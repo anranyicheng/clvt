@@ -3,57 +3,123 @@
 ;;; ===========================================
 ;;; Einsum 引擎 (适配 VT 结构与视图)
 ;;; ===========================================
-(declaim (inline split-by-comma))
-(defun split-by-comma (str)
-  (declare (optimize (speed 3)) (string str))
-  (loop for i = 0 then (1+ j)
-        as j = (position #\, str :start i)
-        collect (subseq str i j)
-        while j))
 
-(declaim (inline normalize-subscripts))
-(defun normalize-subscripts (subscripts)
-  (declare ((or list string) subscripts))
-  (cond
-    ((stringp subscripts)
-     (let* ((no-spaces (remove #\Space subscripts))
-            (arrow-pos (search "->" no-spaces)))
-       (if arrow-pos
-           (let* ((lhs (subseq no-spaces 0 arrow-pos))
-                  (rhs (subseq no-spaces (+ arrow-pos 2)))
-                  (inputs (mapcar (lambda (s) (coerce s 'list))
-				  (split-by-comma lhs)))
-                  (output (coerce rhs 'list)))
-             (values inputs output t))
-           (let ((inputs (mapcar (lambda (s) (coerce s 'list))
-				 (split-by-comma no-spaces))))
-             (values inputs nil nil)))))
-    ((listp subscripts)
-     (let ((arrow-pos (position '-> subscripts)))
-       (if arrow-pos
-           (let ((inputs-raw (subseq subscripts 0 arrow-pos))
-                 (output-raw (nth (1+ arrow-pos) subscripts)))
-             (values
-	      (mapcar (lambda (s)
-			(cond ((stringp s) (coerce s 'list))
-                              ((listp s) s)
-                              ((symbolp s) (coerce (symbol-name s) 'list))
-                              (t (error "无效下标元素: ~A" s))))
-                      inputs-raw)
-              (cond ((stringp output-raw) (coerce output-raw 'list))
-                    ((listp output-raw) output-raw)
-                    ((symbolp output-raw)
-		     (coerce (symbol-name output-raw) 'list))
-                    (t nil))
-              t))
-           (values
-	    (mapcar (lambda (s)
-		      (cond ((stringp s) (coerce s 'list))
-                            ((listp s) s)
-                            ((symbolp s) (coerce (symbol-name s) 'list))
-                            (t (error "无效下标元素: ~A" s))))
-                    subscripts)
-            nil nil))))))
+
+(declaim (inline parse-subscript-tokens))
+(defun parse-subscript-tokens (str)
+  "将下标字符串解析为 Token 列表。
+   支持：
+   1. 标准字符 (如 ij, jk)
+   2. 省略号 ... (解析为 :ELLIPSIS)
+   3. 显式输出 (->)
+   4. 隐式输出 (无 ->)
+   返回：
+   1. inputs: 输入下标列表的列表
+   2. output: 输出下标列表
+   3. explicit-p: 是否显式指定输出"
+  
+  (let ((len (length str))
+        (inputs nil)          ; 存储所有输入张量的下标列表
+        (current-sub nil)     ; 当前正在构建的下标列表
+        (output nil)          ; 输出下标列表
+        (i 0)
+        (state :inputs))      ; 状态机：当前处于输入部分还是输出部分
+    (flet ((save-current-sub ()
+             "将当前累积的 current-sub 保存到 inputs 或 output 中"
+             (when current-sub
+               ;; current-sub 是反序构建的，需要反转
+               (let ((final-sub (nreverse current-sub)))
+                 (if (eq state :inputs)
+                     (push final-sub inputs)
+                     (setf output final-sub)))
+               (setf current-sub nil))))      
+      (loop while (< i len) do
+        (let ((char (char str i)))
+          (cond
+            ;; 1. 处理省略号 "..."
+            ((and (char= char #\.)
+                  (< (+ i 2) len)
+                  (char= (char str (+ i 1)) #\.)
+                  (char= (char str (+ i 2)) #\.))
+             ;; 将 :ellipsis 标记加入当前列表
+             (push :ellipsis current-sub)
+             (incf i 3))
+            ;; 2. 处理箭头 "->"
+            ((and (char= char #\-)
+                  (< (1+ i) len)
+                  (char= (char str (1+ i)) #\>))
+             ;; 遇到箭头，意味着：
+             ;; A. 结束最后一个输入张量的解析
+             (save-current-sub)
+             ;; B. 切换状态到输出模式
+             (setf state :outputs)
+             (incf i 2))
+            ;; 3. 处理逗号 ","
+            ((char= char #\,)
+             ;; 只有在输入模式下，逗号才作为分隔符
+             (when (eq state :inputs)
+               (save-current-sub))
+             ;; 如果在输出模式下遇到逗号，通常是语法错误，
+             ;; 但为了兼容性或特定扩展，这里暂时忽略或报错
+             ;; NumPy 标准输出不支持逗号(只有一个输出)
+             (incf i))
+            ;; 4. 处理空格
+            ((char= char #\Space)
+             (incf i))
+            ;; 5. 错误检查：单点 "."
+            ((char= char #\.)
+             (error "Invalid syntax: single '.' found. Use '...' for ellipsis."))
+            ;; 6. 处理普通字符 (a-z, A-Z)
+            (t (push char current-sub)
+               (incf i)))))
+      
+      ;; 循环结束后，处理最后剩余的 current-sub
+      (save-current-sub)
+      ;; 返回结果
+      ;; inputs 是反序压栈的，需要反转
+      ;; output 不需要反转(只有一个)
+      (values (nreverse inputs) 
+              output 
+              (if (eq state :outputs) t nil)))))
+
+(declaim (inline expand-ellipsis))
+(defun expand-ellipsis (input-subs output-sub vts)
+  "将解析出的 :ellipsis。"
+  ;; 1. 计算维度
+  (let ((ellipsis-ranks nil))
+    (loop for sub in input-subs
+          for vt in vts
+          for explicit-rank = (count-if #'characterp sub)
+          for has-ellipsis = (member :ellipsis sub)
+          for tensor-rank = (length (vt-shape vt))
+          for implicit-rank = (if has-ellipsis (- tensor-rank explicit-rank) 0) do
+	    (when (and has-ellipsis (< implicit-rank 0))
+              (error "Subscript dimension mismatch"))
+	    (when (> (count :ellipsis sub) 1)
+              (error "Only one ellipsis allowed"))
+	    (push implicit-rank ellipsis-ranks))
+    
+    (setf ellipsis-ranks (nreverse ellipsis-ranks))    
+    ;; 2. 生成标签
+    (let* ((max-implicit-rank (reduce #'max ellipsis-ranks :initial-value 0))
+           ;; 使用特殊的内部字符，避免与用户输入冲突
+           (ellipsis-labels (loop for i from 0 below max-implicit-rank
+                                  collect (code-char (+ (char-code #\?) i)))))      
+      (flet ((expand-sub (sub implicit-rank)
+               "高效展开：使用 nconc 代替 append，避免额外拷贝"
+               (let ((pos (position :ellipsis sub)))
+                 (if (not pos)
+                     sub
+                     ;; 优化点：直接拼接列表结构
+                     (let* ((before (subseq sub 0 pos))
+                            (after (nthcdr (1+ pos) sub)) ; nthcdr 不创建新列表，只是移动指针
+                            (labels-to-use (subseq ellipsis-labels 
+                                                   (- max-implicit-rank implicit-rank))))
+                       ;; nconc 是破坏性的，但因为 before 是 subseq 新建的，所以安全
+                       (nconc before labels-to-use after))))))        
+        (values (mapcar #'expand-sub input-subs ellipsis-ranks)
+                (when output-sub
+                  (expand-sub output-sub max-implicit-rank)))))))
 
 ;; 智能重排：优化缓存命中率
 (declaim (inline smart-reorder-labels))
@@ -195,7 +261,8 @@
          
          ;; 输出张量创建
          (out-shape (mapcar (lambda (l)
-			      (gethash l dim-sizes)) output-subscripts))
+			      (gethash l dim-sizes))
+			    output-subscripts))
          (output (vt-zeros out-shape)) ; 默认 double-float
          (out-data (vt-data output))
          
@@ -324,16 +391,26 @@
             (recurse 0))))
     output))
 
-(declaim (inline vt-einsum))		 
+
+(declaim (inline vt-einsum))
 (defun vt-einsum (subscripts &rest vts)
-  "爱因斯坦求和约定 (视图增强版)。
-   支持对转置、切片后的张量进行直接计算，无需数据拷贝。
-   示例: (vt-einsum \"ij,jk->ik\" A B)"
-  (multiple-value-bind (input-subs output-subs explicit-mode)
-      (normalize-subscripts subscripts)
-    (unless (= (length input-subs) (length vts))
-      (error "提供的张量数量 ~A 与子脚标 ~A 不匹配" (length vts) input-subs))
-    (multiple-value-bind (all-labels dim-sizes global-strides output-subs-final)
-        (analyze-einsum input-subs output-subs explicit-mode vts)
-      (einsum-execute-fast
-       all-labels dim-sizes global-strides output-subs-final vts))))
+  "爱因斯坦求和约定 (增强版，支持标准 '...' 省略号)。
+   示例:
+     (vt-einsum \"...ij,...jk->...ik\" A B) ; 批量矩阵乘法
+     (vt-einsum \"...ii->...i\" A)          ; 批量提取对角线
+  "
+  (multiple-value-bind (raw-inputs raw-output explicit-p)
+      (parse-subscript-tokens subscripts)    
+    (unless (= (length raw-inputs) (length vts))
+      (error "提供的张量数量 ~A 与子脚标 ~A 不匹配" (length vts) raw-inputs))
+    ;; 1. 展开 Ellipsis
+    (multiple-value-bind (input-subs output-subs)
+        (expand-ellipsis raw-inputs raw-output vts)
+      ;; 2. 如果没有显式输出，自动推导
+      ;; 注意：analyze-einsum 内部也会推导，但我们需要先展开 ellipsis
+      ;; 这里我们简化，直接传递 nil 让 analyze-einsum 推导
+      (unless explicit-p
+        (setf output-subs nil))
+      (multiple-value-bind (all-labels dim-sizes global-strides output-subs-final)
+          (analyze-einsum input-subs output-subs explicit-p vts)        
+        (einsum-execute-fast all-labels dim-sizes global-strides output-subs-final vts)))))

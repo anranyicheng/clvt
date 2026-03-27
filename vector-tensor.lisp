@@ -1080,7 +1080,7 @@
 
 
 (defun vt-matmul (vt1 vt2)
-  (vt-einsum "ij,jk->ik" vt1 vt2))
+  (vt-einsum "...ij,...jk->...ik" vt1 vt2))
 
 (defun vt-@ (vt1 vt2)
   (vt-matmul vt1 vt2))
