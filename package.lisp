@@ -96,7 +96,7 @@
    ))
 
 (in-package :clvt)
-(defparameter *vt-funcal-list* nil)
+(defparameter *vt-fun-list* nil)
 (do-symbols (var :clvt)
   (when (search "vt-" (symbol-name var) :test #'equalp)
-    (push var *vt-funcal-list*)))
+    (push var *vt-fun-list*)))
