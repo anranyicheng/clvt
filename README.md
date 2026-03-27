@@ -7,6 +7,8 @@ numcl 繁重的类型推理，很难理解，numcl 接口和CL语言标准重合
 这库的核心是 einsum 计算引擎，以及 vt-map, vt-reduce, 其余操作大多数
 都是基于这三个核心函数组合完成，易于理解。同时这个库有完美的打印输出功能。
 
+Common Lisp Vector Tensor Library. This is a tensor library for Lisp, primarily developed using Zhipu Qingyan and assisted by DeepSeek. The goal is to build a concise and powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community has two popular libraries, Magicl and Numcl, Magicl lacks support for high-dimensional tensors, while Numcl has heavy type inference that makes it difficult to understand. Additionally, Numcl's interface overlaps with the CL language standard, making it hard to discuss. The core of this library is the einsum computation engine, along with vt-map and vt-reduce. Most other operations are composed based on these three core functions, making them easy to understand. At the same time, this library features excellent printing and output capabilities.
+
 clvt 举例:
 ``` commmon lisp
 CLVT> (defparameter *m* (vt-arange 27 :start 0 :step 1 :type 'fixnum))
