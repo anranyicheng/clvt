@@ -1,4 +1,4 @@
-;;;; 扩展功能：对标 NumPy 函数
+;;;; 扩展功能:对标 NumPy 函数
 (in-package :clvt)
 
 
@@ -173,12 +173,12 @@
   "返回展平后的视图(尽量不复制数据).
   如果输入是连续的,返回视图；否则返回副本."
   (if (vt-contiguous-p vt)
-      ;; 连续内存：直接创建视图
+      ;; 连续内存:直接创建视图
       (%make-vt :data (vt-data vt)
                 :shape (list (vt-size vt))
                 :strides '(1)
                 :offset (vt-offset vt))
-      ;; 非连续：创建副本
+      ;; 非连续:创建副本
       (vt-flatten vt)))
 
 (defun vt-squeeze (vt &optional axis)
@@ -297,7 +297,7 @@
   axis: 指定轴(nil 表示展平后重复)
   返回: 新张量"
   (cond
-    ;; 无 axis：展平后重复
+    ;; 无 axis:展平后重复
     ((null axis)
      (let* ((flat (vt-flatten vt))
             (size (vt-size flat))
@@ -326,7 +326,7 @@
                                (incf idx)))
              (%make-vt :data result-data :shape (list total-size)
                        :strides '(1) :offset 0)))))
-    ;; 有 axis：沿轴重复
+    ;; 有 axis:沿轴重复
     (t
      (let* ((old-shape (vt-shape vt))
             (axis-size (nth axis old-shape))
@@ -1039,7 +1039,7 @@
 (defun vt-gradient (tensor &key spacing)
   "计算梯度"
   (declare (ignore spacing))
-  ;; 简化实现：中心差分
+  ;; 简化实现:中心差分
   (let* ((flat (vt-flatten tensor))
          (size (vt-size flat))
          (data (vt-data flat))

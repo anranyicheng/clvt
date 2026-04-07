@@ -5,12 +5,12 @@
 (declaim (inline parse-subscript-tokens))
 (defun parse-subscript-tokens (str)
   "将下标字符串解析为 Token 列表.
-   支持：
+   支持:
    1. 标准字符 (如 ij, jk)
    2. 省略号 ... (解析为 :ELLIPSIS)
    3. 显式输出 (->)
    4. 隐式输出 (无 ->)
-   返回：
+   返回:
    1. inputs: 输入下标列表的列表
    2. output: 输出下标列表
    3. explicit-p: 是否显式指定输出"
@@ -20,7 +20,7 @@
         (current-sub nil)     ;; 当前正在构建的下标列表
         (output nil)          ;; 输出下标列表
         (i 0)
-        (state :inputs))      ;; 状态机：当前处于输入部分还是输出部分
+        (state :inputs))      ;; 状态机:当前处于输入部分还是输出部分
     (flet ((save-current-sub ()
              "将当前累积的 current-sub 保存到 inputs 或 output 中"
              (when current-sub
@@ -45,7 +45,7 @@
             ((and (char= char #\-)
                   (< (1+ i) len)
                   (char= (char str (1+ i)) #\>))
-             ;; 遇到箭头,意味着：
+             ;; 遇到箭头,意味着:
              ;; A. 结束最后一个输入张量的解析
              (save-current-sub)
              ;; B. 切换状态到输出模式
@@ -63,7 +63,7 @@
             ;; 4. 处理空格
             ((char= char #\Space)
              (incf i))
-            ;; 5. 错误检查：单点 "."
+            ;; 5. 错误检查:单点 "."
             ((char= char #\.)
              (error "Invalid syntax: single '.' found. Use '...' for ellipsis."))
             ;; 6. 处理普通字符 (a-z, A-Z)
@@ -103,11 +103,11 @@
            (ellipsis-labels (loop for i from 0 below max-implicit-rank
                                   collect (code-char (+ (char-code #\?) i)))))      
       (flet ((expand-sub (sub implicit-rank)
-               "高效展开：使用 nconc 代替 append,避免额外拷贝"
+               "高效展开:使用 nconc 代替 append,避免额外拷贝"
                (let ((pos (position :ellipsis sub)))
                  (if (not pos)
                      sub
-                     ;; 优化点：直接拼接列表结构
+                     ;; 优化点:直接拼接列表结构
                      (let* ((before (subseq sub 0 pos))
                             (after (nthcdr (1+ pos) sub)) ; nthcdr 不创建新列表,只是移动指针
                             (labels-to-use (subseq ellipsis-labels 
@@ -118,7 +118,7 @@
                 (when output-sub
                   (expand-sub output-sub max-implicit-rank)))))))
 
-;; 智能重排：优化缓存命中率
+;; 智能重排:优化缓存命中率
 (declaim (inline smart-reorder-labels))
 (defun smart-reorder-labels (raw-labels output-subscripts sum-labels)
   (declare (type list raw-labels output-subscripts sum-labels)
@@ -144,11 +144,11 @@
           for stride in phys-strides
           for pos = (position label all-labels :test #'char=)
           do (let ((res-dim (gethash label label-dims 0)))
-               ;; 广播逻辑：如果物理维度为1但结果维度>1,步长强制为0
+               ;; 广播逻辑:如果物理维度为1但结果维度>1,步长强制为0
                ;; 否则使用物理步长 (支持非连续视图)
                (when (and (= dim 1) (> res-dim 1))
                  (setf stride 0))
-               ;; 支持对角线：如果标签重复,步长累加
+               ;; 支持对角线:如果标签重复,步长累加
                (incf (nth pos strides) stride)))
     strides))
 
@@ -280,7 +280,7 @@
     (loop for s in out-strides-list for i from 0 do
       (setf (aref out-strides-vec i) s))
 
-    ;; === 优化路径：矩阵乘法 (I, J, K) ===
+    ;; === 优化路径:矩阵乘法 (I, J, K) ===
     ;; 仅当 2 个输入,秩为 3 时启用
     (if (and (= n-vts 2) (= rank 3))
         (let ((labels-vec (coerce all-labels 'vector)))
@@ -358,7 +358,7 @@
 	      ((recurse (depth)
                  (declare (type fixnum depth))
                  (if (= depth rank)
-		     ;; 叶节点：计算
+		     ;; 叶节点:计算
 		     (let ((product 1.0d0)) ;; double-float
 		       (declare (type double-float product))
 		       (loop for k fixnum from 0 below n-vts
@@ -366,7 +366,7 @@
 			     for ptr fixnum = (aref cur-ptrs k)
 			     do (setf product (* product (aref data ptr))))
 		       (incf (aref out-data cur-out-ptr) product))		       
-		     ;; 分支：遍历
+		     ;; 分支:遍历
 		     (let* ((dim (aref dims-vec depth))
 			    (out-stride (aref out-strides-vec depth)))
 		       (declare (type fixnum dim out-stride))
@@ -403,7 +403,7 @@
     (multiple-value-bind (input-subs output-subs)
         (expand-ellipsis raw-inputs raw-output vts)
       ;; 2. 如果没有显式输出,自动推导
-      ;; 注意：analyze-einsum 内部也会推导,但我们需要先展开 ellipsis
+      ;; 注意:analyze-einsum 内部也会推导,但我们需要先展开 ellipsis
       ;; 这里我们简化,直接传递 nil 让 analyze-einsum 推导
       (unless explicit-p
         (setf output-subs nil))

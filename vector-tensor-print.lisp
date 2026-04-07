@@ -4,7 +4,7 @@
 (defvar *vt-print-precision* 4)
 (defvar *vt-indent-step* 1)
 
-;; 辅助函数：判断类型类别
+;; 辅助函数:判断类型类别
 (defun get-type-category (type)
   "将具体的 Lisp 类型归类为 :integer, :float 或 :other"
   (cond
@@ -25,10 +25,10 @@
   "根据数据类型格式化数值字符串"
   (case (get-type-category type)
     (:integer
-     ;; 整数：直接打印,无小数点
+     ;; 整数:直接打印,无小数点
      (format nil "~d" val))    
     (:float
-     ;; 浮点数：保留精度,去除末尾多余的0
+     ;; 浮点数:保留精度,去除末尾多余的0
      (let* ((str (format nil "~,vf" *vt-print-precision* val))
             (trimmed (string-right-trim "0" str)))
        ;; 如果去掉0后以小数点结尾,补一个0 (如 "1." -> "1.0")
@@ -37,7 +37,7 @@
          (setf trimmed (concatenate 'string trimmed "0")))
        trimmed))    
     (otherwise
-     ;; 其他类型：默认打印
+     ;; 其他类型:默认打印
      (format nil "~a" val))))
 
 ;; 辅助函数保持不变
@@ -115,7 +115,7 @@
     (let ((shape (vt-shape obj))
           ;; 获取数据类型
           (element-type (vt-element-type obj)))
-      ;; 打印头部：包含 shape 和 dtype
+      ;; 打印头部:包含 shape 和 dtype
       (format stream "shape:~A dtype:~A " shape element-type)
       
       (cond

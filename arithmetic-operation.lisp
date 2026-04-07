@@ -4,7 +4,7 @@
 
 (defun vt-+ (&rest args)
   "逐元素加法.支持标量、列表、张量混合.
-   自动优化：多参数时单次遍历."
+   自动优化:多参数时单次遍历."
   (apply #'vt-map #'+ args))
 
 (defun vt-* (&rest args)
@@ -67,7 +67,7 @@
 
 (defun vt-even-p (vt)
   "判断是否为偶数.返回 1.0 或 0.0."
-  ;; 注意：浮点数判断偶数需先取整
+  ;; 注意:浮点数判断偶数需先取整
   (vt-map (lambda (v) (if (evenp (floor v)) 1.0d0 0.0d0)) vt))
 
 (defun vt-odd-p (vt)

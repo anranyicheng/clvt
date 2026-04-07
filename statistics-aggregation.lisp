@@ -76,9 +76,9 @@
          (element-type (vt-element-type tensor))
          ;; 计算归约维度的元素个数
          (count (if axis
-                    ;; 轴向归约：除数是该轴的长度
+                    ;; 轴向归约:除数是该轴的长度
                     (the fixnum (nth axis (vt-shape tensor)))
-                    ;; 全局归约：除数是总元素数
+                    ;; 全局归约:除数是总元素数
                     (the fixnum (reduce #'* (vt-shape tensor))))))
     
     ;; 避免除以 0 (虽然理论上 shape 维度不会为 0)
@@ -119,7 +119,7 @@
   "计算方差."
   (let* ((mean-val (vt-mean tensor :axis axis)))
     ;; 1. 计算差值
-    ;; 注意：mean-val 在 axis 模式下是张量,vt-map 会自动广播
+    ;; 注意:mean-val 在 axis 模式下是张量,vt-map 会自动广播
     (let ((diff (vt-map #'- tensor mean-val)))  
       ;; 2. 计算差值的平方
       (let ((sq-diff (vt-map (lambda (x) (* x x)) diff)))
