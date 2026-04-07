@@ -89,12 +89,15 @@
           for explicit-rank = (count-if #'characterp sub)
           for has-ellipsis = (member :ellipsis sub)
           for tensor-rank = (length (vt-shape vt))
-          for implicit-rank = (if has-ellipsis (- tensor-rank explicit-rank) 0) do
-	    (when (and has-ellipsis (< implicit-rank 0))
-              (error "Subscript dimension mismatch"))
-	    (when (> (count :ellipsis sub) 1)
-              (error "Only one ellipsis allowed"))
-	    (push implicit-rank ellipsis-ranks))
+          for implicit-rank = (if has-ellipsis
+				  (- tensor-rank explicit-rank)
+				  0)
+	  do
+	     (when (and has-ellipsis (< implicit-rank 0))
+               (error "Subscript dimension mismatch"))
+	     (when (> (count :ellipsis sub) 1)
+               (error "Only one ellipsis allowed"))
+	     (push implicit-rank ellipsis-ranks))
     
     (setf ellipsis-ranks (nreverse ellipsis-ranks))    
     ;; 2. 生成标签
@@ -109,9 +112,10 @@
                      sub
                      ;; 优化点:直接拼接列表结构
                      (let* ((before (subseq sub 0 pos))
-                            (after (nthcdr (1+ pos) sub)) ; nthcdr 不创建新列表,只是移动指针
-                            (labels-to-use (subseq ellipsis-labels 
-                                                   (- max-implicit-rank implicit-rank))))
+                            (after (nthcdr (1+ pos) sub)) ;; nthcdr 不创建新列表,只是移动指针
+                            (labels-to-use
+			      (subseq ellipsis-labels 
+                                      (- max-implicit-rank implicit-rank))))
                        ;; nconc 是破坏性的,但因为 before 是 subseq 新建的,所以安全
                        (nconc before labels-to-use after))))))        
         (values (mapcar #'expand-sub input-subs ellipsis-ranks)
@@ -123,7 +127,8 @@
 (defun smart-reorder-labels (raw-labels output-subscripts sum-labels)
   (declare (type list raw-labels output-subscripts sum-labels)
 	   (optimize (speed 3)))
-  (if (and (= (length output-subscripts) 2) (= (length sum-labels) 1))
+  (if (and (= (length output-subscripts) 2)
+	   (= (length sum-labels) 1))
       (let ((dim-i (first output-subscripts))
             (dim-k (second output-subscripts))
             (dim-j (first sum-labels)))
@@ -153,32 +158,35 @@
     strides))
 
 (declaim (inline analyze-einsum))
-(defun analyze-einsum (input-subscripts output-subscripts explicit-mode vts)
+(defun analyze-einsum
+    (input-subscripts output-subscripts explicit-mode vts)
   (declare (type list input-subscripts vts)
 	   (optimize (speed 1) (safety 1)))
   (let ((label-dims (make-hash-table))
         (label-counts (make-hash-table))
         (all-labels-set nil))    
     ;; 1. 收集维度信息
-    (loop for sub in input-subscripts
-          for tns in vts
-          for shape = (vt-shape tns)
-          do (unless (= (length sub) (length shape))
-               (error "子脚标 ~A 与张量形状 ~A 维度不匹配" sub shape))
-             (loop for label in sub
-                   for dim in shape
-                   do (incf (gethash label label-counts 0))
-                      (pushnew label all-labels-set)
-                      (multiple-value-bind (old-dim found-p)
-			  (gethash label label-dims)
-			(if found-p
-                            ;; 维度一致性检查 (允许广播: 1扩N)
-                            (unless (or (= old-dim dim) (= dim 1) (= old-dim 1))
-                              (error "标签 ~A 维度冲突: ~A vs ~A" label old-dim dim))
-                            (setf (gethash label label-dims) dim))
-			;; 更新 label-dims 为广播后的最大维度
-			(setf (gethash label label-dims)
-			      (max (gethash label label-dims 0) dim)))))
+    (loop
+      for sub in input-subscripts
+      for tns in vts
+      for shape = (vt-shape tns)
+      do (unless (= (length sub) (length shape))
+           (error "子脚标 ~A 与张量形状 ~A 维度不匹配" sub shape))
+         (loop
+	   for label in sub
+           for dim in shape
+           do (incf (gethash label label-counts 0))
+              (pushnew label all-labels-set)
+              (multiple-value-bind (old-dim found-p)
+		  (gethash label label-dims)
+		(if found-p
+                    ;; 维度一致性检查 (允许广播: 1扩N)
+                    (unless (or (= old-dim dim) (= dim 1) (= old-dim 1))
+                      (error "标签 ~A 维度冲突: ~A vs ~A" label old-dim dim))
+                    (setf (gethash label label-dims) dim))
+		;; 更新 label-dims 为广播后的最大维度
+		(setf (gethash label label-dims)
+		      (max (gethash label label-dims 0) dim)))))
 
     ;; 2. 确定输出下标
     (when (not explicit-mode)
@@ -234,7 +242,7 @@
     ;; 反向计算连续步长
     (loop for label in (reverse all-labels)
           for dim = (gethash label label-dims 0)
-          when (member label output-subscripts) ; 只计算输出维度
+          when (member label output-subscripts) ;; 只计算输出维度
             do (setf (gethash label local-stride-map) acc)
                (setf acc (the fixnum (* acc dim))))
     ;; 映射到 all-labels 顺序
@@ -392,8 +400,8 @@
 (defun vt-einsum (subscripts &rest vts)
   "爱因斯坦求和约定 (增强版,支持标准 '...' 省略号).
    示例:
-     (vt-einsum \"...ij,...jk->...ik\" A B) ; 批量矩阵乘法
-     (vt-einsum \"...ii->...i\" A)          ; 批量提取对角线
+     (vt-einsum \"...ij,...jk->...ik\" A B) ;; 批量矩阵乘法
+     (vt-einsum \"...ii->...i\" A)          ;; 批量提取对角线
   "
   (multiple-value-bind (raw-inputs raw-output explicit-p)
       (parse-subscript-tokens subscripts)    
@@ -407,6 +415,8 @@
       ;; 这里我们简化,直接传递 nil 让 analyze-einsum 推导
       (unless explicit-p
         (setf output-subs nil))
-      (multiple-value-bind (all-labels dim-sizes global-strides output-subs-final)
+      (multiple-value-bind
+	    (all-labels dim-sizes global-strides output-subs-final)
           (analyze-einsum input-subs output-subs explicit-p vts)        
-        (einsum-execute-fast all-labels dim-sizes global-strides output-subs-final vts)))))
+        (einsum-execute-fast
+	 all-labels dim-sizes global-strides output-subs-final vts)))))

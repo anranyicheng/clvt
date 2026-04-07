@@ -130,7 +130,9 @@
          (shape (list count)))
     (loop for i below count
           do (setf (aref data i) (coerce (+ start (* i step)) type)))
-    (%make-vt :data data :shape shape :strides (vt-compute-strides shape))))
+    (%make-vt :data data
+	      :shape shape
+	      :strides (vt-compute-strides shape))))
 
 (defun make-normal-random-generator ()
   "返回一个无参函数,每次调用返回一个标准正态随机数."
@@ -239,7 +241,9 @@
    K: 对角线偏移 (0=主对角线, 1=主对角线之上).
    In-Place: 如果为 T,直接修改原张量；否则返回副本.
    支持 Batch (Rank >= 2)."
-  (let* ((res (if in-place tensor (vt-copy tensor))) ; vt-copy 需自行实现或用 vt-map identity
+  (let* ((res (if in-place
+		  tensor
+		  (vt-copy tensor))) ;; vt-copy 需自行实现或用 vt-map identity
          (res-data (vt-data res))
          (res-shape (vt-shape res))
          (res-strides (vt-strides res))
@@ -258,15 +262,16 @@
                       (stride-col (nth (1+ depth) res-strides)))
                  (declare (type fixnum rows cols stride-row stride-col))
                  
-                 (loop for r fixnum from 0 below rows
-                       for row-ptr fixnum = ptr then (+ row-ptr stride-row) do
-                         (loop for c fixnum from 0 below cols do
-                           ;; 判断条件:列号 >= 行号 + k
-                           (when (< c (+ r k))
-                             ;; 置零
-                             (setf (aref res-data 
-					 (+ row-ptr (* c stride-col)))
-				   0.0d0)))))               
+                 (loop
+		   for r fixnum from 0 below rows
+                   for row-ptr fixnum = ptr then (+ row-ptr stride-row) do
+                     (loop for c fixnum from 0 below cols do
+                       ;; 判断条件:列号 >= 行号 + k
+                       (when (< c (+ r k))
+                         ;; 置零
+                         (setf (aref res-data 
+				     (+ row-ptr (* c stride-col)))
+			       0.0d0)))))               
                ;; === 高维递归 ===
                (let ((dim (nth depth res-shape))
                      (stride (nth depth res-strides)))
@@ -301,15 +306,16 @@
                       (stride-col (nth (1+ depth) res-strides)))
                  (declare (type fixnum rows cols stride-row stride-col))
                  
-                 (loop for r fixnum from 0 below rows
-                       for row-ptr fixnum = ptr then (+ row-ptr stride-row) do
-                         (loop for c fixnum from 0 below cols do
-                           ;; 判断条件:列号 <= 行号 + k
-                           (when (> c (+ r k))
-                             ;; 置零
-                             (setf (aref res-data 
-					 (+ row-ptr (* c stride-col)))
-				   0.0d0)))))
+                 (loop
+		   for r fixnum from 0 below rows
+                   for row-ptr fixnum = ptr then (+ row-ptr stride-row) do
+                     (loop for c fixnum from 0 below cols do
+                       ;; 判断条件:列号 <= 行号 + k
+                       (when (> c (+ r k))
+                         ;; 置零
+                         (setf (aref res-data 
+				     (+ row-ptr (* c stride-col)))
+			       0.0d0)))))
                
                ;; === 高维递归 ===
                (let ((dim (nth depth res-shape))
@@ -336,7 +342,9 @@
            ;; 计算对角线长度
            (diag-len (max 0 (- (min rows cols) (abs offset))))
            ;; 确定输出形状:Batch 维度 + 对角线长度
-           (out-shape (append (subseq in-shape 0 (- rank 2)) (list diag-len)))
+           (out-shape
+	     (append (subseq in-shape 0 (- rank 2))
+		     (list diag-len)))
            (res (make-vt out-shape 0))
            (res-data (vt-data res))
            (in-data (vt-data tensor))
@@ -353,23 +361,26 @@
                        (stride-col (nth (1+ depth) in-strides)))
                    (declare (type fixnum stride-row stride-col))
                    
-                   (loop for i fixnum from 0 below diag-len
-                         ;; 根据偏移量计算起点和步长
-                         ;; offset > 0: 向右偏移,起点 (0, offset)
-                         ;; offset < 0: 向下偏移,起点
-                         for r fixnum = (if (> offset 0) 0 (- offset))
-                         for c fixnum = (if (> offset 0) offset 0)
-                         ;; 计算指针位置
-                         for src-off fixnum = (+ in-ptr 
-                                                 (* (+ r i) stride-row) 
-                                                 (* (+ c i) stride-col))
-                         do (setf (aref res-data out-ptr) (aref in-data src-off))
-                            (incf out-ptr)))
+                   (loop
+		     for i fixnum from 0 below diag-len
+                     ;; 根据偏移量计算起点和步长
+                     ;; offset > 0: 向右偏移,起点 (0, offset)
+                     ;; offset < 0: 向下偏移,起点
+                     for r fixnum = (if (> offset 0) 0 (- offset))
+                     for c fixnum = (if (> offset 0) offset 0)
+                     ;; 计算指针位置
+                     for src-off fixnum = (+ in-ptr 
+                                             (* (+ r i) stride-row) 
+                                             (* (+ c i) stride-col))
+                     do (setf (aref res-data out-ptr)
+			      (aref in-data src-off))
+                        (incf out-ptr)))
                  
                  ;; === 高维递归 ===
                  (let ((dim (nth depth in-shape))
                        (stride (nth depth in-strides))
-                       (out-stride (nth depth (vt-strides res)))) ;; res strides 对应 batch 维
+                       (out-stride
+			 (nth depth (vt-strides res)))) ;; res strides 对应 batch 维
                    (loop for i fixnum from 0 below dim do
                      (recurse (1+ depth) in-ptr out-ptr)
                      (incf in-ptr stride)
@@ -423,7 +434,9 @@
   "零拷贝转置.仅交换步长和形状维度,不移动数据.
    perm: 排列列表,例如 (1 0) 表示交换维度0和1."
   (let* ((rank (length (vt-shape vt)))
-         (perm-real (or perm (loop for i from (1- rank) downto 0 collect i))))
+         (perm-real
+	   (or perm
+	       (loop for i from (1- rank) downto 0 collect i))))
     (unless (= (length perm-real) rank)
       (error "置换维度数量与张量秩不匹配"))
     (%make-vt
@@ -706,24 +719,25 @@
              (rank (length dest-shape))
              (element-type (array-element-type dest-data)))
         
-        (labels ((recurse (depth d-ptr s-ptr)
-                   (declare (type fixnum depth d-ptr s-ptr))
-                   (if (= depth rank)
-                       ;; 叶节点:写入并进行类型转换
-                       (setf (aref dest-data d-ptr)
-                             (coerce (aref src-data s-ptr) element-type))
-                       
-                       ;; 递归层
-                       (let ((dim (nth depth dest-shape))
-                             (d-stride (nth depth dest-strides))
-                             (s-stride (nth depth src-strides))
-                             (cur-d-ptr d-ptr)
-                             (cur-s-ptr s-ptr))
-                         (declare (type fixnum dim d-stride s-stride))
-                         (loop for i fixnum from 0 below dim do
-                           (recurse (1+ depth) cur-d-ptr cur-s-ptr)
-                           (incf cur-d-ptr d-stride)
-                           (incf cur-s-ptr s-stride))))))
+        (labels
+	    ((recurse (depth d-ptr s-ptr)
+               (declare (type fixnum depth d-ptr s-ptr))
+               (if (= depth rank)
+                   ;; 叶节点:写入并进行类型转换
+                   (setf (aref dest-data d-ptr)
+                         (coerce (aref src-data s-ptr) element-type))
+                   
+                   ;; 递归层
+                   (let ((dim (nth depth dest-shape))
+                         (d-stride (nth depth dest-strides))
+                         (s-stride (nth depth src-strides))
+                         (cur-d-ptr d-ptr)
+                         (cur-s-ptr s-ptr))
+                     (declare (type fixnum dim d-stride s-stride))
+                     (loop for i fixnum from 0 below dim do
+                       (recurse (1+ depth) cur-d-ptr cur-s-ptr)
+                       (incf cur-d-ptr d-stride)
+                       (incf cur-s-ptr s-stride))))))
           
           (recurse 0 dest-offset src-offset))
         dest))))
@@ -890,15 +904,18 @@
                                 (1 (coerce (funcall fn d0) 'double-float))
                                 (2 (let ((d1 (aref (aref ins-data 1) 
                                                    (aref cur-ptrs 1))))
-                                     (coerce (funcall fn d0 d1) 'double-float)))
+                                     (coerce (funcall fn d0 d1)
+					     'double-float)))
                                 (otherwise 
                                  (let ((args
-					 (loop for k fixnum from 0 below n-tensors
-                                               collect
-					       (aref (aref ins-data k)
-                                                     (aref cur-ptrs k)))))
+					 (loop
+					   for k fixnum from 0 below n-tensors
+                                           collect
+					   (aref (aref ins-data k)
+                                                 (aref cur-ptrs k)))))
                                    (declare (dynamic-extent args))
-                                   (coerce (apply fn args) 'double-float)))))))
+                                   (coerce (apply fn args)
+					   'double-float)))))))
                  
                  ;; --- 外层:遍历维度 ---
                  (let* ((dim (the fixnum (nth depth out-shape)))
@@ -958,12 +975,10 @@
      (coerce 0 element-type))
     (:max
      (cond ((eq element-type 'double-float) most-negative-double-float)
-           ((eq element-type 'single-float) most-negative-single-float)
            ((eq element-type 'fixnum) most-negative-fixnum)
            (t 0)))
     (:min
      (cond ((eq element-type 'double-float) most-positive-double-float)
-           ((eq element-type 'single-float) most-positive-single-float)
            ((eq element-type 'fixnum) most-positive-fixnum)
            (t 0)))))
 
@@ -1048,14 +1063,16 @@
                            (coerce new-acc element-type))
                      
                      (when (and return-arg do-update-idx res-idx-data)
-                       (setf (aref res-idx-data out-idx-ptr) current-arg-val))))
+                       (setf (aref res-idx-data out-idx-ptr)
+			     current-arg-val))))
                  
                  ;; --- 分支节点:列表遍历 ---
                  (let* ((dim (nth depth in-shape))
                         (in-stride (nth depth in-strides))
                         (out-stride (nth depth out-strides-map))
                         (arg-stride (nth depth arg-strides)))                   
-                   (declare (type fixnum dim in-stride out-stride arg-stride))
+                   (declare
+		    (type fixnum dim in-stride out-stride arg-stride))
                    
                    (loop for i fixnum from 0 below dim do
                      (recurse (1+ depth)
@@ -1262,11 +1279,13 @@
     
     ;; 结果封装
     (let* ((total-indices (length result-indices))
-           (count (if (zerop rank) total-indices (floor total-indices rank))))
+           (count (if (zerop rank)
+		      total-indices (floor total-indices rank))))
       ;; 如果没有找到元素,返回空张量
       (if (zerop count)
           (vt-zeros (list 0 rank))
-          (let ((final-data (make-array total-indices :element-type 'fixnum)))
+          (let ((final-data
+		  (make-array total-indices :element-type 'fixnum)))
             ;; 转换类型
             (loop for i from 0 below total-indices
                   for idx across result-indices
