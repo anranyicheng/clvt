@@ -26,9 +26,13 @@
 (defun make-vt (shape initial-element &key (type 'double-float))
   "创建一个指定形状的张量，填充初始值。"
   (let* ((size (vt-shape-to-size shape))
-         (data (make-array size :element-type type
+	 (tmp-type (if (or (eq type 'fixnum)
+			   (eq type :fixnum))
+		       'fixnum
+		       'double-float))
+         (data (make-array size :element-type tmp-type
 				:initial-element
-				(coerce initial-element type)))
+				(coerce initial-element tmp-type)))
          (strides (vt-compute-strides shape)))
     (%make-vt :data data
 	      :shape (if (listp shape) shape (list shape))

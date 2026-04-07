@@ -107,58 +107,18 @@
   ;; Common Lisp 没有直接的 rint，使用 round 然后 float 化
   (vt-map (lambda (x) (float (round x) x)) vt))
 
-
-;;; 带清洗功能的 Log 函数
-;; 辅助函数：检查是否存在非正数
-(defun vt-any-nonpositive-p (vt)
-  "快速检查张量中是否存在小于等于 0 的元素。"
-  (let ((data (vt-data vt))
-        (offset (vt-offset vt))
-        (strides (vt-strides vt))
-        (shape (vt-shape vt)))
-    (labels
-	((recurse (axis current-idx)
-           (if (= axis (length shape))
-               (let ((val (aref data current-idx)))
-                 (<= val 0.0d0)) ; 发现非正数即返回 T
-               (let ((dim (nth axis shape))
-                     (stride (nth axis strides))
-                     (found nil))
-                 (loop for i from 0 below dim
-                       while (not found) ; 只要找到一个就停止
-                       do (setf found (recurse (1+ axis) 
-                                               (+ current-idx
-						  (* i stride)))))
-                 found))))
-      (recurse 0 offset))))
-
-
-(defun vt-log-clean (x &optional base)
-  "安全的对数计算：
-   1. 检查数据是否全部大于0。
-   2. 如果存在非正数，发出三个顺序警告。
-   3. 将小于等于0的数替换为0进行计算。"
-  (assert (or (null base) (>= base 0)))
-  (let ((has-invalid (vt-any-nonpositive-p x)))
-    ;; 步骤 2: 发出警告
-    (when has-invalid
-      (warn "警告 (1/3): 检测到输入数据中包含小于等于 0 的值。")
-      (warn "警告 (2/3): 这些非法值将被自动替换为 0 进行计算。")
-      (warn "警告 (3/3: 正在执行计算，对应的输出结果将为0。"))
-    (if base
-        (vt-map (lambda (val)
-                  (let ((clean-val (if (> val 0.0d0) val 0.0d0)))
-                    (log clean-val base)))
-                x)
-        (vt-map (lambda (val)
-                  (let ((clean-val (if (> val 0.0d0) val 0.0d0)))
-		    clean-val))
-                x))))
-
+(defun vt-log (vt &optional base)
+  (if base
+      (vt-map (lambda (val)
+		(log val base))
+	      vt)
+      (vt-map (lambda (val)
+		(log val))
+              vt)))
 
 (defun vt-log10 (vt)
   "以 10 为底的对数。"
-  (vt-log-clean vt 10.0d0))
+  (vt-log vt 10.0d0))
 
 (defun vt-log2 (vt)
   "以 2 为底的对数。"
