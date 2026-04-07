@@ -26,8 +26,7 @@
 (defun make-vt (shape initial-element &key (type 'double-float))
   "创建一个指定形状的张量，填充初始值。"
   (let* ((size (vt-shape-to-size shape))
-	 (tmp-type (if (or (eq type 'fixnum)
-			   (eq type :fixnum))
+	 (tmp-type (if (eq type 'fixnum)
 		       'fixnum
 		       'double-float))
          (data (make-array size :element-type tmp-type
@@ -580,7 +579,8 @@
   (if (vt-contiguous-p vt)
       vt
       (let* ((new-size (vt-shape-to-size (vt-shape vt)))
-             (new-data (make-array new-size :element-type 'double-float))
+             (new-data (make-array new-size 
+				   :element-type (vt-element-type vt)))
              (new-vt (%make-vt
                       :data new-data
                       :shape (vt-shape vt)
@@ -597,7 +597,7 @@
    自动处理视图：如果原张量是切片或转置，返回的是落地后的连续数据。"
   (let* ((shape (vt-shape vt))
          (src-data (vt-data vt))
-         (element-type (array-element-type src-data))
+         (element-type (vt-element-type vt))
          (size (vt-shape-to-size shape))
          ;; 分配全新的内存空间
          (new-data (make-array size :element-type element-type))
