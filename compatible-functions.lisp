@@ -7,7 +7,7 @@
 ;;; =========================================================================
 
 (defun vt-itemsize (vt)
-  "返回每个元素的字节大小。"
+  "返回每个元素的字节大小."
   (let ((element-type (vt-element-type vt)))
     (cond ((subtypep element-type 'double-float) 8)
           ((subtypep element-type 'single-float) 4)
@@ -25,7 +25,7 @@
           (t 8)))) ; 默认8字节
 
 (defun vt-nbytes (vt)
-  "返回张量占用的总字节数。"
+  "返回张量占用的总字节数."
   (* (vt-size vt) (vt-itemsize vt)))
 
 
@@ -34,11 +34,11 @@
 ;;; ===========================================
 
 (defun vt-linspace (start end num &key (endpoint t) (type 'double-float))
-  "创建线性间隔数组。
+  "创建线性间隔数组.
   start: 起始值
   end: 结束值
   num: 元素个数
-  endpoint: 是否包含结束值（默认 T）
+  endpoint: 是否包含结束值(默认 T)
   返回: 一维张量"
   (declare (type number start end)
            (type fixnum num)
@@ -57,42 +57,42 @@
     (%make-vt :data data :shape shape :strides '(1) :offset 0)))
 
 (defun vt-full (shape fill-value &key (type 'double-float))
-  "创建指定值填充的数组。
+  "创建指定值填充的数组.
   shape: 形状列表
   fill-value: 填充值
   返回: 张量"
   (make-vt shape fill-value :type type))
 
 (defun vt-empty (shape &key (type 'double-float))
-  "创建未初始化数组（实际用 0 填充，避免垃圾数据）。
+  "创建未初始化数组(实际用 0 填充,避免垃圾数据).
   shape: 形状列表
   返回: 张量"
   (vt-zeros shape :type type))
 
 (defun vt-zeros-like (vt &key (type nil))
-  "创建与给定数组形状相同的全零数组。
+  "创建与给定数组形状相同的全零数组.
   vt: 输入张量
-  type: 数据类型（默认与输入相同）
+  type: 数据类型(默认与输入相同)
   返回: 张量"
   (vt-zeros (vt-shape vt) :type (or type (vt-element-type vt))))
 
 (defun vt-ones-like (vt &key (type nil))
-  "创建与给定数组形状相同的全一数组。"
+  "创建与给定数组形状相同的全一数组."
   (vt-ones (vt-shape vt) :type (or type (vt-element-type vt))))
 
 (defun vt-full-like (vt fill-value &key (type nil))
-  "创建与给定数组形状相同的填充数组。"
+  "创建与给定数组形状相同的填充数组."
   (vt-full (vt-shape vt) fill-value :type (or type (vt-element-type vt))))
 
 (defun vt-empty-like (vt &key (type nil))
-  "创建与给定数组形状相同的未初始化数组。"
+  "创建与给定数组形状相同的未初始化数组."
   (vt-empty (vt-shape vt) :type (or type (vt-element-type vt))))
 
 (defun vt-random-int (low high &key (size nil) (type 'fixnum))
-  "创建随机整数数组。
-  low: 下界（包含）
-  high: 上界（不包含）
-  size: 形状（nil 表示标量）
+  "创建随机整数数组.
+  low: 下界(包含)
+  high: 上界(不包含)
+  size: 形状(nil 表示标量)
   返回: 张量"
   (let ((range (- high low)))
     (if size
@@ -102,7 +102,7 @@
         (coerce (+ low (random range)) type))))
 
 (defun vt-from-function (shape fn &key (type 'double-float))
-  "根据函数创建数组。
+  "根据函数创建数组.
   shape: 形状列表
   fn: 接受索引列表并返回值的函数
   返回: 张量"
@@ -128,9 +128,9 @@
     result))
 
 (defun vt-meshgrid (&rest vts)
-  "生成坐标矩阵。
+  "生成坐标矩阵.
    vts: 一维张量列表
-  返回: 坐标张量列表（稀疏模式，兼容 NumPy sparse=True）"
+  返回: 坐标张量列表(稀疏模式,兼容 NumPy sparse=True)"
   (let* ((shapes (mapcar #'vt-shape vts))
          (dims (mapcar #'car shapes))
          (rank (length dims)))
@@ -164,14 +164,14 @@
 ;;; ===========================================
 
 (defun vt-flatten (vt)
-  "将多维数组降为一维（返回副本）。
+  "将多维数组降为一维(返回副本).
   vt: 输入张量
   返回: 一维张量"
   (vt-reshape vt (list (vt-size vt))))
 
 (defun vt-ravel (vt)
-  "返回展平后的视图（尽量不复制数据）。
-  如果输入是连续的，返回视图；否则返回副本。"
+  "返回展平后的视图(尽量不复制数据).
+  如果输入是连续的,返回视图；否则返回副本."
   (if (vt-contiguous-p vt)
       ;; 连续内存：直接创建视图
       (%make-vt :data (vt-data vt)
@@ -182,8 +182,8 @@
       (vt-flatten vt)))
 
 (defun vt-squeeze (vt &optional axis)
-  "移除长度为1的维度。
-  axis: 指定轴（nil 表示移除所有长度为1的维度）
+  "移除长度为1的维度.
+  axis: 指定轴(nil 表示移除所有长度为1的维度)
   返回: 张量视图"
   (let* ((old-shape (vt-shape vt))
          (old-strides (vt-strides vt))
@@ -207,7 +207,7 @@
                 when (> dim 1)
                   do (push dim new-shape)
                      (push stride new-strides))
-          ;; 如果所有维度都是1，返回标量视图
+          ;; 如果所有维度都是1,返回标量视图
           (when (null new-shape)
             (setf new-shape nil
                   new-strides nil))
@@ -217,8 +217,8 @@
                     :offset old-offset)))))
 
 (defun vt-expand-dims (vt axis)
-  "在指定位置插入新轴。
-  axis: 插入位置（0表示最前面）
+  "在指定位置插入新轴.
+  axis: 插入位置(0表示最前面)
   返回: 张量视图"
   (let* ((old-shape (vt-shape vt))
          (old-strides (vt-strides vt))
@@ -226,7 +226,7 @@
          (rank (length old-shape))
          (actual-axis (if (< axis 0) (+ rank axis 1) axis)))
     (when (or (< actual-axis 0) (> actual-axis rank))
-      (error "轴 ~A 越界（秩 ~A）" axis rank))
+      (error "轴 ~A 越界(秩 ~A)" axis rank))
     (let ((new-shape (append (subseq old-shape 0 actual-axis)
                              (list 1)
                              (subseq old-shape actual-axis)))
@@ -239,7 +239,7 @@
                 :offset old-offset))))
 
 (defun vt-swapaxes (vt axis1 axis2)
-  "交换数组的两个轴。
+  "交换数组的两个轴.
   返回: 张量视图"
   (vt-transpose vt (loop for i from 0 below (length (vt-shape vt))
                          collect (cond ((= i axis1) axis2)
@@ -247,7 +247,7 @@
                                        (t i)))))
 
 (defun vt-tile (vt reps)
-  "重复数组构造新数组。
+  "重复数组构造新数组.
   vt: 输入张量
   reps: 每个维度的重复次数列表
   返回: 新张量"
@@ -292,9 +292,9 @@
       result)))
 
 (defun vt-repeat (vt repeats &key axis)
-  "重复数组元素。
+  "重复数组元素.
   repeats: 整数或整数列表
-  axis: 指定轴（nil 表示展平后重复）
+  axis: 指定轴(nil 表示展平后重复)
   返回: 新张量"
   (cond
     ;; 无 axis：展平后重复
@@ -369,7 +369,7 @@
 ;;; ===========================================
 
 (defun vt-concatenate (axis &rest vts)
-  "沿指定轴连接数组。
+  "沿指定轴连接数组.
   axis: 连接轴
   vts: 张量列表
   返回: 新张量"
@@ -409,7 +409,7 @@
         result))))
 
 (defun vt-stack (axis &rest vts)
-  "沿新轴连接数组。
+  "沿新轴连接数组.
   axis: 新轴位置
   vts: 张量列表
   返回: 新张量"
@@ -430,25 +430,25 @@
       (apply #'vt-concatenate axis expanded-vts))))
 
 (defun vt-vstack (&rest vts)
-  "垂直堆叠（沿轴0）。
+  "垂直堆叠(沿轴0).
   等价于 concatenate axis=0"
   (apply #'vt-concatenate 0 vts))
 
 (defun vt-hstack (&rest vts)
-  "水平堆叠（沿轴1，对于1D数组沿轴0）。
-  对于1D数组，等价于 concatenate"
+  "水平堆叠(沿轴1,对于1D数组沿轴0).
+  对于1D数组,等价于 concatenate"
   (let ((rank (length (vt-shape (car vts)))))
     (if (= rank 1)
         (apply #'vt-concatenate 0 vts)
         (apply #'vt-concatenate 1 vts))))
 
 (defun vt-dstack (&rest vts)
-  "深度堆叠（沿轴2）"
+  "深度堆叠(沿轴2)"
   (apply #'vt-concatenate 2 vts))
 
 (defun vt-array-split (vt indices-or-sections &key axis)
-  "沿轴分割数组。
-  indices-or-sections: 整数N（等分）或索引列表
+  "沿轴分割数组.
+  indices-or-sections: 整数N(等分)或索引列表
   axis: 分割轴
   返回: 张量列表"
   (let* ((shape (vt-shape vt))
@@ -471,15 +471,15 @@
     (nreverse splits)))
 
 (defun vt-vsplit (vt indices-or-sections)
-  "垂直分割（沿轴0）"
+  "垂直分割(沿轴0)"
   (vt-array-split vt indices-or-sections :axis 0))
 
 (defun vt-hsplit (vt indices-or-sections)
-  "水平分割（沿轴1）"
+  "水平分割(沿轴1)"
   (vt-array-split vt indices-or-sections :axis 1))
 
 (defun vt-dsplit (vt indices-or-sections)
-  "深度分割（沿轴2）"
+  "深度分割(沿轴2)"
   (vt-array-split vt indices-or-sections :axis 2))
 
 ;;; ===========================================
@@ -487,8 +487,8 @@
 ;;; ===========================================
 
 (defun vt-prod (tensor &key axis)
-  "求积。
-  axis: 归约轴（nil 表示全局）"
+  "求积.
+  axis: 归约轴(nil 表示全局)"
   (nth-value 0 (vt-reduce tensor axis 1
                           (lambda (acc val)
                             (declare (type number acc val))
@@ -496,8 +496,8 @@
                           :return-arg nil)))
 
 (defun vt-cumsum (tensor &key axis)
-  "累积和。
-  axis: 归约轴（nil 表示展平后计算）
+  "累积和.
+  axis: 归约轴(nil 表示展平后计算)
   返回: 新张量"
   (if axis
       ;; 沿轴累积
@@ -578,8 +578,8 @@
         result)))
 
 (defun vt-median (tensor &key axis)
-  "中位数。
-  axis: 归约轴（nil 表示全局）"
+  "中位数.
+  axis: 归约轴(nil 表示全局)"
   (if axis
       ;; 沿轴计算
       (let* ((shape (vt-shape tensor))
@@ -629,10 +629,10 @@
                2)))))
 
 (defun vt-percentile (tensor percentile &key axis interpolation)
-  "计算百分位数。
-  percentile: 百分位（0-100）
+  "计算百分位数.
+  percentile: 百分位(0-100)
   axis: 归约轴
-  interpolation: 插值方法（:linear, :lower, :higher, :midpoint, :nearest）"
+  interpolation: 插值方法(:linear, :lower, :higher, :midpoint, :nearest)"
   (declare (ignore interpolation))
   (let ((q (/ percentile 100.0d0)))
     (if axis
@@ -683,19 +683,19 @@
              (* frac (nth (min upper (1- size)) sorted)))))))
 
 (defun vt-quantile (tensor q &key axis)
-  "计算分位数。
-  q: 分位数（0-1）"
+  "计算分位数.
+  q: 分位数(0-1)"
   (vt-percentile tensor (* q 100) :axis axis))
 
 (defun vt-ptp (tensor &key axis)
-  "峰-峰值（最大值 - 最小值）"
+  "峰-峰值(最大值 - 最小值)"
   (if axis
       (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
       (- (vt-amax tensor) (vt-amin tensor))))
 
 (defun vt-histogram (tensor &key bins range density)
-  "计算直方图。
-  bins: bin数量（默认10）
+  "计算直方图.
+  bins: bin数量(默认10)
   range: (min, max) 范围
   density: 是否归一化
   返回: (hist, bin-edges)"
@@ -818,9 +818,9 @@
 ;;; ===========================================
 
 (defun vt-sort (tensor &key axis kind)
-  "排序。
-  axis: 排序轴（nil 表示展平）
-  kind: 排序算法（忽略，使用 Common Lisp 的 sort）"
+  "排序.
+  axis: 排序轴(nil 表示展平)
+  kind: 排序算法(忽略,使用 Common Lisp 的 sort)"
   (declare (ignore kind))
   (if axis
       ;; 沿轴排序
@@ -840,7 +840,7 @@
                            do (push i indices)
                               (push (aref (vt-data tensor) in-ptr) values)
                               (incf in-ptr in-stride))
-                     ;; 排序（稳定排序）
+                     ;; 排序(稳定排序)
                      (let ((sorted-pairs (sort (mapcar #'cons values indices)
                                                #'< :key #'car)))
                        ;; 写回
@@ -918,7 +918,7 @@
     (vt-from-sequence unique-list)))
 
 (defun vt-nonzero (condition)
-  "返回非零元素的索引（已存在 vt-where）"
+  "返回非零元素的索引(已存在 vt-where)"
   (vt-where condition))
 
 (defun vt-extract (condition tensor)
@@ -991,7 +991,7 @@
     (vt-unique (vt-concatenate 0 u1 u2))))
 
 (defun vt-setdiff1d (t1 t2)
-  "差集（在 t1 但不在 t2）"
+  "差集(在 t1 但不在 t2)"
   (let* ((u1 (vt-unique t1))
          (u2 (vt-unique t2))
          (u2-set (coerce (vt-data u2) 'list)))

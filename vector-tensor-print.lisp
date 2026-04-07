@@ -25,13 +25,13 @@
   "根据数据类型格式化数值字符串"
   (case (get-type-category type)
     (:integer
-     ;; 整数：直接打印，无小数点
+     ;; 整数：直接打印,无小数点
      (format nil "~d" val))    
     (:float
-     ;; 浮点数：保留精度，去除末尾多余的0
+     ;; 浮点数：保留精度,去除末尾多余的0
      (let* ((str (format nil "~,vf" *vt-print-precision* val))
             (trimmed (string-right-trim "0" str)))
-       ;; 如果去掉0后以小数点结尾，补一个0 (如 "1." -> "1.0")
+       ;; 如果去掉0后以小数点结尾,补一个0 (如 "1." -> "1.0")
        (when (and (> (length trimmed) 0) 
                   (char= (char trimmed (1- (length trimmed))) #\.))
          (setf trimmed (concatenate 'string trimmed "0")))
@@ -52,8 +52,8 @@
 
 (defun print-vt-recursive
     (vt axis current-indices base-indent col-width element-type stream)
-  "递归打印核心逻辑。
-   element-type: 数据类型，传递给格式化函数。"
+  "递归打印核心逻辑.
+   element-type: 数据类型,传递给格式化函数."
   (let* ((shape (vt-shape vt))
          (rank (length shape))
          (dim-size (nth axis shape))

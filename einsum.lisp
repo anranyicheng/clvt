@@ -1,13 +1,10 @@
 (in-package :clvt)
 
-;;; ===========================================
-;;; Einsum 引擎 (适配 VT 结构与视图)
-;;; ===========================================
-
+;; Einsum 引擎 (适配 VT 结构与视图)
 
 (declaim (inline parse-subscript-tokens))
 (defun parse-subscript-tokens (str)
-  "将下标字符串解析为 Token 列表。
+  "将下标字符串解析为 Token 列表.
    支持：
    1. 标准字符 (如 ij, jk)
    2. 省略号 ... (解析为 :ELLIPSIS)
@@ -19,15 +16,15 @@
    3. explicit-p: 是否显式指定输出"
   
   (let ((len (length str))
-        (inputs nil)          ; 存储所有输入张量的下标列表
-        (current-sub nil)     ; 当前正在构建的下标列表
-        (output nil)          ; 输出下标列表
+        (inputs nil)          ;; 存储所有输入张量的下标列表
+        (current-sub nil)     ;; 当前正在构建的下标列表
+        (output nil)          ;; 输出下标列表
         (i 0)
-        (state :inputs))      ; 状态机：当前处于输入部分还是输出部分
+        (state :inputs))      ;; 状态机：当前处于输入部分还是输出部分
     (flet ((save-current-sub ()
              "将当前累积的 current-sub 保存到 inputs 或 output 中"
              (when current-sub
-               ;; current-sub 是反序构建的，需要反转
+               ;; current-sub 是反序构建的,需要反转
                (let ((final-sub (nreverse current-sub)))
                  (if (eq state :inputs)
                      (push final-sub inputs)
@@ -48,7 +45,7 @@
             ((and (char= char #\-)
                   (< (1+ i) len)
                   (char= (char str (1+ i)) #\>))
-             ;; 遇到箭头，意味着：
+             ;; 遇到箭头,意味着：
              ;; A. 结束最后一个输入张量的解析
              (save-current-sub)
              ;; B. 切换状态到输出模式
@@ -56,11 +53,11 @@
              (incf i 2))
             ;; 3. 处理逗号 ","
             ((char= char #\,)
-             ;; 只有在输入模式下，逗号才作为分隔符
+             ;; 只有在输入模式下,逗号才作为分隔符
              (when (eq state :inputs)
                (save-current-sub))
-             ;; 如果在输出模式下遇到逗号，通常是语法错误，
-             ;; 但为了兼容性或特定扩展，这里暂时忽略或报错
+             ;; 如果在输出模式下遇到逗号,通常是语法错误,
+             ;; 但为了兼容性或特定扩展,这里暂时忽略或报错
              ;; NumPy 标准输出不支持逗号(只有一个输出)
              (incf i))
             ;; 4. 处理空格
@@ -73,10 +70,10 @@
             (t (push char current-sub)
                (incf i)))))
       
-      ;; 循环结束后，处理最后剩余的 current-sub
+      ;; 循环结束后,处理最后剩余的 current-sub
       (save-current-sub)
       ;; 返回结果
-      ;; inputs 是反序压栈的，需要反转
+      ;; inputs 是反序压栈的,需要反转
       ;; output 不需要反转(只有一个)
       (values (nreverse inputs) 
               output 
@@ -84,7 +81,7 @@
 
 (declaim (inline expand-ellipsis))
 (defun expand-ellipsis (input-subs output-sub vts)
-  "将解析出的 :ellipsis。"
+  "将解析出的 :ellipsis."
   ;; 1. 计算维度
   (let ((ellipsis-ranks nil))
     (loop for sub in input-subs
@@ -102,20 +99,20 @@
     (setf ellipsis-ranks (nreverse ellipsis-ranks))    
     ;; 2. 生成标签
     (let* ((max-implicit-rank (reduce #'max ellipsis-ranks :initial-value 0))
-           ;; 使用特殊的内部字符，避免与用户输入冲突
+           ;; 使用特殊的内部字符,避免与用户输入冲突
            (ellipsis-labels (loop for i from 0 below max-implicit-rank
                                   collect (code-char (+ (char-code #\?) i)))))      
       (flet ((expand-sub (sub implicit-rank)
-               "高效展开：使用 nconc 代替 append，避免额外拷贝"
+               "高效展开：使用 nconc 代替 append,避免额外拷贝"
                (let ((pos (position :ellipsis sub)))
                  (if (not pos)
                      sub
                      ;; 优化点：直接拼接列表结构
                      (let* ((before (subseq sub 0 pos))
-                            (after (nthcdr (1+ pos) sub)) ; nthcdr 不创建新列表，只是移动指针
+                            (after (nthcdr (1+ pos) sub)) ; nthcdr 不创建新列表,只是移动指针
                             (labels-to-use (subseq ellipsis-labels 
                                                    (- max-implicit-rank implicit-rank))))
-                       ;; nconc 是破坏性的，但因为 before 是 subseq 新建的，所以安全
+                       ;; nconc 是破坏性的,但因为 before 是 subseq 新建的,所以安全
                        (nconc before labels-to-use after))))))        
         (values (mapcar #'expand-sub input-subs ellipsis-ranks)
                 (when output-sub
@@ -136,22 +133,22 @@
 ;; 构建视图感知的步长映射
 (declaim (inline build-view-strides))
 (defun build-view-strides (vt subscript all-labels label-dims)
-  "将 VT 的物理步长映射到全局标签顺序，处理广播和视图。"
+  "将 VT 的物理步长映射到全局标签顺序,处理广播和视图."
   (let* ((phys-shape (vt-shape vt))
          (phys-strides (vt-strides vt))
          (strides (make-list (length all-labels) :initial-element 0)))
     (declare (type list strides phys-shape phys-strides))
-    ;; 遍历下标，建立 标签 -> 物理步长 的映射
+    ;; 遍历下标,建立 标签 -> 物理步长 的映射
     (loop for label in subscript
           for dim in phys-shape
           for stride in phys-strides
           for pos = (position label all-labels :test #'char=)
           do (let ((res-dim (gethash label label-dims 0)))
-               ;; 广播逻辑：如果物理维度为1但结果维度>1，步长强制为0
+               ;; 广播逻辑：如果物理维度为1但结果维度>1,步长强制为0
                ;; 否则使用物理步长 (支持非连续视图)
                (when (and (= dim 1) (> res-dim 1))
                  (setf stride 0))
-               ;; 支持对角线：如果标签重复，步长累加
+               ;; 支持对角线：如果标签重复,步长累加
                (incf (nth pos strides) stride)))
     strides))
 
@@ -230,7 +227,7 @@
 
 (declaim (inline build-output-strides))
 (defun build-output-strides (output-subscripts all-labels label-dims)
-  "计算输出张量的步长（输出总是连续的）。"
+  "计算输出张量的步长(输出总是连续的)."
   (let ((local-stride-map (make-hash-table))
         (acc 1))
     (declare (type fixnum acc))
@@ -284,12 +281,12 @@
       (setf (aref out-strides-vec i) s))
 
     ;; === 优化路径：矩阵乘法 (I, J, K) ===
-    ;; 仅当 2 个输入，秩为 3 时启用
+    ;; 仅当 2 个输入,秩为 3 时启用
     (if (and (= n-vts 2) (= rank 3))
         (let ((labels-vec (coerce all-labels 'vector)))
           (declare (type (simple-array t (*)) labels-vec)
 		   (ignorable labels-vec))
-          ;; 动态查找 I, J, K 位置，确保通用性
+          ;; 动态查找 I, J, K 位置,确保通用性
           (let* ((label-i (first output-subscripts))
                  (label-k (second output-subscripts))
                  (label-j (car (set-difference all-labels output-subscripts)))
@@ -344,7 +341,7 @@
                         (incf ptr-A-base sA-i)
                         (incf ptr-O-base sO-i)))
                     
-                    ;; 如果优化路径执行成功，直接返回
+                    ;; 如果优化路径执行成功,直接返回
                     (return-from einsum-execute-fast output)))))))
 	
 	;; === 通用路径 ===
@@ -362,14 +359,13 @@
                  (declare (type fixnum depth))
                  (if (= depth rank)
 		     ;; 叶节点：计算
-		     (let ((product 1.0d0)) ; double-float
+		     (let ((product 1.0d0)) ;; double-float
 		       (declare (type double-float product))
 		       (loop for k fixnum from 0 below n-vts
 			     for data across in-data-vec
 			     for ptr fixnum = (aref cur-ptrs k)
 			     do (setf product (* product (aref data ptr))))
-		       (incf (aref out-data cur-out-ptr) product))
-		     
+		       (incf (aref out-data cur-out-ptr) product))		       
 		     ;; 分支：遍历
 		     (let* ((dim (aref dims-vec depth))
 			    (out-stride (aref out-strides-vec depth)))
@@ -394,7 +390,7 @@
 
 (declaim (inline vt-einsum))
 (defun vt-einsum (subscripts &rest vts)
-  "爱因斯坦求和约定 (增强版，支持标准 '...' 省略号)。
+  "爱因斯坦求和约定 (增强版,支持标准 '...' 省略号).
    示例:
      (vt-einsum \"...ij,...jk->...ik\" A B) ; 批量矩阵乘法
      (vt-einsum \"...ii->...i\" A)          ; 批量提取对角线
@@ -406,9 +402,9 @@
     ;; 1. 展开 Ellipsis
     (multiple-value-bind (input-subs output-subs)
         (expand-ellipsis raw-inputs raw-output vts)
-      ;; 2. 如果没有显式输出，自动推导
-      ;; 注意：analyze-einsum 内部也会推导，但我们需要先展开 ellipsis
-      ;; 这里我们简化，直接传递 nil 让 analyze-einsum 推导
+      ;; 2. 如果没有显式输出,自动推导
+      ;; 注意：analyze-einsum 内部也会推导,但我们需要先展开 ellipsis
+      ;; 这里我们简化,直接传递 nil 让 analyze-einsum 推导
       (unless explicit-p
         (setf output-subs nil))
       (multiple-value-bind (all-labels dim-sizes global-strides output-subs-final)
