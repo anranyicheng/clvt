@@ -1,17 +1,17 @@
 
 (in-package :clvt)
 
-(defvar *einsum-parse-cache* (make-hash-table :test 'equal))
+(defvar *vt-einsum-parse-cache* (make-hash-table :test 'equal))
 
 (declaim (inline get-parsed-subscripts))
 (defun get-parsed-subscripts (str)
   (declare (optimize (speed 3)))
-  (let ((cached (gethash str *einsum-parse-cache*)))
+  (let ((cached (gethash str *vt-einsum-parse-cache*)))
     (if cached
         (values (first cached) (second cached) (third cached))
         (multiple-value-bind (inputs output explicit-p)
             (parse-subscript-tokens str)
-          (setf (gethash str *einsum-parse-cache*)
+          (setf (gethash str *vt-einsum-parse-cache*)
                 (list inputs output explicit-p))
           (values inputs output explicit-p)))))
 
