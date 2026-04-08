@@ -25,6 +25,7 @@
 
 (defun make-vt (shape initial-element &key (type 'double-float))
   "创建一个指定形状的张量,填充初始值."
+  (declare (list shape))
   (let* ((size (vt-shape-to-size shape))
 	 (tmp-type (if (eq type 'fixnum)
 		       'fixnum
@@ -34,7 +35,7 @@
 				(coerce initial-element tmp-type)))
          (strides (vt-compute-strides shape)))
     (%make-vt :data data
-	      :shape (if (listp shape) shape (list shape))
+	      :shape shape
 	      :strides strides)))
 
 (defun vt-flatten-sequence (seq)
@@ -168,13 +169,16 @@
 
 (defun vt-zeros (shape &key (type 'double-float))
   "创建全0张量."
+  (declare (list shape))
   (make-vt shape 0 :type type))
 
 (defun vt-ones (shape &key (type 'double-float))
   "创建全1张量."
+  (declare (list shape))
   (make-vt shape 1 :type type))
 
 (defun vt-const (shape value &key (type 'double-float))
+  (declare (list shape))
   (make-vt shape value :type type))
 
 (defun vt-eye (n &key (m n) (value 1.0d0) (type 'double-float))
