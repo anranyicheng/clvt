@@ -780,8 +780,9 @@
 (declaim (inline vt-broadcast-strides))
 (defun vt-broadcast-strides (orig-shape target-shape orig-strides)
   "计算广播后的步长.总是返回列表."
+  (declare (list orig-shape target-shape orig-strides))
   (let ((rank-diff (- (length target-shape) (length orig-shape))))
-    (loop for i from 0 below (length target-shape)
+    (loop for i fixnum from 0 below (length target-shape)
           ;; 规则:如果该维度是广播出来的(前面补0),或者原维度为1(被广播),
           ;; 步长为0.否则使用原步长.
           collect (cond
@@ -861,7 +862,7 @@
   "高效映射函数.
    支持标量、列表、张量混合输入.
    特性:自动类型转换、广播、指针算术优化、双目运算内联."
-  (declare (optimize (speed 1) (safety 1)))
+  (declare (function fn))
   ;; 1. [无缝操作] 统一转换输入为 VT
   (let* ((clean-tensors (mapcar #'ensure-vt tensors))
          (n-tensors (length clean-tensors)))    
