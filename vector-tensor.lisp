@@ -743,6 +743,7 @@
         dest))))
 
 ;; 快速类型转换
+(declaim (inline ensure-vt))
 (defun ensure-vt (obj)
   (etypecase obj
     (vt obj)
@@ -771,7 +772,7 @@
 
 (declaim (inline vt-broadcast-strides))
 (defun vt-broadcast-strides (orig-shape target-shape orig-strides)
-  "计算广播后的步长.关键修复:总是返回列表."
+  "计算广播后的步长.总是返回列表."
   (let ((rank-diff (- (length target-shape) (length orig-shape))))
     (loop for i from 0 below (length target-shape)
           ;; 规则:如果该维度是广播出来的(前面补0),或者原维度为1(被广播),
@@ -895,7 +896,7 @@
              (declare (type fixnum depth out-ptr))
              (if (= depth rank)
                  ;; --- 最内层:执行计算 ---
-                 ;; 优化:针对常用参数数量直接调用,避免 apply 开销
+                 ;; 优化:针对常用参数数量直接调用, 避免 apply 开销
                  (let ((d0 (aref (aref ins-data 0) 
                                  (aref cur-ptrs 0))))
                    (setf (aref res-data out-ptr)
@@ -916,6 +917,7 @@
                                    (declare (dynamic-extent args))
                                    (coerce (apply fn args)
 					   'double-float)))))))
+        
                  
                  ;; --- 外层:遍历维度 ---
                  (let* ((dim (the fixnum (nth depth out-shape)))
