@@ -30,23 +30,56 @@
         (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
         (apply #'vt-map #'/ first-vt args))))
 
-(defun vt-sin (vt) "计算逐元素正弦值." (vt-map #'sin vt))
-(defun vt-cos (vt) "计算逐元素余弦值." (vt-map #'cos vt))
-(defun vt-tan (vt) "计算逐元素正切值." (vt-map #'tan vt))
+(defun vt-sin (vt)
+  "计算逐元素正弦值."
+  (vt-map #'sin vt))
 
-(defun vt-asin (vt) "计算逐元素反正弦值." (vt-map #'asin vt))
-(defun vt-acos (vt) "计算逐元素反余弦值." (vt-map #'acos vt))
-(defun vt-atan (vt) "计算逐元素反正切值." (vt-map #'atan vt))
+(defun vt-cos (vt)
+  "计算逐元素余弦值."
+  (vt-map #'cos vt))
+(defun vt-tan (vt)
+  "计算逐元素正切值."
+  (vt-map #'tan vt))
 
-(defun vt-sinh (vt) "计算逐元素双曲正弦值." (vt-map #'sinh vt))
-(defun vt-cosh (vt) "计算逐元素双曲余弦值." (vt-map #'cosh vt))
-(defun vt-tanh (vt) "计算逐元素双曲正切值." (vt-map #'tanh vt))
+(defun vt-asin (vt)
+  "计算逐元素反正弦值."
+  (vt-map #'asin vt))
 
-(defun vt-exp (vt) "计算逐元素 e^vt." (vt-map #'exp vt))
-(defun vt-sqrt (vt) "计算逐元素平方根." (vt-map #'sqrt vt))
+(defun vt-acos (vt)
+  "计算逐元素反余弦值."
+  (vt-map #'acos vt))
 
-(defun vt-abs (vt) "计算逐元素绝对值." (vt-map #'abs vt))
-(defun vt-signum (vt) "计算逐元素符号." (vt-map #'signum vt))
+(defun vt-atan (vt)
+  "计算逐元素反正切值."
+  (vt-map #'atan vt))
+
+(defun vt-sinh (vt)
+  "计算逐元素双曲正弦值."
+  (vt-map #'sinh vt))
+
+(defun vt-cosh (vt)
+  "计算逐元素双曲余弦值."
+  (vt-map #'cosh vt))
+
+(defun vt-tanh (vt)
+  "计算逐元素双曲正切值."
+  (vt-map #'tanh vt))
+
+(defun vt-exp (vt)
+  "计算逐元素 e^vt."
+  (vt-map #'exp vt))
+
+(defun vt-sqrt (vt)
+  "计算逐元素平方根."
+  (vt-map #'sqrt vt))
+
+(defun vt-abs (vt)
+  "计算逐元素绝对值."
+  (vt-map #'abs vt))
+
+(defun vt-signum (vt)
+  "计算逐元素符号."
+  (vt-map #'signum vt))
 
 
 (defun vt-positive-p (vt)
@@ -108,6 +141,7 @@
   (vt-map (lambda (x) (float (round x) x)) vt))
 
 (defun vt-log (vt &optional base)
+  "以 base 为底的对数"
   (if base
       (vt-map (lambda (val)
 		(log val base))
