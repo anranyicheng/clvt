@@ -15,6 +15,7 @@
                 (list inputs output explicit-p))
           (values inputs output explicit-p)))))
 
+(declaim (inline parse-subscript-tokens))
 (defun parse-subscript-tokens (str)
   (declare (optimize (speed 3))
 	   (simple-string str))
