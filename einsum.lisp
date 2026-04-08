@@ -192,13 +192,11 @@
 		    (progn (setf (aref out-strides-vec i) acc)
 			   (setf acc (the fixnum (* acc dim))))
 		    (setf (aref out-strides-vec i) 0))))
-      
       (let ((all-double-float-p
 	      (every #'(lambda (vt)
 			 (eq (vt-element-type vt) 'double-float))
 		     vts)))
         (declare (type boolean all-double-float-p))
-        
         (cond
           ((and (= n-vts 2)
 		(= rank 3)
@@ -240,7 +238,6 @@
                  (declare
 		  (type (simple-array double-float (*))
 			data-a data-b data-c))
-                 
                  (loop for i fixnum from 0 below d-i do
                    (let ((ptr-a-row-start (+ off-A (the fixnum (* i sA-i))))
                          (ptr-c-row-start (* i sO-i)))
@@ -274,10 +271,9 @@
 				   (optimize (speed 1)))
                           (loop for k fixnum from 0 below n-vts do
                             (setf product (* product
-					     (the double-float
                                              (aref (aref in-data-vec k)
 						   (the fixnum
-                                                   (aref cur-ptrs k)))))))
+                                                   (aref cur-ptrs k))))))
                           (incf (aref out-data out-ptr)
 				(the double-float product)))
                         
