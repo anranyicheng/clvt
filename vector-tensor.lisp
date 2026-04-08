@@ -18,10 +18,17 @@
 		 vt-data
 		 vt-reshape
 		 make-vt
-		 vt-zeros))
+		 vt-zeros
+		 vt-shape-to-size))
+
 (defun vt-element-type (vt)
   "返回数组元素的类型"
   (array-element-type (vt-data vt)))
+
+(defun vt-shape-to-size (shape)
+  "计算形状对应的总元素个数."
+  (declare (list shape))
+  (reduce #'* shape :initial-value 1))
 
 (defun make-vt (shape initial-element &key (type 'double-float))
   "创建一个指定形状的张量,填充初始值."
@@ -580,11 +587,6 @@
   (let ((target-view (apply #'vt-slice* vt specs)))
     ;; 2. 执行拷贝 (自动处理标量->广播 或 张量->形状匹配)
     (vt-copy-into target-view value)))
-
-(defun vt-shape-to-size (shape)
-  "计算形状对应的总元素个数."
-  (declare (list shape))
-  (reduce #'* shape :initial-value 1))
 
 (defun vt-contiguous-p (vt)
   "检查张量是否在内存中连续.
