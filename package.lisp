@@ -100,3 +100,4 @@
 (do-symbols (var :clvt)
   (when (search "vt-" (symbol-name var) :test #'equalp)
     (push var *vt-fun-list*)))
+
