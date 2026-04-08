@@ -583,6 +583,7 @@
 
 (defun vt-shape-to-size (shape)
   "计算形状对应的总元素个数."
+  (declare (list shape))
   (reduce #'* shape :initial-value 1))
 
 (defun vt-contiguous-p (vt)

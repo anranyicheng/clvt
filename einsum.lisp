@@ -5,6 +5,7 @@
 
 (declaim (inline get-parsed-subscripts))
 (defun get-parsed-subscripts (str)
+  (declare (optimize (speed 3)))
   (let ((cached (gethash str *einsum-parse-cache*)))
     (if cached
         (values (first cached) (second cached) (third cached))
@@ -15,8 +16,11 @@
           (values inputs output explicit-p)))))
 
 (defun parse-subscript-tokens (str)
+  (declare (optimize (speed 3))
+	   (simple-string str))
   (let ((len (length str))
         (inputs nil) (current-sub nil) (output nil) (i 0) (state :inputs))
+    (declare (fixnum len i))
     (flet ((save-current-sub ()
              (when current-sub
                (let ((final-sub (nreverse current-sub)))
@@ -26,6 +30,7 @@
                (setf current-sub nil))))
       (loop while (< i len) do
         (let ((char (char str i)))
+	  (declare (character char))
           (cond
             ((and (char= char #\.)
 		  (< (+ i 2) len)
@@ -52,14 +57,16 @@
 
 (declaim (inline expand-ellipsis))
 (defun expand-ellipsis (input-subs output-sub vts)
+  (declare (optimize (speed 3)))
   (let ((ellipsis-ranks nil))
+    (declare (list ellipsis-ranks))
     (loop for sub in input-subs
           for vt in vts
           for explicit-rank = (count-if #'characterp sub)
           for has-ellipsis = (member :ellipsis sub)
           for tensor-rank = (length (vt-shape vt))
-          for implicit-rank = (if has-ellipsis
-				  (- tensor-rank explicit-rank) 0)
+          for implicit-rank = (the fixnum (if has-ellipsis
+					      (- tensor-rank explicit-rank) 0))
           do (when (and has-ellipsis (< implicit-rank 0))
                (error "Subscript dimension mismatch"))
              (when (> (count :ellipsis sub) 1)
@@ -71,7 +78,9 @@
            (ellipsis-labels
 	     (loop for i from 0 below max-implicit-rank
                    collect (code-char (+ (char-code #\?) i)))))
+      (declare (fixnum max-implicit-rank))
       (flet ((expand-sub (sub implicit-rank)
+	       (declare (list sub))
                (let ((pos (position :ellipsis sub)))
                  (if (not pos) sub
                      (let* ((before (subseq sub 0 pos))
@@ -86,20 +95,21 @@
 
 (declaim (inline analyze-einsum))
 (defun analyze-einsum (input-subs output-subs vts)
-  (declare (type list input-subs vts))
+  (declare (type list input-subs output-subs vts))
+  (declare (optimize (speed 3)))
   (let ((label-dims (make-array 256 :element-type 'fixnum
 				    :initial-element 0))
         (label-counts (make-array 256 :element-type 'fixnum
 				      :initial-element 0))
         (all-labels-list nil))
     
-    (loop for sub in input-subs
+    (loop for sub list in input-subs
           for tns in vts
           for shape = (vt-shape tns)
           do (unless (= (length sub) (length shape))
                (error "Subscript dimension mismatch"))
              (loop for label in sub
-                   for dim in shape
+                   for dim fixnum in shape
                    for code = (char-code label) do
                    (incf (aref label-counts code))
                    (pushnew label all-labels-list)
@@ -107,7 +117,8 @@
                      (when (and (> old-dim 1) (> dim 1) (/= old-dim dim))
                        (error "Dimension conflict for label ~A: ~A vs ~A"
 			      label old-dim dim))
-                     (setf (aref label-dims code) (max old-dim dim)))))
+                     (setf (aref label-dims code)
+			   (max old-dim dim)))))
     
     (let* ((final-output-subs output-subs)
            (explicit-mode (if final-output-subs t nil)))
@@ -129,13 +140,14 @@
     (all-labels-vec label-dims-vec output-subs input-subs vts)
   (declare (type (simple-array character (*)) all-labels-vec)
            (type (simple-array fixnum (*)) label-dims-vec)
-           (type list output-subs input-subs vts))
+           (type list output-subs input-subs vts)
+	   (optimize (speed 3)))
   
   (let* ((rank (length all-labels-vec))
          (n-vts (length vts))
          (dims-vec (make-array rank :element-type 'fixnum))
          (_ (loop for i fixnum from 0 below rank 
-                  for label across all-labels-vec 
+                  for label character across all-labels-vec 
                   do (setf (aref dims-vec i)
 			   (aref label-dims-vec (char-code label)))))
          
@@ -144,7 +156,7 @@
          (in-offsets-vec (make-array n-vts :element-type 'fixnum)))
     (declare (ignorable _))
     ;; 步长映射构建
-    (loop for sub in input-subs
+    (loop for sub list in input-subs
           for tns in vts
           for t-idx fixnum from 0 do
       (let ((phys-strides (vt-strides tns))
@@ -158,26 +170,28 @@
                 (let ((p-dim (nth phys-pos phys-shape))
                       (p-stride (nth phys-pos phys-strides))
                       (l-dim (aref dims-vec logical-idx)))
+		  (declare (fixnum p-dim l-dim p-stride))
                   (setf (aref strides-mat t-idx logical-idx)
                         (if (and (= p-dim 1) (> l-dim 1)) 0 p-stride)))
                 (setf (aref strides-mat t-idx logical-idx) 0))))))
-    
     ;; 输出张量构建
-    (let* ((out-shape (loop for lbl across all-labels-vec 
+    (let* ((out-shape (loop for lbl character across all-labels-vec 
                             when (member lbl output-subs) 
-                            collect (aref label-dims-vec (char-code lbl))))
+                              collect (the fixnum (aref label-dims-vec
+					    (char-code lbl)))))
            (output (vt-zeros out-shape))
            (out-data (vt-data output))
            (out-strides-vec (make-array rank :element-type 'fixnum)))
-      
+      (declare ((simple-array double-float (*)) out-data)
+	       (list out-shape))
       ;; 计算输出步长
       (let ((acc 1))
         (loop for i fixnum from (1- rank) downto 0
               for dim = (aref dims-vec i) do
-          (if (member (aref all-labels-vec i) output-subs)
-              (progn (setf (aref out-strides-vec i) acc)
-                     (setf acc (the fixnum (* acc dim))))
-              (setf (aref out-strides-vec i) 0))))
+		(if (member (aref all-labels-vec i) output-subs)
+		    (progn (setf (aref out-strides-vec i) acc)
+			   (setf acc (the fixnum (* acc dim))))
+		    (setf (aref out-strides-vec i) 0))))
       
       (let ((all-double-float-p
 	      (every #'(lambda (vt)
@@ -228,14 +242,15 @@
 			data-a data-b data-c))
                  
                  (loop for i fixnum from 0 below d-i do
-                   (let ((ptr-a-row-start (+ off-A (* i sA-i)))
+                   (let ((ptr-a-row-start (+ off-A (the fixnum (* i sA-i))))
                          (ptr-c-row-start (* i sO-i)))
                      (declare (type fixnum ptr-a-row-start ptr-c-row-start))
                      (loop for j fixnum from 0 below d-j do
                        (let ((val-a (aref data-a (+ ptr-a-row-start
-						    (* j sA-j)))))
+						    (the fixnum
+							 (* j sA-j))))))
                          (declare (type double-float val-a))
-                         (let ((ptr-b-start (+ off-B (* j sB-j)))
+                         (let ((ptr-b-start (+ off-B (the fixnum (* j sB-j))))
                                (ptr-c-start ptr-c-row-start))
                            (declare (type fixnum ptr-b-start ptr-c-start))
                            (loop for k fixnum from 0 below d-k do
@@ -247,6 +262,7 @@
           (t  ;; 通用路径
            (let ((cur-ptrs (make-array n-vts :element-type 'fixnum
 					     :initial-element 0)))
+	     (declare ((simple-array fixnum (*)) cur-ptrs))
              (loop for k fixnum from 0 below n-vts do
 	       (setf (aref cur-ptrs k) (aref in-offsets-vec k)))
              (labels
@@ -254,12 +270,16 @@
                     (declare (type fixnum depth out-ptr))
                     (if (= depth rank)
                         (let ((product 1.0d0))
-                          (declare (type double-float product))
+                          (declare (type double-float product)
+				   (optimize (speed 1)))
                           (loop for k fixnum from 0 below n-vts do
-                            (setf product (* product 
+                            (setf product (* product
+					     (the double-float
                                              (aref (aref in-data-vec k)
-                                                   (aref cur-ptrs k)))))
-                          (incf (aref out-data out-ptr) product))
+						   (the fixnum
+                                                   (aref cur-ptrs k)))))))
+                          (incf (aref out-data out-ptr)
+				(the double-float product)))
                         
                         (let* ((dim (aref dims-vec depth))
                                (out-stride (aref out-strides-vec depth)))
