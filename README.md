@@ -1,13 +1,8 @@
 # clvt
-common lisp vector tensor library.
-这是一个 lisp 张量库，是使用智谱清言为主，DeepSeek 为辅助编写的张量库，
-目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。虽然 lisp 社区拥有
-magicl 和 numcl 这两个比较流行的库，但是 magicl 缺乏对高维张量的支持，
-numcl 繁重的类型推理，很难理解，numcl 接口和CL语言标准重合，难以论说。
-这库的核心是 einsum 计算引擎，以及 vt-map, vt-reduce, 其余操作大多数
-都是基于这三个核心函数组合完成，易于理解。同时这个库有完美的打印输出功能。
+clvt (common lisp vector tensor) library.
+这是一个纯 common lisp 语言编写的张量库，是使用'智谱清言'AI为主，'DeepSeek' AI为辅助编写，目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。虽然 lisp 社区拥有 magicl 和 numcl 这两个比较流行的库，但是 magicl 缺乏对高维张量的支持以及缺少一些重要的函数，numcl 注重类型推理并且一些函数接口和CL语言标准重合。clvt 这库的核心是 vt-einsum 计算引擎，以及 vt-map, vt-reduce 函数, 其余操作大多数都是基于这三个核心函数组合完成，易于理解，同时这个库有完美的打印输出功能。目前这个库已经实现了许多张量的基础操作，未来将进一步完善，目标是尽可能实现 numpy 众多功能。这个库的函数都是以 vt- 开头，配合 slime 一起使用非常方便，易于查看已经实现了哪些函数。
 
-Common Lisp Vector Tensor Library. This is a tensor library for Lisp, primarily developed using Zhipu Qingyan and assisted by DeepSeek. The goal is to build a concise and powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community has two popular libraries, Magicl and Numcl, Magicl lacks support for high-dimensional tensors, while Numcl has heavy type inference that makes it difficult to understand. Additionally, Numcl's interface overlaps with the CL language standard, making it hard to discuss. The core of this library is the einsum computation engine, along with vt-map and vt-reduce. Most other operations are composed based on these three core functions, making them easy to understand. At the same time, this library features excellent printing and output capabilities.
+This is a tensor library written purely in Common Lisp, primarily developed using the 'Zhipu Qingyan' AI with assistance from the 'DeepSeek' AI. The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community already has two relatively popular libraries, magicl and numcl, magicl lacks support for high-dimensional tensors and some important functions, while numcl focuses on type inference and overlaps with CL standard functions in some of its interfaces. The core of the clvt library consists of the `vt-einsum` computation engine, along with the `vt-map` and `vt-reduce` functions. Most other operations are composed from these three core functions, making the library easy to understand. Additionally, the library features excellent pretty-printing output. Currently, many basic tensor operations have been implemented, and future development will aim to further improve the library, with the goal of replicating as many of NumPy's features as possible. All functions in this library are prefixed with `vt-`, which works very conveniently with Slime, making it easy to see which functions have been implemented.
 
 clvt 举例:
 ``` commmon lisp
