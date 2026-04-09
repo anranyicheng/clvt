@@ -948,7 +948,112 @@
            (t 0)))))
 
 (declaim (inline vt-reduce))
-(defun vt-reduce (tensor axis init-val reducer-fn &key return-arg)
+;; (defun vt-reduce (tensor axis init-val reducer-fn &key return-arg)
+;;   "通用归约核心.
+;;    特性:
+;;    1. 使用列表递归 (经测试速度更优).
+;;    2. 自动适配输入张量的数据类型.
+;;    3. 强制类型转换保证不会因类型不匹配报错."
+;;   (declare (type vt tensor)
+;;            (type (or null fixnum) axis)
+;;            (type function reducer-fn))  
+;;   (let* ((in-shape (vt-shape tensor))
+;;          ;; 关键:获取实际类型
+;;          (element-type (vt-element-type tensor))
+;;          (rank (length in-shape))
+;;          (is-global-reduction (null axis))
+;; 	 ;; 1. 输出形状
+;; 	 (out-shape (if is-global-reduction
+;; 			nil
+;; 			(loop for d in in-shape
+;;                               for i from 0
+;;                               unless (= i axis) collect d)))
+;; 	 ;; 2. 初始值安全转换
+;; 	 (safe-init-val (coerce init-val element-type))           
+;; 	 ;; 3. 分配结果张量
+;; 	 (res (make-vt out-shape safe-init-val :type element-type))
+;; 	 (res-data (vt-data res))
+;; 	 (res-offset (vt-offset res))           
+;; 	 ;; 4. 索引张量 (类型始终为 fixnum)
+;; 	 (res-idx (when return-arg (make-vt out-shape 0 :type 'fixnum)))
+;; 	 (res-idx-data (when res-idx (vt-data res-idx)))
+;; 	 ;; 5. 输入属性
+;; 	 (in-data (vt-data tensor))
+;; 	 (in-strides (vt-strides tensor))
+;; 	 (in-offset (vt-offset tensor))           
+;; 	 ;; 6. 步长映射 (保持为列表,不做数组特化)
+;; 	 (out-strides-map
+;; 	   (if is-global-reduction
+;;                (make-list rank :initial-element 0)
+;;                (loop for i from 0 below rank
+;; 		     if (= i axis) collect 0
+;; 		       else collect
+;; 			    (let ((out-idx (if (< i axis) i (1- i))))
+;; 			      (nth out-idx (vt-strides res))))))
+;; 	 ;; 索引步长 (用于计算 argmax/argmin 的逻辑位置)
+;; 	 (arg-strides
+;; 	   (if return-arg 
+;;                (if is-global-reduction
+;; 		   (vt-compute-strides in-shape)
+;; 		   (loop for i from 0 below rank
+;; 			 if (= i axis) collect 1
+;; 			   else collect 0))
+;;                (make-list rank :initial-element 0))))      
+;;     (declare (type (simple-array * (*)) in-data res-data)
+;;              (type list out-strides-map in-strides arg-strides in-shape))
+;;     (labels
+;; 	((recurse (depth in-ptr out-ptr out-idx-ptr current-arg-val)
+;;            (declare (type fixnum depth in-ptr out-ptr out-idx-ptr
+;; 			  current-arg-val))           
+;;            (if (= depth rank)
+;;                ;; --- 叶节点:执行归约 ---
+;;                (let ((val (aref in-data in-ptr))
+;;                      (cur-acc (aref res-data out-ptr)))
+;;                  (multiple-value-bind (new-acc do-update-idx) 
+;;                      (funcall reducer-fn cur-acc val)
+;;                    ;; 核心修复:写入前强制转换回原类型
+;;                    ;; 防止 fixnum + fixnum -> overflow 或比较函数返回非预期类型
+;;                    (setf (aref res-data out-ptr) 
+;;                          (coerce new-acc element-type))                   
+;;                    (when (and return-arg do-update-idx res-idx-data)
+;;                      (setf (aref res-idx-data out-idx-ptr)
+;; 			   current-arg-val))))               
+;;                ;; --- 分支节点:列表遍历 ---
+;;                (let* ((dim (nth depth in-shape))
+;;                       (in-stride (nth depth in-strides))
+;;                       (out-stride (nth depth out-strides-map))
+;;                       (arg-stride (nth depth arg-strides)))
+;;                  (declare
+;; 		  (type fixnum dim in-stride out-stride arg-stride))
+;;                  (loop for i fixnum from 0 below dim do
+;;                    (recurse (1+ depth)
+;;                             in-ptr
+;;                             out-ptr
+;;                             out-idx-ptr
+;;                             (+ current-arg-val (* i arg-stride)))
+;;                    (incf in-ptr in-stride)
+;;                    (incf out-ptr out-stride)
+;;                    (when return-arg
+;;                      (incf out-idx-ptr out-stride)))))))
+;;       (recurse 0 in-offset res-offset 
+;;                (if res-idx (vt-offset res-idx) 0) 
+;;                0))    
+;;     ;; 返回逻辑
+;;     (if is-global-reduction
+;;         (let ((final-val (aref res-data res-offset)))
+;;           (if return-arg
+;;               (values final-val (aref res-idx-data (vt-offset res-idx)))
+;;               final-val))
+;;         (values res res-idx))))
+
+
+
+
+
+
+
+(defun vt-reduce
+    (tensor axis init-val reducer-fn &key return-arg keepdims)
   "通用归约核心.
    特性:
    1. 使用列表递归 (经测试速度更优).
@@ -963,11 +1068,19 @@
          (rank (length in-shape))
          (is-global-reduction (null axis))
 	 ;; 1. 输出形状
-	 (out-shape (if is-global-reduction
-			nil
-			(loop for d in in-shape
-                              for i from 0
-                              unless (= i axis) collect d)))
+	 (out-shape
+	   (cond
+             ;; 全局归约 且 不保留维度 -> nil (标量)
+             ((and is-global-reduction (not keepdims)) nil)
+             ;; 全局归约 且 保留维度 -> 例如 (3,4) 变 (1,1)
+             (is-global-reduction (make-list rank :initial-element 1))
+             ;; 轴向归约 且 不保留维度 -> 剔除该轴 (原逻辑)
+             ((not keepdims)
+	      (loop for d in in-shape for i from 0 unless (= i axis)
+		    collect d))
+             ;; 轴向归约 且 保留维度 -> 该轴置为 1，例如 (3,4) axis=1 变 (3,1)
+             (t (loop for d in in-shape for i from 0
+		      collect (if (= i axis) 1 d)))))
 	 ;; 2. 初始值安全转换
 	 (safe-init-val (coerce init-val element-type))           
 	 ;; 3. 分配结果张量
@@ -985,11 +1098,18 @@
 	 (out-strides-map
 	   (if is-global-reduction
                (make-list rank :initial-element 0)
-               (loop for i from 0 below rank
-		     if (= i axis) collect 0
-		       else collect
-			    (let ((out-idx (if (< i axis) i (1- i))))
-			      (nth out-idx (vt-strides res))))))
+               ;; 轴向归约：根据 keepdims 决定索引偏移
+               (loop
+		 for i from 0 below rank
+                 if (= i axis) collect 0
+                   else collect
+			(let ((out-idx
+				(if keepdims
+                                    ;; keepdims=T: 形状没少，输入第 i 轴直接对应输出第 i 轴
+                                    i
+                                    ;; keepdims=nil: 形状少了一维，跨过归约轴后要 -1
+                                    (if (< i axis) i (1- i)))))
+                          (nth out-idx (vt-strides res))))))
 	 ;; 索引步长 (用于计算 argmax/argmin 的逻辑位置)
 	 (arg-strides
 	   (if return-arg 
@@ -1037,13 +1157,13 @@
                      (incf out-idx-ptr out-stride)))))))
       (recurse 0 in-offset res-offset 
                (if res-idx (vt-offset res-idx) 0) 
-               0))    
-    ;; 返回逻辑
-    (if is-global-reduction
+               0))
+     (if (and is-global-reduction (not keepdims))
         (let ((final-val (aref res-data res-offset)))
           (if return-arg
-              (values final-val (aref res-idx-data (vt-offset res-idx)))
-              final-val))
+	      (values final-val (aref res-idx-data (vt-offset res-idx)))
+	      final-val))
+        ;; 其余情况（轴向归约，或 keepdims=T），均返回 VT 结构体
         (values res res-idx))))
 
 (defun vt-matmul (vt1 vt2)

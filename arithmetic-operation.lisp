@@ -30,6 +30,10 @@
         (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
         (apply #'vt-map #'/ first-vt args))))
 
+(defun vt-scale (tensor scalar)
+  "将张量 TENSOR 的所有元素乘以标量 SCALAR,返回新的张量."
+  (vt-map (lambda (x) (* x scalar)) tensor))
+
 (defun vt-sin (vt)
   "计算逐元素正弦值."
   (vt-map #'sin vt))

@@ -1,6 +1,6 @@
 (in-package :clvt)
 
-(defun vt-sum (tensor &key axis)
+(defun vt-sum (tensor &key axis keepdims)
   "求和.自动适配 int/float 类型."
   (let ((element-type (array-element-type (vt-data tensor))))
     ;; 获取类型匹配的初始值 0
@@ -11,9 +11,10 @@
                   (declare (type number acc val))
                   ;; 简单的加法,类型转换由 vt-reduce 内部处理
                   (values (+ acc val) nil))
-                :return-arg nil))))
+                :return-arg nil
+		:keepdims keepdims))))
 
-(defun vt-amax (tensor &key axis)
+(defun vt-amax (tensor &key axis keepdims)
   "最大值.自动适配类型."
   (let ((element-type (array-element-type (vt-data tensor))))
     ;; 获取类型匹配的最小值 (如 most-negative-fixnum)
@@ -25,9 +26,10 @@
                   (if (> val acc)
                       (values val t) ; 返回新值,标记更新索引
                       (values acc nil)))
-                :return-arg nil))))
+                :return-arg nil
+		:keepdims keepdims))))
 
-(defun vt-amin (tensor &key axis)
+(defun vt-amin (tensor &key axis keepdims)
   "最小值.自动适配类型."
   (let ((element-type (array-element-type (vt-data tensor))))
     ;; 获取类型匹配的最大值
@@ -39,7 +41,8 @@
                   (if (< val acc)
                       (values val t)
                       (values acc nil)))
-                :return-arg nil))))
+                :return-arg nil
+		:keepdims keepdims))))
 
 (defun vt-argmax (tensor &key axis)
   "最大值索引."
@@ -68,11 +71,11 @@
                       (values acc nil)))
                 :return-arg t))))
 
-(defun vt-mean (tensor &key axis)
+(defun vt-mean (tensor &key axis keepdims)
   "计算平均值.
    axis: nil (全局) 或 fixnum (轴向).
    返回: double-float 或 VT 张量."
-  (let* ((sum-result (vt-sum tensor :axis axis))
+  (let* ((sum-result (vt-sum tensor :axis axis :keepdims keepdims))
          (element-type (vt-element-type tensor))
          ;; 计算归约维度的元素个数
          (count (if axis
