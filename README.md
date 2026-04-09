@@ -92,13 +92,13 @@ CLVT> (vt-sin *m*)
    [[  -0.751,   0.1499,   0.9129],
     [  0.8367,  -0.0089,  -0.8462],
     [ -0.9056,  -0.1324,   0.7626]]]>
-CLVT> (vt-slice* *m* 0)
+CLVT> (vt-slice *m* 0)
 #<VT shape:(3 3) dtype:FIXNUM 
   [[ 0,  1,  2],
    [ 3,  4,  5],
    [ 6,  7,  8]]>
-CLVT> (setf (vt-slice* *m* 1)
-	    (vt-slice* *m* 0))
+CLVT> (setf (vt-slice *m* 1)
+	    (vt-slice *m* 0))
 #<VT shape:(3 3) dtype:FIXNUM 
   [[ 0,  1,  2],
    [ 3,  4,  5],
@@ -268,7 +268,7 @@ VT-CONTIGUOUS
 VT-COS 
 VT-RESHAPE 
 VT-REF 
-VT-SLICE* 
+VT-SLICE
 VT-ONES 
 VT-ARANGE 
 VT-ACOS 

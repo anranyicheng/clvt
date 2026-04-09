@@ -447,7 +447,7 @@
        :strides strides ; 步长不变！
        :offset new-offset))))
 
-(defun vt-slice* (vt &rest specs)
+(defun vt-slice (vt &rest specs)
   "通用切片函数 (NumPy风格,零拷贝).
    参数:
      vt: 张量
@@ -458,15 +458,15 @@
        - nil: 同 :all.
    示例: 区间左闭右开
      ;; 1. 截取子矩阵 (行0-2, 列1-4)
-     (vt-slice* mat '(0 2) '(1 4))
+     (vt-slice mat '(0 2) '(1 4))
      ;; 2. 提取特定行 (结果降为1维)
-     (vt-slice* mat 1)
+     (vt-slice mat 1)
      ;; 3. 提取特定列 (保留行维度)
-     (vt-slice* mat :all 2)
+     (vt-slice mat :all 2)
      ;; 4. 带步长切片
-     (vt-slice* mat '(0 10 2)) ; 每2行取一行
+     (vt-slice mat '(0 10 2)) ; 每2行取一行
      ;; 5. 负索引支持
-     (vt-slice* mat '(-2 -1)) ; 最后两行"
+     (vt-slice mat '(-2 -1)) ; 最后两行"
   
   (let* ((old-shape (vt-shape vt))
          (old-strides (vt-strides vt))
@@ -546,18 +546,18 @@
                 :strides (nreverse new-strides)
                 :offset cur-offset))))
 
-(defun (setf vt-slice*) (value vt &rest specs)
+(defun (setf vt-slice) (value vt &rest specs)
   "设置切片区域的值.
    value: 可以是数字或另一个张量.
-   specs: 切片参数 (同 vt-slice*).
+   specs: 切片参数 (同 vt-slice).
    示例:
      ;; 将第一行全部置 0
-     (setf (vt-slice* m 0 :all) 0.0)
+     (setf (vt-slice m 0 :all) 0.0)
      ;; 将子矩阵赋值为另一个张量
-     (setf (vt-slice* m '(0 2) '(0 2)) another-matrix)"
+     (setf (vt-slice m '(0 2) '(0 2)) another-matrix)"
   ;; 1. 获取目标切片的视图
-  ;; apply 调用我们之前实现的 vt-slice*
-  (let ((target-view (apply #'vt-slice* vt specs)))
+  ;; apply 调用我们之前实现的 vt-slice
+  (let ((target-view (apply #'vt-slice vt specs)))
     ;; 2. 执行拷贝 (自动处理标量->广播 或 张量->形状匹配)
     (vt-copy-into target-view value)))
 

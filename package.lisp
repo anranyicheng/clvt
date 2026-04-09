@@ -27,7 +27,7 @@
    :vt-reshape
    :vt-split
    :vt-ref     ;; setf 
-   :vt-slice*  ;; setf
+   :vt-slice   ;; setf
    :vt-do-each
    :vt-copy-into
    :vt-copy
