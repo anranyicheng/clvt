@@ -123,9 +123,9 @@
   "逐元素取余数"
   (vt-map (lambda (x) (rem x divisor)) vt))
 
-(defun vt-atan2 (vt-y x)
+(defun vt-atan2 (vty x)
   "逐元素计算 atan2(y, x).支持广播."
-  (vt-map (lambda (y) (atan y x)) vt-y))
+  (vt-map (lambda (y) (atan y x)) vty))
 
 (defun vt-floor (vt divisor)
   "向下取整."
@@ -160,4 +160,4 @@
 
 (defun vt-log2 (vt)
   "以 2 为底的对数."
-  (vt-log-clean vt 2.0d0))
+  (vt-log vt 2.0d0))
