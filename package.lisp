@@ -63,7 +63,7 @@
    :vt-acos
    :vt-atan
    :vt-sinh
-   :vt-consh
+   :vt-cosh
    :vt-tanh
 
    :vt-exp
@@ -89,7 +89,7 @@
    :vt-round
    :vt-rint
 
-   :vt-log-clean
+   :vt-log
    :vt-log2
    :vt-log10
    
