@@ -732,12 +732,15 @@
 (declaim (inline vt-broadcast-shapes))
 (defun vt-broadcast-shapes (shape1 shape2)
   "计算广播结果形状."
+  (declare (list shape1 shape2)
+	   (optimize (speed 3)))
   (let ((len1 (length shape1))
         (len2 (length shape2))
         (result '()))
-    (loop for i from 1 to (max len1 len2)
-          for dim1 = (if (<= i len1) (nth (- len1 i) shape1) 1)
-          for dim2 = (if (<= i len2) (nth (- len2 i) shape2) 1)
+    (declare (fixnum len1 len2))
+    (loop for i fixnum from 1 to (max len1 len2)
+          for dim1 fixnum = (if (<= i len1) (nth (- len1 i) shape1) 1)
+          for dim2 fixnum = (if (<= i len2) (nth (- len2 i) shape2) 1)
           do (cond ((= dim1 dim2) (push dim1 result))
                    ((or (= dim1 1) (= dim2 1))
 		    (push (max dim1 dim2) result))
@@ -749,7 +752,9 @@
 (defun vt-broadcast-strides (orig-shape target-shape orig-strides)
   "计算广播后的步长.总是返回列表."
   (declare (list orig-shape target-shape orig-strides))
+  (declare (optimize (speed 3)))
   (let ((rank-diff (- (length target-shape) (length orig-shape))))
+    (declare (fixnum rank-diff))
     (loop for i fixnum from 0 below (length target-shape)
           ;; 规则:如果该维度是广播出来的(前面补0),或者原维度为1(被广播),
           ;; 步长为0.否则使用原步长.
@@ -759,6 +764,7 @@
                     (t
                      (let* ((orig-idx (- i rank-diff))
                             (orig-dim (nth orig-idx orig-shape)))
+		       (declare (fixnum orig-dim orig-idx))
                        ;; 2. 原维度为1,被广播扩展,步长为 0
                        (if (= orig-dim 1)
                            0
