@@ -2,10 +2,10 @@
 
 (defstruct (vt (:constructor %make-vt))
   "N维张量结构.
-  data: 存储数据的一维简单数组.
-  shape: 形状列表.
-  strides: 步长列表.
-  offset: 起始偏移量,支持切片视图不复制数据."
+   data: 存储数据的一维简单数组.
+   shape: 形状列表.
+   strides: 步长列表.
+   offset: 起始偏移量,支持切片视图不复制数据."
   (data (make-array 0) :type (simple-array *))
   (shape nil :type list)
   (strides nil :type list)
@@ -104,7 +104,7 @@
 
 (defun vt-flatten-to-nested (dims data)
   "将按行主序存储的一维向量 data 转换为符合 dims 维度的嵌套列表.
-  (vt-flatten-to-nested (vt-shape vt) (vt-data vt))"
+   (vt-flatten-to-nested (vt-shape vt) (vt-data vt))"
   (let ((total-size (reduce #'* dims))    ;; 总元素数
         (idx 0))                          ;; 当前读取位置
     (assert (= total-size (length data)) (data)
@@ -836,7 +836,7 @@
            (out-shape (reduce #'vt-broadcast-shapes
 			      (mapcar #'vt-shape clean-tensors)))
            (rank (length out-shape))           
-           ;; 3. 分配结果张量
+           ;; 3. 分配结果张量, 统一返回double-float类型
            (res (vt-zeros out-shape))
            (res-data (vt-data res))
            (res-strides (vt-strides res))           
@@ -866,7 +866,6 @@
              (declare (type fixnum depth out-ptr))
              (if (= depth rank)
                  ;; --- 最内层:执行计算 ---
-                 ;; 优化:针对常用参数数量直接调用, 避免 apply 开销
                  (let ((d0 (aref (aref ins-data 0) 
                                  (aref cur-ptrs 0))))
                    (setf (aref res-data out-ptr)
@@ -902,12 +901,12 @@
                      ;; 更新指针 (移动一个步长)
                      (incf out-ptr res-stride)
                      (loop for k fixnum from 0 below n-tensors
-                           for s in strides-at-depth do
+                           for s fixnum in strides-at-depth do
                              (incf (aref cur-ptrs k) s)))
                    ;; 指针回溯 (为了上层循环的正确性)
                    (decf out-ptr (the fixnum (* dim res-stride)))
                    (loop for k fixnum from 0 below n-tensors
-                         for s in strides-at-depth do
+                         for s fixnum in strides-at-depth do
                            (decf (aref cur-ptrs k)
 				 (the fixnum (* dim s))))))))
         (recurse 0 0))
@@ -995,16 +994,18 @@
 	   (if is-global-reduction
                (make-list rank :initial-element 0)
                ;; 轴向归约：根据 keepdims 决定索引偏移
+	       ;; keepdims=T: 形状没少，输入第 i 轴直接对应输出第 i 轴
+	       ;; keepdims=nil: 形状少了一维，跨过归约轴后要 -1
                (loop
 		 for i from 0 below rank
                  if (= i axis) collect 0
                    else collect
 			(let ((out-idx
-				(if keepdims
-                                    ;; keepdims=T: 形状没少，输入第 i 轴直接对应输出第 i 轴
-                                    i
-                                    ;; keepdims=nil: 形状少了一维，跨过归约轴后要 -1
-                                    (if (< i axis) i (1- i)))))
+				(if keepdims                                  
+                                    i                                  
+                                    (if (< i axis)
+					i
+					(1- i)))))
                           (nth out-idx (vt-strides res))))))
 	 ;; 索引步长 (用于计算 argmax/argmin 的逻辑位置)
 	 (arg-strides
@@ -1012,8 +1013,9 @@
                (if is-global-reduction
 		   (vt-compute-strides in-shape)
 		   (loop for i from 0 below rank
-			 if (= i axis) collect 1
-			   else collect 0))
+			 if (= i axis)
+			   collect 1
+			 else collect 0))
                (make-list rank :initial-element 0))))      
     (declare (type (simple-array * (*)) in-data res-data)
              (type list out-strides-map in-strides arg-strides in-shape))
@@ -1027,7 +1029,7 @@
                      (cur-acc (aref res-data out-ptr)))
                  (multiple-value-bind (new-acc do-update-idx) 
                      (funcall reducer-fn cur-acc val)
-                   ;; 核心修复:写入前强制转换回原类型
+                   ;; 写入前强制转换回原类型
                    ;; 防止 fixnum + fixnum -> overflow 或比较函数返回非预期类型
                    (setf (aref res-data out-ptr) 
                          (coerce new-acc element-type))                   
@@ -1051,10 +1053,12 @@
                    (incf out-ptr out-stride)
                    (when return-arg
                      (incf out-idx-ptr out-stride)))))))
-      (recurse 0 in-offset res-offset 
+      (recurse 0
+	       in-offset
+	       res-offset 
                (if res-idx (vt-offset res-idx) 0) 
                0))
-     (if (and is-global-reduction (not keepdims))
+    (if (and is-global-reduction (not keepdims))
         (let ((final-val (aref res-data res-offset)))
           (if return-arg
 	      (values final-val (aref res-idx-data (vt-offset res-idx)))
