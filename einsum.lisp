@@ -312,3 +312,92 @@
           (analyze-einsum input-subs output-subs vts)
         (einsum-execute
 	 all-labels label-dims output-subs-final input-subs vts)))))
+
+(declaim (inline %matmul-df-kernel))
+(defun %matmul-df-kernel (a-data b-data c-data m k n)
+  "Double-float 类型的 i-k-j 缓存优化矩阵乘法内核"
+  (declare (type (simple-array double-float (*)) a-data b-data c-data)
+           (type fixnum m k n)
+	   (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+  (loop for i of-type fixnum from 0 below m do
+    (let ((i-k (the fixnum (* i k)))
+          (i-n (the fixnum (* i n))))
+      (loop for l of-type fixnum from 0 below k do
+        (let ((a-val (the double-float (aref a-data (the fixnum (+ i-k l)))))
+              (l-n  (the fixnum (* l n))))
+          (loop for j of-type fixnum from 0 below n do
+            (setf (aref c-data (the fixnum (+ i-n j)))
+                  (the double-float
+                       (+ (the double-float
+			       (aref c-data (the fixnum (+ i-n j))))
+                          (the double-float
+			       (* a-val
+				  (the double-float
+				       (aref b-data
+					     (the fixnum (+ l-n j)))))))))))))))
+
+(defun vt-get-contiguous-df-data (vt)
+  "提取张量数据。通过 typecase 消除盲盒数组的运行时派发开销。"
+  ;; 局部开启极致优化
+  (declare (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))  
+  (let ((data (vt-data vt))
+        (shape (vt-shape vt))
+        (strides (vt-strides vt))
+        (offset (vt-offset vt)))
+    (let ((m (first shape))
+          (n (second shape))
+          (s0 (first strides))
+          (s1 (second strides)))
+      (declare (fixnum m n s0 s1 offset)) 
+      (if (and (typep data '(simple-array double-float (*)))
+               (zerop offset)
+               (= s1 1)
+               (= s0 n))
+          data
+          (let ((new-data (make-array (the fixnum (* m n)) 
+                                      :element-type 'double-float 
+                                      :initial-element 0.0d0)))
+            (declare (type (simple-array double-float (*)) new-data))
+            (typecase data
+              ((simple-array double-float (*))
+               (loop for i of-type fixnum from 0 below m do
+                 (let ((base-i (the fixnum (+ offset (the fixnum (* i s0))))))
+                   (loop for j of-type fixnum from 0 below n do
+                     (setf (aref new-data (the fixnum (+ (the fixnum (* i n)) j)))
+                           (aref data (the fixnum
+					   (+ base-i (the fixnum (* j s1))))))))))
+	      
+              ((simple-array fixnum (*))
+               (loop for i of-type fixnum from 0 below m do
+                 (let ((base-i (the fixnum (+ offset (the fixnum (* i s0))))))
+                   (loop for j of-type fixnum from 0 below n do
+                     (setf (aref new-data (the fixnum (+ (the fixnum (* i n)) j)))
+                           (the double-float 
+                                (coerce
+				 (the fixnum 
+                                      (aref data (the fixnum
+						      (+ base-i
+							 (the fixnum (* j s1)))))) 
+                                 'double-float))))))))
+	    new-data)))))
+
+
+(defun vt-matmul-df (a b)
+  "2维张量矩阵乘法 A * B。无论输入类型，结果必定为 double-float 张量。"
+  (declare (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+  (assert (and (listp (vt-shape a)) (listp (vt-shape b))
+               (= (length (vt-shape a)) 2) (= (length (vt-shape b)) 2))
+          (a b) "vt-matmul 仅支持 2 维张量")
+  (let* ((m (first (vt-shape a)))
+         (k1 (second (vt-shape a)))
+         (k2 (first (vt-shape b)))
+         (n (second (vt-shape b))))
+    (assert (eq k1 k2)
+	    (a b) "矩阵乘法维度不匹配: A的列数(~A) != B的行数(~A)" k1 k2)    
+    ;; 1. 降维、连续化、类型统一化 (fixnum 等类型在此被转为 double-float)
+    (let* ((a-data (vt-get-contiguous-df-data a))
+           (b-data (vt-get-contiguous-df-data b))
+           (c-vt (vt-zeros (list m n):type 'double-float))
+           (c-data (vt-data c-vt)))
+      (%matmul-df-kernel a-data b-data c-data m k1 n)
+      c-vt)))

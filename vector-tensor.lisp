@@ -1073,7 +1073,12 @@
         (values res res-idx))))
 
 (defun vt-matmul (vt1 vt2)
-  (vt-einsum "...ij,...jk->...ik" vt1 vt2))
+  (cond ((= 2
+	    (vt-order vt1)
+	    (vt-order vt2))
+	 (vt-matmul-df vt1 vt2))
+	(t 
+	 (vt-einsum "...ij,...jk->...ik" vt1 vt2))))
 
 (defun vt-@ (vt1 vt2)
   (vt-matmul vt1 vt2))
