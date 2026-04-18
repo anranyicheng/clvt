@@ -1,7 +1,7 @@
 (in-package :clvt)
 
 (defun vt-sum (tensor &key axis keepdims)
-  "求和.自动适配 int/float 类型."
+  "求和. 自动适配 int/float 类型."
   (let ((element-type (array-element-type (vt-data tensor))))
     ;; 获取类型匹配的初始值 0
     (nth-value
@@ -15,7 +15,7 @@
 		:keepdims keepdims))))
 
 (defun vt-amax (tensor &key axis keepdims)
-  "最大值.自动适配类型."
+  "最大值. 自动适配类型."
   (let ((element-type (array-element-type (vt-data tensor))))
     ;; 获取类型匹配的最小值 (如 most-negative-fixnum)
     (nth-value
@@ -30,7 +30,7 @@
 		:keepdims keepdims))))
 
 (defun vt-amin (tensor &key axis keepdims)
-  "最小值.自动适配类型."
+  "最小值. 自动适配类型."
   (let ((element-type (array-element-type (vt-data tensor))))
     ;; 获取类型匹配的最大值
     (nth-value

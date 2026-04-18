@@ -1,7 +1,8 @@
 (in-package :clvt)
 
-;; 辅助函数：将 2D VT 转为 Common Lisp 原生嵌套 Array
+
 (defun vt-to-2d-array (vt)
+  "将 2D VT 转为 Common Lisp 原生嵌套 Array"
   (let ((shape (vt-shape vt))
         (data (vt-data vt)))
     (assert (= (length shape) 2))
@@ -18,8 +19,8 @@
           (setf (aref arr i j) (aref data (+ (* i cols) j)))))
       arr)))
 
-;; 辅助函数：从 2D Array 创建 VT
 (defun vt-from-2d-array (arr)
+  "从 2D Array 创建 VT"
   (let* ((rows (array-dimension arr 0))
          (cols (array-dimension arr 1))
          (data (make-array (* rows cols)
@@ -35,14 +36,14 @@
     (%make-vt :data data :shape (list rows cols) 
              :strides (list cols 1) :offset 0)))
 
-;; 确保矩阵在内存中是连续的，否则转换为嵌套数组会出错
 (defun ensure-contiguous-2d-vt (vt)
+  "确保矩阵在内存中是连续的，否则转换为嵌套数组会出错"
   (if (vt-contiguous-p vt)
       vt
       (vt-contiguous vt)))
 
-;; 行列式 (基于高斯消元)
 (defun vt-det (matrix)
+  "行列式 (基于高斯消元)"  
   (let* ((c-vt (ensure-contiguous-2d-vt matrix))
          (arr (vt-to-2d-array c-vt))
          (n (first (vt-shape c-vt)))
@@ -75,9 +76,10 @@
 		      (* factor (aref arr i (+ j i)))))))))
       det-val)))
 
-;; 求解线性方程组 Ax = b (高斯-约旦消元法)
-;; 返回解向量 x (形状为 (n, 1) 的 VT)
+
 (defun vt-solve (a b)
+"求解线性方程组 Ax = b (高斯-约旦消元法)
+ 返回解向量 x (形状为 (n, 1) 的 VT)"
   (let* ((a-c (ensure-contiguous-2d-vt a))
          (b-c (ensure-contiguous-2d-vt b))
          (a-arr (vt-to-2d-array a-c))
@@ -85,8 +87,7 @@
          ;; 构建增广矩阵 [A|b]
          (aug (make-array (list n (1+ n))
 			  :element-type 'double-float
-			  :initial-element 0.0d0)))
-    
+			  :initial-element 0.0d0)))   
     ;; 填充增广矩阵
     (dotimes (i n)
       (declare (fixnum i))
@@ -94,7 +95,6 @@
         (declare (fixnum j))
         (setf (aref aug i j) (aref a-arr i j)))
       (setf (aref aug i n) (aref (vt-data b-c) i))) ;; 假设 b 是列向量
-    
     ;; 高斯-约旦消元
     (dotimes (i n)
       ;; 选列主元并交换行
@@ -118,8 +118,7 @@
             (unless (= k i)
               (let ((factor (aref aug k i)))
                 (dotimes (j (1+ n))
-                  (decf (aref aug k j) (* factor (aref aug i j))))))))))
-    
+                  (decf (aref aug k j) (* factor (aref aug i j))))))))))    
     ;; 提取结果列
     (let ((res-data (make-array n :initial-element 0.0d0
 				  :element-type 'double-float)))
@@ -130,8 +129,8 @@
 		:strides (list 1 1) :offset 0))
     ))
 
-;; 矩阵求逆: 通过求解 AX = I 实现
 (defun vt-inv (matrix)
+  "矩阵求逆: 通过求解 AX = I 实现"
   (let* ((n (first (vt-shape matrix)))
          (identity (vt-eye n)))
     (vt-solve matrix identity)))
