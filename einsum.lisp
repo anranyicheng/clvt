@@ -337,7 +337,7 @@
 					     (the fixnum (+ l-n j)))))))))))))))
 
 (defun vt-get-contiguous-df-data (vt)
-  "提取张量数据。通过 typecase 消除盲盒数组的运行时派发开销。"
+  "提取张量数据, 通过 typecase 消除盲盒数组的运行时派发开销."
   ;; 局部开启极致优化
   (declare (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))  
   (let ((data (vt-data vt))
@@ -383,7 +383,7 @@
 
 
 (defun vt-matmul-df (a b)
-  "2维张量矩阵乘法 A * B。无论输入类型，结果必定为 double-float 张量。"
+  "2维张量矩阵乘法 A * B. 无论输入类型, 结果必定为 double-float 张量."
   (declare (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
   (assert (and (listp (vt-shape a)) (listp (vt-shape b))
                (= (length (vt-shape a)) 2) (= (length (vt-shape b)) 2))

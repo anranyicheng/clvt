@@ -3,12 +3,12 @@
 (in-package #:clvt)
 
 (defun vt-+ (&rest args)
-  "逐元素加法.支持标量、列表、张量混合.
-   自动优化:多参数时单次遍历."
+  "逐元素加法. 支持标量、列表、张量混合.
+   自动优化: 多参数时单次遍历."
   (apply #'vt-map #'+ args))
 
 (defun vt-* (&rest args)
-  "逐元素乘法.支持标量、列表、张量混合."
+  "逐元素乘法. 支持标量、列表、张量混合."
   (apply #'vt-map #'* args))
 
 (defun vt-- (vt &rest args)
@@ -31,7 +31,7 @@
         (apply #'vt-map #'/ first-vt args))))
 
 (defun vt-scale (tensor scalar)
-  "将张量 TENSOR 的所有元素乘以标量 SCALAR,返回新的张量."
+  "将张量 TENSOR 的所有元素乘以标量 SCALAR, 返回新的张量."
   (vt-map (lambda (x) (* x scalar)) tensor))
 
 (defun vt-sin (vt)
@@ -87,44 +87,44 @@
 
 
 (defun vt-positive-p (vt)
-  "判断是否大于零.返回 1.0 (True) 或 0.0 (False)."
+  "判断是否大于零. 返回 1.0 (True) 或 0.0 (False)."
   (vt-map (lambda (v) (if (> v 0.0d0) 1.0d0 0.0d0)) vt))
 
 (defun vt-negative-p (vt)
-  "判断是否小于零.返回 1.0 或 0.0."
+  "判断是否小于零. 返回 1.0 或 0.0."
   (vt-map (lambda (v) (if (< v 0.0d0) 1.0d0 0.0d0)) vt))
 
 (defun vt-zero-p (vt)
-  "判断是否为零.返回 1.0 或 0.0."
+  "判断是否为零. 返回 1.0 或 0.0."
   (vt-map (lambda (v) (if (zerop v) 1.0d0 0.0d0)) vt))
 
 (defun vt-nonzero-p (vt)
-  "判断是否非零.返回 1.0 或 0.0."
+  "判断是否非零. 返回 1.0 或 0.0."
   (vt-map (lambda (v) (if (zerop v) 0.0d0 1.0d0)) vt))
 
 (defun vt-even-p (vt)
-  "判断是否为偶数.返回 1.0 或 0.0."
+  "判断是否为偶数. 返回 1.0 或 0.0."
   ;; 注意:浮点数判断偶数需先取整
   (vt-map (lambda (v) (if (evenp (floor v)) 1.0d0 0.0d0)) vt))
 
 (defun vt-odd-p (vt)
-  "判断是否为奇数.返回 1.0 或 0.0."
+  "判断是否为奇数. 返回 1.0 或 0.0."
   (vt-map (lambda (v) (if (oddp (floor v)) 1.0d0 0.0d0)) vt))
 
 (defun vt-expt (vt-base power-num)
-  "逐元素幂运算"
+  "逐元素幂运算."
   (vt-map (lambda (x) (expt x power-num)) vt-base))
 
 (defun vt-mod (vt divisor)
-  "逐元素取模"
+  "逐元素取模."
   (vt-map (lambda (x) (mod x divisor)) vt))
 
 (defun vt-rem (vt divisor)
-  "逐元素取余数"
+  "逐元素取余数."
   (vt-map (lambda (x) (rem x divisor)) vt))
 
 (defun vt-atan2 (vty x)
-  "逐元素计算 atan2(y, x).支持广播."
+  "逐元素计算 atan2(y, x). 支持广播."
   (vt-map (lambda (y) (atan y x)) vty))
 
 (defun vt-floor (vt divisor)
@@ -145,7 +145,7 @@
   (vt-map (lambda (x) (float (round x) x)) vt))
 
 (defun vt-log (vt &optional base)
-  "以 base 为底的对数"
+  "以 base 为底的对数."
   (if base
       (vt-map (lambda (val)
 		(log val base))
