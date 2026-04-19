@@ -22,6 +22,7 @@
    :vt-const
    :vt-arange
    :vt-random
+   :vt-random-normal
 
    :vt-transpose
    :vt-reshape
@@ -42,6 +43,18 @@
    :vt-scale
    :vt-matmul
    :vt-einsum
+   :vt-dot
+   :vt-outer
+   :vt-trace
+   :vt-norm
+   :vt-l1-norm
+   :vt-frobenius-norm
+
+   :vt-solve
+   :vt-det
+   :vt-inv
+   :vt-to-2d-array
+   :vt-from-2d-array
    
    :vt-sum
    :vt-amax
@@ -92,6 +105,28 @@
    :vt-log
    :vt-log2
    :vt-log10
+
+   :vt-mean
+   :vt-std
+
+   :vt-concatenate
+   :vt-clip
+
+   :vt-sigmoid
+   :vt-relu
+   :vt-leaky-relu
+   :vt-swish
+   :vt-softplus
+   :vt-gelu
+   :vt-mish
+   :vt-hard-tanh
+   :vt-hard-sigmoid
+
+   :vt-softmax
+   :vt-log-softmax
+   :vt-mean-squared-error
+   :vt-binary-cross-entropy
+   :vt-cross-entropy
    
    ))
 
