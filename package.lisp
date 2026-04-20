@@ -12,10 +12,12 @@
    :vt-order
    :vt-shape
    :vt-size
-   
+
+   :vt-flatten
    :vt-flatten-sequence
    :vt-from-sequence
    :vt-data->list
+   :vt-take
    
    :vt-zeros
    :vt-ones
