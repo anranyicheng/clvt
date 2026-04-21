@@ -431,17 +431,6 @@
      :strides (loop for p in perm-real collect (nth p (vt-strides vt)))
      :offset (vt-offset vt))))
 
-;;; --- 内部辅助函数：轴线标准化 ---
-(defun vt-normalize-axis (axis rank)
-  "将可能为负数的 axis 转换为严格正数，并进行越界检查。
-   例如：rank=4, axis=-1 -> 3 ; axis=-2 -> 2"
-  (let ((ax (if (minusp axis)
-		(+ axis rank)
-		axis)))
-    (when (or (< ax 0) (>= ax rank))
-      (error "Axis ~A is out of bounds for tensor of rank ~A" axis rank))
-    ax))
-
 (defun vt-normalize-axis (axis rank)
   "将可能为负数的 axis 转换为严格正数，并进行越界检查。
    例如：rank=4, axis=-1 -> 3 ; axis=-2 -> 2"
