@@ -1139,12 +1139,15 @@
       (let* ((shape (vt-shape tensor))
              (axis-size (nth axis shape))
              (idx-flat (vt-flatten indices))
-             (idx-data (vt-data idx-flat))
+	     (idx-data (vt-data idx-flat))
              (idx-size (vt-size idx-flat))
              (out-shape (loop for d in shape for i from 0
                               if (= i axis) collect idx-size
 				else collect d))
              (result (vt-zeros out-shape :type (vt-element-type tensor))))
+	(when (eq (vt-element-type indices) 'double-float)
+	  (warn "vt-take indices element type if not fixnum")
+	  (setf idx-data (map 'vector #'truncate idx-data)))
         (labels
 	    ((recurse (depth in-ptr out-ptr)
                (declare (type fixnum depth in-ptr out-ptr))
@@ -1184,6 +1187,9 @@
              (result-data
 	       (make-array idx-size
 			   :element-type (vt-element-type tensor))))
+	(when (eq (vt-element-type indices) 'double-float)
+	  (warn "vt-take indices element type if not fixnum")
+	  (setf idx-data (map 'vector #'truncate idx-data)))
         (loop for i from 0 below idx-size
               for idx = (aref idx-data i)
               do (when (or (< idx 0) (>= idx size))
