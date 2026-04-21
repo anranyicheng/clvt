@@ -384,42 +384,56 @@
 
 (defun vt-concatenate (axis &rest vts)
   "沿指定轴连接数组.
-  axis: 连接轴
+  axis: 连接轴 (支持 -1 等负数表示)
   vts: 张量列表
   返回: 新张量"
   (when (null vts)
-    (error "vt-concatenate 至少需要一个张量"))
-  
+    (error "vt-concatenate 至少需要一个张量"))  
   (let* ((shapes (mapcar #'vt-shape vts))
          (rank (length (car shapes)))
-         (types (mapcar #'vt-element-type vts)))
+         ;; 处理负轴
+         (real-axis (if (< axis 0)
+                        (+ rank axis)
+                        axis)))    
     ;; 验证形状
     (loop for shape in shapes
           for i from 0
           do (unless (= (length shape) rank)
                (error "张量 ~A 的秩不匹配" i))
-             (loop
-	       for dim in shape
-               for j from 0
-               unless (or (= j axis) (= dim (nth j (car shapes))))
-                 do (error "形状不匹配")))
-    
+             (loop for dim in shape
+                   for j from 0
+                   unless (or (= j real-axis)
+                              (= dim (nth j (car shapes))))
+                     do (error "形状不匹配")))
     ;; 计算新形状
     (let* ((new-shape (copy-list (car shapes)))
            (total-axis-size
-	     (reduce #'+ (mapcar (lambda (s) (nth axis s)) shapes)))
-           (result-type (car types)))
-      (setf (nth axis new-shape) total-axis-size)
-      
+             (reduce #'+ (mapcar
+                          (lambda (s)
+                            (nth real-axis s))
+                          shapes)))
+           (result-type (vt-element-type (car vts))))
+      (setf (nth real-axis new-shape) total-axis-size)
       (let ((result (vt-zeros new-shape :type result-type))
             (cur-offset 0))
-        ;; 拷贝每个数组
+        ;; 沿轴拷贝数据
         (dolist (vt vts)
-          (let ((axis-size (nth axis (vt-shape vt))))
-            ;; 使用 vt-copy-into 拷贝切片
-            (let ((slice (vt-split result axis cur-offset
-				   (+ cur-offset axis-size))))
-              (vt-copy-into slice vt))
+          (let* ((axis-size
+                   (nth real-axis (vt-shape vt)))
+		 (slice-args
+                   (loop for i from 0 below rank
+                         append
+                         (if (= i real-axis)
+                             ;; 当前拼接轴: 提供范围
+                             (list (list cur-offset
+                                         (+ cur-offset
+                                            axis-size)))
+                             ;; 其他轴: 全部选中
+                             (list :all)))))
+            ;; 将源张量直接写入目标切片
+            (setf (apply #'vt-slice
+                         (cons result slice-args))
+                  vt)
             (incf cur-offset axis-size)))
         result))))
 
