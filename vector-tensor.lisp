@@ -919,9 +919,10 @@
       res)))
 
 (defun vt-ensure-shape-compatible (shape axis)
-  "检查 axis 是否合法."
-  (let ((rank (length shape)))
-    (when (or (< axis 0) (>= axis rank))
+  "检查 axis 是否合法. 支持负数轴."
+  (let* ((rank (length shape))
+         (real-axis (if (< axis 0) (+ rank axis) axis)))
+    (when (or (< real-axis 0) (>= real-axis rank))
       (error "Axis ~A 越界,张量秩为 ~A" axis rank))))
 
 (defun vt-compute-logical-strides (shape)
@@ -967,7 +968,11 @@
          ;; 关键:获取实际类型
          (element-type (vt-element-type tensor))
          (rank (length in-shape))
-         (is-global-reduction (null axis))
+	 (real-axis (when axis 
+                      (let ((a axis))
+                        (when (< a 0) (incf a rank))
+                        a)))
+         (is-global-reduction (null real-axis))
 	 ;; 1. 输出形状
 	 (out-shape
 	   (cond
@@ -977,11 +982,11 @@
              (is-global-reduction (make-list rank :initial-element 1))
              ;; 轴向归约 且 不保留维度 -> 剔除该轴 (原逻辑)
              ((not keepdims)
-	      (loop for d in in-shape for i from 0 unless (= i axis)
+	      (loop for d in in-shape for i from 0 unless (= i real-axis)
 		    collect d))
-             ;; 轴向归约 且 保留维度 -> 该轴置为 1，例如 (3,4) axis=1 变 (3,1)
+             ;; 轴向归约 且 保留维度 -> 该轴置为 1，例如 (3,4) real-axis=1 变 (3,1)
              (t (loop for d in in-shape for i from 0
-		      collect (if (= i axis) 1 d)))))
+		      collect (if (= i real-axis) 1 d)))))
 	 ;; 2. 初始值安全转换
 	 (safe-init-val (coerce init-val element-type))           
 	 ;; 3. 分配结果张量
@@ -1004,12 +1009,12 @@
 	       ;; keepdims=nil: 形状少了一维，跨过归约轴后要 -1
                (loop
 		 for i from 0 below rank
-                 if (= i axis) collect 0
+                 if (= i real-axis) collect 0
                    else collect
 			(let ((out-idx
 				(if keepdims                                  
                                     i                                  
-                                    (if (< i axis)
+                                    (if (< i real-axis)
 					i
 					(1- i)))))
                           (nth out-idx (vt-strides res))))))
@@ -1019,7 +1024,7 @@
                (if is-global-reduction
 		   (vt-compute-strides in-shape)
 		   (loop for i from 0 below rank
-			 if (= i axis)
+			 if (= i real-axis)
 			   collect 1
 			 else collect 0))
                (make-list rank :initial-element 0))))      
@@ -1071,6 +1076,8 @@
 	      final-val))
         ;; 其余情况（轴向归约，或 keepdims=T），均返回 VT 结构体
         (values res res-idx))))
+
+
 
 (defun vt-matmul (vt1 vt2)
   (cond ((= 2
