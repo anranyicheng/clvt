@@ -70,29 +70,28 @@
                       (values val t)
                       (values acc nil)))
                 :return-arg t))))
-
 (defun vt-mean (tensor &key axis keepdims)
-  "计算平均值.
-   axis: nil (全局) 或 fixnum (轴向).
-   返回: double-float 或 VT 张量."
-  (let* ((sum-result (vt-sum tensor :axis axis :keepdims keepdims))
+  "计算平均值. axis: nil (全局) 或 fixnum (支持负数).
+    返回: double-float 或 VT 张量."
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (real-axis (when axis 
+                      (let ((a axis))
+                        (when (< a 0) (incf a rank))
+                        a)))
+         (sum-result (vt-sum tensor :axis real-axis :keepdims keepdims))
          (element-type (vt-element-type tensor))
-         ;; 计算归约维度的元素个数
-         (count (if axis
-                    ;; 轴向归约:除数是该轴的长度
-                    (the fixnum (nth axis (vt-shape tensor)))
-                    ;; 全局归约:除数是总元素数
-                    (the fixnum (reduce #'* (vt-shape tensor))))))
-    
-    ;; 避免除以 0 (虽然理论上 shape 维度不会为 0)
-    (when (= count 0) (return-from vt-mean 0.0d0))
+         (count (if real-axis
+                    (the fixnum (nth real-axis shape))
+                    (the fixnum (reduce #'* shape)))))
+    ;; 避免除以 0
+    (when (= count 0)
+      (return-from vt-mean 0.0d0))
     ;; 执行除法
-    ;; 如果 sum-result 是张量 (axis 模式),vt-map 会自动广播标量 count
-    ;; 如果 sum-result 是数值 (全局模式),直接除
     (if (vt-p sum-result)
-        (vt-map (lambda (s) (/ s (coerce count element-type)))
-		sum-result)
+        (vt-map (lambda (s) (/ s (coerce count element-type))) sum-result)
         (/ sum-result (coerce count element-type)))))
+
 
 (defun vt-average (tensor weights &key axis)
   "计算加权平均值.
