@@ -127,15 +127,15 @@
   "逐元素计算 atan2(y, x). 支持广播."
   (vt-map (lambda (y) (atan y x)) vty))
 
-(defun vt-floor (vt divisor)
+(defun vt-floor (vt &optional (divisor 1))
   "向下取整."
   (vt-map (lambda (x) (floor x divisor)) vt))
 
-(defun vt-ceiling (vt divisor)
+(defun vt-ceiling (vt &optional (divisor 1))
   "向上取整."
   (vt-map (lambda (x) (ceiling x divisor)) vt))
 
-(defun vt-round (vt divisor)
+(defun vt-round (vt &optional (divisor 1))
   "四舍五入."
   (vt-map (lambda (x) (round x divisor)) vt))
 
@@ -143,6 +143,10 @@
   "四舍五入到最接近的整数 (浮点数返回值)."
   ;; Common Lisp 没有直接的 rint,使用 round 然后 float 化
   (vt-map (lambda (x) (float (round x) x)) vt))
+
+(defun vt-trancate (vt &optional (divisor 1))
+  "向0取整"
+  (vt-map (lambda (x) (truncate x divisor))))
 
 (defun vt-log (vt &optional base)
   "以 base 为底的对数."

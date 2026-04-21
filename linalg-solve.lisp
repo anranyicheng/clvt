@@ -8,14 +8,16 @@
     (assert (= (length shape) 2))
     (let* ((rows (first shape))
            (cols (second shape))
+	   (type (vt-element-type vt))
            (arr (make-array (list rows cols)
-			    :initial-element 0.0d0)))
+			    :initial-element (coerce 0 type))))
       (declare (fixnum rows cols))
       (dotimes (i rows)
 	(declare (fixnum i))
         (dotimes (j cols)
 	  (declare (fixnum j))
-          ;; 假设是行主序，直接计算偏移（注意：若 VT 经过 transpose，应先调用 vt-contiguous）
+          ;; 假设是行主序，直接计算偏移(注意:若 VT 经过 transpose，
+	  ;; 应先调用 vt-contiguous)
           (setf (aref arr i j) (aref data (+ (* i cols) j)))))
       arr)))
 
@@ -23,16 +25,19 @@
   "从 2D Array 创建 VT"
   (let* ((rows (array-dimension arr 0))
          (cols (array-dimension arr 1))
+	 (type (if (eq (array-element-type arr) 'fixnum)
+		   'fixnum
+		   'double-float))
          (data (make-array (* rows cols)
-			   :initial-element 0.0d0
-			   :element-type 'double-float)))
+			   :initial-element (coerce 0 type)
+			   :element-type type)))
     (declare (fixnum rows cols))
     (dotimes (i rows)
       (declare (fixnum i))
       (dotimes (j cols)
 	(declare (fixnum j))
         (setf (aref data (+ (* i cols) j))
-	      (coerce (aref arr i j) 'double-float))))
+	      (coerce (aref arr i j) type))))
     (%make-vt :data data :shape (list rows cols) 
              :strides (list cols 1) :offset 0)))
 
