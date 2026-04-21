@@ -431,21 +431,72 @@
      :strides (loop for p in perm-real collect (nth p (vt-strides vt)))
      :offset (vt-offset vt))))
 
-(defun vt-split (vt axis start end)
-  "零拷贝切片.沿指定轴切片,调整偏移量和形状."
+;;; --- 内部辅助函数：轴线标准化 ---
+(defun vt-normalize-axis (axis rank)
+  "将可能为负数的 axis 转换为严格正数，并进行越界检查。
+   例如：rank=4, axis=-1 -> 3 ; axis=-2 -> 2"
+  (let ((ax (if (minusp axis)
+		(+ axis rank)
+		axis)))
+    (when (or (< ax 0) (>= ax rank))
+      (error "Axis ~A is out of bounds for tensor of rank ~A" axis rank))
+    ax))
+
+(defun vt-normalize-axis (axis rank)
+  "将可能为负数的 axis 转换为严格正数，并进行越界检查。
+   例如：rank=4, axis=-1 -> 3 ; axis=-2 -> 2"
+  (if axis
+      (let ((ax (if (minusp axis)
+		    (+ axis rank)
+		    axis)))
+	(when (or (< ax 0) (>= ax rank))
+	  (error "Axis ~A is out of bounds for tensor of rank ~A" axis rank))
+	ax)))
+
+;;; --- 零拷贝切片 (底层基石) ---
+(defun vt-narrow (vt axis start end)
+  "零拷贝切片.沿指定轴切片,调整偏移量和形状. (等价于 PyTorch 的 narrow)"
   (let* ((shape (copy-list (vt-shape vt)))
+         (rank (length shape))
+         (ax (vt-normalize-axis axis rank)) 
          (strides (vt-strides vt))
-         (dim-size (nth axis shape)))
+         (dim-size (nth ax shape)))    
     (when (or (< start 0) (> end dim-size))
-      (error "切片索引越界"))
+      (error "切片索引 [~A, ~A) 越界，当前轴大小为 ~A" start end dim-size))
     (let ((new-offset (+ (vt-offset vt)
-                         (* start (nth axis strides))))
-          (new-shape (progn (setf (nth axis shape) (- end start)) shape)))
+                         (* start (nth ax strides))))
+          (new-shape (progn (setf (nth ax shape) (- end start)) shape)))
       (%make-vt
        :data (vt-data vt)
        :shape new-shape
-       :strides strides ; 步长不变！
+       :strides strides 
        :offset new-offset))))
+
+;;; --- 真正的 Split 接口 ---
+(defun vt-split (tensor indices-or-sections &key (axis 0))
+  "模仿 NumPy 的 split，支持负数 axis。"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (ax (vt-normalize-axis axis rank))
+         (dim-size (nth ax shape)))    
+    (cond
+      ;; ========== 情况 A：均分 ==========
+      ((integerp indices-or-sections)
+       (let* ((n indices-or-sections)
+              (chunk-size (floor dim-size n)))
+         (unless (zerop (rem dim-size n))
+           (error "数组沿轴 ~A 的大小 ~A 不能被 ~A 整除" ax dim-size n))
+         (loop for i from 0 below n
+               collect (vt-narrow tensor ax 
+                                  (* i chunk-size) 
+                                  (* (1+ i) chunk-size)))))      
+      ;; ========== 情况 B：指定位置下刀 ==========
+      ((listp indices-or-sections)
+       (let ((points (append (list 0) indices-or-sections (list dim-size))))
+         (loop for (start end) on points by #'cdr
+               while end
+               collect (vt-narrow tensor ax start end))))      
+      (t (error "indices-or-sections 必须是整数或整数列表")))))
 
 (defun vt-slice (vt &rest specs)
   "通用切片函数 (NumPy风格,零拷贝).
@@ -968,10 +1019,7 @@
          ;; 关键:获取实际类型
          (element-type (vt-element-type tensor))
          (rank (length in-shape))
-	 (real-axis (when axis 
-                      (let ((a axis))
-                        (when (< a 0) (incf a rank))
-                        a)))
+	 (real-axis (vt-normalize-axis axis rank))
          (is-global-reduction (null real-axis))
 	 ;; 1. 输出形状
 	 (out-shape

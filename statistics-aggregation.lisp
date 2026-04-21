@@ -70,15 +70,13 @@
                       (values val t)
                       (values acc nil)))
                 :return-arg t))))
+
 (defun vt-mean (tensor &key axis keepdims)
   "计算平均值. axis: nil (全局) 或 fixnum (支持负数).
     返回: double-float 或 VT 张量."
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
-         (real-axis (when axis 
-                      (let ((a axis))
-                        (when (< a 0) (incf a rank))
-                        a)))
+         (real-axis (vt-normalize-axis axis rank))
          (sum-result (vt-sum tensor :axis real-axis :keepdims keepdims))
          (element-type (vt-element-type tensor))
          (count (if real-axis

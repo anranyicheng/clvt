@@ -488,15 +488,15 @@
         (let ((section-size (floor axis-size indices-or-sections)))
           (loop for i from 0 below axis-size by section-size
                 for end = (min (+ i section-size) axis-size)
-                do (push (vt-split vt axis i end) splits)))
+                do (push (vt-narrow vt axis i end) splits)))
         ;; 按索引分割
         (let ((prev 0))
           (dolist (idx indices-or-sections)
-            (push (vt-split vt axis prev idx) splits)
+            (push (vt-narrow vt axis prev idx) splits)
             (setf prev idx))
           ;; 最后一段
           (when (< prev axis-size)
-            (push (vt-split vt axis prev axis-size) splits))))
+            (push (vt-narrow vt axis prev axis-size) splits))))
     (nreverse splits)))
 
 (defun vt-vsplit (vt indices-or-sections)
