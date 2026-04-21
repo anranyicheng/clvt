@@ -392,9 +392,7 @@
   (let* ((shapes (mapcar #'vt-shape vts))
          (rank (length (car shapes)))
          ;; 处理负轴
-         (real-axis (if (< axis 0)
-                        (+ rank axis)
-                        axis)))    
+         (real-axis (vt-normalize-axis axis rank)))
     ;; 验证形状
     (loop for shape in shapes
           for i from 0
@@ -474,30 +472,6 @@
 (defun vt-dstack (&rest vts)
   "深度堆叠(沿轴2)"
   (apply #'vt-concatenate 2 vts))
-
-(defun vt-array-split (vt indices-or-sections &key axis)
-  "沿轴分割数组.
-  indices-or-sections: 整数N(等分)或索引列表
-  axis: 分割轴
-  返回: 张量列表"
-  (let* ((shape (vt-shape vt))
-         (axis-size (nth axis shape))
-         (splits nil))
-    (if (integerp indices-or-sections)
-        ;; 等分
-        (let ((section-size (floor axis-size indices-or-sections)))
-          (loop for i from 0 below axis-size by section-size
-                for end = (min (+ i section-size) axis-size)
-                do (push (vt-narrow vt axis i end) splits)))
-        ;; 按索引分割
-        (let ((prev 0))
-          (dolist (idx indices-or-sections)
-            (push (vt-narrow vt axis prev idx) splits)
-            (setf prev idx))
-          ;; 最后一段
-          (when (< prev axis-size)
-            (push (vt-narrow vt axis prev axis-size) splits))))
-    (nreverse splits)))
 
 (defun vt-vsplit (vt indices-or-sections)
   "垂直分割(沿轴0)"

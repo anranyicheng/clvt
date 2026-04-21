@@ -453,7 +453,6 @@
 	  (error "Axis ~A is out of bounds for tensor of rank ~A" axis rank))
 	ax)))
 
-;;; --- 零拷贝切片 (底层基石) ---
 (defun vt-narrow (vt axis start end)
   "零拷贝切片.沿指定轴切片,调整偏移量和形状. (等价于 PyTorch 的 narrow)"
   (let* ((shape (copy-list (vt-shape vt)))
@@ -472,9 +471,12 @@
        :strides strides 
        :offset new-offset))))
 
-;;; --- 真正的 Split 接口 ---
 (defun vt-split (tensor indices-or-sections &key (axis 0))
-  "模仿 NumPy 的 split，支持负数 axis。"
+  "模仿 NumPy 的 split，支持负数 axis
+   沿轴分割张量.
+   indices-or-sections: 整数N(等分)或索引列表
+   axis: 分割轴
+   返回: 张量列表"
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
          (ax (vt-normalize-axis axis rank))
