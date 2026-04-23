@@ -77,7 +77,8 @@
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
          (real-axis (vt-normalize-axis axis rank))
-         (sum-result (vt-sum tensor :axis real-axis :keepdims keepdims))
+         (sum-result
+	   (vt-sum tensor :axis real-axis :keepdims keepdims))
          (element-type (vt-element-type tensor))
          (count (if real-axis
                     (the fixnum (nth real-axis shape))
@@ -87,51 +88,44 @@
       (return-from vt-mean 0.0d0))
     ;; 执行除法
     (if (vt-p sum-result)
-        (vt-map (lambda (s) (/ s (coerce count element-type))) sum-result)
+        (vt-map (lambda (s)
+		  (/ s (coerce count element-type)))
+		sum-result)
         (/ sum-result (coerce count element-type)))))
 
-
-(defun vt-average (tensor weights &key axis)
+(defun vt-average (tensor weights &key axis keepdims)
   "计算加权平均值.
    tensor: 输入张量.
    weights: 权重张量 (形状必须可与 tensor 广播).
-   axis: 归约轴."
+   axis: 归约轴.
+   keepdims: 是否保持维度."
   (declare (vt tensor weights))
-  ;; 1. 计算加权和: Sum(X * W)
-  ;; vt-map 会自动处理广播,生成中间张量,然后归约
-  (let* ((weighted-sum (vt-sum (vt-map #'* tensor weights) :axis axis))
-         ;; 2. 计算权重和: Sum(W)
-         ;; 必须对 weights 进行同样方式的归约
-         (sum-weights (vt-sum weights :axis axis)))
-    
-    ;; 3. 相除: Sum(X*W) / Sum(W)
-    ;; 这里的除法利用 vt-map 自动广播,处理张量/张量的点对点除法
+  (let* ((weighted-sum (vt-sum (vt-map #'* tensor weights)
+			       :axis axis
+			       :keepdims keepdims))
+         (sum-weights (vt-sum weights :axis axis
+				      :keepdims keepdims)))
     (if (vt-p weighted-sum)
         (vt-map (lambda (s w) 
                   (if (= w 0) 0.0d0 (/ s w))) 
                 weighted-sum 
                 sum-weights)
         (if (= sum-weights 0)
-	    0.0d0 
-	    (/ weighted-sum sum-weights)))))
+            0.0d0 
+            (/ weighted-sum sum-weights)))))
 
-(defun vt-var (tensor &key axis)
+(defun vt-var (tensor &key axis keepdims)
   "计算方差."
-  (let* ((mean-val (vt-mean tensor :axis axis)))
-    ;; 1. 计算差值
-    ;; 注意:mean-val 在 axis 模式下是张量,vt-map 会自动广播
-    (let ((diff (vt-map #'- tensor mean-val)))  
-      ;; 2. 计算差值的平方
-      (let ((sq-diff (vt-map (lambda (x) (* x x)) diff)))
-        ;; 3. 对平方求均值 (方差即差平方的均值)
-        ;; 复用 vt-mean 避免重复写除法逻辑
-        (vt-mean sq-diff :axis axis)))))
+  (let* ((mean-val (vt-mean tensor :axis axis
+				   :keepdims keepdims))
+         (diff (vt-map #'- tensor mean-val))  
+         (sq-diff (vt-map (lambda (x) (* x x)) diff)))
+    (vt-mean sq-diff :axis axis :keepdims keepdims)))
 
-(defun vt-std (tensor &key axis)
+(defun vt-std (tensor &key axis keepdims)
   "计算标准差."
-  (let ((variance (vt-var tensor :axis axis)))
-    ;; 对方差开根号
+  (let ((variance (vt-var tensor :axis axis
+				 :keepdims keepdims)))
     (if (vt-p variance)
         (vt-map #'sqrt variance)
         (sqrt variance))))
-
