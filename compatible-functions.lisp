@@ -183,7 +183,7 @@
       ;; 非连续:创建副本
       (vt-flatten vt)))
 
-(defun vt-squeeze (vt &optional axis)
+(defun vt-squeeze (vt &key axis)
   "移除长度为1的维度.
   axis: 指定轴(nil 表示移除所有长度为1的维度)
   返回: 张量视图"
@@ -239,6 +239,10 @@
                 :shape new-shape
                 :strides new-strides
                 :offset old-offset))))
+
+(defun vt-unsqueeze (vt axis)
+  "在指定位置插入新轴"
+  (vt-expand-dims vt axis))
 
 (defun vt-swapaxes (vt axis1 axis2)
   "交换数组的两个轴.

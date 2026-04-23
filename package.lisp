@@ -13,6 +13,9 @@
    :vt-shape
    :vt-size
 
+   :vt-squeeze
+   :vt-unsqueeze
+   :vt-expand-dims
    :vt-flatten
    :vt-flatten-sequence
    :vt-from-sequence
