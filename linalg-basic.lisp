@@ -12,14 +12,14 @@
   "矩阵迹: 对角线元素之和"
   (vt-sum (vt-diagonal matrix)))
 
-(defun vt-norm (vt &optional (axis nil))
+(defun vt-norm (vt &key (axis nil))
   "L2 范数 (欧几里得范数)"
   (let ((sq (vt-square vt)))
     (if axis
         (vt-sqrt (vt-sum sq :axis axis))
         (vt-sqrt (vt-sum sq)))))
 
-(defun vt-l1-norm (vt &optional (axis nil))
+(defun vt-l1-norm (vt &key (axis nil))
   "L1 范数"
   (if axis
       (vt-sum (vt-abs vt) :axis axis)

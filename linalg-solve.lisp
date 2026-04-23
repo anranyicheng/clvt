@@ -1,6 +1,5 @@
 (in-package :clvt)
 
-
 (defun vt-to-2d-array (vt)
   "将 2D VT 转为 Common Lisp 原生嵌套 Array"
   (let ((shape (vt-shape vt))
