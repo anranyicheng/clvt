@@ -73,6 +73,10 @@
   "计算逐元素 e^vt."
   (vt-map #'exp vt))
 
+(defun vt-pow (vt power)
+  "计算逐元素幂次方"
+  (vt-map (lambda (x) (expt x power)) vt))
+
 (defun vt-sqrt (vt)
   "计算逐元素平方根."
   (vt-map #'sqrt vt))

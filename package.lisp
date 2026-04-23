@@ -84,7 +84,7 @@
 
    :vt-exp
    :vt-sqrt
-
+   :vt-pow
    :vt-abs
    :vt-signum
 
