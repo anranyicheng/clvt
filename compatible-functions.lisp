@@ -439,6 +439,10 @@
             (incf cur-offset axis-size)))
         result))))
 
+(defun vt-concat (axis &rest vts)
+   "沿指定轴连接数组."
+  (apply #'vt-concatenate axis vts))
+
 (defun vt-stack (axis &rest vts)
   "沿新轴连接数组.
   axis: 新轴位置

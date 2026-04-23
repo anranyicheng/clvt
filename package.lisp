@@ -116,6 +116,7 @@
    :vt-std
 
    :vt-concatenate
+   :vt-concat
    :vt-clip
 
    :vt-sigmoid
