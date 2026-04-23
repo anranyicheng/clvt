@@ -102,6 +102,20 @@
 	     (setf data (coerce data 'vector))
 	     (vt-from-sequence data :type type)))))
 
+(defun vt-from-array (arr)
+  "从数组转vt, 维度不变"
+  (declare (array arr))
+  (let* ((shape (array-dimensions arr))
+	 (type (if (eq (array-element-type arr) 'fixnum)
+		   'fixnum
+		   'double-float))
+	 (vt (vt-zeros shape :type type)))
+    (dotimes (idx (reduce #'* shape))
+      (declare (fixnum idx))
+      (setf (row-major-aref (vt-data vt) idx)
+	    (coerce (row-major-aref arr idx) type)))
+    vt))
+
 (defun vt-flatten-to-nested (dims data)
   "将按行主序存储的一维向量 data 转换为符合 dims 维度的嵌套列表.
    (vt-flatten-to-nested (vt-shape vt) (vt-data vt))"

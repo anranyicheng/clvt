@@ -16,6 +16,7 @@
    :vt-flatten
    :vt-flatten-sequence
    :vt-from-sequence
+   :vt-from-array
    :vt-data->list
    :vt-take
    
