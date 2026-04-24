@@ -326,6 +326,8 @@ vt-diag
 vt-triu
 vt-tril
 vt-diagonal
+vt-qr
+vt-svd
 
 ;; 激活函数
 vt-sigmoid

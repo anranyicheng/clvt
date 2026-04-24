@@ -89,21 +89,63 @@
                 (t (error "~S 不是序列" s)))))
           (nreverse result)))))
 
-(defun vt-from-sequence (contents &key shape (type 'double-float))
-  (cond ((every #'numberp contents)
-	 (let* ((vt (vt-zeros
-		     (if shape shape
-			 (list (length contents)))
-		     :type type)))
-	   (setf contents (coerce contents 'vector))
-	   (dotimes (idx (length contents))
-	     (declare (fixnum idx))
-	     (setf (row-major-aref (vt-data vt) idx)
-		   (coerce (row-major-aref contents idx) type)))
-	   vt))
-	(t (let* ((data (vt-flatten-sequence contents)))
-	     (setf data (coerce data 'vector))
-	     (vt-from-sequence data :shape shape :type type)))))
+(defun vt-from-sequence (contents &key (type 'double-float))
+  "从嵌套序列创建张量。支持任意维度的规则嵌套列表或向量。
+   例如 (vt-from-sequence '((1 2) (3 4))) 返回形状为 (2 2) 的张量。
+   若传入一维序列，返回一维张量。"
+  ;; 辅助函数：递归推断形状并收集元素
+  (labels
+      ((infer-shape (seq)
+         "返回形状列表，同时检查是否规则。"
+         (if (or (listp seq)
+		 (typep seq 'vector))
+             (let ((len (length seq)))
+               (if (zerop len)
+                   (list 0)   ; 空序列作为一维0尺寸
+                   (let* ((first (elt seq 0))
+                          (rest-shape (when (or (listp first)
+						(typep first 'vector))
+                                        (infer-shape first))))
+                     (if rest-shape
+                         ;; 嵌套：所有子序列必须形状一致
+                         (cons
+			  len
+			  (loop for i from 1 below len
+                                for sub = (elt seq i)
+                                for sub-shape = (infer-shape sub)
+                                unless (equal sub-shape rest-shape)
+                                  do (error "不规则嵌套: 期望 ~A 但得到 ~A"
+					    rest-shape sub-shape)
+                                finally (return rest-shape)))
+                         ;; 叶子：一维
+                         (list len)))))
+             ;; 不是序列（但这种情况不应该发生，因为顶层是序列）
+             (error "无法从 ~A 创建张量" seq)))
+       (fill-tensor (data seq shape strides depth flat-idx)
+         (if (null shape)
+             ;; 到达叶子：写入元素
+             (setf (aref data flat-idx) (coerce seq type))
+             (let ((len (first shape))
+                   (stride (first strides)))
+               (loop for i from 0 below len
+                     for elem = (if (and (or (listp seq)
+					     (typep seq 'vector))
+                                         (< i (length seq)))
+                                    (elt seq i)
+                                    (error "序列长度不匹配"))
+                     for offset = (+ flat-idx (* i stride))
+                     do (fill-tensor data elem (rest shape) (rest strides)
+                                     (1+ depth) offset))))))
+    (let* ((shape (infer-shape contents))
+           (size (reduce #'* shape :initial-value 1))
+           (data (make-array size :element-type type
+				  :initial-element (coerce 0 type)))
+           (strides (vt-compute-strides shape)))
+      (fill-tensor data contents shape strides 0 0)
+      (%make-vt :data data
+		:shape shape
+		:strides strides
+		:offset 0))))
 
 (defun vt-from-array (arr)
   "从数组转vt, 维度不变"
