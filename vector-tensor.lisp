@@ -160,41 +160,11 @@
 	      :shape shape
 	      :strides (vt-compute-strides shape))))
 
-(defun make-normal-random-generator ()
-  "返回一个无参函数,每次调用返回一个标准正态随机数."
-  (let ((cached nil)          ;; 是否已有缓存的第二个值
-        (second-value nil))   ;; 缓存的第二个值
-    (lambda ()
-      (if cached
-          (progn
-            (setf cached nil)
-            second-value)
-          (let* ((u1 (random 1.0d0)) ;; (0,1) 均匀分布,避免 0 导致 log 爆炸
-                 (u2 (random 1.0d0))
-                 (r (sqrt (* -2.0d0 (log u1))))
-                 (theta (* 2.0d0 pi u2)))
-            (setf cached t
-                  second-value (* r (sin theta)))
-            (* r (cos theta)))))))
-
-(defun get-random-normal ()
-  "生成一个标准正态分布的随机数"
-  (funcall (make-normal-random-generator)))
-
 (defun vt-random (shape &key (type 'double-float))
   "创建随机数张量"
   (declare (list shape))
   (vt-map (lambda (x) (setf x (coerce (random 1.0) type)))
 	  (vt-zeros shape)))
-
-(defun vt-random-normal (shape)
-  "创建标准正态随机数张量"
-  (declare (list shape))
-  (vt-reshape
-   (vt-from-sequence
-    (loop repeat (vt-shape-to-size shape)
-	  collect (get-random-normal)))
-   shape))
 
 (defun vt-zeros (shape &key (type 'double-float))
   "创建全0张量."
@@ -694,10 +664,9 @@
 
 ;;; --- 高效迭代逻辑  ---
 (defmacro vt-do-each ((ptr-var val-var vt) &body body)
-  "高效遍历宏.
-   纯指针运算,无坐标转换开销,无内存分配.
-   ptr-var: 当前元素的物理索引.
-   val-var: 当前元素的值."
+  "高效遍历宏。
+   ptr-var: 当前元素的物理索引。
+   val-var: 当前元素的值。"
   (let ((rank-sym (gensym "RANK"))
         (shape-sym (gensym "SHAPE"))
         (strides-sym (gensym "STRIDES"))
@@ -709,22 +678,19 @@
             (,data-sym (vt-data ,vt))
             (,offset-sym (vt-offset ,vt))
             (,rank-sym (length ,shape-sym)))
-       ;; 使用局部递归函数
        (labels ((recurse (,depth-sym current-ptr)
                   (if (= ,depth-sym ,rank-sym)
-                      ;; 到达最内层:执行用户代码
-                      (let ((,val-var (aref ,data-sym current-ptr)))
-                        ;; 使用 symbol-macrolet 让 ptr-var 只读指向 current-ptr
-                        (symbol-macrolet ((,ptr-var current-ptr))
-                          ,@body))
-                      ;; 未到最内层:循环并移动指针
+                      ;; 到达最内层：绑定为普通变量，允许 declare ignore
+                      (let ((,ptr-var current-ptr)
+                            (,val-var (aref ,data-sym current-ptr)))
+                        (declare (ignorable ,ptr-var ,val-var))
+                        ,@body)
+                      ;; 中间维度：循环并累加指针
                       (let ((dim (nth ,depth-sym ,shape-sym))
                             (stride (nth ,depth-sym ,strides-sym)))
                         (loop for i from 0 below dim do
                           (recurse (1+ ,depth-sym) current-ptr)
-                          ;; 核心优化:循环内手动累加指针,避免乘法计算
                           (incf current-ptr stride))))))
-         ;; 从 offset 开始递归
          (recurse 0 ,offset-sym)))))
 
 (defun vt-copy-into (dest src)

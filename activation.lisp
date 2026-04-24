@@ -8,7 +8,7 @@
   "ReLU: max(0, x)"
   (vt-map (lambda (x) (max 0.0d0 x)) vt))
 
-(defun vt-leaky-relu (vt &optional (alpha 0.01d0))
+(defun vt-leaky-relu (vt &key (alpha 0.01d0))
   "Leaky ReLU: max(alpha * x, x)"
   (vt-map (lambda (x) (if (> x 0.0d0) x (* alpha x))) vt))
 

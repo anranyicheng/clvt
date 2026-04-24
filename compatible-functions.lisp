@@ -1,9 +1,8 @@
 ;;;; 扩展功能:对标 NumPy 函数
 (in-package :clvt)
 
-
 ;;; =========================================================================
-;;; 2. 数组属性补充
+;;; 0. 数组属性补充
 ;;; =========================================================================
 
 (defun vt-itemsize (vt)
@@ -55,7 +54,10 @@
     (loop for i from 0 below num
           for val = (+ start (* i step))
           do (setf (aref data i) (coerce val type)))
-    (%make-vt :data data :shape shape :strides '(1) :offset 0)))
+    (%make-vt :data data
+	      :shape shape
+	      :strides '(1)
+	      :offset 0)))
 
 (defun vt-full (shape fill-value &key (type 'double-float))
   "创建指定值填充的数组.
@@ -75,19 +77,24 @@
   vt: 输入张量
   type: 数据类型(默认与输入相同)
   返回: 张量"
-  (vt-zeros (vt-shape vt) :type (or type (vt-element-type vt))))
+  (vt-zeros (vt-shape vt)
+	    :type (or type (vt-element-type vt))))
 
 (defun vt-ones-like (vt &key (type nil))
   "创建与给定数组形状相同的全一数组."
-  (vt-ones (vt-shape vt) :type (or type (vt-element-type vt))))
+  (vt-ones (vt-shape vt)
+	   :type (or type (vt-element-type vt))))
 
 (defun vt-full-like (vt fill-value &key (type nil))
   "创建与给定数组形状相同的填充数组."
-  (vt-full (vt-shape vt) fill-value :type (or type (vt-element-type vt))))
+  (vt-full (vt-shape vt)
+	   fill-value
+	   :type (or type (vt-element-type vt))))
 
 (defun vt-empty-like (vt &key (type nil))
   "创建与给定数组形状相同的未初始化数组."
-  (vt-empty (vt-shape vt) :type (or type (vt-element-type vt))))
+  (vt-empty (vt-shape vt)
+	    :type (or type (vt-element-type vt))))
 
 (defun vt-random-int (low high &key (size nil) (type 'fixnum))
   "创建随机整数数组.
@@ -110,7 +117,8 @@
   (let* ((size (vt-shape-to-size shape))
          (data (make-array size :element-type type))
          (result (%make-vt :data data :shape shape 
-                           :strides (vt-compute-strides shape) :offset 0))
+                           :strides (vt-compute-strides shape)
+			   :offset 0))
          (rank (length shape)))
     ;; 递归填充
     (labels
@@ -184,24 +192,22 @@
       (vt-flatten vt)))
 
 (defun vt-squeeze (vt &key axis)
-  "移除长度为1的维度.
-  axis: 指定轴(nil 表示移除所有长度为1的维度)
-  返回: 张量视图"
+  "移除长度为1的维度。支持负轴。"
   (let* ((old-shape (vt-shape vt))
          (old-strides (vt-strides vt))
          (old-offset (vt-offset vt)))
     (if axis
-        ;; 移除指定轴
-        (let ((axis-size (nth axis old-shape)))
+        (let* ((ax (vt-normalize-axis axis (length old-shape)))  ; 规范化
+               (axis-size (nth ax old-shape)))
           (unless (= axis-size 1)
             (error "无法挤压非单例维度: axis ~A 大小为 ~A" axis axis-size))
           (%make-vt :data (vt-data vt)
-                    :shape (append (subseq old-shape 0 axis)
-                                   (subseq old-shape (1+ axis)))
-                    :strides (append (subseq old-strides 0 axis)
-                                     (subseq old-strides (1+ axis)))
+                    :shape (append (subseq old-shape 0 ax)
+                                   (subseq old-shape (1+ ax)))
+                    :strides (append (subseq old-strides 0 ax)
+                                     (subseq old-strides (1+ ax)))
                     :offset old-offset))
-        ;; 移除所有长度为1的维度
+        ;; 移除所有长度为1的维度（保持不变）
         (let ((new-shape '())
               (new-strides '()))
           (loop for dim in old-shape
@@ -209,7 +215,6 @@
                 when (> dim 1)
                   do (push dim new-shape)
                      (push stride new-strides))
-          ;; 如果所有维度都是1,返回标量视图
           (when (null new-shape)
             (setf new-shape nil
                   new-strides nil))
@@ -229,12 +234,14 @@
          (actual-axis (if (< axis 0) (+ rank axis 1) axis)))
     (when (or (< actual-axis 0) (> actual-axis rank))
       (error "轴 ~A 越界(秩 ~A)" axis rank))
-    (let ((new-shape (append (subseq old-shape 0 actual-axis)
-                             (list 1)
-                             (subseq old-shape actual-axis)))
-          (new-strides (append (subseq old-strides 0 actual-axis)
-                               (list 0)  ; 新轴步长为0
-                               (subseq old-strides actual-axis))))
+    (let ((new-shape
+	    (append (subseq old-shape 0 actual-axis)
+                    (list 1)
+                    (subseq old-shape actual-axis)))
+          (new-strides
+	    (append (subseq old-strides 0 actual-axis)
+                    (list 0)  ; 新轴步长为0
+                    (subseq old-strides actual-axis))))
       (%make-vt :data (vt-data vt)
                 :shape new-shape
                 :strides new-strides
@@ -252,135 +259,83 @@
                                        ((= i axis2) axis1)
                                        (t i)))))
 
+(defun vt-broadcast-to (vt new-shape)
+  "将张量广播到新形状，返回零拷贝视图"
+  (let* ((old-shape (vt-shape vt))
+         (broadcast-shape (vt-broadcast-shapes old-shape new-shape)))
+    (unless (equal broadcast-shape new-shape)
+      (error "形状 ~A 不能广播到 ~A" old-shape new-shape))
+    (%make-vt :data (vt-data vt)
+              :shape new-shape
+              :strides (vt-broadcast-strides
+			old-shape new-shape (vt-strides vt))
+              :offset (vt-offset vt))))
+
+(defun vt-repeat (vt repeats &key axis)
+  "重复数组元素。重写为切片拼接方式。
+   修正：正确处理rep=0、apply调用、空结果情形。"
+  (if (null axis)
+      ;; 展平后重复
+      (let* ((flat (vt-flatten vt))
+             (size (vt-size flat))
+             (reps (if (listp repeats)
+		       repeats
+		       (make-list size :initial-element repeats)))
+             (parts
+	       (loop for i from 0 below size
+                     for rep in reps
+                     for val = (vt-ref flat i)
+                     when (> rep 0)
+                       collect (make-vt (list rep) val
+					:type (vt-element-type vt)))))
+        (if parts
+            (apply #'vt-concatenate 0 parts)
+            (vt-zeros (list 0) :type (vt-element-type vt))))
+      ;; 沿轴重复
+      (let* ((sh (vt-shape vt))
+             (ax (vt-normalize-axis axis (length sh)))
+             (ax-size (nth ax sh))
+             (reps (if (listp repeats)
+                       repeats
+                       (make-list ax-size :initial-element repeats)))
+             (slices
+	       (loop for i from 0 below ax-size
+                     for rep in reps
+                     for part = (apply #'vt-slice vt
+                                       (loop for d from 0 below (length sh)
+                                             collect
+					     (if (= d ax)
+                                                 `(,i ,(1+ i)) :all)))
+                     when (> rep 0)
+                       collect (if (= rep 1)
+                                   part
+                                   (apply #'vt-concatenate ax
+                                          (loop repeat rep collect part))))))
+        (if slices
+            (apply #'vt-concatenate ax slices)
+            (let ((zero-shape (copy-list sh)))
+              (setf (nth ax zero-shape) 0)
+              (vt-zeros zero-shape :type (vt-element-type vt)))))))
+
 (defun vt-tile (vt reps)
   "重复数组构造新数组.
   vt: 输入张量
   reps: 每个维度的重复次数列表
   返回: 新张量"
-  (let* ((old-shape (vt-shape vt))
-         (old-rank (length old-shape))
-         (reps-len (length reps)))
-    ;; 扩展 reps 到相同维度
-    (when (< reps-len old-rank)
-      (setf reps (append (make-list (- old-rank reps-len)
-				    :initial-element 1) reps)))
-    (when (> reps-len old-rank)
-      (setf old-shape (append (make-list (- reps-len old-rank)
-					 :initial-element 1)
-			      old-shape)))
-    
-    (let* ((new-shape (mapcar #'* old-shape reps))
-           (result (vt-zeros new-shape :type (vt-element-type vt)))
-           (rank (length new-shape)))
-      ;; 拷贝数据
-      (labels
-	  ((recurse (depth out-idx base-idx)
-             (declare (type fixnum depth out-idx base-idx))
-             (if (= depth rank)
-                 (setf (aref (vt-data result) out-idx)
-                       (aref (vt-data vt) base-idx))
-                 (let ((dim (nth depth old-shape))
-                       (rep (nth depth reps)))
-                   (loop
-		     for r from 0 below rep
-                     do (loop
-			  for i from 0 below dim
-                          do (let ((out-stride
-				     (nth depth (vt-strides result)))
-                                   (in-stride
-				     (if (< depth (length (vt-strides vt)))
-                                         (nth depth (vt-strides vt))
-                                         0)))
-                               (recurse (1+ depth)
-                                        (+ out-idx
-					   (* (+ (* r dim)
-						 i)
-					      out-stride))
-                                        (if in-stride
-					    (+ base-idx
-					       (* i in-stride))
-					    base-idx)))))))))
-        (recurse 0 0 (vt-offset vt)))
-      result)))
-
-(defun vt-repeat (vt repeats &key axis)
-  "重复数组元素.
-  repeats: 整数或整数列表
-  axis: 指定轴(nil 表示展平后重复)
-  返回: 新张量"
-  (cond
-    ;; 无 axis:展平后重复
-    ((null axis)
-     (let* ((flat (vt-flatten vt))
-            (size (vt-size flat))
-            (data (vt-data flat)))
-       (if (listp repeats)
-           ;; 不同元素不同重复次数
-           (let* ((total-size (reduce #'+ repeats))
-                  (result-data
-		    (make-array total-size
-				:element-type (vt-element-type vt)))
-                  (idx 0))
-             (loop for i from 0 below size
-                   for rep in repeats
-                   do (loop for r from 0 below rep
-                            do (setf (aref result-data idx) (aref data i))
-                               (incf idx)))
-             (%make-vt :data result-data :shape (list total-size)
-                       :strides '(1) :offset 0))
-           ;; 所有元素相同重复次数
-           (let* ((total-size (* size repeats))
-                  (result-data
-		    (make-array total-size
-				:element-type (vt-element-type vt)))
-                  (idx 0))
-             (loop for i from 0 below size
-                   do (loop for r from 0 below repeats
-                            do (setf (aref result-data idx) (aref data i))
-                               (incf idx)))
-             (%make-vt :data result-data :shape (list total-size)
-                       :strides '(1) :offset 0)))))
-    ;; 有 axis:沿轴重复
-    (t
-     (let* ((old-shape (vt-shape vt))
-            (axis-size (nth axis old-shape))
-            (reps (if (listp repeats)
-		      repeats
-		      (make-list axis-size :initial-element repeats)))
-            (new-axis-size (reduce #'+ reps))
-            (new-shape (copy-list old-shape)))
-       (setf (nth axis new-shape) new-axis-size)
-       (let ((result (vt-zeros new-shape :type (vt-element-type vt))))
-         ;; 实现沿轴重复
-         (labels
-	     ((recurse (depth in-ptr out-ptr)
-                (declare (type fixnum depth in-ptr out-ptr))
-                (if (= depth axis)
-                    ;; 沿重复轴处理
-                    (let ((in-stride (nth depth (vt-strides vt)))
-                          (out-stride (nth depth (vt-strides result))))
-                      (loop
-			for i from 0 below axis-size
-                        for rep in reps
-                        do (loop
-			     for r from 0 below rep
-                             do (setf (aref (vt-data result) out-ptr)
-                                      (aref (vt-data vt) in-ptr))
-                                (incf out-ptr out-stride))
-                           (incf in-ptr in-stride)))
-                    ;; 其他维度
-                    (if (= depth (length old-shape))
-                        nil
-                        (let ((dim (nth depth old-shape))
-                              (in-stride (nth depth (vt-strides vt)))
-                              (out-stride (nth depth (vt-strides result))))
-                          (loop
-			    for i from 0 below dim
-                            do (recurse (1+ depth)
-					(+ in-ptr (* i in-stride))
-					(+ out-ptr (* i out-stride)))))))))
-           (recurse 0 (vt-offset vt) 0))
-         result)))))
+  (let* ((sh (vt-shape vt))
+         (reps (if (listp reps) reps (list reps)))
+         (ndim (max (length sh) (length reps)))
+         (full-sh (append (make-list (- ndim (length sh))
+				     :initial-element 1) sh))
+         (full-reps (append (make-list (- ndim (length reps))
+				       :initial-element 1)
+			    reps))
+         (result vt))
+    (loop for axis from 0 below ndim
+          for rep = (nth axis full-reps)
+          when (> rep 1)
+            do (setf result (vt-repeat result rep :axis axis)))
+    (vt-reshape result (mapcar #'* full-sh full-reps))))
 
 ;;; ===========================================
 ;;; 3. 数组连接与分割
@@ -440,7 +395,7 @@
         result))))
 
 (defun vt-concat (axis &rest vts)
-   "沿指定轴连接数组."
+  "沿指定轴连接数组."
   (apply #'vt-concatenate axis vts))
 
 (defun vt-stack (axis &rest vts)
@@ -461,7 +416,8 @@
     
     ;; 沿 axis 扩展每个数组维度
     (let ((expanded-vts
-	    (mapcar (lambda (vt) (vt-expand-dims vt axis)) vts)))
+	    (mapcar (lambda (vt) (vt-expand-dims vt axis))
+		    vts)))
       (apply #'vt-concatenate axis expanded-vts))))
 
 (defun vt-vstack (&rest vts)
@@ -483,15 +439,15 @@
 
 (defun vt-vsplit (vt indices-or-sections)
   "垂直分割(沿轴0)"
-  (vt-array-split vt indices-or-sections :axis 0))
+  (vt-split vt indices-or-sections :axis 0))
 
 (defun vt-hsplit (vt indices-or-sections)
   "水平分割(沿轴1)"
-  (vt-array-split vt indices-or-sections :axis 1))
+  (vt-split vt indices-or-sections :axis 1))
 
 (defun vt-dsplit (vt indices-or-sections)
   "深度分割(沿轴2)"
-  (vt-array-split vt indices-or-sections :axis 2))
+  (vt-split vt indices-or-sections :axis 2))
 
 ;;; ===========================================
 ;;; 4. 统计扩展
@@ -605,7 +561,8 @@
              (axis-size (nth axis shape))
              (out-shape (loop for d in shape for i from 0
 			      unless (= i axis) collect d))
-             (result (vt-zeros out-shape :type (vt-element-type tensor))))
+             (result (vt-zeros out-shape
+			       :type (vt-element-type tensor))))
         ;; 对每个切片排序并取中位数
         (labels
 	    ((recurse (depth in-ptr out-ptr)
@@ -722,8 +679,10 @@
 (defun vt-ptp (tensor &key axis)
   "峰-峰值(最大值 - 最小值)"
   (if axis
-      (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
-      (- (vt-amax tensor) (vt-amin tensor))))
+      (vt-- (vt-amax tensor :axis axis)
+	    (vt-amin tensor :axis axis))
+      (- (vt-amax tensor)
+	 (vt-amin tensor))))
 
 (defun vt-histogram (tensor &key bins range density)
   "计算直方图.
@@ -740,7 +699,8 @@
          (bin-width (/ (- data-max data-min) bins))
          (hist (make-array bins :element-type 'double-float
 				:initial-element 0.0d0))
-         (bin-edges (make-array (1+ bins) :element-type 'double-float)))
+         (bin-edges (make-array (1+ bins)
+				:element-type 'double-float)))
     
     ;; 生成 bin edges
     (loop for i from 0 to bins
@@ -773,22 +733,34 @@
 
 (defun vt-logical-and (t1 t2)
   "逻辑与"
-  (vt-map (lambda (a b) (if (and (/= a 0) (/= b 0)) 1.0d0 0.0d0))
+  (vt-map (lambda (a b)
+	    (if (and (/= a 0)
+		     (/= b 0))
+		1.0d0 0.0d0))
 	  t1 t2))
 
 (defun vt-logical-or (t1 t2)
   "逻辑或"
-  (vt-map (lambda (a b) (if (or (/= a 0) (/= b 0)) 1.0d0 0.0d0))
+  (vt-map (lambda (a b)
+	    (if (or (/= a 0)
+		    (/= b 0))
+		1.0d0 0.0d0))
 	  t1 t2))
 
 (defun vt-logical-not (vt)
   "逻辑非"
-  (vt-map (lambda (a) (if (= a 0) 1.0d0 0.0d0)) vt))
+  (vt-map (lambda (a)
+	    (if (= a 0)
+		1.0d0 0.0d0))
+	  vt))
 
 (defun vt-logical-xor (t1 t2)
   "逻辑异或"
   (vt-map (lambda (a b) 
-            (if (/= (if (= a 0) 0 1) (if (= b 0) 0 1)) 1.0d0 0.0d0)) 
+            (if (/= (if (= a 0) 0 1)
+		    (if (= b 0) 0 1))
+		1.0d0
+		0.0d0)) 
           t1 t2))
 
 (defun vt-all (condition &key axis)
@@ -797,7 +769,9 @@
    0 (vt-reduce condition axis 1.0d0
                 (lambda (acc val)
                   (declare (type number acc val))
-                  (values (if (and (/= acc 0) (/= val 0)) 1.0d0 0.0d0) nil))
+                  (values (if (and (/= acc 0) (/= val 0))
+			      1.0d0 0.0d0)
+			  nil))
                 :return-arg nil)))
 
 (defun vt-any (condition &key axis)
@@ -806,14 +780,19 @@
    0 (vt-reduce condition axis 0.0d0
                 (lambda (acc val)
                   (declare (type number acc val))
-                  (values (if (or (/= acc 0) (/= val 0)) 1.0d0 0.0d0) nil))
+                  (values (if (or (/= acc 0) (/= val 0))
+			      1.0d0 0.0d0)
+			  nil))
                 :return-arg nil)))
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个数组元素是否在容差范围内接近"
   (vt-map (lambda (a b)
             (let ((diff (abs (- a b))))
-              (if (<= diff (+ atol (* rtol (max (abs a) (abs b)))))
+              (if (<= diff (+ atol
+			      (* rtol
+				 (max (abs a)
+				      (abs b)))))
                   1.0d0 0.0d0)))
           t1 t2))
 
@@ -913,7 +892,9 @@
              (axis-size (nth axis shape))
              (out-shape
 	       (loop
-		 for d in shape for i from 0 unless (= i axis) collect d))
+		 for d in shape
+		 for i from 0
+		 unless (= i axis) collect d))
              (result (vt-zeros out-shape :type 'fixnum)))
         (labels
 	    ((recurse (depth in-ptr out-ptr)
@@ -1083,10 +1064,6 @@
   "将数值限制在指定范围内"
   (vt-map (lambda (x) (max min (min max x))) tensor))
 
-(defun vt-square (vt)
-  "平方"
-  (vt-map (lambda (x) (* x x)) vt))
-
 (defun vt-gradient (tensor &key spacing)
   "计算梯度"
   (declare (ignore spacing))
@@ -1123,10 +1100,13 @@
              (idx-flat (vt-flatten indices))
 	     (idx-data (vt-data idx-flat))
              (idx-size (vt-size idx-flat))
-             (out-shape (loop for d in shape for i from 0
-                              if (= i axis) collect idx-size
-				else collect d))
-             (result (vt-zeros out-shape :type (vt-element-type tensor))))
+             (out-shape (loop for d in shape
+			      for i from 0
+                              if (= i axis)
+				collect idx-size
+			      else collect d))
+             (result (vt-zeros out-shape
+			       :type (vt-element-type tensor))))
 	(when (eq (vt-element-type indices) 'double-float)
 	  (warn "vt-take indices element type if not fixnum")
 	  (setf idx-data (map 'vector #'truncate idx-data)))
@@ -1195,7 +1175,8 @@
           do (when (or (< idx 0) (>= idx size))
                (error "索引 ~A 越界" idx))
              (setf (aref data idx)
-		   (aref val-data (mod i (vt-size val-flat)))))
+		   (aref val-data
+			 (mod i (vt-size val-flat)))))
     tensor))
 
 (defun vt-choose (choices indices)
@@ -1204,7 +1185,8 @@
          (idx-flat (vt-flatten indices))
          (idx-data (vt-data idx-flat))
          (idx-size (vt-size idx-flat))
-         (result-data (make-array idx-size :element-type 'double-float)))
+         (result-data (make-array idx-size
+				  :element-type 'double-float)))
     (loop for i from 0 below idx-size
           for idx = (aref idx-data i)
           do (when (or (< idx 0) (>= idx n-choices))
@@ -1228,3 +1210,252 @@
 		       (aref (vt-data (nth i choicelist)) ptr))
 		 (return)))
     result))
+
+(defun vt-flip (vt &key axis)
+  "沿指定轴翻转，返回零拷贝视图"
+  (if (null axis)
+      ;; 全部翻转
+      (let* ((strides (vt-strides vt))
+             (shape (vt-shape vt))
+             (new-strides (mapcar #'- strides))
+             (new-offset (+ (vt-offset vt)
+                            (loop for dim in shape
+                                  for stride in strides
+                                  sum (* (1- dim) stride)))))
+        (%make-vt :data (vt-data vt)
+                  :shape shape
+                  :strides new-strides
+                  :offset new-offset))
+      (let* ((rank (length (vt-shape vt)))
+             (ax (vt-normalize-axis axis rank))
+             (strides (copy-list (vt-strides vt)))
+             (dim (nth ax (vt-shape vt)))
+             (old-stride (nth ax strides)))
+        (setf (nth ax strides) (- old-stride))
+        (%make-vt :data (vt-data vt)
+                  :shape (vt-shape vt)
+                  :strides strides
+                  :offset (+ (vt-offset vt)
+			     (* (1- dim) old-stride))))))
+
+(defun vt-roll (vt shift &key axis)
+  "滚动元素。shift 可为整数或列表，axis 可为整数、列表或 nil。
+   多轴模式下 shift 与 axis 长度需相等。"
+  ;; 统一 shift 为列表
+  (let ((shift-list (if (listp shift) shift (list shift))))
+    (cond
+      ;; 多轴模式：axis 为列表
+      ((and axis (listp axis))
+       (let ((result (vt-copy vt)))
+         (loop for s in shift-list
+               for ax in axis
+               do (setf result (vt-roll result s :axis ax)))
+         result))
+      ;; 单轴模式：axis 为整数
+      (axis
+       (let* ((sh (vt-shape vt))
+              (ax (vt-normalize-axis axis (length sh)))
+              (n (nth ax sh))
+              (s (mod (car shift-list) n)))
+         (if (zerop s)
+             vt
+             (vt-concatenate
+	      ax
+              (apply #'vt-slice vt
+                     (loop for i from 0 below (length sh)
+                           collect (if (= i ax)
+                                       `(,(- n s) ,n) :all)))
+              (apply #'vt-slice vt
+                     (loop for i from 0 below (length sh)
+                           collect (if (= i ax)
+                                       `(0 ,(- n s)) :all)))))))
+      ;; axis = nil：展平后滚动并恢复形状
+      (t
+       (let* ((flat (vt-flatten vt))
+              (n (vt-size flat))
+              (s (mod (car shift-list) n)))
+         (if (zerop s)
+             (vt-reshape flat (vt-shape vt))
+             (vt-reshape (vt-concatenate
+			  0
+                          (vt-slice flat `(,(- n s) ,n))
+                          (vt-slice flat `(0 ,(- n s))))
+                         (vt-shape vt))))))))
+
+(defun vt-pad
+    (vt pad-width &key (mode :constant) (constant-values 0))
+  "对数组进行填充。pad-width 为 (before after) 对组成的列表，或整数。"
+  (declare (ignore mode))
+  (let* ((sh (vt-shape vt))
+         (rank (length sh))
+         (pad (if (atom pad-width)
+                  (loop repeat rank collect
+				    (list pad-width pad-width))
+                  pad-width))
+         (new-shape (loop for s in sh
+                          for (b a) in pad
+                          collect (+ s b a)))
+         (result (vt-zeros new-shape
+			   :type (vt-element-type vt))))
+    ;; 如果常数填充且非零，先填满常数
+    (when (and (numberp constant-values)
+	       (not (zerop constant-values)))
+      (setf result (vt-full new-shape constant-values
+			    :type (vt-element-type vt))))
+    ;; 将原始数据复制到填充区域内
+    (let ((region (apply #'vt-slice result
+                         (loop for s in sh
+                               for (b a) in pad
+                               collect `(,b ,(+ b s))))))
+      (setf region vt))
+    result))
+
+(defun vt-diff (vt &key (axis -1) (n 1))
+  "沿指定轴计算 n 阶差分"
+  (let ((result vt))
+    (loop repeat n do
+      (let* ((ax (vt-normalize-axis axis (length (vt-shape result))))
+             (len (nth ax (vt-shape result)))
+             (left (apply #'vt-slice result
+                          (loop for i from 0 below
+					     (length (vt-shape result))
+                                collect (if (= i ax)
+					    '(1 nil)
+					    :all))))
+             (right (apply #'vt-slice result
+                           (loop for i from 0 below
+					      (length (vt-shape result))
+                                 collect (if (= i ax)
+					     `(0 ,(1- len))
+					     :all)))))
+        (setf result (vt-- left right)))
+	  finally (return result))))
+
+(defun vt-bincount (x &key (minlength 0))
+  "统计非负整数数组中每个值出现的次数。"
+  (let* ((flat (vt-flatten x))
+         (maxval (if (zerop (vt-size flat)) -1 (vt-amax flat)))
+         (size (max (1+ maxval) minlength))
+         (result (make-array size :element-type 'fixnum
+				  :initial-element 0)))
+    (vt-do-each (ptr val flat)
+      (declare (ignore ptr))
+      (incf (aref result (truncate val))))
+    (%make-vt :data result :shape (list size)
+	      :strides '(1) :offset 0)))
+
+(defun vt-digitize (x bins &key (right nil))
+  "返回输入值在 bins 中的索引。"
+  (let* ((flat-x (vt-flatten x))
+         (flat-bins (vt-flatten bins))
+         (bin-data (vt-data flat-bins))
+         (nbins (vt-size flat-bins))
+         (result (make-array (vt-size flat-x)
+			     :element-type 'fixnum)))
+    (vt-do-each (ptr val flat-x)
+      (let ((idx (loop for i from 0 below nbins
+                       until (if right
+				 (< val (aref bin-data i))
+                                 (<= val (aref bin-data i)))
+                       finally (return i))))
+        (setf (aref result ptr) idx)))
+    (%make-vt :data result
+	      :shape (vt-shape flat-x)
+	      :strides '(1)
+	      :offset 0)))
+
+(defun vt-correlate (a v &key (mode "full"))
+  "一维互相关 (不翻转 v)。"
+  (let* ((a-flat (vt-flatten a))
+         (v-flat (vt-flatten v))
+         (n (vt-size a-flat))
+         (m (vt-size v-flat))
+         (a-data (vt-data a-flat))
+         (v-data (vt-data v-flat)))
+    ;; 根据移位 k 计算，k = 输出索引 - (m-1)
+    (flet ((compute-one (k)
+             (let ((sum 0.0))
+               (loop for j from (max 0 (- k)) below (min m (- n k))
+                     do (incf sum (* (aref a-data (+ j k))
+                                     (aref v-data j))))
+               sum)))
+      (let ((result
+	      (ecase (intern (string-upcase mode) :keyword)
+                (:full  (let ((res (vt-zeros (list (+ n m -1)))))
+                          (loop for k from (- (1- m)) below n
+                                for i from 0
+                                do (setf (vt-ref res i) (compute-one k)))
+                          res))
+                (:valid (let* ((len (max 0 (- n (1- m))))
+                               (res (vt-zeros (list len))))
+                          (loop for k from 0 below len
+                                for i from 0
+                                do (setf (vt-ref res i) (compute-one k)))
+                          res))
+                (:same  (let* ((out-len (max n m))
+                               (res (vt-zeros (list out-len)))
+                               (start-k (- (floor out-len 2) (floor m 2))))
+                          (loop for i from 0 below out-len
+                                for k = (+ start-k i)
+                                do (setf (vt-ref res i) (compute-one k)))
+                          res)))))
+        result))))
+
+(defun vt-convolve (a v &key (mode "full"))
+  "一维卷积。"
+  (vt-correlate a (vt-flip v) :mode mode))
+
+;;; ===========================================
+;;; 12. 随机数扩展
+;;; ===========================================
+
+(defun make-normal-random-generator ()
+  "返回一个无参函数,每次调用返回一个标准正态随机数."
+  (let ((cached nil)          ;; 是否已有缓存的第二个值
+        (second-value nil))   ;; 缓存的第二个值
+    (lambda ()
+      (if cached
+          (progn
+            (setf cached nil)
+            second-value)
+          (let* ((u1 (random 1.0d0)) ;; (0,1) 均匀分布,避免 0 导致 log 爆炸
+                 (u2 (random 1.0d0))
+                 (r (sqrt (* -2.0d0 (log u1))))
+                 (theta (* 2.0d0 pi u2)))
+            (setf cached t
+                  second-value (* r (sin theta)))
+            (* r (cos theta)))))))
+
+(defvar *vt-normal-generator* (make-normal-random-generator))
+
+(defun vt-random-seed (seed)
+  "设置随机种子。seed 应为 nil, t, 或 random-state 对象。"
+  (setq *random-state*
+	(make-random-state
+	 (if (random-state-p seed)
+	     seed
+	     (make-random-state t))))
+  (setq *vt-normal-generator* (make-normal-random-generator)))
+
+(defun vt-random-uniform (shape &key (low 0.0d0) (high 1.0d0))
+  "生成均匀分布随机张量。"
+  (vt-map (lambda (x) (declare (ignore x))
+            (+ low (* (- high low) (random 1.0d0))))
+          (vt-zeros shape :type 'double-float)))
+
+(defun vt-random-normal (shape &key (mean 0.0d0) (std 1.0d0))
+  "生成正态分布随机张量。"
+  (let ((res (vt-zeros shape :type 'double-float)))
+    (vt-do-each (ptr val res)
+      (declare (ignore val))
+      (setf (aref (vt-data res) ptr)
+            (+ mean (* std (get-random-normal)))))
+    res))
+
+(defun vt-random-integers (low high &key (size nil) (type 'fixnum))
+  "生成随机整数张量。"
+  (vt-random-int low high :size size :type type))
+
+(defun get-random-normal ()
+  "返回标准正态分布随机数。"
+  (funcall *vt-normal-generator*))

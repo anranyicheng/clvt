@@ -165,7 +165,7 @@
 
 (defun vt-trancate (vt &optional (divisor 1))
   "向0取整"
-  (vt-map (lambda (x) (truncate x divisor))))
+  (vt-map (lambda (x) (truncate x divisor)) vt))
 
 (defun vt-log (vt &optional base)
   "以 base 为底的对数."
