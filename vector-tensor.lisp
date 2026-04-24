@@ -89,9 +89,12 @@
                 (t (error "~S 不是序列" s)))))
           (nreverse result)))))
 
-(defun vt-from-sequence (contents &key (type 'double-float))
+(defun vt-from-sequence (contents &key shape (type 'double-float))
   (cond ((every #'numberp contents)
-	 (let* ((vt (vt-zeros (list (length contents)) :type type)))
+	 (let* ((vt (vt-zeros
+		     (if shape shape
+			 (list (length contents)))
+		     :type type)))
 	   (setf contents (coerce contents 'vector))
 	   (dotimes (idx (length contents))
 	     (declare (fixnum idx))
@@ -100,7 +103,7 @@
 	   vt))
 	(t (let* ((data (vt-flatten-sequence contents)))
 	     (setf data (coerce data 'vector))
-	     (vt-from-sequence data :type type)))))
+	     (vt-from-sequence data :shape shape :type type)))))
 
 (defun vt-from-array (arr)
   "从数组转vt, 维度不变"
@@ -1095,8 +1098,6 @@
 	      final-val))
         ;; 其余情况（轴向归约，或 keepdims=T），均返回 VT 结构体
         (values res res-idx))))
-
-
 
 (defun vt-matmul (vt1 vt2)
   (cond ((= 2

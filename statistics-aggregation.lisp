@@ -1,5 +1,13 @@
 (in-package :clvt)
 
+(defun vt-maximum (t1 t2)
+  "逐元素取两数组中较大者"
+  (vt-map (lambda (a b) (max a b)) t1 t2))
+
+(defun vt-minimum (t1 t2)
+  "逐元素取两数组中较小者"
+  (vt-map (lambda (a b) (min a b)) t1 t2))
+
 (defun vt-sum (tensor &key axis keepdims)
   "求和. 自动适配 int/float 类型."
   (let ((element-type (array-element-type (vt-data tensor))))

@@ -192,6 +192,8 @@
    :vt-convolve
    :vt-sort
    :vt-argsort
+   :vt-maximum
+   :vt-minimum
 
    ;; 线性代数
    :vt-matmul
