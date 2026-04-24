@@ -96,6 +96,48 @@
   (vt-empty (vt-shape vt)
 	    :type (or type (vt-element-type vt))))
 
+
+(defun vt-identity (n &key (type 'double-float))
+  "创建 n×n 单位矩阵。"
+  (vt-eye n :type type))
+
+(defun vt-logspace
+    (start stop num &key (base 10.0d0) (endpoint t)
+		      (type 'double-float))
+  "返回对数间隔的 1D 张量。"
+  (vt-map (lambda (x) (expt base x))
+          (vt-linspace start stop num :endpoint endpoint
+				      :type type)))
+
+(defun vt-kron (a b)
+  "计算两个张量的 Kronecker 积。"
+  (let ((a-shape (vt-shape a))
+        (b-shape (vt-shape b)))
+    (if (and (= (length a-shape) 2)
+	     (= (length b-shape) 2))
+        ;; 2D 情况
+        (let* ((ma (first a-shape))
+	       (na (second a-shape))
+               (mb (first b-shape))
+	       (nb (second b-shape))
+               (out (vt-zeros (list (* ma mb) (* na nb)))))
+          (loop
+	    for i from 0 below ma
+            do (loop
+		 for j from 0 below na
+                 for aij = (vt-ref a i j)
+                 do (loop
+		      for p from 0 below mb
+                      do (loop
+			   for q from 0 below nb
+                           do (setf (vt-ref out
+					    (+ (* i mb) p)
+					    (+ (* j nb) q))
+                                    (* aij (vt-ref b p q)))))))
+          out)
+        ;; 高维：递归展平后计算再 reshape
+        (error "vt-kron for >2D not implemented yet"))))
+
 (defun vt-random-int (low high &key (size nil) (type 'fixnum))
   "创建随机整数数组.
   low: 下界(包含)
@@ -1404,6 +1446,74 @@
 (defun vt-convolve (a v &key (mode "full"))
   "一维卷积。"
   (vt-correlate a (vt-flip v) :mode mode))
+
+
+(defun vt-trapz (y &key (x nil) (dx 1.0d0) (axis -1))
+  "使用梯形法则沿指定轴积分。"
+  (let* ((ax (vt-normalize-axis axis (length (vt-shape y))))
+         (x-vt (if x
+                   (ensure-vt x)
+                   (vt-arange (nth ax (vt-shape y))
+			      :step dx
+			      :type 'double-float))))
+    (unless (= (vt-size x-vt) (nth ax (vt-shape y)))
+      (error "x 长度与 y 的 axis 维度不匹配"))
+    (vt-sum
+     (vt-map
+      (lambda (a b h) (* 0.5d0 (+ a b) h))
+      (apply #'vt-slice
+	     y
+	     (loop for i below (length (vt-shape y))
+                   collect (if (= i ax) '(0 -1) :all)))
+      (apply #'vt-slice
+	     y
+	     (loop for i below (length (vt-shape y))
+                   collect (if (= i ax) '(1 nil) :all)))
+      (vt-diff x-vt :axis ax))
+     :axis ax)))
+
+(defun vt-interp (x xp fp &key (left nil) (right nil))
+  "一维线性插值。x, xp, fp 均为 1D 张量。"
+  (let* ((xp-data (vt-data xp))
+         (fp-data (vt-data fp))
+         (n (vt-size xp)))
+    (assert (= (vt-size fp) n))
+    (vt-map
+     (lambda (xi)
+       (if (<= xi (aref xp-data 0))
+           (if left left (aref fp-data 0))
+           (if (>= xi (aref xp-data (1- n)))
+               (if right right (aref fp-data (1- n)))
+               (loop for i from 0 below (1- n)
+                     when (and (>= xi (aref xp-data i))
+                               (<= xi (aref xp-data (1+ i))))
+                       return
+		       (+ (aref fp-data i)
+			  (* (- (aref fp-data (1+ i))
+				(aref fp-data i))
+                             (/ (- xi (aref xp-data i))
+                                (- (aref xp-data (1+ i))
+				   (aref xp-data i)))))))))
+     x)))
+
+(defun vt-hypot (t1 &optional t2)
+  "计算 (|t1|^2 + |t2|^2)^0.5。支持广播。"
+  (vt-sqrt (vt-+ (vt-square t1) (vt-square (if t2 t2 0)))))
+
+(defun vt-sinc (tensor)
+  "计算 sinc(x) = sin(pi*x) / (pi*x)，对 x=0 返回 1。"
+  (let* ((x*pi (vt-scale tensor pi)))
+    (vt-map (lambda (x)
+              (if (zerop x) 1.0d0 (/ (sin x) x)))
+            x*pi)))
+
+(defun vt-deg2rad (tensor)
+  "角度转弧度。"
+  (vt-scale tensor (/ pi 180.0d0)))
+
+(defun vt-rad2deg (tensor)
+  "弧度转角度。"
+  (vt-scale tensor (/ 180.0d0 pi)))
 
 ;;; ===========================================
 ;;; 12. 随机数扩展

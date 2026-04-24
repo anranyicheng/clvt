@@ -130,9 +130,9 @@
   "判断是否为奇数. 返回 1.0 或 0.0."
   (vt-map (lambda (v) (if (oddp (floor v)) 1.0d0 0.0d0)) vt))
 
-(defun vt-expt (vt-base power-num)
+(defun vt-expt (vt power-num)
   "逐元素幂运算."
-  (vt-map (lambda (x) (expt x power-num)) vt-base))
+  (vt-map (lambda (x) (expt x power-num)) vt))
 
 (defun vt-mod (vt divisor)
   "逐元素取模."
