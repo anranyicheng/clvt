@@ -45,6 +45,10 @@
    :vt--
    :vt-*
    :vt-/
+   :vt-add
+   :vt-sub
+   :vt-mul
+   :vt-div
    
    :vt-scale
    :vt-matmul

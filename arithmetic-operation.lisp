@@ -7,9 +7,15 @@
    自动优化: 多参数时单次遍历."
   (apply #'vt-map #'+ args))
 
+(defun vt-add (&rest args)
+  (apply #'vt-+ args))
+
 (defun vt-* (&rest args)
   "逐元素乘法. 支持标量、列表、张量混合."
   (apply #'vt-map #'* args))
+
+(defun vt-mul (&rest args)
+  (apply #'vt-* args))
 
 (defun vt-- (vt &rest args)
   "逐元素减法.
@@ -18,8 +24,10 @@
   (let ((first-vt (ensure-vt vt)))
     (if (null args)
         (vt-map #'- first-vt)
-        ;; 将 first-vt 放在最前面,一次性传入
         (apply #'vt-map #'- first-vt args))))
+
+(defun vt-sub (vt &rest args)
+  (apply #'vt-- vt args))
 
 (defun vt-/ (vt &rest args)
   "逐元素除法.
@@ -29,6 +37,9 @@
     (if (null args)
         (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
         (apply #'vt-map #'/ first-vt args))))
+
+(defun vt-div (vt &rest args)
+  (apply #'vt-/ vt args))
 
 (defun vt-scale (a b)
   "将张量 TENSOR 的所有元素乘以标量 SCALAR, 返回新的张量."
@@ -76,6 +87,10 @@
 (defun vt-pow (vt power)
   "计算逐元素幂次方"
   (vt-map (lambda (x) (expt x power)) vt))
+
+(defun vt-square (vt)
+  "计算逐元素平方"
+  (vt-pow vt 2))
 
 (defun vt-sqrt (vt)
   "计算逐元素平方根."
