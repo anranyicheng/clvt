@@ -262,7 +262,6 @@
    :vt-compute-strides
    :vt-compute-logical-strides
    :vt-ensure-shape-compatible
-   :vt-base
 
    ;; 打印与调试
    :print-vt-recursive

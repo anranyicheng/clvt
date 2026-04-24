@@ -111,11 +111,12 @@ CLVT> *m*
     [ 24,  25,  26]]]>
 
 ```
+
 ``` common lisp
 
 ;; 已经实现并导出的函数有
 ;; 张量结构访问器
-:vt
+vt
 vt-shape
 vt-strides
 vt-offset
