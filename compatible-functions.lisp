@@ -294,17 +294,23 @@
   (vt-expand-dims vt axis))
 
 (defun vt-swapaxes (vt axis1 axis2)
-  "交换数组的两个轴.
-  返回: 张量视图"
-  (vt-transpose vt (loop for i from 0 below (length (vt-shape vt))
-                         collect (cond ((= i axis1) axis2)
-                                       ((= i axis2) axis1)
-                                       (t i)))))
+  "交换数组的两个轴。axis1 和 axis2 支持负数索引。
+   返回：张量视图。"
+  (let* ((rank (length (vt-shape vt)))
+         (ax1 (vt-normalize-axis axis1 rank))
+         (ax2 (vt-normalize-axis axis2 rank)))
+    (vt-transpose
+     vt
+     (loop for i from 0 below rank
+           collect (cond ((= i ax1) ax2)
+                         ((= i ax2) ax1)
+                         (t i))))))
 
 (defun vt-broadcast-to (vt new-shape)
   "将张量广播到新形状，返回零拷贝视图"
   (let* ((old-shape (vt-shape vt))
-         (broadcast-shape (vt-broadcast-shapes old-shape new-shape)))
+         (broadcast-shape
+	   (vt-broadcast-shapes old-shape new-shape)))
     (unless (equal broadcast-shape new-shape)
       (error "形状 ~A 不能广播到 ~A" old-shape new-shape))
     (%make-vt :data (vt-data vt)
@@ -506,38 +512,37 @@
 
 (defun vt-cumsum (tensor &key axis)
   "累积和.
-  axis: 归约轴(nil 表示展平后计算)
-  返回: 新张量"
+   axis 支持负数.
+   返回新张量"
   (if axis
-      ;; 沿轴累积
       (let* ((shape (vt-shape tensor))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))          
              (result (vt-copy tensor)))
         (labels
 	    ((recurse (depth in-ptr out-ptr)
                (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth axis)
+               (if (= depth ax)                      
                    ;; 沿累积轴处理
                    (let* ((dim (nth depth shape))
                           (in-stride (nth depth (vt-strides tensor)))
                           (out-stride (nth depth (vt-strides result)))
                           (sum 0.0d0))
-                     (loop
-		       for i from 0 below dim
-                       do (incf sum (aref (vt-data tensor) in-ptr))
-                          (setf (aref (vt-data result) out-ptr) sum)
-                          (incf in-ptr in-stride)
-                          (incf out-ptr out-stride)))
+                     (loop for i from 0 below dim
+                           do (incf sum (aref (vt-data tensor) in-ptr))
+                              (setf (aref (vt-data result) out-ptr) sum)
+                              (incf in-ptr in-stride)
+                              (incf out-ptr out-stride)))
                    ;; 其他维度
-                   (if (= depth (length shape))
-                       nil
-                       (let ((dim (nth depth shape))
-                             (in-stride (nth depth (vt-strides tensor)))
-                             (out-stride (nth depth (vt-strides result))))
-                         (loop
-			   for i from 0 below dim
-                           do (recurse (1+ depth)
-                                       (+ in-ptr (* i in-stride))
-                                       (+ out-ptr (* i out-stride)))))))))
+                   (when (< depth rank)
+                     (let ((dim (nth depth shape))
+                           (in-stride (nth depth (vt-strides tensor)))
+                           (out-stride (nth depth (vt-strides result))))
+                       (loop for i from 0 below dim
+                             do (recurse
+				 (1+ depth)
+                                 (+ in-ptr (* i in-stride))
+                                 (+ out-ptr (* i out-stride)))))))))
           (recurse 0 (vt-offset tensor) 0))
         result)
       ;; 展平后累积
@@ -551,37 +556,36 @@
         result)))
 
 (defun vt-cumprod (tensor &key axis)
-  "累积积"
+  "累积积.
+   axis 支持负数.
+    返回新张量"
   (if axis
       (let* ((shape (vt-shape tensor))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))   
              (result (vt-copy tensor)))
         (labels
 	    ((recurse (depth in-ptr out-ptr)
                (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth axis)
+               (if (= depth ax)               
                    (let* ((dim (nth depth shape))
                           (in-stride (nth depth (vt-strides tensor)))
                           (out-stride (nth depth (vt-strides result)))
                           (prod 1.0d0))
-                     (loop
-		       for i from 0 below dim
-                       do (setf prod (* prod
-					(aref (vt-data tensor) in-ptr)))
-                          (setf (aref (vt-data result) out-ptr) prod)
-                          (incf in-ptr in-stride)
-                          (incf out-ptr out-stride)))
-                   (if (= depth (length shape))
-                       nil
-                       (let ((dim (nth depth shape))
-                             (in-stride (nth depth (vt-strides tensor)))
-                             (out-stride (nth depth (vt-strides result))))
-                         (loop
-			   for i from 0 below dim
-                           do (recurse (1+ depth)
-                                       (+ in-ptr
-					  (* i in-stride))
-                                       (+ out-ptr
-					  (* i out-stride)))))))))
+                     (loop for i from 0 below dim
+                           do (setf prod (* prod (aref (vt-data tensor) in-ptr)))
+                              (setf (aref (vt-data result) out-ptr) prod)
+                              (incf in-ptr in-stride)
+                              (incf out-ptr out-stride)))
+                   (when (< depth rank)
+                     (let ((dim (nth depth shape))
+                           (in-stride (nth depth (vt-strides tensor)))
+                           (out-stride (nth depth (vt-strides result))))
+                       (loop for i from 0 below dim
+                             do (recurse
+				 (1+ depth)
+                                 (+ in-ptr (* i in-stride))
+                                 (+ out-ptr (* i out-stride)))))))))
           (recurse 0 (vt-offset tensor) 0))
         result)
       (let* ((flat (vt-flatten tensor))
@@ -589,34 +593,31 @@
              (result (vt-zeros (list size)))
              (prod 1.0d0))
         (loop for i from 0 below size
-              do (setf prod (* prod
-			       (aref (vt-data flat) i)))
+              do (setf prod (* prod (aref (vt-data flat) i)))
                  (setf (aref (vt-data result) i) prod))
         result)))
 
+
 (defun vt-median (tensor &key axis)
-  "中位数.
-  axis: 归约轴(nil 表示全局)"
+  "中位数. axis 支持负数 (nil 表示全局)"
   (if axis
-      ;; 沿轴计算
       (let* ((shape (vt-shape tensor))
-             (axis-size (nth axis shape))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))          
+             (axis-size (nth ax shape))                  
              (out-shape (loop for d in shape for i from 0
-			      unless (= i axis) collect d))
-             (result (vt-zeros out-shape
-			       :type (vt-element-type tensor))))
-        ;; 对每个切片排序并取中位数
+                              unless (= i ax) collect d))
+             (result (vt-zeros out-shape :type (vt-element-type tensor))))
         (labels
 	    ((recurse (depth in-ptr out-ptr)
                (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth axis)
-                   ;; 收集该轴的数据
+               (if (= depth ax)                      
                    (let ((data-list '())
                          (in-stride (nth depth (vt-strides tensor))))
-                     (loop
-		       for i from 0 below axis-size
-                       do (push (aref (vt-data tensor) in-ptr) data-list)
-                          (incf in-ptr in-stride))
+                     (loop for i from 0 below axis-size
+                           do (push (aref (vt-data tensor) in-ptr)
+				    data-list)
+                              (incf in-ptr in-stride))
                      (setf data-list (sort data-list #'<))
                      (setf (aref (vt-data result) out-ptr)
                            (if (oddp axis-size)
@@ -624,50 +625,49 @@
                                (/ (+ (nth (1- (/ axis-size 2)) data-list)
                                      (nth (/ axis-size 2) data-list))
                                   2))))
-                   (if (= depth (length shape))
-                       nil
-                       (let ((dim (nth depth shape))
-                             (in-stride (nth depth (vt-strides tensor)))
-                             (out-stride (nth depth (vt-strides result))))
-                         (loop
-			   for i from 0 below dim
-                           do (recurse (1+ depth)
-                                       (+ in-ptr
-					  (* i in-stride))
-                                       (+ out-ptr
-					  (* i out-stride)))))))))
+                   (when (< depth rank)
+                     (let ((dim (nth depth shape))
+                           (in-stride (nth depth (vt-strides tensor)))
+                           (out-stride (nth depth (vt-strides result))))
+                       (loop for i from 0 below dim
+                             do (recurse
+				 (1+ depth)
+                                 (+ in-ptr (* i in-stride))
+                                 (+ out-ptr (* i out-stride)))))))))
           (recurse 0 (vt-offset tensor) 0))
         result)
-      ;; 全局中位数
       (let* ((flat (vt-flatten tensor))
              (size (vt-size flat))
              (data-list (loop for i from 0 below size
-                              collect (aref (vt-data flat) i)))
+			      collect (aref (vt-data flat) i)))
              (sorted (sort data-list #'<)))
         (if (oddp size)
             (nth (floor size 2) sorted)
             (/ (+ (nth (1- (/ size 2)) sorted)
-                  (nth (/ size 2) sorted))
-               2)))))
+		  (nth (/ size 2) sorted))
+	       2)))))
+
 
 (defun vt-percentile (tensor percentile &key axis interpolation)
   "计算百分位数.
   percentile: 百分位(0-100)
-  axis: 归约轴
+  axis: 归约轴 支持负数
   interpolation: 插值方法(:linear, :lower, :higher, :midpoint, :nearest)"
   (declare (ignore interpolation))
   (let ((q (/ percentile 100.0d0)))
     (if axis
         (let* ((shape (vt-shape tensor))
-               (axis-size (nth axis shape))
-               (out-shape
-		 (loop
-		   for d in shape for i from 0 unless (= i axis) collect d))
-               (result (vt-zeros out-shape :type (vt-element-type tensor))))
+               (rank (length shape))
+               (ax (vt-normalize-axis axis rank))          
+               (axis-size (nth ax shape))
+               (out-shape (loop for d in shape for i from 0
+                                unless (= i ax) collect d))
+               (result (vt-zeros out-shape
+				 :type (vt-element-type tensor))))
           (labels
 	      ((recurse (depth in-ptr out-ptr)
                  (declare (type fixnum depth in-ptr out-ptr))
-                 (if (= depth axis)
+                 (if (= depth ax)                      
                      (let ((data-list '())
                            (in-stride (nth depth (vt-strides tensor))))
                        (loop for i from 0 below axis-size
@@ -682,21 +682,17 @@
                          (setf (aref (vt-data result) out-ptr)
                                (+ (* (- 1 frac)
 				     (nth lower data-list))
-                                  (* frac
-				     (nth (min upper (1- axis-size))
-					  data-list))))))
-                     (if (= depth (length shape))
-                         nil
-                         (let ((dim (nth depth shape))
-                               (in-stride (nth depth (vt-strides tensor)))
-                               (out-stride (nth depth (vt-strides result))))
-                           (loop
-			     for i from 0 below dim
-                             do (recurse (1+ depth)
-                                         (+ in-ptr
-					    (* i in-stride))
-                                         (+ out-ptr
-					    (* i out-stride)))))))))
+                                  (* frac (nth (min upper (1- axis-size))
+					       data-list))))))
+                     (when (< depth rank)
+                       (let ((dim (nth depth shape))
+                             (in-stride (nth depth (vt-strides tensor)))
+                             (out-stride (nth depth (vt-strides result))))
+                         (loop for i from 0 below dim
+                               do (recurse
+				   (1+ depth)
+                                   (+ in-ptr (* i in-stride))
+                                   (+ out-ptr (* i out-stride)))))))))
             (recurse 0 (vt-offset tensor) 0))
           result)
         (let* ((flat (vt-flatten tensor))
@@ -708,10 +704,11 @@
                (lower (floor idx))
                (upper (ceiling idx))
                (frac (- idx lower)))
-          (+ (* (- 1 frac)
-		(nth lower sorted))
-             (* frac
-		(nth (min upper (1- size)) sorted)))))))
+          (+ (* (- 1 frac) (nth lower sorted))
+             (* frac (nth (min upper (1- size))
+			  sorted)))))))
+
+
 
 (defun vt-quantile (tensor q &key axis)
   "计算分位数.
@@ -890,37 +887,38 @@
              (result (vt-copy tensor))
              (out-strides (vt-strides result))
              (out-data (vt-data result)))
-        (labels ((recurse (depth in-ptr out-ptr)
-                   (cond
-                     ((= depth ax)
-                      ;; 抵达排序轴：收集该“纤维”上的值，排序后写回
-                      (let* ((in-stride (nth ax in-strides))
-                             (out-stride (nth ax out-strides))
-                             ;; 收集 (值 . 原索引) 对，用于稳定排序
-                             (pairs
-                               (loop for i of-type fixnum from 0 below ax-dim
-                                     for off = (+ in-ptr (* i in-stride))
-                                     collect (cons (aref in-data off) i))))
-                        ;; 稳定排序（按值排序，相等时保持原顺序）
-                        (setq pairs (stable-sort pairs #'< :key #'car))
-                        ;; 将排序后的值按顺序写回结果张量
-                        (loop for (val . nil) in pairs
-                              for off = out-ptr then (+ off out-stride)
-                              do (setf (aref out-data off) val))))
-                     
-                     ((< depth rank)
-                      ;; 非排序轴：遍历该维度，递归进入下一深度
-                      (let ((dim (nth depth shape))
-                            (in-stride (nth depth in-strides))
-                            (out-stride (nth depth out-strides)))
-                        (loop for i of-type fixnum from 0 below dim do
-                          (recurse (1+ depth)
-                                   (+ in-ptr (* i in-stride))
-                                   (+ out-ptr (* i out-stride))))))
-                     
-                     (t
-                      ;; depth == rank 不会发生，若发生则忽略
-                      nil))))
+        (labels
+	    ((recurse (depth in-ptr out-ptr)
+               (cond
+                 ((= depth ax)
+                  ;; 抵达排序轴：收集该“纤维”上的值，排序后写回
+                  (let* ((in-stride (nth ax in-strides))
+                         (out-stride (nth ax out-strides))
+                         ;; 收集 (值 . 原索引) 对，用于稳定排序
+                         (pairs
+                           (loop for i of-type fixnum from 0 below ax-dim
+                                 for off = (+ in-ptr (* i in-stride))
+                                 collect (cons (aref in-data off) i))))
+                    ;; 稳定排序（按值排序，相等时保持原顺序）
+                    (setq pairs (stable-sort pairs #'< :key #'car))
+                    ;; 将排序后的值按顺序写回结果张量
+                    (loop for (val . nil) in pairs
+                          for off = out-ptr then (+ off out-stride)
+                          do (setf (aref out-data off) val))))
+                 
+                 ((< depth rank)
+                  ;; 非排序轴：遍历该维度，递归进入下一深度
+                  (let ((dim (nth depth shape))
+                        (in-stride (nth depth in-strides))
+                        (out-stride (nth depth out-strides)))
+                    (loop for i of-type fixnum from 0 below dim do
+                      (recurse (1+ depth)
+                               (+ in-ptr (* i in-stride))
+                               (+ out-ptr (* i out-stride))))))
+                 
+                 (t
+                  ;; depth == rank 不会发生，若发生则忽略
+                  nil))))
           (recurse 0 in-offset 0))
         result)
       ;; axis = nil：展平为一维后排序
@@ -945,39 +943,40 @@
              (result (vt-zeros shape :type 'fixnum))
              (out-strides (vt-strides result))
              (out-data (vt-data result)))
-        (labels ((recurse (depth in-ptr out-ptr)
-                   ;; depth: 当前递归的维度编号（0..rank-1）
-                   (cond
-                     ((= depth ax)
-                      ;; ---- 到达排序轴：处理一条“纤维” ----
-                      (let* ((in-stride (nth ax in-strides))
-                             (out-stride (nth ax out-strides))
-                             ;; 收集 (索引 . 值) 对
-                             (pairs
-                               (loop for i of-type fixnum from 0 below ax-dim
-                                     for off = (+ in-ptr (* i in-stride))
-                                     collect (cons i (aref in-data off)))))
-                        ;; 按值排序，稳定排序保留原始顺序的语义
-                        (setq pairs (stable-sort pairs #'< :key #'cdr))
-                        ;; 将排序后的原始索引写入输出张量
-                        (loop for i of-type fixnum from 0 below ax-dim
-                              for (src-idx . nil) in pairs
-                              for off = (+ out-ptr (* i out-stride))
-                              do (setf (aref out-data off) src-idx))))
-                     
-                     ((< depth rank)
-                      ;; ---- 非排序轴：在轴尺寸上循环，递归进入下一维 ----
-                      (let ((dim (nth depth shape))
-                            (in-stride (nth depth in-strides))
-                            (out-stride (nth depth out-strides)))
-                        (loop for i of-type fixnum from 0 below dim do
-                          (recurse (1+ depth)
-                                   (+ in-ptr (* i in-stride))
-                                   (+ out-ptr (* i out-stride))))))
-                     
-                     (t
-                      ;; depth == rank 仅当 rank=0（标量）时可能发生，直接取自身
-                      (setf (aref out-data out-ptr) 0)))))
+        (labels
+	    ((recurse (depth in-ptr out-ptr)
+               ;; depth: 当前递归的维度编号（0..rank-1）
+               (cond
+                 ((= depth ax)
+                  ;; ---- 到达排序轴：处理一条“纤维” ----
+                  (let* ((in-stride (nth ax in-strides))
+                         (out-stride (nth ax out-strides))
+                         ;; 收集 (索引 . 值) 对
+                         (pairs
+                           (loop for i of-type fixnum from 0 below ax-dim
+                                 for off = (+ in-ptr (* i in-stride))
+                                 collect (cons i (aref in-data off)))))
+                    ;; 按值排序，稳定排序保留原始顺序的语义
+                    (setq pairs (stable-sort pairs #'< :key #'cdr))
+                    ;; 将排序后的原始索引写入输出张量
+                    (loop for i of-type fixnum from 0 below ax-dim
+                          for (src-idx . nil) in pairs
+                          for off = (+ out-ptr (* i out-stride))
+                          do (setf (aref out-data off) src-idx))))
+                 
+                 ((< depth rank)
+                  ;; ---- 非排序轴：在轴尺寸上循环，递归进入下一维 ----
+                  (let ((dim (nth depth shape))
+                        (in-stride (nth depth in-strides))
+                        (out-stride (nth depth out-strides)))
+                    (loop for i of-type fixnum from 0 below dim do
+                      (recurse (1+ depth)
+                               (+ in-ptr (* i in-stride))
+                               (+ out-ptr (* i out-stride))))))
+                 
+                 (t
+                  ;; depth == rank 仅当 rank=0（标量）时可能发生，直接取自身
+                  (setf (aref out-data out-ptr) 0)))))
           ;; 从第 0 维开始递归
           (recurse 0 in-offset 0))
         result)      
@@ -990,7 +989,7 @@
              (sorted (stable-sort pairs #'< :key #'cdr)))
         (%make-vt
          :data (make-array n :element-type 'fixnum
-                            :initial-contents (mapcar #'car sorted))
+                             :initial-contents (mapcar #'car sorted))
          :shape (list n)
          :strides '(1)
          :offset 0))))
@@ -1121,7 +1120,7 @@
          (size (vt-shape-to-size shape))
          ;; 分配新数据数组，用目标类型的零填充
          (new-data (make-array size :element-type new-type
-                               :initial-element (coerce 0 new-type)))
+				    :initial-element (coerce 0 new-type)))
          ;; 构建结果张量（连续内存）
          (result (%make-vt :data new-data
                            :shape (copy-list shape)
@@ -1240,54 +1239,53 @@
 ;;; ===========================================
 
 (defun vt-take (tensor indices &key axis)
-  "从数组中按索引取值"
+  "从数组中按索引取值。axis 支持负数。"
   (if axis
-      ;; 沿轴取值
       (let* ((shape (vt-shape tensor))
-             (axis-size (nth axis shape))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))
+             (axis-size (nth ax shape))
              (idx-flat (vt-flatten indices))
-	     (idx-data (vt-data idx-flat))
+             (idx-data (vt-data idx-flat))
              (idx-size (vt-size idx-flat))
-             (out-shape (loop for d in shape
-			      for i from 0
-                              if (= i axis)
-				collect idx-size
-			      else collect d))
+             (out-shape (loop for d in shape for i from 0
+                              if (= i ax) collect idx-size
+				else collect d))
              (result (vt-zeros out-shape
-			       :type (vt-element-type tensor))))
-	(when (eq (vt-element-type indices) 'double-float)
-	  (warn "vt-take indices element type if not fixnum")
-	  (setf idx-data (map 'vector #'truncate idx-data)))
+			       :type (vt-element-type tensor)))
+             (in-strides (vt-strides tensor))
+             (out-strides (vt-strides result)))
+        (when (eq (vt-element-type indices) 'double-float)
+          (warn "vt-take indices element type is not fixnum")
+          (setf idx-data (map 'vector #'truncate idx-data)))
         (labels
 	    ((recurse (depth in-ptr out-ptr)
-               (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth axis)
-                   (let ((in-stride (nth depth (vt-strides tensor)))
-                         (out-stride (nth depth (vt-strides result))))
-                     (loop for i from 0 below idx-size
+               (if (= depth rank)
+                   ;; 所有维度遍历完毕，拷贝单个元素
+                   (setf (aref (vt-data result) out-ptr)
+                         (aref (vt-data tensor) in-ptr))
+                   (if (= depth ax)
+                       ;; 目标轴：按索引列表循环，更新指针并进入下层
+                       (let ((in-stride (nth depth in-strides))
+                             (out-stride (nth depth out-strides)))
+                         (loop
+			   for i of-type fixnum from 0 below idx-size
                            for idx = (aref idx-data i)
                            do (when (or (< idx 0) (>= idx axis-size))
                                 (error "索引 ~A 越界" idx))
-                              (setf (aref (vt-data result) out-ptr)
-				    (aref (vt-data tensor)
-					  (+ in-ptr
-					     (* idx in-stride))))
-                              (incf out-ptr out-stride)))
-                   (if (= depth (length shape))
-                       nil
+                              (recurse (1+ depth)
+                                       (+ in-ptr (* idx in-stride))
+                                       (+ out-ptr (* i out-stride)))))
+                       ;; 非目标轴：正常遍历维度
                        (let ((dim (nth depth shape))
-                             (in-stride (nth depth (vt-strides tensor)))
-                             (out-stride (nth depth (vt-strides result))))
-                         (loop
-			   for i from 0 below dim
-                           do (recurse (1+ depth)
-                                       (+ in-ptr
-					  (* i in-stride))
-                                       (+ out-ptr
-					  (* i out-stride)))))))))
+                             (in-stride (nth depth in-strides))
+                             (out-stride (nth depth out-strides)))
+                         (loop for i of-type fixnum from 0 below dim do
+                           (recurse (1+ depth)
+                                    (+ in-ptr (* i in-stride))
+                                    (+ out-ptr (* i out-stride)))))))))
           (recurse 0 (vt-offset tensor) 0))
         result)
-      ;; 展平后取值
       (let* ((flat (vt-flatten tensor))
              (data (vt-data flat))
              (size (vt-size flat))
@@ -1296,10 +1294,11 @@
              (idx-size (vt-size idx-flat))
              (result-data
 	       (make-array idx-size
-			   :element-type (vt-element-type tensor))))
-	(when (eq (vt-element-type indices) 'double-float)
-	  (warn "vt-take indices element type if not fixnum")
-	  (setf idx-data (map 'vector #'truncate idx-data)))
+			   :element-type
+			   (vt-element-type tensor))))
+        (when (eq (vt-element-type indices) 'double-float)
+          (warn "vt-take indices element type is not fixnum")
+          (setf idx-data (map 'vector #'truncate idx-data)))
         (loop for i from 0 below idx-size
               for idx = (aref idx-data i)
               do (when (or (< idx 0) (>= idx size))
@@ -1307,6 +1306,7 @@
                  (setf (aref result-data i) (aref data idx)))
         (%make-vt :data result-data :shape (list idx-size)
                   :strides '(1) :offset 0))))
+
 
 (defun vt-put (tensor indices values)
   "将 values 按 indices 指定的展平（行优先）索引放入 tensor。
@@ -1316,11 +1316,12 @@
    注意：索引必须是 [0, 总元素数) 内的非负整数。"
   (let* ((total-size (vt-size tensor))
          ;; 将 indices 统一为整数列表
-         (idx-list (if (numberp indices)
-                       (list (round indices))
-                       (let ((flat (vt-flatten (ensure-vt indices))))
-                         (loop for i below (vt-size flat)
-                               collect (truncate (aref (vt-data flat) i))))))
+         (idx-list
+	   (if (numberp indices)
+               (list (round indices))
+               (let ((flat (vt-flatten (ensure-vt indices))))
+                 (loop for i below (vt-size flat)
+                       collect (truncate (aref (vt-data flat) i))))))
          ;; 将 values 统一为列表
          (val-list (if (or (numberp values)
 			   (or (listp values)
@@ -1339,14 +1340,17 @@
     (loop for idx in idx-list
           for i from 0
           for val = (nth (mod i n-values) val-list)
-          do (unless (and (integerp idx) (<= 0 idx) (< idx total-size))
+          do (unless (and (integerp idx)
+			  (<= 0 idx)
+			  (< idx total-size))
                (error "索引 ~D 超出范围 [0, ~D)" idx total-size))
              ;; 一维逻辑索引 → 多维坐标 → 物理偏移
              (let ((remaining idx)
                    (phys-offset offset))
                (loop for dim in (reverse shape)
                      for stride in (reverse strides)
-                     do (multiple-value-bind (q r) (floor remaining dim)
+                     do (multiple-value-bind (q r)
+			    (floor remaining dim)
                           (incf phys-offset (* r stride))
                           (setf remaining q)))
                ;; 直接写入底层数组，自动进行必要的类型转换
@@ -1651,38 +1655,29 @@
 ;;; ===========================================
 ;;; 12. 随机数扩展
 ;;; ===========================================
+;;; ===========================================
+;;; 12. 随机数扩展（线程安全，无全局状态）
+;;; ===========================================
 
-(defun make-normal-random-generator ()
-  "返回一个无参函数,每次调用返回一个标准正态随机数."
-  (let ((cached nil)          ;; 是否已有缓存的第二个值
-        (second-value nil))   ;; 缓存的第二个值
-    (lambda ()
-      (if cached
-          (progn
-            (setf cached nil)
-            second-value)
-          (let* ((u1 (random 1.0d0)) ;; (0,1) 均匀分布,避免 0 导致 log 爆炸
-                 (u2 (random 1.0d0))
-                 (r (sqrt (* -2.0d0 (log u1))))
-                 (theta (* 2.0d0 pi u2)))
-            (setf cached t
-                  second-value (* r (sin theta)))
-            (* r (cos theta)))))))
-
-(defvar *vt-normal-generator* (make-normal-random-generator))
+(defun get-random-normal ()
+  "返回标准正态分布随机数。线程安全，无内部缓存。"
+  (let ((u1 (random 1.0d0))
+        (u2 (random 1.0d0)))
+    (* (sqrt (* -2.0d0 (log u1)))
+       (cos (* 2.0d0 pi u2)))))
 
 (defun vt-random-seed (seed)
   "设置随机种子。seed 应为 nil, t, 或 random-state 对象。"
   (setq *random-state*
-	(make-random-state
-	 (if (random-state-p seed)
-	     seed
-	     (make-random-state t))))
-  (setq *vt-normal-generator* (make-normal-random-generator)))
+        (make-random-state
+         (if (random-state-p seed)
+             seed
+             (make-random-state t)))))
 
 (defun vt-random-uniform (shape &key (low 0.0d0) (high 1.0d0))
   "生成均匀分布随机张量。"
-  (vt-map (lambda (x) (declare (ignore x))
+  (vt-map (lambda (x)
+            (declare (ignore x))
             (+ low (* (- high low) (random 1.0d0))))
           (vt-zeros shape :type 'double-float)))
 
@@ -1698,7 +1693,3 @@
 (defun vt-random-integers (low high &key (size nil) (type 'fixnum))
   "生成随机整数张量。"
   (vt-random-int low high :size size :type type))
-
-(defun get-random-normal ()
-  "返回标准正态分布随机数。"
-  (funcall *vt-normal-generator*))
