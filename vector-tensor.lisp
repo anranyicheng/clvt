@@ -208,7 +208,9 @@
 (defun vt-random (shape &key (type 'double-float))
   "创建随机数张量"
   (declare (list shape))
-  (vt-map (lambda (x) (setf x (coerce (random 1.0) type)))
+  (vt-map (lambda (x)
+	    (declare (ignore x))
+	    (coerce (random 1.0) type))
 	  (vt-zeros shape)))
 
 (defun vt-zeros (shape &key (type 'double-float))
@@ -468,7 +470,8 @@
 		    (+ axis rank)
 		    axis)))
 	(when (or (< ax 0) (>= ax rank))
-	  (error "Axis ~A is out of bounds for tensor of rank ~A" axis rank))
+	  (error "Axis ~A is out of bounds for tensor of rank ~A"
+		 axis rank))
 	ax)))
 
 (defun vt-narrow (vt axis start end)
@@ -479,7 +482,11 @@
          (strides (vt-strides vt))
          (dim-size (nth ax shape)))    
     (when (or (< start 0) (> end dim-size))
-      (error "切片索引 [~A, ~A) 越界，当前轴大小为 ~A" start end dim-size))
+      (error "切片索引 [~A, ~A) 越界，当前轴大小为 ~A"
+	     start end dim-size))
+    (when (< end start)
+      (error "vt-narrow: end (~A) must be greater than start (~A)"
+	     end start))
     (let ((new-offset (+ (vt-offset vt)
                          (* start (nth ax strides))))
           (new-shape (progn (setf (nth ax shape) (- end start)) shape)))
@@ -744,7 +751,10 @@
    DEST: 目标张量视图."  
   ;; === 支持标量输入
   (when (numberp src)
-    (setf src (vt-from-sequence (list src))))  
+    (setf src (vt-from-sequence (list src)
+				:type (if (integerp src)
+					  'fixnum
+					  'double-float))))
   (let ((dest-shape (vt-shape dest))
         (src-shape (vt-shape src)))
     ;; 确保 Dest 的形状能够容纳 Src 广播后的形状

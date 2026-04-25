@@ -724,11 +724,11 @@
 	 (vt-amin tensor))))
 
 (defun vt-histogram (tensor &key bins range density)
-  "计算直方图.
-  bins: bin数量(默认10)
-  range: (min, max) 范围
-  density: 是否归一化
-  返回: (hist, bin-edges)"
+  "计算直方图。
+   bins : bin 数量（默认 10）。
+   range : (min, max) 范围。
+   density : 若为 T，返回概率密度直方图（总面积=1）。
+   返回：(hist, bin-edges) 两个一维张量。"
   (let* ((flat (vt-flatten tensor))
          (data (vt-data flat))
          (size (vt-size flat))
@@ -737,34 +737,38 @@
          (data-max (if range (cadr range) (vt-amax tensor)))
          (bin-width (/ (- data-max data-min) bins))
          (hist (make-array bins :element-type 'double-float
-				:initial-element 0.0d0))
-         (bin-edges (make-array (1+ bins)
-				:element-type 'double-float)))
-    
+                                :initial-element 0.0d0))
+         (bin-edges (make-array (1+ bins) :element-type 'double-float)))
+
     ;; 生成 bin edges
     (loop for i from 0 to bins
-          do (setf (aref bin-edges i)
-		   (+ data-min
-		      (* i bin-width))))
-    
-    ;; 计算直方图
+          do (setf (aref bin-edges i) (+ data-min (* i bin-width))))
+
+    ;; 统计计数（左闭右开，但最后一个 bin 包含右边界）
     (loop for i from 0 below size
           for val = (aref data i)
-          for bin-idx = (min (1- bins)
-			     (floor (- val data-min) bin-width))
-          when (and (>= val data-min) (< val data-max))
+          for bin-idx = (cond ((< val data-min) nil)
+                              ((>= val data-max) (1- bins))
+                              (t (floor (- val data-min) bin-width)))
+          when bin-idx
             do (incf (aref hist bin-idx)))
-    
-    ;; 归一化
+
+    ;; 密度归一化
     (when density
       (let ((total (reduce #'+ hist)))
-        (loop for i from 0 below bins
-              do (setf (aref hist i) 
-                       (/ (aref hist i)
-			  (* total bin-width))))))
-    
-    (values (vt-from-sequence (coerce hist 'list))
-            (vt-from-sequence (coerce bin-edges 'list)))))
+        (if (zerop total)
+            ;; 无数据时，返回平坦密度以避免除零（或全零）
+            (loop for i from 0 below bins
+                  do (setf (aref hist i) 0.0d0))
+            (loop for i from 0 below bins
+                  do (setf (aref hist i)
+                           (/ (aref hist i) (* total bin-width)))))))
+
+    ;; 返回两个 VT
+    (values (vt-from-sequence (coerce hist 'list)
+			      :type 'double-float)
+            (vt-from-sequence (coerce bin-edges 'list)
+			      :type 'double-float))))
 
 ;;; ===========================================
 ;;; 5. 逻辑运算扩展
@@ -1100,7 +1104,7 @@
           for val = (aref v-data i)
           do (setf (aref result i)
                    (loop for j from 0 below size
-                         when (< (aref data j) val)
+                         when (>= (aref data j) val)
                            return j
                          finally (return size))))
     (%make-vt :data result :shape (list v-size)
@@ -1211,28 +1215,101 @@
   "将数值限制在指定范围内"
   (vt-map (lambda (x) (max min (min max x))) tensor))
 
-(defun vt-gradient (tensor &key spacing)
-  "计算梯度"
-  (declare (ignore spacing))
-  ;; 简化实现:中心差分
-  (let* ((flat (vt-flatten tensor))
-         (size (vt-size flat))
-         (data (vt-data flat))
-         (result (vt-zeros (list size)))
-         (r-data (vt-data result)))
-    (when (> size 1)
-      ;; 前向差分
-      (setf (aref r-data 0) (- (aref data 1) (aref data 0)))
-      ;; 中心差分
-      (loop for i from 1 below (1- size)
-            do (setf (aref r-data i)
-                     (/ (- (aref data (1+ i))
-			   (aref data (1- i)))
-			2.0d0)))
-      ;; 后向差分
-      (setf (aref r-data (1- size))
-            (- (aref data (1- size)) (aref data (- size 2)))))
-    result))
+(defun vt-gradient (tensor &key (spacing 1.0d0) axis)
+  "计算张量的梯度（沿指定轴的二阶中心差分）。
+   axis  : nil → 全部轴, 整数或整数列表 → 指定轴（支持负数）。
+   spacing: 标量（统一间距）、列表（按轴间距，长度需与轴数一致）、
+            或单轴配合 1D 张量作为坐标数组。
+   返回：若 axis 为 nil 或列表，返回梯度张量的列表；若 axis 为单个整数，返回单个张量。"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (axes
+	   (cond ((null axis)
+		  (loop for i below rank collect i))
+                 ((integerp axis)
+		  (list (vt-normalize-axis axis rank)))
+                 ((listp axis)
+		  (mapcar (lambda (a) (vt-normalize-axis a rank))
+			  axis))
+                 (t (error "axis must be nil, integer or list of integers.")))))
+    (assert (every (lambda (ax) (<= 0 ax (1- rank))) axes))
+    (let ((spacings
+            (cond ((numberp spacing)
+                   (make-list (length axes) :initial-element spacing))
+                  ((listp spacing)
+                   (assert (= (length spacing) (length axes)))
+                   spacing)
+                  ((typep spacing 'vt)
+                   (when (> (length axes) 1)
+                     (error "When spacing is a tensor, axis must be a single axis."))
+                   (list spacing))
+                  (t (error "spacing must be a number, list or 1D tensor.")))))
+      (labels
+	  ((slice-specs (ax start end)
+	     "生成沿轴 AX 的切片规格：从 start (包含) 到 end (不包含)。"
+	     (loop for d from 0 below rank
+                   collect (if (= d ax) (list start end) :all)))
+           (grad-along-axis (ax sp)
+	     (let* ((n (nth ax shape)))
+               (when (< n 2)
+                 (error "Tensor size ~D along axis ~D is too small for gradient." n ax))
+               (if (numberp sp)
+                   ;; ---------- 等间距 ----------
+                   (if (= n 2)
+                       ;; 轴长度=2，仅用一阶差分（左右边界相同）
+                       (let ((edge
+			       (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax 1 2))
+                                           (apply #'vt-slice tensor (slice-specs ax 0 1)))
+                                     sp)))
+                         (vt-concatenate ax edge edge))
+                       ;; 正常长度（n≥3），边界一阶差分 + 内部中心差分
+                       (let* ((left-edge  (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax 1 2))
+                                                      (apply #'vt-slice tensor (slice-specs ax 0 1)))
+                                                sp))
+                              (inner      (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax 2 n))
+                                                      (apply #'vt-slice tensor (slice-specs ax 0 (- n 2))))
+                                                (* 2.0d0 sp)))
+                              (right-edge (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax (1- n) n))
+                                                      (apply #'vt-slice tensor (slice-specs ax (- n 2) (1- n))))
+                                                sp)))
+                         (vt-concatenate ax left-edge inner right-edge)))
+                   ;; ---------- 非均匀间距（坐标数组） ----------
+                   (let* ((h-vt (ensure-vt sp))
+                          (n-h (vt-size h-vt)))
+		     (assert (= n n-h) (sp) "Spacing array must have same length as axis.")
+		     (if (= n 2)
+                         ;; 轴长度=2，一阶差分重复
+                         (let* ((h-diff (vt-- (apply #'vt-slice h-vt (list (list 1 2)))
+                                              (apply #'vt-slice h-vt (list (list 0 1)))))
+                                (df     (vt-- (apply #'vt-slice tensor (slice-specs ax 1 2))
+                                              (apply #'vt-slice tensor (slice-specs ax 0 1))))
+                                (grad   (vt-/ df h-diff)))
+                           (vt-concatenate ax grad grad))
+                         ;; 正常长度（n≥3）
+                         (let* ((h-diff-left  (vt-- (apply #'vt-slice h-vt (list (list 1 2)))
+						    (apply #'vt-slice h-vt (list (list 0 1)))))
+                                (h-diff-right (vt-- (apply #'vt-slice h-vt (list (list (1- n) n)))
+						    (apply #'vt-slice h-vt (list (list (- n 2) (1- n))))))
+                                (h-diff-inner (vt-- (apply #'vt-slice h-vt (list (list 2 n)))
+						    (apply #'vt-slice h-vt (list (list 0 (- n 2))))))
+                                (df-left  (vt-- (apply #'vt-slice tensor (slice-specs ax 1 2))
+                                                (apply #'vt-slice tensor (slice-specs ax 0 1))))
+                                (df-right (vt-- (apply #'vt-slice tensor (slice-specs ax (1- n) n))
+                                                (apply #'vt-slice tensor (slice-specs ax (- n 2) (1- n)))))
+                                (df-inner (vt-- (apply #'vt-slice tensor (slice-specs ax 2 n))
+                                                (apply #'vt-slice tensor (slice-specs ax 0 (- n 2))))))
+                           (vt-concatenate ax
+					   (vt-/ df-left h-diff-left)
+					   (vt-/ df-inner h-diff-inner)
+					   (vt-/ df-right h-diff-right)))))))))
+        ;; 对所有轴计算
+        (let ((results (loop for ax in axes
+                             for sp in spacings
+                             collect (grad-along-axis ax sp))))
+          (if (and (integerp axis) (null (cdr axes)))  ; 单轴直接返回张量
+              (car results)
+              results))))))
+
 
 ;;; ===========================================
 ;;; 10. 索引高级功能
@@ -1323,13 +1400,14 @@
                  (loop for i below (vt-size flat)
                        collect (truncate (aref (vt-data flat) i))))))
          ;; 将 values 统一为列表
-         (val-list (if (or (numberp values)
-			   (or (listp values)
-			       (vectorp values)))
-                       (list values)
-                       (let ((flat (vt-flatten (ensure-vt values))))
-                         (loop for i below (vt-size flat)
-                               collect (aref (vt-data flat) i)))))
+         (val-list (cond ((numberp values) (list values))
+			 ((or (listp values)
+			      (arrayp values))
+			  (vt-flatten-sequence values))
+			 ((vt-p values)
+			  (let ((flat (vt-flatten (ensure-vt values))))
+                            (loop for i below (vt-size flat)
+				  collect (aref (vt-data flat) i))))))
          (n-values (length val-list))
          (shape (vt-shape tensor))
          (strides (vt-strides tensor))
@@ -1461,33 +1539,109 @@
                           (vt-slice flat `(0 ,(- n s))))
                          (vt-shape vt))))))))
 
-(defun vt-pad
-    (vt pad-width &key (mode :constant) (constant-values 0))
-  "对数组进行填充。pad-width 为 (before after) 对组成的列表，或整数。"
-  (declare (ignore mode))
-  (let* ((sh (vt-shape vt))
-         (rank (length sh))
-         (pad (if (atom pad-width)
-                  (loop repeat rank collect
-				    (list pad-width pad-width))
-                  pad-width))
-         (new-shape (loop for s in sh
-                          for (b a) in pad
-                          collect (+ s b a)))
-         (result (vt-zeros new-shape
-			   :type (vt-element-type vt))))
-    ;; 如果常数填充且非零，先填满常数
-    (when (and (numberp constant-values)
-	       (not (zerop constant-values)))
-      (setf result (vt-full new-shape constant-values
-			    :type (vt-element-type vt))))
-    ;; 将原始数据复制到填充区域内
-    (let ((region (apply #'vt-slice result
-                         (loop for s in sh
-                               for (b a) in pad
-                               collect `(,b ,(+ b s))))))
-      (setf region vt))
-    result))
+
+(defun normalize-pad-width (pad-width rank)
+  "将 pad-width 标准化为 列表。"
+  (let ((pw-list (if (integerp pad-width)
+                     (make-list rank :initial-element pad-width)
+                     pad-width)))
+    (unless (= (length pw-list) rank)
+      (error "pad-width length ~A does not match tensor rank ~A"
+	     (length pw-list) rank))
+    (mapcar (lambda (x)
+              (cond ((integerp x) 
+                     (if (< x 0)
+			 (error "Negative padding is not supported")
+			 (list x x)))
+                    ((and (consp x) (= (length x) 2))
+                     (if (or (< (first x) 0) (< (second x) 0))
+                         (error "Negative padding is not supported")
+                         x))
+                    (t (error "Invalid pad-width element: ~A" x))))
+            pw-list)))
+
+(defun apply-pad-mode (mode dist sk side)
+  "纯坐标映射：dist 表示距离边缘的距离 (1, 2, 3...)。
+   sk 是源张量维度大小。"
+  (ecase mode
+    (:edge (if (eq side :left) 0 (1- sk)))
+    
+    (:wrap 
+     ;; wrap 左侧起点 sk-1 向左递减；右侧起点 0 向右递增
+     (let ((x (if (eq side :left) (- sk dist) (1- dist))))
+       (mod x sk)))
+    
+    (:reflect
+     ;; reflect 左侧起点 1 向左递增；右侧起点 sk-2 向右递减
+     (when (<= sk 1)
+       (error "Cannot reflect on dimension with size <= 1"))
+     (let* ((period (* 2 (1- sk)))
+            (x (if (eq side :left) dist (- sk 1 dist)))
+            (idx (mod x period)))
+       (if (< idx sk) idx (- period idx))))
+    
+    (:symmetric
+     ;; symmetric 左侧起点 0 向左递增；右侧起点 sk-1 向右递减
+     (let* ((period (* 2 sk))
+            (x (if (eq side :left) (- dist) (+ sk dist -1)))
+            (idx (mod x period)))
+       (if (< idx sk) idx (- period idx 1))))))
+
+(defun vt-pad (vt pad-width &key (mode :constant) (constant-values 0))
+  "对张量进行填充，返回新张量。
+   pad-width ：整数（所有轴相同）或长度为 rank 的列表，每个元素可为整数或 对。
+   mode :constant（默认）, :edge, :wrap, :reflect, :symmetric。
+   constant-values ：常数填充值，可用标量或 列表。"
+  (let* ((shape (vt-shape vt))
+         (rank (length shape))
+         (pad (normalize-pad-width pad-width rank))
+         
+         (cv-list (if (listp constant-values)
+		      constant-values
+		      (list constant-values constant-values)))
+         (c-left (first cv-list))
+         (c-right (second cv-list))
+         
+         (new-shape (loop for s in shape for (b a) in pad
+			  collect (+ s b a))))
+    
+    (when (and (listp constant-values) (not (= (length cv-list) 2)))
+      (error "constant-values must be a scalar or a list of exactly 2 elements"))
+    
+    (vt-from-function 
+     new-shape
+     (lambda (out-idxs)
+       (let ((const-val nil)
+             (src-idxs (make-list rank)))
+         (loop
+	   for d from 0 below rank
+           for ok = (nth d out-idxs)
+           for (bk ak) in pad
+           for sk = (nth d shape)
+           do (let ((offset (- ok bk)))
+                (declare (fixnum offset))
+                (cond
+                  ;; 左侧填充区：将负数 offset 转化为正向距离 dist
+                  ((< offset 0)
+                   (if (eq mode :constant)
+                       (unless const-val (setf const-val c-left))
+                       (setf (nth d src-idxs) 
+                             (apply-pad-mode mode (- offset) sk :left))))
+                  ;; 右侧填充区：将越界 offset 转化为正向距离 dist
+                  ((>= offset sk)
+                   (if (eq mode :constant)
+                       (unless const-val (setf const-val c-right))
+                       (setf (nth d src-idxs) 
+                             ;; CL中 (- a b -1) 等价于 a - b + 1
+                             (apply-pad-mode mode (- offset sk -1) sk :right))))
+                  ;; 原始数据区
+                  (t
+                   (setf (nth d src-idxs) offset)))))
+         
+         (if const-val
+             const-val
+             (apply #'vt-ref vt src-idxs))))
+     :type (vt-element-type vt))))
 
 (defun vt-diff (vt &key (axis -1) (n 1))
   "沿指定轴计算 n 阶差分"
@@ -1655,9 +1809,6 @@
 ;;; ===========================================
 ;;; 12. 随机数扩展
 ;;; ===========================================
-;;; ===========================================
-;;; 12. 随机数扩展（线程安全，无全局状态）
-;;; ===========================================
 
 (defun get-random-normal ()
   "返回标准正态分布随机数。线程安全，无内部缓存。"
@@ -1693,3 +1844,4 @@
 (defun vt-random-integers (low high &key (size nil) (type 'fixnum))
   "生成随机整数张量。"
   (vt-random-int low high :size size :type type))
+

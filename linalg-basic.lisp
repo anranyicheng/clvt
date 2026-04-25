@@ -10,7 +10,9 @@
         (rb (length (vt-shape b))))
     (cond
       ((and (= ra 1) (= rb 1))
-       (vt-ref (vt-einsum "i,i->" a b)))
+       (let ((scalar (vt-einsum "i,i->" a b)))
+	 (aref (vt-data scalar)
+	       (vt-offset scalar))))
       ((and (= ra 2) (= rb 2))
        (vt-einsum "ij,jk->ik" a b))
       ((and (>= ra 2) (>= rb 2))
