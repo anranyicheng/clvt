@@ -2,40 +2,6 @@
   (:use :cl :clvt))
 (in-package :clvt-test)
 
-;; 1. 简单遍历 (打印非零元素)
-(defparameter *m*
-  (vt-reshape (vt-arange 27 :type 'fixnum)
-	      '(3 3 3)))
-(print *m*)
-;; #<VT shape:(3 3 3) dtype:FIXNUM 
-;;   [[[  0,   1,   2],
-;;     [  3,   4,   5],
-;;     [  6,   7,   8]],
-;;    [[  9,  10,  11],
-;;     [ 12,  13,  14],
-;;     [ 15,  16,  17]],
-;;    [[ 18,  19,  20],
-;;     [ 21,  22,  23],
-;;     [ 24,  25,  26]]]> 
-
-(setf (vt-ref *m* 1 1) 9)
-
-(vt-do-each (ptr val *m*)
-  (print (list ptr val))
-  (when (> val 0.0)
-    (format t "Found value ~a at physical index ~a~%" val ptr)))
-;; 2. 广播拷贝
-(defparameter *dest* (vt-zeros '(3 4)))
-(defparameter *src* (vt-ones '(1 4))) ; 形状 (1 4)
-(vt-copy-into *dest* *src*) ; 自动将 (1 4) 广播填充到 (3 4) 的三行
-(print *dest*)
-;; Output:
-;; #<TENSOR shape:(3 4) 
-;;   [[ 1.0,  1.0,  1.0,  1.0],
-;;    [ 1.0,  1.0,  1.0,  1.0],
-;;    [ 1.0,  1.0,  1.0,  1.0]]>
-
-
 ;;----------------------测试 vt-qr vt-svd ---------------------
 
 (defun diag-matrix (S m n)
@@ -75,71 +41,57 @@
           (format t "Vt Vt^T ≈ I ? max|Vt Vt^T - I| = ~A~%" VtV-error))))))
 
 
+;; ========== QR 分解测试 ==========
+(defun test-qr ()
+  "测试 QR 分解的重构误差和正交性。使用预定义矩阵 *A-qr* 。"
+  (let ((A (vt-from-sequence '((12 -51   4)
+                               ( 6 167 -68)
+                               (-4  24 -41)))))
+    (format t "~%========== QR 分解测试 ==========~%")
+    (format t "原始矩阵 A:~%")
+    (print (vt-data->list A))
+    ;; Full mode
+    (multiple-value-bind (Q R) (vt-qr A :mode :full)
+      (format t "~%Full mode: Q (m×m), R (m×n)~%")
+      (let ((QtQ (vt-@ (vt-transpose Q) Q)))
+        (format t "Q^T Q 偏离单位阵的最大误差 = ~A~%"
+                (let ((I (vt-eye (first (vt-shape Q)) :type 'double-float)))
+                  (reduce #'max (vt-data (vt-abs (vt-- QtQ I)))))))
+      (format t "重构误差: max|A - Q R| = ~A~%"
+              (reduce #'max (vt-data (vt-abs (vt-- A (vt-@ Q R)))))))
+    ;; Reduced mode
+    (multiple-value-bind (Q R) (vt-qr A :mode :reduced)
+      (format t "~%Reduced mode: Q (m×k), R (k×n)~%")
+      (let ((QtQ (vt-@ (vt-transpose Q) Q)))
+        (format t "Q^T Q 偏离单位阵的最大误差 = ~A~%"
+                (let ((I (vt-eye (second (vt-shape Q)) :type 'double-float)))
+                  (reduce #'max (vt-data (vt-abs (vt-- QtQ I)))))))
+      (format t "重构误差: max|A - Q R| = ~A~%"
+              (reduce #'max (vt-data (vt-abs (vt-- A (vt-@ Q R)))))))))
 
+;; ========== SVD 分解测试 ==========
+(defun run-svd-tests ()
+  "对几个典型矩阵运行 test-svd，覆盖经济尺寸和全尺寸。"
+  (let ((A1 (vt-from-sequence '((1 2 3)
+                                (4 5 6)
+                                (7 8 9)
+                                (10 11 12))))
+        (A2 (vt-from-sequence '((3 1 2)
+                                (1 4 1)
+                                (2 1 3))))
+        (A3 (vt-from-sequence '((5)))))   ; 1x1 矩阵
+    (format t "~%========== SVD 分解测试 ==========~%")
+    (dolist (mat (list A1 A2 A3))
+      (format t "~%--- 矩阵 ~A ---~%" (vt-shape mat))
+      (test-svd mat nil)
+      (test-svd mat t))))
 
-
-
-;; ===================== QR 分解测试 =====================
-(defparameter *A-qr* (vt-from-sequence '((12 -51   4)
-                                         ( 6 167 -68)
-                                         (-4  24 -41))))
-(format t "~%========== QR 分解测试 ==========~%")
-(format t "原始矩阵 A:~%")
-(print (vt-data->list *A-qr*))
-
-;; Full mode
-(multiple-value-bind (Q R)
-    (vt-qr *A-qr* :mode :full)
-  (format t "~%Full mode: Q (m×m), R (m×n)~%")
-  (format t "Q 的正交性: Q^T Q ≈ I ?~%")
-  (let ((QtQ (vt-@ (vt-transpose Q) Q)))
-    (print qtq)
-    (format t "  max|Q^T Q - I| = ~A~%"
-            (reduce #'max (vt-data QtQ)
-		    :key (lambda (x)
-			   (abs (- x (if (= (first (vt-shape Q))
-						      (second (vt-shape Q)))
-						   1.0 0.0)))))))
-  (format t "重构误差: max|A - Q R| = ~A~%"
-          (reduce #'max (vt-data (vt-- *A-qr* (vt-@ Q R))) :key #'abs)))
-
-;; Reduced mode
-(multiple-value-bind (Q R) (vt-qr *A-qr* :mode :reduced)
-  (format t "~%Reduced mode: Q (m×k), R (k×n)~%")
-  (format t "Q 的列正交性: Q^T Q ≈ I_k ?~%")
-  (let ((QtQ (vt-@ (vt-transpose Q) Q)))
-    (format t "  max|Q^T Q - I| = ~A~%"
-            (reduce #'max (vt-data (let ((I (vt-eye (second (vt-shape Q))
-						    :type 'double-float)))
-                                     (vt-- QtQ I)))
-		    :key #'abs)))
-  (format t "重构误差: max|A - Q R| = ~A~%"
-          (reduce #'max (vt-data (vt-- *A-qr* (vt-@ Q R))) :key #'abs)))
-
-;; ===================== SVD 分解测试 =====================
-;; 测试矩阵 1: 4x3 非方阵
-(defparameter *A-svd1* (vt-from-sequence '((1 2 3)
-                                          (4 5 6)
-                                          (7 8 9)
-                                           (10 11 12))))
-
-;; 测试矩阵 2: 3x3 方阵
-(defparameter *A-svd2* (vt-from-sequence '((3 1 2)
-                                          (1 4 1)
-                                           (2 1 3))))
-
-;; 测试矩阵 3: 1x1 边界情况
-(defparameter *A-svd3* (vt-from-sequence '((5))))
-
-;; 运行测试
-(format t "~%========== SVD 分解测试 ==========~%")
-(test-svd *A-svd1* nil)
-(test-svd *A-svd1* t)
-(test-svd *A-svd2* nil)
-(test-svd *A-svd2* t)
-;; 1x1 边界测试
-(format t "~%--- 1x1 边界情况 ---")
-(test-svd *A-svd3* nil)
+;; ========== 总入口 ==========
+(defun run-all-linalg-tests ()
+  "依次运行 QR 和 SVD 的测试。"
+  (test-qr)
+  (run-svd-tests)
+  (format t "~%所有线性代数测试完成。~%"))
 
 ;; 重构误差都应该小于 1e-14数量级
 ;;------------------------------------------------------<<
@@ -221,8 +173,6 @@
       (format t "~%Correctly errored on size 1: ~A~%" e)))
   
     (format t "~%All gradient tests passed!~%")))
-
-  
 
 
 (defun test-gradient-advanced ()
@@ -334,20 +284,6 @@
       (format t "~%Correctly signalled length mismatch: ~A~%" e)))
 
   (format t "~%All advanced gradient tests passed!~%")))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 (defun test-pad ()
@@ -603,3 +539,97 @@
                                        :type 'double-float))))
 
     (format t "~%All thorough pad tests passed!~%")))
+
+
+
+(defun test-vt-take ()
+  "全面测试 vt-take，所有场景均与 NumPy 行为对照。"
+  ;; 测试矩阵：4 行 5 列，元素 0..19
+  (let* ((m (vt-from-sequence '(( 0  1  2  3  4)
+                                ( 5  6  7  8  9)
+                                (10 11 12 13 14)
+                                (15 16 17 18 19))
+                              :type 'fixnum))
+         ;; 辅助函数：将张量展平为列表（如果是一维）或保持嵌套
+         (to-list (lambda (vt)
+                    (if (= (length (vt-shape vt)) 1)
+                        (coerce (vt-data vt) 'list)
+                        (vt-data->list vt)))))
+    ;; ================================================================
+    ;; 1. axis = nil : 标量索引
+    ;; np: a = np.arange(20).reshape(4,5); a.take(0)  => np.int64(0)
+    ;; ================================================================
+    (let ((result (vt-take m 0)))
+      (assert (= result 0)
+              () "take(0) failed: expected 0, got ~A" result))
+
+    ;; ================================================================
+    ;; 2. axis = nil : 列表索引
+    ;; np: a.take([0,5])  => [0, 5]
+    ;; ================================================================
+    (let* ((result (vt-take m (list 0 5)))
+           (expected (vt-from-sequence '(0 5) :type 'fixnum)))
+      (assert (equalp (funcall to-list result)
+                      (funcall to-list expected))
+              () "take([0,5]) failed"))
+
+    ;; ================================================================
+    ;; 3. axis = nil : 多维索引，保留形状
+    ;; np: a.take([[1,3],[1,5]])  => [[1,3],[1,5]]  shape (2,2)
+    ;; ================================================================
+    (let* ((indices (vt-from-sequence '((1 3) (1 5)) :type 'fixnum))
+           (result (vt-take m indices)))
+      (assert (equal (vt-shape result) '(2 2))
+              () "take with 2D indices: shape mismatch ~A" (vt-shape result))
+      (assert (equalp (vt-data->list result)
+                      '((1 3) (1 5)))
+              () "take with 2D indices: values mismatch"))
+
+    ;; ================================================================
+    ;; 4. axis = 0 : 一维索引
+    ;; np: a.take([1,3], axis=0)  => [[5,6,7,8,9],[15,16,17,18,19]]  shape (2,5)
+    ;; ================================================================
+    (let* ((indices (vt-arange 2 :start 1 :step 2 :type 'fixnum)) ; [1,3]
+           (result (vt-take m indices :axis 0)))
+      (assert (equal (vt-shape result) '(2 5)) () "axis=0 shape failed")
+      (assert (equalp (vt-data->list result)
+                      '((5 6 7 8 9) (15 16 17 18 19)))
+              () "axis=0 values failed"))
+
+    ;; ================================================================
+    ;; 5. axis = 1 : 一维索引
+    ;; np: a.take([0,2], axis=1)  => [[0,2],[5,7],[10,12],[15,17]]  shape (4,2)
+    ;; ================================================================
+    (let* ((indices (vt-from-sequence '(0 2) :type 'fixnum))
+           (result (vt-take m indices :axis 1)))
+      (assert (equal (vt-shape result) '(4 2)) () "axis=1 shape failed")
+      (assert (equalp (vt-data->list result)
+                      '((0 2) (5 7) (10 12) (15 17)))
+              () "axis=1 values failed"))
+
+    ;; ================================================================
+    ;; 6. axis = -1 (等价 axis=1) : 多维索引
+    ;; np: a.take([[0,2],[1,3]], axis=-1)
+    ;;     输出形状 (4,2,2)
+    ;; ================================================================
+    (let* ((indices (vt-from-sequence '((0 2) (1 3)) :type 'fixnum))
+           (result (vt-take m indices :axis -1)))
+      (assert (equal (vt-shape result) '(4 2 2))
+              () "axis=-1 with 2D indices: shape mismatch ~A" (vt-shape result))
+      (assert (equalp (vt-data->list result)
+                      '(((0 2) (1 3)) ((5 7) (6 8))
+                        ((10 12) (11 13)) ((15 17) (16 18))))
+              () "axis=-1 with 2D indices: values mismatch"))
+
+    ;; ================================================================
+    ;; 7. axis = -2 (等价 axis=0) : 标量索引，降维
+    ;; np: a.take(2, axis=-2)  => 第三行，shape (5)
+    ;; ================================================================
+    (let* ((result (vt-take m 2 :axis -2))
+           (expected (vt-from-sequence '(10 11 12 13 14) :type 'fixnum)))
+      (assert (equal (vt-shape result) '(5)) () "axis=-2 shape failed")
+      (assert (equalp (funcall to-list result)
+                      (funcall to-list expected))
+              () "axis=-2 values failed"))
+
+    (format t "~%All vt-take tests passed!~%")))

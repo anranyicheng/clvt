@@ -1316,73 +1316,117 @@
 ;;; ===========================================
 
 (defun vt-take (tensor indices &key axis)
-  "从数组中按索引取值。axis 支持负数。"
-  (if axis
-      (let* ((shape (vt-shape tensor))
-             (rank (length shape))
-             (ax (vt-normalize-axis axis rank))
-             (axis-size (nth ax shape))
-             (idx-flat (vt-flatten indices))
-             (idx-data (vt-data idx-flat))
-             (idx-size (vt-size idx-flat))
-             (out-shape (loop for d in shape for i from 0
-                              if (= i ax) collect idx-size
-				else collect d))
-             (result (vt-zeros out-shape
-			       :type (vt-element-type tensor)))
-             (in-strides (vt-strides tensor))
-             (out-strides (vt-strides result)))
-        (when (eq (vt-element-type indices) 'double-float)
-          (warn "vt-take indices element type is not fixnum")
-          (setf idx-data (map 'vector #'truncate idx-data)))
-        (labels
-	    ((recurse (depth in-ptr out-ptr)
-               (if (= depth rank)
-                   ;; 所有维度遍历完毕，拷贝单个元素
-                   (setf (aref (vt-data result) out-ptr)
-                         (aref (vt-data tensor) in-ptr))
-                   (if (= depth ax)
-                       ;; 目标轴：按索引列表循环，更新指针并进入下层
-                       (let ((in-stride (nth depth in-strides))
-                             (out-stride (nth depth out-strides)))
-                         (loop
-			   for i of-type fixnum from 0 below idx-size
-                           for idx = (aref idx-data i)
-                           do (when (or (< idx 0) (>= idx axis-size))
-                                (error "索引 ~A 越界" idx))
-                              (recurse (1+ depth)
-                                       (+ in-ptr (* idx in-stride))
-                                       (+ out-ptr (* i out-stride)))))
-                       ;; 非目标轴：正常遍历维度
-                       (let ((dim (nth depth shape))
-                             (in-stride (nth depth in-strides))
-                             (out-stride (nth depth out-strides)))
-                         (loop for i of-type fixnum from 0 below dim do
-                           (recurse (1+ depth)
-                                    (+ in-ptr (* i in-stride))
-                                    (+ out-ptr (* i out-stride)))))))))
-          (recurse 0 (vt-offset tensor) 0))
-        result)
-      (let* ((flat (vt-flatten tensor))
-             (data (vt-data flat))
-             (size (vt-size flat))
-             (idx-flat (vt-flatten indices))
-             (idx-data (vt-data idx-flat))
-             (idx-size (vt-size idx-flat))
-             (result-data
-	       (make-array idx-size
-			   :element-type
-			   (vt-element-type tensor))))
-        (when (eq (vt-element-type indices) 'double-float)
-          (warn "vt-take indices element type is not fixnum")
-          (setf idx-data (map 'vector #'truncate idx-data)))
-        (loop for i from 0 below idx-size
-              for idx = (aref idx-data i)
-              do (when (or (< idx 0) (>= idx size))
-                   (error "索引 ~A 越界" idx))
-                 (setf (aref result-data i) (aref data idx)))
-        (%make-vt :data result-data :shape (list idx-size)
-                  :strides '(1) :offset 0))))
+  "从张量中按索引取值。支持多维 indices 和负数 axis。
+   当 axis=nil 且 indices 为标量数字时，直接返回数值；
+   否则返回张量。"
+  ;; 帮助函数：将任意形式的 indices 转为 fixnum 简单数组
+  (labels
+      ((ensure-fixnum-1d (vt)
+         (let* ((len (vt-size vt))
+                (arr (make-array len :element-type 'fixnum)))
+           (if (eq (vt-element-type vt) 'double-float)
+               (dotimes (i len)
+                 (setf (aref arr i) (truncate (aref (vt-data vt) i))))
+               (dotimes (i len)
+                 (setf (aref arr i) (aref (vt-data vt) i))))
+           (values arr len))))
+
+    (if (null axis)
+        ;; ======== axis = nil ========
+        (let ((idx-vt (ensure-vt indices)))
+          (if (null (vt-shape idx-vt))
+              ;; 标量索引：直接返回数值
+              (let* ((flat (vt-ravel tensor))
+                     (size (vt-size flat))
+                     (idx (if (eq (vt-element-type idx-vt) 'double-float)
+                              (truncate (aref (vt-data idx-vt) 0))
+                              (aref (vt-data idx-vt) 0))))
+                (unless (<= 0 idx (1- size))
+                  (error "索引 ~D 越界，展平大小 ~D" idx size))
+                (aref (vt-data flat) idx))
+              ;; 非标量索引：保留形状
+              (let* ((flat (vt-ravel tensor))
+                     (size (vt-size flat))
+                     (idx-shape (vt-shape idx-vt))
+                     (out (vt-zeros idx-shape
+				    :type (vt-element-type tensor)))
+                     (idx-len (vt-size idx-vt)))
+                (multiple-value-bind (idx-arr _)
+                    (ensure-fixnum-1d idx-vt)
+                  (declare (ignore _))
+                  (let ((flat-data (vt-data flat))
+                        (out-data (vt-data out)))
+                    (dotimes (i idx-len)
+                      (let ((idx (aref idx-arr i)))
+                        (unless (<= 0 idx (1- size))
+                          (error "索引 ~D 越界，展平大小 ~D" idx size))
+                        (setf (aref out-data i) (aref flat-data idx)))))
+                  out))))
+
+	;; ======== axis 整数 ========
+	(let* ((shape (vt-shape tensor))
+               (rank (length shape))
+               (ax (vt-normalize-axis axis rank))
+               (ax-dim (nth ax shape))
+               (idx-vt (ensure-vt indices))
+               (idx-shape (vt-shape idx-vt))
+               (idx-len (length idx-shape))
+               (idx-size (vt-size idx-vt))
+               (out-shape (append (subseq shape 0 ax)
+                                  idx-shape
+                                  (subseq shape (1+ ax))))
+               (out (vt-zeros out-shape :type (vt-element-type tensor)))
+               (idx-strides (vt-compute-strides idx-shape))
+               (idx-arr (make-array idx-size :element-type 'fixnum)))
+          ;; 填充 idx-arr
+          (let ((raw (vt-data (vt-flatten idx-vt))))
+            (if (eq (vt-element-type idx-vt) 'double-float)
+		(dotimes (i idx-size)
+                  (setf (aref idx-arr i) (truncate (aref raw i))))
+		(dotimes (i idx-size)
+                  (setf (aref idx-arr i) (aref raw i)))))
+          (let ((in-strides (vt-strides tensor))
+		(out-strides (vt-strides out))
+		(in-off (vt-offset tensor))
+		(out-off 0))
+            (labels
+		((recurse (depth in-ptr out-ptr)
+                   (if (= depth rank)
+                       (setf (aref (vt-data out) out-ptr)
+			     (aref (vt-data tensor) in-ptr))
+                       (if (= depth ax)
+                           (walk-idx 0 0 in-ptr out-ptr)
+                           (let ((dim (nth depth shape))
+                                 (in-str (nth depth in-strides))
+                                 (out-str
+				   (let ((out-idx
+					   (if (< depth ax)
+                                               depth
+                                               (+ depth idx-len -1))))
+                                     (nth out-idx out-strides))))
+			     (dotimes (i dim)
+                               (recurse (1+ depth)
+                                        (+ in-ptr (* i in-str))
+                                        (+ out-ptr (* i out-str))))))))
+                 (walk-idx (d idx-off in-ptr out-base)
+                   (if (= d idx-len)
+                       (let ((idx (aref idx-arr idx-off)))
+                         (unless (<= 0 idx (1- ax-dim))
+                           (error "索引 ~D 越界，轴 ~D 大小 ~D"
+				  idx ax ax-dim))
+                         (recurse (1+ ax)
+                                  (+ in-ptr (* idx (nth ax in-strides)))
+                                  out-base))
+                       (let ((dim (nth d idx-shape))
+			     (idx-str (nth d idx-strides))
+			     (out-str (nth (+ ax d) out-strides)))
+                         (dotimes (i dim)
+                           (walk-idx (1+ d)
+				     (+ idx-off (* i idx-str))
+				     in-ptr
+				     (+ out-base (* i out-str))))))))
+              (recurse 0 in-off out-off))
+            out)))))
 
 
 (defun vt-put (tensor indices values)
