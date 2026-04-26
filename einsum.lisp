@@ -256,7 +256,10 @@
                                    (* val-a (aref data-b ptr-b-start)))
                              (incf ptr-b-start sB-k)
                              (incf ptr-c-start sO-k)))))))
-                 (return-from einsum-execute output)))))
+                 (return-from einsum-execute
+		   (if (null (vt-shape output))
+		       (vt-ref output)
+		       output))))))
           (t  ;; 通用路径
            (let ((cur-ptrs (make-array n-vts :element-type 'fixnum
 					     :initial-element 0)))
@@ -295,7 +298,9 @@
                           (decf out-ptr (the fixnum (* dim out-stride)))))))
                
                (recurse 0 0)))))
-        output))))
+        (if (null (vt-shape output))
+	    (vt-ref output)
+	    output)))))
 
 (declaim (inline vt-einsum))
 (defun vt-einsum (subscripts &rest vts)

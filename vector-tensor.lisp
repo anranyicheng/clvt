@@ -1086,8 +1086,8 @@
                  if (= i real-axis) collect 0
                    else collect
 			(let ((out-idx
-				(if keepdims                                  
-                                    i                                  
+				(if keepdims
+				    i
                                     (if (< i real-axis)
 					i
 					(1- i)))))
