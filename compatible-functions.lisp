@@ -122,9 +122,11 @@
            (ndim-b (length b-shape))
            (max-ndim (max ndim-a ndim-b))
            ;; 维度对齐：在前面补 1 使秩相等
-           (a-shape-padded (append (make-list (- max-ndim ndim-a) :initial-element 1)
+           (a-shape-padded (append (make-list (- max-ndim ndim-a)
+					      :initial-element 1)
                                    a-shape))
-           (b-shape-padded (append (make-list (- max-ndim ndim-b) :initial-element 1)
+           (b-shape-padded (append (make-list (- max-ndim ndim-b)
+					      :initial-element 1)
                                    b-shape))
            (a-new-shape nil)
            (b-new-shape nil)
@@ -954,7 +956,8 @@
                          (stable-sort pairs #'< :key #'cdr)
                          (sort pairs #'< :key #'cdr))))
         (%make-vt :data (make-array n :element-type 'fixnum
-                                      :initial-contents (mapcar #'car sorted))
+                                      :initial-contents
+				      (mapcar #'car sorted))
                   :shape (list n)
                   :strides '(1)
                   :offset 0))
@@ -1821,8 +1824,10 @@
          (n (nth ax sh)))
     ;; 轴长度不足 → 返回全零，形状删除该轴
     (when (< n 2)
-      (let ((out-shape (append (subseq sh 0 ax) (subseq sh (1+ ax)))))
-        (return-from vt-trapz (vt-zeros out-shape :type (vt-element-type y)))))
+      (let ((out-shape (append (subseq sh 0 ax)
+			       (subseq sh (1+ ax)))))
+        (return-from vt-trapz
+	  (vt-zeros out-shape :type (vt-element-type y)))))
     ;; 步长向量（长度 = n-1）
     (let ((h (if x
                  (vt-diff (ensure-vt x))          ; 1D,长度 n-1
@@ -1832,12 +1837,14 @@
       (let ((h-broadcast-shape
               (append (make-list ax :initial-element 1)
                       (list (1- n))
-                      (make-list (- (length sh) ax 1) :initial-element 1))))
+                      (make-list (- (length sh) ax 1)
+				 :initial-element 1))))
         (setf h (vt-reshape h h-broadcast-shape)))
       ;; 梯形平均：0.5 * (y_[:-1] + y_[1:]) * h
       (let* ((left  (vt-narrow y ax 0 (1- n)))   ; 相当于 y[...,:-1,:...]
              (right (vt-narrow y ax 1 n))        ; 相当于 y[...,1:,:...]
-             (integrand (vt-map (lambda (l r h) (* 0.5d0 (+ l r) h))
+             (integrand (vt-map (lambda (l r h)
+				  (* 0.5d0 (+ l r) h))
                                 left right h)))
         (vt-sum integrand :axis ax)))))
 
