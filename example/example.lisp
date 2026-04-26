@@ -1,7 +1,13 @@
-(defpackage :clvt-test
-  (:use :cl :clvt))
-(in-package :clvt-test)
+(in-package :clvt)
 
+(defun test-cumsum-type ()
+  (format t "~%=== Testing vt-cumsum with fixnum ===")
+  (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
+         (cum (vt-cumsum a))                       ; 应返回 fixnum 数组
+         (expected (vt-from-sequence '(0 1 3 6 10) :type 'fixnum)))
+    (assert (vt-allclose cum expected))
+    (format t "~[FAIL~;PASS~] vt-cumsum fixnum test~%"
+            (if (vt-allclose cum expected) 1 0))))
 ;;----------------------测试 vt-qr vt-svd ---------------------
 
 (defun diag-matrix (S m n)
@@ -674,3 +680,68 @@
 	     (vt-data->list (vt-sort a :axis nil))
 	     '(1 2 3 4 5 6)))
     (print "passed test vt-sort")))
+
+(defun test-argsort-multi-axis ()
+  (format t "~%=== Testing vt-argsort with rank>2 ===")
+  (let ((a (vt-from-sequence '(((3 2) (1 0))
+                               ((9 8) (7 6)))
+                             :type 'fixnum)))   ; shape (2,2,2)
+    ;; 沿最后一轴（axis=-1）排序，期望每层内两个元素升序
+    (let ((sorted (vt-argsort a :axis -1)))
+      (assert (equal (vt-data->list sorted)
+                     '(((1 0) (1 0))
+                       ((1 0) (1 0)))))
+      (format t "~[FAIL~;PASS~] argsort axis=-1~%"
+              (if (equal (vt-data->list sorted)
+                         '(((1 0) (1 0)) ((1 0) (1 0))))
+		  1 0)))
+    ;; 沿 axis=0 排序
+    (let ((sorted (vt-argsort a :axis 0)))
+      (assert (equal (vt-data->list sorted)
+                     '(((0 0) (0 0))
+                       ((1 1) (1 1)))))
+      (format t "~[FAIL~;PASS~] argsort axis=0~%"
+              (if (equal (vt-data->list sorted)
+                         '(((0 0) (0 0)) ((1 1) (1 1))))
+		  1 0)))))
+
+ (macrolet ((assert-close (a b &optional (eps 1e-8))
+             `(unless (<= (abs (- ,a ,b)) ,eps)
+                (error "Assertion failed: ~A ~A differ by ~A"
+                       ',a ',b (abs (- ,a ,b))))))
+	(defun test-svd-correctness ()
+  (format t "~%=== Testing vt-svd correctness ===")
+  (let* ((A (vt-from-sequence '((1 2 3)
+                                (4 5 6)
+                                (7 8 9)
+                                (10 11 12))
+                              :type 'double-float))
+         (m (first (vt-shape A)))
+         (n (second (vt-shape A)))
+         (k (min m n)))
+    ;; 经济模式
+    (multiple-value-bind (U S Vt) (vt-svd A :full-matrices nil)
+      (let* ((Smat (vt-zeros (list (vt-size S) (vt-size S)) :type 'double-float))
+             (_ (dotimes (i (vt-size S))
+                  (setf (vt-ref Smat i i) (vt-ref S i))))
+             (recon (vt-@ (vt-@ U Smat) Vt))
+             (err (vt-amax (vt-abs (vt-- A recon)))))
+        (format t "~%Economic SVD: max reconstruction error = ~A" err)
+        (assert-close err 0.0d0 1e-12)
+        (assert (equal (vt-shape Vt) (list k n))   ; Vt 应为 k×n
+                () "Economic Vt shape is ~A, expected (~A ~A)" (vt-shape Vt) k n)))
+    ;; 完整模式
+    (multiple-value-bind (U S Vt) (vt-svd A :full-matrices t)
+      (let* ((m (first (vt-shape A)))   ; = 4
+             (n (second (vt-shape A)))  ; = 3
+             (k (vt-size S))            ; = 3
+             (Smat (vt-zeros (list m n) :type 'double-float)))  ; 4×3
+	(dotimes (i k)
+	  (setf (vt-ref Smat i i) (vt-ref S i)))
+	(let* ((recon (vt-@ (vt-@ U Smat) Vt))
+              (err (vt-amax (vt-abs (vt-- A recon)))))
+	  (format t "Full SVD reconstruction error: ~A~%" err)
+        (assert-close err 0.0d0 1e-12)
+        (assert (equal (vt-shape Vt) (list n n))
+                () "Full Vt shape is ~A, expected (~A ~A)" (vt-shape Vt) n n)))
+    (format t "~%SVD tests passed~%")))))
