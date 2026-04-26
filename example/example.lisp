@@ -633,3 +633,44 @@
               () "axis=-2 values failed"))
 
     (format t "~%All vt-take tests passed!~%")))
+
+
+(defun test-vt-argsort ()
+  (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
+    (assert (equal
+	     (vt-data->list (vt-argsort a :axis -1))
+	     '((1 2 0)
+	       (2 1 0))))
+     (assert (equal
+	     (vt-data->list (vt-argsort a :axis 1))
+	     '((1 2 0)
+	       (2 1 0))))
+
+     (assert (equal
+	     (vt-data->list (vt-argsort a :axis 0))
+	     '((0 0 0)
+	       (1 1 1))))
+     (assert (equal
+	     (vt-data->list (vt-argsort a :axis nil))
+	     '(1 2 0 5 4 3)))
+    (print "passed test vt-argsort")))
+    
+    
+(defun test-vt-sort ()
+  (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
+    (assert (equal
+	     (vt-data->list (vt-sort a :axis -1))
+	     '((1 2 3)
+	       (4 5 6))))
+     (assert (equal
+	     (vt-data->list (vt-sort a :axis 1))
+	     '((1 2 3)
+	       (4 5 6))))
+     (assert (equal
+	     (vt-data->list (vt-sort a :axis 0))
+	     '((3 1 2)
+	       (6 5 4))))
+     (assert (equal
+	     (vt-data->list (vt-sort a :axis nil))
+	     '(1 2 3 4 5 6)))
+    (print "passed test vt-sort")))

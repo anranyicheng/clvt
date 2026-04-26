@@ -875,9 +875,8 @@
 ;;; 6. 排序与搜索
 ;;; ===========================================
 
-(defun vt-sort (tensor &key axis kind)
+(defun vt-sort (tensor &key (axis -1))
   "沿指定轴排序；axis 为 nil 时展平后排序。axis 支持负数。"
-  (declare (ignore kind))
   (if axis
       (let* ((shape (vt-shape tensor))
              (rank (length shape))
@@ -929,74 +928,95 @@
       (let* ((flat (vt-flatten tensor))
              (data (coerce (vt-data flat) 'list))
              (sorted (stable-sort data #'<)))
-        (vt-from-sequence sorted))))
+        (vt-from-sequence sorted :type (vt-element-type tensor)))))
 
-
-(defun vt-argsort (tensor &key axis)
-  "返回沿轴的排序索引张量，形状与输入相同。
-   axis 支持负数索引。如果 axis 为 nil，先展平再排序，返回一维索引。"
-  (if axis
-      (let* ((shape (vt-shape tensor))
-             (rank (length shape))
-             (ax (vt-normalize-axis axis rank)) ;; 处理负数轴
-             (ax-dim (nth ax shape))
-             (in-strides (vt-strides tensor))
-             (in-offset (vt-offset tensor))
-             (in-data (vt-data tensor))
-             ;; 输出为 fixnum 类型，形状与输入完全相同
-             (result (vt-zeros shape :type 'fixnum))
-             (out-strides (vt-strides result))
-             (out-data (vt-data result)))
-        (labels
-	    ((recurse (depth in-ptr out-ptr)
-               ;; depth: 当前递归的维度编号（0..rank-1）
-               (cond
-                 ((= depth ax)
-                  ;; ---- 到达排序轴：处理一条“纤维” ----
-                  (let* ((in-stride (nth ax in-strides))
-                         (out-stride (nth ax out-strides))
-                         ;; 收集 (索引 . 值) 对
-                         (pairs
-                           (loop for i of-type fixnum from 0 below ax-dim
-                                 for off = (+ in-ptr (* i in-stride))
-                                 collect (cons i (aref in-data off)))))
-                    ;; 按值排序，稳定排序保留原始顺序的语义
-                    (setq pairs (stable-sort pairs #'< :key #'cdr))
-                    ;; 将排序后的原始索引写入输出张量
-                    (loop for i of-type fixnum from 0 below ax-dim
-                          for (src-idx . nil) in pairs
-                          for off = (+ out-ptr (* i out-stride))
-                          do (setf (aref out-data off) src-idx))))
-                 
-                 ((< depth rank)
-                  ;; ---- 非排序轴：在轴尺寸上循环，递归进入下一维 ----
-                  (let ((dim (nth depth shape))
-                        (in-stride (nth depth in-strides))
-                        (out-stride (nth depth out-strides)))
-                    (loop for i of-type fixnum from 0 below dim do
-                      (recurse (1+ depth)
-                               (+ in-ptr (* i in-stride))
-                               (+ out-ptr (* i out-stride))))))
-                 
-                 (t
-                  ;; depth == rank 仅当 rank=0（标量）时可能发生，直接取自身
-                  (setf (aref out-data out-ptr) 0)))))
-          ;; 从第 0 维开始递归
-          (recurse 0 in-offset 0))
-        result)      
-      ;; axis = nil：展平为一维后排序
-      (let* ((flat (vt-flatten tensor))
+(defun vt-argsort (tensor &key (axis -1))
+  "返回沿指定轴的排序索引张量，形状与输入相同。
+   axis 默认 -1（最后一轴），支持负数；axis = nil 时展平排序。"
+  (if (null axis)
+      ;; 展平排序
+      (let* ((flat (vt-ravel tensor))
              (n (vt-size flat))
              (data (vt-data flat))
              (pairs (loop for i from 0 below n
                           collect (cons i (aref data i))))
-             (sorted (stable-sort pairs #'< :key #'cdr)))
-        (%make-vt
-         :data (make-array n :element-type 'fixnum
-                             :initial-contents (mapcar #'car sorted))
-         :shape (list n)
-         :strides '(1)
-         :offset 0))))
+             (sorted (if (fboundp 'stable-sort)
+                         (stable-sort pairs #'< :key #'cdr)
+                         (sort pairs #'< :key #'cdr))))
+        (%make-vt :data (make-array n :element-type 'fixnum
+                                    :initial-contents (mapcar #'car sorted))
+                  :shape (list n)
+                  :strides '(1)
+                  :offset 0))
+      ;; 沿特定轴排序
+      (let* ((shape (vt-shape tensor))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))
+             (ax-dim (nth ax shape))
+             (in-strides (vt-strides tensor))
+             (in-offset (vt-offset tensor))
+             (in-data (vt-data tensor))
+             (result (vt-zeros shape :type 'fixnum))
+             (out-strides (vt-strides result))
+             (out-data (vt-data result)))
+        (labels
+            ;; 主递归：遍历 depth < ax 的维度
+            ((recurse (depth in-ptr out-ptr)
+               (cond
+                 ((= depth rank) nil)      ; 不应发生
+                 ((< depth ax)
+                  ;; 在 ax 之前的维度，正常循环
+                  (let ((dim (nth depth shape))
+                        (in-stride (nth depth in-strides))
+                        (out-stride (nth depth out-strides)))
+                    (dotimes (i dim)
+                      (recurse (1+ depth)
+                               (+ in-ptr (* i in-stride))
+                               (+ out-ptr (* i out-stride))))))
+                 ((= depth ax)
+                  ;; 到达排序轴：对 ax 之后的每个更深组合，提取纤维并排序
+                  (let* ((in-stride (nth ax in-strides))
+                         (out-stride (nth ax out-strides))
+                         ;; 计算更深维度的总步长组合数量（用于遍历）
+                         (tail-dims (subseq shape (1+ ax)))
+                         (tail-strides (subseq out-strides (1+ ax)))
+                         (tail-size (reduce #'* tail-dims :initial-value 1)))
+                    (dotimes (tail-i tail-size)
+                      ;; 计算当前组合在更深处导致的偏移
+                      (let ((rem tail-i)
+                            (extra-in-off 0)
+                            (extra-out-off 0))
+                        (loop for dim in tail-dims
+                              for s in tail-strides
+                              do (multiple-value-bind (q r)
+				     (floor rem dim)
+                                   (incf extra-in-off
+					 (* r (nth (1+ (position dim tail-dims)) in-strides))) ; 需要正确的 in-stride
+                                   (incf extra-out-off (* r s))
+                                   (setf rem q)))
+                        ;; 收集纤维
+                        (let ((pairs nil))
+                          (dotimes (pos ax-dim)
+                            (let* ((in-off (+ in-ptr (* pos in-stride) extra-in-off))
+                                   (val (aref in-data in-off)))
+                              (push (cons pos val) pairs)))
+                          ;; 排序
+                          (setf pairs
+                                (if (fboundp 'stable-sort)
+                                    (stable-sort (nreverse pairs) #'< :key #'cdr)
+                                    (sort (nreverse pairs) #'< :key #'cdr)))
+                          ;; 写回索引
+                          (dotimes (pos ax-dim)
+                            (let* ((out-off (+ out-ptr (* pos out-stride) extra-out-off))
+                                   (src-idx (car (nth pos pairs))))
+                              (setf (aref out-data out-off) src-idx)))))))))))
+          (recurse 0 in-offset 0))
+        result)))
+
+
+
+
+
 
 (defun vt-unique (tensor &key return-index return-inverse return-counts)
   "返回展平后张量中的唯一元素，自动排序（升序）。
