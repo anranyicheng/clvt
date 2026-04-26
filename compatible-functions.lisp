@@ -45,19 +45,21 @@
            (type boolean endpoint))
   (when (<= num 0)
     (error "num 必须大于 0"))
-  (let* ((actual-num (if endpoint num (1- num)))
-         (step (if (= actual-num 0)
-                   0
-                   (/ (- end start) actual-num)))
-         (data (make-array num :element-type type))
-         (shape (list num)))
-    (loop for i from 0 below num
-          for val = (+ start (* i step))
-          do (setf (aref data i) (coerce val type)))
-    (%make-vt :data data
-	      :shape shape
-	      :strides '(1)
-	      :offset 0)))
+  (if (= num 1)
+      ;; 单点情况：直接返回 [start]
+      (let ((data (make-array 1 :element-type type
+                                :initial-element (coerce start type))))
+        (%make-vt :data data :shape '(1) :strides '(1) :offset 0))
+      (let* ((divisor (if endpoint (1- num) num))
+             (step (/ (- end start) divisor))
+             (data (make-array num :element-type type)))
+        (loop for i from 0 below num
+              do (setf (aref data i)
+                       (coerce (+ start (* i step)) type)))
+        (%make-vt :data data
+                  :shape (list num)
+                  :strides '(1)
+                  :offset 0))))
 
 (defun vt-full (shape fill-value &key (type 'double-float))
   "创建指定值填充的数组.
@@ -110,33 +112,38 @@
 				      :type type)))
 
 (defun vt-kron (a b)
-  "计算两个张量的 Kronecker 积。"
+  "计算任意维张量的 Kronecker 积，行为与 NumPy 完全一致。"
   (let ((a-shape (vt-shape a))
         (b-shape (vt-shape b)))
-    (if (and (= (length a-shape) 2)
-	     (= (length b-shape) 2))
-        ;; 2D 情况
-        (let* ((ma (first a-shape))
-	       (na (second a-shape))
-               (mb (first b-shape))
-	       (nb (second b-shape))
-               (out (vt-zeros (list (* ma mb) (* na nb)))))
-          (loop
-	    for i from 0 below ma
-            do (loop
-		 for j from 0 below na
-                 for aij = (vt-ref a i j)
-                 do (loop
-		      for p from 0 below mb
-                      do (loop
-			   for q from 0 below nb
-                           do (setf (vt-ref out
-					    (+ (* i mb) p)
-					    (+ (* j nb) q))
-                                    (* aij (vt-ref b p q)))))))
-          out)
-        ;; 高维：递归展平后计算再 reshape
-        (error "vt-kron for >2D not implemented yet"))))
+    ;; 标量视为形状 (1)
+    (when (null a-shape) (setf a-shape '(1)))
+    (when (null b-shape) (setf b-shape '(1)))
+    (let* ((ndim-a (length a-shape))
+           (ndim-b (length b-shape))
+           (max-ndim (max ndim-a ndim-b))
+           ;; 维度对齐：在前面补 1 使秩相等
+           (a-shape-padded (append (make-list (- max-ndim ndim-a) :initial-element 1)
+                                   a-shape))
+           (b-shape-padded (append (make-list (- max-ndim ndim-b) :initial-element 1)
+                                   b-shape))
+           (a-new-shape nil)
+           (b-new-shape nil)
+           (final-shape nil))
+      ;; 构建交错形状：A: (d1, 1, d2, 1, ...)，B: (1, e1, 1, e2, ...)
+      (loop for da in a-shape-padded
+            for db in b-shape-padded
+            do (push da a-new-shape)   ; A: da, 1
+               (push 1 a-new-shape)
+               (push 1 b-new-shape)   ; B: 1, db
+               (push db b-new-shape)
+               (push (* da db) final-shape))
+      (setf a-new-shape (nreverse a-new-shape))
+      (setf b-new-shape (nreverse b-new-shape))
+      (setf final-shape (nreverse final-shape))
+      ;; 重塑并广播相乘，最后 reshape 到目标形状
+      (let ((a-reshaped (vt-reshape a a-new-shape))
+            (b-reshaped (vt-reshape b b-new-shape)))
+        (vt-reshape (vt-* a-reshaped b-reshaped) final-shape)))))
 
 (defun vt-random-int (low high &key (size nil) (type 'fixnum))
   "创建随机整数数组.
@@ -934,7 +941,7 @@
   "返回沿指定轴的排序索引张量，形状与输入相同。
    axis 默认 -1（最后一轴），支持负数；axis = nil 时展平排序。"
   (if (null axis)
-      ;; 展平排序
+      ;; 展平排序（保持不变）
       (let* ((flat (vt-ravel tensor))
              (n (vt-size flat))
              (data (vt-data flat))
@@ -948,7 +955,7 @@
                   :shape (list n)
                   :strides '(1)
                   :offset 0))
-      ;; 沿特定轴排序
+      ;; 沿特定轴排序（修复版本）
       (let* ((shape (vt-shape tensor))
              (rank (length shape))
              (ax (vt-normalize-axis axis rank))
@@ -960,12 +967,10 @@
              (out-strides (vt-strides result))
              (out-data (vt-data result)))
         (labels
-            ;; 主递归：遍历 depth < ax 的维度
             ((recurse (depth in-ptr out-ptr)
                (cond
-                 ((= depth rank) nil)      ; 不应发生
+                 ((= depth rank) nil)
                  ((< depth ax)
-                  ;; 在 ax 之前的维度，正常循环
                   (let ((dim (nth depth shape))
                         (in-stride (nth depth in-strides))
                         (out-stride (nth depth out-strides)))
@@ -974,49 +979,51 @@
                                (+ in-ptr (* i in-stride))
                                (+ out-ptr (* i out-stride))))))
                  ((= depth ax)
-                  ;; 到达排序轴：对 ax 之后的每个更深组合，提取纤维并排序
                   (let* ((in-stride (nth ax in-strides))
                          (out-stride (nth ax out-strides))
-                         ;; 计算更深维度的总步长组合数量（用于遍历）
                          (tail-dims (subseq shape (1+ ax)))
+                         (tail-rank (length tail-dims))
                          (tail-strides (subseq out-strides (1+ ax)))
                          (tail-size (reduce #'* tail-dims :initial-value 1)))
-                    (dotimes (tail-i tail-size)
-                      ;; 计算当前组合在更深处导致的偏移
-                      (let ((rem tail-i)
-                            (extra-in-off 0)
-                            (extra-out-off 0))
-                        (loop for dim in tail-dims
-                              for s in tail-strides
-                              do (multiple-value-bind (q r)
-				     (floor rem dim)
-                                   (incf extra-in-off
-					 (* r (nth (1+ (position dim tail-dims)) in-strides))) ; 需要正确的 in-stride
-                                   (incf extra-out-off (* r s))
-                                   (setf rem q)))
-                        ;; 收集纤维
-                        (let ((pairs nil))
-                          (dotimes (pos ax-dim)
-                            (let* ((in-off (+ in-ptr (* pos in-stride) extra-in-off))
-                                   (val (aref in-data in-off)))
-                              (push (cons pos val) pairs)))
-                          ;; 排序
-                          (setf pairs
-                                (if (fboundp 'stable-sort)
-                                    (stable-sort (nreverse pairs) #'< :key #'cdr)
-                                    (sort (nreverse pairs) #'< :key #'cdr)))
-                          ;; 写回索引
-                          (dotimes (pos ax-dim)
-                            (let* ((out-off (+ out-ptr (* pos out-stride) extra-out-off))
-                                   (src-idx (car (nth pos pairs))))
-                              (setf (aref out-data out-off) src-idx)))))))))))
+                    ;; 预计算尾部每个维度在原始步长中的偏移
+                    (let ((tail-in-strides
+                            (loop for idx from 0 below tail-rank
+                                  collect (nth (+ ax 1 idx) in-strides))))
+                      (dotimes (tail-i tail-size)
+                        (let ((rem tail-i)
+                              (extra-in-off 0)
+                              (extra-out-off 0))
+                          ;; 计算当前组合的额外偏移（正确乘以 r）
+                          (loop for idx from 0 below tail-rank
+                                for dim in tail-dims
+                                for in-strd in tail-in-strides
+                                for out-strd in tail-strides
+                                do (multiple-value-bind (q r)
+				       (floor rem dim)
+                                     (incf extra-in-off (* r in-strd))
+                                     (incf extra-out-off (* r out-strd))
+                                     (setf rem q)))
+                          ;; 收集当前纤维上所有元素（值 + 原始位置）
+                          (let ((pairs nil))
+                            (dotimes (pos ax-dim)
+                              (let* ((in-off (+ in-ptr
+						(* pos in-stride)
+						extra-in-off))
+                                     (val (aref in-data in-off)))
+                                (push (cons pos val) pairs)))
+                            (setf pairs (stable-sort (nreverse pairs)
+						     #'<
+						     :key #'cdr))
+                            ;; 写回排序后的索引
+                            (dotimes (pos ax-dim)
+                              (let* ((out-off (+ out-ptr
+						 (* pos out-stride)
+						 extra-out-off))
+                                     (src-idx (car (nth pos pairs))))
+                                (setf (aref out-data out-off)
+				      src-idx))))))))))))
           (recurse 0 in-offset 0))
         result)))
-
-
-
-
-
 
 (defun vt-unique (tensor &key return-index return-inverse return-counts)
   "返回展平后张量中的唯一元素，自动排序（升序）。
@@ -1708,24 +1715,25 @@
      :type (vt-element-type vt))))
 
 (defun vt-diff (vt &key (axis -1) (n 1))
-  "沿指定轴计算 n 阶差分"
+  "沿指定轴计算 n 阶差分，与 numpy.diff 兼容。"
   (let ((result vt))
-    (loop repeat n do
-      (let* ((ax (vt-normalize-axis axis (length (vt-shape result))))
-             (len (nth ax (vt-shape result)))
-             (left (apply #'vt-slice result
-                          (loop for i from 0 below
-					     (length (vt-shape result))
-                                collect (if (= i ax)
-					    '(1 nil)
-					    :all))))
-             (right (apply #'vt-slice result
-                           (loop for i from 0 below
-					      (length (vt-shape result))
-                                 collect (if (= i ax)
-					     `(0 ,(1- len))
-					     :all)))))
-        (setf result (vt-- left right)))
+    (loop repeat n
+	  do
+	     (let* ((sh (vt-shape result))
+		    (ax (vt-normalize-axis axis (length sh)))
+		    (len (nth ax sh)))
+               ;; 当轴长度 <= 1 时，无法做差分，返回空张量
+               (when (< len 2)
+		 (let ((out-shape (append (subseq sh 0 ax)
+					  (list 0)
+					  (subseq sh (1+ ax)))))
+		   (return-from vt-diff
+		     (vt-zeros out-shape
+			       :type (vt-element-type result)))))
+               ;; left: result[..., 1:, ...] ; right: result[..., :-1, ...]
+               (let ((left  (vt-narrow result ax 1 len))
+		     (right (vt-narrow result ax 0 (1- len))))
+		 (setf result (vt-- left right))))
 	  finally (return result))))
 
 (defun vt-bincount (x &key (minlength 0))
@@ -1762,70 +1770,77 @@
 	      :offset 0)))
 
 (defun vt-correlate (a v &key (mode "full"))
-  "一维互相关 (不翻转 v)。"
+  "一维互相关（不翻转 v），与 numpy.correlate 完全一致。"
   (let* ((a-flat (vt-flatten a))
          (v-flat (vt-flatten v))
          (n (vt-size a-flat))
          (m (vt-size v-flat))
          (a-data (vt-data a-flat))
          (v-data (vt-data v-flat)))
-    ;; 根据移位 k 计算，k = 输出索引 - (m-1)
     (flet ((compute-one (k)
-             (let ((sum 0.0))
+             (let ((sum 0.0d0))
                (loop for j from (max 0 (- k)) below (min m (- n k))
                      do (incf sum (* (aref a-data (+ j k))
-                                     (aref v-data j))))
+				     (aref v-data j))))
                sum)))
-      (let ((result
-	      (ecase (intern (string-upcase mode) :keyword)
-                (:full  (let ((res (vt-zeros (list (+ n m -1)))))
-                          (loop for k from (- (1- m)) below n
-                                for i from 0
-                                do (setf (vt-ref res i) (compute-one k)))
-                          res))
-                (:valid (let* ((len (max 0 (- n (1- m))))
-                               (res (vt-zeros (list len))))
-                          (loop for k from 0 below len
-                                for i from 0
-                                do (setf (vt-ref res i) (compute-one k)))
-                          res))
-                (:same  (let* ((out-len (max n m))
-                               (res (vt-zeros (list out-len)))
-                               (start-k (- (floor out-len 2) (floor m 2))))
-                          (loop for i from 0 below out-len
-                                for k = (+ start-k i)
-                                do (setf (vt-ref res i) (compute-one k)))
-                          res)))))
-        result))))
+      ;; 取 full 的长度和偏移
+      (let* ((full-len (+ n m -1))
+             (offset  (1- m))          ; k=0 对应 full 数组的索引 offset
+             (full (make-array full-len :element-type 'double-float)))
+        ;; 计算完整的 full 互相关
+        (loop for k from (- offset) below n
+              for i from 0
+              do (setf (aref full i) (compute-one k)))
+        (ecase (intern (string-upcase mode) :keyword)
+          (:full
+           (%make-vt :data full :shape (list full-len) :strides '(1) :offset 0))
+          (:valid
+           (let* ((len (max 0 (1+ (- n m))))     ; n - m + 1
+                  (start offset))
+             (let ((data (make-array len :element-type 'double-float)))
+               (loop for i from 0 below len
+                     for idx from start
+                     do (setf (aref data i) (aref full idx)))
+               (%make-vt :data data :shape (list len) :strides '(1) :offset 0))))
+          (:same
+           (let* ((out-len (max n m))
+                  (start (floor (- full-len out-len) 2)))
+             (let ((data (make-array out-len :element-type 'double-float)))
+               (loop for i from 0 below out-len
+                     for idx from start
+                     do (setf (aref data i) (aref full idx)))
+               (%make-vt :data data :shape (list out-len) :strides '(1) :offset 0)))))))))
 
 (defun vt-convolve (a v &key (mode "full"))
   "一维卷积。"
   (vt-correlate a (vt-flip v) :mode mode))
 
-
 (defun vt-trapz (y &key (x nil) (dx 1.0d0) (axis -1))
-  "使用梯形法则沿指定轴积分。"
-  (let* ((ax (vt-normalize-axis axis (length (vt-shape y))))
-         (x-vt (if x
-                   (ensure-vt x)
-                   (vt-arange (nth ax (vt-shape y))
-			      :step dx
-			      :type 'double-float))))
-    (unless (= (vt-size x-vt) (nth ax (vt-shape y)))
-      (error "x 长度与 y 的 axis 维度不匹配"))
-    (vt-sum
-     (vt-map
-      (lambda (a b h) (* 0.5d0 (+ a b) h))
-      (apply #'vt-slice
-	     y
-	     (loop for i below (length (vt-shape y))
-                   collect (if (= i ax) '(0 -1) :all)))
-      (apply #'vt-slice
-	     y
-	     (loop for i below (length (vt-shape y))
-                   collect (if (= i ax) '(1 nil) :all)))
-      (vt-diff x-vt :axis ax))
-     :axis ax)))
+  "使用梯形法则沿指定轴积分，与 numpy.trapz 一致。"
+  (let* ((sh (vt-shape y))
+         (ax (vt-normalize-axis axis (length sh)))
+         (n (nth ax sh)))
+    ;; 轴长度不足 → 返回全零，形状删除该轴
+    (when (< n 2)
+      (let ((out-shape (append (subseq sh 0 ax) (subseq sh (1+ ax)))))
+        (return-from vt-trapz (vt-zeros out-shape :type (vt-element-type y)))))
+    ;; 步长向量（长度 = n-1）
+    (let ((h (if x
+                 (vt-diff (ensure-vt x))          ; 1D,长度 n-1
+                 (make-vt (list (1- n)) dx
+                          :type (vt-element-type y)))))
+      ;; 将 h 的外形扩展为 [1,…,1,n-1,1,…,1] 以便广播
+      (let ((h-broadcast-shape
+              (append (make-list ax :initial-element 1)
+                      (list (1- n))
+                      (make-list (- (length sh) ax 1) :initial-element 1))))
+        (setf h (vt-reshape h h-broadcast-shape)))
+      ;; 梯形平均：0.5 * (y_[:-1] + y_[1:]) * h
+      (let* ((left  (vt-narrow y ax 0 (1- n)))   ; 相当于 y[...,:-1,:...]
+             (right (vt-narrow y ax 1 n))        ; 相当于 y[...,1:,:...]
+             (integrand (vt-map (lambda (l r h) (* 0.5d0 (+ l r) h))
+                                left right h)))
+        (vt-sum integrand :axis ax)))))
 
 (defun vt-interp (x xp fp &key (left nil) (right nil))
   "一维线性插值。x, xp, fp 均为 1D 张量。"

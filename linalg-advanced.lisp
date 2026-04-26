@@ -53,7 +53,6 @@
                     R
                     (vt-slice R (list 0 k) :all))))))
 
-
 (defun compute-householder (x)
   "给定向量 x，返回三个值：v, beta, sigma。
    其中 sigma = -sign(x[0]) * ||x||，
@@ -67,7 +66,7 @@
         (values v beta sigma)))))
 
 (defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50)
-			(tol 1e-10))
+                        (tol 1e-10))
   "奇异值分解 A = U S V^T。
    full-matrices : T 则返回完整尺寸 U(m×m), S(k), Vt(n×n)  (k = min(m,n))
                   : NIL 返回经济尺寸 U(m×k), S(k), Vt(k×n)
@@ -77,7 +76,7 @@
          (m (first (vt-shape mat)))
          (n (second (vt-shape mat)))
          (k (min m n)))
-    ;; ===== 标量情形 =====
+    ;; 标量情形
     (when (and (= m 1) (= n 1))
       (let ((val (aref (vt-data mat) 0)))
         (return-from vt-svd
@@ -87,125 +86,83 @@
                       (vt-ones '(1 1) :type 'double-float)
                       (vt-const '(1 1) -1.0d0 :type 'double-float))))))
 
-    ;; ===== 辅助函数：列范数平方、列内积 =====
-    ;; 提升到此处，使得整个函数体可见
     (flet ((col-norm-sq (M col)
-             "返回矩阵 M 第 col 列的平方范数（即列与自身的点积）。"
              (vt-dot (vt-slice M :all col) (vt-slice M :all col)))
            (col-dot (M c1 c2)
-             "返回矩阵 M 第 c1 列与第 c2 列的点积。"
              (vt-dot (vt-slice M :all c1) (vt-slice M :all c2))))
 
-      ;; ===== 1. 单边 Jacobi =====
-      (let* ((U (vt-copy mat))  ;; m×n，迭代后前 k 列有意义
-             (V (vt-eye n :type 'double-float)) 
+      (let* ((U (vt-copy mat))   ; m×n
+             (V (vt-eye n :type 'double-float))
              (changed t)
              (sweep 0))
-        ;; Jacobi 循环
+        ;; Jacobi 旋转
         (loop while (and changed (< sweep max-sweeps)) do
           (setf changed nil)
           (loop for i from 0 below (1- n) do
-            (loop
-	      for j from (1+ i) below n
-              for alpha = (col-norm-sq U i)
-              for beta  = (col-norm-sq U j)
-              for gamma = (col-dot U i j)
-              when (> (abs gamma) (* tol (sqrt (* alpha beta))))
-                do (setf changed t)
-                   ;; 计算 Givens 旋转参数
-                   (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
-                          (t-abs (/ 1.0d0
-				    (+ (abs zeta)
-                                       (sqrt (+ 1 (* zeta zeta))))))
-                          (t-val (if (>= zeta 0)
-				     t-abs
-				     (- t-abs)))
-                          (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
-                          (s (* c t-val)))
-                     ;; 更新 U 的第 i, j 列
-                     (let ((old-i (vt-copy (vt-slice U :all i)))
-                           (old-j (vt-copy (vt-slice U :all j))))
-                       (setf (vt-slice U :all i)
-                             (vt-- (vt-scale old-i c)
-				   (vt-scale old-j s))
-                             (vt-slice U :all j)
-                             (vt-+ (vt-scale old-i s)
-				   (vt-scale old-j c))))
-                     ;; 更新 V 的第 i, j 列
-                     (let ((old-i (vt-copy (vt-slice V :all i)))
-                           (old-j (vt-copy (vt-slice V :all j))))
-                       (setf (vt-slice V :all i)
-                             (vt-- (vt-scale old-i c)
-				   (vt-scale old-j s))
-                             (vt-slice V :all j)
-                             (vt-+ (vt-scale old-i s)
-				   (vt-scale old-j c)))))))
+            (loop for j from (1+ i) below n
+                  for alpha = (col-norm-sq U i)
+                  for beta  = (col-norm-sq U j)
+                  for gamma = (col-dot U i j)
+                  when (> (abs gamma) (* tol (sqrt (* alpha beta))))
+                    do (setf changed t)
+                       (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
+                              (t-abs (/ 1.0d0 (+ (abs zeta) (sqrt (+ 1 (* zeta zeta))))))
+                              (t-val (if (>= zeta 0) t-abs (- t-abs)))
+                              (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
+                              (s (* c t-val)))
+                         (let ((old-i (vt-copy (vt-slice U :all i)))
+                               (old-j (vt-copy (vt-slice U :all j))))
+                           (setf (vt-slice U :all i) (vt-- (vt-scale old-i c) (vt-scale old-j s))
+                                 (vt-slice U :all j) (vt-+ (vt-scale old-i s) (vt-scale old-j c))))
+                         (let ((old-i (vt-copy (vt-slice V :all i)))
+                               (old-j (vt-copy (vt-slice V :all j))))
+                           (setf (vt-slice V :all i) (vt-- (vt-scale old-i c) (vt-scale old-j s))
+                                 (vt-slice V :all j) (vt-+ (vt-scale old-i s) (vt-scale old-j c)))))))
           (incf sweep))
 
-	;; ===== 2. 提取奇异值并排序 (此时 col-norm-sq 仍然可见) =====
-	(let* ((S-vec (make-array k :element-type 'double-float))
+        ;; 提取奇异值并排序
+        (let* ((S-vec (make-array k :element-type 'double-float))
                (U-k (vt-zeros (list m k) :type 'double-float))
-               ;; 生成奇异值列表 (sqrt(col_norm_sq) . 原始列号)
-               (pairs
-		 (sort (loop
-			 for col from 0 below k
-                         collect (cons (sqrt (col-norm-sq U col))
-				       col))
-                       #'> :key #'car)))
-          ;; 重组 U_k 并填充 S
+               (pairs (sort (loop for col from 0 below k
+                                  collect (cons (sqrt (col-norm-sq U col)) col))
+                            #'> :key #'car)))
+          ;; 重组 U-k 和奇异值
           (dotimes (new-i k)
             (destructuring-bind (val . old-col) (nth new-i pairs)
               (setf (aref S-vec new-i) val)
-              (setf (vt-slice U-k :all new-i)
-		    (vt-slice U :all old-col))))
-          ;; 规范化 U_k 的列
+              (setf (vt-slice U-k :all new-i) (vt-slice U :all old-col))))
+          ;; 归一化 U-k 的列
           (dotimes (i k)
-            (let ((inv (if (zerop (aref S-vec i)) 0.0d0
-                           (/ 1.0d0 (aref S-vec i)))))
-              (setf (vt-slice U-k :all i)
-		    (vt-scale (vt-slice U-k :all i) inv))))
-          ;; 重排序 V：需要将 V 的列也按照奇异值降序排列
-          (labels
-	      ((reorder-V-by-pairs (V-matrix pairs)
-                 (let* ((n (second (vt-shape V-matrix)))
-                        (V-sorted (vt-zeros (list n n)
-					    :type 'double-float)))
-                   ;; 前 k 个主奇异向量按降序放置
-                   (dotimes (new-i k)
-		     (let ((old-col (cdr (nth new-i pairs))))
-                       (setf (vt-slice V-sorted :all new-i)
-			     (vt-slice V-matrix :all old-col))))
-                   ;; 剩余 n-k 个零奇异值向量保持原顺序
-                   (let ((rest
-			   (loop
-			     for col from 0 below n
-			     unless (member col (mapcar #'cdr pairs))
-                               collect col)))
-		     (loop
-		       for offset from 0
-                       for col in rest
-                       do (setf (vt-slice V-sorted :all (+ k offset))
-				(vt-slice V-matrix :all col))))
-                   V-sorted)))
-            (let ((V-sorted (reorder-V-by-pairs V pairs)))
-              ;; Vt 为 n×n 矩阵
-              (setf V (vt-transpose V-sorted))))
-	  
-	  (let ((S-vt (vt-from-sequence (coerce S-vec 'list)
-					:type 'double-float)))
-            (if (not full-matrices)
-		;; 经济尺寸：U(m×k), S(k), Vt(k×n)
-		(let ((Vt-k (vt-slice V (list 0 k) :all)))
-                  (values U-k S-vt Vt-k))
-		;; 全尺寸：U(m×m), S(k), Vt(n×n)
-		(cond
-                  ((= m n)
-                   (values U-k S-vt V))
-                  ((> m n)
-                   (let ((U-full (extend-orthogonal-basis U-k)))
-                     (values U-full S-vt V)))
-                  ((< m n)
-                   (values U-k S-vt V))))))))))
+            (let ((inv (if (zerop (aref S-vec i)) 0.0d0 (/ 1.0d0 (aref S-vec i)))))
+              (setf (vt-slice U-k :all i) (vt-scale (vt-slice U-k :all i) inv))))
+
+          ;; 重排序 V 的列
+          (let* ((V-sorted (vt-zeros (list n n) :type 'double-float))
+                 (used-cols nil))
+            (dotimes (new-i k)
+              (let ((old-col (cdr (nth new-i pairs))))
+                (push old-col used-cols)
+                (setf (vt-slice V-sorted :all new-i) (vt-slice V :all old-col))))
+            (let ((rest-cols (loop for col from 0 below n
+                                   unless (member col used-cols) collect col)))
+              (loop for offset from 0 for col in rest-cols
+                    do (setf (vt-slice V-sorted :all (+ k offset)) (vt-slice V :all col))))
+
+            (let ((S-vt (vt-from-sequence (coerce S-vec 'list) :type 'double-float))
+                  (Vt (vt-transpose V-sorted)))   ; 现在 Vt 是 n×n 的 V^T
+              (if (not full-matrices)
+                  ;; 经济模式：取 Vt 的前 k 行 -> k×n
+                  (let ((Vt-k (vt-slice Vt (list 0 k) :all)))
+                    (values U-k S-vt Vt-k))
+                  ;; 完整模式：需要补全 U 到 m×m
+                  (cond
+                    ((= m n)
+                     (values U-k S-vt Vt))
+                    ((> m n)
+                     (let ((U-full (extend-orthogonal-basis U-k)))
+                       (values U-full S-vt Vt)))
+                    ((< m n)
+                     (values U-k S-vt Vt)))))))))))
 
 
 (defun extend-orthogonal-basis (U-econ)

@@ -183,8 +183,34 @@
       (recurse dims total-size))))
 
 (defun vt-data->list (vt)
-  "张量数据按照维度结构导出为列表形式,多维则是嵌套列表"
-  (vt-flatten-to-nested (vt-shape vt) (vt-data vt)))
+  "将张量转换为嵌套列表，正确处理任意 strides / offset 的视图。"
+  (labels ((build (depth shape strides offset data)
+             (declare (type fixnum depth offset)
+                      (type list shape strides)
+                      (type (simple-array * (*)) data))
+             (if (null shape)
+                 ;; 叶子：直接取标量
+                 (aref data offset)
+                 ;; 内部节点：遍历当前维度并递归
+                 (let ((dim (first shape))
+                       (stride (first strides))
+                       (rest-shape (rest shape))
+                       (rest-strides (rest strides))
+                       (result nil))
+                   (loop for i fixnum from (1- dim) downto 0
+                         for sub-offset fixnum = (+ offset (* i stride))
+                         do (push (build (1+ depth) rest-shape rest-strides
+                                         sub-offset data)
+                                  result))
+                   result))))
+    (let ((shape (vt-shape vt))
+          (strides (vt-strides vt))
+          (offset (vt-offset vt))
+          (data (vt-data vt)))
+      (if shape
+          (build 0 shape strides offset data)
+          ;; 0 维张量（标量）直接返回值
+          (aref data offset)))))
 
 (defun vt-order (vt)
   "张量的维度大小"
@@ -231,8 +257,7 @@
   "创建单位矩阵 或矩形矩阵.
    N: 行数.
    M: 列数 (默认为 N).
-   Value: 对角线填充值 (默认 1.0).
-   支持高维批处理:如果传入 shape (b1 b2 ... n m),则创建批量单位矩阵."
+   Value: 对角线填充值 (默认 1.0)."
   (let* ((rows n)
          (cols m)
          ;; 简单情况:2D 矩阵
@@ -241,8 +266,7 @@
          (data (vt-data res))
          (strides (vt-strides res)))    
     (declare (type (simple-array * (*)) data)
-             (type list strides))    
-    ;; 优化:直接计算对角线步长
+             (type list strides))
     ;; 对于行优先,data[i, i] 的偏移是 i * row_stride + i * col_stride
     ;; row_stride 通常是 cols (对于密集矩阵), col_stride 是 1
     (let ((row-stride (first strides)) ;; 第一维步长
@@ -1143,7 +1167,7 @@
 	       res-offset 
                (if res-idx (vt-offset res-idx) 0) 
                0))
-    (if (and is-global-reduction (not keepdims))
+    (if (null (vt-shape res))
         (let ((final-val (aref res-data res-offset)))
           (if return-arg
 	      (values final-val (aref res-idx-data (vt-offset res-idx)))

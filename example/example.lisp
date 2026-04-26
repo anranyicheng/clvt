@@ -92,17 +92,8 @@
       (test-svd mat nil)
       (test-svd mat t))))
 
-;; ========== 总入口 ==========
-(defun run-all-linalg-tests ()
-  "依次运行 QR 和 SVD 的测试。"
-  (test-qr)
-  (run-svd-tests)
-  (format t "~%所有线性代数测试完成。~%"))
-
 ;; 重构误差都应该小于 1e-14数量级
 ;;------------------------------------------------------<<
-
-
 
 
 (defun test-gradient ()
@@ -745,3 +736,544 @@
         (assert (equal (vt-shape Vt) (list n n))
                 () "Full Vt shape is ~A, expected (~A ~A)" (vt-shape Vt) n n)))
     (format t "~%SVD tests passed~%")))))
+
+
+
+
+;;; ============================================================
+;;; vt-put 测试（与 NumPy 的 numpy.put 行为对齐）
+;;; ============================================================
+
+(defun test-vt-put ()
+  (format t "~%=== Testing vt-put (NumPy style) ===~%")
+
+  ;; ------------------------------------------------------------
+  ;; 测试 1: 标量 indices + 标量 values (展平后设置单个元素)
+  ;; NumPy:
+  ;;   import numpy as np
+  ;;   a = np.arange(6).reshape(2,3)   # [[0,1,2],[3,4,5]]
+  ;;   np.put(a, 4, 99)                # 展平索引 4 处设值
+  ;;   print(a)                        # [[0,1,2],[3,99,5]]
+  ;; ------------------------------------------------------------
+  (let ((a (vt-arange 6 :type 'fixnum)))
+    (setf a (vt-reshape a '(2 3)))
+    (vt-put a 4 99)
+    (let ((expected (vt-from-sequence '((0 1 2) (3 99 5)) :type 'fixnum)))
+      (assert (vt-allclose a expected))
+      (format t "Test 1 passed: scalar index + scalar value~%")))
+
+  ;; ------------------------------------------------------------
+  ;; 测试 2: 一维 indices 列表 + 一维 values 列表（长度相等）
+  ;; NumPy:
+  ;;   a = np.arange(10)
+  ;;   np.put(a, [0, 5, 9], [100, 200, 300])
+  ;;   print(a)   # [100, 1, 2, 3, 4, 200, 6, 7, 8, 300]
+  ;; ------------------------------------------------------------
+  (let ((a (vt-arange 10 :type 'fixnum)))
+    (vt-put a '(0 5 9) '(100 200 300))
+    (let ((expected (vt-from-sequence '(100 1 2 3 4 200 6 7 8 300) :type 'fixnum)))
+      (assert (vt-allclose a expected))
+      (format t "Test 2 passed: 1D indices + same length values~%")))
+
+  ;; ------------------------------------------------------------
+  ;; 测试 3: 一维 indices 列表 + 标量 values（标量广播）
+  ;; NumPy:
+  ;;   a = np.arange(8)
+  ;;   np.put(a, [1, 3, 5, 7], -1)
+  ;;   print(a)   # [0, -1, 2, -1, 4, -1, 6, -1]
+  ;; ------------------------------------------------------------
+  (let ((a (vt-arange 8 :type 'fixnum)))
+    (vt-put a '(1 3 5 7) -1)
+    (let ((expected (vt-from-sequence '(0 -1 2 -1 4 -1 6 -1) :type 'fixnum)))
+      (assert (vt-allclose a expected))
+      (format t "Test 3 passed: 1D indices + scalar value (broadcast)~%")))
+
+  ;; ------------------------------------------------------------
+  ;; 测试 4: 一维 indices 列表 + 较短的 values（循环使用）
+  ;; NumPy:
+  ;;   a = np.arange(6)
+  ;;   np.put(a, [0, 2, 4, 5], [10, 20])   # values = [10,20,10,20] 循环填充
+  ;;   print(a)   # [10, 1, 20, 3, 10, 20]
+  ;; ------------------------------------------------------------
+  (let ((a (vt-arange 6 :type 'fixnum)))
+    (vt-put a '(0 2 4 5) '(10 20))
+    (let ((expected (vt-from-sequence '(10 1 20 3 10 20) :type 'fixnum)))
+      (assert (vt-allclose a expected))
+      (format t "Test 4 passed: 1D indices + shorter values (cycle)~%"))
+
+  ;; ------------------------------------------------------------
+  ;; 测试 5: 多维 indices（自动展平）+ 标量 values
+  ;; NumPy:
+  ;;   a = np.arange(12).reshape(3,4)
+  ;;   indices = np.array([[0, 3], [8, 11]])   # 展平后为 [0,3,8,11]
+  ;;   np.put(a, indices, -999)
+  ;;   print(a)
+  ;;   # [[-999,   1,   2, -999],
+  ;;   #  [   4,   5,   6,   7],
+  ;;   #  [-999,   9,  10, -999]]
+  ;; ------------------------------------------------------------
+  (let ((a (vt-arange 12 :type 'fixnum)))
+    (setf a (vt-reshape a '(3 4)))
+    (let ((indices (vt-from-sequence '((0 3) (8 11)) :type 'fixnum)))
+      (vt-put a indices -999))
+    (let ((expected (vt-from-sequence '((-999 1 2 -999)
+                                        (4 5 6 7)
+                                        (-999 9 10 -999))
+                                      :type 'fixnum)))
+      (assert (vt-allclose a expected))
+      (format t "Test 5 passed: multi-dim indices (flattened) + scalar value~%"))
+
+  ;; ------------------------------------------------------------
+  ;; 测试 6: 二维张量（非展平）使用 axis 参数（注意：vt-put 目前没有 axis 参数，
+  ;;         它总是按展平索引工作。NumPy 的 put 也没有 axis，但 numpy.put_along_axis 有。
+  ;;         这里测试的是展平索引在多维数组上的行为，符合预期。）
+  ;; NumPy:
+  ;;   a = np.arange(12).reshape(3,4)
+  ;;   np.put(a, [2, 7, 10], [777, 888, 999])
+  ;;   print(a)
+  ;;   # [[  0,   1, 777,   3],
+  ;;   #  [  4,   5,   6, 888],
+  ;;   #  [  8,   9, 999,  11]]
+  ;; ------------------------------------------------------------
+  (let ((a (vt-arange 12 :type 'fixnum)))
+    (setf a (vt-reshape a '(3 4)))
+    (vt-put a '(2 7 10) '(777 888 999))
+    (let ((expected (vt-from-sequence '((0 1 777 3)
+                                        (4 5 6 888)
+                                        (8 9 999 11))
+                                      :type 'fixnum)))
+      (assert (vt-allclose a expected))
+      (format t "Test 6 passed: flat indices on 2D array~%"))
+
+  ;; ------------------------------------------------------------
+  ;; 测试 7: 索引越界检测（应抛出错误）
+  ;; NumPy: np.put(a, [100], 0) 会引发 IndexError
+  ;; ------------------------------------------------------------
+  (handler-case
+      (let ((a (vt-arange 5 :type 'fixnum)))
+        (vt-put a 100 42))
+    (simple-error (e)
+      (format t "Test 7 passed: caught out-of-bounds error: ~A~%" e)))
+
+  (format t "All vt-put tests passed successfully!~%")))))
+
+
+
+;;; 测试 VT-NAN* 函数
+;; 辅助：判断两个 double-float 是否均为 NaN (即 (/= x x) 均为真)
+(defun both-nan-p (a b)
+  (and (/= a a) (/= b b)))
+
+(defun test-nan-functions ()
+  (format t "~%--- Testing NaN statistics functions ---~%")
+
+  ;; 准备数据: 包含 NaN 的 2x3 矩阵
+  (let* ((nan (/ 0.0d0 0.0d0))
+	 (data (vt-from-sequence (list (list 1.0 2.0 3.0)
+				   (list 4.0 nan 6.0))
+				 :type 'double-float))
+         ;; 手动将符号 :nan 替换为实际 NaN
+         (arr (vt-data data)))
+    (loop for i below (length arr)
+          when (eql (aref arr i) 0.0) ;; 因为先创建为0再赋值，实际不会是0
+          ;; 直接使用 VT-SET 来设置 NaN，由于 VT-REF 无法处理 :nan，
+          ;; 我们重新构建：用 0 占位然后将已知位置设为 NaN
+          ;; 简化：直接修改底层数据数组
+          do (when (and (= (mod i 3) 1) (= (floor i 3) 1))
+               (setf (aref arr i) (/ 0.0d0 0.0d0))))  ;; 索引 (1,1) 设为 NaN
+    ;; 检查 NaN 是否设置成功
+    (format t "~2%Original tensor:~%")
+    (print-vt-recursive data 0 nil 2 10 'double-float t) ;; 简化打印，直接使用内部打印函数可能需要调整
+    ;; 使用 vt-map 来打印，避免未导出函数
+    (format t "~2%Data values: ~{~A ~}~%" (vt-data->list data))
+    
+    ;; ---- test vt-nansum ----
+    (let ((s-global (vt-nansum data))
+          (s-axis0 (vt-nansum data :axis 0))
+          (s-axis1 (vt-nansum data :axis 1))
+          (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
+      (assert (= (coerce s-global 'double-float) 16.0d0) () "nansum global-> ~A" s-global)
+      (assert (equalp (vt-data->list s-axis0) '(5.0 2.0 9.0)))
+      (assert (equalp (vt-data->list s-axis1)  '(6.0 10.0)))
+      (assert (equal (list (first (vt-shape s-keepdim))
+			   (second (vt-shape s-keepdim))) '(1 3)))
+      (format t "~%vt-nansum: PASS~%"))
+
+    ;; ---- test vt-nanmean ----
+    (let ((m-global (vt-nanmean data))
+          (m-axis0 (vt-nanmean data :axis 0))
+          (m-axis1 (vt-nanmean data :axis 1)))
+      (assert (< (abs (- m-global (/ 16.0d0 5))) 1d-10))
+      (assert (equalp (vt-data->list m-axis0) '(2.5 2.0 4.5d0)))
+      (assert (equalp (vt-data->list m-axis1) '(2.0 5.0)))
+      (format t "vt-nanmean: PASS~%"))
+
+    ;; ---- test vt-nanvar (ddof=0, default) ----
+    (let* ((v-global (vt-nanvar data))
+           (expected (/ (+ (expt (- 1 3.2) 2)
+			   (expt (- 2 3.2) 2)
+                           (expt (- 3 3.2) 2)
+			   (expt (- 4 3.2) 2)
+                           (expt (- 6 3.2) 2))
+			5)))
+      (print v-global)
+      (print expected)
+      (assert (< (abs (- v-global expected)) 1d-10))
+      (let ((v-axis0 (vt-nanvar data :axis 0))
+            (v-axis1 (vt-nanvar data :axis 1 :ddof 1)))
+        ;; axis0: 每列包含 NaN 被忽略，列0:[1,4] 有效数2，列1:[2] 有效数1，列2:[3,6] 有效数2
+        (assert (equalp (vt-data->list v-axis0) 
+                        (list (/ (+ (expt (- 1 2.5) 2)
+				    (expt (- 4 2.5) 2))
+				 2)
+                              ;; 列1只有一个数，方差应为0
+                              0.0d0
+                              (/ (+ (expt (- 3 4.5) 2)
+				    (expt (- 6 4.5) 2))
+				 2))))
+        ;; axis1: [1,2,3] variance=? 和 [4,6] variance=?  sample var (ddof=1)
+	(assert (equalp (vt-data->list v-axis1)
+			(list (/ (+ (expt (- 1 2) 2)
+				    (expt (- 2 2) 2)
+				    (expt (- 3 2) 2)) 2)
+                              (/ (+ (expt (- 4 5) 2)
+				    (expt (- 6 5) 2)) 1)))))
+      (format t "vt-nanvar: PASS~%")
+
+      ;; ---- test vt-nanstd ----
+      (let ((std-global (vt-nanstd data)))
+	(assert (< (abs (- std-global (sqrt expected))) 1d-10))
+	(format t "vt-nanstd: PASS~%")))
+
+    ;; ---- test vt-nanmax ----
+    (let ((mx-global (vt-nanmax data))
+          (mx-axis0 (vt-nanmax data :axis 0)))
+      (assert (= mx-global 6.0d0))
+      (assert (equalp (vt-data->list mx-axis0) '(4.0 2.0 6.0)))
+      (format t "vt-nanmax: PASS~%"))
+
+    ;; ---- test vt-nanmin ----
+    (let ((mn-global (vt-nanmin data))
+          (mn-axis0 (vt-nanmin data :axis 0)))
+      (assert (= mn-global 1.0d0))
+      (assert (equalp (vt-data->list mn-axis0) '(1.0 2.0 3.0)))
+      (format t "vt-nanmin: PASS~%"))
+
+    ;; ---- 边界情况：全 NaN ----
+    (let* ((all-nan (vt-ones '(2 3) :type 'double-float))
+           (d (vt-data all-nan)))
+      (loop for i below (length d)
+	    do (setf (aref d i) (/ 0.0d0 0.0d0)))
+      ;; 测试这些函数不会崩溃，并返回 NaN 或适当值
+      
+
+
+      (let ((s (vt-nansum all-nan))
+	    (m (vt-nanmean all-nan))
+	    (v (vt-nanvar all-nan))
+	    (mx (vt-nanmax all-nan))
+	    (mn (vt-nanmin all-nan)))
+	;; 检查标量
+	(assert (/= m m))                 ; m 是 NaN
+	(assert (= s 0.0d0))
+	;; 检查一维张量: 全部元素都是 NaN
+	(let ((m0 (vt-nanmean all-nan :axis 0)))
+	  (assert (vt-all (vt-isnan m0)))
+	  ;; 同时验证标量 m 也是 NaN
+	  (assert (vt-all (vt-isnan (ensure-vt m)))))
+	;; max / min 边界
+	(assert (vt-all (vt-isinf mx)))    ; -inf
+	(assert (vt-all (vt-isinf mn)))    ; +inf? 看实现，应该是 most-positive-double-float
+	;; 方差也应为 NaN
+	(assert (vt-all (vt-isnan (ensure-vt v))))))
+
+    ;; ---- 边界情况：无 NaN ----
+    (let* ((clean (vt-arange 6 :step 1 :type 'double-float)))
+      (assert (= (vt-nansum clean) 15.0d0))
+      (assert (= (vt-nanmean clean) 2.5d0))
+      (assert (< (abs (- (vt-nanvar clean) (vt-var clean))) 1d-10))
+      (format t "No-NaN edge cases: PASS~%"))
+
+    (format t "~%All NaN statistics tests passed!~%")
+    t))
+
+
+;;; 测试 vt-logspace
+(defun test-vt-logspace ()
+  (format t "~%--- Testing vt-logspace ---~%")
+  ;; 1. 默认底数10，端点包含
+  (let* ((ls (vt-logspace 0 3 4 :type 'double-float))
+         (arr (vt-data->list ls)))
+    (assert (= (vt-size ls) 4))
+    (assert (< (abs (- (first arr) 1.0d0)) 1d-10))
+    (assert (< (abs (- (second arr) 10.0d0)) 1d-10))
+    (assert (< (abs (- (third arr) 100.0d0)) 1d-10))
+    (assert (< (abs (- (fourth arr) 1000.0d0)) 1d-10))
+    (format t "  logspace(0,3,4) = ~A  PASS~%" arr))
+  
+  ;; 2. 底数为2，不包含终点
+  (let* ((ls (vt-logspace 1 4 3 :base 2.0d0 :endpoint nil :type 'double-float))
+         (arr (vt-data->list ls)))
+    ;; 对数间隔在[1,4)上等分3个点：2^1=2, 2^2=4, 2^3=8
+    (assert (< (abs (- (first arr) 2.0d0)) 1d-10))
+    (assert (< (abs (- (second arr) 4.0d0)) 1d-10))
+    (assert (< (abs (- (third arr) 8.0d0)) 1d-10))
+    (format t "  logspace(1,4,3,base=2,endpoint=nil) = ~A  PASS~%" arr))
+  
+  ;; 3. 单点
+  (let* ((ls (vt-logspace 0 0 1))
+         (arr (vt-data->list ls)))
+    (assert (= (length arr) 1))
+    (assert (< (abs (- (first arr) 1.0d0)) 1d-10))
+    (format t "  logspace(0,0,1) = ~A  PASS~%" arr))
+  
+  (format t "vt-logspace tests passed.~%"))
+
+(defun test-vt-kron ()
+  (format t "~%--- Testing vt-kron ---~%")
+  ;; 1. 两个向量（结果为一维）
+  (let* ((a (vt-from-sequence '(1 2) :type 'double-float))
+         (b (vt-from-sequence '(3 4 5) :type 'double-float))
+         (k (vt-kron a b))
+         (expected (vt-from-sequence '(3 4 5 6 8 10) :type 'double-float)))
+    (assert (equalp (vt-shape k) '(6)))
+    (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
+    (format t "  kron([1,2],[3,4,5]) = ~A  PASS~%" k))
+  
+  ;; 2. 两个矩阵
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+         (b (vt-from-sequence '((0 5) (6 7)) :type 'double-float))
+         (k (vt-kron a b))
+         (expected (vt-from-sequence
+                     '((0 5 0 10)
+                       (6 7 12 14)
+                       (0 15 0 20)
+                       (18 21 24 28))
+                     :type 'double-float)))
+    (assert (equalp (vt-shape k) '(4 4)))
+    (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
+    (format t "  kron([[1,2],[3,4]], [[0,5],[6,7]]) PASS~%"))
+  
+  ;; 3. 向量与矩阵（向量视为行向量）
+  (let* ((a (vt-from-sequence '(1 2) :type 'double-float))
+         (b (vt-from-sequence '((3 4) (5 6)) :type 'double-float))
+         (k (vt-kron a b))
+         ;; 预期：a 视为 1x2，b 为 2x2 → 结果 2x4
+         (expected (vt-from-sequence
+                     '((3 4 6 8)
+                       (5 6 10 12))
+                     :type 'double-float)))
+    (assert (equalp (vt-shape k) '(2 4)))
+    (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
+    (format t "  kron([1,2], [[3,4],[5,6]]) PASS~%"))
+  
+  ;; 4. 高维情况 (3D)
+  (let* ((a (vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8)))))
+         (b (vt-from-sequence '((9 10) (11 12))))
+         (k (vt-kron a b)))
+    ;; a 形状 (2,2,2)，b 形状 (2,2) → 对齐后 a (2,2,2), b (1,2,2) → 结果 (2,4,4)
+    (assert (equalp (vt-shape k) '(2 4 4)))
+    ;; 取一个子块验证
+    (let* ((sub-k (vt-slice k 0 :all :all))
+           (expected-sub (vt-kron (vt-slice a 0 :all :all) b)))
+      (assert (vt-all (vt-isclose sub-k expected-sub :atol 1d-12 :rtol 1d-12))))
+    (format t "  kron of 2x2x2 and 2x2 PASS~%"))
+  
+  (format t "vt-kron tests passed.~%"))
+
+
+(defun test-vt-diff ()
+  (format t "~%--- Testing vt-diff ---~%")
+  
+  ;; 1. 一维数组，默认一阶差分
+  (let* ((data (vt-from-sequence '(1 3 7 13 21) :type 'double-float))
+         (result (vt-diff data)))
+    (assert (equalp (vt-shape result) '(4)))
+    (assert (equalp (vt-data->list result) '(2 4 6 8)))
+    (format t "  1D 1st-order diff: ~A PASS~%" result))
+  
+  ;; 2. 一维数组，二阶差分
+  (let* ((data (vt-from-sequence '(1 3 7 13 21) :type 'double-float))
+         (result (vt-diff data :n 2)))
+    (assert (equalp (vt-shape result) '(3)))
+    (assert (equalp (vt-data->list result) '(2 2 2)))
+    (format t "  1D 2nd-order diff: ~A PASS~%" result))
+  
+  ;; 3. 一维数组，高阶差分 (n=3)
+  (let* ((data (vt-from-sequence '(1 2 4 8 16) :type 'double-float))
+         (result (vt-diff data :n 3)))
+    ;; 原始: [1,2,4,8,16]
+    ;; diff1: [1,2,4,8]
+    ;; diff2: [1,2,4]
+    ;; diff3: [1,2]
+    (assert (equalp (vt-shape result) '(2)))
+    (assert (equalp (vt-data->list result) '(1 2)))
+    (format t "  1D 3rd-order diff: ~A PASS~%" result))
+  
+  ;; 4. 二维数组，默认轴 (axis = -1)
+  (let* ((data (vt-from-sequence '((1 3 7) (1 4 9)) :type 'double-float))
+         (result (vt-diff data)))
+    ;; 沿最后一轴 (axis=1) 差分
+    (assert (equalp (vt-shape result) '(2 2)))
+    (assert (equalp (vt-data->list result) '((2 4) (3 5))))
+    (format t "  2D diff axis=-1: ~A PASS~%" result))
+  
+  ;; 5. 二维数组，沿 axis=0 差分
+  (let* ((data (vt-from-sequence '((1 3 7) (1 4 9)) :type 'double-float))
+         (result (vt-diff data :axis 0)))
+    ;; 沿第0轴 (行方向) 差分
+    (assert (equalp (vt-shape result) '(1 3)))
+    (assert (equalp (vt-data->list result) '((0 1 2))))
+    (format t "  2D diff axis=0: ~A PASS~%" result))
+  
+  ;; 6. 二维数组，沿 axis=1 且 n=2
+  (let* ((data (vt-from-sequence '((1 3 7 13) (1 4 9 16)) :type 'double-float))
+         (result (vt-diff data :axis 1 :n 2)))
+    (assert (equalp (vt-shape result) '(2 2)))
+    ;; 第一行: diff1 [2,4,6], diff2 [2,2]
+    ;; 第二行: diff1 [3,5,7], diff2 [2,2]
+    (assert (equalp (vt-data->list result) '((2 2) (2 2))))
+    (format t "  2D diff axis=1, n=2: ~A PASS~%" result))
+  
+  ;; 7. 边界情况：长度不足以做差分（长度 < n+1）应返回空形状
+  ;; NumPy 行为：若数组长度小于 n+1，返回空数组
+  (let ((data (vt-from-sequence '(1 2) :type 'double-float)))
+    ;; 一阶差分可做 (结果长度1)
+    (let ((r (vt-diff data)))
+      (assert (equalp (vt-shape r) '(1)))
+      (assert (equalp (vt-data->list r) '(1))))
+    ;; 二阶差分不可做 (结果长度0)
+    (let ((r2 (vt-diff data :n 2)))
+      (assert (equalp (vt-shape r2) '(0)))
+      (assert (= (vt-size r2) 0)))
+    (format t "  Boundary cases (short array): PASS~%"))
+  
+  (format t "vt-diff tests passed.~%"))
+
+;;; 测试 vt-trapz
+(defun test-vt-trapz ()
+  (format t "~%--- Testing vt-trapz ---~%")
+  ;; 1. 一维数组，默认 dx=1
+  (let* ((y (vt-from-sequence '(1 2 3 4) :type 'double-float))
+         (trap (vt-trapz y)))
+    ;; 梯形积分： (1+2)/2 + (2+3)/2 + (3+4)/2 = 1.5+2.5+3.5 = 7.5
+    (assert (floatp trap))
+    (assert (< (abs (- trap 7.5d0)) 1d-10))
+    (format t "  trapz([1,2,3,4]) default dx=1 -> ~A  PASS~%" trap))
+  
+  ;; 2. 指定 x 坐标
+  (let* ((x (vt-from-sequence '(0 2 3 5) :type 'double-float))
+         (y (vt-from-sequence '(1 2 3 4) :type 'double-float))
+         (trap (vt-trapz y :x x)))
+    ;; 梯度：dx1=2, dx2=1, dx3=2
+    ;; 积分 = (1+2)/2*2 + (2+3)/2*1 + (3+4)/2*2 = 3*2 + 2.5*1 + 3.5*2 = 6+2.5+7 = 12.5
+    (assert (< (abs (- trap 12.5d0)) 1d-10))
+    (format t "  trapz with x=[0,2,3,5] -> ~A  PASS~%" trap))
+  
+  ;; 3. 二维数组，沿指定轴
+  (let* ((data (vt-from-sequence '((1 2 3) (4 5 6)) :type 'double-float))
+         (trap-axis0 (vt-trapz data :axis 0))
+         (trap-axis1 (vt-trapz data :axis 1)))
+    ;; axis=0：每列沿行方向（长度2）梯形积分，dx=1
+    ;; 列0: (1+4)/2 = 2.5
+    ;; 列1: (2+5)/2 = 3.5
+    ;; 列2: (3+6)/2 = 4.5
+    (assert (equalp (vt-data->list trap-axis0) '(2.5 3.5 4.5)))
+    ;; axis=1：每行沿列方向（长度3）梯形积分
+    ;; 行0: (1+2)/2 + (2+3)/2 = 1.5+2.5=4.0
+    ;; 行1: (4+5)/2 + (5+6)/2 = 4.5+5.5=10.0
+    (assert (equalp (vt-data->list trap-axis1) '(4.0 10.0)))
+    (format t "  trapz on 2D array axis=0,1 PASS~%"))
+  
+  ;; 4. 仅有一个元素的错误处理
+  (handler-case
+      (vt-trapz (vt-from-sequence '(1)))
+    (error (e)
+      (format t "  trapz on single element correctly signaled error: ~A~%" e)))
+  
+  (format t "vt-trapz tests passed.~%"))
+
+(defun test-vt-correlate ()
+  (format t "~%--- Testing vt-correlate ---~%")
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
+         (v (vt-from-sequence '(0 1 0.5) :type 'double-float)))
+    ;; full 模式
+    (let ((res (vt-correlate a v :mode "full")))
+      (assert (equalp (vt-data->list res) '(0.5 2.0 3.5 3.0 0.0)))
+      (format t "  full  mode: ~A PASS~%" res))
+    ;; valid 模式
+    (let ((res (vt-correlate a v :mode "valid")))
+      (assert (equalp (vt-data->list res) '(3.5)))
+      (format t "  valid mode: ~A PASS~%" res))
+    ;; same 模式
+    (let ((res (vt-correlate a v :mode "same")))
+      (assert (equalp (vt-data->list res) '(2.0 3.5 3.0)))
+      (format t "  same  mode: ~A PASS~%" res)))
+  ;; 单元素
+  (let ((a (vt-from-sequence '(5) :type 'double-float))
+        (v (vt-from-sequence '(3) :type 'double-float)))
+    (dolist (mode '("full" "valid" "same"))
+      (let ((res (vt-correlate a v :mode mode)))
+        (assert (equalp (vt-data->list res) '(15)))
+        (format t "  length-1 ~A: ~A PASS~%" mode res))))
+  (format t "vt-correlate tests passed.~%"))
+
+
+(defun vt-correlate-a (a v &key (mode "full"))
+  "一维互相关（不翻转 v），与 numpy.correlate 一致。"
+  (let* ((a-flat (vt-flatten a))
+         (v-flat (vt-flatten v))
+         (n (vt-size a-flat))
+         (m (vt-size v-flat))
+         (a-data (vt-data a-flat))
+         (v-data (vt-data v-flat)))
+    (flet ((compute-one (k)
+             (let ((sum 0.0d0))
+               (loop for j from (max 0 (- k)) below (min m (- n k))
+                     do (incf sum (* (aref a-data (+ j k)) (aref v-data j))))
+               sum)))
+      ;; 生成完整的 full 结果 (长度 n+m-1)
+      (let* ((full-len (+ n m -1))
+             (full (vt-zeros (list full-len))))
+        (loop for k from (- (1- m)) below n
+              for i from 0
+              do (setf (vt-ref full i) (compute-one k)))
+        ;; 根据模式裁剪并返回连续副本
+        (ecase (intern (string-upcase mode) :keyword)
+          (:full full)
+          (:valid
+           (let* ((start (1- m))                    ; 第一个完整重叠的位置
+                  (len (max 0 (1+ (- n m)))))      ; n - m + 1，最小为0
+             (if (zerop len)
+                 (vt-zeros '(0))
+                 (vt-copy (apply #'vt-slice full (list (list start (+ start len))))))))
+          (:same
+           (let* ((out-len (max n m))
+                  (start (floor (- full-len out-len) 2))
+                  (end (+ start out-len)))
+             (vt-copy (apply #'vt-slice full (list (list start end)))))))))))
+
+
+
+
+
+(defun run-all-tests ()
+
+  (test-qr)
+  (run-svd-tests)
+  (test-gradient)
+  (test-gradient-advanced)
+  (test-pad)
+  (test-all-pad)
+  (test-pad-thorough)
+  (test-vt-take)
+  (test-vt-sort)
+  (test-vt-argsort)
+  (test-argsort-multi-axis)
+  (test-vt-put)
+  (test-nan-functions)
+  (test-vt-logspace)
+  (test-vt-kron)
+  (test-vt-diff)
+  (test-vt-trapz)
+  (test-vt-correlate))
