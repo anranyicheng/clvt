@@ -153,9 +153,12 @@
   返回: 张量"
   (let ((range (- high low)))
     (if size
-        (vt-map (lambda (x) (declare (ignore x))
-                  (coerce (+ low (random range)) type))
-                (vt-zeros size :type type))
+        (vt-astype
+	 (vt-map (lambda (x)
+		   (declare (ignore x))
+                   (+ low (random range)))
+                 (vt-zeros size :type type))
+	 type)
         (coerce (+ low (random range)) type))))
 
 (defun vt-from-function (shape fn &key (type 'double-float))
@@ -951,7 +954,7 @@
                          (stable-sort pairs #'< :key #'cdr)
                          (sort pairs #'< :key #'cdr))))
         (%make-vt :data (make-array n :element-type 'fixnum
-                                    :initial-contents (mapcar #'car sorted))
+                                      :initial-contents (mapcar #'car sorted))
                   :shape (list n)
                   :strides '(1)
                   :offset 0))
@@ -1140,38 +1143,34 @@
 ;;; ===========================================
 ;;; 7. 数据类型转换
 ;;; ===========================================
+
 (defun vt-astype (tensor new-type)
-  "将张量元素类型转换为 new-type，仅支持 :fixnum 或 :double-float。
-   返回一个新的连续内存张量，形状与输入相同。"
-  (assert (or (eq new-type 'fixnum)
-	      (eq new-type 'double-float))
-          (new-type) "new-type 必须是 :fixnum 或 :double-float")
+  "将张量转换为新类型。浮点数→整数时使用截断 (truncate)，其余使用 coerce。"
   (let* ((shape (vt-shape tensor))
+	 (type (if (eq new-type 'fixnum) 'fixnum 'double-float))
+         (new (vt-zeros shape :type type))
+         (new-data (vt-data new))
+         (offset (vt-offset new))
+         (in-data (vt-data tensor))
+         (in-strides (vt-strides tensor))
+         (in-offset (vt-offset tensor))
          (rank (length shape))
-         (size (vt-shape-to-size shape))
-         ;; 分配新数据数组，用目标类型的零填充
-         (new-data (make-array size :element-type new-type
-				    :initial-element (coerce 0 new-type)))
-         ;; 构建结果张量（连续内存）
-         (result (%make-vt :data new-data
-                           :shape (copy-list shape)
-                           :strides (vt-compute-strides shape)
-                           :offset 0)))
-    (labels ((copy-rec (depth in-ptr out-idx)
+         (converter (if (eq new-type 'fixnum)
+                        #'truncate
+                        (lambda (x) (coerce x type)))))
+    (labels ((copy-rec (depth in-ptr out-ptr)
                (if (= depth rank)
-                   ;; 到达单个元素：读取、转换、写入
-                   (setf (aref new-data out-idx)
-                         (coerce (aref (vt-data tensor) in-ptr) new-type))
-                   ;; 在维度 depth 上迭代
+                   (setf (aref new-data out-ptr)
+			 (funcall converter (aref in-data in-ptr)))
                    (let ((dim (nth depth shape))
-                         (in-stride (nth depth (vt-strides tensor)))
-                         (out-stride (nth depth (vt-strides result))))
-                     (loop for i of-type fixnum from 0 below dim do
-                       (copy-rec (1+ depth)
-                                 (+ in-ptr (* i in-stride))
-                                 (+ out-idx (* i out-stride))))))))
-      (copy-rec 0 (vt-offset tensor) 0))
-    result))
+                         (in-stride (nth depth in-strides))
+                         (out-stride (nth depth (vt-strides new))))
+                     (loop for i below dim do
+                       (copy-rec (1+ depth) in-ptr out-ptr)
+                       (incf in-ptr in-stride)
+                       (incf out-ptr out-stride))))))
+      (copy-rec 0 in-offset offset))
+    new))
 
 (defun vt-tolist (tensor)
   "将数组转换为嵌套列表"

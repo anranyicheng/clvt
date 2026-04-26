@@ -43,7 +43,8 @@
          (strides (vt-compute-strides shape)))
     (%make-vt :data data
 	      :shape shape
-	      :strides strides)))
+	      :strides strides
+	      :offset 0)))
 
 (defun vt-flatten-sequence (seq)
   "深度优先遍历 SEQ 及其嵌套序列,返回所有原子元素的列表.
