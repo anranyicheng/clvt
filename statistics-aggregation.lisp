@@ -99,7 +99,7 @@
         (vt-map (lambda (s)
 		  (/ s (coerce count element-type)))
 		sum-result)
-        (/ sum-result (coerce count element-type)))))
+        (/ sum-result (coerce count element-type) 1.0d0))))
 
 (defun vt-average (tensor weights &key axis keepdims)
   "计算加权平均值.

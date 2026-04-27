@@ -241,10 +241,13 @@
 (defun vt-random (shape &key (type 'double-float))
   "创建随机数张量"
   (declare (list shape))
-  (vt-map (lambda (x)
-	    (declare (ignore x))
-	    (coerce (random 1.0) type))
-	  (vt-zeros shape)))
+  (let* ((result (vt-map (lambda (x)
+			   (declare (ignore x))
+			   (random 1.0))
+			 (vt-zeros shape))))
+    (if (eq type 'fixnum)
+	(vt-astype result type)
+	result)))
 
 (defun vt-zeros (shape &key (type 'double-float))
   "创建全0张量."
@@ -454,6 +457,28 @@
             do (setf stride (* stride dim))
             finally (return (reverse strides)))))
 
+(defun vt-contiguous-p (vt)
+  "检查张量是否在内存中连续.
+   只有连续的张量才能安全地重塑为任意形状."
+  (equal (vt-strides vt) (vt-compute-strides (vt-shape vt))))
+
+(defun vt-contiguous (vt)
+  "返回一个内存连续的副本.如果原张量已连续,可能返回自身或副本.
+   这是视图操作后的“落地”操作."
+  (if (vt-contiguous-p vt)
+      vt
+      (let* ((new-size (vt-shape-to-size (vt-shape vt)))
+             (new-data (make-array new-size 
+				   :element-type (vt-element-type vt)))
+             (new-vt (%make-vt
+                      :data new-data
+                      :shape (vt-shape vt)
+                      :strides (vt-compute-strides (vt-shape vt))
+                      :offset 0)))
+        ;; 高效拷贝:利用迭代器填充新数据
+        (vt-copy-into new-vt vt)
+        new-vt)))
+
 (defun vt-reshape (vt new-shape)
   "重塑形状.
    如果张量是连续的,则创建视图(零拷贝)；
@@ -557,140 +582,164 @@
       (t (error "indices-or-sections 必须是整数或整数列表")))))
 
 (defun vt-slice (vt &rest specs)
-  "通用切片函数 (NumPy风格,零拷贝).
-   参数:
-     vt: 张量
-     specs: 切片规格列表,每个元素可以是:
-       - 整数: 选取指定索引,该维度消失.
-       - 列表: 切片,保留维度.
-       - 关键字 :all 或 t: 选取整个维度.
-       - nil: 同 :all.
-   示例: 区间左闭右开
-     ;; 1. 截取子矩阵 (行0-2, 列1-4)
-     (vt-slice mat '(0 2) '(1 4))
-     ;; 2. 提取特定行 (结果降为1维)
-     (vt-slice mat 1)
-     ;; 3. 提取特定列 (保留行维度)
-     (vt-slice mat :all 2)
-     ;; 4. 带步长切片
-     (vt-slice mat '(0 10 2)) ; 每2行取一行
-     ;; 5. 负索引支持
-     (vt-slice mat '(-2 -1)) ; 最后两行"
-  
+  "通用切片函数（统一列表接口）。
+   每个 spec 必须是一个列表：
+     - (:all) 或 (t)   : 保留整个维度
+     - (:newa)         : 插入一个长度为1的新轴 newaxis
+     - (:elli)         : 省略号 ellipsis（最多一个），自动展开为多个 :all
+     - (idx)           : 整数索引，降维
+     - (start end &optional step) : 范围切片，start/end 可用 nil 省略
+   自动补齐尾部缺失的 :all；支持负索引与负步长。
+   返回零拷贝视图。
+编号  NumPy 表达式          含义                        新 vt-slice 写法                                   输出形状
+1     b[1, 2]              单个元素                   (vt-slice b '(1) '(2))                             标量 (降维)
+2     b[1, :]              第 1 行                    (vt-slice b '(1) '(:all))                          (5)
+3     b[:, 2]              第 2 列                    (vt-slice b '(:all) '(2))                          (4)
+4     b[0:2, 1:4]          子矩阵                     (vt-slice b '(0 2) '(1 4))                         (2,3)
+5     b[:2, 2:]            前两行，第 2 列起           (vt-slice b '(nil 2) '(2 nil))                     (2,3)
+6     b[:, :]              整个矩阵                   (vt-slice b '(:all) '(:all)) 或 (vt-slice b)       (4,5)
+7     b[::-1, :]           行逆序                     (vt-slice b '(nil nil -1) '(:all))                 (4,5)
+8     b[:, ::-1]           列逆序                     (vt-slice b '(:all) '(nil nil -1))                 (4,5)
+9     b[-1, :]             最后一行                   (vt-slice b '(-1) '(:all))                         (5)
+10    b[:, -2:]            最后两列                   (vt-slice b '(:all) '(-2 nil))                     (4,2)
+11    b[1, -2]             固定行列 (降维)             (vt-slice b '(1) '(-2))                            标量
+12    b[1:3, :]            行切片                     (vt-slice b '(1 3) '(:all))                        (2,5)
+13    b[1:, :-2]           第 1 行起，不含最后两列      (vt-slice b '(1 nil) '(nil -2))                    (3,3)
+14    b[::2, 1::2]         隔行，第 1 列隔列取         (vt-slice b '(nil nil 2) '(1 nil 2))               (2,2)
+15    b[None,:,None,0]     插入新轴并选取              (vt-slice b '(:newa) '(:all) '(:newa) '(0))        (1,4,1)
+16    b[..., :2]           省略号，切最后一维前两列     (vt-slice b '(:elli) '(nil 2))                     (4,2)
+17    b[:, -1]             最后一列 (降维)             (vt-slice b '(:all) '(-1))                         (4)
+18    b[:, [0,2]]          花式索引 (暂未支持)         可考虑用 vt-take                                   —
+"
   (let* ((old-shape (vt-shape vt))
          (old-strides (vt-strides vt))
          (old-offset (vt-offset vt))
          (old-rank (length old-shape))
-         (n-specs (length specs)))    
-    ;; 1. 参数预处理:如果 specs 少于维度,用 :all 补齐
-    (when (< n-specs old-rank)
-      (setf specs (append specs (make-list (- old-rank n-specs)
-					   :initial-element :all))))    
-    (when (> (length specs) old-rank)
-      (error "切片参数过多: ~A > 张量秩 ~A" (length specs) old-rank))    
+         (expanded-specs '()))
+
+    ;; ========== 1. 展开省略号，确保原轴数正确 ==========
+    (let* ((ellipsis-pos (position '(:elli) specs :test #'equal))
+           (num-newaxis (count '(:newa) specs :test #'equal))
+           (explicit-original (- (length specs) (if ellipsis-pos 1 0) num-newaxis)))
+      (when (> explicit-original old-rank)
+        (error "Too many indices for array of rank ~D" old-rank))
+      (let ((needed-all (- old-rank explicit-original)))
+        (dolist (s specs)
+          (if (equal s '(:elli))
+              (dotimes (i needed-all)
+                (push '(:all) expanded-specs))
+              (push s expanded-specs)))
+        (setf expanded-specs (nreverse expanded-specs))
+        (unless ellipsis-pos
+          (let ((remaining (- old-rank (- (length expanded-specs) num-newaxis))))
+            (dotimes (i remaining)
+              (setf expanded-specs (append expanded-specs '((:all)))))))))
+
+    ;; ========== 2. 遍历每个规格 ==========
     (let ((new-shape '())
           (new-strides '())
-          (cur-offset old-offset))      
-      ;; 2. 遍历每个维度规格
-      (loop for spec in specs
-            for dim in old-shape
-            for stride in old-strides
-            do (cond
-		 ;; --- 情况 A: 整数索引 (降维) ---
-		 ((integerp spec)
-		  (let ((idx spec))
-                    ;; 处理负索引
-                    (when (< idx 0) (incf idx dim))
-                    (unless (and (>= idx 0) (< idx dim))
-                      (error "索引 ~A 越界 (维度大小: ~A)" spec dim))
-                    ;; 仅移动偏移量,不添加到 shape/strides
-                    (incf cur-offset (* idx stride))))
-		 ;; --- 情况 B: 全选 ---
-		 ((member spec '(:all t nil))
-		  (push dim new-shape)
-		  (push stride new-strides))              
-		 ;; --- 情况 C: 列表切片 ---
-		 ((and (listp spec) (<= 2 (length spec) 3))
-		  (destructuring-bind (start end &optional (step 1)) spec
-                    ;; 1. 规范化负索引
-                    (when (< start 0) (incf start dim))
-                    (when (< end 0) (incf end dim))                 
-                    ;; 2. 边界钳位 (类似 NumPy)
-                    ;; start: clamp(0, dim)
-                    ;; end: clamp(0, dim)
-                    ;; 注意:如果 start > end 且 step > 0,切片为空
-                    (setf start (max 0 (min start dim)))
-                    (setf end (max 0 (min end dim)))
-                    ;; 3. 计算新维度大小和新偏移量
-                    (let ((slice-dim 0))
-                      (cond
-			;; 正向步长
-			((> step 0)
-			 (when (< start end)
-                           ;; 长度 = ceil((end - start) / step)
-                           (setf slice-dim
-				 (floor (+ (- end start) step -1) step))))
-			;; 反向步长
-			((< step 0)
-			 ;; 允许反向切片,例如 (5 -1 -1) 或 (5 0 -1)
-			 ;; 调整边界逻辑以允许从大到小
-			 ;; NumPy 处理 start/end 的方式较复杂,这里简化处理:
-			 ;; 假设用户给出的 start/end 在逻辑路径上是有效的
-			 ;; 简单起见,若 step < 0,我们计算元素个数
-			 ;; count = floor((start - end - 1) / abs(step))
-			 (when (> start end)
-                           (setf slice-dim (floor (+ (- start end)
-						     (abs step) -1)
-						  (abs step)))))
-			(t (error "步长不能为0")))
-                      ;; 更新状态
-                      (incf cur-offset (* start stride))
-                      (push slice-dim new-shape)
-                      (push (* stride step) new-strides))))
-		 (t (error "无效的切片规格: ~A" spec))))
-      
-      ;; 3. 构建结果
+          (cur-offset old-offset)
+          (axis-idx 0))
+      (dolist (spec expanded-specs)
+        (unless (listp spec)
+          (error "Invalid slice spec: ~A, expected a list" spec))
+        (cond
+          ;; --- 新轴 ---
+          ((equal spec '(:newa))
+           (push 1 new-shape)
+           (push 0 new-strides))
+
+          ;; --- 全选（:all 或 t） ---
+          ((or (equal spec '(:all)) (equal spec '(t)))
+           (when (>= axis-idx old-rank)
+             (error "Axis index out of bounds"))
+           (let ((dim (nth axis-idx old-shape))
+                 (stride (nth axis-idx old-strides)))
+             (push dim new-shape)
+             (push stride new-strides)
+             (incf axis-idx)))
+
+          ;; --- 范围切片 (start end &optional step) ---
+          ((and (listp spec) (<= 2 (length spec) 3))
+           (destructuring-bind (start end &optional (step 1)) spec
+             (when (>= axis-idx old-rank)
+               (error "Axis index out of bounds"))
+             (let ((dim (nth axis-idx old-shape))
+                   (stride (nth axis-idx old-strides)))
+               (when (and (numberp start) (< start 0))
+                 (incf start dim))
+               (when (and (numberp end)   (< end 0))
+                 (incf end dim))
+               (when (zerop step)
+                 (error "Slice step cannot be zero"))
+               (cond
+                 ((> step 0)
+                  (setf start (if (null start) 0
+                                  (max 0 (min start dim))))
+                  (setf end   (if (null end) dim
+                                  (max 0 (min end dim)))))
+                 ((< step 0)
+                  (setf start (if (null start) (1- dim)
+                                  (max 0 (min start (1- dim)))))
+                  (setf end   (if (null end) -1
+                                  (max -1 (min end (1- dim)))))))
+               (let ((slice-dim 0))
+                 (cond
+                   ((> step 0)
+                    (when (> end start)
+                      (setf slice-dim (ceiling (- end start) step))))
+                   ((< step 0)
+                    (when (> start end)
+                      (setf slice-dim (ceiling (- start end) (- step))))))
+                 (incf cur-offset (* start stride))
+                 (push slice-dim new-shape)
+                 (push (* stride step) new-strides)))
+             (incf axis-idx)))
+
+          ;; --- 整数索引 (降维) ---
+          ((and (listp spec) (= (length spec) 1) (integerp (first spec)))
+           (let ((idx (first spec)))
+             (when (>= axis-idx old-rank)
+               (error "Axis index out of bounds"))
+             (let ((dim (nth axis-idx old-shape))
+                   (stride (nth axis-idx old-strides)))
+               (when (< idx 0) (incf idx dim))
+               (unless (and (>= idx 0) (< idx dim))
+                 (error "Index ~D out of bounds for axis ~D (size ~D)" idx axis-idx dim))
+               (incf cur-offset (* idx stride))
+               (incf axis-idx))))
+
+          ;; --- 其他情况报错 ---
+          (t (error "Invalid slice spec: ~A" spec))))
+
       (%make-vt :data (vt-data vt)
                 :shape (nreverse new-shape)
                 :strides (nreverse new-strides)
                 :offset cur-offset))))
 
 (defun (setf vt-slice) (value vt &rest specs)
-  "设置切片区域的值.
-   value: 可以是数字或另一个张量.
-   specs: 切片参数 (同 vt-slice).
+  "设置切片区域的值。value 可以是数字或张量。
+   specs 遵循新 vt-slice 的统一列表接口。
    示例:
+     (let ((m (vt-ones '(4 5) :type 'fixnum)))
      ;; 将第一行全部置 0
-     (setf (vt-slice m 0 :all) 0.0)
+     (setf (vt-slice m '(0) '(:all)) 8)
      ;; 将子矩阵赋值为另一个张量
-     (setf (vt-slice m '(0 2) '(0 2)) another-matrix)"
-  ;; 1. 获取目标切片的视图
-  ;; apply 调用我们之前实现的 vt-slice
+     (setf (vt-slice m '(0 2) '(0 2)) (vt-slice m '(2 4) '(2 4))))"
   (let ((target-view (apply #'vt-slice vt specs)))
-    ;; 2. 执行拷贝 (自动处理标量->广播 或 张量->形状匹配)
-    (vt-copy-into target-view value)))
-
-(defun vt-contiguous-p (vt)
-  "检查张量是否在内存中连续.
-   只有连续的张量才能安全地重塑为任意形状."
-  (equal (vt-strides vt) (vt-compute-strides (vt-shape vt))))
-
-(defun vt-contiguous (vt)
-  "返回一个内存连续的副本.如果原张量已连续,可能返回自身或副本.
-   这是视图操作后的“落地”操作."
-  (if (vt-contiguous-p vt)
-      vt
-      (let* ((new-size (vt-shape-to-size (vt-shape vt)))
-             (new-data (make-array new-size 
-				   :element-type (vt-element-type vt)))
-             (new-vt (%make-vt
-                      :data new-data
-                      :shape (vt-shape vt)
-                      :strides (vt-compute-strides (vt-shape vt))
-                      :offset 0)))
-        ;; 高效拷贝:利用迭代器填充新数据
-        (vt-copy-into new-vt vt)
-        new-vt)))
+    (if (null (vt-shape target-view))
+        ;; 目标为标量：直接将 value 转换为标量数值并写入
+        (let ((scalar-value
+                (cond ((numberp value) value)
+                      ((vt-p value)
+                       (if (null (vt-shape value))
+                           (aref (vt-data value) (vt-offset value))
+                           (error "Cannot assign tensor of shape ~A to scalar slice"
+                                  (vt-shape value))))
+                      (t (error "Invalid value ~A for scalar slice" value)))))
+          (setf (vt-ref target-view) scalar-value))
+        ;; 目标为非标量：使用通用拷贝（支持广播）
+        (vt-copy-into target-view value))))
 
 (defun vt-copy (vt)
   "深度拷贝张量.

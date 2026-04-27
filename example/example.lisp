@@ -1,5 +1,210 @@
 (in-package :clvt)
 
+(defun test-vt-slice ()
+  ;; ============================================================
+  ;; 辅助函数：将张量转换为列表以便比较（已存在于库中）
+  ;; ============================================================
+
+  ;; ============================================================
+  ;; 一维张量测试 (a = np.arange(10))
+  ;; ============================================================
+  (let ((a (vt-arange 10 :type 'fixnum)))
+    ;; 1a. 单个整数索引
+    ;; a[3] -> 3
+    (assert (= (vt-ref (vt-slice a '(3))) 3))
+    
+    ;; 1b. 正向范围
+    ;; a[2:7] -> [2,3,4,5,6]
+    (assert (equal (vt-to-list (vt-slice a '(2 7))) '(2 3 4 5 6)))
+    
+    ;; 1c. 带步长
+    ;; a[1:9:2] -> [1,3,5,7]
+    (assert (equal (vt-to-list (vt-slice a '(1 9 2))) '(1 3 5 7)))
+    
+    ;; 1d. 省略 start
+    ;; a[:5] -> [0,1,2,3,4]
+    (assert (equal (vt-to-list (vt-slice a '(nil 5))) '(0 1 2 3 4)))
+    
+    ;; 1e. 省略 end
+    ;; a[5:] -> [5,6,7,8,9]
+    (assert (equal (vt-to-list (vt-slice a '(5 nil))) '(5 6 7 8 9)))
+    
+    ;; 1f. 反向步长
+    ;; a[8:3:-1] -> [8,7,6,5,4]
+    (assert (equal (vt-to-list (vt-slice a '(8 3 -1))) '(8 7 6 5 4)))
+    
+    ;; 1g. 完整反向
+    ;; a[::-1] -> [9,8,7,6,5,4,3,2,1,0]
+    (assert (equal (vt-to-list (vt-slice a '(nil nil -1)))
+                   '(9 8 7 6 5 4 3 2 1 0)))
+    
+    ;; 1h. 负索引
+    ;; a[-1] -> 9
+    (assert (= (vt-ref (vt-slice a '(-1))) 9))
+    
+    ;; a[-3:-1] -> [7,8]
+    (assert (equal (vt-to-list (vt-slice a '(-3 -1))) '(7 8)))
+    
+    ;; 1i. 空切片
+    ;; a[5:5] -> []
+    (assert (equal (vt-to-list (vt-slice a '(5 5))) '()))
+    ;; a[10:10] -> []
+    (assert (equal (vt-to-list (vt-slice a '(10 10))) '())))
+
+  ;; ============================================================
+  ;; 二维张量测试 (b = np.arange(20).reshape(4,5))
+  ;; ============================================================
+  (let* ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5))))
+    ;; 2a. 单个元素
+    ;; b[1,2] -> 7
+    (assert (= (vt-ref (vt-slice b '(1) '(2))) 7.0))
+    
+    ;; 2b. 取一行
+    ;; b[2,:] -> [10,11,12,13,14]
+    (assert (equal (vt-to-list (vt-slice b '(2) '(:all)))
+                   '(10 11 12 13 14)))
+    
+    ;; 2c. 取一列
+    ;; b[:,3] -> [3,8,13,18]
+    (assert (equal (vt-to-list (vt-slice b '(:all) '(3)))
+                   '(3 8 13 18)))
+    
+    ;; 2d. 子矩阵
+    ;; b[1:3, 2:4] -> [[7,8],[12,13]]
+    (assert (equal (vt-to-list (vt-slice b '(1 3) '(2 4)))
+                   '((7 8) (12 13))))
+    
+    ;; 2e. 省略边界
+    ;; b[:2, 2:] -> [[2,3,4],[7,8,9]]
+    (assert (equal (vt-to-list (vt-slice b '(nil 2) '(2 nil)))
+                   '((2 3 4) (7 8 9))))
+    
+    ;; 2f. 行逆序
+    ;; b[::-1, :] -> 行颠倒
+    (assert (equal (vt-to-list (vt-slice b '(nil nil -1) '(:all)))
+                   '((15 16 17 18 19)
+                     (10 11 12 13 14)
+                     (5 6 7 8 9)
+                     (0 1 2 3 4))))
+    
+    ;; 2g. 列逆序
+    ;; b[:, ::-1] -> 列颠倒
+    (assert (equal (vt-to-list (vt-slice b '(:all) '(nil nil -1)))
+                   '((4 3 2 1 0)
+                     (9 8 7 6 5)
+                     (14 13 12 11 10)
+                     (19 18 17 16 15))))
+    
+    ;; 2h. 负索引与省略
+    ;; b[-2:, -3:] -> [[15,16,17,18,19],[10,11,12,13,14]] ... 不对
+    ;; 注意：numpy 中 b[-2:, -3:] 是后两行，后三列 -> [[2,3,4],[7,8,9],[12,13,14],[17,18,19]]? 需要看形状(4,5)
+    ;; b[-2:, -3:] -> 后两行的后三列，即索引2..4行, 2..5列 -> [[2,3,4],[7,8,9]]? 让我们验证：
+    ;; b[-2:] = 最后两行: 索引2,3 -> [10..14],[15..19]
+    ;; b[..., -3:] = 后三列: 索引2,3,4 -> [2,3,4],[7,8,9],[12,13,14],[17,18,19]
+    ;; 交集: [[12,13,14],[17,18,19]] 正确
+    ;; 所以测试：
+    (assert (equal (vt-to-list (vt-slice b '(-2 nil) '(-3 nil)))
+                   '((12 13 14) (17 18 19))))
+    
+    ;; 2i. 混合整数与范围
+    ;; b[1, 1:4] -> [6,7,8]
+    (assert (equal (vt-to-list (vt-slice b '(1) '(1 4)))
+                   '(6 7 8)))
+    
+    ;; 2j. 负步长带省略
+    ;; b[:, 4:1:-1] -> 列4,3,2
+    (assert (equal (vt-to-list (vt-slice b '(:all) '(4 1 -1)))
+                   '((4 3 2) (9 8 7) (14 13 12) (19 18 17))))
+    
+    ;; 2k. 使用 else 省略号 (二维中省略号相当于 :)
+    ;; b[..., :2] -> 所有行，前两列
+    (assert (equal (vt-to-list (vt-slice b '(:elli) '(nil 2)))
+                   '((0 1) (5 6) (10 11) (15 16))))
+    
+    ;; 2l. 新轴插入
+    ;; b[:, None, :] -> 形状 (4,1,5)
+    (assert (equal (vt-shape (vt-slice b '(:all) '(:newa) '(:all)))
+                   '(4 1 5)))
+    ;; b[None, :, None, 0] -> (1,4,1)
+    (assert (equal (vt-shape (vt-slice b '(:newa) '(:all) '(:newa) '(0)))
+                   '(1 4 1)))
+    ;; 值检查：
+    (assert (equal (vt-to-list (vt-slice b '(:newa) '(:all) '(:newa) '(0)))
+                   '(((0) (5) (10) (15)))))   ; 因为额外维度，需注意嵌套
+    
+    ;; 2m. 空切片视图
+    ;; b[2:2, :] -> shape (0,5)
+    (assert (equal (vt-shape (vt-slice b '(2 2) '(:all))) '(0 5)))
+    ;; b[1:3, 5:5] -> (2,0)
+    (assert (equal (vt-shape (vt-slice b '(1 3) '(5 5))) '(2 0))))
+
+  ;; ============================================================
+  ;; 三维张量测试 (c = np.arange(24).reshape(2,3,4))
+  ;; ============================================================
+  (let* ((c (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+    ;; 3a. 取一个元素
+    ;; c[0,1,2] -> 6
+    (assert (= (vt-ref (vt-slice c '(0) '(1) '(2))) 6.0))
+    
+    ;; 3b. 取一个平面
+    ;; c[1, :, :] -> shape (3,4), 值 12..23
+    (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
+                   '((12 13 14 15) (16 17 18 19) (20 21 22 23))))
+    
+    ;; 3c. 切片与范围
+    ;; c[0, 0:2, 1:3] -> [[1,2],[5,6]]
+    (assert (equal (vt-to-list (vt-slice c '(0) '(0 2) '(1 3)))
+                   '((1 2) (5 6))))
+    
+    ;; 3d. 多个省略号 (只有一个)
+    ;; c[..., :2] -> 形状 (2,3,2) 取每个块的前两列
+    (assert (equal (vt-shape (vt-slice c '(:elli) '(nil 2)))
+                   '(2 3 2)))
+    ;; 值：每个 matrix 的前两列
+    (assert (equal (vt-to-list (vt-slice c '(:elli) '(nil 2)))
+                   '(((0 1) (4 5) (8 9)) ((12 13) (16 17) (20 21)))))
+    
+    ;; 3e. 新轴与省略号混合
+    ;; c[None, ..., :2, None] -> 形状 (1,2,3,2,1)
+    (assert (equal (vt-shape (vt-slice c '(:newa) '(:elli) '(nil 2) '(:newa)))
+                   '(1 2 3 2 1)))
+    
+    ;; 3f. 负索引与步长
+    ;; c[:, ::-1, ::2] -> 行反转，列隔列取
+    (let ((result (vt-slice c '(:all) '(nil nil -1) '(nil nil 2))))
+      ;; 形状应为 (2,3,2) 因为列维度4，隔列后为2
+      (assert (equal (vt-shape result) '(2 3 2)))
+      ;; 检查第一个块
+      (assert (equal (vt-to-list (vt-slice result '(0) '(:all) '(:all)))
+                     '((8 10) (4 6) (0 2)))))  
+    
+    ;; 3g. 混合整数降维
+    ;; c[0, -1, 2] -> 10
+    (assert (= (vt-ref (vt-slice c '(0) '(-1) '(2))) 10.0))
+    
+    ;; 3h. 省略号处于中间
+    ;; c[0, ..., 2] -> 等价 c[0, :, :, 2]？不，这是三维，c[0, :, 2] -> shape (3,)
+    (assert (equal (vt-to-list (vt-slice c '(0) '(:elli) '(2)))
+                   '(2 6 10)))  ; 所有行的第2列
+    
+    ;; 3i. 新轴扩展
+    ;; c[:, None, :, :] -> shape (2,1,3,4)
+    (assert (equal (vt-shape (vt-slice c '(:all) '(:newa) '(:all) '(:all)))
+                   '(2 1 3 4)))
+    
+    ;; 3j. 反向步长且 start/end 省略
+    ;; c[:, :, ::-1] -> 最后一维反转
+    (assert (equal (vt-to-list (vt-slice c '(:all) '(:all) '(nil nil -1)))
+                   '(((3 2 1 0) (7 6 5 4) (11 10 9 8))
+                     ((15 14 13 12) (19 18 17 16) (23 22 21 20))))))
+
+  (format t "~%All new vt-slice tests passed.~%")
+
+  )
+
+
+
+  
 (defun test-cumsum-type ()
   (format t "~%=== Testing vt-cumsum with fixnum ===")
   (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
@@ -347,7 +552,7 @@
     ;; 规则：对于左边界，填充序列为 a[1], a[0]；对于右边界，填充序列为 a[n-2], a[n-3]...
       ;; 仅验证形状即可，因为内容需要严格按照规则；这里改为验证特定元素
       ;; 验证中心区域与原矩阵一致
-      (let ((center (apply #'vt-slice padded '((2 4) (2 5)))))
+      (let ((center (vt-slice padded '(2 4) '(2 5))))
         (assert (vt-allclose center a))))
   
   ;; 5. 对称填充 (symmetric) - 重复边缘
@@ -411,7 +616,7 @@
   ;; 4. Reflect（只需验证中心区域不变）
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
     (let ((padded (vt-pad a '((2 2) (2 2)) :mode :reflect)))
-      (assert (vt-allclose (apply #'vt-slice padded '((2 4) (2 4))) a))))
+      (assert (vt-allclose (vt-slice padded '(2 4) '(2 4)) a))))
   ;; 5. Symmetric
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
     (let ((padded (vt-pad a '((1 1) (1 1)) :mode :symmetric)))
@@ -491,7 +696,7 @@
     (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum))
            (p (vt-pad a '((2 2) (3 3)) :mode :reflect)))
       ;; 只验证中心区域未变，并验证几个特征点（NumPy 可生成完整预期，此处省略）
-      (assert (vt= (apply #'vt-slice p '((2 4) (3 6))) a))
+      (assert (vt= (vt-slice p '(2 4) '(3 6)) a))
       (assert (= 189 (vt-sum p)))
       )
 
@@ -866,133 +1071,133 @@
 
 (defun test-nan-functions ()
   (format t "~%--- Testing NaN statistics functions ---~%")
-
-  ;; 准备数据: 包含 NaN 的 2x3 矩阵
-  (let* ((nan (/ 0.0d0 0.0d0))
-	 (data (vt-from-sequence (list (list 1.0 2.0 3.0)
-				   (list 4.0 nan 6.0))
-				 :type 'double-float))
-         ;; 手动将符号 :nan 替换为实际 NaN
-         (arr (vt-data data)))
-    (loop for i below (length arr)
-          when (eql (aref arr i) 0.0) ;; 因为先创建为0再赋值，实际不会是0
-          ;; 直接使用 VT-SET 来设置 NaN，由于 VT-REF 无法处理 :nan，
-          ;; 我们重新构建：用 0 占位然后将已知位置设为 NaN
-          ;; 简化：直接修改底层数据数组
-          do (when (and (= (mod i 3) 1) (= (floor i 3) 1))
-               (setf (aref arr i) (/ 0.0d0 0.0d0))))  ;; 索引 (1,1) 设为 NaN
-    ;; 检查 NaN 是否设置成功
-    (format t "~2%Original tensor:~%")
-    (print-vt-recursive data 0 nil 2 10 'double-float t) ;; 简化打印，直接使用内部打印函数可能需要调整
-    ;; 使用 vt-map 来打印，避免未导出函数
-    (format t "~2%Data values: ~{~A ~}~%" (vt-to-list data))
-    
-    ;; ---- test vt-nansum ----
-    (let ((s-global (vt-nansum data))
-          (s-axis0 (vt-nansum data :axis 0))
-          (s-axis1 (vt-nansum data :axis 1))
-          (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
-      (assert (= (coerce s-global 'double-float) 16.0d0) () "nansum global-> ~A" s-global)
-      (assert (equalp (vt-to-list s-axis0) '(5.0 2.0 9.0)))
-      (assert (equalp (vt-to-list s-axis1)  '(6.0 10.0)))
-      (assert (equal (list (first (vt-shape s-keepdim))
-			   (second (vt-shape s-keepdim))) '(1 3)))
-      (format t "~%vt-nansum: PASS~%"))
-
-    ;; ---- test vt-nanmean ----
-    (let ((m-global (vt-nanmean data))
-          (m-axis0 (vt-nanmean data :axis 0))
-          (m-axis1 (vt-nanmean data :axis 1)))
-      (assert (< (abs (- m-global (/ 16.0d0 5))) 1d-10))
-      (assert (equalp (vt-to-list m-axis0) '(2.5 2.0 4.5d0)))
-      (assert (equalp (vt-to-list m-axis1) '(2.0 5.0)))
-      (format t "vt-nanmean: PASS~%"))
-
-    ;; ---- test vt-nanvar (ddof=0, default) ----
-    (let* ((v-global (vt-nanvar data))
-           (expected (/ (+ (expt (- 1 3.2) 2)
-			   (expt (- 2 3.2) 2)
-                           (expt (- 3 3.2) 2)
-			   (expt (- 4 3.2) 2)
-                           (expt (- 6 3.2) 2))
-			5)))
-      (print v-global)
-      (print expected)
-      (assert (< (abs (- v-global expected)) 1d-10))
-      (let ((v-axis0 (vt-nanvar data :axis 0))
-            (v-axis1 (vt-nanvar data :axis 1 :ddof 1)))
-        ;; axis0: 每列包含 NaN 被忽略，列0:[1,4] 有效数2，列1:[2] 有效数1，列2:[3,6] 有效数2
-        (assert (equalp (vt-to-list v-axis0) 
-                        (list (/ (+ (expt (- 1 2.5) 2)
-				    (expt (- 4 2.5) 2))
-				 2)
-                              ;; 列1只有一个数，方差应为0
-                              0.0d0
-                              (/ (+ (expt (- 3 4.5) 2)
-				    (expt (- 6 4.5) 2))
-				 2))))
-        ;; axis1: [1,2,3] variance=? 和 [4,6] variance=?  sample var (ddof=1)
-	(assert (equalp (vt-to-list v-axis1)
-			(list (/ (+ (expt (- 1 2) 2)
-				    (expt (- 2 2) 2)
-				    (expt (- 3 2) 2)) 2)
-                              (/ (+ (expt (- 4 5) 2)
-				    (expt (- 6 5) 2)) 1)))))
-      (format t "vt-nanvar: PASS~%")
-
-      ;; ---- test vt-nanstd ----
-      (let ((std-global (vt-nanstd data)))
-	(assert (< (abs (- std-global (sqrt expected))) 1d-10))
-	(format t "vt-nanstd: PASS~%")))
-
-    ;; ---- test vt-nanmax ----
-    (let ((mx-global (vt-nanmax data))
-          (mx-axis0 (vt-nanmax data :axis 0)))
-      (assert (= mx-global 6.0d0))
-      (assert (equalp (vt-to-list mx-axis0) '(4.0 2.0 6.0)))
-      (format t "vt-nanmax: PASS~%"))
-
-    ;; ---- test vt-nanmin ----
-    (let ((mn-global (vt-nanmin data))
-          (mn-axis0 (vt-nanmin data :axis 0)))
-      (assert (= mn-global 1.0d0))
-      (assert (equalp (vt-to-list mn-axis0) '(1.0 2.0 3.0)))
-      (format t "vt-nanmin: PASS~%"))
-
-    ;; ---- 边界情况：全 NaN ----
-    (let* ((all-nan (vt-ones '(2 3) :type 'double-float))
-           (d (vt-data all-nan)))
-      (loop for i below (length d)
-	    do (setf (aref d i) (/ 0.0d0 0.0d0)))
-      ;; 测试这些函数不会崩溃，并返回 NaN 或适当值
+  (sb-vm::with-float-traps-masked (:invalid :divide-by-zero :overflow)
+    ;; 准备数据: 包含 NaN 的 2x3 矩阵
+    (let* ((nan (/ 0.0d0 0.0d0))
+	   (data (vt-from-sequence (list (list 1.0 2.0 3.0)
+					 (list 4.0 nan 6.0))
+				   :type 'double-float))
+           ;; 手动将符号 :nan 替换为实际 NaN
+           (arr (vt-data data)))
+      (loop for i below (length arr)
+            when (eql (aref arr i) 0.0) ;; 因为先创建为0再赋值，实际不会是0
+					;; 直接使用 VT-SET 来设置 NaN，由于 VT-REF 无法处理 :nan，
+					;; 我们重新构建：用 0 占位然后将已知位置设为 NaN
+					;; 简化：直接修改底层数据数组
+              do (when (and (= (mod i 3) 1) (= (floor i 3) 1))
+		   (setf (aref arr i) (/ 0.0d0 0.0d0))))  ;; 索引 (1,1) 设为 NaN
+      ;; 检查 NaN 是否设置成功
+      (format t "~2%Original tensor:~%")
+      (print-vt-recursive data 0 nil 2 10 'double-float t) ;; 简化打印，直接使用内部打印函数可能需要调整
+      ;; 使用 vt-map 来打印，避免未导出函数
+      (format t "~2%Data values: ~{~A ~}~%" (vt-to-list data))
       
+      ;; ---- test vt-nansum ----
+      (let ((s-global (vt-nansum data))
+            (s-axis0 (vt-nansum data :axis 0))
+            (s-axis1 (vt-nansum data :axis 1))
+            (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
+	(assert (= (coerce s-global 'double-float) 16.0d0) () "nansum global-> ~A" s-global)
+	(assert (equalp (vt-to-list s-axis0) '(5.0 2.0 9.0)))
+	(assert (equalp (vt-to-list s-axis1)  '(6.0 10.0)))
+	(assert (equal (list (first (vt-shape s-keepdim))
+			     (second (vt-shape s-keepdim))) '(1 3)))
+	(format t "~%vt-nansum: PASS~%"))
+
+      ;; ---- test vt-nanmean ----
+      (let ((m-global (vt-nanmean data))
+            (m-axis0 (vt-nanmean data :axis 0))
+            (m-axis1 (vt-nanmean data :axis 1)))
+	(assert (< (abs (- m-global (/ 16.0d0 5))) 1d-10))
+	(assert (equalp (vt-to-list m-axis0) '(2.5 2.0 4.5d0)))
+	(assert (equalp (vt-to-list m-axis1) '(2.0 5.0)))
+	(format t "vt-nanmean: PASS~%"))
+
+      ;; ---- test vt-nanvar (ddof=0, default) ----
+      (let* ((v-global (vt-nanvar data))
+             (expected (/ (+ (expt (- 1 3.2) 2)
+			     (expt (- 2 3.2) 2)
+                             (expt (- 3 3.2) 2)
+			     (expt (- 4 3.2) 2)
+                             (expt (- 6 3.2) 2))
+			  5)))
+	(print v-global)
+	(print expected)
+	(assert (< (abs (- v-global expected)) 1d-10))
+	(let ((v-axis0 (vt-nanvar data :axis 0))
+              (v-axis1 (vt-nanvar data :axis 1 :ddof 1)))
+          ;; axis0: 每列包含 NaN 被忽略，列0:[1,4] 有效数2，列1:[2] 有效数1，列2:[3,6] 有效数2
+          (assert (equalp (vt-to-list v-axis0) 
+                          (list (/ (+ (expt (- 1 2.5) 2)
+				      (expt (- 4 2.5) 2))
+				   2)
+				;; 列1只有一个数，方差应为0
+				0.0d0
+				(/ (+ (expt (- 3 4.5) 2)
+				      (expt (- 6 4.5) 2))
+				   2))))
+          ;; axis1: [1,2,3] variance=? 和 [4,6] variance=?  sample var (ddof=1)
+	  (assert (equalp (vt-to-list v-axis1)
+			  (list (/ (+ (expt (- 1 2) 2)
+				      (expt (- 2 2) 2)
+				      (expt (- 3 2) 2)) 2)
+				(/ (+ (expt (- 4 5) 2)
+				      (expt (- 6 5) 2)) 1)))))
+	(format t "vt-nanvar: PASS~%")
+
+	;; ---- test vt-nanstd ----
+	(let ((std-global (vt-nanstd data)))
+	  (assert (< (abs (- std-global (sqrt expected))) 1d-10))
+	  (format t "vt-nanstd: PASS~%")))
+
+      ;; ---- test vt-nanmax ----
+      (let ((mx-global (vt-nanmax data))
+            (mx-axis0 (vt-nanmax data :axis 0)))
+	(assert (= mx-global 6.0d0))
+	(assert (equalp (vt-to-list mx-axis0) '(4.0 2.0 6.0)))
+	(format t "vt-nanmax: PASS~%"))
+
+      ;; ---- test vt-nanmin ----
+      (let ((mn-global (vt-nanmin data))
+            (mn-axis0 (vt-nanmin data :axis 0)))
+	(assert (= mn-global 1.0d0))
+	(assert (equalp (vt-to-list mn-axis0) '(1.0 2.0 3.0)))
+	(format t "vt-nanmin: PASS~%"))
+
+      ;; ---- 边界情况：全 NaN ----
+      (let* ((all-nan (vt-ones '(2 3) :type 'double-float))
+             (d (vt-data all-nan)))
+	(loop for i below (length d)
+	      do (setf (aref d i) (/ 0.0d0 0.0d0)))
+	;; 测试这些函数不会崩溃，并返回 NaN 或适当值
+	
 
 
-      (let ((s (vt-nansum all-nan))
-	    (m (vt-nanmean all-nan))
-	    (v (vt-nanvar all-nan))
-	    (mx (vt-nanmax all-nan))
-	    (mn (vt-nanmin all-nan)))
-	;; 检查标量
-	(assert (/= m m))                 ; m 是 NaN
-	(assert (= s 0.0d0))
-	;; 检查一维张量: 全部元素都是 NaN
-	(let ((m0 (vt-nanmean all-nan :axis 0)))
-	  (assert (vt-all (vt-isnan m0)))
-	  ;; 同时验证标量 m 也是 NaN
-	  (assert (vt-all (vt-isnan (ensure-vt m)))))
-	;; max / min 边界
-	(assert (vt-all (vt-isinf mx)))    ; -inf
-	(assert (vt-all (vt-isinf mn)))    ; +inf? 看实现，应该是 most-positive-double-float
-	;; 方差也应为 NaN
-	(assert (vt-all (vt-isnan (ensure-vt v))))))
+	(let ((s (vt-nansum all-nan))
+	      (m (vt-nanmean all-nan))
+	      (v (vt-nanvar all-nan))
+	      (mx (vt-nanmax all-nan))
+	      (mn (vt-nanmin all-nan)))
+	  ;; 检查标量
+	  (assert (/= m m))                 ; m 是 NaN
+	  (assert (= s 0.0d0))
+	  ;; 检查一维张量: 全部元素都是 NaN
+	  (let ((m0 (vt-nanmean all-nan :axis 0)))
+	    (assert (vt-all (vt-isnan m0)))
+	    ;; 同时验证标量 m 也是 NaN
+	    (assert (vt-all (vt-isnan (ensure-vt m)))))
+	  ;; max / min 边界
+	  (assert (vt-all (vt-isinf mx)))    ; -inf
+	  (assert (vt-all (vt-isinf mn)))    ; +inf? 看实现，应该是 most-positive-double-float
+	  ;; 方差也应为 NaN
+	  (assert (vt-all (vt-isnan (ensure-vt v))))))
 
-    ;; ---- 边界情况：无 NaN ----
-    (let* ((clean (vt-arange 6 :step 1 :type 'double-float)))
-      (assert (= (vt-nansum clean) 15.0d0))
-      (assert (= (vt-nanmean clean) 2.5d0))
-      (assert (< (abs (- (vt-nanvar clean) (vt-var clean))) 1d-10))
-      (format t "No-NaN edge cases: PASS~%"))
+      ;; ---- 边界情况：无 NaN ----
+      (let* ((clean (vt-arange 6 :step 1 :type 'double-float)))
+	(assert (= (vt-nansum clean) 15.0d0))
+	(assert (= (vt-nanmean clean) 2.5d0))
+	(assert (< (abs (- (vt-nanvar clean) (vt-var clean))) 1d-10))
+	(format t "No-NaN edge cases: PASS~%")))
 
     (format t "~%All NaN statistics tests passed!~%")
     t))
@@ -1074,8 +1279,8 @@
     ;; a 形状 (2,2,2)，b 形状 (2,2) → 对齐后 a (2,2,2), b (1,2,2) → 结果 (2,4,4)
     (assert (equalp (vt-shape k) '(2 4 4)))
     ;; 取一个子块验证
-    (let* ((sub-k (vt-slice k 0 :all :all))
-           (expected-sub (vt-kron (vt-slice a 0 :all :all) b)))
+    (let* ((sub-k (vt-slice k '(0) '(:all) '(:all)))
+           (expected-sub (vt-kron (vt-slice a '(0) '(:all) '(:all)) b)))
       (assert (vt-all (vt-isclose sub-k expected-sub :atol 1d-12 :rtol 1d-12))))
     (format t "  kron of 2x2x2 and 2x2 PASS~%"))
   

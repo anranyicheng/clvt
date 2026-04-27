@@ -14,7 +14,7 @@
          (betas (make-array k :element-type 'double-float)))
     ;; ---- 1. 正向分解，更新 R ----
     (loop for i from 0 below k
-          for x = (vt-slice R (list i m) i)
+          for x = (vt-slice R (list i m) (list i))
 	  ;; 第 i 列，i 行开始，形状 (m-i)
           do (if (<= (vt-size x) 1)
                  (setf (aref betas i) 0.0d0)
@@ -41,17 +41,17 @@
             for beta = (aref betas i)
             for v = (aref vlist i)
             when (and v (> beta 0.0d0))
-              do (let ((Qsub (vt-slice Q (list i m) :all)))
+              do (let ((Qsub (vt-slice Q (list i m) '(:all))))
                    (let* ((w (vt-einsum "i,ij->j" v Qsub))
 			  (wsize (vt-size w))
                           (vcol (vt-reshape v (list (vt-size v) 1)))
                           (wrow (vt-reshape w (list 1 wsize)))
                           (update (vt-outer vcol wrow)))
-                     (setf (vt-slice Q (list i m) :all)
+                     (setf (vt-slice Q (list i m) '(:all))
                            (vt-- Qsub (vt-scale update beta))))))
       (values Q (if need-full
                     R
-                    (vt-slice R (list 0 k) :all))))))
+                    (vt-slice R (list 0 k) '(:all)))))))
 
 (defun compute-householder (x)
   "给定向量 x，返回三个值：v, beta, sigma。
@@ -87,9 +87,11 @@
                       (vt-const '(1 1) -1.0d0 :type 'double-float))))))
 
     (flet ((col-norm-sq (M col)
-             (vt-dot (vt-slice M :all col) (vt-slice M :all col)))
+             (vt-dot (vt-slice M '(:all) (list col))
+		     (vt-slice M '(:all) (list col))))
            (col-dot (M c1 c2)
-             (vt-dot (vt-slice M :all c1) (vt-slice M :all c2))))
+             (vt-dot (vt-slice M '(:all) (list c1))
+		     (vt-slice M '(:all) (list c2)))))
 
       (let* ((U (vt-copy mat))   ; m×n
              (V (vt-eye n :type 'double-float))
@@ -110,14 +112,18 @@
                               (t-val (if (>= zeta 0) t-abs (- t-abs)))
                               (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
                               (s (* c t-val)))
-                         (let ((old-i (vt-copy (vt-slice U :all i)))
-                               (old-j (vt-copy (vt-slice U :all j))))
-                           (setf (vt-slice U :all i) (vt-- (vt-scale old-i c) (vt-scale old-j s))
-                                 (vt-slice U :all j) (vt-+ (vt-scale old-i s) (vt-scale old-j c))))
-                         (let ((old-i (vt-copy (vt-slice V :all i)))
-                               (old-j (vt-copy (vt-slice V :all j))))
-                           (setf (vt-slice V :all i) (vt-- (vt-scale old-i c) (vt-scale old-j s))
-                                 (vt-slice V :all j) (vt-+ (vt-scale old-i s) (vt-scale old-j c)))))))
+                         (let ((old-i (vt-copy (vt-slice U '(:all) (list i))))
+                               (old-j (vt-copy (vt-slice U '(:all) (list j)))))
+                           (setf (vt-slice U '(:all) (list i))
+				 (vt-- (vt-scale old-i c) (vt-scale old-j s)))
+                           (setf (vt-slice U '(:all) (list j))
+				 (vt-+ (vt-scale old-i s) (vt-scale old-j c))))
+                         (let ((old-i (vt-copy (vt-slice V '(:all) (list i))))
+                               (old-j (vt-copy (vt-slice V '(:all) (list j)))))
+                           (setf (vt-slice V '(:all) (list i))
+				 (vt-- (vt-scale old-i c) (vt-scale old-j s)))
+                           (setf (vt-slice V '(:all) (list j))
+				 (vt-+ (vt-scale old-i s) (vt-scale old-j c)))))))
           (incf sweep))
 
         ;; 提取奇异值并排序
@@ -130,11 +136,13 @@
           (dotimes (new-i k)
             (destructuring-bind (val . old-col) (nth new-i pairs)
               (setf (aref S-vec new-i) val)
-              (setf (vt-slice U-k :all new-i) (vt-slice U :all old-col))))
+              (setf (vt-slice U-k '(:all) (list new-i))
+		    (vt-slice U '(:all) (list old-col)))))
           ;; 归一化 U-k 的列
           (dotimes (i k)
             (let ((inv (if (zerop (aref S-vec i)) 0.0d0 (/ 1.0d0 (aref S-vec i)))))
-              (setf (vt-slice U-k :all i) (vt-scale (vt-slice U-k :all i) inv))))
+              (setf (vt-slice U-k '(:all) (list i))
+		    (vt-scale (vt-slice U-k '(:all) (list i)) inv))))
 
           ;; 重排序 V 的列
           (let* ((V-sorted (vt-zeros (list n n) :type 'double-float))
@@ -142,17 +150,20 @@
             (dotimes (new-i k)
               (let ((old-col (cdr (nth new-i pairs))))
                 (push old-col used-cols)
-                (setf (vt-slice V-sorted :all new-i) (vt-slice V :all old-col))))
+                (setf (vt-slice V-sorted '(:all) (list new-i))
+		      (vt-slice V '(:all) (list old-col)))))
             (let ((rest-cols (loop for col from 0 below n
                                    unless (member col used-cols) collect col)))
               (loop for offset from 0 for col in rest-cols
-                    do (setf (vt-slice V-sorted :all (+ k offset)) (vt-slice V :all col))))
+                    do (setf (vt-slice V-sorted '(:all) (list (+ k offset)))
+			     (vt-slice V '(:all) (list col)))))
 
-            (let ((S-vt (vt-from-sequence (coerce S-vec 'list) :type 'double-float))
+            (let ((S-vt (vt-from-sequence (coerce S-vec 'list)
+					  :type 'double-float))
                   (Vt (vt-transpose V-sorted)))   ; 现在 Vt 是 n×n 的 V^T
               (if (not full-matrices)
                   ;; 经济模式：取 Vt 的前 k 行 -> k×n
-                  (let ((Vt-k (vt-slice Vt (list 0 k) :all)))
+                  (let ((Vt-k (vt-slice Vt (list 0 k) '(:all))))
                     (values U-k S-vt Vt-k))
                   ;; 完整模式：需要补全 U 到 m×m
                   (cond
@@ -175,18 +186,19 @@
         (let ((U-full (vt-zeros (list m m) :type 'double-float)))
           ;; 复制前 k 列（不变）
           (dotimes (i k)
-            (setf (vt-slice U-full :all i) (vt-slice U-econ :all i)))
+            (setf (vt-slice U-full '(:all) (list i))
+		  (vt-slice U-econ '(:all) (list i))))
           ;; 对第 k..m-1 列执行带重正交化的 Gram‑Schmidt
           (loop for col from k below m
                 for v = (vt-random (list m)) ;; 随机向量
                 do (loop repeat 2            ;; 重复两次以增强数值稳定性
                          do (dotimes (j col)
-                              (let* ((uj (vt-slice U-full :all j))
+                              (let* ((uj (vt-slice U-full '(:all) (list j)))
                                      (proj (vt-dot uj v)))
                                 (setf v (vt-- v (vt-scale uj proj))))))
                    (let ((norm (sqrt (vt-dot v v))))
                      (if (> norm 1e-12)
-                         (setf (vt-slice U-full :all col)
+                         (setf (vt-slice U-full '(:all) (list col))
                                (vt-scale v (/ 1.0 norm)))
                          (error "Failed to generate orthogonal vector"))))
           U-full))))

@@ -365,7 +365,7 @@
                                        (loop for d from 0 below (length sh)
                                              collect
 					     (if (= d ax)
-                                                 `(,i ,(1+ i)) :all)))
+                                                 `(,i ,(1+ i)) '(:all))))
                      when (> rep 0)
                        collect (if (= rep 1)
                                    part
@@ -446,11 +446,9 @@
                                          (+ cur-offset
                                             axis-size)))
                              ;; 其他轴: 全部选中
-                             (list :all)))))
+                             (list '(:all))))))
             ;; 将源张量直接写入目标切片
-            (setf (apply #'vt-slice
-                         (cons result slice-args))
-                  vt)
+            (setf (apply #'vt-slice result slice-args) vt)
             (incf cur-offset axis-size)))
         result))))
 
@@ -1273,7 +1271,7 @@
 	  ((slice-specs (ax start end)
 	     "生成沿轴 AX 的切片规格：从 start (包含) 到 end (不包含)。"
 	     (loop for d from 0 below rank
-                   collect (if (= d ax) (list start end) :all)))
+                   collect (if (= d ax) (list start end) '(:all))))
            (grad-along-axis (ax sp)
 	     (let* ((n (nth ax shape)))
                (when (< n 2)
@@ -1590,11 +1588,11 @@
               (apply #'vt-slice vt
                      (loop for i from 0 below (length sh)
                            collect (if (= i ax)
-                                       `(,(- n s) ,n) :all)))
+                                       `(,(- n s) ,n) '(:all))))
               (apply #'vt-slice vt
                      (loop for i from 0 below (length sh)
                            collect (if (= i ax)
-                                       `(0 ,(- n s)) :all)))))))
+                                       `(0 ,(- n s)) '(:all))))))))
       ;; axis = nil：展平后滚动并恢复形状
       (t
        (let* ((flat (vt-flatten vt))
