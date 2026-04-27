@@ -1,45 +1,5 @@
 (in-package :clvt)
 
-;; 原有的辅助函数保持不变
-(defun vt-to-2d-array (vt)
-  "将 2D VT 转为 Common Lisp 原生嵌套 Array"
-  (let ((shape (vt-shape vt))
-        (data (vt-data vt)))
-    (assert (= (length shape) 2))
-    (let* ((rows (first shape))
-           (cols (second shape))
-	   (type (vt-element-type vt))
-           (arr (make-array (list rows cols)
-			    :initial-element (coerce 0 type))))
-      (declare (fixnum rows cols))
-      (dotimes (i rows)
-	(declare (fixnum i))
-        (dotimes (j cols)
-	  (declare (fixnum j))
-          (setf (aref arr i j) (aref data (+ (* i cols) j)))))
-      arr)))
-
-(defun vt-from-2d-array (arr)
-  "从 2D Array 创建 VT"
-  (let* ((rows (array-dimension arr 0))
-         (cols (array-dimension arr 1))
-	 (type (if (eq (array-element-type arr)
-		       'fixnum)
-		   'fixnum 'double-float))
-         (data (make-array (* rows cols) :initial-element (coerce 0 type)
-					 :element-type type)))
-    (declare (fixnum rows cols))
-    (dotimes (i rows)
-      (declare (fixnum i))
-      (dotimes (j cols)
-	(declare (fixnum j))
-        (setf (aref data (+ (* i cols) j))
-	      (coerce (aref arr i j) type))))
-    (%make-vt :data data
-	      :shape (list rows cols)
-	      :strides (list cols 1)
-	      :offset 0)))
-
 (defun ensure-contiguous-2d-vt (vt)
   "确保矩阵在内存中是连续的."
   (if (vt-contiguous-p vt)

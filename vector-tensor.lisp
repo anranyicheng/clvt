@@ -183,7 +183,7 @@
                      (nreverse result)))))   ;; 反转得到正确顺序
       (recurse dims total-size))))
 
-(defun vt-data->list (vt)
+(defun vt-to-list (vt)
   "将张量转换为嵌套列表，正确处理任意 strides / offset 的视图。"
   (labels ((build (depth shape strides offset data)
              (declare (type fixnum depth offset)
@@ -212,6 +212,12 @@
           (build 0 shape strides offset data)
           ;; 0 维张量（标量）直接返回值
           (aref data offset)))))
+
+(defun vt-to-array (vt)
+  "将张量转化为同维度的数组"
+  (make-array (vt-shape vt)
+	      :element-type (vt-element-type vt)
+	      :initial-contents (vt-to-list vt)))
 
 (defun vt-order (vt)
   "张量的维度大小"

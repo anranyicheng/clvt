@@ -55,7 +55,7 @@
                                (-4  24 -41)))))
     (format t "~%========== QR 分解测试 ==========~%")
     (format t "原始矩阵 A:~%")
-    (print (vt-data->list A))
+    (print (vt-to-list A))
     ;; Full mode
     (multiple-value-bind (Q R) (vt-qr A :mode :full)
       (format t "~%Full mode: Q (m×m), R (m×n)~%")
@@ -551,7 +551,7 @@
          (to-list (lambda (vt)
                     (if (= (length (vt-shape vt)) 1)
                         (coerce (vt-data vt) 'list)
-                        (vt-data->list vt)))))
+                        (vt-to-list vt)))))
     ;; ================================================================
     ;; 1. axis = nil : 标量索引
     ;; np: a = np.arange(20).reshape(4,5); a.take(0)  => np.int64(0)
@@ -578,7 +578,7 @@
            (result (vt-take m indices)))
       (assert (equal (vt-shape result) '(2 2))
               () "take with 2D indices: shape mismatch ~A" (vt-shape result))
-      (assert (equalp (vt-data->list result)
+      (assert (equalp (vt-to-list result)
                       '((1 3) (1 5)))
               () "take with 2D indices: values mismatch"))
 
@@ -589,7 +589,7 @@
     (let* ((indices (vt-arange 2 :start 1 :step 2 :type 'fixnum)) ; [1,3]
            (result (vt-take m indices :axis 0)))
       (assert (equal (vt-shape result) '(2 5)) () "axis=0 shape failed")
-      (assert (equalp (vt-data->list result)
+      (assert (equalp (vt-to-list result)
                       '((5 6 7 8 9) (15 16 17 18 19)))
               () "axis=0 values failed"))
 
@@ -600,7 +600,7 @@
     (let* ((indices (vt-from-sequence '(0 2) :type 'fixnum))
            (result (vt-take m indices :axis 1)))
       (assert (equal (vt-shape result) '(4 2)) () "axis=1 shape failed")
-      (assert (equalp (vt-data->list result)
+      (assert (equalp (vt-to-list result)
                       '((0 2) (5 7) (10 12) (15 17)))
               () "axis=1 values failed"))
 
@@ -613,7 +613,7 @@
            (result (vt-take m indices :axis -1)))
       (assert (equal (vt-shape result) '(4 2 2))
               () "axis=-1 with 2D indices: shape mismatch ~A" (vt-shape result))
-      (assert (equalp (vt-data->list result)
+      (assert (equalp (vt-to-list result)
                       '(((0 2) (1 3)) ((5 7) (6 8))
                         ((10 12) (11 13)) ((15 17) (16 18))))
               () "axis=-1 with 2D indices: values mismatch"))
@@ -635,20 +635,20 @@
 (defun test-vt-argsort ()
   (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
     (assert (equal
-	     (vt-data->list (vt-argsort a :axis -1))
+	     (vt-to-list (vt-argsort a :axis -1))
 	     '((1 2 0)
 	       (2 1 0))))
      (assert (equal
-	     (vt-data->list (vt-argsort a :axis 1))
+	     (vt-to-list (vt-argsort a :axis 1))
 	     '((1 2 0)
 	       (2 1 0))))
 
      (assert (equal
-	     (vt-data->list (vt-argsort a :axis 0))
+	     (vt-to-list (vt-argsort a :axis 0))
 	     '((0 0 0)
 	       (1 1 1))))
      (assert (equal
-	     (vt-data->list (vt-argsort a :axis nil))
+	     (vt-to-list (vt-argsort a :axis nil))
 	     '(1 2 0 5 4 3)))
     (print "passed test vt-argsort")))
     
@@ -656,19 +656,19 @@
 (defun test-vt-sort ()
   (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
     (assert (equal
-	     (vt-data->list (vt-sort a :axis -1))
+	     (vt-to-list (vt-sort a :axis -1))
 	     '((1 2 3)
 	       (4 5 6))))
      (assert (equal
-	     (vt-data->list (vt-sort a :axis 1))
+	     (vt-to-list (vt-sort a :axis 1))
 	     '((1 2 3)
 	       (4 5 6))))
      (assert (equal
-	     (vt-data->list (vt-sort a :axis 0))
+	     (vt-to-list (vt-sort a :axis 0))
 	     '((3 1 2)
 	       (6 5 4))))
      (assert (equal
-	     (vt-data->list (vt-sort a :axis nil))
+	     (vt-to-list (vt-sort a :axis nil))
 	     '(1 2 3 4 5 6)))
     (print "passed test vt-sort")))
 
@@ -679,20 +679,20 @@
                              :type 'fixnum)))   ; shape (2,2,2)
     ;; 沿最后一轴（axis=-1）排序，期望每层内两个元素升序
     (let ((sorted (vt-argsort a :axis -1)))
-      (assert (equal (vt-data->list sorted)
+      (assert (equal (vt-to-list sorted)
                      '(((1 0) (1 0))
                        ((1 0) (1 0)))))
       (format t "~[FAIL~;PASS~] argsort axis=-1~%"
-              (if (equal (vt-data->list sorted)
+              (if (equal (vt-to-list sorted)
                          '(((1 0) (1 0)) ((1 0) (1 0))))
 		  1 0)))
     ;; 沿 axis=0 排序
     (let ((sorted (vt-argsort a :axis 0)))
-      (assert (equal (vt-data->list sorted)
+      (assert (equal (vt-to-list sorted)
                      '(((0 0) (0 0))
                        ((1 1) (1 1)))))
       (format t "~[FAIL~;PASS~] argsort axis=0~%"
-              (if (equal (vt-data->list sorted)
+              (if (equal (vt-to-list sorted)
                          '(((0 0) (0 0)) ((1 1) (1 1))))
 		  1 0)))))
 
@@ -885,7 +885,7 @@
     (format t "~2%Original tensor:~%")
     (print-vt-recursive data 0 nil 2 10 'double-float t) ;; 简化打印，直接使用内部打印函数可能需要调整
     ;; 使用 vt-map 来打印，避免未导出函数
-    (format t "~2%Data values: ~{~A ~}~%" (vt-data->list data))
+    (format t "~2%Data values: ~{~A ~}~%" (vt-to-list data))
     
     ;; ---- test vt-nansum ----
     (let ((s-global (vt-nansum data))
@@ -893,8 +893,8 @@
           (s-axis1 (vt-nansum data :axis 1))
           (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
       (assert (= (coerce s-global 'double-float) 16.0d0) () "nansum global-> ~A" s-global)
-      (assert (equalp (vt-data->list s-axis0) '(5.0 2.0 9.0)))
-      (assert (equalp (vt-data->list s-axis1)  '(6.0 10.0)))
+      (assert (equalp (vt-to-list s-axis0) '(5.0 2.0 9.0)))
+      (assert (equalp (vt-to-list s-axis1)  '(6.0 10.0)))
       (assert (equal (list (first (vt-shape s-keepdim))
 			   (second (vt-shape s-keepdim))) '(1 3)))
       (format t "~%vt-nansum: PASS~%"))
@@ -904,8 +904,8 @@
           (m-axis0 (vt-nanmean data :axis 0))
           (m-axis1 (vt-nanmean data :axis 1)))
       (assert (< (abs (- m-global (/ 16.0d0 5))) 1d-10))
-      (assert (equalp (vt-data->list m-axis0) '(2.5 2.0 4.5d0)))
-      (assert (equalp (vt-data->list m-axis1) '(2.0 5.0)))
+      (assert (equalp (vt-to-list m-axis0) '(2.5 2.0 4.5d0)))
+      (assert (equalp (vt-to-list m-axis1) '(2.0 5.0)))
       (format t "vt-nanmean: PASS~%"))
 
     ;; ---- test vt-nanvar (ddof=0, default) ----
@@ -922,7 +922,7 @@
       (let ((v-axis0 (vt-nanvar data :axis 0))
             (v-axis1 (vt-nanvar data :axis 1 :ddof 1)))
         ;; axis0: 每列包含 NaN 被忽略，列0:[1,4] 有效数2，列1:[2] 有效数1，列2:[3,6] 有效数2
-        (assert (equalp (vt-data->list v-axis0) 
+        (assert (equalp (vt-to-list v-axis0) 
                         (list (/ (+ (expt (- 1 2.5) 2)
 				    (expt (- 4 2.5) 2))
 				 2)
@@ -932,7 +932,7 @@
 				    (expt (- 6 4.5) 2))
 				 2))))
         ;; axis1: [1,2,3] variance=? 和 [4,6] variance=?  sample var (ddof=1)
-	(assert (equalp (vt-data->list v-axis1)
+	(assert (equalp (vt-to-list v-axis1)
 			(list (/ (+ (expt (- 1 2) 2)
 				    (expt (- 2 2) 2)
 				    (expt (- 3 2) 2)) 2)
@@ -949,14 +949,14 @@
     (let ((mx-global (vt-nanmax data))
           (mx-axis0 (vt-nanmax data :axis 0)))
       (assert (= mx-global 6.0d0))
-      (assert (equalp (vt-data->list mx-axis0) '(4.0 2.0 6.0)))
+      (assert (equalp (vt-to-list mx-axis0) '(4.0 2.0 6.0)))
       (format t "vt-nanmax: PASS~%"))
 
     ;; ---- test vt-nanmin ----
     (let ((mn-global (vt-nanmin data))
           (mn-axis0 (vt-nanmin data :axis 0)))
       (assert (= mn-global 1.0d0))
-      (assert (equalp (vt-data->list mn-axis0) '(1.0 2.0 3.0)))
+      (assert (equalp (vt-to-list mn-axis0) '(1.0 2.0 3.0)))
       (format t "vt-nanmin: PASS~%"))
 
     ;; ---- 边界情况：全 NaN ----
@@ -1003,7 +1003,7 @@
   (format t "~%--- Testing vt-logspace ---~%")
   ;; 1. 默认底数10，端点包含
   (let* ((ls (vt-logspace 0 3 4 :type 'double-float))
-         (arr (vt-data->list ls)))
+         (arr (vt-to-list ls)))
     (assert (= (vt-size ls) 4))
     (assert (< (abs (- (first arr) 1.0d0)) 1d-10))
     (assert (< (abs (- (second arr) 10.0d0)) 1d-10))
@@ -1013,7 +1013,7 @@
   
   ;; 2. 底数为2，不包含终点
   (let* ((ls (vt-logspace 1 4 3 :base 2.0d0 :endpoint nil :type 'double-float))
-         (arr (vt-data->list ls)))
+         (arr (vt-to-list ls)))
     ;; 对数间隔在[1,4)上等分3个点：2^1=2, 2^2=4, 2^3=8
     (assert (< (abs (- (first arr) 2.0d0)) 1d-10))
     (assert (< (abs (- (second arr) 4.0d0)) 1d-10))
@@ -1022,7 +1022,7 @@
   
   ;; 3. 单点
   (let* ((ls (vt-logspace 0 0 1))
-         (arr (vt-data->list ls)))
+         (arr (vt-to-list ls)))
     (assert (= (length arr) 1))
     (assert (< (abs (- (first arr) 1.0d0)) 1d-10))
     (format t "  logspace(0,0,1) = ~A  PASS~%" arr))
@@ -1089,14 +1089,14 @@
   (let* ((data (vt-from-sequence '(1 3 7 13 21) :type 'double-float))
          (result (vt-diff data)))
     (assert (equalp (vt-shape result) '(4)))
-    (assert (equalp (vt-data->list result) '(2 4 6 8)))
+    (assert (equalp (vt-to-list result) '(2 4 6 8)))
     (format t "  1D 1st-order diff: ~A PASS~%" result))
   
   ;; 2. 一维数组，二阶差分
   (let* ((data (vt-from-sequence '(1 3 7 13 21) :type 'double-float))
          (result (vt-diff data :n 2)))
     (assert (equalp (vt-shape result) '(3)))
-    (assert (equalp (vt-data->list result) '(2 2 2)))
+    (assert (equalp (vt-to-list result) '(2 2 2)))
     (format t "  1D 2nd-order diff: ~A PASS~%" result))
   
   ;; 3. 一维数组，高阶差分 (n=3)
@@ -1107,7 +1107,7 @@
     ;; diff2: [1,2,4]
     ;; diff3: [1,2]
     (assert (equalp (vt-shape result) '(2)))
-    (assert (equalp (vt-data->list result) '(1 2)))
+    (assert (equalp (vt-to-list result) '(1 2)))
     (format t "  1D 3rd-order diff: ~A PASS~%" result))
   
   ;; 4. 二维数组，默认轴 (axis = -1)
@@ -1115,7 +1115,7 @@
          (result (vt-diff data)))
     ;; 沿最后一轴 (axis=1) 差分
     (assert (equalp (vt-shape result) '(2 2)))
-    (assert (equalp (vt-data->list result) '((2 4) (3 5))))
+    (assert (equalp (vt-to-list result) '((2 4) (3 5))))
     (format t "  2D diff axis=-1: ~A PASS~%" result))
   
   ;; 5. 二维数组，沿 axis=0 差分
@@ -1123,7 +1123,7 @@
          (result (vt-diff data :axis 0)))
     ;; 沿第0轴 (行方向) 差分
     (assert (equalp (vt-shape result) '(1 3)))
-    (assert (equalp (vt-data->list result) '((0 1 2))))
+    (assert (equalp (vt-to-list result) '((0 1 2))))
     (format t "  2D diff axis=0: ~A PASS~%" result))
   
   ;; 6. 二维数组，沿 axis=1 且 n=2
@@ -1132,7 +1132,7 @@
     (assert (equalp (vt-shape result) '(2 2)))
     ;; 第一行: diff1 [2,4,6], diff2 [2,2]
     ;; 第二行: diff1 [3,5,7], diff2 [2,2]
-    (assert (equalp (vt-data->list result) '((2 2) (2 2))))
+    (assert (equalp (vt-to-list result) '((2 2) (2 2))))
     (format t "  2D diff axis=1, n=2: ~A PASS~%" result))
   
   ;; 7. 边界情况：长度不足以做差分（长度 < n+1）应返回空形状
@@ -1141,7 +1141,7 @@
     ;; 一阶差分可做 (结果长度1)
     (let ((r (vt-diff data)))
       (assert (equalp (vt-shape r) '(1)))
-      (assert (equalp (vt-data->list r) '(1))))
+      (assert (equalp (vt-to-list r) '(1))))
     ;; 二阶差分不可做 (结果长度0)
     (let ((r2 (vt-diff data :n 2)))
       (assert (equalp (vt-shape r2) '(0)))
@@ -1178,11 +1178,11 @@
     ;; 列0: (1+4)/2 = 2.5
     ;; 列1: (2+5)/2 = 3.5
     ;; 列2: (3+6)/2 = 4.5
-    (assert (equalp (vt-data->list trap-axis0) '(2.5 3.5 4.5)))
+    (assert (equalp (vt-to-list trap-axis0) '(2.5 3.5 4.5)))
     ;; axis=1：每行沿列方向（长度3）梯形积分
     ;; 行0: (1+2)/2 + (2+3)/2 = 1.5+2.5=4.0
     ;; 行1: (4+5)/2 + (5+6)/2 = 4.5+5.5=10.0
-    (assert (equalp (vt-data->list trap-axis1) '(4.0 10.0)))
+    (assert (equalp (vt-to-list trap-axis1) '(4.0 10.0)))
     (format t "  trapz on 2D array axis=0,1 PASS~%"))
   
   ;; 4. 仅有一个元素的错误处理
@@ -1199,22 +1199,22 @@
          (v (vt-from-sequence '(0 1 0.5) :type 'double-float)))
     ;; full 模式
     (let ((res (vt-correlate a v :mode "full")))
-      (assert (equalp (vt-data->list res) '(0.5 2.0 3.5 3.0 0.0)))
+      (assert (equalp (vt-to-list res) '(0.5 2.0 3.5 3.0 0.0)))
       (format t "  full  mode: ~A PASS~%" res))
     ;; valid 模式
     (let ((res (vt-correlate a v :mode "valid")))
-      (assert (equalp (vt-data->list res) '(3.5)))
+      (assert (equalp (vt-to-list res) '(3.5)))
       (format t "  valid mode: ~A PASS~%" res))
     ;; same 模式
     (let ((res (vt-correlate a v :mode "same")))
-      (assert (equalp (vt-data->list res) '(2.0 3.5 3.0)))
+      (assert (equalp (vt-to-list res) '(2.0 3.5 3.0)))
       (format t "  same  mode: ~A PASS~%" res)))
   ;; 单元素
   (let ((a (vt-from-sequence '(5) :type 'double-float))
         (v (vt-from-sequence '(3) :type 'double-float)))
     (dolist (mode '("full" "valid" "same"))
       (let ((res (vt-correlate a v :mode mode)))
-        (assert (equalp (vt-data->list res) '(15)))
+        (assert (equalp (vt-to-list res) '(15)))
         (format t "  length-1 ~A: ~A PASS~%" mode res))))
   (format t "vt-correlate tests passed.~%"))
 

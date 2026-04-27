@@ -152,10 +152,8 @@ vt-from-sequence
 vt-from-array
 vt-from-function
 vt-flatten-sequence
-vt-to-2d-array
-vt-from-2d-array
-vt-data->list
-vt-tolist
+vt-to-list
+vt-to-array
 vt-astype
 
 ;; 形状操作与视图
