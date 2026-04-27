@@ -191,37 +191,47 @@
       (recurse 0 nil 0))
     result))
 
-(defun vt-meshgrid (&rest vts)
-  "生成坐标矩阵.
-   vts: 一维张量列表
-  返回: 坐标张量列表(稀疏模式,兼容 NumPy sparse=True)"
-  (let* ((shapes (mapcar #'vt-shape vts))
-         (dims (mapcar #'car shapes))
-         (rank (length dims)))
-    ;; 每个输出张量的形状是所有维度的组合
-    (loop for i from 0 below rank
-          for vt in vts
-          for dim-i = (nth i dims)
-          collect
-          (let* ((out-shape dims)
-                 (result (vt-zeros out-shape))
-                 (data (vt-data result))
-                 (strides (vt-strides result)))
-            ;; 广播填充
-            (labels
-		((recurse (depth indices)
-                   (declare (type fixnum depth))
-                   (if (= depth rank)
-                       (let ((flat-idx (loop for idx in indices
-                                             for stride in strides
-                                             sum (* idx stride))))
-                         (setf (aref data flat-idx)
-                               (aref (vt-data vt) (nth i indices))))
-                       (loop for j from 0 below (nth depth dims)
-                             do (recurse (1+ depth)
-					 (append indices (list j)))))))
-              (recurse 0 nil))
-            result))))
+(defun vt-meshgrid (vts-list &key (indexing :xy) (sparse nil) (copy t))
+  "生成坐标矩阵，完全兼容 NumPy 的 meshgrid 语义。
+   vts-list : 一维张量列表。
+   indexing : :ij（矩阵索引）或 :xy（笛卡尔坐标，默认 :xy）。
+   sparse   : 若为 T，返回稀疏网格（形状中非对应轴为 1 的广播视图），否则返回全尺寸网格。
+   copy     : 若为 T，强制复制数据；否则尽量返回视图。
+   返回     : 张量列表，长度与 vts 相同。"
+  (declare (list vts-list))
+  (dolist (v vts-list)
+    (assert (= (length (vt-shape v)) 1)
+            (v) "All inputs to meshgrid must be 1-D"))
+  (let* ((nd (length vts-list))
+         (dims (mapcar (lambda (v) (first (vt-shape v))) vts-list))
+         ;; 计算输出形状（xy 模式下交换前两个维度）
+         (output-shape
+           (if (and (eq indexing :xy) (>= nd 2))
+               (let ((sh (copy-list dims)))
+                 (rotatef (first sh) (second sh))
+                 sh)
+               dims))
+         ;; 每个输入在输出形状中对应的轴
+         (target-axes
+           (if (and (eq indexing :xy) (>= nd 2))
+               (let ((axes (loop for i below nd collect i)))
+                 (rotatef (first axes) (second axes))
+                 axes)
+               (loop for i below nd collect i))))
+    ;; 生成第 i 个输出的稀疏形状（基于 output-shape）
+    (labels ((make-sparse-shape (i)
+               (loop for ax from 0 below nd
+                     collect (if (= ax (nth i target-axes))
+				 (nth i dims)
+				 1))))
+      (loop for i from 0 below nd
+            for v in vts-list
+            for src = (if copy (vt-copy v) v)
+            for sp = (make-sparse-shape i)
+            collect (if sparse
+			(vt-reshape src sp)
+			(let ((sp-view (vt-reshape src sp)))
+			  (vt-broadcast-to sp-view output-shape)))))))
 
 ;;; ===========================================
 ;;; 2. 形状操作扩展
@@ -537,7 +547,7 @@
                    (let* ((dim (nth depth shape))
                           (in-stride (nth depth (vt-strides tensor)))
                           (out-stride (nth depth (vt-strides result)))
-                          (sum 0.0d0))
+                          (sum (coerce 0 (vt-element-type tensor))))
                      (loop for i from 0 below dim
                            do (incf sum (aref (vt-data tensor) in-ptr))
                               (setf (aref (vt-data result) out-ptr) sum)
@@ -558,8 +568,8 @@
       ;; 展平后累积
       (let* ((flat (vt-flatten tensor))
              (size (vt-size flat))
-             (result (vt-zeros (list size)))
-             (sum 0.0d0))
+             (result (vt-zeros (list size) :type (vt-element-type tensor)))
+             (sum (coerce 0 (vt-element-type tensor))))
         (loop for i from 0 below size
               do (incf sum (aref (vt-data flat) i))
                  (setf (aref (vt-data result) i) sum))
@@ -581,7 +591,7 @@
                    (let* ((dim (nth depth shape))
                           (in-stride (nth depth (vt-strides tensor)))
                           (out-stride (nth depth (vt-strides result)))
-                          (prod 1.0d0))
+                          (prod (coerce 1 (vt-element-type tensor))))
                      (loop for i from 0 below dim
                            do (setf prod (* prod (aref (vt-data tensor) in-ptr)))
                               (setf (aref (vt-data result) out-ptr) prod)
@@ -600,8 +610,8 @@
         result)
       (let* ((flat (vt-flatten tensor))
              (size (vt-size flat))
-             (result (vt-zeros (list size)))
-             (prod 1.0d0))
+             (result (vt-zeros (list size) :type (vt-element-type tensor)))
+             (prod (coerce 1 (vt-element-type tensor))))
         (loop for i from 0 below size
               do (setf prod (* prod (aref (vt-data flat) i)))
                  (setf (aref (vt-data result) i) prod))
@@ -717,8 +727,6 @@
           (+ (* (- 1 frac) (nth lower sorted))
              (* frac (nth (min upper (1- size))
 			  sorted)))))))
-
-
 
 (defun vt-quantile (tensor q &key axis)
   "计算分位数.

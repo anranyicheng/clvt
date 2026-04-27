@@ -202,9 +202,28 @@
 
   )
 
+(defun test-vt-meshgrid ()
+  (let* ((x (vt-arange 3))
+	 (y (vt-arange 4))
+	 (z (vt-arange 5)))
+    ;; xy 稀疏
+    (let ((g (vt-meshgrid (list x y) :sparse t :indexing :xy)))
+      (assert (equal (vt-shape (first g)) (list 1 3)))
+      (assert (equal (vt-shape (second g)) (list 4 1))))
+    ;; ij 稀疏
+    (let ((g (vt-meshgrid (list x y) :sparse t :indexing :ij)))
+      (assert (equal (vt-shape (first g)) (list 3 1)))
+      (assert (equal (vt-shape (second g)) (list 1 4))))
+    ;; 三维 xy 稀疏
+    (let ((g (vt-meshgrid (list x y z) :sparse t :indexing :xy)))
+      (assert (equal (mapcar #'vt-shape g) '((1 3 1) (4 1 1) (1 1 5)))))
+    ;; 非稀疏 xy 全尺寸
+    (let ((g (vt-meshgrid (list x y) :sparse nil :indexing :xy)))
+      (assert (equal (vt-shape (first g)) (list 4 3)))
+      (assert (equal (vt-shape (second g)) (list 4 3)))))
+  (print "Testing vt-meshgrid passed"))
 
 
-  
 (defun test-cumsum-type ()
   (format t "~%=== Testing vt-cumsum with fixnum ===")
   (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
@@ -250,6 +269,7 @@
                (Iv (vt-eye (first (vt-shape VtV)) :type 'double-float))
                (VtV-error (reduce #'max (vt-data (vt-abs (vt-- VtV Iv))))))
           (format t "Vt Vt^T ≈ I ? max|Vt Vt^T - I| = ~A~%" VtV-error))))))
+
 
 
 ;; ========== QR 分解测试 ==========
@@ -1463,7 +1483,8 @@
 
 
 (defun run-all-tests ()
-
+  (test-vt-slice)
+  (test-vt-meshgrid)
   (test-qr)
   (run-svd-tests)
   (test-gradient)
