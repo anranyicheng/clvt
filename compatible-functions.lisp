@@ -1773,7 +1773,7 @@
 	      :strides '(1)
 	      :offset 0)))
 
-(defun vt-correlate (a v &key (mode "full"))
+(defun vt-correlate (a v &key (mode :full))
   "一维互相关（不翻转 v），与 numpy.correlate 完全一致。"
   (let* ((a-flat (vt-flatten a))
          (v-flat (vt-flatten v))
@@ -1795,7 +1795,7 @@
         (loop for k from (- offset) below n
               for i from 0
               do (setf (aref full i) (compute-one k)))
-        (ecase (intern (string-upcase mode) :keyword)
+        (ecase mode
           (:full
            (%make-vt :data full :shape (list full-len) :strides '(1) :offset 0))
           (:valid
@@ -1815,7 +1815,7 @@
                      do (setf (aref data i) (aref full idx)))
                (%make-vt :data data :shape (list out-len) :strides '(1) :offset 0)))))))))
 
-(defun vt-convolve (a v &key (mode "full"))
+(defun vt-convolve (a v &key (mode :full))
   "一维卷积。"
   (vt-correlate a (vt-flip v) :mode mode))
 

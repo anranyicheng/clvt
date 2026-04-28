@@ -1423,21 +1423,21 @@
   (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
          (v (vt-from-sequence '(0 1 0.5) :type 'double-float)))
     ;; full 模式
-    (let ((res (vt-correlate a v :mode "full")))
+    (let ((res (vt-correlate a v :mode :full)))
       (assert (equalp (vt-to-list res) '(0.5 2.0 3.5 3.0 0.0)))
       (format t "  full  mode: ~A PASS~%" res))
     ;; valid 模式
-    (let ((res (vt-correlate a v :mode "valid")))
+    (let ((res (vt-correlate a v :mode :valid)))
       (assert (equalp (vt-to-list res) '(3.5)))
       (format t "  valid mode: ~A PASS~%" res))
     ;; same 模式
-    (let ((res (vt-correlate a v :mode "same")))
+    (let ((res (vt-correlate a v :mode :same)))
       (assert (equalp (vt-to-list res) '(2.0 3.5 3.0)))
       (format t "  same  mode: ~A PASS~%" res)))
   ;; 单元素
   (let ((a (vt-from-sequence '(5) :type 'double-float))
         (v (vt-from-sequence '(3) :type 'double-float)))
-    (dolist (mode '("full" "valid" "same"))
+    (dolist (mode '(:full :valid :same))
       (let ((res (vt-correlate a v :mode mode)))
         (assert (equalp (vt-to-list res) '(15)))
         (format t "  length-1 ~A: ~A PASS~%" mode res))))
