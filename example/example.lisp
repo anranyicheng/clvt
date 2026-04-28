@@ -829,23 +829,6 @@
 		   '((0.0 0.0) (1.0 2.0) (2.0 4.0)))))
   (format t "~%test-vt-outer passed.~%"))
 
-;; ============================================================
-;; 汇总运行
-;; ============================================================
-(defun test-linalg-core ()
-  (test-vt-matmul)
-  (test-vt-einsum)
-  (test-vt-dot)
-  (test-vt-solve)
-  (test-vt-inv)
-  (test-vt-det)
-  (test-vt-norm)
-  (test-vt-frobenius-norm)
-  (test-vt-trace)
-  (test-vt-outer)
-  (format t "~%All linalg core tests passed.~%"))
-
-
 (defun test-cumsum-type ()
   (format t "~%=== Testing vt-cumsum with fixnum ===")
   (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
@@ -2112,6 +2095,17 @@
   (test-vt-meshgrid)
   (test-vt-median)
   (test-vt-percentile)
+  (test-vt-matmul)
+  (test-vt-einsum)
+  (test-vt-dot)
+  (test-vt-solve)
+  (test-vt-inv)
+  (test-vt-det)
+  (test-vt-norm)
+  (test-vt-frobenius-norm)
+  (test-vt-trace)
+  (test-vt-outer)
+  (test-cumsum-type)
   (test-qr)
   (run-svd-tests)
   (test-gradient)
