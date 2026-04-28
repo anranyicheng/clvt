@@ -115,12 +115,14 @@
 				      :keepdims keepdims)))
     (if (vt-p weighted-sum)
         (vt-map (lambda (s w) 
-                  (if (= w 0) 0.0d0 (/ s w))) 
+                  (if (= w 0)
+		      0.0d0
+		      (/ s w))) 
                 weighted-sum 
                 sum-weights)
         (if (= sum-weights 0)
             0.0d0 
-            (/ weighted-sum sum-weights)))))
+            (/ weighted-sum sum-weights 1.0d0)))))
 
 (defun vt-var (tensor &key axis keepdims)
   "计算方差."

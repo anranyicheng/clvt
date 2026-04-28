@@ -224,6 +224,152 @@
   (print "Testing vt-meshgrid passed"))
 
 
+;; ============================================================
+;; 辅助函数：比较浮点数列表（允许微小误差）
+;; ============================================================
+(defun list-approx-equal (l1 l2 &key (epsilon 1e-10))
+  (and (= (length l1) (length l2))
+       (every (lambda (a b) (< (abs (- a b)) epsilon)) l1 l2)))
+
+;; ============================================================
+;; vt-median 测试
+;; ============================================================
+(defun test-vt-median ()
+  ;; 全局中位数（一维向量）
+  ;; np.median(np.array([5, 2, 8, 1, 9])) -> 5.0
+  (let ((a (vt-from-sequence '(5 2 8 1 9))))
+    (assert (= (vt-median a) 5.0d0)))
+
+  ;; 全局中位数（偶数个元素）
+  ;; np.median(np.array([1, 2, 3, 4])) -> 2.5
+  (let ((a (vt-from-sequence '(1 2 3 4))))
+    (assert (= (vt-median a) 2.5d0)))
+
+  ;; 二维张量，沿 axis=0 求中位数
+  ;; a = np.arange(30).reshape(5,6)
+  ;; np.median(a, axis=0) -> [12. 13. 14. 15. 16. 17.]
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-median a :axis 0))))
+      (assert (list-approx-equal result '(12.0 13.0 14.0 15.0 16.0 17.0)))))
+
+  ;; 二维张量，沿 axis=1 求中位数
+  ;; np.median(a, axis=1) -> [2.5 8.5 14.5 20.5 26.5]
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-median a :axis 1))))
+      (assert (list-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
+
+  ;; 三维张量，沿 axis=1 求中位数
+  ;; a = np.arange(24).reshape(2,3,4)
+  ;; np.median(a, axis=1) -> [[ 4.  5.  6.  7.] [16. 17. 18. 19.]]
+  (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+    (let ((result (vt-to-list (vt-median a :axis 1))))
+      (assert (list-approx-equal (reduce #'append result) 
+				 '(4.0 5.0 6.0 7.0 16.0 17.0 18.0 19.0)))))
+
+  ;; 三维张量，沿 axis=2（最后一维）求中位数
+  ;; np.median(a, axis=2) -> [[ 1.5  5.5  9.5] [13.5 17.5 21.5]]
+  (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+    (let ((result (vt-to-list (vt-median a :axis 2))))
+      (assert (list-approx-equal (reduce #'append result)
+				 '(1.5 5.5 9.5 13.5 17.5 21.5)))))
+
+  ;; 使用负轴 axis=-1 等同于 axis=1
+  ;; np.median(a, axis=-1) -> [2.5 8.5 14.5 20.5 26.5]
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-median a :axis -1))))
+      (assert (list-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
+
+  ;; 全局中位数（标量）作为数字返回
+  ;; np.median(np.array([1.0])) -> 1.0
+  (let ((a (vt-zeros '(1))))
+    (assert (= (vt-median a) 0.0d0)))
+  (print "Test vt-median passed")
+  )
+;; ============================================================
+;; vt-percentile 测试
+;; ============================================================
+(defun test-vt-percentile ()
+  ;; 一维向量，线性插值（默认方法）
+  ;; a = np.array([1, 2, 3, 4, 5])
+  ;; np.percentile(a, 50) -> 3.0
+  (let ((a (vt-from-sequence '(1 2 3 4 5))))
+    (assert (= (vt-percentile a 50) 3.0d0)))
+
+  ;; 一维向量，lower 方法
+  ;; np.percentile(a, 40, interpolation='lower') -> 2
+  (let ((a (vt-from-sequence '(1 2 3 4 5))))
+    (assert (= (vt-percentile a 40 :interpolation :lower) 2.0d0)))
+
+  ;; 一维向量，higher 方法
+  ;; np.percentile(a, 40, interpolation='higher') -> 3
+  (let ((a (vt-from-sequence '(1 2 3 4 5))))
+    (assert (= (vt-percentile a 40 :interpolation :higher) 3.0d0)))
+
+  ;; 一维向量，midpoint 方法
+  ;; np.percentile(a, 40, interpolation='midpoint') -> 2.5
+  (let ((a (vt-from-sequence '(1 2 3 4 5))))
+    (assert (= (vt-percentile a 40 :interpolation :midpoint) 2.5d0)))
+
+  ;; 一维向量，nearest 方法
+  ;; np.percentile(a, 40, interpolation='nearest') -> 2  (since idx=1.6, frac=0.6 > 0.5 -> upper=2?)
+  (let ((a (vt-from-sequence '(1 2 3 4 5))))
+    (assert (= (vt-percentile a 40 :interpolation :nearest) 3.0d0)))  ; idx=1.6, frac=0.6>0.5 => upper=2?
+
+  ;; 二维轴向：axis=1，线性
+  ;; a = np.arange(30).reshape(5,6)
+  ;; np.percentile(a, 30, axis=1) -> [1.5 7.5 13.5 19.5 25.5]
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-percentile a 30 :axis 1))))
+      (assert (list-approx-equal result '(1.5 7.5 13.5 19.5 25.5)))))
+
+  ;; 二维轴向：axis=0，nearest
+  ;; np.percentile(a, 90, axis=0, interpolation='nearest') -> [22 23 24 25 26 27]? 原数组精确
+  ;; a 是 fixnum，shape (5,6)，每列 5 个值，90% 的索引 = 0.9*4=3.6，frac=0.6>0.5 => upper=4，取第4个（0-based）
+  ;; 列0：0,6,12,18,24 -> 索引4=24，正确
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-percentile a 90 :axis 0 :interpolation :nearest))))
+      (assert (list-approx-equal result '(24.0 25.0 26.0 27.0 28.0 29.0)))))
+
+  ;; 二维轴向：axis=1，nearest 验证与 NumPy 的一致性
+  ;; np.percentile(a, 90, axis=1, interpolation='nearest') -> [4 10 16 22 28]
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :nearest))))
+      (assert (list-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
+  ;;  np.percentile(a, 90,axis=1,interpolation="lower")
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :lower))))
+      (assert (list-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
+  
+  ;; np.percentile(a, 90,axis=1,interpolation="higher")
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :higher))))
+      (assert (list-approx-equal result '(5.0 11.0 17.0 23.0 29.0)))))
+
+  ;;np.percentile(a, 90,axis=1,interpolation="midpoint")
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :midpoint))))
+      (assert (list-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
+
+  ;; np.percentile(a, 90,axis=1,interpolation="linear")
+  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+    (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :linear))))
+      (assert (list-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
+  ;; 三维轴向：axis=2，线性
+  ;; a = np.arange(24).reshape(2,3,4)
+  ;; np.percentile(a, 25, axis=2) -> [[0.75 4.75 8.75] [12.75 16.75 20.75]]
+  (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+    (let ((result (vt-to-list (vt-percentile a 25 :axis 2))))
+      (assert (list-approx-equal (reduce #'append result)
+				 '(0.75 4.75 8.75 12.75 16.75 20.75)))))
+
+  ;; 全局百分位数，标量输入
+  ;; np.percentile(np.array(42), 50) -> 42.0
+  (let ((a (vt-const '() 42 :type 'double-float)))  ; 标量张量
+    (assert (= (vt-percentile a 50) 42.0d0)))
+
+  (format t "vt-percentile tests passed.~%")
+  )
+
 (defun test-cumsum-type ()
   (format t "~%=== Testing vt-cumsum with fixnum ===")
   (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
@@ -1485,6 +1631,8 @@
 (defun run-all-tests ()
   (test-vt-slice)
   (test-vt-meshgrid)
+  (test-vt-median)
+  (test-vt-percentile)
   (test-qr)
   (run-svd-tests)
   (test-gradient)

@@ -377,10 +377,11 @@
 					     (if (= d ax)
                                                  `(,i ,(1+ i)) '(:all))))
                      when (> rep 0)
-                       collect (if (= rep 1)
-                                   part
-                                   (apply #'vt-concatenate ax
-                                          (loop repeat rep collect part))))))
+                       collect
+		       (if (= rep 1)
+                           part
+                           (apply #'vt-concatenate ax
+                                  (loop repeat rep collect part))))))
         (if slices
             (apply #'vt-concatenate ax slices)
             (let ((zero-shape (copy-list sh)))
@@ -593,7 +594,8 @@
                           (out-stride (nth depth (vt-strides result)))
                           (prod (coerce 1 (vt-element-type tensor))))
                      (loop for i from 0 below dim
-                           do (setf prod (* prod (aref (vt-data tensor) in-ptr)))
+                           do (setf prod
+				    (* prod (aref (vt-data tensor) in-ptr)))
                               (setf (aref (vt-data result) out-ptr) prod)
                               (incf in-ptr in-stride)
                               (incf out-ptr out-stride)))
@@ -617,121 +619,134 @@
                  (setf (aref (vt-data result) i) prod))
         result)))
 
+(defun vt-unravel-index (offset shape strides)
+  "将一维物理偏移 offset 转换为多维逻辑索引（基于 shape 和 strides，行优先序）。"
+  (declare (type fixnum offset))
+  (loop with rem = offset
+        for dim in shape
+        for stride in strides
+        collect (multiple-value-bind (idx r)
+		    (floor rem stride)
+                  (setf rem r)
+                  idx)))
 
 (defun vt-median (tensor &key axis)
-  "中位数. axis 支持负数 (nil 表示全局)"
+  "中位数。axis 支持负数 (nil 表示全局)。"
   (if axis
       (let* ((shape (vt-shape tensor))
              (rank (length shape))
-             (ax (vt-normalize-axis axis rank))          
-             (axis-size (nth ax shape))                  
+             (ax (vt-normalize-axis axis rank))
              (out-shape (loop for d in shape for i from 0
                               unless (= i ax) collect d))
-             (result (vt-zeros out-shape :type (vt-element-type tensor))))
-        (labels
-	    ((recurse (depth in-ptr out-ptr)
-               (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth ax)                      
-                   (let ((data-list '())
-                         (in-stride (nth depth (vt-strides tensor))))
-                     (loop for i from 0 below axis-size
-                           do (push (aref (vt-data tensor) in-ptr)
-				    data-list)
-                              (incf in-ptr in-stride))
-                     (setf data-list (sort data-list #'<))
-                     (setf (aref (vt-data result) out-ptr)
-                           (if (oddp axis-size)
-                               (nth (floor axis-size 2) data-list)
-                               (/ (+ (nth (1- (/ axis-size 2)) data-list)
-                                     (nth (/ axis-size 2) data-list))
-                                  2))))
-                   (when (< depth rank)
-                     (let ((dim (nth depth shape))
-                           (in-stride (nth depth (vt-strides tensor)))
-                           (out-stride (nth depth (vt-strides result))))
-                       (loop for i from 0 below dim
-                             do (recurse
-				 (1+ depth)
-                                 (+ in-ptr (* i in-stride))
-                                 (+ out-ptr (* i out-stride)))))))))
-          (recurse 0 (vt-offset tensor) 0))
+             (result (vt-zeros out-shape :type 'double-float))
+             (out-strides (vt-strides result)))
+        (vt-do-each (ptr val result)
+          (declare (ignore val))
+          ;; 根据输出指针 ptr 生成输出逻辑索引
+          (let ((out-idx (vt-unravel-index ptr out-shape out-strides)))
+            ;; 构建切片规格：在归约轴用 :all，其他轴用单元素索引列表
+            (let* ((specs (loop for i from 0 below rank
+                                if (= i ax) collect '(:all)
+                                  else collect (list (pop out-idx))))
+                   (fiber (apply #'vt-slice tensor specs))
+                   (fiber-size (vt-size fiber)))
+              ;; 收集纤维元素，必须通过 vt-ref 读取以处理视图偏移/步长
+              (let ((vals (sort (loop for i below fiber-size
+                                      collect (vt-ref fiber i))
+                                #'<)))
+                (setf (aref (vt-data result) ptr)
+                      (if (oddp fiber-size)
+                          (coerce (nth (floor fiber-size 2) vals)
+				  'double-float)
+                          (/ (+ (coerce (nth (1- (floor fiber-size 2)) vals)
+					'double-float)
+                                (coerce (nth (floor fiber-size 2) vals)
+					'double-float))
+                             2.0d0)))))))
         result)
+      ;; 全局中位数
       (let* ((flat (vt-flatten tensor))
              (size (vt-size flat))
-             (data-list (loop for i from 0 below size
-			      collect (aref (vt-data flat) i)))
-             (sorted (sort data-list #'<)))
+             (vals (sort (loop for i below size
+                               collect (aref (vt-data flat) i))
+                         #'<)))
         (if (oddp size)
-            (nth (floor size 2) sorted)
-            (/ (+ (nth (1- (/ size 2)) sorted)
-		  (nth (/ size 2) sorted))
-	       2)))))
+            (coerce (nth (floor size 2) vals) 'double-float)
+            (/ (+ (coerce (nth (1- (floor size 2)) vals) 'double-float)
+                  (coerce (nth (floor size 2) vals) 'double-float))
+               2.0d0)))))
 
 
-(defun vt-percentile (tensor percentile &key axis interpolation)
-  "计算百分位数.
-  percentile: 百分位(0-100)
-  axis: 归约轴 支持负数
-  interpolation: 插值方法(:linear, :lower, :higher, :midpoint, :nearest)"
-  (declare (ignore interpolation))
+(defun percent-from-sorted (sorted q interpolation)
+  "从已排序列表 SORTED 中，按分数 Q (0..1) 和插值方法 INTERPOLATION 计算百分位值。
+   INTERPOLATION 可选 :LINEAR, :LOWER, :HIGHER, :MIDPOINT, :NEAREST。"
+  (let* ((N (length sorted))
+         (idx (* q (1- N)))
+         (lower (floor idx))
+         (upper (min (ceiling idx) (1- N)))
+         (frac (- idx lower)))
+    (case interpolation
+      (:linear
+       (if (= lower upper)
+           (coerce (nth lower sorted) 'double-float)
+           (+ (* (- 1 frac) (coerce (nth lower sorted) 'double-float))
+              (* frac (coerce (nth upper sorted) 'double-float)))))
+      (:lower
+       (coerce (nth lower sorted) 'double-float))
+      (:higher
+       (coerce (nth upper sorted) 'double-float))
+      (:midpoint
+       (/ (+ (coerce (nth lower sorted) 'double-float)
+             (coerce (nth upper sorted) 'double-float))
+          2.0d0))
+      (:nearest
+       (let ((nearest-idx (if (<= frac 0.5d0) lower upper)))
+	 (coerce (nth nearest-idx sorted) 'double-float)))
+      (otherwise
+       (error "Unknown interpolation method ~A" interpolation)))))
+
+(defun vt-percentile (tensor percentile &key axis (interpolation :linear))
+  "计算百分位数。
+   PERCENTILE : 0~100 的百分位数值。
+   AXIS       : 归约轴，支持负数 (NIL 表示全局)。
+   INTERPOLATION : :LINEAR, :LOWER, :HIGHER, :MIDPOINT,
+                   :NEAREST (默认 :LINEAR)。"
   (let ((q (/ percentile 100.0d0)))
     (if axis
         (let* ((shape (vt-shape tensor))
                (rank (length shape))
-               (ax (vt-normalize-axis axis rank))          
-               (axis-size (nth ax shape))
+               (ax (vt-normalize-axis axis rank))
                (out-shape (loop for d in shape for i from 0
                                 unless (= i ax) collect d))
-               (result (vt-zeros out-shape
-				 :type (vt-element-type tensor))))
-          (labels
-	      ((recurse (depth in-ptr out-ptr)
-                 (declare (type fixnum depth in-ptr out-ptr))
-                 (if (= depth ax)                      
-                     (let ((data-list '())
-                           (in-stride (nth depth (vt-strides tensor))))
-                       (loop for i from 0 below axis-size
-                             do (push (aref (vt-data tensor) in-ptr)
-				      data-list)
-                                (incf in-ptr in-stride))
-                       (setf data-list (sort data-list #'<))
-                       (let* ((idx (* q (1- axis-size)))
-                              (lower (floor idx))
-                              (upper (ceiling idx))
-                              (frac (- idx lower)))
-                         (setf (aref (vt-data result) out-ptr)
-                               (+ (* (- 1 frac)
-				     (nth lower data-list))
-                                  (* frac (nth (min upper (1- axis-size))
-					       data-list))))))
-                     (when (< depth rank)
-                       (let ((dim (nth depth shape))
-                             (in-stride (nth depth (vt-strides tensor)))
-                             (out-stride (nth depth (vt-strides result))))
-                         (loop for i from 0 below dim
-                               do (recurse
-				   (1+ depth)
-                                   (+ in-ptr (* i in-stride))
-                                   (+ out-ptr (* i out-stride)))))))))
-            (recurse 0 (vt-offset tensor) 0))
+               (result (vt-zeros out-shape :type 'double-float))
+               (out-strides (vt-strides result)))
+          (vt-do-each (ptr val result)
+            (declare (ignore val))
+            (let ((out-idx (vt-unravel-index ptr out-shape out-strides)))
+              (let* ((specs (loop for i from 0 below rank
+                                  if (= i ax) collect '(:all)
+                                    else collect (list (pop out-idx))))
+                     (fiber (apply #'vt-slice tensor specs))
+                     (fiber-size (vt-size fiber))
+                     (vals (sort (loop for i below fiber-size
+                                       collect (vt-ref fiber i))
+                                 #'<)))
+                (setf (aref (vt-data result) ptr)
+                      (percent-from-sorted vals q interpolation)))))
           result)
+        ;; 全局百分位
         (let* ((flat (vt-flatten tensor))
                (size (vt-size flat))
-               (data-list (loop for i from 0 below size
-				collect (aref (vt-data flat) i)))
-               (sorted (sort data-list #'<))
-               (idx (* q (1- size)))
-               (lower (floor idx))
-               (upper (ceiling idx))
-               (frac (- idx lower)))
-          (+ (* (- 1 frac) (nth lower sorted))
-             (* frac (nth (min upper (1- size))
-			  sorted)))))))
+               (vals (sort (loop for i below size
+                                 collect (aref (vt-data flat) i))
+                           #'<)))
+          (percent-from-sorted vals q interpolation)))))
 
-(defun vt-quantile (tensor q &key axis)
+(defun vt-quantile (tensor q &key axis (interpolation :linear))
   "计算分位数.
   q: 分位数(0-1)"
-  (vt-percentile tensor (* q 100) :axis axis))
+  (vt-percentile tensor (* q 100) :axis axis
+				  :interpolation interpolation))
 
 (defun vt-ptp (tensor &key axis)
   "峰-峰值(最大值 - 最小值)"
@@ -747,6 +762,7 @@
    range : (min, max) 范围。
    density : 若为 T，返回概率密度直方图（总面积=1）。
    返回：(hist, bin-edges) 两个一维张量。"
+  (declare (list range))
   (let* ((flat (vt-flatten tensor))
          (data (vt-data flat))
          (size (vt-size flat))
@@ -996,7 +1012,8 @@
                          (tail-dims (subseq shape (1+ ax)))
                          (tail-rank (length tail-dims))
                          (tail-strides (subseq out-strides (1+ ax)))
-                         (tail-size (reduce #'* tail-dims :initial-value 1)))
+                         (tail-size
+			   (reduce #'* tail-dims :initial-value 1)))
                     ;; 预计算尾部每个维度在原始步长中的偏移
                     (let ((tail-in-strides
                             (loop for idx from 0 below tail-rank
@@ -1708,7 +1725,8 @@
                        (unless const-val (setf const-val c-right))
                        (setf (nth d src-idxs) 
                              ;; CL中 (- a b -1) 等价于 a - b + 1
-                             (apply-pad-mode mode (- offset sk -1) sk :right))))
+                             (apply-pad-mode
+			      mode (- offset sk -1) sk :right))))
                   ;; 原始数据区
                   (t
                    (setf (nth d src-idxs) offset)))))
@@ -1797,7 +1815,10 @@
               do (setf (aref full i) (compute-one k)))
         (ecase mode
           (:full
-           (%make-vt :data full :shape (list full-len) :strides '(1) :offset 0))
+           (%make-vt :data full
+		     :shape (list full-len)
+		     :strides '(1)
+		     :offset 0))
           (:valid
            (let* ((len (max 0 (1+ (- n m))))     ; n - m + 1
                   (start offset))
@@ -1805,7 +1826,10 @@
                (loop for i from 0 below len
                      for idx from start
                      do (setf (aref data i) (aref full idx)))
-               (%make-vt :data data :shape (list len) :strides '(1) :offset 0))))
+               (%make-vt :data data
+			 :shape (list len)
+			 :strides '(1)
+			 :offset 0))))
           (:same
            (let* ((out-len (max n m))
                   (start (floor (- full-len out-len) 2)))
@@ -1813,7 +1837,10 @@
                (loop for i from 0 below out-len
                      for idx from start
                      do (setf (aref data i) (aref full idx)))
-               (%make-vt :data data :shape (list out-len) :strides '(1) :offset 0)))))))))
+               (%make-vt :data data
+			 :shape (list out-len)
+			 :strides '(1)
+			 :offset 0)))))))))
 
 (defun vt-convolve (a v &key (mode :full))
   "一维卷积。"

@@ -263,7 +263,7 @@
   (declare (list shape))
   (make-vt shape value :type type))
 
-(defun vt-eye (n &key (m n) (value 1.0d0) (type 'double-float))
+(defun vt-eye (n &key (m n) (value 1) (type 'double-float))
   "创建单位矩阵 或矩形矩阵.
    N: 行数.
    M: 列数 (默认为 N).
@@ -272,7 +272,7 @@
          (cols m)
          ;; 简单情况:2D 矩阵
          (shape (list rows cols))
-         (res (make-vt shape 0 :type type))
+         (res (vt-zeros shape :type type))
          (data (vt-data res))
          (strides (vt-strides res)))    
     (declare (type (simple-array * (*)) data)
@@ -341,7 +341,7 @@
                          ;; 置零
                          (setf (aref res-data 
 				     (+ row-ptr (* c stride-col)))
-			       0.0d0)))))               
+			        (coerce 0 (vt-element-type tensor)))))))               
                ;; === 高维递归 ===
                (let ((dim (nth depth res-shape))
                      (stride (nth depth res-strides)))
@@ -380,7 +380,7 @@
                          ;; 置零
                          (setf (aref res-data 
 				     (+ row-ptr (* c stride-col)))
-			       0.0d0)))))               
+			       (coerce 0 (vt-element-type tensor)))))))               
                ;; === 高维递归 ===
                (let ((dim (nth depth res-shape))
                      (stride (nth depth res-strides)))
@@ -401,15 +401,15 @@
            (cols (nth (- rank 1) in-shape))
            ;; 计算对角线长度
            (diag-len (max 0 (- (min rows cols) (abs offset))))
+	   (type (vt-element-type tensor))
            ;; 确定输出形状:Batch 维度 + 对角线长度
            (out-shape
 	     (append (subseq in-shape 0 (- rank 2))
 		     (list diag-len)))
-           (res (make-vt out-shape 0))
+           (res (vt-zeros out-shape :type type))
            (res-data (vt-data res))
            (in-data (vt-data tensor))
-           (in-strides (vt-strides tensor)))      
-      (declare (type (simple-array double-float (*)) in-data res-data))
+           (in-strides (vt-strides tensor)))
       (labels 
 	  ((recurse (depth in-ptr out-ptr)
              (declare (type fixnum depth in-ptr out-ptr))
