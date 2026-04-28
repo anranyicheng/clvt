@@ -1030,14 +1030,78 @@
 		   '((0.0 0.0) (1.0 2.0) (2.0 4.0)))))
   (format t "~%test-vt-outer passed.~%"))
 
-(defun test-cumsum-type ()
-  (format t "~%=== Testing vt-cumsum with fixnum ===")
-  (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
-         (cum (vt-cumsum a))                       ; 应返回 fixnum 数组
-         (expected (vt-from-sequence '(0 1 3 6 10) :type 'fixnum)))
-    (assert (vt-allclose cum expected))
-    (format t "~[FAIL~;PASS~] vt-cumsum fixnum test~%"
-            (if (vt-allclose cum expected) 1 0))))
+
+
+;; --------------------------------------------------------------------
+;; 累积和与累积积测试
+;; --------------------------------------------------------------------
+
+(defun test-vt-cumsum ()
+  ;; np.cumsum([0,1,2,3,4]) → [0,1,3,6,10]
+  (let* ((a (vt-arange 5 :type 'fixnum))
+         (res (vt-cumsum a)))
+    (assert (equal (vt-to-list res) '(0 1 3 6 10))))
+
+  ;; np.cumsum([1.0, 2.0, 3.0]) → [1,3,6]
+  (let* ((a (vt-from-sequence '(1.0 2.0 3.0) :type 'double-float))
+         (res (vt-cumsum a)))
+    (assert (equal (vt-to-list res) '(1.0 3.0 6.0))))
+
+  ;; a = np.arange(6).reshape(2,3)
+  ;; np.cumsum(a, axis=0) → [[0,1,2],[3,5,7]]
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (res (vt-cumsum a :axis 0)))
+    (assert (equal (vt-to-list res) '((0 1 2) (3 5 7)))))
+
+  ;; axis=1 → [[0,1,3],[3,7,12]]
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (res (vt-cumsum a :axis 1)))
+    (assert (equal (vt-to-list res) '((0 1 3) (3 7 12)))))
+
+  ;; 负轴 axis=-1 同 axis=1
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (res (vt-cumsum a :axis -1)))
+    (assert (equal (vt-to-list res) '((0 1 3) (3 7 12)))))
+
+  ;; a = np.arange(8).reshape(2,2,2)
+  ;; np.cumsum(a, axis=1) → [[[0,1],[2,4]],[[4,5],[10,12]]]
+  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+         (res (vt-cumsum a :axis 1)))
+    (assert (equal (vt-to-list res)
+                   '(((0 1) (2 4)) ((4 5) (10 12))))))
+
+  ;; np.cumsum([]) → []
+  (let* ((a (vt-zeros '(0)))
+         (res (vt-cumsum a)))
+    (assert (equal (vt-to-list res) '())))
+
+  ;; 空轴切片（形状某维为0）
+  (let* ((a (vt-zeros '(2 0 3)))
+         (res (vt-cumsum a :axis 1)))
+    (assert (equal (vt-shape res) '(2 0 3)))))
+
+
+(defun test-vt-cumprod ()
+  ;; np.cumprod([1,2,3,4]) → [1,2,6,24]
+  (let* ((a (vt-from-sequence '(1 2 3 4) :type 'fixnum))
+         (res (vt-cumprod a)))
+    (assert (equal (vt-to-list res) '(1 2 6 24))))
+  ;; a = np.array([[1,2],[3,4]])
+  ;; np.cumprod(a, axis=0) → [[1,2],[3,8]]
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+         (res (vt-cumprod a :axis 0)))
+    (assert (equal (vt-to-list res) '((1 2) (3 8)))))
+
+  ;; axis=1 → [[1,2],[3,12]]
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+         (res (vt-cumprod a :axis 1)))
+    (assert (equal (vt-to-list res) '((1 2) (3 12)))))
+  ;; 确保输出类型与输入一致 (fixnum)
+  (let* ((a (vt-ones '(3) :type 'fixnum))
+         (res (vt-cumprod a)))
+    (assert (eq (vt-element-type res) 'fixnum))))
+
+
 ;;----------------------测试 vt-qr vt-svd ---------------------
 
 (defun diag-matrix (S m n)
@@ -1079,7 +1143,7 @@
 
 
 ;; ========== QR 分解测试 ==========
-(defun test-qr ()
+(defun test-vt-qr ()
   "测试 QR 分解的重构误差和正交性。使用预定义矩阵 *A-qr* 。"
   (let ((A (vt-from-sequence '((12 -51   4)
                                ( 6 167 -68)
@@ -1127,7 +1191,7 @@
 ;;------------------------------------------------------<<
 
 
-(defun test-gradient ()
+(defun test-vt-gradient ()
   ;; 辅助：近似相等断言
   (macrolet ((assert-close (a b &optional (eps 1e-8))
                `(progn
@@ -1203,7 +1267,7 @@
     (format t "~%All gradient tests passed!~%")))
 
 
-(defun test-gradient-advanced ()
+(defun test-vt-gradient-advanced ()
   (macrolet ((assert-close (a b &optional (eps 1e-8))
                `(progn
                   (unless (<= (abs (- ,a ,b)) ,eps)
@@ -1314,7 +1378,7 @@
   (format t "~%All advanced gradient tests passed!~%")))
 
 
-(defun test-pad ()
+(defun test-vt-pad ()
   "测试 vt-pad 的各种填充模式"
   (format t "~%=== Testing vt-pad ===")
   
@@ -1703,7 +1767,7 @@
 	     '(1 2 3 4 5 6)))
     (print "passed test vt-sort")))
 
-(defun test-argsort-multi-axis ()
+(defun test-vt-argsort-multi-axis ()
   (format t "~%=== Testing vt-argsort with rank>2 ===")
   (let ((a (vt-from-sequence '(((3 2) (1 0))
                                ((9 8) (7 6)))
@@ -2058,6 +2122,93 @@
   
   (format t "vt-logspace tests passed.~%"))
 
+;; ----------------------------------------
+;; vt-linspace 测试
+;; ----------------------------------------
+(defun test-vt-linspace ()
+  (format t "~%=== Testing vt-linspace ===")
+
+  ;; -----------------------------------------------------------
+  ;; 1. 基本用法，默认 endpoint=t，double-float
+  ;; np.linspace(0, 10, 5)
+  ;; → array([ 0. ,  2.5,  5. ,  7.5, 10. ])
+  ;; -----------------------------------------------------------
+  (let ((vt (vt-linspace 0 10 5)))
+    (assert (list-approx-equal (vt-to-list vt)
+			       '(0.0 2.5 5.0 7.5 10.0)
+			       :epsilon 1e-6)))
+
+  ;; -----------------------------------------------------------
+  ;; 2. endpoint=nil，不包含终点
+  ;; np.linspace(0, 10, 5, endpoint=False)
+  ;; → array([0., 2., 4., 6., 8.])
+  ;; -----------------------------------------------------------
+  (let ((vt (vt-linspace 0 10 5 :endpoint nil)))
+    (assert (list-approx-equal (vt-to-list vt)
+			       '(0.0 2.0 4.0 6.0 8.0)
+			       :epsilon 1e-6)))
+
+  ;; -----------------------------------------------------------
+  ;; 3. num=1，此时应返回只包含 start 的数组
+  ;; np.linspace(5, 20, 1)
+  ;; → array([5.])
+  ;; -----------------------------------------------------------
+  (let ((vt (vt-linspace 5 20 1)))
+    (assert (= (vt-size vt) 1))
+    (assert (= (vt-ref vt 0) 5.0)))
+
+  ;; -----------------------------------------------------------
+  ;; 4. 整型 type，返回 fixnum 数组（需注意步长截断）
+  ;; np.linspace(0, 10, 5, dtype=np.int32)
+  ;; 但 NumPy 会进行取整，我们使用 fixnum 演示
+  ;; 注意：因整数除法截断，结果可能不一样，这里仅验证类型和形状
+  ;; -----------------------------------------------------------
+  (let ((vt (vt-linspace 0 10 5 :type 'fixnum)))
+    (assert (equal (vt-shape vt) '(5)))
+    (assert (eq (vt-element-type vt) 'fixnum))
+    ;; 值不做具体断言，因为整数除法会丢失精度
+    )
+
+  ;; -----------------------------------------------------------
+  ;; 5. num=0 应报错
+  ;; -----------------------------------------------------------
+  (handler-case
+      (progn
+        (vt-linspace 0 10 0)
+        (error "Should have signaled an error"))
+    (error (e)
+      (format t "~%[OK] Caught expected error for num=0: ~a" e)))
+
+  ;; -----------------------------------------------------------
+  ;; 6. 负步长（start > end）
+  ;; np.linspace(10, 0, 5)
+  ;; → array([10. ,  7.5,  5. ,  2.5,  0. ])
+  ;; -----------------------------------------------------------
+  (let ((vt (vt-linspace 10 0 5)))
+    (assert (list-approx-equal (vt-to-list vt)
+			       '(10.0 7.5 5.0 2.5 0.0) :epsilon 1e-6)))
+
+  ;; -----------------------------------------------------------
+  ;; 7. endpoint=t 且 num=2
+  ;; np.linspace(0, 1, 2)
+  ;; → array([0., 1.])
+  ;; -----------------------------------------------------------
+  (let ((vt (vt-linspace 0 1 2)))
+    (assert (list-approx-equal (vt-to-list vt)
+			       '(0.0 1.0) :epsilon 1e-6)))
+
+  ;; -----------------------------------------------------------
+  ;; 8. endpoint=nil 且 num=2
+  ;; np.linspace(0, 1, 2, endpoint=False)
+  ;; → array([0. , 0.5])
+  ;; -----------------------------------------------------------
+  (let ((vt (vt-linspace 0 1 2 :endpoint nil)))
+    (assert (list-approx-equal (vt-to-list vt)
+			       '(0.0 0.5) :epsilon 1e-6)))
+
+  (format t "~%All vt-linspace tests passed.~%"))
+
+
 (defun test-vt-kron ()
   (format t "~%--- Testing vt-kron ---~%")
   ;; 1. 两个向量（结果为一维）
@@ -2283,6 +2434,75 @@
              (vt-copy (apply #'vt-slice full (list (list start end)))))))))))
 
 
+(defun test-vt-histogram ()
+  (format t "~%=== Testing vt-histogram ===")
+
+  ;; ---- 1. 默认 bins=10，无 range，无 density ----
+  ;; np.random.seed(42); a = np.random.randn(1000)
+  ;; hist, edges = np.histogram(a)
+  ;; 我们使用简单数据测试：0..9 的 10 个整数，bins=5
+  ;; a = np.arange(10)
+  ;; np.histogram(a, bins=5) -> (array([2,2,2,2,2]), array([0., 1.8, 3.6, 5.4, 7.2, 9.]))
+  (let* ((a (vt-arange 10 :type 'fixnum))
+         (result (multiple-value-list (vt-histogram a :bins 5)))
+         (hist (first result))
+         (edges (second result)))
+    (assert (equal (vt-to-list hist) '(2.0 2.0 2.0 2.0 2.0)))
+    (assert (list-approx-equal (vt-to-list edges) '(0.0 1.8 3.6 5.4 7.2 9.0) :epsilon 1e-6)))
+
+  ;; ---- 2. 指定 range ----
+  ;; a = np.array([0,1,2,3,4,5,6,7,8,9])
+  ;; np.histogram(a, bins=3, range=(0,9)) -> (array([3,3,4]), array([0., 3., 6., 9.]))
+  (let* ((a (vt-arange 10 :type 'fixnum))
+         (mv (multiple-value-list (vt-histogram a :bins 3 :range '(0 9))))
+         (hist (first mv))
+         (edges (second mv)))
+    (assert (equal (vt-to-list hist) '(3.0 3.0 4.0)))
+    (assert (list-approx-equal (vt-to-list edges) '(0.0 3.0 6.0 9.0) :epsilon 1e-6)))
+
+  ;; ---- 3. density=True ----
+  ;; a = np.array([0,1,2,3,4])
+  ;; np.histogram(a, bins=5, density=True) -> histogram/bin_width，所有 bin 宽度 0.8，每个 bin 计数 1
+  ;; 密度 = 1 / (5 * 0.8) = 0.25? 实际 np.histogram(a, bins=5, density=True) 输出 hist 使得总面积=1，总面积 = sum(hist * bin_width) = 1
+  ;; 如果每个 bin 计数为 1，宽度 0.8，则每个 bin 高度 = 1/(5*0.8)=0.25
+  (let* ((a (vt-arange 5))
+         (mv (multiple-value-list (vt-histogram a :bins 5 :density t)))
+         (hist (first mv)))
+    (assert (list-approx-equal (vt-to-list hist) '(0.25 0.25 0.25 0.25 0.25) :epsilon 1e-6)))
+
+  ;; ---- 4. 值全相同 ----
+  ;; a = np.array([2,2,2,2])
+  ;; np.histogram(a, bins=3) -> 所有值落在同一个 bin？实际默认 range 会扩展至 (2-0.5, 2+0.5)? 需要指定 range 为准
+  ;; 我们指定 range=(0,10), bins=5
+  ;; np.histogram(np.array([2,2,2,2]), bins=5, range=(0,10)) -> (array([0,4,0,0,0]), array([0.,2.,4.,6.,8.,10.]))
+  (let* ((a (vt-const '(4) 2 :type 'fixnum))
+         (mv (multiple-value-list (vt-histogram a :bins 5 :range '(0 10))))
+         (hist (first mv))
+         (edges (second mv)))
+    (assert (equal (vt-to-list hist) '(0.0 4.0 0.0 0.0 0.0)))
+    (assert (list-approx-equal (vt-to-list edges) '(0.0 2.0 4.0 6.0 8.0 10.0) :epsilon 1e-6)))
+
+  ;; ---- 5. 一维空张量 ----
+  ;; a = np.array([])
+  ;; np.histogram(a, bins=5) -> (array([0,0,0,0,0]), array([0.,0.,0.,0.,0.,0.])) 但实际空数组 range 未定义会报错
+  ;; NumPy 对空数组调用 histogram 会出错，我们只需确保程序不崩溃并返回合理空结果（如全零）
+  (let* ((a (vt-zeros '(0)))
+         (mv (multiple-value-list (vt-histogram a :bins 5 :range '(0 5))))
+         (hist (first mv)))
+    (assert (every #'zerop (vt-to-list hist)))
+    (assert (= (vt-size hist) 5)))
+
+  ;; ---- 6. 二维张量（内部自动展平） ----
+  ;; a = np.arange(6).reshape(2,3)
+  ;; np.histogram(a, bins=3, range=(0,5)) -> 展平后直方图
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (mv (multiple-value-list (vt-histogram a :bins 3 :range '(0 5))))
+         (hist (first mv))
+         (edges (second mv)))
+    (assert (equal (vt-to-list hist) '(2.0 2.0 2.0))) ; 0,1,2,3,4,5  -> bin 宽度 1.666..., 计数分别为 2,2,2
+    (assert (list-approx-equal (vt-to-list edges) '(0.0 1.66666667 3.33333333 5.0) :epsilon 1e-6)))
+
+  (format t "~%All vt-histogram tests passed.~%"))
 ;; --------------------- 汇总 ---------------------
 
 (defun run-all-tests ()
@@ -2313,22 +2533,26 @@
   (test-vt-frobenius-norm)
   (test-vt-trace)
   (test-vt-outer)
-  (test-cumsum-type)
-  (test-qr)
+  (test-vt-cumsum)
+  (test-vt-cumprod)
+  (test-vt-qr)
   (run-svd-tests)
-  (test-gradient)
-  (test-gradient-advanced)
-  (test-pad)
+  (test-vt-gradient)
+  (test-vt-gradient-advanced)
+  (test-vt-pad)
   (test-all-pad)
   (test-pad-thorough)
   (test-vt-take)
   (test-vt-sort)
   (test-vt-argsort)
-  (test-argsort-multi-axis)
+  (test-vt-argsort-multi-axis)
   (test-vt-put)
   (test-nan-functions)
   (test-vt-logspace)
+  (test-vt-linspace)
   (test-vt-kron)
   (test-vt-diff)
   (test-vt-trapz)
-  (test-vt-correlate))
+  (test-vt-correlate)
+  (test-vt-histogram))
+

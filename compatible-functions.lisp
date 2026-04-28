@@ -32,34 +32,31 @@
 ;;; 1. 数组创建扩展
 ;;; ===========================================
 
-(defun vt-linspace
-    (start end num &key (endpoint t) (type 'double-float))
-  "创建线性间隔数组.
-  start: 起始值
-  end: 结束值
-  num: 元素个数
-  endpoint: 是否包含结束值(默认 T)
-  返回: 一维张量"
+(defun vt-linspace (start end num &key (endpoint t) (type 'double-float))
+  "创建线性间隔数组，与 NumPy linspace 完全兼容。
+   start     : 起始值
+   end       : 结束值
+   num       : 元素个数（>0 整数）
+   endpoint  : 是否包含终止值（默认 T）
+   type      : 元素类型（默认 double-float）
+   返回      : 一维张量"
   (declare (type number start end)
            (type fixnum num)
            (type boolean endpoint))
   (when (<= num 0)
-    (error "num 必须大于 0"))
-  (if (= num 1)
-      ;; 单点情况：直接返回 [start]
-      (let ((data (make-array 1 :element-type type
-                                :initial-element (coerce start type))))
-        (%make-vt :data data :shape '(1) :strides '(1) :offset 0))
-      (let* ((divisor (if endpoint (1- num) num))
-             (step (/ (- end start) divisor))
-             (data (make-array num :element-type type)))
-        (loop for i from 0 below num
-              do (setf (aref data i)
-                       (coerce (+ start (* i step)) type)))
-        (%make-vt :data data
-                  :shape (list num)
-                  :strides '(1)
-                  :offset 0))))
+    (error "num 必须大于 0，当前值为 ~D" num))
+  ;; 单元素特殊情况
+  (when (= num 1)
+    (return-from vt-linspace
+      (make-vt (list 1) (coerce start type) :type type)))
+  ;; 计算步长与元素个数
+  (let* ((div (if endpoint (1- num) num))
+         (step (/ (- end start) div))
+         (elements (loop for i fixnum from 0 below num
+                         collect (+ start (* i step)))))
+    (if (eq type 'fixnum)
+	(setf elements (mapcar #'truncate elements)))
+    (vt-from-sequence elements :type type)))
 
 (defun vt-full (shape fill-value &key (type 'double-float))
   "创建指定值填充的数组.
@@ -535,94 +532,6 @@
                             (values (* acc val) nil))
                           :return-arg nil)))
 
-(defun vt-cumsum (tensor &key axis)
-  "累积和.
-   axis 支持负数.
-   返回新张量"
-  (if axis
-      (let* ((shape (vt-shape tensor))
-             (rank (length shape))
-             (ax (vt-normalize-axis axis rank))          
-             (result (vt-copy tensor)))
-        (labels
-	    ((recurse (depth in-ptr out-ptr)
-               (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth ax)                      
-                   ;; 沿累积轴处理
-                   (let* ((dim (nth depth shape))
-                          (in-stride (nth depth (vt-strides tensor)))
-                          (out-stride (nth depth (vt-strides result)))
-                          (sum (coerce 0 (vt-element-type tensor))))
-                     (loop for i from 0 below dim
-                           do (incf sum (aref (vt-data tensor) in-ptr))
-                              (setf (aref (vt-data result) out-ptr) sum)
-                              (incf in-ptr in-stride)
-                              (incf out-ptr out-stride)))
-                   ;; 其他维度
-                   (when (< depth rank)
-                     (let ((dim (nth depth shape))
-                           (in-stride (nth depth (vt-strides tensor)))
-                           (out-stride (nth depth (vt-strides result))))
-                       (loop for i from 0 below dim
-                             do (recurse
-				 (1+ depth)
-                                 (+ in-ptr (* i in-stride))
-                                 (+ out-ptr (* i out-stride)))))))))
-          (recurse 0 (vt-offset tensor) 0))
-        result)
-      ;; 展平后累积
-      (let* ((flat (vt-flatten tensor))
-             (size (vt-size flat))
-             (result (vt-zeros (list size) :type (vt-element-type tensor)))
-             (sum (coerce 0 (vt-element-type tensor))))
-        (loop for i from 0 below size
-              do (incf sum (aref (vt-data flat) i))
-                 (setf (aref (vt-data result) i) sum))
-        result)))
-
-(defun vt-cumprod (tensor &key axis)
-  "累积积.
-   axis 支持负数.
-    返回新张量"
-  (if axis
-      (let* ((shape (vt-shape tensor))
-             (rank (length shape))
-             (ax (vt-normalize-axis axis rank))   
-             (result (vt-copy tensor)))
-        (labels
-	    ((recurse (depth in-ptr out-ptr)
-               (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth ax)               
-                   (let* ((dim (nth depth shape))
-                          (in-stride (nth depth (vt-strides tensor)))
-                          (out-stride (nth depth (vt-strides result)))
-                          (prod (coerce 1 (vt-element-type tensor))))
-                     (loop for i from 0 below dim
-                           do (setf prod
-				    (* prod (aref (vt-data tensor) in-ptr)))
-                              (setf (aref (vt-data result) out-ptr) prod)
-                              (incf in-ptr in-stride)
-                              (incf out-ptr out-stride)))
-                   (when (< depth rank)
-                     (let ((dim (nth depth shape))
-                           (in-stride (nth depth (vt-strides tensor)))
-                           (out-stride (nth depth (vt-strides result))))
-                       (loop for i from 0 below dim
-                             do (recurse
-				 (1+ depth)
-                                 (+ in-ptr (* i in-stride))
-                                 (+ out-ptr (* i out-stride)))))))))
-          (recurse 0 (vt-offset tensor) 0))
-        result)
-      (let* ((flat (vt-flatten tensor))
-             (size (vt-size flat))
-             (result (vt-zeros (list size) :type (vt-element-type tensor)))
-             (prod (coerce 1 (vt-element-type tensor))))
-        (loop for i from 0 below size
-              do (setf prod (* prod (aref (vt-data flat) i)))
-                 (setf (aref (vt-data result) i) prod))
-        result)))
-
 (defun vt-unravel-index (offset shape strides)
   "将一维物理偏移 offset 转换为多维逻辑索引（基于 shape 和 strides，行优先序）。"
   (declare (type fixnum offset))
@@ -633,6 +542,82 @@
 		    (floor rem stride)
                   (setf rem r)
                   idx)))
+
+(defun vt-cumsum (tensor &key axis)
+  "累积和。axis 支持负数，返回与输入同类型的新张量。"
+  (if axis
+      (let* ((shape (vt-shape tensor))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))
+             (axis-size (nth ax shape))
+             ;; 创建输出张量，初始化为零
+             (result (vt-zeros shape :type (vt-element-type tensor)))
+             (out-strides (vt-strides result)))
+        (vt-do-each (ptr val result)
+          (declare (ignore val))
+          (let ((full-idx (vt-unravel-index ptr shape out-strides)))
+            ;; 仅处理每条纤维的起点，避免重复计算
+            (when (= (nth ax full-idx) 0)
+              (let* ((specs (loop for i from 0 below rank
+                                  if (= i ax) collect '(:all)
+                                  else collect (list (nth i full-idx))))
+                     (fiber (apply #'vt-slice tensor specs))
+                     (cum (coerce 0 (vt-element-type tensor))))
+                (loop for i from 0 below axis-size
+                      for val = (vt-ref fiber i)
+                      do (setf cum (+ cum val))
+                         ;; 写入输出对应位置
+                         (let ((pos-idx (copy-list full-idx)))
+                           (setf (nth ax pos-idx) i)
+                           (setf (apply #'vt-ref result pos-idx) cum)))))))
+        result)
+      ;; axis = nil：展平后续累积和
+      (let* ((flat (vt-flatten tensor))
+             (size (vt-size flat))
+             (result (vt-zeros (list size) :type (vt-element-type tensor)))
+             (in-data (vt-data flat))
+             (out-data (vt-data result))
+             (cum (coerce 0 (vt-element-type tensor))))
+        (loop for i fixnum from 0 below size
+              do (setf cum (+ cum (aref in-data i)))
+                 (setf (aref out-data i) cum))
+        result)))
+
+(defun vt-cumprod (tensor &key axis)
+  "累积积。axis 支持负数，返回与输入同类型的新张量。"
+  (if axis
+      (let* ((shape (vt-shape tensor))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))
+             (axis-size (nth ax shape))
+             (result (vt-zeros shape :type (vt-element-type tensor))) ; 实际会被重写
+             (out-strides (vt-strides result)))
+        (vt-do-each (ptr val result)
+          (declare (ignore val))
+          (let ((full-idx (vt-unravel-index ptr shape out-strides)))
+            (when (= (nth ax full-idx) 0)
+              (let* ((specs (loop for i from 0 below rank
+                                  if (= i ax) collect '(:all)
+                                  else collect (list (nth i full-idx))))
+                     (fiber (apply #'vt-slice tensor specs))
+                     (cum (coerce 1 (vt-element-type tensor)))) ; 初始值为 1
+                (loop for i from 0 below axis-size
+                      for val = (vt-ref fiber i)
+                      do (setf cum (* cum val))
+                         (let ((pos-idx (copy-list full-idx)))
+                           (setf (nth ax pos-idx) i)
+                           (setf (apply #'vt-ref result pos-idx) cum)))))))
+        result)
+      (let* ((flat (vt-flatten tensor))
+             (size (vt-size flat))
+             (result (vt-zeros (list size) :type (vt-element-type tensor)))
+             (in-data (vt-data flat))
+             (out-data (vt-data result))
+             (cum (coerce 1 (vt-element-type tensor))))
+        (loop for i fixnum from 0 below size
+              do (setf cum (* cum (aref in-data i)))
+                 (setf (aref out-data i) cum))
+        result)))
 
 (defun vt-median (tensor &key axis)
   "中位数。axis 支持负数 (nil 表示全局)。"
@@ -774,13 +759,13 @@
          (data-min (if range (car range) (vt-amin tensor)))
          (data-max (if range (cadr range) (vt-amax tensor)))
          (bin-width (/ (- data-max data-min) bins))
-         (hist (make-array bins :element-type 'double-float
-                                :initial-element 0.0d0))
-         (bin-edges (make-array (1+ bins) :element-type 'double-float)))
+         (hist (make-array bins :initial-element 0))
+         (bin-edges (make-array (1+ bins) :element-type t)))
 
     ;; 生成 bin edges
     (loop for i from 0 to bins
-          do (setf (aref bin-edges i) (+ data-min (* i bin-width))))
+          do (setf (aref bin-edges i)
+		   (+ data-min (* i bin-width))))
 
     ;; 统计计数（左闭右开，但最后一个 bin 包含右边界）
     (loop for i from 0 below size
@@ -800,7 +785,8 @@
                   do (setf (aref hist i) 0.0d0))
             (loop for i from 0 below bins
                   do (setf (aref hist i)
-                           (/ (aref hist i) (* total bin-width)))))))
+                           (/ (aref hist i)
+			      (* total bin-width)))))))
 
     ;; 返回两个 VT
     (values (vt-from-sequence (coerce hist 'list)
