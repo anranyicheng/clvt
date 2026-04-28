@@ -868,20 +868,21 @@
   (= (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol)) 1.0d0))
 
 (defun vt-isfinite (vt)
-  "检查是否为有限值"
-  (vt-map (lambda (x) 
+  "检查是否为有限值。"
+  (vt-map (lambda (x)
             (declare (type double-float x))
-            (if (and (< x most-positive-double-float)
-                     (> x most-negative-double-float))
+            (if (and (not (= x sb-kernel::double-float-positive-infinity))
+                     (not (= x sb-kernel::double-float-negative-infinity))
+                     (= x x))    ; NaN 与自身不相等
                 1.0d0 0.0d0))
           vt))
 
 (defun vt-isinf (vt)
-  "检查是否为无穷"
+  "检查是否为无穷。"
   (vt-map (lambda (x)
             (declare (type double-float x))
-            (if (or (= x most-positive-double-float)
-                    (= x most-negative-double-float))
+            (if (or (= x sb-kernel::double-float-positive-infinity)
+                    (= x sb-kernel::double-float-negative-infinity))
                 1.0d0 0.0d0))
           vt))
 
@@ -892,8 +893,6 @@
             (if (/= x x)  ; NaN 不等于自身
                 1.0d0 0.0d0))
           vt))
-
-
 
 ;;; ===========================================
 ;;; 6. 排序与搜索
@@ -1068,7 +1067,8 @@
              (type (simple-array fixnum (*)) sorted-idx)
              (type fixnum n))
     ;; 稳定排序索引，键为对应的元素值
-    (stable-sort sorted-idx #'< :key (lambda (i) (aref src-data i)))
+    (setf sorted-idx
+	  (stable-sort sorted-idx #'< :key (lambda (i) (aref src-data i))))
     ;; 动态数组收集结果
     (let ((unique-vals (make-array 0 :element-type elem-type
                                      :adjustable t :fill-pointer t))
@@ -1202,7 +1202,8 @@
 	(declare (ignore ptr))
 	(when (member val u2-set)
 	  (push val result)))
-      (vt-from-sequence (sort result #'<)))))
+      (vt-from-sequence (sort result #'<)
+			:type (vt-element-type t1)))))
 
 (defun vt-union1d (t1 t2)
   "并集"
@@ -1220,7 +1221,8 @@
 	(declare (ignore ptr))
 	(unless (member val u2-set)
 	  (push val result)))
-      (vt-from-sequence (sort result #'<)))))
+      (vt-from-sequence (sort result #'<)
+			:type (vt-element-type t1)))))
 
 (defun vt-setxor1d (t1 t2)
   "对称差集"
@@ -1237,7 +1239,8 @@
 	(declare (ignore ptr))
 	(unless (member val u1-set)
 	  (push val result)))
-      (vt-from-sequence (sort result #'<)))))
+      (vt-from-sequence (sort result #'<)
+			:type (vt-element-type t1)))))
 
 (defun vt-in1d (t1 t2)
   "检查数组元素是否在另一个数组中"

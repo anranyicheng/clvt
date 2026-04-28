@@ -21,19 +21,18 @@
   (vt-mean (vt-square (vt-- y-true y-pred))))
 
 (defun vt-binary-cross-entropy (y-true y-pred &key (eps 1e-7))
-"二元交叉熵: -[y*log(p) + (1-y)*log(1-p)]
- 内部使用 clip 防止 log(0) 产生 NaN"
+  "二元交叉熵: -[y*log(p) + (1-y)*log(1-p)]"
   (let* ((p-clipped (vt-clip y-pred eps (- 1.0d0 eps)))
+         (one-minus-p (vt-clip (vt-- 1.0d0 p-clipped) eps 1.0d0))
          (term1 (vt-* y-true (vt-log p-clipped)))
          (term2 (vt-* (vt-- 1.0d0 y-true)
-		      (vt-log (vt-- 1.0d0 p-clipped))))
-         (loss (vt-- (vt-- term1 term2))))
+		      (vt-log one-minus-p)))
+         (loss (vt-- (vt-+ term1 term2))))
     (vt-mean loss)))
 
 (defun vt-cross-entropy (y-true y-pred &key (eps 1e-7))
-  "多分类交叉熵: -sum(y_true * log(y_pred))
-   通常配合 vt-softmax 输出的 y_pred 和 one-hot 的 y_true 使用"
+  "多分类交叉熵: -sum(y_true * log(y_pred))"
   (let* ((p-clipped (vt-clip y-pred eps (- 1.0d0 eps)))
-         (loss-per-sample (vt-sum (vt-* y-true (vt-log p-clipped))
-				  :axis -1)))
+         (log-prob (vt-log p-clipped))
+         (loss-per-sample (vt-- (vt-sum (vt-* y-true log-prob) :axis -1))))
     (vt-mean loss-per-sample)))
