@@ -158,23 +158,33 @@
     (declare (ignorable _))
     ;; 步长映射构建
     (loop for sub list in input-subs
-          for tns in vts
-          for t-idx fixnum from 0 do
-      (let ((phys-strides (vt-strides tns))
-            (phys-shape (vt-shape tns)))
-        (setf (aref in-data-vec t-idx) (vt-data tns)
-              (aref in-offsets-vec t-idx) (vt-offset tns))
-        (loop for lbl across all-labels-vec
-              for logical-idx fixnum from 0 do
-          (let ((phys-pos (position lbl sub)))
-            (if phys-pos
-                (let ((p-dim (nth phys-pos phys-shape))
-                      (p-stride (nth phys-pos phys-strides))
-                      (l-dim (aref dims-vec logical-idx)))
-		  (declare (fixnum p-dim l-dim p-stride))
-                  (setf (aref strides-mat t-idx logical-idx)
-                        (if (and (= p-dim 1) (> l-dim 1)) 0 p-stride)))
-                (setf (aref strides-mat t-idx logical-idx) 0))))))
+	  for tns in vts
+	  for t-idx fixnum from 0
+	  do (let ((phys-strides (vt-strides tns))
+		   (phys-shape (vt-shape tns)))
+               (declare (list phys-strides phys-shape))
+               (setf (aref in-data-vec t-idx) (vt-data tns)
+                     (aref in-offsets-vec t-idx) (vt-offset tns))
+               (loop
+		 for lbl character across all-labels-vec
+                 for logical-idx fixnum from 0
+                 do (let ((p-stride-sum 0))
+                      (declare (fixnum p-stride-sum))
+                      (loop
+			for pos fixnum from 0
+                        for sub-lbl character in sub
+                        when (eql sub-lbl lbl)
+                          do (let ((p-dim (nth pos phys-shape))
+                                   (p-stride (nth pos phys-strides)))
+                               (declare (fixnum p-dim p-stride))
+                               (incf p-stride-sum
+                                     (if (and (= p-dim 1)
+                                              (> (aref dims-vec logical-idx) 1))
+                                         0
+                                         p-stride))))
+                      (setf (aref strides-mat t-idx logical-idx)
+			    p-stride-sum)))))    
+
     ;; 输出张量构建
     (let* ((out-shape (loop for lbl character across all-labels-vec 
                             when (member lbl output-subs) 
@@ -256,10 +266,7 @@
                                    (* val-a (aref data-b ptr-b-start)))
                              (incf ptr-b-start sB-k)
                              (incf ptr-c-start sO-k)))))))
-                 (return-from einsum-execute
-		   (if (null (vt-shape output))
-		       (vt-ref output)
-		       output))))))
+                 (return-from einsum-execute output)))))
           (t  ;; 通用路径
            (let ((cur-ptrs (make-array n-vts :element-type 'fixnum
 					     :initial-element 0)))
@@ -298,9 +305,7 @@
                           (decf out-ptr (the fixnum (* dim out-stride)))))))
                
                (recurse 0 0)))))
-        (if (null (vt-shape output))
-	    (vt-ref output)
-	    output)))))
+        output))))
 
 (declaim (inline vt-einsum))
 (defun vt-einsum (subscripts &rest vts)

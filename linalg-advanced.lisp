@@ -6,6 +6,7 @@
    mode   :REDUCED 返回 Q(m×k), R(k×n)，k = min(m,n)。
           :FULL    返回 Q(m×m), R(m×n)。
    返回 (values Q R)。"
+  (assert (= 2 (vt-order matrix))) 
   (let* ((m (first (vt-shape matrix)))
          (n (second (vt-shape matrix)))
          (k (min m n))
@@ -57,12 +58,12 @@
   "给定向量 x，返回三个值：v, beta, sigma。
    其中 sigma = -sign(x[0]) * ||x||，
    使得 (I - beta * v * v^T) * x = sigma * e1 。"
-  (let* ((norm (sqrt (vt-dot x x)))
+  (let* ((norm (sqrt (vt-ref (vt-dot x x))))
          (sx0 (aref (vt-data x) 0))
          (sigma (if (>= sx0 0.0d0) (- norm) norm)))
     (let ((v (vt-copy x)))
       (incf (aref (vt-data v) 0) sigma)
-      (let ((beta (/ 2.0d0 (vt-dot v v))))
+      (let ((beta (/ 2.0d0 (vt-ref (vt-dot v v)))))
         (values v beta sigma)))))
 
 (defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50)
@@ -72,6 +73,7 @@
                   : NIL 返回经济尺寸 U(m×k), S(k), Vt(k×n)
    max-sweeps    : Jacobi 最大扫描次数
    tol           : 收敛容差"
+  (assert (= 2 (vt-order matrix))) 
   (let* ((mat (vt-astype matrix 'double-float))
          (m (first (vt-shape mat)))
          (n (second (vt-shape mat)))
@@ -87,11 +89,11 @@
                       (vt-const '(1 1) -1.0d0 :type 'double-float))))))
 
     (flet ((col-norm-sq (M col)
-             (vt-dot (vt-slice M '(:all) (list col))
-		     (vt-slice M '(:all) (list col))))
+             (vt-ref (vt-dot (vt-slice M '(:all) (list col))
+		     (vt-slice M '(:all) (list col)))))
            (col-dot (M c1 c2)
-             (vt-dot (vt-slice M '(:all) (list c1))
-		     (vt-slice M '(:all) (list c2)))))
+             (vt-ref (vt-dot (vt-slice M '(:all) (list c1))
+		     (vt-slice M '(:all) (list c2))))))
 
       (let* ((U (vt-copy mat))   ; m×n
              (V (vt-eye n :type 'double-float))
@@ -194,9 +196,9 @@
                 do (loop repeat 2            ;; 重复两次以增强数值稳定性
                          do (dotimes (j col)
                               (let* ((uj (vt-slice U-full '(:all) (list j)))
-                                     (proj (vt-dot uj v)))
+                                     (proj (vt-ref (vt-dot uj v))))
                                 (setf v (vt-- v (vt-scale uj proj))))))
-                   (let ((norm (sqrt (vt-dot v v))))
+                   (let ((norm (sqrt (vt-ref (vt-dot v v)))))
                      (if (> norm 1e-12)
                          (setf (vt-slice U-full '(:all) (list col))
                                (vt-scale v (/ 1.0 norm)))

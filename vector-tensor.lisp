@@ -1223,7 +1223,7 @@
 	       res-offset 
                (if res-idx (vt-offset res-idx) 0) 
                0))
-    (if (null (vt-shape res))
+    (if (and is-global-reduction (not keepdims))
         (let ((final-val (aref res-data res-offset)))
           (if return-arg
 	      (values final-val (aref res-idx-data (vt-offset res-idx)))

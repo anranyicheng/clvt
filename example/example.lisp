@@ -582,6 +582,270 @@
   (format t "~%test-vt-argwhere passed.~%"))
 
 
+
+;; ============================================================
+;; test-vt-matmul
+;; ============================================================
+(defun test-vt-matmul ()
+  ;; 2D 矩阵乘法 double-float
+  ;; a = np.array([[1,2],[3,4]], dtype=np.float64)
+  ;; b = np.array([[5,6],[7,8]], dtype=np.float64)
+  ;; np.matmul(a,b) -> [[19,22],[43,50]]
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+         (b (vt-from-sequence '((5 6) (7 8)) :type 'double-float))
+         (c (vt-matmul a b)))
+    (assert (equal (vt-to-list c) '((19.0 22.0) (43.0 50.0)))))
+
+  ;; 2D 矩阵乘法 fixnum 输入，结果应为 double-float
+  ;; a = np.arange(6).reshape(2,3)
+  ;; b = np.arange(6).reshape(3,2)
+  ;; np.matmul(a,b) -> [[10,13],[28,40]]
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
+         (c (vt-matmul a b)))
+    (assert (equal (vt-to-list c) '((10.0 13.0) (28.0 40.0)))))
+
+  ;; 批量矩阵乘法 (使用 einsum 路径)
+  ;; a = np.arange(8).reshape(2,2,2)
+  ;; b = np.arange(8).reshape(2,2,2)
+  ;; np.matmul(a,b) -> 形状 (2,2,2)，手动计算
+  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+         (b (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+         (c (vt-matmul a b)))
+    ;; 预期：第一个批次 a[0]=[[0,1],[2,3]] b[0]=[[0,1],[2,3]] -> [[2,3],[6,11]]
+    ;; 第二个批次 a[1]=[[4,5],[6,7]] b[1]=[[4,5],[6,7]] -> [[46,55],[66,79]]
+    (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
+		   '((2.0 3.0) (6.0 11.0))))
+    (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
+		   '((46.0 55.0) (66.0 79.0)))))
+  (format t "~%test-vt-matmul passed.~%"))
+
+;; ============================================================
+;; test-vt-einsum
+;; ============================================================
+(defun test-vt-einsum ()
+  ;; 向量内积
+  ;; a = np.array([1,2,3]), b = np.array([4,5,6])
+  ;; np.einsum('i,i->', a, b) -> 32
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (b (vt-from-sequence '(4 5 6) :type 'fixnum))
+         (res (vt-einsum "i,i->" a b)))
+    (assert (= (vt-ref res) 32.0d0)))
+
+  ;; 矩阵乘法
+  ;; a = np.arange(6).reshape(2,3), b = np.arange(6).reshape(3,2)
+  ;; np.einsum('ij,jk->ik', a, b) -> [[10,13],[28,40]]
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
+         (c (vt-einsum "ij,jk->ik" a b)))
+    (assert (equal (vt-to-list c) '((10.0 13.0) (28.0 40.0)))))
+
+  ;; 批量矩阵乘法
+  ;; a = np.arange(12).reshape(2,2,3), b = np.arange(18).reshape(2,3,3)
+  ;; np.einsum('bij,bjk->bik', a, b)
+  ;; 第一个批次：a[0]=[[0,1,2],[3,4,5]], b[0]=[[0,1,2],[3,4,5],[6,7,8]] -> [[15,18,21],[42,54,66]]
+  ;; 第二个批次：a[1]=[[6,7,8],[9,10,11]], b[1]=[[9,10,11],[12,13,14],[15,16,17]] -> [[258, 279, 300], [366, 396, 426]]
+  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(2 2 3)))
+         (b (vt-reshape (vt-arange 18 :type 'fixnum) '(2 3 3)))
+         (c (vt-einsum "bij,bjk->bik" a b)))
+    (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
+		   '((15.0 18.0 21.0) (42.0 54.0 66.0))))
+    (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
+		   '((258.0 279.0 300.0) (366.0 396.0 426.0)))))
+
+  ;; 对角线提取
+  ;; a = np.arange(9).reshape(3,3)
+  ;; np.einsum('ii->i', a) -> [0,4,8]
+  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+         (diag (vt-einsum "ii->i" a)))
+    (assert (equal (vt-to-list diag) '(0.0 4.0 8.0))))
+
+  ;; 外积
+  ;; a = np.array([1,2,3]), b = np.array([4,5])
+  ;; np.einsum('i,j->ij', a, b) -> [[4,5],[8,10],[12,15]]
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (b (vt-from-sequence '(4 5) :type 'fixnum))
+         (outer (vt-einsum "i,j->ij" a b)))
+    (assert (equal (vt-to-list outer)
+		   '((4.0 5.0) (8.0 10.0) (12.0 15.0)))))
+  (format t "~%test-vt-einsum passed.~%"))
+
+;; ============================================================
+;; test-vt-dot
+;; ============================================================
+(defun test-vt-dot ()
+  ;; 向量内积
+  ;; a = np.array([1,2,3]), b = np.array([4,5,6])
+  ;; np.dot(a,b) -> 32
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (b (vt-from-sequence '(4 5 6) :type 'fixnum))
+         (res (vt-dot a b)))
+    (assert (= (vt-ref res) 32.0d0)))
+
+  ;; 矩阵乘法 (2D)
+  ;; a = np.arange(6).reshape(2,3), b = np.arange(6).reshape(3,2)
+  ;; np.dot(a,b) -> [[10,13],[28,40]]
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
+         (c (vt-dot a b)))
+    (assert (equal (vt-to-list c) '((10.0 13.0) (28.0 40.0)))))
+
+  ;; 批量矩阵乘法 (秩 >= 2)
+  ;;  a = np.arange(8).reshape(2,2,2)
+  ;;  np.einsum('...ij,...jk->...ik', a,a) # 不是 np.dot(a,a)
+  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+         (b (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+         (c (vt-dot a b)))  ;;   (vt-einsum "...ij,...jk->...ik" a b)
+    (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
+		   '((2.0 3.0) (6.0 11.0))))
+    (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
+		   '((46.0 55.0) (66.0 79.0)))))
+  (format t "~%test-vt-dot passed.~%"))
+
+;; ============================================================
+;; test-vt-solve
+;; ============================================================
+(defun test-vt-solve ()
+  ;; 解 Ax = b，单右端
+  ;; A = [[2,1],[1,3]], b = [7,8]
+  ;; np.linalg.solve(A,b) -> [2.6, 1.8]? 实际：(2,1)^T? 让我们算：2x+y=7, x+3y=8 => 消元：y=7-2x, x+21-6x=8 => -5x=-13 => x=2.6, y=1.8
+  ;; 所以解为 [2.6, 1.8]
+  (let* ((A (vt-from-sequence '((2 1) (1 3)) :type 'double-float))
+         (b (vt-from-sequence '(7 8) :type 'double-float))
+         (x (vt-solve A b)))
+    (assert (list-approx-equal (vt-to-list x) '(2.6 1.8) :epsilon 1e-6)))
+
+  ;; 多右端项
+  ;; A = [[3,1],[1,2]]
+  ;; B = [[9,8],[8,7]]
+  ;; np.linalg.solve(A,B) -> [[2., 1.8.], [3., 2.6]]
+  (let* ((A (vt-from-sequence '((3 1) (1 2)) :type 'double-float))
+         (B (vt-from-sequence '((9 8) (8 7)) :type 'double-float))
+         (X (vt-solve A B)))
+    (assert (list-approx-equal (vt-to-list (vt-slice X '(:all) '(0)))
+			       '(2.0 3.0) :epsilon 1e-6))
+    (assert (list-approx-equal (vt-to-list (vt-slice X '(:all) '(1)))
+			       '(1.8 2.6) :epsilon 1e-6)))
+  (format t "~%test-vt-solve passed.~%"))
+
+;; ============================================================
+;; test-vt-inv
+;; ============================================================
+(defun test-vt-inv ()
+  ;; A = [[4,7],[2,6]]
+  ;; np.linalg.inv(A) -> [[ 0.6, -0.7], [-0.2,  0.4]]
+  (let* ((A (vt-from-sequence '((4 7) (2 6)) :type 'double-float))
+         (invA (vt-inv A)))
+    (assert (list-approx-equal (vt-to-list (vt-slice invA '(:all) '(0)))
+			       '(0.6 -0.2) :epsilon 1e-6))
+    (assert (list-approx-equal (vt-to-list (vt-slice invA '(:all) '(1)))
+			       '(-0.7 0.4) :epsilon 1e-6)))
+  (format t "~%test-vt-inv passed.~%"))
+
+;; ============================================================
+;; test-vt-det
+;; ============================================================
+(defun test-vt-det ()
+  ;; A = [[1,2],[3,4]] -> det = -2.0
+  (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+    (assert (= (vt-det A) -2.0d0)))
+  ;; 三维矩阵
+  ;; A = [[6,1,1],[4,-2,5],[2,8,7]] -> det = -306.0? 计算一下：6*(-14-40) -1*(28-10) +1*(32+4) = 6*(-54) -18 +36 = -324 -18+36 = -306.0
+  (let ((A (vt-from-sequence '((6 1 1) (4 -2 5) (2 8 7)) :type 'double-float)))
+    (assert (list-approx-equal (list (vt-det A))
+			       '(-306.0) :epsilon 1e-6)))
+  (format t "~%test-vt-det passed.~%"))
+
+;; ============================================================
+;; test-vt-norm
+;; ============================================================
+(defun test-vt-norm ()
+  ;; 向量 L2 范数
+  ;; np.linalg.norm(np.array([3,4])) -> 5.0
+  (let ((v (vt-from-sequence '(3 4) :type 'double-float)))
+    (assert (= (vt-ref (vt-norm v)) 5.0d0)))
+  ;; 矩阵 L2 范数 (全局) 默认是 Frobenius? 根据代码 vt-norm 是 L2 范数 (vt-sqrt(vt-sum(sq)))，对于矩阵是 Frobenius。
+  ;; np.linalg.norm(np.array([[1,2],[3,4]])) -> 5.477225575051661
+  (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+    (assert (list-approx-equal (list (vt-ref (vt-norm A)))
+			       (list (sqrt 30.0d0)) :epsilon 1e-6)))
+  ;; 沿轴计算 L2 范数
+  ;; np.linalg.norm(np.array([[1,2],[3,4]]), axis=1) -> [2.23606798, 5.0]
+  (let* ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+         (norms (vt-to-list (vt-norm A :axis 1))))
+    (assert (list-approx-equal norms (list (sqrt 5.0) (sqrt 25.0)) :epsilon 1e-6)))
+  (format t "~%test-vt-norm passed.~%"))
+
+;; ============================================================
+;; test-vt-frobenius-norm
+;; ============================================================
+(defun test-vt-frobenius-norm ()
+  ;; 矩阵 Frobenius 范数
+  ;; np.linalg.norm(np.array([[1,2],[3,4]]), 'fro') -> 5.477225575051661
+  (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+    (assert (list-approx-equal (list (vt-ref (vt-frobenius-norm A)))
+			       (list (sqrt 30.0d0)) :epsilon 1e-6)))
+  (format t "~%test-vt-frobenius-norm passed.~%"))
+
+;; ============================================================
+;; test-vt-trace
+;; ============================================================
+(defun test-vt-trace ()
+  ;; A = [[1,2],[3,4]] -> trace = 5.0
+  (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+    (assert (= (vt-trace A) 5.0d0)))
+  ;; 非方阵应报错或只取 min 对角线? 根据代码，vt-trace 调用 vt-diagonal 然后 sum，vt-diagonal 需要 rank>=2，会自动取 min 对角线。我们测试一个矩形矩阵。
+  ;; np.trace(np.arange(6).reshape(2,3)) -> 0+4 = 4.0
+  (let ((A (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3))))
+    (assert (= (vt-trace A) 4.0d0)))
+  (format t "~%test-vt-trace passed.~%"))
+
+;; ============================================================
+;; test-vt-outer
+;; ============================================================
+(defun test-vt-outer ()
+  ;; flatten模式（默认）
+  ;; np.outer([1,2], [3,4,5]) -> [[3,4,5],[6,8,10]]
+  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+         (b (vt-from-sequence '(3 4 5) :type 'fixnum))
+         (outer (vt-outer a b)))
+    (assert (equal (vt-to-list outer)
+		   '((3.0 4.0 5.0) (6.0 8.0 10.0)))))
+  ;; 不展平：保留形状
+  ;; a = np.array([1,2]), b = np.array([3,4,5])
+  ;; np.multiply.outer(a,b) 相当于 a[:,None] * b[None,:] 得到二维矩阵，与 flatten 相同
+  ;; 用不展平模式，输入1D依然是[[...]]。测试 flatten=NIL，输入1D应等同于flatten？实际上代码中当 flatten=NIL 时，会做 "...i,...j->...ij" 这会将前面的维度视为批量，所以如果前面维度是0维，结果也是二维，但形状会多出一些1维度？我们简单测试一下：一维输入给出的 outer 形状应该是 (2,3)。保持默认即可。
+  ;; 测试非展平模式下的高维外积
+  ;; a = np.arange(6).reshape(2,3)  b = np.array([1,2])
+  ;; 使用 np.multiply.outer(a,b) 形状 (2,3,2)，但 NumPy 没有直接 outer 高维函数，我们用 einsum 模拟
+  ;; 对于 flatten=NIL，预期形状 = a.shape + b.shape
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (b (vt-from-sequence '(1 2) :type 'fixnum))
+         (outer (vt-outer a b :flatten nil)))
+    (assert (equal (vt-shape outer) '(2 3 2)))
+    ;; 检查值：a[i,j] * b[k] 存储在 outer[i,j,k]
+    ;; 0*1=0, 0*2=0, 1*1=1, 1*2=2, 2*1=2, 2*2=4 ...
+    (assert (equal (vt-to-list (vt-slice outer '(0) '(:all) '(:all)))
+		   '((0.0 0.0) (1.0 2.0) (2.0 4.0)))))
+  (format t "~%test-vt-outer passed.~%"))
+
+;; ============================================================
+;; 汇总运行
+;; ============================================================
+(defun test-linalg-core ()
+  (test-vt-matmul)
+  (test-vt-einsum)
+  (test-vt-dot)
+  (test-vt-solve)
+  (test-vt-inv)
+  (test-vt-det)
+  (test-vt-norm)
+  (test-vt-frobenius-norm)
+  (test-vt-trace)
+  (test-vt-outer)
+  (format t "~%All linalg core tests passed.~%"))
+
+
 (defun test-cumsum-type ()
   (format t "~%=== Testing vt-cumsum with fixnum ===")
   (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
@@ -1736,7 +2000,7 @@
   (format t "~%--- Testing vt-trapz ---~%")
   ;; 1. 一维数组，默认 dx=1
   (let* ((y (vt-from-sequence '(1 2 3 4) :type 'double-float))
-         (trap (vt-trapz y)))
+         (trap (vt-ref (vt-trapz y))))
     ;; 梯形积分： (1+2)/2 + (2+3)/2 + (3+4)/2 = 1.5+2.5+3.5 = 7.5
     (assert (floatp trap))
     (assert (< (abs (- trap 7.5d0)) 1d-10))
@@ -1745,7 +2009,7 @@
   ;; 2. 指定 x 坐标
   (let* ((x (vt-from-sequence '(0 2 3 5) :type 'double-float))
          (y (vt-from-sequence '(1 2 3 4) :type 'double-float))
-         (trap (vt-trapz y :x x)))
+         (trap (vt-ref (vt-trapz y :x x))))
     ;; 梯度：dx1=2, dx2=1, dx3=2
     ;; 积分 = (1+2)/2*2 + (2+3)/2*1 + (3+4)/2*2 = 3*2 + 2.5*1 + 3.5*2 = 6+2.5+7 = 12.5
     (assert (< (abs (- trap 12.5d0)) 1d-10))
