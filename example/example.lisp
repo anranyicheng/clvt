@@ -7,6 +7,9 @@
   (and (= (length l1) (length l2))
        (every (lambda (a b) (< (abs (- a b)) epsilon)) l1 l2)))
 
+(defun all-same-shape (vts)
+  (let ((s (vt-shape (first vts))))
+    (every (lambda (v) (equal (vt-shape v) s)) (rest vts))))
 
 (defun test-vt-slice ()
   ;; ============================================================
@@ -209,6 +212,204 @@
   (format t "~%All new vt-slice tests passed.~%")
 
   )
+
+;; --------------------- test reshape ---------------------
+(defun test-vt-reshape ()
+  ;; np.arange(6).reshape(2,3)
+  (let* ((a (vt-arange 6 :type 'fixnum))
+         (b (vt-reshape a '(2 3))))
+    (assert (equal (vt-shape b) '(2 3)))
+    (assert (equal (vt-to-list b) '((0 1 2) (3 4 5))))
+    ;; 重塑为一维
+    (let ((c (vt-reshape b '(6))))
+      (assert (equal (vt-shape c) '(6)))
+      (assert (equal (vt-to-list c) '(0 1 2 3 4 5)))))
+  ;; 大小不匹配应报错
+  (let ((a (vt-arange 6)))
+    (handler-case (vt-reshape a '(2 4))
+      (error (e) (format t "~%[OK] Reshape size mismatch caught: ~a" e))))
+  (format t "~%test-vt-reshape passed.~%"))
+
+;; --------------------- test transpose ---------------------
+(defun test-vt-transpose ()
+  ;; a = np.arange(6).reshape(2,3)
+  ;; a.T -> shape (3,2)
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (at (vt-transpose a)))
+    (assert (equal (vt-shape at) '(3 2)))
+    (assert (equal (vt-to-list at) '((0 3) (1 4) (2 5)))))
+  ;; 指定 perm
+  ;; a = np.arange(24).reshape(2,3,4)
+  ;; a.transpose(1,0,2) -> shape (3,2,4)
+  (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
+         (at (vt-transpose a '(1 0 2))))
+    (assert (equal (vt-shape at) '(3 2 4)))
+    ;; 检查个别值
+    (assert (= (vt-ref at 0 0 0) 0))
+    (assert (= (vt-ref at 0 1 0) 12))
+    (assert (= (vt-ref at 2 1 3) 23)))
+  ;; 一维转置无变化
+  (let* ((a (vt-arange 5 :type 'fixnum))
+         (at (vt-transpose a)))
+    (assert (equal (vt-shape at) '(5)))
+    (assert (equal (vt-to-list at) '(0 1 2 3 4))))
+  (format t "~%test-vt-transpose passed.~%"))
+
+;; --------------------- test squeeze ---------------------
+(defun test-vt-squeeze ()
+  ;; a = np.arange(6).reshape(1,2,3)
+  ;; np.squeeze(a)  -> shape (2,3)
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(1 2 3)))
+         (sq (vt-squeeze a)))
+    (assert (equal (vt-shape sq) '(2 3)))
+    (assert (equal (vt-to-list sq) '((0 1 2) (3 4 5)))))
+  ;; 指定轴
+  ;; a = np.arange(6).reshape(2,1,3)
+  ;; np.squeeze(a, axis=1) -> shape (2,3)
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 1 3)))
+         (sq (vt-squeeze a :axis 1)))
+    (assert (equal (vt-shape sq) '(2 3)))
+    (assert (equal (vt-to-list sq) '((0 1 2) (3 4 5)))))
+  ;; 挤压非单例轴应报错
+  (let ((a (vt-reshape (vt-arange 6) '(2 3))))
+    (handler-case (vt-squeeze a :axis 0)
+      (error (e) (format t "~%[OK] Squeeze non-singleton axis caught: ~a" e))))
+  ;; 负轴
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3 1)))
+         (sq (vt-squeeze a :axis -1)))
+    (assert (equal (vt-shape sq) '(2 3))))
+  (format t "~%test-vt-squeeze passed.~%"))
+
+;; --------------------- test expand-dims ---------------------
+(defun test-vt-expand-dims ()
+  ;; a = np.array([1,2,3])
+  ;; np.expand_dims(a, 0)  -> shape (1,3)
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (ea (vt-expand-dims a 0)))
+    (assert (equal (vt-shape ea) '(1 3)))
+    (assert (equal (vt-to-list ea) '((1 2 3)))))
+  ;; axis=1
+  ;; np.expand_dims(a, 1) -> shape (3,1)
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (ea (vt-expand-dims a 1)))
+    (assert (equal (vt-shape ea) '(3 1)))
+    (assert (equal (vt-to-list ea) '((1) (2) (3)))))
+  ;; 负轴
+  ;; np.expand_dims(a, -1) 相同
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (ea (vt-expand-dims a -1)))
+    (assert (equal (vt-shape ea) '(3 1))))
+  (format t "~%test-vt-expand-dims passed.~%"))
+
+;; --------------------- test concatenate ---------------------
+(defun test-vt-concatenate ()
+  ;; a = np.array([[1,2],[3,4]])
+  ;; b = np.array([[5,6]])
+  ;; np.concatenate([a,b], axis=0) -> [[1,2],[3,4],[5,6]]
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+         (b (vt-from-sequence '((5 6)) :type 'fixnum))
+         (c (vt-concatenate 0 a b)))
+    (assert (equal (vt-shape c) '(3 2)))
+    (assert (equal (vt-to-list c) '((1 2) (3 4) (5 6)))))
+  ;; 沿轴1
+  ;; np.concatenate([a,b.T], axis=1)
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+         (b (vt-from-sequence '((5) (6)) :type 'fixnum))  ; 列向量
+         (c (vt-concatenate 1 a b)))
+    (assert (equal (vt-shape c) '(2 3)))
+    (assert (equal (vt-to-list c) '((1 2 5) (3 4 6)))))
+  ;; 负轴，等价 axis=0 (一维数组 axis=-1 归一化为 0)
+  ;; a = np.array([0,1,2])
+  ;; b = np.array([2,3,4])
+  ;; np.concatenate([a,b], axis=0) -> [0,1,2,2,3,4]
+  (let* ((a (vt-arange 3 :type 'fixnum))
+	 (b (vt-arange 3 :start 2 :type 'fixnum))
+	 (c (vt-concatenate -1 a b)))
+    (assert (equal (vt-shape c) '(6)))
+    (assert (equal (vt-to-list c) '(0 1 2 2 3 4))))
+  (format t "~%test-vt-concatenate passed.~%"))
+
+;; --------------------- test stack ---------------------
+(defun test-vt-stack ()
+  ;; a = [1,2], b = [3,4]
+  ;; np.stack([a,b], axis=0) -> [[1,2],[3,4]]
+  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+         (b (vt-from-sequence '(3 4) :type 'fixnum))
+         (s (vt-stack 0 a b)))
+    (assert (equal (vt-shape s) '(2 2)))
+    (assert (equal (vt-to-list s) '((1 2) (3 4)))))
+  ;; axis=1 -> [[1,3],[2,4]]
+  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+         (b (vt-from-sequence '(3 4) :type 'fixnum))
+         (s (vt-stack 1 a b)))
+    (assert (equal (vt-shape s) '(2 2)))
+    (assert (equal (vt-to-list s) '((1 3) (2 4)))))
+  ;; 三维
+  ;; a = np.zeros((2,3)), b = np.ones((2,3))
+  ;; np.stack([a,b], axis=0) -> (2,2,3)
+  (let* ((a (vt-zeros '(2 3)))
+         (b (vt-ones '(2 3)))
+         (s (vt-stack 0 a b)))
+    (assert (equal (vt-shape s) '(2 2 3)))
+    (assert (= (vt-ref s 0 0 0) 0.0d0))
+    (assert (= (vt-ref s 1 0 0) 1.0d0)))
+  (format t "~%test-vt-stack passed.~%"))
+
+;; --------------------- test tile ---------------------
+(defun test-vt-tile ()
+  ;; a = np.array([0,1,2])
+  ;; np.tile(a, 3) -> [0,1,2,0,1,2,0,1,2]
+  (let* ((a (vt-from-sequence '(0 1 2) :type 'fixnum))
+         (b (vt-tile a 3)))
+    (assert (equal (vt-shape b) '(9)))
+    (assert (equal (vt-to-list b) '(0 1 2 0 1 2 0 1 2))))
+  ;; 二维 tile reps=(2,3)
+  ;; a = np.array([[1,2],[3,4]])
+  ;; np.tile(a, (2,3)) -> shape (4,6)
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+         (b (vt-tile a '(2 3))))
+    (assert (equal (vt-shape b) '(4 6)))
+    (assert (= (vt-ref b 0 0) 1))
+    (assert (= (vt-ref b 1 0) 3))
+    (assert (= (vt-ref b 3 5) 4)))
+  ;; reps 自动扩展到维数
+  ;; a = [1,2], reps=(2,3) -> 先扩展 a 为 (1,2) 再 tile -> (2,6)
+  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+         (b (vt-tile a '(2 3))))
+    (assert (equal (vt-shape b) '(2 6)))
+    (assert (equal (vt-to-list (vt-slice b '(:all) '(0 nil 2)))
+		   '((1 1 1) (1 1 1))))) ; 略
+  (format t "~%test-vt-tile passed.~%"))
+
+;; --------------------- test repeat ---------------------
+(defun test-vt-repeat ()
+  ;; a = np.array([0,1,2])
+  ;; np.repeat(a, 3) -> [0,0,0,1,1,1,2,2,2]
+  (let* ((a (vt-from-sequence '(0 1 2) :type 'fixnum))
+         (r (vt-repeat a 3)))
+    (assert (equal (vt-shape r) '(9)))
+    (assert (equal (vt-to-list r) '(0 0 0 1 1 1 2 2 2))))
+  ;; 沿轴重复
+  ;; a = np.array([[1,2],[3,4]])
+  ;; np.repeat(a, 2, axis=1) -> [[1,1,2,2],[3,3,4,4]]
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+         (r (vt-repeat a 2 :axis 1)))
+    (assert (equal (vt-shape r) '(2 4)))
+    (assert (equal (vt-to-list r) '((1 1 2 2) (3 3 4 4)))))
+  ;; 沿轴0，每个元素不同重复次数（列表）
+  ;; a = np.array([1,2,3])
+  ;; np.repeat(a, [2,0,1]) -> [1,1,3]
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (r (vt-repeat a '(2 0 1))))
+    (assert (equal (vt-shape r) '(3)))
+    (assert (equal (vt-to-list r) '(1 1 3))))
+  ;; 负轴
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+         (r (vt-repeat a 2 :axis -1)))
+    (assert (equal (vt-shape r) '(2 4)))
+    (assert (equal (vt-to-list r) '((1 1 2 2) (3 3 4 4)))))
+  (format t "~%test-vt-repeat passed.~%"))
+
 
 (defun test-vt-meshgrid ()
   (let* ((x (vt-arange 3))
@@ -2082,11 +2283,18 @@
              (vt-copy (apply #'vt-slice full (list (list start end)))))))))))
 
 
-
-
+;; --------------------- 汇总 ---------------------
 
 (defun run-all-tests ()
   (test-vt-slice)
+  (test-vt-reshape)
+  (test-vt-transpose)
+  (test-vt-squeeze)
+  (test-vt-expand-dims)
+  (test-vt-concatenate)
+  (test-vt-stack)
+  (test-vt-tile)
+  (test-vt-repeat)
   (test-vt-sum)
   (test-vt-amax-amin)
   (test-vt-argmax-argmin)

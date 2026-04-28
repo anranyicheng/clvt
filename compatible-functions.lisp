@@ -389,24 +389,28 @@
               (vt-zeros zero-shape :type (vt-element-type vt)))))))
 
 (defun vt-tile (vt reps)
-  "重复数组构造新数组.
-  vt: 输入张量
-  reps: 每个维度的重复次数列表
-  返回: 新张量"
+  "重复数组构造新数组（与 NumPy tile 一致）
+   vt: 输入张量
+   reps: 每个维度的重复次数列表
+   返回: 新张量"
   (let* ((sh (vt-shape vt))
-         (reps (if (listp reps) reps (list reps)))
-         (ndim (max (length sh) (length reps)))
-         (full-sh (append (make-list (- ndim (length sh))
-				     :initial-element 1) sh))
-         (full-reps (append (make-list (- ndim (length reps))
-				       :initial-element 1)
-			    reps))
-         (result vt))
+         (reps-list (if (listp reps) reps (list reps)))
+         (ndim (max (length sh) (length reps-list)))
+         ;; 在前面补 1 使秩等于 ndim
+         (padded-sh (append (make-list (- ndim (length sh))
+				       :initial-element 1) sh))
+         (padded-reps (append (make-list (- ndim (length reps-list))
+					 :initial-element 1)
+			      reps-list))
+         ;; 先将 vt 重塑为 ndim 维
+         (result (vt-reshape vt padded-sh)))
     (loop for axis from 0 below ndim
-          for rep = (nth axis full-reps)
+          for rep = (nth axis padded-reps)
           when (> rep 1)
-            do (setf result (vt-repeat result rep :axis axis)))
-    (vt-reshape result (mapcar #'* full-sh full-reps))))
+            do (let ((parts (loop repeat rep collect result)))
+                 (setf result (apply #'vt-concatenate axis parts))))
+    ;; 最终形状
+    (vt-reshape result (mapcar #'* padded-sh padded-reps))))
 
 ;;; ===========================================
 ;;; 3. 数组连接与分割
