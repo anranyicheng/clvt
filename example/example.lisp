@@ -1,5 +1,13 @@
 (in-package :clvt)
 
+;; ============================================================
+;; 辅助函数：比较浮点数列表（允许微小误差）
+;; ============================================================
+(defun list-approx-equal (l1 l2 &key (epsilon 1e-10))
+  (and (= (length l1) (length l2))
+       (every (lambda (a b) (< (abs (- a b)) epsilon)) l1 l2)))
+
+
 (defun test-vt-slice ()
   ;; ============================================================
   ;; 辅助函数：将张量转换为列表以便比较（已存在于库中）
@@ -224,12 +232,6 @@
   (print "Testing vt-meshgrid passed"))
 
 
-;; ============================================================
-;; 辅助函数：比较浮点数列表（允许微小误差）
-;; ============================================================
-(defun list-approx-equal (l1 l2 &key (epsilon 1e-10))
-  (and (= (length l1) (length l2))
-       (every (lambda (a b) (< (abs (- a b)) epsilon)) l1 l2)))
 
 ;; ============================================================
 ;; vt-median 测试
@@ -370,6 +372,216 @@
   (format t "vt-percentile tests passed.~%")
   )
 
+;; ============================================================
+;; test-vt-sum
+;; ============================================================
+(defun test-vt-sum ()
+  ;; 一维全局求和
+  ;; np.sum(np.array([1,2,3,4,5])) -> 15
+  (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
+    (assert (= (vt-sum a) 15.0d0)))
+
+  ;; 二维沿轴0求和，保持维度
+  ;; a = np.arange(6).reshape(2,3)
+  ;; np.sum(a, axis=0, keepdims=True) -> [[3,5,7]]
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (res (vt-to-list (vt-sum a :axis 0 :keepdims t))))
+    (assert (equal res '((3 5 7)))))
+
+  ;; 二维沿轴1求和，不保留维度
+  ;; np.sum(a, axis=1) -> [3,12]
+  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+         (res (vt-to-list (vt-sum a :axis 1))))
+    (assert (equal res '(3 12))))
+
+  ;; 三维沿轴1求和（中间轴）
+  ;; a = np.arange(24).reshape(2,3,4)
+  ;; np.sum(a, axis=1) -> [[12,15,18,21],[48,51,54,57]]
+  (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
+         (res (vt-to-list (vt-sum a :axis 1))))
+    (assert (list-approx-equal (reduce #'append res)
+			       '(12.0 15.0 18.0 21.0 48.0 51.0 54.0 57.0))))
+
+  ;; 全局求和（标量形状）
+  ;; np.sum(np.array(42)) -> 42
+  (let ((a (vt-const '() 42 :type 'fixnum)))
+    (assert (= (vt-sum a) 42.0d0)))
+
+  (format t "~%test-vt-sum passed.~%"))
+
+;; ============================================================
+;; test-vt-amax / test-vt-amin
+;; ============================================================
+(defun test-vt-amax-amin ()
+  ;; amax 全局
+  ;; np.max(np.array([10,3,7,2,9])) -> 10
+  (let ((a (vt-from-sequence '(10 3 7 2 9))))
+    (assert (= (vt-amax a) 10.0d0))
+
+    ;; amin 全局
+    ;; np.min(a) -> 2
+    (assert (= (vt-amin a) 2.0d0)))
+
+  ;; 二维沿轴0 amax，不保留维度
+  ;; a = np.arange(12).reshape(3,4)
+  ;; np.max(a, axis=0) -> [8,9,10,11]
+  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(3 4)))
+         (res (vt-to-list (vt-amax a :axis 0))))
+    (assert (equalp res '(8.0 9.0 10.0 11.0))))
+
+  ;; 二维沿轴1 amin，保留维度
+  ;; np.min(a, axis=1, keepdims=True) -> [[0],[4],[8]]
+  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(3 4)))
+         (res (vt-to-list (vt-amin a :axis 1 :keepdims t))))
+    (assert (equalp res '((0.0) (4.0) (8.0)))))
+
+  ;; 三维沿轴2 amax
+  ;; a = np.arange(8).reshape(2,2,2)
+  ;; np.max(a, axis=2) -> [[1,3],[5,7]]
+  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+         (res (vt-to-list (vt-amax a :axis 2))))
+    (assert (equalp res '((1.0 3.0) (5.0 7.0)))))
+
+  (format t "~%test-vt-amax-amin passed.~%"))
+
+;; ============================================================
+;; test-vt-argmax / test-vt-argmin
+;; ============================================================
+(defun test-vt-argmax-argmin ()
+  ;; 一维 argmax
+  ;; a = np.array([1,5,3,9,2])
+  ;; np.argmax(a) -> 3
+  (let ((a (vt-from-sequence '(1 5 3 9 2))))
+    (assert (= (vt-argmax a) 3))
+
+    ;; 一维 argmin
+    ;; np.argmin(a) -> 0
+    (assert (= (vt-argmin a) 0)))
+
+  ;; 二维沿轴0 argmax
+  ;; a = np.array([[2,8,4],[7,3,6],[1,5,9]])
+  ;; np.argmax(a, axis=0) -> [1,0,2]
+  (let* ((a (vt-from-sequence '((2 8 4) (7 3 6) (1 5 9))))
+         (res (vt-to-list (vt-argmax a :axis 0))))
+    (assert (equal res '(1 0 2))))
+
+  ;; 二维沿轴1 argmin
+  ;; np.argmin(a, axis=1) -> [0,1,0]
+  (let* ((a (vt-from-sequence '((2 8 4) (7 3 6) (1 5 9))))
+         (res (vt-to-list (vt-argmin a :axis 1))))
+    (assert (equal res '(0 1 0))))
+
+  ;; 三维沿轴1 argmax
+  ;; a = np.arange(12).reshape(2,3,2)
+  ;; np.argmax(a, axis=1) -> [[2,2],[2,2]]? 实际每一列沿第二维的最大值索引
+  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(2 3 2)))
+         (res (vt-to-list (vt-argmax a :axis 1))))
+    (assert (equal res '((2 2) (2 2)))))
+
+  ;; 负轴
+  ;; a = np.array([[1,9,3],[6,5,4]])
+  ;; np.argmax(a, axis=-1) -> [1,0]
+  (let* ((a (vt-from-sequence '((1 9 3) (6 5 4))))
+         (res (vt-to-list (vt-argmax a :axis -1))))
+    (assert (equal res '(1 0))))
+
+  ;; 全局 argmin（标量）
+  ;; np.argmin(np.array(5)) -> 0
+  (let ((a (vt-zeros '(1))))
+    (assert (= (vt-argmin a) 0)))
+
+  (format t "~%test-vt-argmax-argmin passed.~%"))
+
+;; ============================================================
+;; test-vt-where （三元选择模式与仅条件模式）
+;; ============================================================
+(defun test-vt-where ()
+  ;; 模式1：单条件，返回索引列表
+  ;; a = np.array([0,1,2,0,3,0])
+  ;; np.where(a != 0) -> (array([1,2,4]),)
+  (let* ((a (vt-from-sequence '(0 1 2 0 3 0)))
+         (indices (vt-where (vt-> a (vt-const '() 0)))))  ; 条件：a>0
+    ;; 对于一维，应返回一个列表，含一个形状 (3,) 的索引张量
+    (assert (= (length indices) 1))
+    (let ((idx-tensor (first indices)))
+      (assert (equal (vt-to-list idx-tensor) '(1 2 4)))))
+
+  ;; 二维条件，返回行列索引
+  ;; a = np.array([[1,0],[0,1]])
+  ;; np.where(a) -> (array([0,1]), array([0,1]))
+  (let* ((a (vt-from-sequence '((1 0) (0 1))))
+         (indices (vt-where a)))   ; 条件就是 a 本身（非零即为真）
+    (assert (= (length indices) 2))
+    (assert (equal (vt-to-list (first indices)) '(0 1)))    ; 行索引
+    (assert (equal (vt-to-list (second indices)) '(0 1))))  ; 列索引
+  ;; a = np.array([1,2,3,4])
+  ;; cond = np.array([True, False, True, False]);
+  ;; np.where(cond, a, -a)
+  (let* ((a (vt-from-sequence '(1 2 3 4)))
+	 (cond (vt-= (vt-from-sequence '(1 0 1 0)) 1.0d0)) ; 构造布尔张量 [True,False,True,False]
+	 (res (vt-where cond a (vt-- a))))
+    (assert (equal (vt-to-list res) '(1.0 -2.0 3.0 -4.0))))
+
+  ;; 测试2: 条件 a < 3，用标量作为 x 和 y
+  ;;  a = np.array([1, 2, 3, 4])
+  ;;  cond = a < 3  -> [True, True, False, False]
+  ;;  np.where(cond, 100, 200) -> array([100, 100, 200, 200])
+  (let* ((a (vt-from-sequence '(1 2 3 4)))
+	 (cond (vt-< a (vt-full '() 3.0d0))))  ; a < 3
+    (let ((res (vt-where cond 100 200)))
+      (assert (equal (vt-to-list res) '(100.0 100.0 200.0 200.0)))))
+
+
+  ;; 广播测试
+  ;; a = np.array([1,2,3])
+  ;; cond = np.array([True, False, True])
+  ;; x = 10, y = 20
+  ;; np.where(cond, x, y) -> [10, 20, 10]
+  (let* ((a (vt-from-sequence '(1 2 3)))
+         (cond (vt-= a (vt-const '() 2.0d0)))  ; [F,T,F]
+         (res (vt-where cond 10 20)))
+    (assert (equal (vt-to-list res) '(20.0 10.0 20.0))))
+
+  (format t "~%test-vt-where passed.~%"))
+
+;; ============================================================
+;; test-vt-argwhere
+;; ============================================================
+(defun test-vt-argwhere ()
+  ;; 一维
+  ;; a = np.array([0,1,0,2])
+  ;; np.argwhere(a) -> [[1],[3]]
+  (let* ((a (vt-from-sequence '(0 1 0 2)))
+         (indices (vt-to-list (vt-argwhere a)))) ; 形状 (2,1)
+    (assert (equal indices '((1) (3)))))
+
+  ;; 二维
+  ;; a = np.array([[1,0],[0,1]])
+  ;; np.argwhere(a) -> [[0,0],[1,1]]
+  (let* ((a (vt-from-sequence '((1 0) (0 1))))
+         (indices (vt-to-list (vt-argwhere a)))) ; 形状 (2,2)
+    (assert (equal indices '((0 0) (1 1)))))
+
+  ;; 三维
+  ;; a = np.zeros((2,2,2))
+  ;; a[0,1,1] = 1; a[1,0,0] = 2
+  ;; np.argwhere(a) -> [[0,1,1],[1,0,0]]
+  (let* ((a (vt-zeros '(2 2 2)))
+	 (indices))
+    (setf (vt-ref a 0 1 1) 1.0d0)
+    (setf (vt-ref a 1 0 0) 2.0d0)    
+    (setf indices (vt-to-list (vt-argwhere a)))
+    (assert (equal indices '((0 1 1) (1 0 0)))))
+
+  ;; 空条件
+  ;; np.argwhere(np.array([0,0,0])) -> empty (0,1)
+  (let* ((a (vt-from-sequence '(0 0 0)))
+         (indices (vt-argwhere a)))
+    (assert (equal (vt-shape indices) '(0 1))))
+
+  (format t "~%test-vt-argwhere passed.~%"))
+
+
 (defun test-cumsum-type ()
   (format t "~%=== Testing vt-cumsum with fixnum ===")
   (let* ((a (vt-arange 5 :type 'fixnum))           ; (0 1 2 3 4)
@@ -426,7 +638,7 @@
                                (-4  24 -41)))))
     (format t "~%========== QR 分解测试 ==========~%")
     (format t "原始矩阵 A:~%")
-    (print (vt-to-list A))
+    (print A)
     ;; Full mode
     (multiple-value-bind (Q R) (vt-qr A :mode :full)
       (format t "~%Full mode: Q (m×m), R (m×n)~%")
@@ -1287,8 +1499,6 @@
 			     (expt (- 4 3.2) 2)
                              (expt (- 6 3.2) 2))
 			  5)))
-	(print v-global)
-	(print expected)
 	(assert (< (abs (- v-global expected)) 1d-10))
 	(let ((v-axis0 (vt-nanvar data :axis 0))
               (v-axis1 (vt-nanvar data :axis 1 :ddof 1)))
@@ -1630,6 +1840,11 @@
 
 (defun run-all-tests ()
   (test-vt-slice)
+  (test-vt-sum)
+  (test-vt-amax-amin)
+  (test-vt-argmax-argmin)
+  (test-vt-where)
+  (test-vt-argwhere)
   (test-vt-meshgrid)
   (test-vt-median)
   (test-vt-percentile)
