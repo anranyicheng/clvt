@@ -1775,8 +1775,8 @@
     (vt-do-each (ptr val flat-x)
       (let ((idx (loop for i from 0 below nbins
                        until (if right
-				 (< val (aref bin-data i))
-                                 (<= val (aref bin-data i)))
+                                 (<= val (aref bin-data i))
+				 (< val (aref bin-data i)))
                        finally (return i))))
         (setf (aref result ptr) idx)))
     (%make-vt :data result

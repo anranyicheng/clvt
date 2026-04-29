@@ -3021,6 +3021,211 @@
   (format t "~%test-random passed.~%"))
 
 
+;; --------------------------------------------------------------------
+;; 激活函数补充测试
+;; --------------------------------------------------------------------
+(defun test-more-activations ()
+  ;; vt-leaky-relu alpha=0.01
+  ;; np.where(x > 0, x, 0.01*x)
+  (let* ((a (vt-from-sequence '(-1.0 0.0 2.0) :type 'double-float))
+         (act (vt-leaky-relu a :alpha 0.01d0)))
+    (assert (list-approx-equal (vt-to-list act) '(-0.01 0.0 2.0) :epsilon 1e-6)))
+
+  ;; vt-swish = x * sigmoid(x)
+  ;; swish(0) = 0, swish(1) ≈ 1/(1+exp(-1)) ≈ 0.7311
+  (let* ((a (vt-from-sequence '(0.0 1.0) :type 'double-float))
+         (act (vt-swish a)))
+    (assert (list-approx-equal (vt-to-list act) '(0.0 0.7310585786300049) :epsilon 1e-6)))
+
+  ;; vt-softplus: log(1+exp(x))，大值近似 x
+  (let* ((a (vt-from-sequence '(0.0 10.0) :type 'double-float))
+         (act (vt-softplus a)))
+    (assert (list-approx-equal (vt-to-list act) (list (log 2.0d0) (+ (log (1+ (exp 10.0d0))) 0.0d0)) :epsilon 1e-6)))
+
+  ;; vt-mish: x * tanh(softplus(x)) 在0处为0，正数近似 x
+  (let* ((a (vt-from-sequence '(0.0 2.0) :type 'double-float))
+         (act (vt-mish a)))
+    (assert (list-approx-equal (vt-to-list act) (list 0.0d0 (* 2.0d0 (tanh (log (1+ (exp 2.0d0)))))) :epsilon 1e-6)))
+
+  ;; vt-hard-tanh: clamp(x, -1, 1)
+  (let* ((a (vt-from-sequence '(-1.5 -0.5 0.5 1.5) :type 'double-float))
+         (act (vt-hard-tanh a)))
+    (assert (equal (vt-to-list act) '(-1.0 -0.5 0.5 1.0))))
+
+  ;; vt-hard-sigmoid: 快速分段线性近似
+  ;; 实现: 0.2*x + 0.5 后 clip [0,1]
+  (let* ((a (vt-from-sequence '(-3.0 0.0 3.0) :type 'double-float))
+         (act (vt-hard-sigmoid a)))
+    (assert (list-approx-equal (vt-to-list act) '(0.0 0.5 1.0) :epsilon 1e-6)))
+
+  (format t "~%test-more-activations passed.~%"))
+
+;; --------------------------------------------------------------------
+;; 通用数学运算测试（逐元素，含广播）
+;; --------------------------------------------------------------------
+(defun test-arithmetic-ops ()
+  ;; vt-square
+  (let* ((a (vt-from-sequence '(-2 0 3) :type 'fixnum))
+         (sq (vt-square a)))
+    (assert (equalp (vt-to-list sq) '(4 0 9))))
+
+  ;; vt-sqrt
+  (let* ((a (vt-from-sequence '(4.0 0.0 9.0) :type 'double-float))
+         (sq (vt-sqrt a)))
+    (assert (list-approx-equal (vt-to-list sq) '(2.0 0.0 3.0))))
+
+  ;; vt-exp / vt-log
+  (let* ((a (vt-from-sequence '(1.0 0.0) :type 'double-float))
+         (exp-a (vt-exp a))
+         (log-exp (vt-log exp-a)))
+    (assert (list-approx-equal (vt-to-list log-exp) '(1.0 0.0) :epsilon 1e-6)))
+
+  ;; vt-clip (already tested, but verify broadcast)
+  (let* ((a (vt-from-sequence '((-1 2 5) (10 0 -3)) :type 'fixnum))
+         (cl (vt-clip a 0 4)))
+    (assert (equalp (vt-to-list cl) '((0 2 4) (4 0 0)))))
+
+  ;; vt-mod / vt-rem
+  (let* ((a (vt-from-sequence '(5 3 8) :type 'fixnum))
+         (mod (vt-mod a 3))
+         (rem (vt-rem a 3)))
+    (assert (equalp (vt-to-list mod) '(2 0 2)))
+    (assert (equalp (vt-to-list rem) '(2 0 2))))
+
+  ;; vt-round / vt-floor / vt-ceiling / vt-truncate
+  (let* ((a (vt-from-sequence '(-1.4 2.6) :type 'double-float))
+         (r (vt-round a))
+         (f (vt-floor a))
+         (c (vt-ceiling a))
+         (e (vt-trancate a)))
+    (assert (list-approx-equal (vt-to-list r) '(-1.0 3.0)))
+    (assert (list-approx-equal (vt-to-list f) '(-2.0 2.0)))
+    (assert (list-approx-equal (vt-to-list c) '(-1.0 3.0)))
+    (assert (list-approx-equal (vt-to-list e) '(-1.0 2.0))))
+
+  ;; vt-rint (round to nearest integer, float)
+  (let* ((a (vt-from-sequence '(1.2 2.7 -1.5) :type 'double-float))
+         (ri (vt-rint a)))
+    ;; 注意：rint 在半值向上取整
+    (assert (list-approx-equal (vt-to-list ri) '(1.0 3.0 -2.0))))
+
+  ;; vt-signum
+  (let* ((a (vt-from-sequence '(-3 0 5) :type 'fixnum))
+         (s (vt-signum a)))
+    (assert (equalp (vt-to-list s) '(-1 0 1))))
+
+  ;; 三角函数简单测试
+  ;; sin(0)=0, cos(0)=1
+  (let ((a (vt-const '(1) 0.0d0 :type 'double-float)))
+    (assert (< (abs (vt-ref (vt-sin a) 0)) 1e-10))
+    (assert (< (abs (- 1.0d0 (vt-ref (vt-cos a) 0))) 1e-10))
+    (assert (< (abs (vt-ref (vt-tan a) 0)) 1e-10)))
+
+  ;; 双曲函数
+  (let ((a (vt-const '(1) 0.0d0 :type 'double-float)))
+    (assert (< (abs (vt-ref (vt-sinh a) 0)) 1e-10))
+    (assert (< (abs (- 1.0d0 (vt-ref (vt-cosh a) 0))) 1e-10))
+    (assert (< (abs (vt-ref (vt-tanh a) 0)) 1e-10)))
+
+  ;; vt-hypot
+  (let* ((a (vt-from-sequence '(3.0) :type 'double-float))
+         (b (vt-from-sequence '(4.0) :type 'double-float))
+         (h (vt-hypot a b)))
+    (assert (list-approx-equal (vt-to-list h) '(5.0) :epsilon 1e-6)))
+
+  ;; vt-sinc: sinc(x) = sin(pi*x)/(pi*x), sinc(0)=1
+  (let* ((a (vt-from-sequence '(0.0 0.5) :type 'double-float))
+         (sc (vt-sinc a)))
+    ;; sinc(0.5) = sin(pi/2)/(pi/2) = 1 / (pi/2) = 2/pi ≈ 0.6366
+    (assert (list-approx-equal (vt-to-list sc) (list 1.0d0 (/ 2.0d0 pi)) :epsilon 1e-6)))
+
+  ;; vt-deg2rad / vt-rad2deg
+  (let* ((a (vt-from-sequence '(180.0) :type 'double-float))
+         (rad (vt-deg2rad a))
+         (deg (vt-rad2deg rad)))
+    (assert (list-approx-equal (vt-to-list rad) (list pi) :epsilon 1e-6))
+    (assert (list-approx-equal (vt-to-list deg) '(180.0) :epsilon 1e-6)))
+
+  (format t "~%test-arithmetic-ops passed.~%"))
+
+;; --------------------------------------------------------------------
+;; vt-from-function 测试
+;; --------------------------------------------------------------------
+(defun test-vt-from-function ()
+  ;; 使用函数生成二维索引和
+  ;; np.fromfunction(lambda i,j: i+j, (3,2), dtype=int)
+  (let* ((shape '(3 2))
+         (fn (lambda (idxs) (+ (first idxs) (second idxs))))
+         (arr (vt-from-function shape fn :type 'fixnum)))
+    (assert (equal (vt-shape arr) shape))
+    (assert (equal (vt-to-list arr) '((0 1) (1 2) (2 3)))))
+
+  ;; 一维情况
+  (let* ((shape '(5))
+         (fn (lambda (idxs) (* (first idxs) 2)))
+         (arr (vt-from-function shape fn :type 'fixnum)))
+    (assert (equal (vt-to-list arr) '(0 2 4 6 8))))
+
+  (format t "~%test-vt-from-function passed.~%"))
+
+;; --------------------------------------------------------------------
+;; vt-bincount 测试
+;; --------------------------------------------------------------------
+(defun test-vt-bincount ()
+  ;; np.bincount([0,1,2,1,0,3]) -> [2,2,1,1]
+  (let* ((a (vt-from-sequence '(0 1 2 1 0 3) :type 'fixnum))
+         (cnt (vt-bincount a)))
+    (assert (equal (vt-to-list cnt) '(2 2 1 1))))
+
+  ;; 指定 minlength
+  ;; np.bincount([0,1,1], minlength=5) -> [1,2,0,0,0]
+  (let* ((a (vt-from-sequence '(0 1 1) :type 'fixnum))
+         (cnt (vt-bincount a :minlength 5)))
+    (assert (equal (vt-to-list cnt) '(1 2 0 0 0))))
+
+  ;; 空输入（零大小）
+  (let* ((a (vt-zeros '(0) :type 'fixnum))
+         (cnt (vt-bincount a)))
+    (assert (equal (vt-to-list cnt) '())))
+
+  (format t "~%test-vt-bincount passed.~%"))
+
+;; --------------------------------------------------------------------
+;; vt-digitize 测试
+;; --------------------------------------------------------------------
+(defun test-vt-digitize ()
+  ;; 默认 right=False：bins[i-1] <= x < bins[i]
+  ;; np.digitize([0.2, 6.4, 3.0, 1.6], [0,2,4,6]) -> [1,4,2,1]
+  (let* ((x (vt-from-sequence '(0.2 6.4 3.0 1.6) :type 'double-float))
+         (bins (vt-from-sequence '(0 2 4 6) :type 'double-float))
+         (dig (vt-digitize x bins)))
+    (assert (equal (vt-to-list dig) '(1 4 2 1))))
+
+  ;; x = np.array([2.0])
+  ;; bins = np.array([0, 2, 4])
+  ;; # right=False（默认）：bins[i-1] <= x < bins[i]
+  ;; # 返回第一个大于 x 的 bin 索引
+  ;; dig_false = np.digitize(x, bins, right=False)
+  ;; print(dig_false)   # [2]   (因为 2.0 属于 [2,4) 区间，索引为 2)
+
+  ;; # right=True ：bins[i-1] < x <= bins[i]
+  ;; # 返回第一个大于等于 x 的 bin 索引
+  ;; dig_true = np.digitize(x, bins, right=True)
+  ;; print(dig_true)  
+  (let* ((x (vt-from-sequence '(2.0) :type 'double-float))
+         (bins (vt-from-sequence '(0 2 4) :type 'double-float))
+         (dig-false (vt-digitize x bins))
+         (dig-true (vt-digitize x bins :right t)))
+    ;; right=False: 2.0 属于 [2,4) -> bin 2
+    (assert (= (vt-ref dig-false 0) 2))
+    ;; right=True: 2.0 属于 (0,2] -> bin 1
+    (assert (= (vt-ref dig-true 0) 1)))
+
+  (format t "~%test-vt-digitize passed.~%"))
+
+;; --------------------------------------------------------------------
+;; 汇总运行
+;; --------------------------------------------------------------------
 
 
 
@@ -3085,6 +3290,7 @@
   (test-vt-trapz)
   (test-vt-correlate)
   (test-vt-histogram)
+  ;; test-pos:
   ;; vt-unique vt-intersect1d vt-union1d
   ;; vt-setdiff1d vt-setxor1d vt-in1d
   (test-set-ops)
@@ -3092,5 +3298,9 @@
   (test-stats-more)
   (test-logical)
   (test-math-ops)
-  (test-random))
-
+  (test-random)
+  (test-more-activations)
+  (test-arithmetic-ops)
+  (test-vt-from-function)
+  (test-vt-bincount)
+  (test-vt-digitize))
