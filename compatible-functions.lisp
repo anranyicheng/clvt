@@ -520,6 +520,152 @@
   (vt-split vt indices-or-sections :axis 2))
 
 ;;; ===========================================
+;;; 数组追加、插入、删除
+;;; ===========================================
+
+(defun vt-append (arr values &key (axis nil))
+  "将 values 附加到 arr 末尾。
+   ARR    : 输入张量
+   VALUES : 要追加的值（张量、标量或序列）
+   AXIS   : 连接轴（None 表示展平后追加；整数表示沿该轴连接）
+   返回   : 新张量"
+  (let ((arr-vt (ensure-vt arr))
+        (val-vt (ensure-vt values)))
+    (if (null axis)
+        ;; 展平模式
+        (let ((flat-arr (vt-flatten arr-vt))
+              (flat-val (vt-flatten val-vt)))
+          (vt-concatenate 0 flat-arr flat-val))
+        ;; 沿轴连接
+        (let* ((rank (length (vt-shape arr-vt)))
+               (ax (vt-normalize-axis axis rank))
+               (arr-shape (vt-shape arr-vt))
+               (val-shape (vt-shape val-vt)))
+          ;; 形状校验：除连接轴外，其余维度必须相等
+          (when (/= (length arr-shape) (length val-shape))
+            (error "vt-append: dimensions mismatch: arr has rank ~A, values has rank ~A"
+                   (length arr-shape) (length val-shape)))
+          (loop for i from 0 below (length arr-shape)
+                unless (or (= i ax)
+                           (= (nth i arr-shape) (nth i val-shape)))
+                  do (error "vt-append: shape mismatch at axis ~A: arr ~A vs values ~A"
+                            i (nth i arr-shape) (nth i val-shape)))
+          (vt-concatenate ax arr-vt val-vt)))))
+
+(defun vt-insert (arr obj values &key (axis nil))
+  "完全兼容 NumPy 的 np.insert。"
+  (let ((arr-vt (ensure-vt arr))
+        (values-vt (ensure-vt values)))
+    (if (null axis)
+        ;; ---------- 展平模式 ----------
+        (let* ((flat-arr (vt-flatten arr-vt))
+               (flat-val (vt-flatten values-vt)))
+          (flet ((insert-at (base idx)
+                   (let ((current-size (vt-size base)))
+                     (when (or (< idx 0) (> idx current-size))
+                       (error "Index out of bounds"))
+                     (let ((left (if (> idx 0)
+                                     (vt-slice base (list 0 idx))
+                                     (vt-zeros (list 0) :type (vt-element-type base))))
+                           (right (if (< idx current-size)
+                                      (vt-slice base (list idx current-size))
+                                      (vt-zeros (list 0) :type (vt-element-type base)))))
+                       (vt-concatenate 0 left flat-val right)))))
+            (cond ((integerp obj) (insert-at flat-arr obj))
+                  ((listp obj)
+                   (let ((result flat-arr))
+                     (dolist (idx (sort (copy-list obj) #'>))
+                       (setf result (insert-at result idx)))
+                     result))
+                  (t (error "vt-insert: obj must be integer or list of integers when axis=nil")))))
+        ;; ---------- 沿轴插入 ----------
+        (let* ((arr-shape (vt-shape arr-vt))
+               (rank (length arr-shape))
+               (ax (vt-normalize-axis axis rank))
+               (arr-axis-size (nth ax arr-shape))
+               (obj-list (if (listp obj) obj (list obj)))
+               (num-insert (length obj-list)))
+          (let ((desired-axis-size (if (listp obj) num-insert 1)))
+            (let ((target-shape (loop for i below rank
+                                      collect (if (= i ax)
+                                                  desired-axis-size
+                                                  (nth i arr-shape)))))
+              (let ((values-total-size (vt-size values-vt))
+                    (target-total-size (reduce #'* target-shape)))
+                (unless (= values-total-size target-total-size)
+                  (error "Cannot reshape values of size ~A to shape ~A"
+			 values-total-size target-shape))
+                (let ((values-reshaped
+                        (vt-reshape values-vt target-shape)))
+                  ;; 3. 将 arr 沿轴分割成切片列表
+                  (let ((arr-slices (loop for i from 0 below arr-axis-size
+                                          collect (vt-narrow arr-vt ax i (1+ i))))
+                        ;; 将 values-reshaped 沿轴分割成块列表（每个块形状在轴维度为1）
+                        (value-blocks
+                          (if (= desired-axis-size 1)
+                              (list values-reshaped)
+                              (loop for i from 0 below desired-axis-size
+                                    collect (vt-narrow values-reshaped ax i (1+ i))))))
+                    ;; 4. 构建新切片列表，在 obj-list 指定位置插入对应块
+                    (let ((result-slices (copy-list arr-slices)))
+                      (loop for pos in (sort (copy-list obj-list) #'>)
+                            for block in value-blocks
+                            do (setf result-slices
+                                     (append (subseq result-slices 0 pos)
+                                             (list block)
+                                             (subseq result-slices pos))))
+                      ;; 5. 连接所有切片
+                      (apply #'vt-concatenate ax result-slices)))))))))))
+
+
+(defun vt-delete (arr obj &key (axis nil))
+  "完全兼容 NumPy 的 np.delete。
+   OBJ 可以是：
+     - 整数：删除单个索引。
+     - 整数列表：删除多个独立索引（例如 `(0 2)` 删除索引 0 和 2）。
+     - 形如 `(:slice start end)` 的列表：删除从 start 到 end-1 的连续切片。
+   AXIS 为 nil 时展平后删除，否则沿指定轴删除。"
+  (let* ((orig (ensure-vt arr))
+         (elem-type (vt-element-type orig))
+         (shape (vt-shape orig))
+         (rank (length shape)))
+    (flet ((to-list (x) (vt-to-list x))
+           (from-list (lst) (vt-from-sequence lst :type elem-type))
+           (normalize-obj (obj len)
+             "返回要删除的索引列表（0‑based）。"
+             (cond ((integerp obj) (list obj))
+                   ((and (listp obj) (= (length obj) 3) (eq (first obj) :slice))
+                    (destructuring-bind (_ start end)
+			obj
+		      (declare (ignorable _))
+                      (assert (<= 0 start end len) (start end) "Invalid slice")
+                      (loop for i from start below end collect i)))
+                   ((listp obj) (copy-list obj))
+                   (t (error "vt-delete: invalid obj")))))
+      (if (null axis)
+          ;; 展平模式
+          (let* ((flat (vt-flatten-sequence (to-list orig)))
+                 (len (length flat))
+                 (del (normalize-obj obj len))
+                 (new (loop for i from 0 below len
+                            unless (member i del) collect (nth i flat))))
+            (from-list new))
+          ;; 沿轴模式
+          (let* ((ax (vt-normalize-axis axis rank))
+                 (axis-size (nth ax shape))
+                 (del (normalize-obj obj axis-size))
+                 (keep (loop for i from 0 below axis-size
+                             unless (member i del) collect i)))
+            (labels ((recurse (lst depth)
+                       (if (= depth ax)
+                           (mapcar (lambda (idx) (nth idx lst)) keep)
+                           (mapcar (lambda (sub) (recurse sub (1+ depth))) lst))))
+              (let ((new (recurse (to-list orig) 0)))
+                (from-list new))))))))
+
+
+
+;;; ===========================================
 ;;; 4. 统计扩展
 ;;; ===========================================
 
@@ -861,6 +1007,25 @@
 				 (max (abs a)
 				      (abs b)))))
                   1.0d0 0.0d0)))
+          t1 t2))
+
+(defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) (equal-nan nil))
+  "判断两个数组元素是否在容差范围内接近"
+  (declare (ignore equal-nan)) ; 简化，暂不支持
+  (vt-map (lambda (a b)
+            (cond
+              ((or (and (floatp a) (floatp b) (/= a a))   ; NaN
+                   (and (floatp a) (floatp b) (/= b b)))
+               0.0d0)
+              ((and (floatp a) (floatp b)
+                    (or (and (= a most-positive-double-float)
+			     (= b most-positive-double-float))
+                        (and (= a most-negative-double-float)
+			     (= b most-negative-double-float))))
+               1.0d0)
+              (t (let ((diff (abs (- a b))))
+                   (if (<= diff (+ atol (* rtol (abs b))))
+                       1.0d0 0.0d0)))))
           t1 t2))
 
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))

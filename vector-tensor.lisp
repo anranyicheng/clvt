@@ -296,7 +296,8 @@
    输出: 形状为 的张量,非对角线为 0."
   (let* ((in-data (vt-data vector-tensor))
          (n (car (vt-shape vector-tensor)))
-         (res (make-vt (list n n) 0))
+         (res (make-vt (list n n) 0
+		       :type (vt-element-type vector-push-extend)))
          (res-data (vt-data res))
          (res-strides (vt-strides res)))    
     (declare (type fixnum n)
@@ -835,6 +836,9 @@
 				:type (if (integerp src)
 					  'fixnum
 					  'double-float))))
+  (unless (eq (vt-element-type dest)
+	      (vt-element-type src))
+    (setf src (vt-astype src (vt-element-type dest))))
   (let ((dest-shape (vt-shape dest))
         (src-shape (vt-shape src)))
     ;; 确保 Dest 的形状能够容纳 Src 广播后的形状

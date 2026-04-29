@@ -704,34 +704,34 @@
   ;; np.median(a, axis=0) -> [12. 13. 14. 15. 16. 17.]
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-median a :axis 0))))
-      (assert (list-approx-equal result '(12.0 13.0 14.0 15.0 16.0 17.0)))))
+      (assert (lists-approx-equal result '(12.0 13.0 14.0 15.0 16.0 17.0)))))
 
   ;; 二维张量，沿 axis=1 求中位数
   ;; np.median(a, axis=1) -> [2.5 8.5 14.5 20.5 26.5]
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-median a :axis 1))))
-      (assert (list-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
+      (assert (lists-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
 
   ;; 三维张量，沿 axis=1 求中位数
   ;; a = np.arange(24).reshape(2,3,4)
   ;; np.median(a, axis=1) -> [[ 4.  5.  6.  7.] [16. 17. 18. 19.]]
   (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
     (let ((result (vt-to-list (vt-median a :axis 1))))
-      (assert (list-approx-equal (reduce #'append result) 
+      (assert (lists-approx-equal (reduce #'append result) 
 				 '(4.0 5.0 6.0 7.0 16.0 17.0 18.0 19.0)))))
 
   ;; 三维张量，沿 axis=2（最后一维）求中位数
   ;; np.median(a, axis=2) -> [[ 1.5  5.5  9.5] [13.5 17.5 21.5]]
   (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
     (let ((result (vt-to-list (vt-median a :axis 2))))
-      (assert (list-approx-equal (reduce #'append result)
+      (assert (lists-approx-equal (reduce #'append result)
 				 '(1.5 5.5 9.5 13.5 17.5 21.5)))))
 
   ;; 使用负轴 axis=-1 等同于 axis=1
   ;; np.median(a, axis=-1) -> [2.5 8.5 14.5 20.5 26.5]
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-median a :axis -1))))
-      (assert (list-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
+      (assert (lists-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
 
   ;; 全局中位数（标量）作为数字返回
   ;; np.median(np.array([1.0])) -> 1.0
@@ -774,7 +774,7 @@
   ;; np.percentile(a, 30, axis=1) -> [1.5 7.5 13.5 19.5 25.5]
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 30 :axis 1))))
-      (assert (list-approx-equal result '(1.5 7.5 13.5 19.5 25.5)))))
+      (assert (lists-approx-equal result '(1.5 7.5 13.5 19.5 25.5)))))
 
   ;; 二维轴向：axis=0，nearest
   ;; np.percentile(a, 90, axis=0, interpolation='nearest') -> [22 23 24 25 26 27]? 原数组精确
@@ -782,38 +782,38 @@
   ;; 列0：0,6,12,18,24 -> 索引4=24，正确
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 0 :interpolation :nearest))))
-      (assert (list-approx-equal result '(24.0 25.0 26.0 27.0 28.0 29.0)))))
+      (assert (lists-approx-equal result '(24.0 25.0 26.0 27.0 28.0 29.0)))))
 
   ;; 二维轴向：axis=1，nearest 验证与 NumPy 的一致性
   ;; np.percentile(a, 90, axis=1, interpolation='nearest') -> [4 10 16 22 28]
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :nearest))))
-      (assert (list-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
+      (assert (lists-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
   ;;  np.percentile(a, 90,axis=1,interpolation="lower")
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :lower))))
-      (assert (list-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
+      (assert (lists-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
   
   ;; np.percentile(a, 90,axis=1,interpolation="higher")
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :higher))))
-      (assert (list-approx-equal result '(5.0 11.0 17.0 23.0 29.0)))))
+      (assert (lists-approx-equal result '(5.0 11.0 17.0 23.0 29.0)))))
 
   ;;np.percentile(a, 90,axis=1,interpolation="midpoint")
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :midpoint))))
-      (assert (list-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
+      (assert (lists-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
 
   ;; np.percentile(a, 90,axis=1,interpolation="linear")
   (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :linear))))
-      (assert (list-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
+      (assert (lists-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
   ;; 三维轴向：axis=2，线性
   ;; a = np.arange(24).reshape(2,3,4)
   ;; np.percentile(a, 25, axis=2) -> [[0.75 4.75 8.75] [12.75 16.75 20.75]]
   (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
     (let ((result (vt-to-list (vt-percentile a 25 :axis 2))))
-      (assert (list-approx-equal (reduce #'append result)
+      (assert (lists-approx-equal (reduce #'append result)
 				 '(0.75 4.75 8.75 12.75 16.75 20.75)))))
 
   ;; 全局百分位数，标量输入
@@ -851,7 +851,7 @@
   ;; np.sum(a, axis=1) -> [[12,15,18,21],[48,51,54,57]]
   (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
          (res (vt-to-list (vt-sum a :axis 1))))
-    (assert (list-approx-equal (reduce #'append res)
+    (assert (lists-approx-equal (reduce #'append res)
 			       '(12.0 15.0 18.0 21.0 48.0 51.0 54.0 57.0))))
 
   ;; 全局求和（标量形状）
@@ -1165,7 +1165,7 @@
   (let* ((A (vt-from-sequence '((2 1) (1 3)) :type 'double-float))
          (b (vt-from-sequence '(7 8) :type 'double-float))
          (x (vt-solve A b)))
-    (assert (list-approx-equal (vt-to-list x) '(2.6 1.8) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list x) '(2.6 1.8) :epsilon 1e-6)))
 
   ;; 多右端项
   ;; A = [[3,1],[1,2]]
@@ -1174,9 +1174,9 @@
   (let* ((A (vt-from-sequence '((3 1) (1 2)) :type 'double-float))
          (B (vt-from-sequence '((9 8) (8 7)) :type 'double-float))
          (X (vt-solve A B)))
-    (assert (list-approx-equal (vt-to-list (vt-slice X '(:all) '(0)))
+    (assert (lists-approx-equal (vt-to-list (vt-slice X '(:all) '(0)))
 			       '(2.0 3.0) :epsilon 1e-6))
-    (assert (list-approx-equal (vt-to-list (vt-slice X '(:all) '(1)))
+    (assert (lists-approx-equal (vt-to-list (vt-slice X '(:all) '(1)))
 			       '(1.8 2.6) :epsilon 1e-6)))
   (format t "~%test-vt-solve passed.~%"))
 
@@ -1188,9 +1188,9 @@
   ;; np.linalg.inv(A) -> [[ 0.6, -0.7], [-0.2,  0.4]]
   (let* ((A (vt-from-sequence '((4 7) (2 6)) :type 'double-float))
          (invA (vt-inv A)))
-    (assert (list-approx-equal (vt-to-list (vt-slice invA '(:all) '(0)))
+    (assert (lists-approx-equal (vt-to-list (vt-slice invA '(:all) '(0)))
 			       '(0.6 -0.2) :epsilon 1e-6))
-    (assert (list-approx-equal (vt-to-list (vt-slice invA '(:all) '(1)))
+    (assert (lists-approx-equal (vt-to-list (vt-slice invA '(:all) '(1)))
 			       '(-0.7 0.4) :epsilon 1e-6)))
   (format t "~%test-vt-inv passed.~%"))
 
@@ -1204,7 +1204,7 @@
   ;; 三维矩阵
   ;; A = [[6,1,1],[4,-2,5],[2,8,7]] -> det = -306.0? 计算一下：6*(-14-40) -1*(28-10) +1*(32+4) = 6*(-54) -18 +36 = -324 -18+36 = -306.0
   (let ((A (vt-from-sequence '((6 1 1) (4 -2 5) (2 8 7)) :type 'double-float)))
-    (assert (list-approx-equal (list (vt-det A))
+    (assert (lists-approx-equal (list (vt-det A))
 			       '(-306.0) :epsilon 1e-6)))
   (format t "~%test-vt-det passed.~%"))
 
@@ -1219,13 +1219,13 @@
   ;; 矩阵 L2 范数 (全局) 默认是 Frobenius? 根据代码 vt-norm 是 L2 范数 (vt-sqrt(vt-sum(sq)))，对于矩阵是 Frobenius。
   ;; np.linalg.norm(np.array([[1,2],[3,4]])) -> 5.477225575051661
   (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
-    (assert (list-approx-equal (list (vt-ref (vt-norm A)))
+    (assert (lists-approx-equal (list (vt-ref (vt-norm A)))
 			       (list (sqrt 30.0d0)) :epsilon 1e-6)))
   ;; 沿轴计算 L2 范数
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), axis=1) -> [2.23606798, 5.0]
   (let* ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
          (norms (vt-to-list (vt-norm A :axis 1))))
-    (assert (list-approx-equal norms (list (sqrt 5.0) (sqrt 25.0)) :epsilon 1e-6)))
+    (assert (lists-approx-equal norms (list (sqrt 5.0) (sqrt 25.0)) :epsilon 1e-6)))
   (format t "~%test-vt-norm passed.~%"))
 
 ;; ============================================================
@@ -1235,7 +1235,7 @@
   ;; 矩阵 Frobenius 范数
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), 'fro') -> 5.477225575051661
   (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
-    (assert (list-approx-equal (list (vt-ref (vt-frobenius-norm A)))
+    (assert (lists-approx-equal (list (vt-ref (vt-frobenius-norm A)))
 			       (list (sqrt 30.0d0)) :epsilon 1e-6)))
   (format t "~%test-vt-frobenius-norm passed.~%"))
 
@@ -2385,7 +2385,7 @@
   ;; → array([ 0. ,  2.5,  5. ,  7.5, 10. ])
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 10 5)))
-    (assert (list-approx-equal (vt-to-list vt)
+    (assert (lists-approx-equal (vt-to-list vt)
 			       '(0.0 2.5 5.0 7.5 10.0)
 			       :epsilon 1e-6)))
 
@@ -2395,7 +2395,7 @@
   ;; → array([0., 2., 4., 6., 8.])
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 10 5 :endpoint nil)))
-    (assert (list-approx-equal (vt-to-list vt)
+    (assert (lists-approx-equal (vt-to-list vt)
 			       '(0.0 2.0 4.0 6.0 8.0)
 			       :epsilon 1e-6)))
 
@@ -2436,7 +2436,7 @@
   ;; → array([10. ,  7.5,  5. ,  2.5,  0. ])
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 10 0 5)))
-    (assert (list-approx-equal (vt-to-list vt)
+    (assert (lists-approx-equal (vt-to-list vt)
 			       '(10.0 7.5 5.0 2.5 0.0) :epsilon 1e-6)))
 
   ;; -----------------------------------------------------------
@@ -2445,7 +2445,7 @@
   ;; → array([0., 1.])
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 1 2)))
-    (assert (list-approx-equal (vt-to-list vt)
+    (assert (lists-approx-equal (vt-to-list vt)
 			       '(0.0 1.0) :epsilon 1e-6)))
 
   ;; -----------------------------------------------------------
@@ -2454,7 +2454,7 @@
   ;; → array([0. , 0.5])
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 1 2 :endpoint nil)))
-    (assert (list-approx-equal (vt-to-list vt)
+    (assert (lists-approx-equal (vt-to-list vt)
 			       '(0.0 0.5) :epsilon 1e-6)))
 
   (format t "~%All vt-linspace tests passed.~%"))
@@ -2699,7 +2699,7 @@
          (hist (first result))
          (edges (second result)))
     (assert (equal (vt-to-list hist) '(2.0 2.0 2.0 2.0 2.0)))
-    (assert (list-approx-equal (vt-to-list edges) '(0.0 1.8 3.6 5.4 7.2 9.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list edges) '(0.0 1.8 3.6 5.4 7.2 9.0) :epsilon 1e-6)))
 
   ;; ---- 2. 指定 range ----
   ;; a = np.array([0,1,2,3,4,5,6,7,8,9])
@@ -2709,7 +2709,7 @@
          (hist (first mv))
          (edges (second mv)))
     (assert (equal (vt-to-list hist) '(3.0 3.0 4.0)))
-    (assert (list-approx-equal (vt-to-list edges) '(0.0 3.0 6.0 9.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list edges) '(0.0 3.0 6.0 9.0) :epsilon 1e-6)))
 
   ;; ---- 3. density=True ----
   ;; a = np.array([0,1,2,3,4])
@@ -2719,7 +2719,7 @@
   (let* ((a (vt-arange 5))
          (mv (multiple-value-list (vt-histogram a :bins 5 :density t)))
          (hist (first mv)))
-    (assert (list-approx-equal (vt-to-list hist) '(0.25 0.25 0.25 0.25 0.25) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list hist) '(0.25 0.25 0.25 0.25 0.25) :epsilon 1e-6)))
 
   ;; ---- 4. 值全相同 ----
   ;; a = np.array([2,2,2,2])
@@ -2731,7 +2731,7 @@
          (hist (first mv))
          (edges (second mv)))
     (assert (equal (vt-to-list hist) '(0.0 4.0 0.0 0.0 0.0)))
-    (assert (list-approx-equal (vt-to-list edges) '(0.0 2.0 4.0 6.0 8.0 10.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list edges) '(0.0 2.0 4.0 6.0 8.0 10.0) :epsilon 1e-6)))
 
   ;; ---- 5. 一维空张量 ----
   ;; a = np.array([])
@@ -2751,7 +2751,7 @@
          (hist (first mv))
          (edges (second mv)))
     (assert (equal (vt-to-list hist) '(2.0 2.0 2.0))) ; 0,1,2,3,4,5  -> bin 宽度 1.666..., 计数分别为 2,2,2
-    (assert (list-approx-equal (vt-to-list edges) '(0.0 1.66666667 3.33333333 5.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list edges) '(0.0 1.66666667 3.33333333 5.0) :epsilon 1e-6)))
 
   (format t "~%All vt-histogram tests passed.~%"))
 
@@ -2905,9 +2905,9 @@
   (let* ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
          (v (vt-var a))
          (s (vt-std a)))
-    (assert (list-approx-equal (list v)
+    (assert (lists-approx-equal (list v)
 			       '(1.25d0) :epsilon 1e-6))
-    (assert (list-approx-equal (list s)
+    (assert (lists-approx-equal (list s)
 			       (list (sqrt 1.25d0)) :epsilon 1e-6)))
 
   ;; vt-prod
@@ -2980,7 +2980,7 @@
          (v (vt-from-sequence '(0 1 0.5) :type 'double-float))
          (c (vt-convolve a v :mode :same)))
     ;; NumPy: array([1., 2.5, 4 ])  计算略
-    (assert (list-approx-equal (vt-to-list c)
+    (assert (lists-approx-equal (vt-to-list c)
 			       '(1.0 2.5 4.0) :epsilon 1e-6)))
 
   (format t "~%test-math-ops passed.~%"))
@@ -3029,23 +3029,23 @@
   ;; np.where(x > 0, x, 0.01*x)
   (let* ((a (vt-from-sequence '(-1.0 0.0 2.0) :type 'double-float))
          (act (vt-leaky-relu a :alpha 0.01d0)))
-    (assert (list-approx-equal (vt-to-list act) '(-0.01 0.0 2.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list act) '(-0.01 0.0 2.0) :epsilon 1e-6)))
 
   ;; vt-swish = x * sigmoid(x)
   ;; swish(0) = 0, swish(1) ≈ 1/(1+exp(-1)) ≈ 0.7311
   (let* ((a (vt-from-sequence '(0.0 1.0) :type 'double-float))
          (act (vt-swish a)))
-    (assert (list-approx-equal (vt-to-list act) '(0.0 0.7310585786300049) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list act) '(0.0 0.7310585786300049) :epsilon 1e-6)))
 
   ;; vt-softplus: log(1+exp(x))，大值近似 x
   (let* ((a (vt-from-sequence '(0.0 10.0) :type 'double-float))
          (act (vt-softplus a)))
-    (assert (list-approx-equal (vt-to-list act) (list (log 2.0d0) (+ (log (1+ (exp 10.0d0))) 0.0d0)) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list act) (list (log 2.0d0) (+ (log (1+ (exp 10.0d0))) 0.0d0)) :epsilon 1e-6)))
 
   ;; vt-mish: x * tanh(softplus(x)) 在0处为0，正数近似 x
   (let* ((a (vt-from-sequence '(0.0 2.0) :type 'double-float))
          (act (vt-mish a)))
-    (assert (list-approx-equal (vt-to-list act) (list 0.0d0 (* 2.0d0 (tanh (log (1+ (exp 2.0d0)))))) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list act) (list 0.0d0 (* 2.0d0 (tanh (log (1+ (exp 2.0d0)))))) :epsilon 1e-6)))
 
   ;; vt-hard-tanh: clamp(x, -1, 1)
   (let* ((a (vt-from-sequence '(-1.5 -0.5 0.5 1.5) :type 'double-float))
@@ -3056,7 +3056,7 @@
   ;; 实现: 0.2*x + 0.5 后 clip [0,1]
   (let* ((a (vt-from-sequence '(-3.0 0.0 3.0) :type 'double-float))
          (act (vt-hard-sigmoid a)))
-    (assert (list-approx-equal (vt-to-list act) '(0.0 0.5 1.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list act) '(0.0 0.5 1.0) :epsilon 1e-6)))
 
   (format t "~%test-more-activations passed.~%"))
 
@@ -3072,13 +3072,13 @@
   ;; vt-sqrt
   (let* ((a (vt-from-sequence '(4.0 0.0 9.0) :type 'double-float))
          (sq (vt-sqrt a)))
-    (assert (list-approx-equal (vt-to-list sq) '(2.0 0.0 3.0))))
+    (assert (lists-approx-equal (vt-to-list sq) '(2.0 0.0 3.0))))
 
   ;; vt-exp / vt-log
   (let* ((a (vt-from-sequence '(1.0 0.0) :type 'double-float))
          (exp-a (vt-exp a))
          (log-exp (vt-log exp-a)))
-    (assert (list-approx-equal (vt-to-list log-exp) '(1.0 0.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list log-exp) '(1.0 0.0) :epsilon 1e-6)))
 
   ;; vt-clip (already tested, but verify broadcast)
   (let* ((a (vt-from-sequence '((-1 2 5) (10 0 -3)) :type 'fixnum))
@@ -3098,16 +3098,16 @@
          (f (vt-floor a))
          (c (vt-ceiling a))
          (e (vt-trancate a)))
-    (assert (list-approx-equal (vt-to-list r) '(-1.0 3.0)))
-    (assert (list-approx-equal (vt-to-list f) '(-2.0 2.0)))
-    (assert (list-approx-equal (vt-to-list c) '(-1.0 3.0)))
-    (assert (list-approx-equal (vt-to-list e) '(-1.0 2.0))))
+    (assert (lists-approx-equal (vt-to-list r) '(-1.0 3.0)))
+    (assert (lists-approx-equal (vt-to-list f) '(-2.0 2.0)))
+    (assert (lists-approx-equal (vt-to-list c) '(-1.0 3.0)))
+    (assert (lists-approx-equal (vt-to-list e) '(-1.0 2.0))))
 
   ;; vt-rint (round to nearest integer, float)
   (let* ((a (vt-from-sequence '(1.2 2.7 -1.5) :type 'double-float))
          (ri (vt-rint a)))
     ;; 注意：rint 在半值向上取整
-    (assert (list-approx-equal (vt-to-list ri) '(1.0 3.0 -2.0))))
+    (assert (lists-approx-equal (vt-to-list ri) '(1.0 3.0 -2.0))))
 
   ;; vt-signum
   (let* ((a (vt-from-sequence '(-3 0 5) :type 'fixnum))
@@ -3131,20 +3131,20 @@
   (let* ((a (vt-from-sequence '(3.0) :type 'double-float))
          (b (vt-from-sequence '(4.0) :type 'double-float))
          (h (vt-hypot a b)))
-    (assert (list-approx-equal (vt-to-list h) '(5.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list h) '(5.0) :epsilon 1e-6)))
 
   ;; vt-sinc: sinc(x) = sin(pi*x)/(pi*x), sinc(0)=1
   (let* ((a (vt-from-sequence '(0.0 0.5) :type 'double-float))
          (sc (vt-sinc a)))
     ;; sinc(0.5) = sin(pi/2)/(pi/2) = 1 / (pi/2) = 2/pi ≈ 0.6366
-    (assert (list-approx-equal (vt-to-list sc) (list 1.0d0 (/ 2.0d0 pi)) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list sc) (list 1.0d0 (/ 2.0d0 pi)) :epsilon 1e-6)))
 
   ;; vt-deg2rad / vt-rad2deg
   (let* ((a (vt-from-sequence '(180.0) :type 'double-float))
          (rad (vt-deg2rad a))
          (deg (vt-rad2deg rad)))
-    (assert (list-approx-equal (vt-to-list rad) (list pi) :epsilon 1e-6))
-    (assert (list-approx-equal (vt-to-list deg) '(180.0) :epsilon 1e-6)))
+    (assert (lists-approx-equal (vt-to-list rad) (list pi) :epsilon 1e-6))
+    (assert (lists-approx-equal (vt-to-list deg) '(180.0) :epsilon 1e-6)))
 
   (format t "~%test-arithmetic-ops passed.~%"))
 
@@ -3223,12 +3223,153 @@
 
   (format t "~%test-vt-digitize passed.~%"))
 
-;; --------------------------------------------------------------------
-;; 汇总运行
-;; --------------------------------------------------------------------
 
 
+;;; ===========================================
+;;; 测试函数 (需放在 (clvt) 包内)
+;;; 每个用例均注释了对应的 NumPy 实现
+;;; ===========================================
 
+(defun test-vt-append ()
+  "测试 vt-append 与 NumPy np.append 行为的一致性。"
+  (format t "~%Testing vt-append...~%")
+  (flet ((check (name got expected-list)
+           (let ((expected (vt-from-sequence expected-list :type 'double-float)))
+             (if (vt-allclose got expected :rtol 1e-5 :atol 1e-8)
+                 (format t "✓ PASS: ~A~%" name)
+                 (format t "✗ FAIL: ~A~%  got: ~A~%  expected: ~A~%" 
+                         name (vt-to-list got) expected-list)))))
+    
+    ;; 用例1: 展平模式，标量 values 自动转为张量
+    ;; # NumPy: a = np.array([[1,2],[3,4]]); b = 5; np.append(a, b)  # axis=None
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+          (b 5))
+      (check "append_flat_scalar"
+             (vt-append a b :axis nil)
+             '(1 2 3 4 5)))
+    
+    ;; 用例2: 展平模式，张量 values
+    ;; # NumPy: a = np.array([[1,2],[3,4]]); b = np.array([5,6]); np.append(a, b)
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+          (b (vt-from-sequence '(5 6) :type 'double-float)))
+      (check "append_flat_tensor"
+             (vt-append a b :axis nil)
+             '(1 2 3 4 5 6)))
+    
+    ;; 用例3: 沿 axis=0 连接
+    ;; # NumPy: a = np.array([[1,2],[3,4]]); b = np.array([[5,6]]); np.append(a, b, axis=0)
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+          (b (vt-from-sequence '((5 6)) :type 'double-float)))
+      (check "append_axis0"
+             (vt-append a b :axis 0)
+             '((1 2) (3 4) (5 6))))
+    
+    ;; 用例4: 沿 axis=1 连接 (要求行数相同)
+    ;; # NumPy: a = np.array([[1,2],[3,4]]); b = np.array([[5],[6]]); np.append(a, b, axis=1)
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+          (b (vt-from-sequence '((5) (6)) :type 'double-float)))
+      (check "append_axis1"
+             (vt-append a b :axis 1)
+             '((1 2 5) (3 4 6))))
+    t))
+
+(defun test-vt-insert ()
+  "测试 vt-insert 与 NumPy np.insert 行为的一致性。"
+  (format t "~%Testing vt-insert...~%")
+  (flet ((check (name got expected-list)
+           (let ((expected (vt-from-sequence expected-list :type 'double-float)))
+             (if (vt-allclose got expected :rtol 1e-5 :atol 1e-8)
+                 (format t "✓ PASS: ~A~%" name)
+                 (format t "✗ FAIL: ~A~%  got: ~A~%  expected: ~A~%" 
+                         name (vt-to-list got) expected-list)))))
+    
+    ;; 用例1: 展平模式，单索引插入标量
+    ;; # NumPy: a = np.array([1,2,3,4]); np.insert(a, 2, 99)  # axis=None
+    (let ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
+          (vals 99))
+      (check "insert_flat_scalar"
+             (vt-insert a 2 vals :axis nil)
+             '(1 2 99 3 4)))
+    
+    ;; 用例2: 展平模式，单索引插入张量
+    ;; # NumPy: a = np.array([1,2,3,4]); vals = np.array([99,100]); np.insert(a, 2, vals)
+    (let ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
+          (vals (vt-from-sequence '(99 100) :type 'double-float)))
+      (check "insert_flat_tensor"
+             (vt-insert a 2 vals :axis nil)
+             '(1 2 99 100 3 4)))
+    
+    ;; 用例3: 展平模式，多索引列表插入
+    ;; # NumPy: a = np.array([1,2,3,4]); np.insert(a, [0,2], 99)
+    (let ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
+          (vals (vt-from-sequence '(99) :type 'double-float)))
+      (check "insert_flat_multi_index"
+             (vt-insert a '(0 2) vals :axis nil)
+             '(99 1 2 99 3 4)))
+    
+    ;; 用例4: 沿 axis=1 插入 (矩阵列)
+    ;; # NumPy: a = np.array([[1,2],[3,4]]); vals = np.array([[99,100]]); np.insert(a, 1, vals, axis=1)
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+          (vals (vt-from-sequence '((99 100)) :type 'double-float)))
+      (check "insert_axis1"
+             (vt-insert a 1 vals :axis 1)
+             '((1 99 2) (3 100 4))))
+    
+    ;; 用例5: 沿 axis=0 插入行
+    ;; # NumPy: a = np.array([[1,2],[3,4]]); vals = np.array([[5,6]]); np.insert(a, 1, vals, axis=0)
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+          (vals (vt-from-sequence '((5 6)) :type 'double-float)))
+      (check "insert_axis0"
+             (vt-insert a 1 vals :axis 0)
+             '((1 2) (5 6) (3 4))))
+    t))
+
+(defun test-vt-delete ()
+  "测试 vt-delete 与 NumPy np.delete 行为的一致性。"
+  (format t "~%Testing vt-delete...~%")
+  (flet ((check (name got expected-list)
+           (let ((expected (vt-from-sequence expected-list :type 'double-float)))
+             (if (vt-allclose got expected :rtol 1e-5 :atol 1e-8)
+                 (format t "✓ PASS: ~A~%" name)
+                 (format t "✗ FAIL: ~A~%  got: ~A~%  expected: ~A~%" 
+                         name (vt-to-list got) expected-list)))))
+    
+    ;; 用例1: 展平模式，单索引删除
+    ;; # NumPy: a = np.array([1,2,3,4,5]); np.delete(a, 2)  # axis=None
+    (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float)))
+      (check "delete_flat_single"
+             (vt-delete a 2 :axis nil)
+             '(1 2 4 5)))
+    
+    ;; 用例2: 展平模式，切片删除 (start end)
+    ;; # NumPy: a = np.array([1,2,3,4,5]); np.delete(a, slice(1,3))
+
+    (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float)))
+  (check "delete_flat_slice"
+         (vt-delete a '(:slice 1 3) :axis nil)   ; 注意改为 (:slice 1 3)
+         '(1 4 5)))
+    
+    ;; 用例3: 展平模式，索引列表删除
+    ;; # NumPy: a = np.array([1,2,3,4,5]); np.delete(a, [0,2,4])
+    (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float)))
+      (check "delete_flat_list"
+             (vt-delete a '(0 2 4) :axis nil)
+             '(2 4)))
+    
+    ;; 用例4: 沿 axis=0 删除索引列表
+    ;; # NumPy: a = np.array([[1,2],[3,4],[5,6]]); np.delete(a, [0,2], axis=0)
+    (let ((a (vt-from-sequence '((1 2) (3 4) (5 6)) :type 'double-float)))
+      (check "delete_axis0_list"
+             (vt-delete a '(0 2) :axis 0)
+             '((3 4))))
+    
+    ;; 用例5: 沿 axis=1 删除切片
+    ;; # NumPy: a = np.array([[1,2,3],[4,5,6]]); np.delete(a, slice(0,2), axis=1)
+    (let ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'double-float)))
+      (check "delete_axis1_slice"
+             (vt-delete a '(:slice 0 2) :axis 1)     ; 删除列 0 和 1
+             '((3) (6))))
+    t))
 
 
 ;; --------------------- 汇总 ---------------------
@@ -3303,4 +3444,8 @@
   (test-arithmetic-ops)
   (test-vt-from-function)
   (test-vt-bincount)
-  (test-vt-digitize))
+  (test-vt-digitize)
+
+    (test-vt-append)
+  (test-vt-insert)
+  (test-vt-delete))
