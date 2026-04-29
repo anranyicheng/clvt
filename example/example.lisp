@@ -718,14 +718,14 @@
   (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
     (let ((result (vt-to-list (vt-median a :axis 1))))
       (assert (lists-approx-equal (reduce #'append result) 
-				 '(4.0 5.0 6.0 7.0 16.0 17.0 18.0 19.0)))))
+				  '(4.0 5.0 6.0 7.0 16.0 17.0 18.0 19.0)))))
 
   ;; 三维张量，沿 axis=2（最后一维）求中位数
   ;; np.median(a, axis=2) -> [[ 1.5  5.5  9.5] [13.5 17.5 21.5]]
   (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
     (let ((result (vt-to-list (vt-median a :axis 2))))
       (assert (lists-approx-equal (reduce #'append result)
-				 '(1.5 5.5 9.5 13.5 17.5 21.5)))))
+				  '(1.5 5.5 9.5 13.5 17.5 21.5)))))
 
   ;; 使用负轴 axis=-1 等同于 axis=1
   ;; np.median(a, axis=-1) -> [2.5 8.5 14.5 20.5 26.5]
@@ -814,7 +814,7 @@
   (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
     (let ((result (vt-to-list (vt-percentile a 25 :axis 2))))
       (assert (lists-approx-equal (reduce #'append result)
-				 '(0.75 4.75 8.75 12.75 16.75 20.75)))))
+				  '(0.75 4.75 8.75 12.75 16.75 20.75)))))
 
   ;; 全局百分位数，标量输入
   ;; np.percentile(np.array(42), 50) -> 42.0
@@ -852,7 +852,7 @@
   (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
          (res (vt-to-list (vt-sum a :axis 1))))
     (assert (lists-approx-equal (reduce #'append res)
-			       '(12.0 15.0 18.0 21.0 48.0 51.0 54.0 57.0))))
+				'(12.0 15.0 18.0 21.0 48.0 51.0 54.0 57.0))))
 
   ;; 全局求和（标量形状）
   ;; np.sum(np.array(42)) -> 42
@@ -1175,9 +1175,9 @@
          (B (vt-from-sequence '((9 8) (8 7)) :type 'double-float))
          (X (vt-solve A B)))
     (assert (lists-approx-equal (vt-to-list (vt-slice X '(:all) '(0)))
-			       '(2.0 3.0) :epsilon 1e-6))
+				'(2.0 3.0) :epsilon 1e-6))
     (assert (lists-approx-equal (vt-to-list (vt-slice X '(:all) '(1)))
-			       '(1.8 2.6) :epsilon 1e-6)))
+				'(1.8 2.6) :epsilon 1e-6)))
   (format t "~%test-vt-solve passed.~%"))
 
 ;; ============================================================
@@ -1189,9 +1189,9 @@
   (let* ((A (vt-from-sequence '((4 7) (2 6)) :type 'double-float))
          (invA (vt-inv A)))
     (assert (lists-approx-equal (vt-to-list (vt-slice invA '(:all) '(0)))
-			       '(0.6 -0.2) :epsilon 1e-6))
+				'(0.6 -0.2) :epsilon 1e-6))
     (assert (lists-approx-equal (vt-to-list (vt-slice invA '(:all) '(1)))
-			       '(-0.7 0.4) :epsilon 1e-6)))
+				'(-0.7 0.4) :epsilon 1e-6)))
   (format t "~%test-vt-inv passed.~%"))
 
 ;; ============================================================
@@ -1205,7 +1205,7 @@
   ;; A = [[6,1,1],[4,-2,5],[2,8,7]] -> det = -306.0? 计算一下：6*(-14-40) -1*(28-10) +1*(32+4) = 6*(-54) -18 +36 = -324 -18+36 = -306.0
   (let ((A (vt-from-sequence '((6 1 1) (4 -2 5) (2 8 7)) :type 'double-float)))
     (assert (lists-approx-equal (list (vt-det A))
-			       '(-306.0) :epsilon 1e-6)))
+				'(-306.0) :epsilon 1e-6)))
   (format t "~%test-vt-det passed.~%"))
 
 ;; ============================================================
@@ -1220,7 +1220,7 @@
   ;; np.linalg.norm(np.array([[1,2],[3,4]])) -> 5.477225575051661
   (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
     (assert (lists-approx-equal (list (vt-ref (vt-norm A)))
-			       (list (sqrt 30.0d0)) :epsilon 1e-6)))
+				(list (sqrt 30.0d0)) :epsilon 1e-6)))
   ;; 沿轴计算 L2 范数
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), axis=1) -> [2.23606798, 5.0]
   (let* ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
@@ -1236,7 +1236,7 @@
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), 'fro') -> 5.477225575051661
   (let ((A (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
     (assert (lists-approx-equal (list (vt-ref (vt-frobenius-norm A)))
-			       (list (sqrt 30.0d0)) :epsilon 1e-6)))
+				(list (sqrt 30.0d0)) :epsilon 1e-6)))
   (format t "~%test-vt-frobenius-norm passed.~%"))
 
 ;; ============================================================
@@ -1450,71 +1450,71 @@
                     (error "Assertion failed: ~A ~A differ by ~A"
                            ',a ',b (abs (- ,a ,b))))
                   t)))
-  
-  ;; ---------- 1D 等间距 ----------
-  (let* ((x (vt-arange 6 :step 1.0d0 :type 'double-float))       ; 0,1,2,3,4,5
-         (y (vt-square x))                                         ; y = x^2
-         ;; axis nil → 返回所有轴的梯度列表（此处 1D → 单元素列表）
-         (grad-list (vt-gradient y))
-         (grad (first grad-list)))     ; 取出唯一张量
-    (format t "~%1D uniform (single from list): ~A~%" grad)
-    ;; 理论：内部二阶中心差分，边界一阶差分
-    (assert-close (vt-ref grad 0) 1.0d0)       ; (f1-f0)/1 = 1
-    (assert-close (vt-ref grad 1) 2.0d0)       ; (f2-f0)/2 = 2
-    (assert-close (vt-ref grad 2) 4.0d0)
-    (assert-close (vt-ref grad 3) 6.0d0)
-    (assert-close (vt-ref grad 4) 8.0d0)
-    (assert-close (vt-ref grad 5) 9.0d0))      ; (f5-f4)/1 = 9
-  
-  ;; ---------- 1D 非等间距（坐标数组）----------
-  (let* ((x (vt-from-sequence '(0.0d0 1.0d0 3.0d0 6.0d0) :type 'double-float))
-         (y (vt-square x))
-         ;; 指定单轴 axis=0，直接返回该轴张量（不是列表）
-         (grad (vt-gradient y :spacing x :axis 0)))
-    (format t "~%1D non-uniform (axis=0): ~A~%" grad)
-    (assert-close (vt-ref grad 0) 1.0d0)
-    (assert-close (vt-ref grad 1) 3.0d0)
-    (assert-close (vt-ref grad 2) 7.0d0)
-    (assert-close (vt-ref grad 3) 9.0d0))
-  
-  ;; ---------- 2D 等间距，指定单个轴 ----------
-  (let* ((mat (vt-from-sequence '((0.0d0 1.0d0 2.0d0)
-                                  (3.0d0 4.0d0 5.0d0)
-                                  (6.0d0 7.0d0 8.0d0))
-                                :type 'double-float))
-         ;; axis 整数 → 直接返回该轴梯度张量
-         (grad0 (vt-gradient mat :axis 0))
-         (grad1 (vt-gradient mat :axis 1)))
-    (format t "~%2D along axis=0:~%~A~%" grad0)
-    (format t "2D along axis=1:~%~A~%" grad1)
-    (dotimes (i 3)
-      (dotimes (j 3)
-        (assert-close (vt-ref grad0 i j) 3.0d0)))
-    (dotimes (i 3)
-      (dotimes (j 3)
-        (assert-close (vt-ref grad1 i j) 1.0d0))))
-  
-  ;; ---------- 多轴同时计算 ----------
-  (let* ((a (vt-from-sequence '((1.0d0 2.0d0 3.0d0)
-                                (4.0d0 5.0d0 6.0d0))
-                              :type 'double-float))
-         ;; axis 列表 → 返回列表
-         (grads (vt-gradient a :axis '(0 1))))
-    (format t "~%Multi-axis gradients:~%~A~%~A~%" (first grads) (second grads))
-    (assert (= (length grads) 2))
-    (let ((g0 (first grads)) (g1 (second grads)))
-      (assert (equal (vt-shape g0) '(2 3)))
-      (assert (equal (vt-shape g1) '(2 3)))
-      (format t "Multi-axis test passed.~%")))
-  
-  ;; ---------- 边界条件：尺寸太小 ----------
-  (handler-case
-      (progn
-        (vt-gradient (vt-from-sequence '(1.0d0) :type 'double-float) :axis 0)
-        (error "Should have thrown an error for size 1"))
-    (simple-error (e)
-      (format t "~%Correctly errored on size 1: ~A~%" e)))
-  
+    
+    ;; ---------- 1D 等间距 ----------
+    (let* ((x (vt-arange 6 :step 1.0d0 :type 'double-float))       ; 0,1,2,3,4,5
+           (y (vt-square x))                                         ; y = x^2
+           ;; axis nil → 返回所有轴的梯度列表（此处 1D → 单元素列表）
+           (grad-list (vt-gradient y))
+           (grad (first grad-list)))     ; 取出唯一张量
+      (format t "~%1D uniform (single from list): ~A~%" grad)
+      ;; 理论：内部二阶中心差分，边界一阶差分
+      (assert-close (vt-ref grad 0) 1.0d0)       ; (f1-f0)/1 = 1
+      (assert-close (vt-ref grad 1) 2.0d0)       ; (f2-f0)/2 = 2
+      (assert-close (vt-ref grad 2) 4.0d0)
+      (assert-close (vt-ref grad 3) 6.0d0)
+      (assert-close (vt-ref grad 4) 8.0d0)
+      (assert-close (vt-ref grad 5) 9.0d0))      ; (f5-f4)/1 = 9
+    
+    ;; ---------- 1D 非等间距（坐标数组）----------
+    (let* ((x (vt-from-sequence '(0.0d0 1.0d0 3.0d0 6.0d0) :type 'double-float))
+           (y (vt-square x))
+           ;; 指定单轴 axis=0，直接返回该轴张量（不是列表）
+           (grad (vt-gradient y :spacing x :axis 0)))
+      (format t "~%1D non-uniform (axis=0): ~A~%" grad)
+      (assert-close (vt-ref grad 0) 1.0d0)
+      (assert-close (vt-ref grad 1) 3.0d0)
+      (assert-close (vt-ref grad 2) 7.0d0)
+      (assert-close (vt-ref grad 3) 9.0d0))
+    
+    ;; ---------- 2D 等间距，指定单个轴 ----------
+    (let* ((mat (vt-from-sequence '((0.0d0 1.0d0 2.0d0)
+                                    (3.0d0 4.0d0 5.0d0)
+                                    (6.0d0 7.0d0 8.0d0))
+                                  :type 'double-float))
+           ;; axis 整数 → 直接返回该轴梯度张量
+           (grad0 (vt-gradient mat :axis 0))
+           (grad1 (vt-gradient mat :axis 1)))
+      (format t "~%2D along axis=0:~%~A~%" grad0)
+      (format t "2D along axis=1:~%~A~%" grad1)
+      (dotimes (i 3)
+	(dotimes (j 3)
+          (assert-close (vt-ref grad0 i j) 3.0d0)))
+      (dotimes (i 3)
+	(dotimes (j 3)
+          (assert-close (vt-ref grad1 i j) 1.0d0))))
+    
+    ;; ---------- 多轴同时计算 ----------
+    (let* ((a (vt-from-sequence '((1.0d0 2.0d0 3.0d0)
+                                  (4.0d0 5.0d0 6.0d0))
+				:type 'double-float))
+           ;; axis 列表 → 返回列表
+           (grads (vt-gradient a :axis '(0 1))))
+      (format t "~%Multi-axis gradients:~%~A~%~A~%" (first grads) (second grads))
+      (assert (= (length grads) 2))
+      (let ((g0 (first grads)) (g1 (second grads)))
+	(assert (equal (vt-shape g0) '(2 3)))
+	(assert (equal (vt-shape g1) '(2 3)))
+	(format t "Multi-axis test passed.~%")))
+    
+    ;; ---------- 边界条件：尺寸太小 ----------
+    (handler-case
+	(progn
+          (vt-gradient (vt-from-sequence '(1.0d0) :type 'double-float) :axis 0)
+          (error "Should have thrown an error for size 1"))
+      (simple-error (e)
+	(format t "~%Correctly errored on size 1: ~A~%" e)))
+    
     (format t "~%All gradient tests passed!~%")))
 
 
@@ -1526,107 +1526,107 @@
                            ',a ',b (abs (- ,a ,b))))
                   t)))
 
-  ;; === 3D 张量，等间距，指定两个轴（axis 列表 + 标量 spacing） ===
-  (let* ((t3d (vt-from-sequence
-               '((( 0.0d0  1.0d0  2.0d0) ( 3.0d0  4.0d0  5.0d0) ( 6.0d0  7.0d0  8.0d0))
-                 (( 9.0d0 10.0d0 11.0d0) (12.0d0 13.0d0 14.0d0) (15.0d0 16.0d0 17.0d0))
-                 ((18.0d0 19.0d0 20.0d0) (21.0d0 22.0d0 23.0d0) (24.0d0 25.0d0 26.0d0)))
-               :type 'double-float))
-         ;; t3d 形状 (3, 3, 3)，每个元素值相当于 i*9 + j*3 + k
-         ;; 沿 axis=0 和 axis=2 求梯度，spacing=1
-         (grads (vt-gradient t3d :axis '(0 2)))
-         (g0 (first grads))
-         (g2 (second grads)))
-    (format t "~%3D multi-axis (0,2) uniform spacing=1~%")
-    (format t "grad along 0:~%~A~%" g0)
-    (format t "grad along 2:~%~A~%" g2)
-    ;; 沿 axis=0 的梯度：边界一阶，内部中心差分，由于每层相差9，所以梯度应为全9。
-    ;; 沿 axis=2 的梯度：最内层变化步长1，梯度应为全1。
-    ;; 验证：
-    (dotimes (i 3)
-      (dotimes (j 3)
-        (dotimes (k 3)
-          (assert-close (vt-ref g0 i j k) 9.0d0)
-          (assert-close (vt-ref g2 i j k) 1.0d0))))
-    (format t "3D multi-axis passed.~%"))
+    ;; === 3D 张量，等间距，指定两个轴（axis 列表 + 标量 spacing） ===
+    (let* ((t3d (vt-from-sequence
+		 '((( 0.0d0  1.0d0  2.0d0) ( 3.0d0  4.0d0  5.0d0) ( 6.0d0  7.0d0  8.0d0))
+                   (( 9.0d0 10.0d0 11.0d0) (12.0d0 13.0d0 14.0d0) (15.0d0 16.0d0 17.0d0))
+                   ((18.0d0 19.0d0 20.0d0) (21.0d0 22.0d0 23.0d0) (24.0d0 25.0d0 26.0d0)))
+		 :type 'double-float))
+           ;; t3d 形状 (3, 3, 3)，每个元素值相当于 i*9 + j*3 + k
+           ;; 沿 axis=0 和 axis=2 求梯度，spacing=1
+           (grads (vt-gradient t3d :axis '(0 2)))
+           (g0 (first grads))
+           (g2 (second grads)))
+      (format t "~%3D multi-axis (0,2) uniform spacing=1~%")
+      (format t "grad along 0:~%~A~%" g0)
+      (format t "grad along 2:~%~A~%" g2)
+      ;; 沿 axis=0 的梯度：边界一阶，内部中心差分，由于每层相差9，所以梯度应为全9。
+      ;; 沿 axis=2 的梯度：最内层变化步长1，梯度应为全1。
+      ;; 验证：
+      (dotimes (i 3)
+	(dotimes (j 3)
+          (dotimes (k 3)
+            (assert-close (vt-ref g0 i j k) 9.0d0)
+            (assert-close (vt-ref g2 i j k) 1.0d0))))
+      (format t "3D multi-axis passed.~%"))
 
-  ;; === 4D 张量，axis=nil（全部轴），等间距 ===
-  (let* ((shape '(2 2 2 2))
-         (t4d (vt-from-function shape
-                                 (lambda (idxs)
-                                   (coerce (reduce #'+ idxs) 'double-float))
-                                 :type 'double-float))
-         ;; t4d 的元素是坐标索引之和 (i0+i1+i2+i3)
-         ;; 每轴步长1，所以任何轴的梯度都应为1
-         (grads (vt-gradient t4d))   ; 返回 4 个张量的列表
-         )
-    (format t "~%4D all axes nil uniform spacing=1~%")
-    (assert (= (length grads) 4))
-    (loop for g in grads
-          do (assert (equal (vt-shape g) shape))
-             (vt-do-each (ptr val g)
-               (declare (ignore ptr))
-               (assert-close val 1.0d0)))
-    (format t "4D all axes passed.~%"))
+    ;; === 4D 张量，axis=nil（全部轴），等间距 ===
+    (let* ((shape '(2 2 2 2))
+           (t4d (vt-from-function shape
+                                  (lambda (idxs)
+                                    (coerce (reduce #'+ idxs) 'double-float))
+                                  :type 'double-float))
+           ;; t4d 的元素是坐标索引之和 (i0+i1+i2+i3)
+           ;; 每轴步长1，所以任何轴的梯度都应为1
+           (grads (vt-gradient t4d))   ; 返回 4 个张量的列表
+           )
+      (format t "~%4D all axes nil uniform spacing=1~%")
+      (assert (= (length grads) 4))
+      (loop for g in grads
+            do (assert (equal (vt-shape g) shape))
+               (vt-do-each (ptr val g)
+		 (declare (ignore ptr))
+		 (assert-close val 1.0d0)))
+      (format t "4D all axes passed.~%"))
 
-  ;; === 2D，不同轴的间距不同（列表 spacing） ===
-  (let* ((mat (vt-from-sequence '((0.0d0 1.0d0 2.0d0 3.0d0)
-                                  (4.0d0 5.0d0 6.0d0 7.0d0)
-                                  (8.0d0 9.0d0 10.0d0 11.0d0))
-                                :type 'double-float))
-         ;; 轴0 间距 2.0, 轴1 间距 0.5
-         (grads (vt-gradient mat :spacing '(2.0d0 0.5d0) :axis '(0 1)))
-         (g0 (first grads))
-         (g1 (second grads)))
-    (format t "~%2D multi-axis with list spacing (2, 0.5)~%")
-    (format t "grad0:~%~A~%" g0)
-    (format t "grad1:~%~A~%" g1)
-    ;; 轴0内部中心差分应为 4/dx = 4/2 = 2.0，边界一阶 4/2=2.0
-    ;; 轴1内部中心差分应为 1/dx = 1/0.5 = 2.0，边界一阶 1/0.5=2.0
-    (dotimes (i 3)
-      (dotimes (j 4)
-        (assert-close (vt-ref g0 i j) 2.0d0)
-        (assert-close (vt-ref g1 i j) 2.0d0)))
-    (format t "List spacing test passed.~%"))
+    ;; === 2D，不同轴的间距不同（列表 spacing） ===
+    (let* ((mat (vt-from-sequence '((0.0d0 1.0d0 2.0d0 3.0d0)
+                                    (4.0d0 5.0d0 6.0d0 7.0d0)
+                                    (8.0d0 9.0d0 10.0d0 11.0d0))
+                                  :type 'double-float))
+           ;; 轴0 间距 2.0, 轴1 间距 0.5
+           (grads (vt-gradient mat :spacing '(2.0d0 0.5d0) :axis '(0 1)))
+           (g0 (first grads))
+           (g1 (second grads)))
+      (format t "~%2D multi-axis with list spacing (2, 0.5)~%")
+      (format t "grad0:~%~A~%" g0)
+      (format t "grad1:~%~A~%" g1)
+      ;; 轴0内部中心差分应为 4/dx = 4/2 = 2.0，边界一阶 4/2=2.0
+      ;; 轴1内部中心差分应为 1/dx = 1/0.5 = 2.0，边界一阶 1/0.5=2.0
+      (dotimes (i 3)
+	(dotimes (j 4)
+          (assert-close (vt-ref g0 i j) 2.0d0)
+          (assert-close (vt-ref g1 i j) 2.0d0)))
+      (format t "List spacing test passed.~%"))
 
-  ;; === 一维，非均匀间距（坐标数组），长度2（刚修复的边界情况） ===
-  (let* ((x (vt-from-sequence '(1.0d0 5.0d0) :type 'double-float))
-         (y (vt-square x))   ; y = [1, 25]
-         (grad (vt-gradient y :spacing x :axis 0)))
-    (format t "~%1D length-2 non-uniform: ~A~%" grad)
-    ;; 只能用一阶差分：(25-1)/(5-1) = 24/4 = 6，两端相同
-    (assert-close (vt-ref grad 0) 6.0d0)
-    (assert-close (vt-ref grad 1) 6.0d0)
-    (format t "Length-2 test passed.~%"))
+    ;; === 一维，非均匀间距（坐标数组），长度2（刚修复的边界情况） ===
+    (let* ((x (vt-from-sequence '(1.0d0 5.0d0) :type 'double-float))
+           (y (vt-square x))   ; y = [1, 25]
+           (grad (vt-gradient y :spacing x :axis 0)))
+      (format t "~%1D length-2 non-uniform: ~A~%" grad)
+      ;; 只能用一阶差分：(25-1)/(5-1) = 24/4 = 6，两端相同
+      (assert-close (vt-ref grad 0) 6.0d0)
+      (assert-close (vt-ref grad 1) 6.0d0)
+      (format t "Length-2 test passed.~%"))
 
-  ;; === 3D 指定单个轴（int axis），非均匀间距（坐标数组） ===
-  (let* ((t3d (vt-from-sequence
-               '(((1.0d0 2.0d0) (3.0d0 4.0d0))   ; shape (2,2,2)
-                 ((5.0d0 6.0d0) (7.0d0 8.0d0)))
-               :type 'double-float))
-         ;; 沿 axis=1 求梯度，使用非均匀坐标 [0.0, 1.0] （对应轴大小2）
-         (coord (vt-from-sequence '(0.0d0 1.0d0) :type 'double-float))
-         (grad (vt-gradient t3d :spacing coord :axis 1)))
-    (format t "~%3D axis=1 non-uniform (length 2 axis): ~A~%" grad)
-    ;; 轴1长度=2，只能用一阶差分
-    ;; 计算：对于每个“纤维”（axis=1），df = t3d[...,1,:] - t3d[...,0,:], dx=1.0
-    ;; 梯度应为常数：第一块 (3-1,4-2)=(2,2)，第二块 (7-5,8-6)=(2,2)
-    (let ((expected (vt-from-sequence '(((2.0d0 2.0d0) (2.0d0 2.0d0))
-                                        ((2.0d0 2.0d0) (2.0d0 2.0d0)))
-                                      :type 'double-float)))
-      (vt-do-each (ptr val grad)
-        (assert-close val (aref (vt-data expected) ptr))))
-    (format t "3D non-uniform length-2 axis passed.~%"))
+    ;; === 3D 指定单个轴（int axis），非均匀间距（坐标数组） ===
+    (let* ((t3d (vt-from-sequence
+		 '(((1.0d0 2.0d0) (3.0d0 4.0d0))   ; shape (2,2,2)
+                   ((5.0d0 6.0d0) (7.0d0 8.0d0)))
+		 :type 'double-float))
+           ;; 沿 axis=1 求梯度，使用非均匀坐标 [0.0, 1.0] （对应轴大小2）
+           (coord (vt-from-sequence '(0.0d0 1.0d0) :type 'double-float))
+           (grad (vt-gradient t3d :spacing coord :axis 1)))
+      (format t "~%3D axis=1 non-uniform (length 2 axis): ~A~%" grad)
+      ;; 轴1长度=2，只能用一阶差分
+      ;; 计算：对于每个“纤维”（axis=1），df = t3d[...,1,:] - t3d[...,0,:], dx=1.0
+      ;; 梯度应为常数：第一块 (3-1,4-2)=(2,2)，第二块 (7-5,8-6)=(2,2)
+      (let ((expected (vt-from-sequence '(((2.0d0 2.0d0) (2.0d0 2.0d0))
+                                          ((2.0d0 2.0d0) (2.0d0 2.0d0)))
+					:type 'double-float)))
+	(vt-do-each (ptr val grad)
+          (assert-close val (aref (vt-data expected) ptr))))
+      (format t "3D non-uniform length-2 axis passed.~%"))
 
-  ;; === 错误场景：坐标数组长度不匹配 ===
-  (handler-case
-      (progn
-        (vt-gradient (vt-arange 5) :spacing (vt-arange 3) :axis 0)
-        (format t "~%ERROR: Should have signalled mismatch~%"))
-    (simple-error (e)
-      (format t "~%Correctly signalled length mismatch: ~A~%" e)))
+    ;; === 错误场景：坐标数组长度不匹配 ===
+    (handler-case
+	(progn
+          (vt-gradient (vt-arange 5) :spacing (vt-arange 3) :axis 0)
+          (format t "~%ERROR: Should have signalled mismatch~%"))
+      (simple-error (e)
+	(format t "~%Correctly signalled length mismatch: ~A~%" e)))
 
-  (format t "~%All advanced gradient tests passed!~%")))
+    (format t "~%All advanced gradient tests passed!~%")))
 
 
 (defun test-vt-pad ()
@@ -1641,12 +1641,12 @@
     (format t "~%Constant padding:~%~A~%" padded)
     (assert (equal (vt-shape padded) '(5 3)))  ; (2+1+2)=5, (2+0+1)=3
     (assert (vt-allclose padded
-                          (vt-from-sequence '((99 99 99)
-                                              (1  2  99)
-                                              (3  4  99)
-                                              (99 99 99)
-                                              (99 99 99))
-                                             :type 'fixnum))))
+                         (vt-from-sequence '((99 99 99)
+                                             (1  2  99)
+                                             (3  4  99)
+                                             (99 99 99)
+                                             (99 99 99))
+                                           :type 'fixnum))))
   
   ;; 1b. 常数填充，左右不同常数
   (let* ((a (vt-arange 5 :type 'fixnum))
@@ -1666,7 +1666,7 @@
                                         (1 1 1 2 3 3 3)
                                         (4 4 4 5 6 6 6)
                                         (4 4 4 5 6 6 6))
-                                       :type 'fixnum)))
+                                      :type 'fixnum)))
       (assert (vt-allclose padded expected))))
   
   ;; 3. 循环填充 (wrap)
@@ -1680,7 +1680,7 @@
                                         (2 1 2 1)
                                         (4 3 4 3)
                                         (2 1 2 1))
-                                       :type 'fixnum)))
+                                      :type 'fixnum)))
       (assert (vt-allclose padded expected))))
   
   ;; 4. 反射填充 (reflect) - 不重复边缘
@@ -1691,10 +1691,10 @@
     (assert (equal (vt-shape padded) '(6 7)))
     ;; 手动计算预期：轴0反射：原始行索引 0,1 → 左填充：跳过边缘(0)，从 1,0? 实际上 reflect 模式：左填充从左向右反射第一行（索引1），第二行（索引0）
     ;; 规则：对于左边界，填充序列为 a[1], a[0]；对于右边界，填充序列为 a[n-2], a[n-3]...
-      ;; 仅验证形状即可，因为内容需要严格按照规则；这里改为验证特定元素
-      ;; 验证中心区域与原矩阵一致
-      (let ((center (vt-slice padded '(2 4) '(2 5))))
-        (assert (vt-allclose center a))))
+    ;; 仅验证形状即可，因为内容需要严格按照规则；这里改为验证特定元素
+    ;; 验证中心区域与原矩阵一致
+    (let ((center (vt-slice padded '(2 4) '(2 5))))
+      (assert (vt-allclose center a))))
   
   ;; 5. 对称填充 (symmetric) - 重复边缘
   (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
@@ -1707,7 +1707,7 @@
                                         (1 1 2 2)
                                         (3 3 4 4)
                                         (3 3 4 4))
-                                       :type 'fixnum)))
+                                      :type 'fixnum)))
       (assert (vt-allclose padded expected))))
   
   ;; 6. 反射模式宽度超过限制应报错
@@ -1731,29 +1731,29 @@
     (let ((padded (vt-pad a '((1 2) (0 1)) :mode :constant :constant-values 99)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((99 99 99)
-                                                ( 1  2 99)
-                                                ( 3  4 99)
-                                                (99 99 99)
-                                                (99 99 99))
-                                              :type 'fixnum)))))
+                                               ( 1  2 99)
+                                               ( 3  4 99)
+                                               (99 99 99)
+                                               (99 99 99))
+                                             :type 'fixnum)))))
   ;; 2. Edge
   (let ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum)))
     (let ((padded (vt-pad a '((1 1) (2 2)) :mode :edge)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((1 1 1 2 3 3 3)
-                                                (1 1 1 2 3 3 3)
-                                                (4 4 4 5 6 6 6)
-                                                (4 4 4 5 6 6 6))
-                                              :type 'fixnum)))))
+                                               (1 1 1 2 3 3 3)
+                                               (4 4 4 5 6 6 6)
+                                               (4 4 4 5 6 6 6))
+                                             :type 'fixnum)))))
   ;; 3. Wrap
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
     (let ((padded (vt-pad a '((1 1) (1 1)) :mode :wrap)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((4 3 4 3)
-                                                (2 1 2 1)
-                                                (4 3 4 3)
-                                                (2 1 2 1))
-                                              :type 'fixnum)))))
+                                               (2 1 2 1)
+                                               (4 3 4 3)
+                                               (2 1 2 1))
+                                             :type 'fixnum)))))
   ;; 4. Reflect（只需验证中心区域不变）
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
     (let ((padded (vt-pad a '((2 2) (2 2)) :mode :reflect)))
@@ -1763,10 +1763,10 @@
     (let ((padded (vt-pad a '((1 1) (1 1)) :mode :symmetric)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((1 1 2 2)
-                                                (1 1 2 2)
-                                                (3 3 4 4)
-                                                (3 3 4 4))
-                                              :type 'fixnum)))))
+                                               (1 1 2 2)
+                                               (3 3 4 4)
+                                               (3 3 4 4))
+                                             :type 'fixnum)))))
   ;; 6. 1D symmetric (NumPy 示例)
   (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
     (assert (vt-allclose (vt-pad a '((0 2)) :mode :symmetric)
@@ -1793,9 +1793,9 @@
            (p (vt-pad a '((1 0) (2 1)) :mode :constant :constant-values 0)))
       ;; NumPy: np.pad([[1,2],[3,4]], ((1,0),(2,1)), 'constant') -> [[0,0,0,0,0], [0,0,1,2,0], [0,0,3,4,0]]
       (assert (vt= p (vt-from-sequence '((0 0 0 0 0)
-                                        (0 0 1 2 0)
-                                        (0 0 3 4 0))
-                                      :type 'fixnum))))
+                                         (0 0 1 2 0)
+                                         (0 0 3 4 0))
+                                       :type 'fixnum))))
 
     (let* ((a (vt-from-sequence '(1.0d0 2.0d0) :type 'double-float))
            (p (vt-pad a '((1 1)) :mode :constant :constant-values '(10.0d0 20.0d0))))
@@ -1984,36 +1984,36 @@
 	     (vt-to-list (vt-argsort a :axis -1))
 	     '((1 2 0)
 	       (2 1 0))))
-     (assert (equal
+    (assert (equal
 	     (vt-to-list (vt-argsort a :axis 1))
 	     '((1 2 0)
 	       (2 1 0))))
 
-     (assert (equal
+    (assert (equal
 	     (vt-to-list (vt-argsort a :axis 0))
 	     '((0 0 0)
 	       (1 1 1))))
-     (assert (equal
+    (assert (equal
 	     (vt-to-list (vt-argsort a :axis nil))
 	     '(1 2 0 5 4 3)))
     (print "passed test vt-argsort")))
-    
-    
+
+
 (defun test-vt-sort ()
   (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
     (assert (equal
 	     (vt-to-list (vt-sort a :axis -1))
 	     '((1 2 3)
 	       (4 5 6))))
-     (assert (equal
+    (assert (equal
 	     (vt-to-list (vt-sort a :axis 1))
 	     '((1 2 3)
 	       (4 5 6))))
-     (assert (equal
+    (assert (equal
 	     (vt-to-list (vt-sort a :axis 0))
 	     '((3 1 2)
 	       (6 5 4))))
-     (assert (equal
+    (assert (equal
 	     (vt-to-list (vt-sort a :axis nil))
 	     '(1 2 3 4 5 6)))
     (print "passed test vt-sort")))
@@ -2042,46 +2042,46 @@
                          '(((0 0) (0 0)) ((1 1) (1 1))))
 		  1 0)))))
 
- (macrolet ((assert-close (a b &optional (eps 1e-8))
+(macrolet ((assert-close (a b &optional (eps 1e-8))
              `(unless (<= (abs (- ,a ,b)) ,eps)
                 (error "Assertion failed: ~A ~A differ by ~A"
                        ',a ',b (abs (- ,a ,b))))))
-	(defun test-svd-correctness ()
-  (format t "~%=== Testing vt-svd correctness ===")
-  (let* ((A (vt-from-sequence '((1 2 3)
-                                (4 5 6)
-                                (7 8 9)
-                                (10 11 12))
-                              :type 'double-float))
-         (m (first (vt-shape A)))
-         (n (second (vt-shape A)))
-         (k (min m n)))
-    ;; 经济模式
-    (multiple-value-bind (U S Vt) (vt-svd A :full-matrices nil)
-      (let* ((Smat (vt-zeros (list (vt-size S) (vt-size S)) :type 'double-float))
-             (_ (dotimes (i (vt-size S))
-                  (setf (vt-ref Smat i i) (vt-ref S i))))
-             (recon (vt-@ (vt-@ U Smat) Vt))
-             (err (vt-amax (vt-abs (vt-- A recon)))))
-        (format t "~%Economic SVD: max reconstruction error = ~A" err)
-        (assert-close err 0.0d0 1e-12)
-        (assert (equal (vt-shape Vt) (list k n))   ; Vt 应为 k×n
-                () "Economic Vt shape is ~A, expected (~A ~A)" (vt-shape Vt) k n)))
-    ;; 完整模式
-    (multiple-value-bind (U S Vt) (vt-svd A :full-matrices t)
-      (let* ((m (first (vt-shape A)))   ; = 4
-             (n (second (vt-shape A)))  ; = 3
-             (k (vt-size S))            ; = 3
-             (Smat (vt-zeros (list m n) :type 'double-float)))  ; 4×3
-	(dotimes (i k)
-	  (setf (vt-ref Smat i i) (vt-ref S i)))
-	(let* ((recon (vt-@ (vt-@ U Smat) Vt))
-              (err (vt-amax (vt-abs (vt-- A recon)))))
-	  (format t "Full SVD reconstruction error: ~A~%" err)
-        (assert-close err 0.0d0 1e-12)
-        (assert (equal (vt-shape Vt) (list n n))
-                () "Full Vt shape is ~A, expected (~A ~A)" (vt-shape Vt) n n)))
-    (format t "~%SVD tests passed~%")))))
+  (defun test-svd-correctness ()
+    (format t "~%=== Testing vt-svd correctness ===")
+    (let* ((A (vt-from-sequence '((1 2 3)
+                                  (4 5 6)
+                                  (7 8 9)
+                                  (10 11 12))
+				:type 'double-float))
+           (m (first (vt-shape A)))
+           (n (second (vt-shape A)))
+           (k (min m n)))
+      ;; 经济模式
+      (multiple-value-bind (U S Vt) (vt-svd A :full-matrices nil)
+	(let* ((Smat (vt-zeros (list (vt-size S) (vt-size S)) :type 'double-float))
+               (_ (dotimes (i (vt-size S))
+                    (setf (vt-ref Smat i i) (vt-ref S i))))
+               (recon (vt-@ (vt-@ U Smat) Vt))
+               (err (vt-amax (vt-abs (vt-- A recon)))))
+          (format t "~%Economic SVD: max reconstruction error = ~A" err)
+          (assert-close err 0.0d0 1e-12)
+          (assert (equal (vt-shape Vt) (list k n))   ; Vt 应为 k×n
+                  () "Economic Vt shape is ~A, expected (~A ~A)" (vt-shape Vt) k n)))
+      ;; 完整模式
+      (multiple-value-bind (U S Vt) (vt-svd A :full-matrices t)
+	(let* ((m (first (vt-shape A)))   ; = 4
+               (n (second (vt-shape A)))  ; = 3
+               (k (vt-size S))            ; = 3
+               (Smat (vt-zeros (list m n) :type 'double-float)))  ; 4×3
+	  (dotimes (i k)
+	    (setf (vt-ref Smat i i) (vt-ref S i)))
+	  (let* ((recon (vt-@ (vt-@ U Smat) Vt))
+		 (err (vt-amax (vt-abs (vt-- A recon)))))
+	    (format t "Full SVD reconstruction error: ~A~%" err)
+            (assert-close err 0.0d0 1e-12)
+            (assert (equal (vt-shape Vt) (list n n))
+                    () "Full Vt shape is ~A, expected (~A ~A)" (vt-shape Vt) n n)))
+	(format t "~%SVD tests passed~%")))))
 
 
 
@@ -2147,61 +2147,61 @@
       (assert (vt-allclose a expected))
       (format t "Test 4 passed: 1D indices + shorter values (cycle)~%"))
 
-  ;; ------------------------------------------------------------
-  ;; 测试 5: 多维 indices（自动展平）+ 标量 values
-  ;; NumPy:
-  ;;   a = np.arange(12).reshape(3,4)
-  ;;   indices = np.array([[0, 3], [8, 11]])   # 展平后为 [0,3,8,11]
-  ;;   np.put(a, indices, -999)
-  ;;   print(a)
-  ;;   # [[-999,   1,   2, -999],
-  ;;   #  [   4,   5,   6,   7],
-  ;;   #  [-999,   9,  10, -999]]
-  ;; ------------------------------------------------------------
-  (let ((a (vt-arange 12 :type 'fixnum)))
-    (setf a (vt-reshape a '(3 4)))
-    (let ((indices (vt-from-sequence '((0 3) (8 11)) :type 'fixnum)))
-      (vt-put a indices -999))
-    (let ((expected (vt-from-sequence '((-999 1 2 -999)
-                                        (4 5 6 7)
-                                        (-999 9 10 -999))
-                                      :type 'fixnum)))
-      (assert (vt-allclose a expected))
-      (format t "Test 5 passed: multi-dim indices (flattened) + scalar value~%"))
+    ;; ------------------------------------------------------------
+    ;; 测试 5: 多维 indices（自动展平）+ 标量 values
+    ;; NumPy:
+    ;;   a = np.arange(12).reshape(3,4)
+    ;;   indices = np.array([[0, 3], [8, 11]])   # 展平后为 [0,3,8,11]
+    ;;   np.put(a, indices, -999)
+    ;;   print(a)
+    ;;   # [[-999,   1,   2, -999],
+    ;;   #  [   4,   5,   6,   7],
+    ;;   #  [-999,   9,  10, -999]]
+    ;; ------------------------------------------------------------
+    (let ((a (vt-arange 12 :type 'fixnum)))
+      (setf a (vt-reshape a '(3 4)))
+      (let ((indices (vt-from-sequence '((0 3) (8 11)) :type 'fixnum)))
+	(vt-put a indices -999))
+      (let ((expected (vt-from-sequence '((-999 1 2 -999)
+                                          (4 5 6 7)
+                                          (-999 9 10 -999))
+					:type 'fixnum)))
+	(assert (vt-allclose a expected))
+	(format t "Test 5 passed: multi-dim indices (flattened) + scalar value~%"))
 
-  ;; ------------------------------------------------------------
-  ;; 测试 6: 二维张量（非展平）使用 axis 参数（注意：vt-put 目前没有 axis 参数，
-  ;;         它总是按展平索引工作。NumPy 的 put 也没有 axis，但 numpy.put_along_axis 有。
-  ;;         这里测试的是展平索引在多维数组上的行为，符合预期。）
-  ;; NumPy:
-  ;;   a = np.arange(12).reshape(3,4)
-  ;;   np.put(a, [2, 7, 10], [777, 888, 999])
-  ;;   print(a)
-  ;;   # [[  0,   1, 777,   3],
-  ;;   #  [  4,   5,   6, 888],
-  ;;   #  [  8,   9, 999,  11]]
-  ;; ------------------------------------------------------------
-  (let ((a (vt-arange 12 :type 'fixnum)))
-    (setf a (vt-reshape a '(3 4)))
-    (vt-put a '(2 7 10) '(777 888 999))
-    (let ((expected (vt-from-sequence '((0 1 777 3)
-                                        (4 5 6 888)
-                                        (8 9 999 11))
-                                      :type 'fixnum)))
-      (assert (vt-allclose a expected))
-      (format t "Test 6 passed: flat indices on 2D array~%"))
+      ;; ------------------------------------------------------------
+      ;; 测试 6: 二维张量（非展平）使用 axis 参数（注意：vt-put 目前没有 axis 参数，
+      ;;         它总是按展平索引工作。NumPy 的 put 也没有 axis，但 numpy.put_along_axis 有。
+      ;;         这里测试的是展平索引在多维数组上的行为，符合预期。）
+      ;; NumPy:
+      ;;   a = np.arange(12).reshape(3,4)
+      ;;   np.put(a, [2, 7, 10], [777, 888, 999])
+      ;;   print(a)
+      ;;   # [[  0,   1, 777,   3],
+      ;;   #  [  4,   5,   6, 888],
+      ;;   #  [  8,   9, 999,  11]]
+      ;; ------------------------------------------------------------
+      (let ((a (vt-arange 12 :type 'fixnum)))
+	(setf a (vt-reshape a '(3 4)))
+	(vt-put a '(2 7 10) '(777 888 999))
+	(let ((expected (vt-from-sequence '((0 1 777 3)
+                                            (4 5 6 888)
+                                            (8 9 999 11))
+					  :type 'fixnum)))
+	  (assert (vt-allclose a expected))
+	  (format t "Test 6 passed: flat indices on 2D array~%"))
 
-  ;; ------------------------------------------------------------
-  ;; 测试 7: 索引越界检测（应抛出错误）
-  ;; NumPy: np.put(a, [100], 0) 会引发 IndexError
-  ;; ------------------------------------------------------------
-  (handler-case
-      (let ((a (vt-arange 5 :type 'fixnum)))
-        (vt-put a 100 42))
-    (simple-error (e)
-      (format t "Test 7 passed: caught out-of-bounds error: ~A~%" e)))
+	;; ------------------------------------------------------------
+	;; 测试 7: 索引越界检测（应抛出错误）
+	;; NumPy: np.put(a, [100], 0) 会引发 IndexError
+	;; ------------------------------------------------------------
+	(handler-case
+	    (let ((a (vt-arange 5 :type 'fixnum)))
+              (vt-put a 100 42))
+	  (simple-error (e)
+	    (format t "Test 7 passed: caught out-of-bounds error: ~A~%" e)))
 
-  (format t "All vt-put tests passed successfully!~%")))))
+	(format t "All vt-put tests passed successfully!~%")))))
 
 
 
@@ -2386,8 +2386,8 @@
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 10 5)))
     (assert (lists-approx-equal (vt-to-list vt)
-			       '(0.0 2.5 5.0 7.5 10.0)
-			       :epsilon 1e-6)))
+				'(0.0 2.5 5.0 7.5 10.0)
+				:epsilon 1e-6)))
 
   ;; -----------------------------------------------------------
   ;; 2. endpoint=nil，不包含终点
@@ -2396,8 +2396,8 @@
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 10 5 :endpoint nil)))
     (assert (lists-approx-equal (vt-to-list vt)
-			       '(0.0 2.0 4.0 6.0 8.0)
-			       :epsilon 1e-6)))
+				'(0.0 2.0 4.0 6.0 8.0)
+				:epsilon 1e-6)))
 
   ;; -----------------------------------------------------------
   ;; 3. num=1，此时应返回只包含 start 的数组
@@ -2437,7 +2437,7 @@
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 10 0 5)))
     (assert (lists-approx-equal (vt-to-list vt)
-			       '(10.0 7.5 5.0 2.5 0.0) :epsilon 1e-6)))
+				'(10.0 7.5 5.0 2.5 0.0) :epsilon 1e-6)))
 
   ;; -----------------------------------------------------------
   ;; 7. endpoint=t 且 num=2
@@ -2446,7 +2446,7 @@
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 1 2)))
     (assert (lists-approx-equal (vt-to-list vt)
-			       '(0.0 1.0) :epsilon 1e-6)))
+				'(0.0 1.0) :epsilon 1e-6)))
 
   ;; -----------------------------------------------------------
   ;; 8. endpoint=nil 且 num=2
@@ -2455,7 +2455,7 @@
   ;; -----------------------------------------------------------
   (let ((vt (vt-linspace 0 1 2 :endpoint nil)))
     (assert (lists-approx-equal (vt-to-list vt)
-			       '(0.0 0.5) :epsilon 1e-6)))
+				'(0.0 0.5) :epsilon 1e-6)))
 
   (format t "~%All vt-linspace tests passed.~%"))
 
@@ -2476,11 +2476,11 @@
          (b (vt-from-sequence '((0 5) (6 7)) :type 'double-float))
          (k (vt-kron a b))
          (expected (vt-from-sequence
-                     '((0 5 0 10)
-                       (6 7 12 14)
-                       (0 15 0 20)
-                       (18 21 24 28))
-                     :type 'double-float)))
+                    '((0 5 0 10)
+                      (6 7 12 14)
+                      (0 15 0 20)
+                      (18 21 24 28))
+                    :type 'double-float)))
     (assert (equalp (vt-shape k) '(4 4)))
     (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([[1,2],[3,4]], [[0,5],[6,7]]) PASS~%"))
@@ -2491,9 +2491,9 @@
          (k (vt-kron a b))
          ;; 预期：a 视为 1x2，b 为 2x2 → 结果 2x4
          (expected (vt-from-sequence
-                     '((3 4 6 8)
-                       (5 6 10 12))
-                     :type 'double-float)))
+                    '((3 4 6 8)
+                      (5 6 10 12))
+                    :type 'double-float)))
     (assert (equalp (vt-shape k) '(2 4)))
     (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([1,2], [[3,4],[5,6]]) PASS~%"))
@@ -2906,9 +2906,9 @@
          (v (vt-var a))
          (s (vt-std a)))
     (assert (lists-approx-equal (list v)
-			       '(1.25d0) :epsilon 1e-6))
+				'(1.25d0) :epsilon 1e-6))
     (assert (lists-approx-equal (list s)
-			       (list (sqrt 1.25d0)) :epsilon 1e-6)))
+				(list (sqrt 1.25d0)) :epsilon 1e-6)))
 
   ;; vt-prod
   ;; np.prod([1,2,3,4]) -> 24
@@ -2981,7 +2981,7 @@
          (c (vt-convolve a v :mode :same)))
     ;; NumPy: array([1., 2.5, 4 ])  计算略
     (assert (lists-approx-equal (vt-to-list c)
-			       '(1.0 2.5 4.0) :epsilon 1e-6)))
+				'(1.0 2.5 4.0) :epsilon 1e-6)))
 
   (format t "~%test-math-ops passed.~%"))
 
@@ -3345,9 +3345,9 @@
     ;; # NumPy: a = np.array([1,2,3,4,5]); np.delete(a, slice(1,3))
 
     (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float)))
-  (check "delete_flat_slice"
-         (vt-delete a '(:slice 1 3) :axis nil)   ; 注意改为 (:slice 1 3)
-         '(1 4 5)))
+      (check "delete_flat_slice"
+             (vt-delete a '(:slice 1 3) :axis nil)   ; 注意改为 (:slice 1 3)
+             '(1 4 5)))
     
     ;; 用例3: 展平模式，索引列表删除
     ;; # NumPy: a = np.array([1,2,3,4,5]); np.delete(a, [0,2,4])
@@ -3445,7 +3445,6 @@
   (test-vt-from-function)
   (test-vt-bincount)
   (test-vt-digitize)
-
-    (test-vt-append)
+  (test-vt-append)
   (test-vt-insert)
   (test-vt-delete))
