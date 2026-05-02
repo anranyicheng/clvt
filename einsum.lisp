@@ -1,19 +1,29 @@
-
 (in-package :clvt)
 
-(defvar *vt-einsum-parse-cache* (make-hash-table :test 'equal))
+(defvar *vt-einsum-parse-cache* (make-hash-table :test 'eq))
 
 (declaim (inline get-parsed-subscripts))
 (defun get-parsed-subscripts (str)
-  (declare (optimize (speed 3)))
-  (let ((cached (gethash str *vt-einsum-parse-cache*)))
-    (if cached
-        (values (first cached) (second cached) (third cached))
-        (multiple-value-bind (inputs output explicit-p)
-            (parse-subscript-tokens str)
-          (setf (gethash str *vt-einsum-parse-cache*)
-                (list inputs output explicit-p))
-          (values inputs output explicit-p)))))
+  "高性能 Einsum 下标解析入口。使用 Symbol 作为哈希键实现 O(1) 查找。"
+  (declare (optimize (speed 3) (safety 0))
+           (simple-string str))
+  ;; 1. 将字符串 intern 为符号。例如 "ij,jk->ik" 变为符号 |ij,jk->ik|
+  ;; 无论这个下标出现多少次，intern 返回的都是同一个内存地址的符号对象
+  (let ((key (intern str "CLVT")))
+    (declare (type symbol key))
+    ;; 2. 使用 eq 测试在哈希表中查找，这是 CPU 指令级别的极速操作
+    (let ((cached (gethash key *vt-einsum-parse-cache*)))
+      (if cached
+          ;; 命中缓存：添加 the 声明消除返回值的类型检查开销
+          (values (the list (first cached))
+                  (the list (second cached))
+                  (the boolean (third cached)))
+          ;; 未命中：执行解析，并将结果绑定到符号键上
+          (multiple-value-bind (inputs output explicit-p)
+	      (parse-subscript-tokens str)
+            (setf (gethash key *vt-einsum-parse-cache*)
+		  (list inputs output explicit-p))
+            (values inputs output explicit-p))))))
 
 (declaim (inline parse-subscript-tokens))
 (defun parse-subscript-tokens (str)
