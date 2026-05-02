@@ -999,62 +999,50 @@
                 :return-arg nil)))
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
-  "判断两个数组元素是否在容差范围内接近"
+  "判断两个数组元素是否在容差范围内接近。
+   注意：此实现采用对称容差 (使用 max(|a|, |b|))，与 PyTorch 一致。"
   (vt-map (lambda (a b)
-            (let ((diff (abs (- a b))))
-              (if (<= diff (+ atol
-			      (* rtol
-				 (max (abs a)
-				      (abs b)))))
-                  1.0d0 0.0d0)))
+            ;; 1. 利用 CL 的 = 运算符：Inf == Inf 为 T，NaN == NaN 为 NIL
+            ;; 这一步直接拦截了无穷大相等的情况，并加速了完全相同的元素
+            (if (= a b)
+                1.0d0
+                ;; 2. 对于不相等的有限浮点数，进行容差比较
+                ;; (如果包含 NaN，- 运算会得到 NaN，随后的 <= 会返回 NIL，逻辑依然正确)
+                (let ((diff (abs (- a b))))
+                  (if (<= diff (+ atol (* rtol (max (abs a) (abs b)))))
+                      1.0d0 
+                      0.0d0))))
           t1 t2))
 
-(defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) (equal-nan nil))
-  "判断两个数组元素是否在容差范围内接近"
-  (declare (ignore equal-nan)) ; 简化，暂不支持
-  (vt-map (lambda (a b)
-            (cond
-              ((or (and (floatp a) (floatp b) (/= a a))   ; NaN
-                   (and (floatp a) (floatp b) (/= b b)))
-               0.0d0)
-              ((and (floatp a) (floatp b)
-                    (or (and (= a most-positive-double-float)
-			     (= b most-positive-double-float))
-                        (and (= a most-negative-double-float)
-			     (= b most-negative-double-float))))
-               1.0d0)
-              (t (let ((diff (abs (- a b))))
-                   (if (<= diff (+ atol (* rtol (abs b))))
-                       1.0d0 0.0d0)))))
-          t1 t2))
 
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个数组整体是否在容差范围内接近"
   (= (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol)) 1.0d0))
 
 (defun vt-isfinite (vt)
-  "检查是否为有限值。"
-  (vt-map (lambda (x)
-            (declare (type double-float x))
-            (if (and (not (= x sb-kernel::double-float-positive-infinity))
-                     (not (= x sb-kernel::double-float-negative-infinity))
-                     (= x x))    ; NaN 与自身不相等
-                1.0d0 0.0d0))
-          vt))
+  "检查是否为有限值（非 NaN，非无穷）。跨平台兼容实现。"
+  (let ((pos-inf (* most-positive-double-float 2.0d0))
+        (neg-inf (* most-negative-double-float 2.0d0)))
+    (vt-map (lambda (x)
+              (if (and (= x x) ; 排除 NaN
+                       (not (= x pos-inf))
+                       (not (= x neg-inf)))
+                  1.0d0 0.0d0))
+            vt)))
 
 (defun vt-isinf (vt)
   "检查是否为无穷。"
-  (vt-map (lambda (x)
-            (declare (type double-float x))
-            (if (or (= x sb-kernel::double-float-positive-infinity)
-                    (= x sb-kernel::double-float-negative-infinity))
-                1.0d0 0.0d0))
-          vt))
+  (let ((pos-inf (* most-positive-double-float 2.0d0))
+        (neg-inf (* most-negative-double-float 2.0d0)))
+    (vt-map (lambda (x)
+              (if (or (= x pos-inf)
+                      (= x neg-inf))
+                      1.0d0 0.0d0))
+              vt)))
 
 (defun vt-isnan (vt)
   "检查是否为 NaN"
   (vt-map (lambda (x)
-            (declare (type double-float x))
             (if (/= x x)  ; NaN 不等于自身
                 1.0d0 0.0d0))
           vt))

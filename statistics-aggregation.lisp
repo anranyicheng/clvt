@@ -124,20 +124,36 @@
             0.0d0 
             (/ weighted-sum sum-weights 1.0d0)))))
 
-(defun vt-var (tensor &key axis keepdims)
-  "计算方差."
-  (let* ((mean-val (vt-mean tensor :axis axis
-				   :keepdims keepdims))
-         (diff (vt-map #'- tensor mean-val))  
-         (sq-diff (vt-map (lambda (x) (* x x)) diff)))
-    (vt-mean sq-diff :axis axis :keepdims keepdims)))
+(defun vt-var (tensor &key axis keepdims (ddof 0))
+  "计算方差。
+   ddof : Delta Degrees of Freedom（自由度修正值）。默认为 0（总体方差）。
+   设为 1 则计算无偏样本方差。"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (real-axis (when axis (vt-normalize-axis axis rank)))
+         ;; 1. 计算均值（强制 keepdims 以便后续广播）
+         (mean-val (vt-mean tensor :axis real-axis :keepdims t))
+         ;; 2. 计算偏差平方
+         (sq-diff (vt-square (vt-- tensor mean-val)))
+         ;; 3. 计算平方和
+         (sum-sq (vt-sum sq-diff :axis real-axis :keepdims keepdims))
+         ;; 4. 计算元素个数 N
+         (n (if real-axis 
+               (the fixnum (nth real-axis shape))
+               (the fixnum (reduce #'* shape))))
+         ;; 5. 计算除数，防止除零或负数
+         (divisor (max 0 (- n ddof))))
+    ;; 6. 执行除法（标量除以张量，自动广播）
+    (if (vt-p sum-sq)
+        (vt-/ sum-sq divisor)
+        (if (zerop divisor) 0.0d0 (/ sum-sq divisor)))))
 
-(defun vt-std (tensor &key axis keepdims)
-  "计算标准差."
-  (let ((variance (vt-var tensor :axis axis
-				 :keepdims keepdims)))
+(defun vt-std (tensor &key axis keepdims (ddof 0))
+  "计算标准差。
+   ddof : 自由度修正值，默认为 0。设为 1 计算无偏样本标准差。"
+  (let ((variance (vt-var tensor :axis axis :keepdims keepdims :ddof ddof)))
     (if (vt-p variance)
-        (vt-map #'sqrt variance)
+        (vt-sqrt variance)
         (sqrt variance))))
 
 (defun nan-stats-helpers (tensor &key axis keepdims)
@@ -180,7 +196,6 @@
          (clean (vt-where mask (vt-zeros-like tensor) tensor))
          (count (vt-sum not-nan :axis axis :keepdims keepdims))
          (mean (vt-nanmean tensor :axis axis :keepdims t))
-         ;; 关键修正：平方偏差 * 掩码，使 NaN 位置贡献 0
          (squared-diff (vt-* (vt-map (lambda (c m) (* (- c m) (- c m)))
 				     clean mean)
                              not-nan))

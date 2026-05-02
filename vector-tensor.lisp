@@ -297,7 +297,7 @@
   (let* ((in-data (vt-data vector-tensor))
          (n (car (vt-shape vector-tensor)))
          (res (make-vt (list n n) 0
-		       :type (vt-element-type vector-push-extend)))
+		       :type (vt-element-type vector-tensor)))
          (res-data (vt-data res))
          (res-strides (vt-strides res)))    
     (declare (type fixnum n)
