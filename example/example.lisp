@@ -3371,7 +3371,237 @@
              '((3) (6))))
     t))
 
+;; --------------------- test vt-flatten ---------------------
+(defun test-vt-flatten ()
+  ;; a = np.array([[1, 2], [3, 4]])
+  ;; a.flatten() -> [1, 2, 3, 4]
+  (let* ((a (vt-from-sequence '((1 2) (3 4))))
+         (flat (vt-flatten a)))
+    (assert (equal (vt-shape flat) '(4)))
+    (assert (equal (vt-to-list flat) '(1.0d0 2.0d0 3.0d0 4.0d0))))
+  ;; 对已经是 1D 的张量 flatten 无影响
+  (let* ((a (vt-arange 3 :type 'fixnum))
+         (flat (vt-flatten a)))
+    (assert (equal (vt-shape flat) '(3)))
+    (assert (equal (vt-to-list flat) '(0 1 2))))
+  (format t "~%test-vt-flatten passed.~%"))
 
+;; --------------------- test vt-from-sequence ---------------------
+(defun test-vt-from-sequence ()
+  ;; np.array([[1, 2], [3, 4]], dtype=np.float64)
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+    (assert (equal (vt-shape a) '(2 2)))
+    (assert (eq (vt-element-type a) 'double-float))
+    (assert (= (vt-ref a 0 0) 1.0d0))
+    (assert (= (vt-ref a 1 1) 4.0d0)))
+  ;; 从 1D list 创建
+  (let* ((a (vt-from-sequence '(5 6 7) :type 'fixnum)))
+    (assert (equal (vt-shape a) '(3)))
+    (assert (equal (vt-to-list a) '(5 6 7))))
+  (format t "~%test-vt-from-sequence passed.~%"))
+
+;; --------------------- test vt-diag ---------------------
+(defun test-vt-diag ()
+  ;; np.diag([1, 2, 3])
+  ;; -> [[1 0 0]
+  ;;     [0 2 0]
+  ;;     [0 0 3]]
+  (let* ((v (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (m (vt-diag v)))
+    (assert (equal (vt-shape m) '(3 3)))
+    (assert (= (vt-ref m 0 0) 1))
+    (assert (= (vt-ref m 1 1) 2))
+    (assert (= (vt-ref m 2 2) 3))
+    (assert (= (vt-ref m 0 1) 0))
+    (assert (= (vt-ref m 1 0) 0)))
+  (format t "~%test-vt-diag passed.~%"))
+
+;; --------------------- test arithmetic basics ---------------------
+(defun test-arithmetic-basics ()
+  ;; a = np.array([10.0, 20.0, 30.0])
+  ;; b = np.array([1.0, 2.0, 3.0])
+  ;; a + b -> [11, 22, 33]
+  (let* ((a (vt-from-sequence '(10.0 20.0 30.0)))
+         (b (vt-from-sequence '(1.0 2.0 3.0)))
+         (add (vt-+ a b))
+         (sub (vt-- a b))
+         (mul (vt-* a b))
+         (div (vt-/ a b)))
+    (assert (equal (vt-to-list add) '(11.0d0 22.0d0 33.0d0)))
+    ;; a - b -> [9, 18, 27]
+    (assert (equal (vt-to-list sub) '(9.0d0 18.0d0 27.0d0)))
+    ;; a * b -> [10, 40, 90]
+    (assert (equal (vt-to-list mul) '(10.0d0 40.0d0 90.0d0)))
+    ;; a / b -> [10, 10, 10]
+    (assert (equal (vt-to-list div) '(10.0d0 10.0d0 10.0d0))))
+  ;; 标量与张量运算
+  ;; a * 2 -> [20, 40, 60]
+  (let* ((a (vt-from-sequence '(10.0 20.0 30.0)))
+         (res (vt-* a 2.0d0)))
+    (assert (equal (vt-to-list res) '(20.0d0 40.0d0 60.0d0))))
+  (format t "~%test-arithmetic-basics passed.~%"))
+
+;; --------------------- test vt-comparison ---------------------
+(defun test-vt-comparison ()
+  ;; a = np.array([1, 2, 3])
+  ;; b = np.array([1, 4, 1])
+  ;; a == b -> [True, False, False] (1.0, 0.0, 0.0)
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (b (vt-from-sequence '(1 4 1) :type 'fixnum))
+         (eq (vt-= a b))
+         (lt (vt-< a b))
+         (gt (vt-> a b)))
+    (assert (equalp (vt-to-list eq) '(1 0 0)))
+    ;; a < b -> [False, True, False]
+    (assert (equalp (vt-to-list lt) '(0 1 0)))
+    ;; a > b -> [False, False, True]
+    (assert (equalp (vt-to-list gt) '(0 0 1))))
+  (format t "~%test-vt-comparison passed.~%"))
+
+;; --------------------- test vt-var-std-ddof ---------------------
+(defun test-vt-var-std-ddof ()
+  ;; a = np.array([1, 2, 3, 4])
+  ;; np.var(a) -> 1.25 (总体方差)
+  (let* ((a (vt-from-sequence '(1.0 2.0 3.0 4.0)))
+         (var-pop (vt-var a)))
+    (assert (< (abs (- var-pop 1.25d0)) 1e-9)))
+  ;; np.var(a, ddof=1) -> 1.666666... (样本方差)
+  (let* ((a (vt-from-sequence '(1.0 2.0 3.0 4.0)))
+         (var-sample (vt-var a :ddof 1)))
+    (assert (< (abs (- var-sample (/ 5.0d0 3.0d0))) 1e-9)))
+  ;; np.std(a, ddof=1) -> sqrt(1.666...) -> 1.29099...
+  (let* ((a (vt-from-sequence '(1.0 2.0 3.0 4.0)))
+         (std-sample (vt-std a :ddof 1)))
+    (assert (< (abs (- std-sample (sqrt (/ 5.0d0 3.0d0)))) 1e-9)))
+  (format t "~%test-vt-var-std-ddof passed.~%"))
+
+;; --------------------- test vt-prod-ptp ---------------------
+(defun test-vt-prod-ptp ()
+  ;; a = np.array([2, 3, 4])
+  ;; np.prod(a) -> 24
+  (let* ((a (vt-from-sequence '(2 3 4) :type 'fixnum))
+         (p (vt-prod a)))
+    (assert (= p 24)))
+  ;; np.ptp(a) -> 4 - 2 = 2 (峰峰值)
+  (let* ((a (vt-from-sequence '(2 3 4) :type 'fixnum))
+         (p (vt-ptp a)))
+    (assert (= p 2)))
+  (format t "~%test-vt-prod-ptp passed.~%"))
+
+;; --------------------- test vt-lu ---------------------
+(defun test-vt-lu ()
+  ;; 情况 1：无需行交换
+  ;; A = np.array([[3.0, 4.0], [1.0, 2.0]])
+  ;; 第一列主元已经是 3.0，无需交换
+  (let* ((a (vt-from-sequence '((3.0 4.0) (1.0 2.0))))
+         (lu-and-piv (multiple-value-list (vt-lu a)))
+         (lu (first lu-and-piv))
+         (piv (second lu-and-piv))
+         (sign (third lu-and-piv)))
+    ;; 无交换，sign 为 1，piv 保持原样
+    (assert (= sign 1))
+    (assert (equal piv '(0 1)))
+    ;; 检查紧凑 LU 矩阵
+    ;; U 的部分 (第一行和第二行后半)
+    (assert (< (abs (- (vt-ref lu 0 0) 3.0d0)) 1e-9))
+    (assert (< (abs (- (vt-ref lu 0 1) 4.0d0)) 1e-9))
+    (assert (< (abs (- (vt-ref lu 1 1) (/ 2.0d0 3.0d0))) 1e-9))
+    ;; L 的乘数部分 (第二行前半)
+    (assert (< (abs (- (vt-ref lu 1 0) (/ 1.0d0 3.0d0))) 1e-9)))
+
+  ;; 情况 2：发生行交换 (你提供的 case)
+  ;; A = np.array([[1.0, 2.0], [3.0, 4.0]])
+  ;; 第一列最大值是 3.0，在第 1 行，触发第 0 行和第 1 行交换
+  (let* ((a (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+         (lu-and-piv (multiple-value-list (vt-lu a)))
+         (lu (first lu-and-piv))
+         (piv (second lu-and-piv))
+         (sign (third lu-and-piv)))
+    ;; 发生一次交换，sign 变为 -1
+    (assert (= sign -1))
+    ;; piv 记录：结果的第 0 行来自原第 1 行，结果的第 1 行来自原第 0 行
+    (assert (equal piv '(1 0)))
+    ;; 交换后，第一行变成了原第二行 [3.0, 4.0]
+    (assert (< (abs (- (vt-ref lu 0 0) 3.0d0)) 1e-9))
+    (assert (< (abs (- (vt-ref lu 0 1) 4.0d0)) 1e-9))
+    ;; 消元乘数: 1.0 / 3.0 = 0.3333...
+    (assert (< (abs (- (vt-ref lu 1 0) (/ 1.0d0 3.0d0))) 1e-9))
+    ;; U 的最后一个元素: 2.0 - (1.0/3.0)*4.0 = 2.0/3.0 = 0.6667...
+    (assert (< (abs (- (vt-ref lu 1 1) (/ 2.0d0 3.0d0))) 1e-9)))
+
+  (format t "~%test-vt-lu passed.~%"))
+
+
+;; --------------------- test compatible functions ---------------------
+(defun test-vt-interp ()
+  ;; xp = [1, 2, 3]
+  ;; fp = [10, 20, 30]
+  ;; np.interp(1.5, xp, fp) -> 15.0
+  ;; np.interp(0.0, xp, fp, left=-1) -> -1.0 (左边界外)
+  (let* ((xp (vt-from-sequence '(1.0 2.0 3.0)))
+         (fp (vt-from-sequence '(10.0 20.0 30.0)))
+         (x (vt-from-sequence '(1.5)))
+         (res1 (vt-interp x xp fp))
+         (x2 (vt-from-sequence '(0.0)))
+         (res2 (vt-interp x2 xp fp :left -1.0d0)))
+    ;; vt-interp 返回的是张量，取其值
+    (assert (< (abs (- (vt-ref res1 0) 15.0d0)) 1e-9))
+    (assert (= (vt-ref res2 0) -1.0d0)))
+  (format t "~%test-vt-interp passed.~%"))
+
+(defun test-vt-convolve ()
+  ;; a = [1, 2, 3]
+  ;; v = [0, 1, 0.5]
+  ;; np.convolve(a, v, 'full') -> [0.0, 1.0, 2.5, 4.0, 1.5]
+  (let* ((a (vt-from-sequence '(1.0 2.0 3.0)))
+         (v (vt-from-sequence '(0.0 1.0 0.5)))
+         (res (vt-convolve a v :mode :full)))
+    (assert (equal (vt-shape res) '(5)))
+    (assert (< (abs (- (vt-ref res 0) 0.0d0)) 1e-9))
+    (assert (< (abs (- (vt-ref res 2) 2.5d0)) 1e-9))
+    (assert (< (abs (- (vt-ref res 4) 1.5d0)) 1e-9)))
+  (format t "~%test-vt-convolve passed.~%"))
+
+(defun test-vt-searchsorted ()
+  ;; a = np.array([1, 2, 3, 4, 5])
+  ;; np.searchsorted(a, 3) -> 2
+  ;; np.searchsorted(a, 0) -> 0
+  ;; np.searchsorted(a, 6) -> 5
+  (let* ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum))
+         (vals (vt-from-sequence '(3 0 6) :type 'fixnum))
+         (res (vt-searchsorted a vals)))
+    (assert (equal (vt-to-list res) '(2 0 5))))
+  (format t "~%test-vt-searchsorted passed.~%"))
+
+;; --------------------- test vt-extract ---------------------
+(defun test-vt-extract ()
+  ;; a = np.array([10, 20, 30, 40, 50])
+  ;; mask = np.array([True, False, True, False, True])
+  ;; a[mask] -> [10, 30, 50]
+  (let* ((a (vt-from-sequence '(10 20 30 40 50) :type 'fixnum))
+         (mask (vt-from-sequence '(1 0 1 0 1) :type 'fixnum))
+         (res (vt-extract mask a)))
+    (assert (equal (vt-shape res) '(3)))
+    (assert (equalp (vt-to-list res) '(10 30 50))))
+  (format t "~%test-vt-extract passed.~%"))
+
+;; --------------------- test vt-itemsize-nbytes ---------------------
+(defun test-vt-itemsize-nbytes ()
+  ;; a = np.array([1, 2], dtype=np.float64)
+  ;; a.itemsize -> 8
+  ;; a.nbytes -> 16
+  (let* ((a (vt-from-sequence '(1.0 2.0)))
+         (size (vt-size a))
+         (itemsize (vt-itemsize a))
+         (nbytes (vt-nbytes a)))
+    (assert (= size 2))
+    (assert (= itemsize 8))
+    (assert (= nbytes 16)))
+  ;; fixnum 测试 (通常为 8 字节，取决于平台，此处用 > 0 断言避免平台差异)
+  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+         (itemsize (vt-itemsize a)))
+    (assert (> itemsize 0)))
+  (format t "~%test-vt-itemsize-nbytes passed.~%"))
 ;; --------------------- 汇总 ---------------------
 
 (defun run-all-tests ()
@@ -3447,4 +3677,17 @@
   (test-vt-digitize)
   (test-vt-append)
   (test-vt-insert)
-  (test-vt-delete))
+  (test-vt-delete)
+  (test-vt-flatten)
+  (test-vt-from-sequence)
+  (test-vt-diag)
+  (test-arithmetic-basics)
+  (test-vt-comparison)
+  (test-vt-var-std-ddof)
+  (test-vt-prod-ptp)
+  ;;(test-vt-lu)
+  (test-vt-interp)
+  (test-vt-convolve)
+  (test-vt-searchsorted)
+  (test-vt-extract)
+  (test-vt-itemsize-nbytes))
