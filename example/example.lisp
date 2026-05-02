@@ -3685,7 +3685,7 @@
   (test-vt-comparison)
   (test-vt-var-std-ddof)
   (test-vt-prod-ptp)
-  ;;(test-vt-lu)
+  (test-vt-lu)
   (test-vt-interp)
   (test-vt-convolve)
   (test-vt-searchsorted)
