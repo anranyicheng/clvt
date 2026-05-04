@@ -1,5 +1,9 @@
 (in-package #:clvt)
 
+(defmacro with-float-safe (&body body)
+  `(sb-int:with-float-traps-masked (:invalid :divide-by-zero)
+     ,@body))
+
 (defstruct (vt (:constructor %make-vt))
   "N维张量结构.
    data: 存储数据的一维简单数组.
@@ -36,20 +40,21 @@
 (defun make-vt (shape initial-element &key (type 'double-float))
   "创建一个指定形状的张量,填充初始值."
   (declare (list shape))
-  (sb-int::with-float-traps-masked (:invalid)
-      (let* ((size (vt-shape-to-size shape))
-	     (tmp-type (if (eq type 'fixnum)
-			   'fixnum
-			   'double-float))
-             (data (make-array size :element-type tmp-type
-				    :initial-element
-				    (coerce initial-element tmp-type)))
-             (strides (vt-compute-strides shape)))
-	(%make-vt :data data
-		  :shape shape
-		  :strides strides
-		  :offset 0
-		  :etype tmp-type))))
+  (with-float-safe
+    (let* ((size (vt-shape-to-size shape))
+	   (tmp-type (if (eq type 'fixnum)
+			 'fixnum
+			 'double-float))
+           (data (make-array size :element-type tmp-type
+				  :initial-element
+				  (coerce initial-element tmp-type)))
+           (strides (vt-compute-strides shape)))
+      (%make-vt :data data
+		:shape shape
+		:strides strides
+		:offset 0
+		:etype tmp-type))))
+
 
 (defun vt-flatten-sequence (seq)
   "深度优先遍历 SEQ 及其嵌套序列,返回所有原子元素的列表.
@@ -100,81 +105,81 @@
    例如 (vt-from-sequence '((1 2) (3 4))) 返回形状为 (2 2) 的张量。
    若传入一维序列，返回一维张量。"
   ;; 辅助函数：递归推断形状并收集元素
-  (sb-int::with-float-traps-masked (:invalid)
-      (labels
-	  ((infer-shape (seq)
-             "返回形状列表，同时检查是否规则。"
-             (if (or (listp seq)
-		     (typep seq 'vector))
-		 (let ((len (length seq)))
-		   (if (zerop len)
-                       (list 0)   ; 空序列作为一维0尺寸
-                       (let* ((first (elt seq 0))
-                              (rest-shape (when (or (listp first)
-						    (typep first 'vector))
-                                            (infer-shape first))))
-			 (if rest-shape
-                             ;; 嵌套：所有子序列必须形状一致
-                             (cons
-			      len
-			      (loop for i from 1 below len
-                                    for sub = (elt seq i)
-                                    for sub-shape = (infer-shape sub)
-                                    unless (equal sub-shape rest-shape)
-                                      do (error "不规则嵌套: 期望 ~A 但得到 ~A"
-						rest-shape sub-shape)
-                                    finally (return rest-shape)))
-                             ;; 叶子：一维
-                             (list len)))))
-		 ;; 不是序列（但这种情况不应该发生，因为顶层是序列）
-		 (error "无法从 ~A 创建张量" seq)))
-	   (fill-tensor (data seq shape strides depth flat-idx)
-             (if (null shape)
-		 ;; 到达叶子：写入元素
-		 (setf (aref data flat-idx) (coerce seq type))
-		 (let ((len (first shape))
-                       (stride (first strides)))
-		   (loop for i from 0 below len
-			 for elem = (if (and (or (listp seq)
-						 (typep seq 'vector))
-                                             (< i (length seq)))
-					(elt seq i)
-					(error "序列长度不匹配"))
-			 for offset = (+ flat-idx (* i stride))
-			 do (fill-tensor data elem (rest shape) (rest strides)
-					 (1+ depth) offset))))))
-	(let* ((shape (infer-shape contents))
-               (size (reduce #'* shape :initial-value 1))
-               (data (make-array size :element-type type
-				      :initial-element (coerce 0 type)))
-               (strides (vt-compute-strides shape)))
-	  (fill-tensor data contents shape strides 0 0)
-	  (%make-vt :data data
-		    :shape shape
-		    :strides strides
-		    :offset 0
-		    :etype type)))))
+  (with-float-safe
+    (labels
+	((infer-shape (seq)
+           "返回形状列表，同时检查是否规则。"
+           (if (or (listp seq)
+		   (typep seq 'vector))
+	       (let ((len (length seq)))
+		 (if (zerop len)
+                     (list 0)   ; 空序列作为一维0尺寸
+                     (let* ((first (elt seq 0))
+                            (rest-shape (when (or (listp first)
+						  (typep first 'vector))
+                                          (infer-shape first))))
+		       (if rest-shape
+                           ;; 嵌套：所有子序列必须形状一致
+                           (cons
+			    len
+			    (loop for i from 1 below len
+                                  for sub = (elt seq i)
+                                  for sub-shape = (infer-shape sub)
+                                  unless (equal sub-shape rest-shape)
+                                    do (error "不规则嵌套: 期望 ~A 但得到 ~A"
+					      rest-shape sub-shape)
+                                  finally (return rest-shape)))
+                           ;; 叶子：一维
+                           (list len)))))
+	       ;; 不是序列（但这种情况不应该发生，因为顶层是序列）
+	       (error "无法从 ~A 创建张量" seq)))
+	 (fill-tensor (data seq shape strides depth flat-idx)
+           (if (null shape)
+	       ;; 到达叶子：写入元素
+	       (setf (aref data flat-idx) (coerce seq type))
+	       (let ((len (first shape))
+                     (stride (first strides)))
+		 (loop for i from 0 below len
+		       for elem = (if (and (or (listp seq)
+					       (typep seq 'vector))
+                                           (< i (length seq)))
+				      (elt seq i)
+				      (error "序列长度不匹配"))
+		       for offset = (+ flat-idx (* i stride))
+		       do (fill-tensor data elem (rest shape) (rest strides)
+				       (1+ depth) offset))))))
+      (let* ((shape (infer-shape contents))
+             (size (reduce #'* shape :initial-value 1))
+             (data (make-array size :element-type type
+				    :initial-element (coerce 0 type)))
+             (strides (vt-compute-strides shape)))
+	(fill-tensor data contents shape strides 0 0)
+	(%make-vt :data data
+		  :shape shape
+		  :strides strides
+		  :offset 0
+		  :etype type)))))
 
 (defun vt-from-array (arr)
   "从数组转vt, 维度不变"
   (declare (array arr))
-  (sb-int::with-float-traps-masked (:invalid)
-      (let* ((shape (array-dimensions arr))
-	     (type (if (eq (array-element-type arr) 'fixnum)
-		       'fixnum
-		       'double-float))
-	     (vt (vt-zeros shape :type type)))
-	(dotimes (idx (reduce #'* shape))
-	  (declare (fixnum idx))
-	  (setf (row-major-aref (vt-data vt) idx)
-		(coerce (row-major-aref arr idx) type)))
-	vt)))
+  (with-float-safe
+    (let* ((shape (array-dimensions arr))
+	   (type (if (eq (array-element-type arr) 'fixnum)
+		     'fixnum
+		     'double-float))
+	   (vt (vt-zeros shape :type type)))
+      (dotimes (idx (reduce #'* shape))
+	(declare (fixnum idx))
+	(setf (row-major-aref (vt-data vt) idx)
+	      (coerce (row-major-aref arr idx) type)))
+      vt)))
 
 (defun vt-flatten-to-nested (dims data)
   "将按行主序存储的一维向量 data 转换为符合 dims 维度的嵌套列表.
    (vt-flatten-to-nested (vt-shape vt) (vt-data vt))"
   (let ((total-size (reduce #'* dims))    ;; 总元素数
-        (idx 0))                          ;; 当前读取位置
+					  (idx 0))                          ;; 当前读取位置
     (assert (= total-size (length data)) (data)
             "数据长度与维度乘积不匹配")
     (labels ((recurse (dims block-size)
@@ -233,7 +238,7 @@
 
 (defun vt-size (vt)
   "张量的数据大小"
-  (reduce #'* (vt-shape vt)))
+  (reduce #'* (vt-shape vt) :initial-value 1))
 
 (defun vt-arange (n &key (start 0) (step 1) (type 'double-float))
   "创建一个包含范围值的一维张量."
@@ -289,8 +294,8 @@
     ;; 对于行优先,data[i, i] 的偏移是 i * row_stride + i * col_stride
     ;; row_stride 通常是 cols (对于密集矩阵), col_stride 是 1
     (let ((row-stride (first strides)) ;; 第一维步长
-          (col-stride (second strides)) ;; 第二维步长
-          (diagonal-len (min rows cols)))      
+				       (col-stride (second strides)) ;; 第二维步长
+				       (diagonal-len (min rows cols)))      
       (declare (type fixnum row-stride col-stride diagonal-len))
       ;; 沿对角线填充
       (loop for i fixnum from 0 below diagonal-len
@@ -326,10 +331,10 @@
    In-Place: 如果为 T,直接修改原张量；否则返回副本.
    支持 Batch (Rank >= 2)."
   (let* ((res (if in-place tensor (vt-copy tensor))) ;; vt-copy 需自行实现或用 vt-map identity
-         (res-data (vt-data res))
-         (res-shape (vt-shape res))
-         (res-strides (vt-strides res))
-         (rank (length res-shape)))    
+						     (res-data (vt-data res))
+						     (res-shape (vt-shape res))
+						     (res-strides (vt-strides res))
+						     (rank (length res-shape)))    
     (when (< rank 2) (error "vt-triu requires rank >= 2"))
     (labels
 	((recurse (depth ptr)
@@ -350,7 +355,7 @@
                          ;; 置零
                          (setf (aref res-data 
 				     (+ row-ptr (* c stride-col)))
-			        (coerce 0 (vt-element-type tensor)))))))               
+			       (coerce 0 (vt-element-type tensor)))))))               
                ;; === 高维递归 ===
                (let ((dim (nth depth res-shape))
                      (stride (nth depth res-strides)))
@@ -800,7 +805,7 @@
 
 (defun (setf vt-ref) (value vt &rest indices)
   "设置张量元素."
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((strides (vt-strides vt))
            (data (vt-data vt))
            (base-offset (vt-offset vt))
@@ -816,7 +821,7 @@
   "高效遍历宏。
    ptr-var: 当前元素的物理索引。
    val-var: 当前元素的值。"
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let ((rank-sym (gensym "RANK"))
           (shape-sym (gensym "SHAPE"))
           (strides-sym (gensym "STRIDES"))
@@ -856,7 +861,7 @@
   (unless (eq (vt-element-type dest)
 	      (vt-element-type src))
     (setf src (vt-astype src (vt-element-type dest))))
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let ((dest-shape (vt-shape dest))
           (src-shape (vt-shape src)))
       ;; 确保 Dest 的形状能够容纳 Src 广播后的形状
@@ -957,7 +962,7 @@
 (defmacro with-broadcasting-ptrs ((t1 t2 result-vt) &body body)
   "高性能广播宏.
    修复了指针迭代逻辑,确保指针随着循环正确递增."
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let ((idx-var (gensym "IDX"))
           (rank-var (gensym "RANK"))
           (res-shape (gensym "RES-SHAPE"))
@@ -1018,7 +1023,7 @@
    特性:自动类型转换、广播、指针算术优化、双目运算内联."
   (declare (function fn))
   ;; 1. [无缝操作] 统一转换输入为 VT
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((clean-tensors (mapcar #'ensure-vt tensors))
            (n-tensors (length clean-tensors)))    
       (when (= n-tensors 0) (error "vt-map requires at least one tensor"))
@@ -1148,7 +1153,7 @@
   (declare (type vt tensor)
            (type (or null fixnum) axis)
            (type function reducer-fn))
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((in-shape (vt-shape tensor))
            ;; 关键:获取实际类型
            (element-type (vt-element-type tensor))
@@ -1349,7 +1354,7 @@
    模式 2 (三元选择): (vt-where condition x y)
      根据 condition 从 x 或 y 中选择元素.支持广播.
      示例: (vt-where cond t1 t2) -> 新张量"
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (cond
       ;; === 模式 2: 三元选择 (condition, x, y) ===
       ((and x y)
@@ -1412,7 +1417,7 @@
    返回: 形状为 (N, Rank) 的二维张量,每一行是一个非零元素的完整坐标.
    示例: (vt-argwhere tensor) -> [[0, 1], [2, 3], ...]"
   (declare (type vt condition))
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((in-shape (vt-shape condition))
            (rank (length in-shape))
            (in-data (vt-data condition))
@@ -1473,33 +1478,33 @@
 ;;;; 关于nan的相关定义
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun vt-float-nan ()
-    (sb-int::with-float-traps-masked (:invalid :divide-by-zero)
+    (with-float-safe
       (/ 0.0d0 0.0d0)))
 
   (defun vt-float-nan-p (x)
     (sb-kernel::float-nan-p (coerce x 'double-float)))
 
   (defun vt-float-nan-= (nan-a nan-b)
-    (sb-int::with-float-traps-masked (:invalid)
+    (with-float-safe
       (= nan-a nan-b)))
 
   (defun vt-pos-inf ()
-    (sb-int::with-float-traps-masked (:invalid)
+    (with-float-safe
       (* sb-kernel::double-float-positive-infinity 2.0d0)))
 
   (defun vt-neg-inf ()
-    (sb-int::with-float-traps-masked (:invalid)
+    (with-float-safe
       (* sb-kernel::double-float-negative-infinity 2.0d0)))
 
   (defun vt-float-inf-p (x)
     (sb-kernel::float-infinity-p (coerce x 'double-float)))
 
   (defun vt-float-inf-= (inf-a inf-b)
-    (sb-int::with-float-traps-masked (:invalid)
+    (with-float-safe
       (= inf-a inf-b)))
 
   (defun vt-nan-inf-= (a b)
-    (sb-int::with-float-traps-masked (:invalid)
+    (with-float-safe
       (= a b))))
 
 (defconstant +vt-nan+
@@ -1520,7 +1525,7 @@
 	      (eq predicate '<)
 	      (eq predicate #'>)
 	      (eq predicate '>)))
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let ((sequence (coerce sequence 'list))    ; 统一为列表
           non-nans
           nans)

@@ -58,81 +58,83 @@
 
 (defun expand-ellipsis (input-subs output-sub vts)
   (declare (optimize (speed 3)))
-  (let ((ellipsis-ranks nil))
-    (declare (list ellipsis-ranks))
-    (loop for sub in input-subs
-          for vt in vts
-          for explicit-rank = (count-if #'characterp sub)
-          for has-ellipsis = (member :ellipsis sub)
-          for tensor-rank = (length (vt-shape vt))
-          for implicit-rank = (the fixnum (if has-ellipsis
-					      (- tensor-rank explicit-rank) 0))
-          do (when (and has-ellipsis (< implicit-rank 0))
-               (error "Subscript dimension mismatch"))
-             (when (> (count :ellipsis sub) 1)
-               (error "Only one ellipsis allowed"))
-             (push implicit-rank ellipsis-ranks))
-    (setf ellipsis-ranks (nreverse ellipsis-ranks))
-    (let* ((max-implicit-rank
-	     (reduce #'max ellipsis-ranks :initial-value 0))
-           (ellipsis-labels
-	     (loop for i from 0 below max-implicit-rank
-                   collect (code-char (+ (char-code #\?) i)))))
-      (declare (fixnum max-implicit-rank))
-      (flet ((expand-sub (sub implicit-rank)
-	       (declare (list sub))
-               (let ((pos (position :ellipsis sub)))
-                 (if (not pos) sub
-                     (let* ((before (subseq sub 0 pos))
-                            (after (nthcdr (1+ pos) sub))
-                            (labels-to-use
-			      (subseq ellipsis-labels
-				      (- max-implicit-rank implicit-rank))))
-                       (nconc before labels-to-use after))))))
-        (values (mapcar #'expand-sub input-subs ellipsis-ranks)
-                (when output-sub
-		  (expand-sub output-sub max-implicit-rank)))))))
+  (with-float-safe
+    (let ((ellipsis-ranks nil))
+      (declare (list ellipsis-ranks))
+      (loop for sub in input-subs
+            for vt in vts
+            for explicit-rank = (count-if #'characterp sub)
+            for has-ellipsis = (member :ellipsis sub)
+            for tensor-rank = (length (vt-shape vt))
+            for implicit-rank = (the fixnum (if has-ellipsis
+						(- tensor-rank explicit-rank) 0))
+            do (when (and has-ellipsis (< implicit-rank 0))
+		 (error "Subscript dimension mismatch"))
+               (when (> (count :ellipsis sub) 1)
+		 (error "Only one ellipsis allowed"))
+               (push implicit-rank ellipsis-ranks))
+      (setf ellipsis-ranks (nreverse ellipsis-ranks))
+      (let* ((max-implicit-rank
+	       (reduce #'max ellipsis-ranks :initial-value 0))
+             (ellipsis-labels
+	       (loop for i from 0 below max-implicit-rank
+                     collect (code-char (+ (char-code #\?) i)))))
+	(declare (fixnum max-implicit-rank))
+	(flet ((expand-sub (sub implicit-rank)
+		 (declare (list sub))
+		 (let ((pos (position :ellipsis sub)))
+                   (if (not pos) sub
+                       (let* ((before (subseq sub 0 pos))
+                              (after (nthcdr (1+ pos) sub))
+                              (labels-to-use
+				(subseq ellipsis-labels
+					(- max-implicit-rank implicit-rank))))
+			 (nconc before labels-to-use after))))))
+          (values (mapcar #'expand-sub input-subs ellipsis-ranks)
+                  (when output-sub
+		    (expand-sub output-sub max-implicit-rank))))))))
 
 (defun analyze-einsum (input-subs output-subs vts)
   (declare (type list input-subs output-subs vts))
   (declare (optimize (speed 3)))
-  (let ((label-dims (make-array 256 :element-type 'fixnum
-				    :initial-element 0))
-        (label-counts (make-array 256 :element-type 'fixnum
+  (with-float-safe
+    (let ((label-dims (make-array 256 :element-type 'fixnum
 				      :initial-element 0))
-        (all-labels-list nil))
-    
-    (loop for sub list in input-subs
-          for tns in vts
-          for shape = (vt-shape tns)
-          do (unless (= (length sub) (length shape))
-               (error "Subscript dimension mismatch"))
-             (loop for label in sub
-                   for dim fixnum in shape
-                   for code = (char-code label) do
-                   (incf (aref label-counts code))
-                   (pushnew label all-labels-list)
-                   (let ((old-dim (aref label-dims code)))
-                     (when (and (> old-dim 1) (> dim 1) (/= old-dim dim))
-                       (error "Dimension conflict for label ~A: ~A vs ~A"
-			      label old-dim dim))
-                     (setf (aref label-dims code)
-			   (max old-dim dim)))))
-    
-    (let* ((final-output-subs output-subs)
-           (explicit-mode (if final-output-subs t nil)))
-      (unless explicit-mode
-        (setf final-output-subs
-              (sort (loop for code from 0 below 256
-                          when (and (= (aref label-counts code) 1) 
-                                    (find (code-char code) all-labels-list))
-                          collect (code-char code))
-                    #'char<)))
+          (label-counts (make-array 256 :element-type 'fixnum
+					:initial-element 0))
+          (all-labels-list nil))
       
-      (let* ((sum-labels (set-difference all-labels-list final-output-subs))
-             (all-labels (coerce (append final-output-subs sum-labels) 
-                                 '(simple-array character (*)))))
-        (values all-labels label-dims final-output-subs)))))
+      (loop for sub list in input-subs
+            for tns in vts
+            for shape = (vt-shape tns)
+            do (unless (= (length sub) (length shape))
+		 (error "Subscript dimension mismatch"))
+               (loop for label in sub
+                     for dim fixnum in shape
+                     for code = (char-code label) do
+                       (incf (aref label-counts code))
+                       (pushnew label all-labels-list)
+                       (let ((old-dim (aref label-dims code)))
+			 (when (and (> old-dim 1) (> dim 1) (/= old-dim dim))
+			   (error "Dimension conflict for label ~A: ~A vs ~A"
+				  label old-dim dim))
+			 (setf (aref label-dims code)
+			       (max old-dim dim)))))
+      
+      (let* ((final-output-subs output-subs)
+             (explicit-mode (if final-output-subs t nil)))
+	(unless explicit-mode
+          (setf final-output-subs
+		(sort (loop for code from 0 below 256
+                            when (and (= (aref label-counts code) 1) 
+                                      (find (code-char code) all-labels-list))
+                              collect (code-char code))
+                      #'char<)))
+	
+	(let* ((sum-labels (set-difference all-labels-list final-output-subs))
+               (all-labels (coerce (append final-output-subs sum-labels) 
+                                   '(simple-array character (*)))))
+          (values all-labels label-dims final-output-subs))))))
 
 (defun einsum-execute
     (all-labels-vec label-dims-vec output-subs input-subs vts)
@@ -140,7 +142,7 @@
            (type (simple-array fixnum (*)) label-dims-vec)
            (type list output-subs input-subs vts)
 	   (optimize (speed 3)))
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((rank (length all-labels-vec))
            (n-vts (length vts))
            (dims-vec (make-array rank :element-type 'fixnum))
@@ -328,8 +330,8 @@
   "Double-float 类型的 i-k-j 缓存优化矩阵乘法内核"
   (declare (type (simple-array double-float (*)) a-data b-data c-data)
            (type fixnum m k n)
-	   (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
-  (sb-int::with-float-traps-masked (:invalid)
+	   (optimize (speed 3) (safety 0) (compilation-speed 0)))
+  (with-float-safe
     (loop for i of-type fixnum from 0 below m do
       (let ((i-k (the fixnum (* i k)))
             (i-n (the fixnum (* i n))))
@@ -350,47 +352,48 @@
 (defun vt-get-contiguous-df-data (vt)
   "提取张量数据, 通过 typecase 消除盲盒数组的运行时派发开销."
   ;; 局部开启极致优化
-  (declare (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))  
-  (let ((data (vt-data vt))
-        (shape (vt-shape vt))
-        (strides (vt-strides vt))
-        (offset (vt-offset vt)))
-    (let ((m (first shape))
-          (n (second shape))
-          (s0 (first strides))
-          (s1 (second strides)))
-      (declare (fixnum m n s0 s1 offset)) 
-      (if (and (typep data '(simple-array double-float (*)))
-               (zerop offset)
-               (= s1 1)
-               (= s0 n))
-          data
-          (let ((new-data (make-array (the fixnum (* m n)) 
-                                      :element-type 'double-float 
-                                      :initial-element 0.0d0)))
-            (declare (type (simple-array double-float (*)) new-data))
-            (typecase data
-              ((simple-array double-float (*))
-               (loop for i of-type fixnum from 0 below m do
-                 (let ((base-i (the fixnum (+ offset (the fixnum (* i s0))))))
-                   (loop for j of-type fixnum from 0 below n do
-                     (setf (aref new-data (the fixnum (+ (the fixnum (* i n)) j)))
-                           (aref data (the fixnum
-					   (+ base-i (the fixnum (* j s1))))))))))
-	      
-              ((simple-array fixnum (*))
-               (loop for i of-type fixnum from 0 below m do
-                 (let ((base-i (the fixnum (+ offset (the fixnum (* i s0))))))
-                   (loop for j of-type fixnum from 0 below n do
-                     (setf (aref new-data (the fixnum (+ (the fixnum (* i n)) j)))
-                           (the double-float 
-                                (coerce
-				 (the fixnum 
-                                      (aref data (the fixnum
-						      (+ base-i
-							 (the fixnum (* j s1)))))) 
-                                 'double-float))))))))
-	    new-data)))))
+  (declare (optimize (speed 3) (safety 0) (compilation-speed 0)))
+  (with-float-safe
+    (let ((data (vt-data vt))
+          (shape (vt-shape vt))
+          (strides (vt-strides vt))
+          (offset (vt-offset vt)))
+      (let ((m (first shape))
+            (n (second shape))
+            (s0 (first strides))
+            (s1 (second strides)))
+	(declare (fixnum m n s0 s1 offset)) 
+	(if (and (typep data '(simple-array double-float (*)))
+		 (zerop offset)
+		 (= s1 1)
+		 (= s0 n))
+            data
+            (let ((new-data (make-array (the fixnum (* m n)) 
+					:element-type 'double-float 
+					:initial-element 0.0d0)))
+              (declare (type (simple-array double-float (*)) new-data))
+              (typecase data
+		((simple-array double-float (*))
+		 (loop for i of-type fixnum from 0 below m do
+                   (let ((base-i (the fixnum (+ offset (the fixnum (* i s0))))))
+                     (loop for j of-type fixnum from 0 below n do
+                       (setf (aref new-data (the fixnum (+ (the fixnum (* i n)) j)))
+                             (aref data (the fixnum
+					     (+ base-i (the fixnum (* j s1))))))))))
+		
+		((simple-array fixnum (*))
+		 (loop for i of-type fixnum from 0 below m do
+                   (let ((base-i (the fixnum (+ offset (the fixnum (* i s0))))))
+                     (loop for j of-type fixnum from 0 below n do
+                       (setf (aref new-data (the fixnum (+ (the fixnum (* i n)) j)))
+                             (the double-float 
+                                  (coerce
+				   (the fixnum 
+					(aref data (the fixnum
+							(+ base-i
+							   (the fixnum (* j s1)))))) 
+                                   'double-float))))))))
+	      new-data))))))
 
 
 (defun vt-matmul-df (a b)

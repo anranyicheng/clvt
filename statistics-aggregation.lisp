@@ -82,24 +82,25 @@
 (defun vt-mean (tensor &key axis keepdims)
   "计算平均值. axis: nil (全局) 或 fixnum (支持负数).
     返回: double-float 或 VT 张量."
-  (let* ((shape (vt-shape tensor))
-         (rank (length shape))
-         (real-axis (vt-normalize-axis axis rank))
-         (sum-result
-	   (vt-sum tensor :axis real-axis :keepdims keepdims))
-         (element-type (vt-element-type tensor))
-         (count (if real-axis
-                    (the fixnum (nth real-axis shape))
-                    (the fixnum (reduce #'* shape)))))
-    ;; 避免除以 0
-    (when (= count 0)
-      (return-from vt-mean 0.0d0))
-    ;; 执行除法
-    (if (vt-p sum-result)
-        (vt-map (lambda (s)
-		  (/ s (coerce count element-type)))
-		sum-result)
-        (/ sum-result (coerce count element-type) 1.0d0))))
+  (sb-int:with-float-traps-masked (:invalid)
+    (let* ((shape (vt-shape tensor))
+           (rank (length shape))
+           (real-axis (vt-normalize-axis axis rank))
+           (sum-result
+	     (vt-sum tensor :axis real-axis :keepdims keepdims))
+           (element-type (vt-element-type tensor))
+           (count (if real-axis
+                      (the fixnum (nth real-axis shape))
+                      (the fixnum (reduce #'* shape)))))
+      ;; 避免除以 0
+      (when (= count 0)
+	(return-from vt-mean 0.0d0))
+      ;; 执行除法
+      (if (vt-p sum-result)
+          (vt-map (lambda (s)
+		    (/ s (coerce count element-type)))
+		  sum-result)
+          (/ sum-result (coerce count element-type) 1.0d0)))))
 
 (defun vt-average (tensor weights &key axis keepdims)
   "计算加权平均值.
@@ -108,86 +109,64 @@
    axis: 归约轴.
    keepdims: 是否保持维度."
   (declare (vt tensor weights))
-  (let* ((weighted-sum (vt-sum (vt-map #'* tensor weights)
-			       :axis axis
-			       :keepdims keepdims))
-         (sum-weights (vt-sum weights :axis axis
-				      :keepdims keepdims)))
-    (if (vt-p weighted-sum)
-        (vt-map (lambda (s w) 
-                  (if (= w 0)
-		      0.0d0
-		      (/ s w))) 
-                weighted-sum 
-                sum-weights)
-        (if (= sum-weights 0)
-            0.0d0 
-            (/ weighted-sum sum-weights 1.0d0)))))
-
-(defun vt-var (tensor &key axis keepdims (ddof 0))
-  "计算方差。
-   ddof : Delta Degrees of Freedom（自由度修正值）。默认为 0（总体方差）。
-   设为 1 则计算无偏样本方差。"
-  (let* ((shape (vt-shape tensor))
-         (rank (length shape))
-         (real-axis (when axis (vt-normalize-axis axis rank)))
-         ;; 1. 计算均值（强制 keepdims 以便后续广播）
-         (mean-val (vt-mean tensor :axis real-axis :keepdims t))
-         ;; 2. 计算偏差平方
-         (sq-diff (vt-square (vt-- tensor mean-val)))
-         ;; 3. 计算平方和
-         (sum-sq (vt-sum sq-diff :axis real-axis :keepdims keepdims))
-         ;; 4. 计算元素个数 N
-         (n (if real-axis 
-		(the fixnum (nth real-axis shape))
-		(the fixnum (reduce #'* shape))))
-         ;; 5. 计算除数，防止除零或负数
-         (divisor (max 0 (- n ddof))))
-    ;; 6. 执行除法（标量除以张量，自动广播）
-    (if (vt-p sum-sq)
-        (vt-/ sum-sq divisor)
-        (if (zerop divisor) 0.0d0 (/ sum-sq divisor)))))
+  (sb-int:with-float-traps-masked (:invalid)
+    (let* ((weighted-sum (vt-sum (vt-map #'* tensor weights)
+				 :axis axis
+				 :keepdims keepdims))
+           (sum-weights (vt-sum weights :axis axis
+					:keepdims keepdims)))
+      (if (vt-p weighted-sum)
+          (vt-map (lambda (s w) 
+                    (if (= w 0)
+			0.0d0
+			(/ s w))) 
+                  weighted-sum 
+                  sum-weights)
+          (if (= sum-weights 0)
+              0.0d0 
+              (/ weighted-sum sum-weights 1.0d0))))))
 
 (defun vt-var (tensor &key axis keepdims (ddof 0))
   "计算方差。
    ddof : Delta Degrees of Freedom（自由度修正值）。默认为 0（总体方差）。
    设为 1 则计算无偏样本方差。
    当 N - ddof <= 0 时，遵循 NumPy 规范返回 NaN。"
-  (let* ((shape (vt-shape tensor))
-         (rank (length shape))
-         (real-axis (when axis (vt-normalize-axis axis rank)))
-         ;; 1. 计算均值（强制 keepdims 以便后续广播）
-         (mean-val (vt-mean tensor :axis real-axis :keepdims t))
-         ;; 2. 计算偏差平方
-         (sq-diff (vt-square (vt-- tensor mean-val)))
-         ;; 3. 计算平方和
-         (sum-sq (vt-sum sq-diff :axis real-axis :keepdims keepdims))
-         ;; 4. 计算元素个数 N
-         (n (if real-axis 
-                (the fixnum (nth real-axis shape))
-                (the fixnum (reduce #'* shape))))
-         ;; 5. 计算除数
-         (divisor (- n ddof)))
-    
-    ;; 6. 判断除数是否合法
-    (if (<= divisor 0)
-        ;; 分母不合法（<=0），按照 IEEE 754 / NumPy 规范显式注入 NaN
-        (let ((nan-val (vt-float-nan)))
+  (sb-int:with-float-traps-masked (:invalid)
+    (let* ((shape (vt-shape tensor))
+           (rank (length shape))
+           (real-axis (when axis (vt-normalize-axis axis rank)))
+           ;; 1. 计算均值（强制 keepdims 以便后续广播）
+           (mean-val (vt-mean tensor :axis real-axis :keepdims t))
+           ;; 2. 计算偏差平方
+           (sq-diff (vt-square (vt-- tensor mean-val)))
+           ;; 3. 计算平方和
+           (sum-sq (vt-sum sq-diff :axis real-axis :keepdims keepdims))
+           ;; 4. 计算元素个数 N
+           (n (if real-axis 
+                  (the fixnum (nth real-axis shape))
+                  (the fixnum (reduce #'* shape))))
+           ;; 5. 计算除数
+           (divisor (- n ddof)))
+      
+      ;; 6. 判断除数是否合法
+      (if (<= divisor 0)
+          ;; 分母不合法（<=0），按照 IEEE 754 / NumPy 规范显式注入 NaN
+          (let ((nan-val (vt-float-nan)))
+            (if (vt-p sum-sq)
+		;; 返回一个形状相同、全为 NaN 的张量
+		(let* ((out-shape (vt-shape sum-sq))
+                       (out (vt-zeros out-shape :type 'double-float))
+                       (data (vt-data out))
+                       (offset (vt-offset out)))
+                  (dotimes (i (reduce #'* out-shape))
+                    (setf (row-major-aref data (+ i offset)) nan-val))
+                  out)
+		;; 如果是标量，直接返回 NaN 数值本身
+		nan-val))
+          ;; 分母合法，执行正常除法
           (if (vt-p sum-sq)
-              ;; 返回一个形状相同、全为 NaN 的张量
-              (let* ((out-shape (vt-shape sum-sq))
-                     (out (vt-zeros out-shape :type 'double-float))
-                     (data (vt-data out))
-                     (offset (vt-offset out)))
-                (dotimes (i (reduce #'* out-shape))
-                  (setf (row-major-aref data (+ i offset)) nan-val))
-                out)
-              ;; 如果是标量，直接返回 NaN 数值本身
-              nan-val))
-        ;; 分母合法，执行正常除法
-        (if (vt-p sum-sq)
-            (vt-/ sum-sq divisor)
-            (/ sum-sq divisor)))))
+              (vt-/ sum-sq divisor)
+              (/ sum-sq divisor))))))
 
 
 (defun vt-std (tensor &key axis keepdims (ddof 0))
