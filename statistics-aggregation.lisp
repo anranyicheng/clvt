@@ -139,8 +139,8 @@
          (sum-sq (vt-sum sq-diff :axis real-axis :keepdims keepdims))
          ;; 4. 计算元素个数 N
          (n (if real-axis 
-               (the fixnum (nth real-axis shape))
-               (the fixnum (reduce #'* shape))))
+		(the fixnum (nth real-axis shape))
+		(the fixnum (reduce #'* shape))))
          ;; 5. 计算除数，防止除零或负数
          (divisor (max 0 (- n ddof))))
     ;; 6. 执行除法（标量除以张量，自动广播）
@@ -148,10 +148,54 @@
         (vt-/ sum-sq divisor)
         (if (zerop divisor) 0.0d0 (/ sum-sq divisor)))))
 
+(defun vt-var (tensor &key axis keepdims (ddof 0))
+  "计算方差。
+   ddof : Delta Degrees of Freedom（自由度修正值）。默认为 0（总体方差）。
+   设为 1 则计算无偏样本方差。
+   当 N - ddof <= 0 时，遵循 NumPy 规范返回 NaN。"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (real-axis (when axis (vt-normalize-axis axis rank)))
+         ;; 1. 计算均值（强制 keepdims 以便后续广播）
+         (mean-val (vt-mean tensor :axis real-axis :keepdims t))
+         ;; 2. 计算偏差平方
+         (sq-diff (vt-square (vt-- tensor mean-val)))
+         ;; 3. 计算平方和
+         (sum-sq (vt-sum sq-diff :axis real-axis :keepdims keepdims))
+         ;; 4. 计算元素个数 N
+         (n (if real-axis 
+                (the fixnum (nth real-axis shape))
+                (the fixnum (reduce #'* shape))))
+         ;; 5. 计算除数
+         (divisor (- n ddof)))
+    
+    ;; 6. 判断除数是否合法
+    (if (<= divisor 0)
+        ;; 分母不合法（<=0），按照 IEEE 754 / NumPy 规范显式注入 NaN
+        (let ((nan-val (vt-float-nan)))
+          (if (vt-p sum-sq)
+              ;; 返回一个形状相同、全为 NaN 的张量
+              (let* ((out-shape (vt-shape sum-sq))
+                     (out (vt-zeros out-shape :type 'double-float))
+                     (data (vt-data out))
+                     (offset (vt-offset out)))
+                (dotimes (i (reduce #'* out-shape))
+                  (setf (row-major-aref data (+ i offset)) nan-val))
+                out)
+              ;; 如果是标量，直接返回 NaN 数值本身
+              nan-val))
+        ;; 分母合法，执行正常除法
+        (if (vt-p sum-sq)
+            (vt-/ sum-sq divisor)
+            (/ sum-sq divisor)))))
+
+
 (defun vt-std (tensor &key axis keepdims (ddof 0))
   "计算标准差。
    ddof : 自由度修正值，默认为 0。设为 1 计算无偏样本标准差。"
-  (let ((variance (vt-var tensor :axis axis :keepdims keepdims :ddof ddof)))
+  (let ((variance (vt-var tensor :axis axis
+				 :keepdims keepdims
+				 :ddof ddof)))
     (if (vt-p variance)
         (vt-sqrt variance)
         (sqrt variance))))
@@ -180,7 +224,7 @@
       ;; 防止除零，当 count 为 0 时返回 NaN
       (labels ((safe-div (s c)
                  (if (zerop c)
-                     (/ 0.0d0 0.0d0)   ;; 产生 NaN
+                     (vt-float-nan)  ;; 产生 NaN
                      (/ s c))))
         (if (vt-p sum)
             (vt-map #'safe-div sum count)
@@ -205,7 +249,7 @@
                       (max 0 (- count ddof)))))
     (labels ((safe-div (s d)
                (if (<= d 0)
-                   (/ 0.0d0 0.0d0)
+                   (vt-float-nan)
                    (/ s d))))
       (if (vt-p sum2)
           (vt-map #'safe-div sum2 divisor)
@@ -213,11 +257,12 @@
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0))
   "忽略 NaN 计算标准差。参数同 vt-nanvar。"
-  (let ((var (vt-nanvar tensor :axis axis :keepdims keepdims
-			       :ddof ddof)))
-    (if (vt-p var)
-        (vt-map #'sqrt var)
-        (sqrt var))))
+  (sb-int::with-float-traps-masked (:invalid)
+    (let ((var (vt-nanvar tensor :axis axis :keepdims keepdims
+				 :ddof ddof)))
+      (if (vt-p var)
+          (vt-map #'sqrt var)
+          (sqrt var)))))
 
 (defun vt-nanmax (tensor &key axis keepdims)
   "忽略 NaN 的最大值。"

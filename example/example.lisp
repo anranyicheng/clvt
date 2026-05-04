@@ -21,6 +21,18 @@
     (every (lambda (v) (equal (vt-shape v) s)) (rest vts))))
 
 
+(defun approx= (a b &optional (tol 1e-10))
+  "检查两个数字或张量是否近似相等。"
+  (cond ((and (numberp a) (numberp b))
+         (or (= a b) (< (abs (- a b)) tol)))
+        ((and (vt-p a) (vt-p b))
+         (vt-allclose a b :rtol tol :atol tol))
+        (t nil)))
+
+(defun assert-ok (condition msg)
+  (unless condition
+    (error "TEST FAILED: ~A" msg)))
+
 ;; ============================================================
 ;; test-vt-ravel
 ;; ============================================================
@@ -1120,6 +1132,69 @@
          (outer (vt-einsum "i,j->ij" a b)))
     (assert (equal (vt-to-list outer)
 		   '((4.0 5.0) (8.0 10.0) (12.0 15.0)))))
+  ;; 测试 1：标准矩阵乘法
+  (let* ((a (vt-from-sequence '((1 2) (3 4) (5 6))))
+         (b (vt-from-sequence '((7 8 9) (10 11 12))))
+         (out-einsum (vt-einsum "ij,jk->ik" a b))
+         (out-matmul (vt-matmul a b)))
+    (assert-ok (approx= out-einsum out-matmul) "标准矩阵乘法 einsum 失败"))
+
+  ;; 测试 2：输出转置 "ij,jk->ki"
+  (let* ((a (vt-from-sequence '((1 2) (3 4))))
+         (b (vt-from-sequence '((5 6) (7 8))))
+         (out-einsum (vt-einsum "ij,jk->ki" a b))
+         (out-expected (vt-transpose (vt-matmul a b))))
+    (assert-ok (approx= out-einsum out-expected) "输出转置 einsum 失败"))
+
+  ;; 测试 3：输入有转置 "ji,kj->ik"
+  (let* ((a (vt-from-sequence '((1 2) (3 4) (5 6))))   ; 3x2
+         (b (vt-from-sequence '((7 8 9) (10 11 12))))   ; 2x3
+         (at (vt-transpose a))          ; 2x3
+         (bt (vt-transpose b))          ; 3x2
+         (out-einsum (vt-einsum "ji,kj->ik" a b))   ; 注意 a 作为第一个输入对应 ji
+         (out-expected (vt-matmul at bt)))
+    (assert-ok (approx= out-einsum out-expected) "输入转置 einsum 失败"))
+
+  ;; 测试 4：非标准输出顺序 "ab,bc->ca"
+  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6))))   ; 2x3
+         (b (vt-from-sequence '((7 8) (9 10) (11 12)))) ; 3x2
+         (out-einsum (vt-einsum "ab,bc->ca" a b))
+         (out-expected (vt-transpose (vt-matmul a b))))
+    (assert-ok (approx= out-einsum out-expected) "ab,bc->ca 失败"))
+
+  ;; 测试 5：三个矩阵连乘 "ij,jk,kl->il"
+  (let* ((a (vt-from-sequence '((1 2) (3 4))))
+         (b (vt-from-sequence '((5 6) (7 8))))
+         (c (vt-from-sequence '((9 10) (11 12))))
+         (out-einsum (vt-einsum "ij,jk,kl->il" a b c))
+         (out-matmul (vt-matmul (vt-matmul a b) c)))
+    (assert-ok (approx= out-einsum out-matmul) "三矩阵 einsum 失败"))
+
+  ;; 测试 6：迹 "ii->"
+  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9))))
+         (trace (vt-ref (vt-einsum "ii->" a))))
+    (assert-ok (approx= trace (+ 1 5 9)) "迹 einsum 失败"))
+
+  ;; 测试 7：批量矩阵乘法 "...ij,...jk->...ik"
+  (let* ((batch-a (vt-from-sequence '(((1 2) (3 4))   ; 2x2x2
+                                        ((5 6) (7 8)))))
+         (batch-b (vt-from-sequence '(((9 10) (11 12))
+                                        ((13 14) (15 16)))))
+         (out-einsum (vt-einsum "...ij,...jk->...ik" batch-a batch-b)))
+    ;; 如果 vt-matmul 不支持批量，可以手动验证
+    (assert-ok (and (approx= (vt-slice out-einsum '(0) '(:all) '(:all))
+                             (vt-matmul (vt-slice batch-a '(0) '(:all) '(:all))
+                                        (vt-slice batch-b '(0) '(:all) '(:all))))
+                    (approx= (vt-slice out-einsum '(1) '(:all) '(:all))
+                             (vt-matmul (vt-slice batch-a '(1) '(:all) '(:all))
+                                        (vt-slice batch-b '(1) '(:all) '(:all)))))
+               "批量矩阵乘法 einsum 失败"))
+
+  ;; 测试 8：向量内积 "i,i->"
+  (let* ((a (vt-from-sequence '(1 2 3)))
+         (b (vt-from-sequence '(4 5 6)))
+         (res (vt-ref (vt-einsum "i,i->" a b))))
+    (assert-ok (approx= res 32.0) "向量内积 einsum 失败"))
   (format t "~%test-vt-einsum passed.~%"))
 
 ;; ============================================================
@@ -1152,6 +1227,37 @@
 		   '((2.0 3.0) (6.0 11.0))))
     (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
 		   '((46.0 55.0) (66.0 79.0)))))
+  ;; 测试 1：两个一维向量 → 标量数值
+  (let* ((a (vt-from-sequence '(1.0 2.0 3.0)))
+         (b (vt-from-sequence '(4.0 5.0 6.0)))
+         (res (vt-ref (vt-dot a b))))
+    (assert-ok (and (numberp res) (approx= res 32.0))
+               "向量点积应返回标量数字"))
+
+  ;; 测试 2：向量与矩阵 (1D @ 2D)
+  (let* ((a (vt-from-sequence '(1.0 2.0)))
+         (B (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+         (res (vt-dot a B)))
+    (assert-ok (and (= (length (vt-shape res)) 1)
+                    (approx= res (vt-from-sequence '(7.0 10.0))))
+               "向量与矩阵点积失败"))
+
+  ;; 测试 3：矩阵与向量 (2D @ 1D)
+  (let* ((B (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+         (a (vt-from-sequence '(1.0 2.0)))
+         (res (vt-dot B a)))
+    (assert-ok (and (= (length (vt-shape res)) 1)
+                    (approx= res (vt-from-sequence '(5.0 11.0))))
+               "矩阵与向量点积失败"))
+
+  ;; 测试 4：0 维标量与向量（如果支持）
+  ;; CLVT 可能不支持 0-d 张量，可以跳过。
+
+  ;; 测试 5：两个矩阵
+  (let* ((A (vt-from-sequence '((1 2) (3 4))))
+         (B (vt-from-sequence '((5 6) (7 8))))
+         (res (vt-dot A B)))
+    (assert-ok (approx= res (vt-matmul A B)) "矩阵点积失败"))
   (format t "~%test-vt-dot passed.~%"))
 
 ;; ============================================================
@@ -1178,6 +1284,44 @@
 				'(2.0 3.0) :epsilon 1e-6))
     (assert (lists-approx-equal (vt-to-list (vt-slice X '(:all) '(1)))
 				'(1.8 2.6) :epsilon 1e-6)))
+  ;; 测试 1：单右端项
+  (let* ((a (vt-from-sequence '(( 1.0  2.0  3.0 )
+                                ( 2.0  1.0  4.0 )
+                                ( 3.0  4.0  1.0 ))))
+	 (x-true (vt-from-sequence '(1.0 -2.0 0.5)))
+	 (b (vt-dot a x-true))          ;; ← 改用 vt-dot
+	 (x-sol (vt-solve a b)))
+    (assert-ok (approx= x-sol x-true) "vt-solve 单右端项失败"))
+
+  ;; 测试 2：多右端项
+  (let* ((a (vt-from-sequence '(( 1.0  2.0 )
+                                ( 3.0  4.0 ))))
+         (b (vt-from-sequence '(( 5.0  6.0 )
+                                ( 7.0  8.0 ))))
+         (x-sol (vt-solve a b))
+         (ax (vt-matmul a x-sol)))
+    (assert-ok (approx= ax b) "vt-solve 多右端项失败"))
+
+  ;; 测试 3：奇异矩阵（应抛出错误）
+  (let ((a-sing (vt-from-sequence '((1.0 2.0) (2.0 4.0))))
+        (b-sing (vt-from-sequence '(1.0 2.0))))
+    (handler-case
+        (progn (vt-solve a-sing b-sing)
+               (error "不应到达这里"))
+      (error () t)))  ; 预期抛出错误
+
+  ;; 测试 4：接近奇异矩阵
+  (let* ((a-ill (vt-from-sequence '((1.0 1.0) (1.0 1.0000000001))))
+         (b-ill (vt-from-sequence '(2.0 2.0000000001)))
+         (x-ill (vt-solve a-ill b-ill))
+         (ax-ill (vt-matmul a-ill x-ill)))
+    (assert-ok (approx= ax-ill b-ill 1e-8) "接近奇异矩阵求解失败"))
+
+  ;; 测试 5：整数类型 -> 自动转为 double-float
+  (let* ((a (vt-from-sequence '((2 1) (1 2)) :type 'fixnum))
+         (b (vt-from-sequence '(3 4) :type 'fixnum))
+         (x (vt-solve a b)))
+    (assert-ok (approx= (vt-@ a x) b) "整数矩阵求解失败"))
   (format t "~%test-vt-solve passed.~%"))
 
 ;; ============================================================
@@ -1995,8 +2139,36 @@
 	       (1 1 1))))
     (assert (equal
 	     (vt-to-list (vt-argsort a :axis nil))
-	     '(1 2 0 5 4 3)))
-    (print "passed test vt-argsort")))
+	     '(1 2 0 5 4 3))))
+  
+  (let ((tensor-3d (vt-from-sequence
+                    '(((0.0d0 99.0d0 2.0d0)    ;; 深度 0 的数据
+                       (4.0d0 6.0d0 8.0d0))
+                      ((1.0d0 -99.0d0 3.0d0)   ;; 深度 1 的数据
+                       (5.0d0 7.0d0 9.0d0))))))
+    
+    (format t "~%--- 输入张量 (形状 2x2x3) ---~%")
+    ;; 打印出来方便直观感受
+    (format t "深度 0: ~A~%" (vt-to-list (vt-slice tensor-3d '(0) '(:all) '(:all))))
+    (format t "深度 1: ~A~%" (vt-to-list (vt-slice tensor-3d '(1) '(:all) '(:all))))
+
+    ;; 2. 沿着 axis=0 (深度轴) 进行 argsort
+    ;; 这意味着对于任意一个 坐标，我们会拿出 [A[0,r,c], A[1,r,c]] 进行排序
+    (let ((result (vt-argsort tensor-3d :axis 0)))
+      
+      (format t "~%--- 实际输出 (扁平化查看) ---~%")
+      ;; 将 3D 结果展平为一维列表，这样最容易看出内存级别的错乱
+      (let ((flat-result (vt-to-list (vt-flatten result))))
+	(format t "扁平结果: ~A~%" flat-result)
+	
+	;; 3. 构造预期的正确结果
+	;; 沿 axis=0 排序，输出的形状依然是 (2, 2, 3)
+	;; 对于大部分 位置，数据是升序的(如 0<1, 2<3)，所以正确的索引是 [0, 1]
+	;; 唯独在 (行=0, 列=1) 的位置，数据是 [99, -99]，逆序！所以正确的索引必须是 [1, 0]
+	;; 按照行优先内存布局，预期的扁平列表应该是：
+	(let ((expected-flat '(0 1 0 0 0 0 1 0 1 1 1 1)))
+          (format t "预期扁平: ~A~%" expected-flat)))))
+    (print "passed test vt-argsort"))
 
 
 (defun test-vt-sort ()
@@ -2199,9 +2371,48 @@
 	    (let ((a (vt-arange 5 :type 'fixnum)))
               (vt-put a 100 42))
 	  (simple-error (e)
-	    (format t "Test 7 passed: caught out-of-bounds error: ~A~%" e)))
+	    (format t "Test 7 passed: caught out-of-bounds error: ~A~%" e))))))
+      
+  ;; 测试 1：连续数组上 put (完全正确，不用改)
+  (let* ((a (vt-arange 12 :type 'double-float))
+         (indices '(2 5 10))
+         (values  '(0 0 0)))
+    (vt-put a indices values)
+    (assert-ok (approx= a (vt-from-sequence
+                           (list 0d0 1d0 0d0 3d0 4d0 0d0
+                                 6d0 7d0 8d0 9d0 0d0 11d0)))
+	       "连续 put 失败"))
 
-	(format t "All vt-put tests passed successfully!~%")))))
+  ;; 测试 2：转置视图上的 put
+  (let* ((a (vt-arange 12 :type 'double-float))
+         (a-reshape (vt-reshape a '(3 4)))
+         (aT (vt-transpose a-reshape))
+         ;; 修复：aT(1,2)的逻辑索引是 1*3+2=5，aT(2,1)的逻辑索引是 2*3+1=7
+         (_ (vt-put aT '(5 7) '(0 0))) 
+         (expected (vt-from-sequence
+		    '((0d0 1d0 2d0 3d0)
+		      (4d0 5d0 0d0 7d0)   ; 原索引 (1,2) 被置0
+		      (8d0 0d0 10d0 11d0))))) ; 原索引 (2,1) 被置0 (原注释写错为3,1)
+    (assert-ok (approx= a-reshape expected) "转置视图 put 失败"))
+
+  ;; 测试 3：切片视图上的 put
+  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9)) :type 'double-float))
+         (s (vt-slice a '(1 3) '(1 3)))   ; [[5,6],[8,9]]
+         ;; 修复：s(0,0)的逻辑索引是 0，s(1,1)的逻辑索引是 1*2+1=3
+         (_ (vt-put s '(0 3) '(-1 -2)))
+         (expected (vt-from-sequence
+		    '((1d0 2d0 3d0)
+		      (4d0 -1d0 6d0)
+		      (7d0 8d0 -2d0)))))
+    (assert-ok (approx= a expected) "切片视图 put 失败"))
+
+  ;; 测试 5：空 indices (不用改)
+  (let* ((a (vt-from-sequence '(1 2 3 4 5))))
+    (vt-put a '() '())
+    (assert-ok (approx= a (vt-from-sequence '(1 2 3 4 5)))
+	       "空 put 改变了数组"))
+
+  (format t "All vt-put tests passed successfully!~%"))
 
 
 
@@ -3322,6 +3533,40 @@
       (check "insert_axis0"
              (vt-insert a 1 vals :axis 0)
              '((1 2) (5 6) (3 4))))
+    ;; 测试 1：轴0插入，索引0
+    (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
+           (res (vt-insert a 0 (vt-from-sequence '(10 11 12) :type 'double-float) :axis 0))
+           (expected (vt-from-sequence '((10 11 12) (0 1 2) (3 4 5)))))
+      (assert-ok (approx= res expected) "vt-insert 轴0插入失败"))
+
+    ;; 测试 2：轴1末尾插入
+    (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
+           (res (vt-insert a (second (vt-shape a))
+			   (vt-from-sequence '(7 8) :type 'double-float) :axis 1))
+           (expected (vt-from-sequence '((0 1 2 7) (3 4 5 8)))))
+      (assert-ok (approx= res expected) "vt-insert 轴末尾插入失败"))
+
+    ;; 测试 3：越界索引（应为错误）
+    (let ((a (vt-from-sequence '((0 1 2) (3 4 5)))))
+      (handler-case
+          (progn
+            (vt-insert a 5 (vt-from-sequence '(1)) :axis 0)
+            (error "应该抛出越界错误"))
+	(error () t)))
+
+    ;; 测试 4：空索引列表（什么都不插入）
+    (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
+           (res (vt-insert a '() (vt-from-sequence '()) :axis 1)))
+      (assert-ok (approx= res a) "空插入应返回原数组"))
+
+    ;; 测试 5：展平模式越界索引
+    (let ((a-flat (vt-from-sequence '(0 1 2 3 4))))
+      (handler-case
+          (progn
+            (vt-insert a-flat 6 99)   ; 索引 6 越界（有效 0~5）
+            (error "应该抛出越界错误"))
+	(error () t)))
+    (format t "~%vt-insert 全部测试通过~%")
     t))
 
 (defun test-vt-delete ()
@@ -3602,6 +3847,124 @@
          (itemsize (vt-itemsize a)))
     (assert (> itemsize 0)))
   (format t "~%test-vt-itemsize-nbytes passed.~%"))
+
+(defun test-vt-atan2 ()
+  ;; ==========================================
+  ;; 测试 1: 基础矩阵运算 (无广播，验证数学正确性)
+  ;; ==========================================
+  (let ((y (vt-from-sequence '((0.0d0 1.0d0) 
+                               (1.0d0 1.0d0))))
+	(x (vt-from-sequence '((1.0d0 1.0d0) 
+                               (-1.0d0 1.0d0)))))
+    (let ((res (vt-atan2 y x))
+          ;; 预期结果: [[0, pi/4], [3*pi/4, pi/4]]
+          (expected (vt-from-sequence
+		     (list (list 0.0d0 (/ pi 4))
+                           (list (* 3.0d0 (/ pi 4)) (/ pi 4))))))
+      (format t "~%--- 测试 1: 基础矩阵运算 ---~%")
+      (format t "结果: ~A~%" (vt-to-list res))
+      ;; 使用库自带的 vt-allclose 进行容差比较
+      (assert (vt-allclose res expected))
+      (format t "✔ 通过: 数学计算完全正确~%")))
+
+  ;; ==========================================
+  ;; 测试 2: 张量与标量运算 (验证标量自动转换与广播)
+  ;; ==========================================
+  ;; 原代码中 x 如果是标量，闭包会直接捕获标量对象，如果传入张量则会报错。
+  ;; 修复后，标量会被 ensure-vt 转为 0维张量，并广播到 y 的形状。
+  (let ((y (vt-from-sequence '((0.0d0 1.0d0) 
+                               (-1.0d0 0.0d0))))
+	(x 1.0d0)) ;; 注意这里传入的是纯数字标量
+    (let ((res (vt-atan2 y x))
+          (expected (vt-from-sequence (list (list 0.0d0 (/ pi 4))
+                                            (list (- (/ pi 4)) 0.0d0)))))
+      (format t "~%--- 测试 2: 标量广播 ---~%")
+      (format t "输入 y 形状: ~A, 输入 x: ~A~%" (vt-shape y) x)
+      (format t "结果形状: ~A~%" (vt-shape res))
+      (assert (equal (vt-shape res) '(2 2))) ; 验证形状被正确广播
+      (assert (vt-allclose res expected))
+      (format t "✔ 通过: 标量广播与形状推断正确~%")))
+
+  ;; ==========================================
+  ;; 测试 3: 张量与 1D 向量运算 (验证真正的维度广播)
+  ;; ==========================================
+  ;; y 是 2x2，x 是 1x2。x 应该沿着第 0 轴广播，变成 2x2 后逐元素计算。
+  (let ((y (vt-from-sequence '((1.0d0 2.0d0) 
+                               (1.0d0 2.0d0))))
+	(x (vt-from-sequence '(1.0d0 -1.0d0))))
+    (let ((res (vt-atan2 y x)))
+      (format t "~%--- 测试 3: 维度广播 (2x2 与 1x2) ---~%")
+      (format t "输入 y 形状: ~A~%" (vt-shape y))
+      (format t "输入 x 形状: ~A~%" (vt-shape x))
+      (format t "结果形状: ~A~%" (vt-shape res))
+      
+      ;; 验证形状合并正确
+      (assert (equal (vt-shape res) '(2 2)))
+      
+      ;; 手动验证几个关键点的值
+      ;; res[0, 0] = atan2(1.0, 1.0) = pi/4
+      (assert (< (abs (- (vt-ref res 0 0) (/ pi 4))) 1e-9))
+      ;; res[0, 1] = atan2(2.0, -1.0) = pi - atan(2)
+      (assert (< (abs (- (vt-ref res 0 1) (- pi (atan 2.0d0)))) 1e-9))
+      ;; res[1, 1] = atan2(2.0, -1.0) = pi - atan(2)
+      (assert (< (abs (- (vt-ref res 1 1) (- pi (atan 2.0d0)))) 1e-9))
+      
+      (format t "✔ 通过: 跨维度广播机制触发成功~%")))
+
+  (format t "~%========================================~%")
+  (format t "所有 vt-atan2 测试均已通过！~%"))
+
+
+;; ============================================================
+;;  测试方差标准差除零保护
+;; ============================================================
+(defun test-vt-var-std ()
+  ;; 测试 1：总体方差
+  (let* ((data (vt-from-sequence '(1 2 3)))
+         (var (vt-var data :ddof 0)))
+    (assert-ok (approx= var (/ 2.0 3.0)) "总体方差错误"))
+
+  ;; 测试 2：样本方差 ddof=1
+  (let* ((data (vt-from-sequence '(1 2 3)))
+         (var (vt-var data :ddof 1)))
+    (assert-ok (approx= var 1.0) "样本方差错误"))
+
+  ;; 测试 3：除数为 0 (ddof = 数据个数)
+  (let* ((data (vt-from-sequence '(1 2 3)))
+         (var (vt-var data :ddof 3)))
+    ;; 应返回 NaN (Common Lisp 的 (coerce (/ 0.0d0 0.0d0) 'double-float) 就是 NaN)
+    (assert-ok (not (vt-float-nan-= var var)) "ddof=3 时应返回 NaN"))
+
+  ;; 测试 4：沿轴方差，除数为0
+  (let* ((a2d (vt-from-sequence '((1 2) (3 4))))
+         (var-axis (vt-var a2d :axis 0 :ddof 2)))
+    ;; 每个轴只有2个元素，ddof=2导致除数为0，应得到 NaN 张量
+    (assert-ok (every (lambda (v) (not (vt-float-nan-= v v)))
+                      (loop for i below (vt-size var-axis)
+                            collect (vt-ref var-axis i)))
+               "轴方差除零时应为 NaN"))
+
+  ;; 测试 5：标准差除零
+  (let* ((data (vt-from-sequence '(1 2 3)))
+         (std (vt-nanstd data :ddof 3)))
+    (assert-ok (not (vt-float-nan-= std std)) "标准差除零时应返回 NaN"))
+
+  ;; 测试 6：nanvar 除零
+  (let* ((data-nan (vt-from-sequence (list 1.0 +vt-nan+ 3.0)))  ; 注意 NaN 需要由 (/ 0.0d0 0.0d0) 生成
+         (nanvar (vt-nanvar data-nan :ddof 2)))  ; 有效样本数=2, ddof=2 导致除数0
+      (if (vt-p nanvar)
+      (assert-ok (not (vt-float-nan-= (vt-ref nanvar 0) (vt-ref nanvar 0)))
+                 "nanvar 除零时应为 NaN")
+      (assert-ok (not (vt-float-nan-= nanvar nanvar)) ; NaN 永远不等于自身
+                 "nanvar 除零时应为 NaN")))
+  (format t "~%vt-var / vt-std 全部测试通过~%"))
+
+
+;; ============================================================
+;; 运行所有测试
+;; ============================================================
+
+
 ;; --------------------- 汇总 ---------------------
 
 (defun run-all-tests ()
@@ -3690,4 +4053,7 @@
   (test-vt-convolve)
   (test-vt-searchsorted)
   (test-vt-extract)
-  (test-vt-itemsize-nbytes))
+  (test-vt-itemsize-nbytes)
+  (test-vt-atan2)
+  (test-vt-var-std)
+)

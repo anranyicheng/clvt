@@ -144,7 +144,7 @@
 
 (defun vt-atan2 (vty x)
   "逐元素计算 atan2(y, x). 支持广播."
-  (vt-map (lambda (y) (atan y x)) vty))
+  (vt-map (lambda (y vax) (atan y vax)) vty x))
 
 (defun vt-floor (vt &optional (divisor 1))
   "向下取整."

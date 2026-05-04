@@ -167,9 +167,11 @@
   返回: 张量"
   (let* ((size (vt-shape-to-size shape))
          (data (make-array size :element-type type))
-         (result (%make-vt :data data :shape shape 
+         (result (%make-vt :data data
+			   :shape shape 
                            :strides (vt-compute-strides shape)
-			   :offset 0))
+			   :offset 0
+			   :etype type))
          (rank (length shape)))
     ;; 递归填充
     (labels
@@ -248,7 +250,8 @@
       (%make-vt :data (vt-data vt)
                 :shape (list (vt-size vt))
                 :strides '(1)
-                :offset (vt-offset vt))
+                :offset (vt-offset vt)
+		:etype (vt-element-type vt))
       ;; 非连续:创建副本
       (vt-flatten vt)))
 
@@ -267,7 +270,8 @@
                                    (subseq old-shape (1+ ax)))
                     :strides (append (subseq old-strides 0 ax)
                                      (subseq old-strides (1+ ax)))
-                    :offset old-offset))
+                    :offset old-offset
+		    :etype (vt-element-type vt)))
         ;; 移除所有长度为1的维度（保持不变）
         (let ((new-shape '())
               (new-strides '()))
@@ -282,7 +286,8 @@
           (%make-vt :data (vt-data vt)
                     :shape (nreverse new-shape)
                     :strides (nreverse new-strides)
-                    :offset old-offset)))))
+                    :offset old-offset
+		    :etype (vt-element-type vt))))))
 
 (defun vt-expand-dims (vt axis)
   "在指定位置插入新轴.
@@ -306,7 +311,8 @@
       (%make-vt :data (vt-data vt)
                 :shape new-shape
                 :strides new-strides
-                :offset old-offset))))
+                :offset old-offset
+		:etype (vt-element-type vt)))))
 
 (defun vt-unsqueeze (vt axis)
   "在指定位置插入新轴"
@@ -336,7 +342,8 @@
               :shape new-shape
               :strides (vt-broadcast-strides
 			old-shape new-shape (vt-strides vt))
-              :offset (vt-offset vt))))
+              :offset (vt-offset vt)
+	      :etype (vt-element-type vt))))
 
 (defun vt-repeat (vt repeats &key axis)
   "重复数组元素。重写为切片拼接方式。
@@ -574,7 +581,7 @@
             (cond ((integerp obj) (insert-at flat-arr obj))
                   ((listp obj)
                    (let ((result flat-arr))
-                     (dolist (idx (sort (copy-list obj) #'>))
+                     (dolist (idx (stable-sort (copy-list obj) #'>))
                        (setf result (insert-at result idx)))
                      result))
                   (t (error "vt-insert: obj must be integer or list of integers when axis=nil")))))
@@ -608,7 +615,7 @@
                                     collect (vt-narrow values-reshaped ax i (1+ i))))))
                     ;; 4. 构建新切片列表，在 obj-list 指定位置插入对应块
                     (let ((result-slices (copy-list arr-slices)))
-                      (loop for pos in (sort (copy-list obj-list) #'>)
+                      (loop for pos in (stable-sort (copy-list obj-list) #'>)
                             for block in value-blocks
                             do (setf result-slices
                                      (append (subseq result-slices 0 pos)
@@ -786,7 +793,7 @@
                    (fiber (apply #'vt-slice tensor specs))
                    (fiber-size (vt-size fiber)))
               ;; 收集纤维元素，必须通过 vt-ref 读取以处理视图偏移/步长
-              (let ((vals (sort (loop for i below fiber-size
+              (let ((vals (vt-numpy-sort (loop for i below fiber-size
                                       collect (vt-ref fiber i))
                                 #'<)))
                 (setf (aref (vt-data result) ptr)
@@ -802,7 +809,7 @@
       ;; 全局中位数
       (let* ((flat (vt-flatten tensor))
              (size (vt-size flat))
-             (vals (sort (loop for i below size
+             (vals (vt-numpy-sort (loop for i below size
                                collect (aref (vt-data flat) i))
                          #'<)))
         (if (oddp size)
@@ -863,7 +870,7 @@
                                     else collect (list (pop out-idx))))
                      (fiber (apply #'vt-slice tensor specs))
                      (fiber-size (vt-size fiber))
-                     (vals (sort (loop for i below fiber-size
+                     (vals (vt-numpy-sort (loop for i below fiber-size
                                        collect (vt-ref fiber i))
                                  #'<)))
                 (setf (aref (vt-data result) ptr)
@@ -872,7 +879,7 @@
         ;; 全局百分位
         (let* ((flat (vt-flatten tensor))
                (size (vt-size flat))
-               (vals (sort (loop for i below size
+               (vals (vt-numpy-sort (loop for i below size
                                  collect (aref (vt-data flat) i))
                            #'<)))
           (percent-from-sorted vals q interpolation)))))
@@ -1004,7 +1011,7 @@
   (vt-map (lambda (a b)
             ;; 1. 利用 CL 的 = 运算符：Inf == Inf 为 T，NaN == NaN 为 NIL
             ;; 这一步直接拦截了无穷大相等的情况，并加速了完全相同的元素
-            (if (= a b)
+            (if (vt-nan-inf-= a b)
                 1.0d0
                 ;; 2. 对于不相等的有限浮点数，进行容差比较
                 ;; (如果包含 NaN，- 运算会得到 NaN，随后的 <= 会返回 NIL，逻辑依然正确)
@@ -1021,29 +1028,29 @@
 
 (defun vt-isfinite (vt)
   "检查是否为有限值（非 NaN，非无穷）。跨平台兼容实现。"
-  (let ((pos-inf (* most-positive-double-float 2.0d0))
-        (neg-inf (* most-negative-double-float 2.0d0)))
+  (let ((pos-inf (vt-pos-inf))
+        (neg-inf (vt-neg-inf)))
     (vt-map (lambda (x)
-              (if (and (= x x) ; 排除 NaN
-                       (not (= x pos-inf))
-                       (not (= x neg-inf)))
+              (if (and (vt-float-nan-= x x) ; 排除 NaN
+                       (not (vt-float-inf-= x pos-inf))
+                       (not (vt-float-inf-= x neg-inf)))
                   1.0d0 0.0d0))
             vt)))
 
 (defun vt-isinf (vt)
   "检查是否为无穷。"
-  (let ((pos-inf (* most-positive-double-float 2.0d0))
-        (neg-inf (* most-negative-double-float 2.0d0)))
+  (let ((pos-inf (vt-pos-inf))
+        (neg-inf (vt-neg-inf)))
     (vt-map (lambda (x)
-              (if (or (= x pos-inf)
-                      (= x neg-inf))
+              (if (or (vt-float-nan-= x pos-inf)
+                      (vt-float-inf-= x neg-inf))
                       1.0d0 0.0d0))
               vt)))
 
 (defun vt-isnan (vt)
   "检查是否为 NaN"
   (vt-map (lambda (x)
-            (if (/= x x)  ; NaN 不等于自身
+            (if (not (vt-float-nan-= x x))  ; NaN 不等于自身
                 1.0d0 0.0d0))
           vt))
 
@@ -1053,6 +1060,7 @@
 
 (defun vt-sort (tensor &key (axis -1))
   "沿指定轴排序；axis 为 nil 时展平后排序。axis 支持负数。"
+  (sb-int::with-float-traps-masked (:invalid)
   (if axis
       (let* ((shape (vt-shape tensor))
              (rank (length shape))
@@ -1078,6 +1086,7 @@
                            (loop for i of-type fixnum from 0 below ax-dim
                                  for off = (+ in-ptr (* i in-stride))
                                  collect (cons (aref in-data off) i))))
+		    (print pairs)
                     ;; 稳定排序（按值排序，相等时保持原顺序）
                     (setq pairs (stable-sort pairs #'< :key #'car))
                     ;; 将排序后的值按顺序写回结果张量
@@ -1103,98 +1112,95 @@
       ;; axis = nil：展平为一维后排序
       (let* ((flat (vt-flatten tensor))
              (data (coerce (vt-data flat) 'list))
-             (sorted (stable-sort data #'<)))
-        (vt-from-sequence sorted :type (vt-element-type tensor)))))
+             (sorted (vt-numpy-sort data #'<)))
+        (vt-from-sequence sorted :type (vt-element-type tensor))))))
 
 (defun vt-argsort (tensor &key (axis -1))
   "返回沿指定轴的排序索引张量，形状与输入相同。
    axis 默认 -1（最后一轴），支持负数；axis = nil 时展平排序。"
-  (if (null axis)
-      ;; 展平排序（保持不变）
-      (let* ((flat (vt-ravel tensor))
-             (n (vt-size flat))
-             (data (vt-data flat))
-             (pairs (loop for i from 0 below n
-                          collect (cons i (aref data i))))
-             (sorted (if (fboundp 'stable-sort)
-                         (stable-sort pairs #'< :key #'cdr)
-                         (sort pairs #'< :key #'cdr))))
-        (%make-vt :data (make-array n :element-type 'fixnum
-                                      :initial-contents
-				      (mapcar #'car sorted))
-                  :shape (list n)
-                  :strides '(1)
-                  :offset 0))
-      ;; 沿特定轴排序（修复版本）
-      (let* ((shape (vt-shape tensor))
-             (rank (length shape))
-             (ax (vt-normalize-axis axis rank))
-             (ax-dim (nth ax shape))
-             (in-strides (vt-strides tensor))
-             (in-offset (vt-offset tensor))
-             (in-data (vt-data tensor))
-             (result (vt-zeros shape :type 'fixnum))
-             (out-strides (vt-strides result))
-             (out-data (vt-data result)))
-        (labels
-            ((recurse (depth in-ptr out-ptr)
-               (cond
-                 ((= depth rank) nil)
-                 ((< depth ax)
-                  (let ((dim (nth depth shape))
-                        (in-stride (nth depth in-strides))
-                        (out-stride (nth depth out-strides)))
-                    (dotimes (i dim)
-                      (recurse (1+ depth)
-                               (+ in-ptr (* i in-stride))
-                               (+ out-ptr (* i out-stride))))))
-                 ((= depth ax)
-                  (let* ((in-stride (nth ax in-strides))
-                         (out-stride (nth ax out-strides))
-                         (tail-dims (subseq shape (1+ ax)))
-                         (tail-rank (length tail-dims))
-                         (tail-strides (subseq out-strides (1+ ax)))
-                         (tail-size
-			   (reduce #'* tail-dims :initial-value 1)))
-                    ;; 预计算尾部每个维度在原始步长中的偏移
-                    (let ((tail-in-strides
-                            (loop for idx from 0 below tail-rank
-                                  collect (nth (+ ax 1 idx) in-strides))))
+  (sb-int::with-float-traps-masked (:invalid)
+    (if (null axis)
+	;; 展平排序
+	(let* ((flat (vt-ravel tensor))
+               (n (vt-size flat))
+               (data (vt-data flat))
+               (pairs (loop for i from 0 below n
+			    collect (cons i (aref data i))))
+               (sorted (stable-sort pairs #'< :key #'cdr)))
+	  (%make-vt :data (make-array n :element-type 'fixnum
+					:initial-contents (mapcar #'car sorted))
+                    :shape (list n)
+                    :strides '(1)
+                    :offset 0
+		    :etype 'fixnum))
+	;; 沿特定轴排序（终极修复版）
+	(let* ((shape (vt-shape tensor))
+               (rank (length shape))
+               (ax (vt-normalize-axis axis rank))
+               (ax-dim (nth ax shape))
+               (in-strides (vt-strides tensor))
+               (in-offset (vt-offset tensor))
+               (in-data (vt-data tensor))
+               (result (vt-zeros shape :type 'fixnum))
+               (out-strides (vt-strides result))
+               (out-data (vt-data result)))
+	  (labels
+	      ((recurse (depth in-ptr out-ptr)
+		 (cond
+		   ((= depth rank) nil)
+                   ((< depth ax)
+                    (let ((dim (nth depth shape))
+                          (in-stride (nth depth in-strides))
+                          (out-stride (nth depth out-strides)))
+                      (dotimes (i dim)
+			(recurse (1+ depth)
+				 (+ in-ptr (* i in-stride))
+				 (+ out-ptr (* i out-stride))))))
+                   ((= depth ax)
+                    (let* ((in-stride (nth ax in-strides))
+                           (out-stride (nth ax out-strides))
+                           (tail-dims (subseq shape (1+ ax)))
+                           (tail-rank (length tail-dims))
+                           (tail-strides (subseq out-strides (1+ ax)))
+                           (tail-size (reduce #'* tail-dims :initial-value 1))
+                           ;; 预计算尾部每个维度在原始步长中的偏移
+                           (tail-in-strides
+			     (loop for idx from 0 below tail-rank
+                                   collect (nth (+ ax 1 idx) in-strides))))
                       (dotimes (tail-i tail-size)
-                        (let ((rem tail-i)
+			(let ((rem tail-i)
                               (extra-in-off 0)
                               (extra-out-off 0))
-                          ;; 计算当前组合的额外偏移（正确乘以 r）
+                          ;; 逆向解析多维坐标
                           (loop for idx from 0 below tail-rank
-                                for dim in tail-dims
-                                for in-strd in tail-in-strides
-                                for out-strd in tail-strides
-                                do (multiple-value-bind (q r)
-				       (floor rem dim)
-                                     (incf extra-in-off (* r in-strd))
-                                     (incf extra-out-off (* r out-strd))
-                                     (setf rem q)))
+				for dim in tail-dims
+				for in-strd in tail-in-strides
+				for out-strd in tail-strides
+				do (multiple-value-bind (q r) 
+                                       (floor rem in-strd)
+                                     (incf extra-in-off (* q in-strd))
+                                     (incf extra-out-off (* q out-strd))
+                                     (setf rem r)))
+                          
                           ;; 收集当前纤维上所有元素（值 + 原始位置）
                           (let ((pairs nil))
                             (dotimes (pos ax-dim)
-                              (let* ((in-off (+ in-ptr
-						(* pos in-stride)
+                              (let* ((in-off (+ in-ptr (* pos in-stride)
 						extra-in-off))
                                      (val (aref in-data in-off)))
-                                (push (cons pos val) pairs)))
+				(push (cons pos val) pairs)))
                             (setf pairs (stable-sort (nreverse pairs)
-						     #'<
-						     :key #'cdr))
+						     #'< :key #'cdr))
+                            
                             ;; 写回排序后的索引
                             (dotimes (pos ax-dim)
-                              (let* ((out-off (+ out-ptr
-						 (* pos out-stride)
+                              (let* ((out-off (+ out-ptr (* pos out-stride)
 						 extra-out-off))
                                      (src-idx (car (nth pos pairs))))
-                                (setf (aref out-data out-off)
-				      src-idx))))))))))))
-          (recurse 0 in-offset 0))
-        result)))
+				(setf (aref out-data out-off)
+				      src-idx)))))))))))
+            (recurse 0 in-offset 0))
+	  result))))
 
 (defun vt-unique (tensor &key return-index return-inverse return-counts)
   "返回展平后张量中的唯一元素，自动排序（升序）。
@@ -1261,7 +1267,8 @@
                          (%make-vt :data v
 				   :shape (list n)
 				   :strides '(1)
-				   :offset 0))))
+				   :offset 0
+				   :etype 'fixnum))))
             (cnt-vt  (when return-counts
                        (vt-from-sequence (coerce cnts 'list)
 					 :type 'fixnum))))
@@ -1306,8 +1313,11 @@
                          when (>= (aref data j) val)
                            return j
                          finally (return size))))
-    (%make-vt :data result :shape (list v-size)
-	      :strides '(1) :offset 0)))
+    (%make-vt :data result
+	      :shape (list v-size)
+	      :strides '(1)
+	      :offset 0
+	      :etype 'fixnum)))
 
 ;;; ===========================================
 ;;; 7. 数据类型转换
@@ -1355,7 +1365,7 @@
 	(declare (ignore ptr))
 	(when (member val u2-set)
 	  (push val result)))
-      (vt-from-sequence (sort result #'<)
+      (vt-from-sequence (vt-numpy-sort result #'<)
 			:type (vt-element-type t1)))))
 
 (defun vt-union1d (t1 t2)
@@ -1374,7 +1384,7 @@
 	(declare (ignore ptr))
 	(unless (member val u2-set)
 	  (push val result)))
-      (vt-from-sequence (sort result #'<)
+      (vt-from-sequence (vt-numpy-sort result #'<)
 			:type (vt-element-type t1)))))
 
 (defun vt-setxor1d (t1 t2)
@@ -1392,7 +1402,7 @@
 	(declare (ignore ptr))
 	(unless (member val u1-set)
 	  (push val result)))
-      (vt-from-sequence (sort result #'<)
+      (vt-from-sequence (vt-numpy-sort result #'<)
 			:type (vt-element-type t1)))))
 
 (defun vt-in1d (t1 t2)
@@ -1622,30 +1632,29 @@
               (recurse 0 in-off out-off))
             out)))))
 
-
-(defun vt-put (tensor indices values)
+(defun vt-put (tensor indices values &key (mode :raise))
   "将 values 按 indices 指定的展平（行优先）索引放入 tensor。
    tensor 被原地修改并返回。
    indices: 整数、一维张量或列表。
    values: 标量、一维张量或列表，长度不足时循环使用。
-   注意：索引必须是 [0, 总元素数) 内的非负整数。"
+   mode: :raise (越界报错，默认), :wrap (越界取模), :clip (越界截断)。"
   (let* ((total-size (vt-size tensor))
-         ;; 将 indices 统一为整数列表
+         ;; 统一 indices 为整数列表
          (idx-list
-	   (if (numberp indices)
+           (if (numberp indices)
                (list (round indices))
                (let ((flat (vt-flatten (ensure-vt indices))))
                  (loop for i below (vt-size flat)
                        collect (truncate (aref (vt-data flat) i))))))
-         ;; 将 values 统一为列表
+         ;; 统一 values 为列表
          (val-list (cond ((numberp values) (list values))
-			 ((or (listp values)
+                         ((or (listp values)
 			      (arrayp values))
 			  (vt-flatten-sequence values))
-			 ((vt-p values)
-			  (let ((flat (vt-flatten (ensure-vt values))))
+                         ((vt-p values)
+                          (let ((flat (vt-flatten (ensure-vt values))))
                             (loop for i below (vt-size flat)
-				  collect (aref (vt-data flat) i))))))
+                                  collect (aref (vt-data flat) i))))))
          (n-values (length val-list))
          (shape (vt-shape tensor))
          (strides (vt-strides tensor))
@@ -1653,25 +1662,29 @@
          (data (vt-data tensor))
          (elem-type (vt-element-type tensor)))
     
-    (loop for idx in idx-list
-          for i from 0
-          for val = (nth (mod i n-values) val-list)
-          do (unless (and (integerp idx)
-			  (<= 0 idx)
-			  (< idx total-size))
-               (error "索引 ~D 超出范围 [0, ~D)" idx total-size))
-             ;; 一维逻辑索引 → 多维坐标 → 物理偏移
-             (let ((remaining idx)
-                   (phys-offset offset))
-               (loop for dim in (reverse shape)
-                     for stride in (reverse strides)
-                     do (multiple-value-bind (q r)
-			    (floor remaining dim)
-                          (incf phys-offset (* r stride))
-                          (setf remaining q)))
-               ;; 直接写入底层数组，自动进行必要的类型转换
-               (setf (aref data phys-offset)
-                     (coerce val elem-type))))
+    (loop for raw-idx in idx-list
+          for val-idx from 0 
+          ;; 优化：用 mod 递增代替 (nth (mod i n) list)，保证 O(1) 取值
+          for val = (nth (mod val-idx n-values) val-list)
+          do (let ((idx raw-idx))
+               ;; 处理越界模式
+               (cond
+                 ((and (>= idx 0) (< idx total-size)) nil) ; 合法，什么都不做
+                 ((eq mode :clip) (setq idx (max 0 (min idx (1- total-size)))))
+                 ((eq mode :wrap) (setq idx (mod idx total-size)))
+                 (t (error "索引 ~D 超出范围 [0, ~D)" raw-idx total-size)))
+               
+               ;; 核心算法：1D逻辑索引 → 多维坐标 → 物理偏移
+               (let ((remaining idx)
+                     (phys-offset offset))
+                 (loop for dim in (reverse shape)
+                       for stride in (reverse strides)
+                       do (multiple-value-bind (q r) (floor remaining dim)
+                            (incf phys-offset (* r stride))
+                            (setf remaining q)))
+                 ;; 写入底层物理内存
+                 (setf (aref data phys-offset)
+                       (coerce val elem-type)))))
     tensor))
 
 (defun vt-choose (choices indices)
@@ -1688,8 +1701,11 @@
                (error "选择索引 ~A 越界" idx))
              (setf (aref result-data i)
                    (aref (vt-data (nth idx choices)) i)))
-    (%make-vt :data result-data :shape (list idx-size)
-              :strides '(1) :offset 0)))
+    (%make-vt :data result-data
+	      :shape (list idx-size)
+              :strides '(1)
+	      :offset 0
+	      :etype 'double-float)))
 
 (defun vt-select (condlist choicelist &key default)
   "根据多个条件从多个数组中选择值"
@@ -1720,7 +1736,8 @@
         (%make-vt :data (vt-data vt)
                   :shape shape
                   :strides new-strides
-                  :offset new-offset))
+                  :offset new-offset
+		  :etype (vt-element-type vt)))
       (let* ((rank (length (vt-shape vt)))
              (ax (vt-normalize-axis axis rank))
              (strides (copy-list (vt-strides vt)))
@@ -1731,7 +1748,8 @@
                   :shape (vt-shape vt)
                   :strides strides
                   :offset (+ (vt-offset vt)
-			     (* (1- dim) old-stride))))))
+			     (* (1- dim) old-stride))
+		  :etype (vt-element-type vt)))))
 
 (defun vt-roll (vt shift &key axis)
   "滚动元素。shift 可为整数或列表，axis 可为整数、列表或 nil。
@@ -1914,8 +1932,11 @@
     (vt-do-each (ptr val flat)
       (declare (ignore ptr))
       (incf (aref result (truncate val))))
-    (%make-vt :data result :shape (list size)
-	      :strides '(1) :offset 0)))
+    (%make-vt :data result
+	      :shape (list size)
+	      :strides '(1)
+	      :offset 0
+	      :etype 'fixnum)))
 
 (defun vt-digitize (x bins &key (right nil))
   "返回输入值在 bins 中的索引。"
@@ -1935,7 +1956,8 @@
     (%make-vt :data result
 	      :shape (vt-shape flat-x)
 	      :strides '(1)
-	      :offset 0)))
+	      :offset 0
+	      :etype 'fixnum)))
 
 (defun vt-correlate (a v &key (mode :full))
   "一维互相关（不翻转 v），与 numpy.correlate 完全一致。"
@@ -1964,7 +1986,8 @@
            (%make-vt :data full
 		     :shape (list full-len)
 		     :strides '(1)
-		     :offset 0))
+		     :offset 0
+		     :etype 'double-float))
           (:valid
            (let* ((len (max 0 (1+ (- n m))))     ; n - m + 1
                   (start offset))
@@ -1975,7 +1998,8 @@
                (%make-vt :data data
 			 :shape (list len)
 			 :strides '(1)
-			 :offset 0))))
+			 :offset 0
+			 :etype 'double-float))))
           (:same
            (let* ((out-len (max n m))
                   (start (floor (- full-len out-len) 2)))
@@ -1986,7 +2010,8 @@
                (%make-vt :data data
 			 :shape (list out-len)
 			 :strides '(1)
-			 :offset 0)))))))))
+			 :offset 0
+			 :etype 'double-float)))))))))
 
 (defun vt-convolve (a v &key (mode :full))
   "一维卷积。"

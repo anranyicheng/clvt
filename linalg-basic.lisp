@@ -1,24 +1,24 @@
 (in-package :clvt)
 
-(defun vt-dot (a b)
-  "点积/内积，支持任意维度：
-   - 若 a,b 均为 1D → 向量内积，返回数字。
-   - 若 a,b 均为 2D → 矩阵乘法 a @ b。
-   - 若 a,b 秩均 ≥2  → 批量矩阵乘法 '...ij,...jk->...ik'。
-   其他情况（如 1D 与 2D）请直接使用 vt-einsum。"
-  (let ((ra (length (vt-shape a)))
-        (rb (length (vt-shape b))))
-    (cond
-      ((and (= ra 1) (= rb 1))
-       (vt-einsum "i,i->" a b))
-      ((and (= ra 2) (= rb 2))
-       (vt-einsum "ij,jk->ik" a b))
-      ((and (>= ra 2) (>= rb 2))
-       (vt-einsum "...ij,...jk->...ik" a b))
-      (t
-       (error "vt-dot: Unsupported dimensions (a: ~D, b: ~D).
-               Use vt-einsum directly."
-              ra rb)))))
+(defun vt-dot (a b) 
+  "点积/内积，支持任意维度： 
+   - 若 a,b 均为 1D → 向量内积，返回数字。 
+   - 若 a 为 2D, b 为 1D → 矩阵乘向量，返回 1D 向量。 
+   - 若 a 为 1D, b 为 2D → 向量乘矩阵，返回 1D 向量。 
+   - 若 a,b 均为 2D → 矩阵乘法 a @ b。 
+   - 若 a,b 秩均 ≥2 → 批量矩阵乘法 '...ij,...jk->...ik'。 
+   其他情况请直接使用 vt-einsum。" 
+  (let ((ra (length (vt-shape a))) 
+        (rb (length (vt-shape b)))) 
+    (cond ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b)) 
+          ;; === 新增以下两个分支 ===
+          ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b)) 
+          ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b)) 
+          ;; ==========================
+          ((and (= ra 2) (= rb 2)) (vt-einsum "ij,jk->ik" a b)) 
+          ((and (>= ra 2) (>= rb 2)) (vt-einsum "...ij,...jk->...ik" a b)) 
+          (t (error "vt-dot: Unsupported dimensions (a: ~D, b: ~D).
+                     Use vt-einsum directly." ra rb)))))
 
 (defun vt-outer (a b &key (flatten t))
   "计算张量外积。
