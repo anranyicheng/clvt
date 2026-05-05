@@ -2,14 +2,15 @@
 
 (defun ensure-contiguous-2d-vt (vt)
   "确保矩阵在内存中是连续的."
-  (if (vt-contiguous-p vt)
-      vt
-      (vt-contiguous vt)))
+  (with-float-safe
+    (if (vt-contiguous-p vt)
+	vt
+	(vt-contiguous vt))))
 
 ;;; 部分选主元 LU 分解 (返回 P, L, U，使 P*A = L*U)
 (defun vt-lu (matrix)
   "LU 分解。返回 (P, L, U)，其中 P 为置换矩阵（由行交换向量表示）。"
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((a (ensure-contiguous-2d-vt matrix))
            (n (first (vt-shape a)))
            (lu (vt-copy a))          ; 原地存储 L+U
@@ -45,7 +46,7 @@
 
 (defun vt-det (matrix)
   "基于 LU 分解计算行列式。"
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (multiple-value-bind (lu piv sign)
 	(vt-lu matrix)
       (declare (ignore piv))
@@ -58,7 +59,7 @@
 
 (defun vt-solve (a b)
   "求解线性方程组 Ax = b（支持多右端项）。"
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((a (ensure-contiguous-2d-vt a))
            (b-vt (ensure-vt b))
            (n (first (vt-shape a)))
@@ -112,7 +113,7 @@
 
 (defun vt-inv (matrix)
   "矩阵求逆。"
-  (sb-int::with-float-traps-masked (:invalid)
+  (with-float-safe
     (let* ((n (first (vt-shape matrix)))
            (identity (vt-eye n :type (vt-element-type matrix))))
       (vt-solve matrix identity))))

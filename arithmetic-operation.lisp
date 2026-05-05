@@ -5,14 +5,16 @@
 (defun vt-+ (&rest args)
   "逐元素加法. 支持标量、列表、张量混合.
    自动优化: 多参数时单次遍历."
-  (apply #'vt-map #'+ args))
+  (with-float-safe
+    (apply #'vt-map #'+ args)))
 
 (defun vt-add (&rest args)
   (apply #'vt-+ args))
 
 (defun vt-* (&rest args)
   "逐元素乘法. 支持标量、列表、张量混合."
-  (apply #'vt-map #'* args))
+  (with-float-safe
+    (apply #'vt-map #'* args)))
 
 (defun vt-mul (&rest args)
   (apply #'vt-* args))
@@ -21,10 +23,11 @@
   "逐元素减法.
    单参数: 取反.
    多参数: a - b - c ... "
-  (let ((first-vt (ensure-vt vt)))
-    (if (null args)
-        (vt-map #'- first-vt)
-        (apply #'vt-map #'- first-vt args))))
+  (with-float-safe
+    (let ((first-vt (ensure-vt vt)))
+      (if (null args)
+          (vt-map #'- first-vt)
+          (apply #'vt-map #'- first-vt args)))))
 
 (defun vt-sub (vt &rest args)
   (apply #'vt-- vt args))
@@ -33,10 +36,11 @@
   "逐元素除法.
    单参数: 倒数.
    多参数: a / b / c ... "
-  (let ((first-vt (ensure-vt vt)))
-    (if (null args)
-        (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
-        (apply #'vt-map #'/ first-vt args))))
+  (with-float-safe
+    (let ((first-vt (ensure-vt vt)))
+      (if (null args)
+          (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
+          (apply #'vt-map #'/ first-vt args)))))
 
 (defun vt-div (vt &rest args)
   (apply #'vt-/ vt args))
@@ -86,7 +90,8 @@
 
 (defun vt-pow (vt power)
   "计算逐元素幂次方"
-  (vt-map (lambda (x) (expt x power)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (expt x power)) vt)))
 
 (defun vt-square (vt)
   "计算逐元素平方"
@@ -107,80 +112,98 @@
 
 (defun vt-positive-p (vt)
   "判断是否大于零. 返回 1.0 (True) 或 0.0 (False)."
-  (vt-map (lambda (v) (if (> v 0.0d0) 1.0d0 0.0d0)) vt))
+  (with-float-safe
+    (vt-map (lambda (v) (if (> v 0.0d0) 1.0d0 0.0d0)) vt)))
 
 (defun vt-negative-p (vt)
   "判断是否小于零. 返回 1.0 或 0.0."
-  (vt-map (lambda (v) (if (< v 0.0d0) 1.0d0 0.0d0)) vt))
+  (with-float-safe
+    (vt-map (lambda (v) (if (< v 0.0d0) 1.0d0 0.0d0)) vt)))
 
 (defun vt-zero-p (vt)
   "判断是否为零. 返回 1.0 或 0.0."
-  (vt-map (lambda (v) (if (zerop v) 1.0d0 0.0d0)) vt))
+  (with-float-safe
+    (vt-map (lambda (v) (if (zerop v) 1.0d0 0.0d0)) vt)))
 
 (defun vt-nonzero-p (vt)
   "判断是否非零. 返回 1.0 或 0.0."
-  (vt-map (lambda (v) (if (zerop v) 0.0d0 1.0d0)) vt))
+  (with-float-safe
+    (vt-map (lambda (v) (if (zerop v) 0.0d0 1.0d0)) vt)))
 
 (defun vt-even-p (vt)
   "判断是否为偶数. 返回 1.0 或 0.0."
   ;; 注意:浮点数判断偶数需先取整
-  (vt-map (lambda (v) (if (evenp (floor v)) 1.0d0 0.0d0)) vt))
+  (with-float-safe
+    (vt-map (lambda (v) (if (evenp (floor v)) 1.0d0 0.0d0)) vt)))
 
 (defun vt-odd-p (vt)
   "判断是否为奇数. 返回 1.0 或 0.0."
-  (vt-map (lambda (v) (if (oddp (floor v)) 1.0d0 0.0d0)) vt))
+  (with-float-safe
+    (vt-map (lambda (v) (if (oddp (floor v)) 1.0d0 0.0d0)) vt)))
 
 (defun vt-expt (vt power-num)
   "逐元素幂运算."
-  (vt-map (lambda (x) (expt x power-num)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (expt x power-num)) vt)))
 
 (defun vt-mod (vt divisor)
   "逐元素取模."
-  (vt-map (lambda (x) (mod x divisor)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (mod x divisor)) vt)))
 
 (defun vt-rem (vt divisor)
   "逐元素取余数."
-  (vt-map (lambda (x) (rem x divisor)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (rem x divisor)) vt)))
 
 (defun vt-atan2 (vty x)
   "逐元素计算 atan2(y, x). 支持广播."
-  (vt-map (lambda (y vax) (atan y vax)) vty x))
+  (with-float-safe
+    (vt-map (lambda (y vax) (atan y vax)) vty x)))
 
 (defun vt-floor (vt &optional (divisor 1))
   "向下取整."
-  (vt-map (lambda (x) (floor x divisor)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (floor x divisor)) vt)))
 
 (defun vt-ceiling (vt &optional (divisor 1))
   "向上取整."
-  (vt-map (lambda (x) (ceiling x divisor)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (ceiling x divisor)) vt)))
 
 (defun vt-round (vt &optional (divisor 1))
   "四舍五入."
-  (vt-map (lambda (x) (round x divisor)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (round x divisor)) vt)))
 
 (defun vt-rint (vt)
   "四舍五入到最接近的整数 (浮点数返回值)."
   ;; Common Lisp 没有直接的 rint,使用 round 然后 float 化
-  (vt-map (lambda (x) (float (round x) x)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (float (round x) x)) vt)))
 
 (defun vt-trancate (vt &optional (divisor 1))
   "向0取整"
-  (vt-map (lambda (x) (truncate x divisor)) vt))
+  (with-float-safe
+    (vt-map (lambda (x) (truncate x divisor)) vt)))
 
 (defun vt-log (vt &optional base)
   "以 base 为底的对数."
-  (if base
-      (vt-map (lambda (val)
-		(log val base))
-	      vt)
-      (vt-map (lambda (val)
-		(log val))
-              vt)))
+  (with-float-safe
+    (if base
+	(vt-map (lambda (val)
+		  (log val base))
+		vt)
+	(vt-map (lambda (val)
+		  (log val))
+		vt))))
 
 (defun vt-log10 (vt)
   "以 10 为底的对数."
-  (vt-log vt 10.0d0))
+  (with-float-safe
+    (vt-log vt 10.0d0)))
 
 (defun vt-log2 (vt)
   "以 2 为底的对数."
-  (vt-log vt 2.0d0))
+  (with-float-safe
+    (vt-log vt 2.0d0)))

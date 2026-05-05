@@ -7,18 +7,19 @@
    - 若 a 为 1D, b 为 2D → 向量乘矩阵，返回 1D 向量。 
    - 若 a,b 均为 2D → 矩阵乘法 a @ b。 
    - 若 a,b 秩均 ≥2 → 批量矩阵乘法 '...ij,...jk->...ik'。 
-   其他情况请直接使用 vt-einsum。" 
-  (let ((ra (length (vt-shape a))) 
-        (rb (length (vt-shape b)))) 
-    (cond ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b)) 
-          ;; === 新增以下两个分支 ===
-          ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b)) 
-          ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b)) 
-          ;; ==========================
-          ((and (= ra 2) (= rb 2)) (vt-einsum "ij,jk->ik" a b)) 
-          ((and (>= ra 2) (>= rb 2)) (vt-einsum "...ij,...jk->...ik" a b)) 
-          (t (error "vt-dot: Unsupported dimensions (a: ~D, b: ~D).
-                     Use vt-einsum directly." ra rb)))))
+   其他情况请直接使用 vt-einsum。"
+  (with-float-safe
+    (let ((ra (length (vt-shape a))) 
+          (rb (length (vt-shape b)))) 
+      (cond ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b)) 
+            ;; === 新增以下两个分支 ===
+            ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b)) 
+            ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b)) 
+            ;; ==========================
+            ((and (= ra 2) (= rb 2)) (vt-einsum "ij,jk->ik" a b)) 
+            ((and (>= ra 2) (>= rb 2)) (vt-einsum "...ij,...jk->...ik" a b)) 
+            (t (error "vt-dot: Unsupported dimensions (a: ~D, b: ~D).
+                     Use vt-einsum directly." ra rb))))))
 
 (defun vt-outer (a b &key (flatten t))
   "计算张量外积。
@@ -30,29 +31,34 @@
       例如 2D 与 3D → 5D 张量。
       等价于 (vt-einsum \"... ,...-> ... ...\"
        无法使用的替代显式下标写法)。"
-  (if flatten
-      (let ((flat-a (vt-flatten a))
-            (flat-b (vt-flatten b)))
-        (vt-einsum "i,j->ij" flat-a flat-b))
-      (vt-einsum "...i,...j->...ij" a b)))
+  (with-float-safe
+    (if flatten
+	(let ((flat-a (vt-flatten a))
+              (flat-b (vt-flatten b)))
+          (vt-einsum "i,j->ij" flat-a flat-b))
+	(vt-einsum "...i,...j->...ij" a b))))
 
 (defun vt-trace (matrix)
   "矩阵迹: 对角线元素之和"
-  (vt-sum (vt-diagonal matrix)))
+  (with-float-safe
+    (vt-sum (vt-diagonal matrix))))
 
 (defun vt-norm (vt &key (axis nil))
   "L2 范数 (欧几里得范数)"
-  (let ((sq (vt-square vt)))
-    (if axis
-        (vt-sqrt (vt-sum sq :axis axis))
-        (vt-sqrt (vt-sum sq)))))
+  (with-float-safe
+    (let ((sq (vt-square vt)))
+      (if axis
+          (vt-sqrt (vt-sum sq :axis axis))
+          (vt-sqrt (vt-sum sq))))))
 
 (defun vt-l1-norm (vt &key (axis nil))
   "L1 范数"
-  (if axis
-      (vt-sum (vt-abs vt) :axis axis)
-      (vt-sum (vt-abs vt))))
+  (with-float-safe
+    (if axis
+	(vt-sum (vt-abs vt) :axis axis)
+	(vt-sum (vt-abs vt)))))
 
 (defun vt-frobenius-norm (matrix)
   "Frobenius 范数 (专用于矩阵)"
-  (vt-norm matrix))
+  (with-float-safe
+    (vt-norm matrix)))
