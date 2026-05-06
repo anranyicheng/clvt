@@ -3950,7 +3950,7 @@
     (assert-ok (not (vt-float-nan-= std std)) "标准差除零时应返回 NaN"))
 
   ;; 测试 6：nanvar 除零
-  (let* ((data-nan (vt-from-sequence (list 1.0 +vt-nan+ 3.0)))  ; 注意 NaN 需要由 (/ 0.0d0 0.0d0) 生成
+  (let* ((data-nan (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0)))  ; 注意 NaN 需要由 (/ 0.0d0 0.0d0) 生成
          (nanvar (vt-nanvar data-nan :ddof 2)))  ; 有效样本数=2, ddof=2 导致除数0
       (if (vt-p nanvar)
       (assert-ok (not (vt-float-nan-= (vt-ref nanvar 0) (vt-ref nanvar 0)))
