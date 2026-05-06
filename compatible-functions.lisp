@@ -2181,7 +2181,7 @@
 ;;; 12. 随机数扩展
 ;;; ===========================================
 
-(defvar *vt-default-random-state* (make-random-state t)
+(defvar *vt-default-random-state* (make-random-state *random-state*)
   "CLVT 内部使用的默认随机状态。可由 vt-random-seed 修改或通过 let 覆盖。")
 
 (defun vt-make-random-state (&optional seed)
@@ -2190,10 +2190,14 @@
      (vt-make-random-state)     => 使用 T 随机初始化
      (vt-make-random-state NIL) => 从当前 *random-state* 复制
      (vt-make-random-state 42)  => 不可移植地使用整数初始化"
+  #+sbcl
+  (sb-ext::seed-random-state seed)
+  #-sbcl
   (typecase seed
-    (null (make-random-state nil))        ; 保持与 CL 一致：nil → 复制当前全局状态
+    (null (make-random-state nil)) ; 保持与 CL 一致：nil → 复制当前全局状态
     (random-state (make-random-state seed))
-    (t (make-random-state seed))))        ; 实现依赖，通常可为整数加载
+    (t (make-random-state seed)))  ; 实现依赖，通常可为整数加载
+  )
 
 (defun vt-random-seed (seed)
   "修改 *vt-default-random-state* 并返回新的状态。seed 含义同 vt-make-random-state。
