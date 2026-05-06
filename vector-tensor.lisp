@@ -257,17 +257,6 @@
 	      :strides (vt-compute-strides shape)
 	      :etype type)))
 
-(defun vt-random (shape &key (type 'double-float))
-  "创建随机数张量"
-  (declare (list shape))
-  (let* ((result (vt-map (lambda (x)
-			   (declare (ignore x))
-			   (random 1.0))
-			 (vt-zeros shape))))
-    (if (eq type 'fixnum)
-	(vt-astype result type)
-	result)))
-
 (defun vt-zeros (shape &key (type 'double-float))
   "创建全0张量."
   (declare (list shape))

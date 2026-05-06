@@ -181,8 +181,10 @@
                       ((< m n)
                        (values U-k S-vt Vt))))))))))))
 
-(defun extend-orthogonal-basis (U-econ)
-  "将 m×k 的正交列矩阵 U_econ 补全为 m×m 正交矩阵，保持前 k 列完全不变。"
+
+(defun extend-orthogonal-basis (U-econ &key (rng *vt-default-random-state*))
+  "将 m×k 的 U_econ 通过随机向量 + Gram-Schmidt 补全为 m×m 正交矩阵。"
+  (declare (random-state rng))
   (with-float-safe
     (let* ((m (first (vt-shape U-econ)))
            (k (second (vt-shape U-econ)))
@@ -190,21 +192,19 @@
       (if (zerop extra)
           U-econ
           (let ((U-full (vt-zeros (list m m) :type 'double-float)))
-            ;; 复制前 k 列（不变）
             (dotimes (i k)
               (setf (vt-slice U-full '(:all) (list i))
-		    (vt-slice U-econ '(:all) (list i))))
-            ;; 对第 k..m-1 列执行带重正交化的 Gram‑Schmidt
+                    (vt-slice U-econ '(:all) (list i))))
             (loop for col from k below m
-                  for v = (vt-random (list m)) ;; 随机向量
-                  do (loop repeat 2            ;; 重复两次以增强数值稳定性
+                  for v = (vt-random (list m) :rng rng)
+                  do (loop repeat 2
                            do (dotimes (j col)
-				(let* ((uj (vt-slice U-full '(:all) (list j)))
+                                (let* ((uj (vt-slice U-full '(:all) (list j)))
                                        (proj (vt-ref (vt-dot uj v))))
                                   (setf v (vt-- v (vt-scale uj proj))))))
                      (let ((norm (sqrt (vt-ref (vt-dot v v)))))
                        (if (> norm 1e-12)
                            (setf (vt-slice U-full '(:all) (list col))
-				 (vt-scale v (/ 1.0 norm)))
+                                 (vt-scale v (/ 1.0 norm)))
                            (error "Failed to generate orthogonal vector"))))
             U-full)))))

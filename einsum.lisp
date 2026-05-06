@@ -345,7 +345,7 @@
         (einsum-execute
 	 all-labels label-dims output-subs-final input-subs vts)))))
 
-
+(declaim (inline %matmul-df-kernel))
 (defun %matmul-df-kernel (a-data b-data c-data m k n)
   "Double-float 类型的 i-k-j 缓存优化矩阵乘法内核"
   (declare (type (simple-array double-float (*)) a-data b-data c-data)
@@ -370,6 +370,7 @@
 					 (aref b-data
 					       (the fixnum (+ l-n j))))))))))))))))
 
+(declaim (inline vt-get-contiguous-df-data))
 (defun vt-get-contiguous-df-data (vt)
   "提取张量数据, 通过 typecase 消除盲盒数组的运行时派发开销."
   ;; 局部开启极致优化
@@ -421,7 +422,7 @@
                                    'double-float))))))))
 	      new-data))))))
 
-
+(declaim (inline vt-matmul-df))
 (defun vt-matmul-df (a b)
   "2维张量矩阵乘法 A * B. 无论输入类型, 结果必定为 double-float 张量."
   (declare (optimize (speed 3) (safety 0) (compilation-speed 0)))
