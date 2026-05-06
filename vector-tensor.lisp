@@ -1287,15 +1287,15 @@
   (let ((ra (vt-order a))
         (rb (vt-order b)))
     (cond
+      ;; 2D @ 2D → 2D（矩阵乘法）
+      ((and (= ra 2) (= rb 2))
+       (vt-matmul-df a b))
       ;; 1D @ 1D → 标量（内积）
       ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b))
       ;; 2D @ 1D → 1D（矩阵乘向量）
       ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b))
       ;; 1D @ 2D → 1D（向量乘矩阵）
       ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b))
-      ;; 2D @ 2D → 2D（矩阵乘法）
-      ((and (= ra 2) (= rb 2))
-       (vt-matmul-df a b))
       ;; >2D @ >2D → 批量矩阵乘法
       (t (vt-einsum "...ij,...jk->...ik" a b)))))
 
