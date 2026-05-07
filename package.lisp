@@ -249,6 +249,17 @@
    :vt-random-integers
    :vt-random-seed
 
+   ;; nan的相关
+   :vt-float-nan
+   :vt-float-nan-p
+   :vt-float-nan-=
+   :vt-float-pos-inf
+   :vt-float-neg-inf
+   :vt-float-pos-inf-p
+   :vt-float-neg-inf-p
+   :vt-float-inf-=
+   :vt-float-nan-inf-=
+
    ;; 核心迭代与映射
    :vt-map
    :vt-do-each
@@ -264,7 +275,8 @@
    :vt-compute-strides
    :vt-compute-logical-strides
    :vt-ensure-shape-compatible
-
+   :with-float-safe
+   
    ;; 打印与调试
    :print-vt-recursive
    :*vt-print-threshold*
