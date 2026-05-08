@@ -6,7 +6,7 @@
 
 ;; 辅助函数: 判断类型类别
 (defun get-type-category (type)
-  "将具体的 Lisp 类型归类为 :integer, :float 或 :other"
+  "将具体的 lisp 类型归类为 :integer, :float 或 :other"
   (cond
     ;; 整数类型判断 (包括 fixnum, bit, 以及 signed/unsigned byte)
     ((or (eq type 'fixnum)
@@ -18,7 +18,7 @@
     ;; 浮点类型判断
     ((member type '(single-float double-float short-float long-float float))
      :float)    
-    ;; 其他类型 (如 T, character, complex 等)
+    ;; 其他类型 (如 t, character, complex 等)
     (t :other)))
 
 (defun format-number-string (val type)
@@ -115,7 +115,7 @@
           ;; 获取数据类型
           (element-type (vt-element-type obj)))
       ;; 打印头部: 包含 shape 和 dtype
-      (format stream "shape:~A dtype:~A " shape element-type)
+      (format stream "shape:~a dtype:~a " shape element-type)
       
       (cond
         ((zerop (reduce #'* shape :initial-value 1))

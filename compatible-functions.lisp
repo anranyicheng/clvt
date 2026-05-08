@@ -1,4 +1,4 @@
-;;;; 扩展功能:对标 NumPy 函数
+;;;; 扩展功能:对标 numpy 函数
 (in-package :clvt)
 
 ;;; =========================================================================
@@ -33,18 +33,18 @@
 ;;; ===========================================
 
 (defun vt-linspace (start end num &key (endpoint t) (type 'double-float))
-  "创建线性间隔数组，与 NumPy linspace 完全兼容。
+  "创建线性间隔数组，与 numpy linspace 完全兼容。
    start     : 起始值
    end       : 结束值
    num       : 元素个数（>0 整数）
-   endpoint  : 是否包含终止值（默认 T）
+   endpoint  : 是否包含终止值（默认 t）
    type      : 元素类型（默认 double-float）
    返回      : 一维张量"
   (declare (type number start end)
            (type fixnum num)
            (type boolean endpoint))
   (when (<= num 0)
-    (error "num 必须大于 0，当前值为 ~D" num))
+    (error "num 必须大于 0，当前值为 ~d" num))
   (with-float-safe
     ;; 单元素特殊情况
     (when (= num 1)
@@ -106,14 +106,14 @@
 (defun vt-logspace
     (start stop num &key (base 10.0d0) (endpoint t)
 		      (type 'double-float))
-  "返回对数间隔的 1D 张量。"
+  "返回对数间隔的 1d 张量。"
   (with-float-safe
     (vt-map (lambda (x) (expt base x))
             (vt-linspace start stop num :endpoint endpoint
 					:type type))))
 
 (defun vt-kron (a b)
-  "计算任意维张量的 Kronecker 积，行为与 NumPy 完全一致。"
+  "计算任意维张量的 kronecker 积，行为与 numpy 完全一致。"
   (with-float-safe
     (let ((a-shape (vt-shape a))
           (b-shape (vt-shape b)))
@@ -133,12 +133,12 @@
              (a-new-shape nil)
              (b-new-shape nil)
              (final-shape nil))
-	;; 构建交错形状：A: (d1, 1, d2, 1, ...)，B: (1, e1, 1, e2, ...)
+	;; 构建交错形状：a: (d1, 1, d2, 1, ...)，b: (1, e1, 1, e2, ...)
 	(loop for da in a-shape-padded
               for db in b-shape-padded
-              do (push da a-new-shape)   ; A: da, 1
+              do (push da a-new-shape)   ; a: da, 1
 		 (push 1 a-new-shape)
-		 (push 1 b-new-shape)   ; B: 1, db
+		 (push 1 b-new-shape)   ; b: 1, db
 		 (push db b-new-shape)
 		 (push (* da db) final-shape))
 	(setf a-new-shape (nreverse a-new-shape))
@@ -148,22 +148,6 @@
 	(let ((a-reshaped (vt-reshape a a-new-shape))
               (b-reshaped (vt-reshape b b-new-shape)))
           (vt-reshape (vt-* a-reshaped b-reshaped) final-shape))))))
-
-(defun vt-random-int (low high &key (size nil) (type 'fixnum))
-  "创建随机整数数组.
-  low: 下界(包含)
-  high: 上界(不包含)
-  size: 形状(nil 表示标量)
-  返回: 张量"
-  (let ((range (- high low)))
-    (if size
-        (vt-astype
-	 (vt-map (lambda (x)
-		   (declare (ignore x))
-                   (+ low (random range)))
-                 (vt-zeros size :type type))
-	 type)
-        (coerce (+ low (random range)) type))))
 
 (defun vt-from-function (shape fn &key (type 'double-float))
   "根据函数创建数组.
@@ -197,17 +181,17 @@
       result)))
 
 (defun vt-meshgrid (vts-list &key (indexing :xy) (sparse nil) (copy t))
-  "生成坐标矩阵，完全兼容 NumPy 的 meshgrid 语义。
+  "生成坐标矩阵，完全兼容 numpy 的 meshgrid 语义。
    vts-list : 一维张量列表。
    indexing : :ij（矩阵索引）或 :xy（笛卡尔坐标，默认 :xy）。
-   sparse   : 若为 T，返回稀疏网格（形状中非对应轴为 1 的广播视图），否则返回全尺寸网格。
-   copy     : 若为 T，强制复制数据；否则尽量返回视图。
+   sparse   : 若为 t，返回稀疏网格（形状中非对应轴为 1 的广播视图），否则返回全尺寸网格。
+   copy     : 若为 t，强制复制数据；否则尽量返回视图。
    返回     : 张量列表，长度与 vts 相同。"
   (declare (list vts-list))
   (with-float-safe
     (dolist (v vts-list)
       (assert (= (length (vt-shape v)) 1)
-              (v) "All inputs to meshgrid must be 1-D"))
+              (v) "all inputs to meshgrid must be 1-d"))
     (let* ((nd (length vts-list))
            (dims (mapcar (lambda (v) (first (vt-shape v))) vts-list))
            ;; 计算输出形状（xy 模式下交换前两个维度）
@@ -272,7 +256,7 @@
           (let* ((ax (vt-normalize-axis axis (length old-shape)))  ; 规范化
 		 (axis-size (nth ax old-shape)))
             (unless (= axis-size 1)
-              (error "无法挤压非单例维度: axis ~A 大小为 ~A" axis axis-size))
+              (error "无法挤压非单例维度: axis ~a 大小为 ~a" axis axis-size))
             (%make-vt :data (vt-data vt)
                       :shape (append (subseq old-shape 0 ax)
                                      (subseq old-shape (1+ ax)))
@@ -308,7 +292,7 @@
            (rank (length old-shape))
            (actual-axis (if (< axis 0) (+ rank axis 1) axis)))
       (when (or (< actual-axis 0) (> actual-axis rank))
-	(error "轴 ~A 越界(秩 ~A)" axis rank))
+	(error "轴 ~a 越界(秩 ~a)" axis rank))
       (let ((new-shape
 	      (append (subseq old-shape 0 actual-axis)
                       (list 1)
@@ -348,7 +332,7 @@
            (broadcast-shape
 	     (vt-broadcast-shapes old-shape new-shape)))
       (unless (equal broadcast-shape new-shape)
-	(error "形状 ~A 不能广播到 ~A" old-shape new-shape))
+	(error "形状 ~a 不能广播到 ~a" old-shape new-shape))
       (%make-vt :data (vt-data vt)
 		:shape new-shape
 		:strides (vt-broadcast-strides
@@ -405,7 +389,7 @@
 		(vt-zeros zero-shape :type (vt-element-type vt))))))))
 
 (defun vt-tile (vt reps)
-  "重复数组构造新数组（与 NumPy tile 一致）
+  "重复数组构造新数组（与 numpy tile 一致）
    vt: 输入张量
    reps: 每个维度的重复次数列表
    返回: 新张量"
@@ -449,7 +433,7 @@
       (loop for shape in shapes
             for i from 0
             do (unless (= (length shape) rank)
-		 (error "张量 ~A 的秩不匹配" i))
+		 (error "张量 ~a 的秩不匹配" i))
                (loop for dim in shape
                      for j from 0
                      unless (or (= j real-axis)
@@ -503,7 +487,7 @@
       (loop for shape in shapes
             for i from 0
             unless (equal shape base-shape)
-              do (error "张量 ~A 形状不匹配" i))
+              do (error "张量 ~a 形状不匹配" i))
       
       ;; 沿 axis 扩展每个数组维度
       (let ((expanded-vts
@@ -517,8 +501,8 @@
   (apply #'vt-concatenate 0 vts))
 
 (defun vt-hstack (&rest vts)
-  "水平堆叠(沿轴1,对于1D数组沿轴0).
-  对于1D数组,等价于 concatenate"
+  "水平堆叠(沿轴1,对于1d数组沿轴0).
+  对于1d数组,等价于 concatenate"
   (let ((rank (length (vt-shape (car vts)))))
     (if (= rank 1)
         (apply #'vt-concatenate 0 vts)
@@ -546,9 +530,9 @@
 
 (defun vt-append (arr values &key (axis nil))
   "将 values 附加到 arr 末尾。
-   ARR    : 输入张量
-   VALUES : 要追加的值（张量、标量或序列）
-   AXIS   : 连接轴（None 表示展平后追加；整数表示沿该轴连接）
+   arr    : 输入张量
+   values : 要追加的值（张量、标量或序列）
+   axis   : 连接轴（none 表示展平后追加；整数表示沿该轴连接）
    返回   : 新张量"
   (with-float-safe
     (let ((arr-vt (ensure-vt arr))
@@ -565,17 +549,17 @@
 		 (val-shape (vt-shape val-vt)))
             ;; 形状校验：除连接轴外，其余维度必须相等
             (when (/= (length arr-shape) (length val-shape))
-              (error "vt-append: dimensions mismatch: arr has rank ~A, values has rank ~A"
+              (error "vt-append: dimensions mismatch: arr has rank ~a, values has rank ~a"
                      (length arr-shape) (length val-shape)))
             (loop for i from 0 below (length arr-shape)
                   unless (or (= i ax)
                              (= (nth i arr-shape) (nth i val-shape)))
-                    do (error "vt-append: shape mismatch at axis ~A: arr ~A vs values ~A"
+                    do (error "vt-append: shape mismatch at axis ~a: arr ~a vs values ~a"
                               i (nth i arr-shape) (nth i val-shape)))
             (vt-concatenate ax arr-vt val-vt))))))
 
 (defun vt-insert (arr obj values &key (axis nil))
-  "完全兼容 NumPy 的 np.insert。"
+  "完全兼容 numpy 的 np.insert。"
   (with-float-safe
     (let ((arr-vt (ensure-vt arr))
           (values-vt (ensure-vt values)))
@@ -586,7 +570,7 @@
             (flet ((insert-at (base idx)
                      (let ((current-size (vt-size base)))
                        (when (or (< idx 0) (> idx current-size))
-			 (error "Index out of bounds"))
+			 (error "index out of bounds"))
                        (let ((left (if (> idx 0)
                                        (vt-slice base (list 0 idx))
                                        (vt-zeros (list 0) :type (vt-element-type base))))
@@ -616,7 +600,7 @@
 		(let ((values-total-size (vt-size values-vt))
                       (target-total-size (reduce #'* target-shape)))
                   (unless (= values-total-size target-total-size)
-                    (error "Cannot reshape values of size ~A to shape ~A"
+                    (error "cannot reshape values of size ~a to shape ~a"
 			   values-total-size target-shape))
                   (let ((values-reshaped
                           (vt-reshape values-vt target-shape)))
@@ -642,12 +626,12 @@
 
 
 (defun vt-delete (arr obj &key (axis nil))
-  "完全兼容 NumPy 的 np.delete。
-   OBJ 可以是：
+  "完全兼容 numpy 的 np.delete。
+   obj 可以是：
      - 整数：删除单个索引。
      - 整数列表：删除多个独立索引（例如 `(0 2)` 删除索引 0 和 2）。
      - 形如 `(:slice start end)` 的列表：删除从 start 到 end-1 的连续切片。
-   AXIS 为 nil 时展平后删除，否则沿指定轴删除。"
+   axis 为 nil 时展平后删除，否则沿指定轴删除。"
   (with-float-safe
     (let* ((orig (ensure-vt arr))
            (elem-type (vt-element-type orig))
@@ -662,7 +646,7 @@
                       (destructuring-bind (_ start end)
 			  obj
 			(declare (ignorable _))
-			(assert (<= 0 start end len) (start end) "Invalid slice")
+			(assert (<= 0 start end len) (start end) "invalid slice")
 			(loop for i from start below end collect i)))
                      ((listp obj) (copy-list obj))
                      (t (error "vt-delete: invalid obj")))))
@@ -842,13 +826,13 @@
 
 
 (defun percent-from-sorted (sorted q interpolation)
-  "从已排序列表 SORTED 中，按分数 Q (0..1) 和插值方法 INTERPOLATION 计算百分位值。
-   INTERPOLATION 可选 :LINEAR, :LOWER, :HIGHER, :MIDPOINT, :NEAREST。"
+  "从已排序列表 sorted 中，按分数 q (0..1) 和插值方法 interpolation 计算百分位值。
+   interpolation 可选 :linear, :lower, :higher, :midpoint, :nearest。"
   (with-float-safe
-    (let* ((N (length sorted))
-           (idx (* q (1- N)))
+    (let* ((n (length sorted))
+           (idx (* q (1- n)))
            (lower (floor idx))
-           (upper (min (ceiling idx) (1- N)))
+           (upper (min (ceiling idx) (1- n)))
            (frac (- idx lower)))
       (case interpolation
 	(:linear
@@ -868,14 +852,14 @@
 	 (let ((nearest-idx (if (<= frac 0.5d0) lower upper)))
 	   (coerce (nth nearest-idx sorted) 'double-float)))
 	(otherwise
-	 (error "Unknown interpolation method ~A" interpolation))))))
+	 (error "unknown interpolation method ~a" interpolation))))))
 
 (defun vt-percentile (tensor percentile &key axis (interpolation :linear))
   "计算百分位数。
-   PERCENTILE : 0~100 的百分位数值。
-   AXIS       : 归约轴，支持负数 (NIL 表示全局)。
-   INTERPOLATION : :LINEAR, :LOWER, :HIGHER, :MIDPOINT,
-                   :NEAREST (默认 :LINEAR)。"
+   percentile : 0~100 的百分位数值。
+   axis       : 归约轴，支持负数 (nil 表示全局)。
+   interpolation : :linear, :lower, :higher, :midpoint,
+                   :nearest (默认 :linear)。"
   (with-float-safe
     (let ((q (/ percentile 100.0d0)))
       (if axis
@@ -928,7 +912,7 @@
   "计算直方图。
    bins : bin 数量（默认 10）。
    range : (min, max) 范围。
-   density : 若为 T，返回概率密度直方图（总面积=1）。
+   density : 若为 t，返回概率密度直方图（总面积=1）。
    返回：(hist, bin-edges) 两个一维张量。"
   (declare (list range))
   (with-float-safe
@@ -968,7 +952,7 @@
                              (/ (aref hist i)
 				(* total bin-width)))))))
 
-      ;; 返回两个 VT
+      ;; 返回两个 vt
       (values (vt-from-sequence (coerce hist 'list)
 				:type 'double-float)
               (vt-from-sequence (coerce bin-edges 'list)
@@ -1040,15 +1024,15 @@
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个数组元素是否在容差范围内接近。
-   注意：此实现采用对称容差 (使用 max(|a|, |b|))，与 PyTorch 一致。"
+   注意：此实现采用对称容差 (使用 max(|a|, |b|))，与 pytorch 一致。"
   (with-float-safe
     (vt-map (lambda (a b)
-              ;; 1. 利用 CL 的 = 运算符：Inf == Inf 为 T，NaN == NaN 为 NIL
+              ;; 1. 利用 cl 的 = 运算符：inf == inf 为 t，nan == nan 为 nil
               ;; 这一步直接拦截了无穷大相等的情况，并加速了完全相同的元素
               (if (vt-float-nan-inf-= a b)
                   1.0d0
                   ;; 2. 对于不相等的有限浮点数，进行容差比较
-                  ;; (如果包含 NaN，- 运算会得到 NaN，随后的 <= 会返回 NIL，逻辑依然正确)
+                  ;; (如果包含 nan，- 运算会得到 nan，随后的 <= 会返回 nil，逻辑依然正确)
                   (let ((diff (abs (- a b))))
                     (if (<= diff (+ atol (* rtol (max (abs a) (abs b)))))
 			1.0d0 
@@ -1062,12 +1046,12 @@
     (= (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol)) 1.0d0)))
 
 (defun vt-isfinite (vt)
-  "检查是否为有限值（非 NaN，非无穷）。跨平台兼容实现。"
+  "检查是否为有限值（非 nan，非无穷）。跨平台兼容实现。"
   (with-float-safe
     (let ((pos-inf (vt-float-pos-inf))
           (neg-inf (vt-float-neg-inf)))
       (vt-map (lambda (x)
-		(if (and (vt-float-nan-= x x) ; 排除 NaN
+		(if (and (vt-float-nan-= x x) ; 排除 nan
 			 (not (vt-float-inf-= x pos-inf))
 			 (not (vt-float-inf-= x neg-inf)))
                     1.0d0 0.0d0))
@@ -1085,10 +1069,10 @@
               vt))))
 
 (defun vt-isnan (vt)
-  "检查是否为 NaN"
+  "检查是否为 nan"
   (with-float-safe
     (vt-map (lambda (x)
-              (if (not (vt-float-nan-= x x))  ; NaN 不等于自身
+              (if (not (vt-float-nan-= x x))  ; nan 不等于自身
                   1.0d0 0.0d0))
             vt)))
 
@@ -1117,7 +1101,7 @@
                                (vals (loop for i fixnum from 0 below ax-dim
                                            for off = (+ in-ptr (* i in-stride))
                                            collect (aref in-data off)))
-                               ;; 使用 NaN 安全的 vt-numpy-sort 排序
+                               ;; 使用 nan 安全的 vt-numpy-sort 排序
                                (sorted-vals (vt-numpy-sort vals #'<)))
                           ;; 将排序后的值按顺序写回结果张量
                           (loop for val in sorted-vals
@@ -1154,7 +1138,7 @@
                ;; 构造 (值 . 原始索引) 对
                (pairs (loop for i fixnum from 0 below n
                             collect (cons (aref in-data i) i))))
-          ;; 分离 NaN 和非 NaN，保持各自原始顺序
+          ;; 分离 nan 和非 nan，保持各自原始顺序
           (let ((non-nans '())
                 (nans '()))
             (dolist (p pairs)
@@ -1163,12 +1147,12 @@
                   (push p non-nans)))
             (setq non-nans (nreverse non-nans)
                   nans      (nreverse nans))
-            ;; 非 NaN 部分按值稳定排序
+            ;; 非 nan 部分按值稳定排序
             (setq non-nans (stable-sort non-nans #'< :key #'car))
-            ;; 拼接：升序时 NaN 在末尾
+            ;; 拼接：升序时 nan 在末尾
             (let ((sorted-indices (mapcar #'cdr (append non-nans nans))))
               (%make-vt :data (make-array n :element-type 'fixnum
-                                          :initial-contents sorted-indices)
+                                            :initial-contents sorted-indices)
                         :shape (list n)
                         :strides '(1)
                         :offset 0
@@ -1211,8 +1195,8 @@
                            (tail-strides (subseq out-strides (1+ ax)))
                            (tail-size (reduce #'* tail-dims :initial-value 1))
                            (tail-in-strides
-                            (loop for idx from 0 below tail-rank
-                                  collect (nth (+ ax 1 idx) in-strides))))
+                             (loop for idx from 0 below tail-rank
+                                   collect (nth (+ ax 1 idx) in-strides))))
                       ;; 遍历每根纤维（通过线性索引 tail-i）
                       (dotimes (tail-i tail-size)
                         ;; ---------- 计算尾部偏移 ----------
@@ -1236,7 +1220,7 @@
                                         for in-off = (+ in-ptr (* pos in-stride)
                                                         extra-in-off)
                                         collect (cons (aref in-data in-off) pos))))
-                            ;; 分离 NaN 和非 NaN
+                            ;; 分离 nan 和非 nan
                             (let ((non-nans '())
                                   (nans '()))
                               (dolist (p pairs)
@@ -1245,7 +1229,7 @@
                                     (push p non-nans)))
                               (setq non-nans (nreverse non-nans)
                                     nans      (nreverse nans))
-                              ;; 对非 NaN 稳定排序
+                              ;; 对非 nan 稳定排序
                               (setq non-nans (stable-sort non-nans #'< :key #'car))
                               ;; 写回索引（cdr 即原始位置）
                               (loop for (val . pos) in (append non-nans nans)
@@ -1310,7 +1294,7 @@
                        do (setf (aref inverse orig) uniq-num)
                           (incf pos))
 		 (vector-push-extend (- pos start) cnts))
-	;; 转换为 VT
+	;; 转换为 vt
 	(let ((uniq-vt (vt-from-sequence (coerce unique-vals 'list)
 					 :type elem-type))
               (idx-vt  (when return-index
@@ -1488,7 +1472,7 @@
   "计算张量的梯度（沿指定轴的二阶中心差分）。
    axis  : nil → 全部轴, 整数或整数列表 → 指定轴（支持负数）。
    spacing: 标量（统一间距）、列表（按轴间距，长度需与轴数一致）、
-            或单轴配合 1D 张量作为坐标数组。
+            或单轴配合 1d 张量作为坐标数组。
    返回：若 axis 为 nil 或列表，返回梯度张量的列表；若 axis 为单个整数，返回单个张量。"
   (with-float-safe
     (let* ((shape (vt-shape tensor))
@@ -1511,18 +1495,18 @@
                      spacing)
                     ((typep spacing 'vt)
                      (when (> (length axes) 1)
-                       (error "When spacing is a tensor, axis must be a single axis."))
+                       (error "when spacing is a tensor, axis must be a single axis."))
                      (list spacing))
-                    (t (error "spacing must be a number, list or 1D tensor.")))))
+                    (t (error "spacing must be a number, list or 1d tensor.")))))
 	(labels
 	    ((slice-specs (ax start end)
-	       "生成沿轴 AX 的切片规格：从 start (包含) 到 end (不包含)。"
+	       "生成沿轴 ax 的切片规格：从 start (包含) 到 end (不包含)。"
 	       (loop for d from 0 below rank
                      collect (if (= d ax) (list start end) '(:all))))
              (grad-along-axis (ax sp)
 	       (let* ((n (nth ax shape)))
 		 (when (< n 2)
-                   (error "Tensor size ~D along axis ~D is too small for gradient." n ax))
+                   (error "tensor size ~d along axis ~d is too small for gradient." n ax))
 		 (if (numberp sp)
                      ;; ---------- 等间距 ----------
                      (if (= n 2)
@@ -1546,7 +1530,7 @@
                      ;; ---------- 非均匀间距（坐标数组） ----------
                      (let* ((h-vt (ensure-vt sp))
                             (n-h (vt-size h-vt)))
-		       (assert (= n n-h) (sp) "Spacing array must have same length as axis.")
+		       (assert (= n n-h) (sp) "spacing array must have same length as axis.")
 		       (if (= n 2)
                            ;; 轴长度=2，一阶差分重复
                            (let* ((h-diff (vt-- (apply #'vt-slice h-vt (list (list 1 2)))
@@ -1613,7 +1597,7 @@
 				(truncate (aref (vt-data idx-vt) 0))
 				(aref (vt-data idx-vt) 0))))
                   (unless (<= 0 idx (1- size))
-                    (error "索引 ~D 越界，展平大小 ~D" idx size))
+                    (error "索引 ~d 越界，展平大小 ~d" idx size))
                   (aref (vt-data flat) idx))
 		;; 非标量索引：保留形状
 		(let* ((flat (vt-ravel tensor))
@@ -1630,7 +1614,7 @@
                       (dotimes (i idx-len)
 			(let ((idx (aref idx-arr i)))
                           (unless (<= 0 idx (1- size))
-                            (error "索引 ~D 越界，展平大小 ~D" idx size))
+                            (error "索引 ~d 越界，展平大小 ~d" idx size))
                           (setf (aref out-data i) (aref flat-data idx)))))
                     out))))
 
@@ -1683,7 +1667,7 @@
                      (if (= d idx-len)
 			 (let ((idx (aref idx-arr idx-off)))
                            (unless (<= 0 idx (1- ax-dim))
-                             (error "索引 ~D 越界，轴 ~D 大小 ~D"
+                             (error "索引 ~d 越界，轴 ~d 大小 ~d"
 				    idx ax ax-dim))
                            (recurse (1+ ax)
                                     (+ in-ptr (* idx (nth ax in-strides)))
@@ -1732,7 +1716,7 @@
       
       (loop for raw-idx in idx-list
             for val-idx from 0 
-            ;; 优化：用 mod 递增代替 (nth (mod i n) list)，保证 O(1) 取值
+            ;; 优化：用 mod 递增代替 (nth (mod i n) list)，保证 o(1) 取值
             for val = (nth (mod val-idx n-values) val-list)
             do (let ((idx raw-idx))
 		 ;; 处理越界模式
@@ -1740,9 +1724,9 @@
                    ((and (>= idx 0) (< idx total-size)) nil) ; 合法，什么都不做
                    ((eq mode :clip) (setq idx (max 0 (min idx (1- total-size)))))
                    ((eq mode :wrap) (setq idx (mod idx total-size)))
-                   (t (error "索引 ~D 超出范围 [0, ~D)" raw-idx total-size)))
+                   (t (error "索引 ~d 超出范围 [0, ~d)" raw-idx total-size)))
 		 
-		 ;; 核心算法：1D逻辑索引 → 多维坐标 → 物理偏移
+		 ;; 核心算法：1d逻辑索引 → 多维坐标 → 物理偏移
 		 (let ((remaining idx)
                        (phys-offset offset))
                    (loop for dim in (reverse shape)
@@ -1767,7 +1751,7 @@
       (loop for i from 0 below idx-size
             for idx = (aref idx-data i)
             do (when (or (< idx 0) (>= idx n-choices))
-		 (error "选择索引 ~A 越界" idx))
+		 (error "选择索引 ~a 越界" idx))
                (setf (aref result-data i)
                      (aref (vt-data (nth idx choices)) i)))
       (%make-vt :data result-data
@@ -1778,7 +1762,7 @@
 
 (defun vt-select (condlist choicelist &key default)
   "根据多个条件从多个数组中选择值"
-   (declare (ignore default))
+  (declare (ignore default))
   (with-float-safe   
     (let* ((n-conds (length condlist))
            (shape (vt-shape (car condlist)))
@@ -1875,18 +1859,18 @@
                        (make-list rank :initial-element pad-width)
                        pad-width)))
       (unless (= (length pw-list) rank)
-	(error "pad-width length ~A does not match tensor rank ~A"
+	(error "pad-width length ~a does not match tensor rank ~a"
 	       (length pw-list) rank))
       (mapcar (lambda (x)
 		(cond ((integerp x) 
                        (if (< x 0)
-			   (error "Negative padding is not supported")
+			   (error "negative padding is not supported")
 			   (list x x)))
                       ((and (consp x) (= (length x) 2))
                        (if (or (< (first x) 0) (< (second x) 0))
-                           (error "Negative padding is not supported")
+                           (error "negative padding is not supported")
                            x))
-                      (t (error "Invalid pad-width element: ~A" x))))
+                      (t (error "invalid pad-width element: ~a" x))))
               pw-list))))
 
 (defun apply-pad-mode (mode dist sk side)
@@ -1904,7 +1888,7 @@
       (:reflect
        ;; reflect 左侧起点 1 向左递增；右侧起点 sk-2 向右递减
        (when (<= sk 1)
-	 (error "Cannot reflect on dimension with size <= 1"))
+	 (error "cannot reflect on dimension with size <= 1"))
        (let* ((period (* 2 (1- sk)))
               (x (if (eq side :left) dist (- sk 1 dist)))
               (idx (mod x period)))
@@ -1963,7 +1947,7 @@
                      (if (eq mode :constant)
 			 (unless const-val (setf const-val c-right))
 			 (setf (nth d src-idxs) 
-                               ;; CL中 (- a b -1) 等价于 a - b + 1
+                               ;; cl中 (- a b -1) 等价于 a - b + 1
                                (apply-pad-mode
 				mode (- offset sk -1) sk :right))))
                     ;; 原始数据区
@@ -2111,7 +2095,7 @@
 	    (vt-zeros out-shape :type (vt-element-type y)))))
       ;; 步长向量（长度 = n-1）
       (let ((h (if x
-                   (vt-diff (ensure-vt x))          ; 1D,长度 n-1
+                   (vt-diff (ensure-vt x))          ; 1d,长度 n-1
                    (make-vt (list (1- n)) dx
                             :type (vt-element-type y)))))
 	;; 将 h 的外形扩展为 [1,…,1,n-1,1,…,1] 以便广播
@@ -2130,7 +2114,7 @@
           (vt-sum integrand :axis ax))))))
 
 (defun vt-interp (x xp fp &key (left nil) (right nil))
-  "一维线性插值。x, xp, fp 均为 1D 张量。"
+  "一维线性插值。x, xp, fp 均为 1d 张量。"
   (with-float-safe
     (let* ((xp-data (vt-data xp))
            (fp-data (vt-data fp))
@@ -2182,26 +2166,26 @@
 ;;; ===========================================
 
 (defvar *vt-default-random-state* (make-random-state *random-state*)
-  "CLVT 内部使用的默认随机状态。可由 vt-random-seed 修改或通过 let 覆盖。")
+  "clvt 内部使用的默认随机状态。可由 vt-random-seed 修改或通过 let 覆盖。")
 
 (defun vt-make-random-state (&optional seed)
   "创建并返回一个新的 random-state 对象。seed 同 make-random-state 参数。
    示例：
-     (vt-make-random-state)     => 使用 T 随机初始化
-     (vt-make-random-state NIL) => 从当前 *random-state* 复制
+     (vt-make-random-state)     => 使用 t 随机初始化
+     (vt-make-random-state nil) => 从当前 *random-state* 复制
      (vt-make-random-state 42)  => 不可移植地使用整数初始化"
   #+sbcl
   (sb-ext::seed-random-state seed)
   #-sbcl
   (typecase seed
-    (null (make-random-state nil)) ; 保持与 CL 一致：nil → 复制当前全局状态
+    (null (make-random-state nil)) ; 保持与 cl 一致：nil → 复制当前全局状态
     (random-state (make-random-state seed))
     (t (make-random-state seed)))  ; 实现依赖，通常可为整数加载
   )
 
 (defun vt-random-seed (seed)
   "修改 *vt-default-random-state* 并返回新的状态。seed 含义同 vt-make-random-state。
-   例：(vt-random-seed 42)  后，所有使用默认 RNG 的函数将产生可复现序列。"
+   例：(vt-random-seed 42)  后，所有使用默认 rng 的函数将产生可复现序列。"
   (setf *vt-default-random-state* (vt-make-random-state seed)))
 
 (declaim (inline %uniform-rand %normal-rand))
@@ -2212,7 +2196,7 @@
   (random 1.0d0 state))
 
 (defun %normal-rand (state)
-  "Box-Muller 方法生成标准正态分布随机数。"
+  "box-muller 方法生成标准正态分布随机数。"
   (declare (random-state state))
   (let ((u1 (random 1.0d0 state))
         (u2 (random 1.0d0 state)))
@@ -2221,7 +2205,7 @@
 
 (defun vt-random (shape &key (type 'double-float)
 			  (rng *vt-default-random-state*))
-  "返回形状为 SHAPE 的张量，元素独立同分布于 [0,1) 均匀分布。"
+  "返回形状为 shape 的张量，元素独立同分布于 [0,1) 均匀分布。"
   (declare (list shape) (random-state rng))
   (vt-map (lambda (x)
             (declare (ignore x))
@@ -2252,7 +2236,11 @@
 
 (defun vt-random-int (low high &key (size nil) (type 'fixnum)
 				 (rng *vt-default-random-state*))
-  "生成 [low, high) 的随机整数。若 SIZE 为 NIL，返回标量；否则返回张量。"
+  "创建随机整数数组.
+  low: 下界(包含)
+  high: 上界(不包含)
+  size: 形状(nil 表示标量)
+  返回: 张量"
   (declare (random-state rng))
   (let ((range (- high low)))
     (if size

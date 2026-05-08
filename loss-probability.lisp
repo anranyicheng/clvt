@@ -1,7 +1,7 @@
 (in-package :clvt)
 
 (defun vt-softmax (vt &key (axis -1))
-  "Softmax: exp(x - max) / sum(exp(x - max))
+  "softmax: exp(x - max) / sum(exp(x - max))
  关键: 减去 max 保证数值稳定性; keepdims 保证广播正确"
   (with-float-safe
     (let* ((max-val (vt-amax vt :axis axis :keepdims t))
@@ -10,7 +10,7 @@
       (vt-/ exp-vt sum-exp))))
 
 (defun vt-log-softmax (vt &key (axis -1))
-  "Log-Softmax: log(softmax(x))，比分开算更数值稳定"
+  "log-softmax: log(softmax(x))，比分开算更数值稳定"
   (with-float-safe
     (let* ((max-val (vt-amax vt :axis axis :keepdims t))
            (shifted (vt-- vt max-val))

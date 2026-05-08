@@ -46,7 +46,7 @@
   (apply #'vt-/ vt args))
 
 (defun vt-scale (a b)
-  "将张量 TENSOR 的所有元素乘以标量 SCALAR, 返回新的张量."
+  "将张量 tensor 的所有元素乘以标量 scalar, 返回新的张量."
   (vt-* a b))
 
 (defun vt-sin (vt)
@@ -111,7 +111,7 @@
 
 
 (defun vt-positive-p (vt)
-  "判断是否大于零. 返回 1.0 (True) 或 0.0 (False)."
+  "判断是否大于零. 返回 1.0 (true) 或 0.0 (false)."
   (with-float-safe
     (vt-map (lambda (v) (if (> v 0.0d0) 1.0d0 0.0d0)) vt)))
 
@@ -178,7 +178,7 @@
 
 (defun vt-rint (vt)
   "四舍五入到最接近的整数 (浮点数返回值)."
-  ;; Common Lisp 没有直接的 rint,使用 round 然后 float 化
+  ;; common lisp 没有直接的 rint,使用 round 然后 float 化
   (with-float-safe
     (vt-map (lambda (x) (float (round x) x)) vt)))
 

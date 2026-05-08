@@ -5,7 +5,7 @@
      ,@body))
 
 (defstruct (vt (:constructor %make-vt))
-  "N维张量结构.
+  "n维张量结构.
    data: 存储数据的一维简单数组.
    shape: 形状列表.
    strides: 步长列表.
@@ -57,7 +57,7 @@
 
 
 (defun vt-flatten-sequence (seq)
-  "深度优先遍历 SEQ 及其嵌套序列,返回所有原子元素的列表.
+  "深度优先遍历 seq 及其嵌套序列,返回所有原子元素的列表.
    支持列表、向量、多维数组、位数组等序列类型,按行优先顺序处理."
   (with-float-safe
     (labels ((sequence-p (obj)
@@ -98,7 +98,7 @@
                                (push (cons elt (if (listp elt) elt 0))
 				     stack)
                                (push elt result))))))
-                  (t (error "~S 不是序列" s)))))
+                  (t (error "~s 不是序列" s)))))
             (nreverse result))))))
 
 (defun vt-from-sequence (contents &key (type 'double-float))
@@ -127,13 +127,13 @@
                                   for sub = (elt seq i)
                                   for sub-shape = (infer-shape sub)
                                   unless (equal sub-shape rest-shape)
-                                    do (error "不规则嵌套: 期望 ~A 但得到 ~A"
+                                    do (error "不规则嵌套: 期望 ~a 但得到 ~a"
 					      rest-shape sub-shape)
                                   finally (return rest-shape)))
                            ;; 叶子：一维
                            (list len)))))
 	       ;; 不是序列（但这种情况不应该发生，因为顶层是序列）
-	       (error "无法从 ~A 创建张量" seq)))
+	       (error "无法从 ~a 创建张量" seq)))
 	 (fill-tensor (data seq shape strides depth flat-idx)
            (if (null shape)
 	       ;; 到达叶子：写入元素
@@ -273,13 +273,13 @@
 
 (defun vt-eye (n &key (m n) (value 1) (type 'double-float))
   "创建单位矩阵 或矩形矩阵.
-   N: 行数.
-   M: 列数 (默认为 N).
-   Value: 对角线填充值 (默认 1.0)."
+   n: 行数.
+   m: 列数 (默认为 n).
+   value: 对角线填充值 (默认 1.0)."
   (with-float-safe
     (let* ((rows n)
            (cols m)
-           ;; 简单情况:2D 矩阵
+           ;; 简单情况:2d 矩阵
            (shape (list rows cols))
            (res (vt-zeros shape :type type))
            (data (vt-data res))
@@ -299,7 +299,7 @@
       res)))
 
 (defun vt-diag (vector-tensor)
-  "从 1D 张量 (向量) 创建方阵对角矩阵.
+  "从 1d 张量 (向量) 创建方阵对角矩阵.
    输入: 形状为 的张量.
    输出: 形状为 的张量,非对角线为 0."
   (with-float-safe
@@ -322,9 +322,9 @@
 
 (defun vt-triu (tensor &key (k 0) (in-place nil))
   "返回上三角矩阵.
-   K: 对角线偏移 (0=主对角线, 1=主对角线之上).
-   In-Place: 如果为 T,直接修改原张量；否则返回副本.
-   支持 Batch (Rank >= 2)."
+   k: 对角线偏移 (0=主对角线, 1=主对角线之上).
+   in-place: 如果为 t,直接修改原张量；否则返回副本.
+   支持 batch (rank >= 2)."
   (with-float-safe
     (let* ((res (if in-place tensor (vt-copy tensor)))
 	   ;; vt-copy 需自行实现或用 vt-map identity
@@ -364,8 +364,8 @@
 
 (defun vt-tril (tensor &key (k 0) (in-place nil))
   "返回下三角矩阵.
-   K: 对角线偏移 (0=主对角线, -1=主对角线之下).
-   支持 Batch."
+   k: 对角线偏移 (0=主对角线, -1=主对角线之下).
+   支持 batch."
   (with-float-safe
     (let* ((res (if in-place tensor (vt-copy tensor)))
            (res-data (vt-data res))
@@ -404,8 +404,8 @@
 
 (defun vt-diagonal (tensor &key (offset 0))
   "提取对角线元素.
-   返回一个 1D 张量 (向量),如果是 Batch 输入则返回 2D 张量.
-   Offset: 对角线偏移."
+   返回一个 1d 张量 (向量),如果是 batch 输入则返回 2d 张量.
+   offset: 对角线偏移."
   (with-float-safe
     (let* ((in-shape (vt-shape tensor))
            (rank (length in-shape)))    
@@ -415,7 +415,7 @@
              ;; 计算对角线长度
              (diag-len (max 0 (- (min rows cols) (abs offset))))
 	     (type (vt-element-type tensor))
-             ;; 确定输出形状:Batch 维度 + 对角线长度
+             ;; 确定输出形状:batch 维度 + 对角线长度
              (out-shape
 	       (append (subseq in-shape 0 (- rank 2))
 		       (list diag-len)))
@@ -460,8 +460,8 @@
 ;; 1. 选用正确的步长计算函数
 (defun vt-compute-strides (shape)
   "根据形状计算连续内存步长.
-   Shape 为 nil (标量) -> 返回 nil.
-   Shape 为 (10) -> 返回 (1)."
+   shape 为 nil (标量) -> 返回 nil.
+   shape 为 (10) -> 返回 (1)."
   (if (null shape)
       nil
       (loop with stride = 1
@@ -501,7 +501,7 @@
   (let ((old-size (vt-shape-to-size (vt-shape vt)))
         (new-size (vt-shape-to-size new-shape)))
     (unless (= old-size new-size)
-      (error "重塑失败:元素总数不一致 (旧: ~A, 新: ~A)" old-size new-size))    
+      (error "重塑失败:元素总数不一致 (旧: ~a, 新: ~a)" old-size new-size))    
     (if (vt-contiguous-p vt)
         ;; 零拷贝路径:直接复用数据
         (%make-vt
@@ -543,12 +543,12 @@
 		    (+ axis rank)
 		    axis)))
 	(when (or (< ax 0) (>= ax rank))
-	  (error "Axis ~A is out of bounds for tensor of rank ~A"
+	  (error "axis ~a is out of bounds for tensor of rank ~a"
 		 axis rank))
 	ax)))
 
 (defun vt-narrow (vt axis start end)
-  "零拷贝切片.沿指定轴切片,调整偏移量和形状. (等价于 PyTorch 的 narrow)"
+  "零拷贝切片.沿指定轴切片,调整偏移量和形状. (等价于 pytorch 的 narrow)"
   (with-float-safe
     (let* ((shape (copy-list (vt-shape vt)))
            (rank (length shape))
@@ -556,10 +556,10 @@
            (strides (vt-strides vt))
            (dim-size (nth ax shape)))    
       (when (or (< start 0) (> end dim-size))
-	(error "切片索引 [~A, ~A) 越界，当前轴大小为 ~A"
+	(error "切片索引 [~a, ~a) 越界，当前轴大小为 ~a"
 	       start end dim-size))
       (when (< end start)
-	(error "vt-narrow: end (~A) must be greater than start (~A)"
+	(error "vt-narrow: end (~a) must be greater than start (~a)"
 	       end start))
       (let ((new-offset (+ (vt-offset vt)
                            (* start (nth ax strides))))
@@ -572,9 +572,9 @@
 	 :etype (vt-element-type vt))))))
 
 (defun vt-split (tensor indices-or-sections &key (axis 0))
-  "模仿 NumPy 的 split，支持负数 axis
+  "模仿 numpy 的 split，支持负数 axis
    沿轴分割张量.
-   indices-or-sections: 整数N(等分)或索引列表
+   indices-or-sections: 整数n(等分)或索引列表
    axis: 分割轴
    返回: 张量列表"
   (with-float-safe
@@ -583,17 +583,17 @@
            (ax (vt-normalize-axis axis rank))
            (dim-size (nth ax shape)))    
       (cond
-	;; ========== 情况 A：均分 ==========
+	;; ========== 情况 a：均分 ==========
 	((integerp indices-or-sections)
 	 (let* ((n indices-or-sections)
 		(chunk-size (floor dim-size n)))
            (unless (zerop (rem dim-size n))
-             (error "数组沿轴 ~A 的大小 ~A 不能被 ~A 整除" ax dim-size n))
+             (error "数组沿轴 ~a 的大小 ~a 不能被 ~a 整除" ax dim-size n))
            (loop for i from 0 below n
 		 collect (vt-narrow tensor ax 
                                     (* i chunk-size) 
                                     (* (1+ i) chunk-size)))))      
-	;; ========== 情况 B：指定位置下刀 ==========
+	;; ========== 情况 b：指定位置下刀 ==========
 	((listp indices-or-sections)
 	 (let ((points (append (list 0) indices-or-sections (list dim-size))))
            (loop for (start end) on points by #'cdr
@@ -611,7 +611,7 @@
      - (start end &optional step) : 范围切片，start/end 可用 nil 省略
    自动补齐尾部缺失的 :all；支持负索引与负步长。
    返回零拷贝视图。
-编号  NumPy 表达式          含义                        新 vt-slice 写法                                   输出形状
+编号  numpy 表达式          含义                        新 vt-slice 写法                                   输出形状
 1     b[1, 2]              单个元素                   (vt-slice b '(1) '(2))                             标量 (降维)
 2     b[1, :]              第 1 行                    (vt-slice b '(1) '(:all))                          (5)
 3     b[:, 2]              第 2 列                    (vt-slice b '(:all) '(2))                          (4)
@@ -626,7 +626,7 @@
 12    b[1:3, :]            行切片                     (vt-slice b '(1 3) '(:all))                        (2,5)
 13    b[1:, :-2]           第 1 行起，不含最后两列      (vt-slice b '(1 nil) '(nil -2))                    (3,3)
 14    b[::2, 1::2]         隔行，第 1 列隔列取         (vt-slice b '(nil nil 2) '(1 nil 2))               (2,2)
-15    b[None,:,None,0]     插入新轴并选取              (vt-slice b '(:newa) '(:all) '(:newa) '(0))        (1,4,1)
+15    b[none,:,none,0]     插入新轴并选取              (vt-slice b '(:newa) '(:all) '(:newa) '(0))        (1,4,1)
 16    b[..., :2]           省略号，切最后一维前两列     (vt-slice b '(:elli) '(nil 2))                     (4,2)
 17    b[:, -1]             最后一列 (降维)             (vt-slice b '(:all) '(-1))                         (4)
 18    b[:, [0,2]]          花式索引 (暂未支持)         可考虑用 vt-take                                   —
@@ -643,7 +643,7 @@
              (num-newaxis (count '(:newa) specs :test #'equal))
              (explicit-original (- (length specs) (if ellipsis-pos 1 0) num-newaxis)))
 	(when (> explicit-original old-rank)
-          (error "Too many indices for array of rank ~D" old-rank))
+          (error "too many indices for array of rank ~d" old-rank))
 	(let ((needed-all (- old-rank explicit-original)))
           (dolist (s specs)
             (if (equal s '(:elli))
@@ -663,7 +663,7 @@
             (axis-idx 0))
 	(dolist (spec expanded-specs)
           (unless (listp spec)
-            (error "Invalid slice spec: ~A, expected a list" spec))
+            (error "invalid slice spec: ~a, expected a list" spec))
           (cond
             ;; --- 新轴 ---
             ((equal spec '(:newa))
@@ -673,7 +673,7 @@
             ;; --- 全选（:all 或 t） ---
             ((or (equal spec '(:all)) (equal spec '(t)))
              (when (>= axis-idx old-rank)
-               (error "Axis index out of bounds"))
+               (error "axis index out of bounds"))
              (let ((dim (nth axis-idx old-shape))
                    (stride (nth axis-idx old-strides)))
                (push dim new-shape)
@@ -684,7 +684,7 @@
             ((and (listp spec) (<= 2 (length spec) 3))
              (destructuring-bind (start end &optional (step 1)) spec
                (when (>= axis-idx old-rank)
-		 (error "Axis index out of bounds"))
+		 (error "axis index out of bounds"))
                (let ((dim (nth axis-idx old-shape))
                      (stride (nth axis-idx old-strides)))
 		 (when (and (numberp start) (< start 0))
@@ -692,7 +692,7 @@
 		 (when (and (numberp end)   (< end 0))
                    (incf end dim))
 		 (when (zerop step)
-                   (error "Slice step cannot be zero"))
+                   (error "slice step cannot be zero"))
 		 (cond
                    ((> step 0)
                     (setf start (if (null start) 0
@@ -721,18 +721,18 @@
             ((and (listp spec) (= (length spec) 1) (integerp (first spec)))
              (let ((idx (first spec)))
                (when (>= axis-idx old-rank)
-		 (error "Axis index out of bounds"))
+		 (error "axis index out of bounds"))
                (let ((dim (nth axis-idx old-shape))
                      (stride (nth axis-idx old-strides)))
 		 (when (< idx 0) (incf idx dim))
 		 (unless (and (>= idx 0) (< idx dim))
-                   (error "Index ~D out of bounds for axis ~D (size ~D)"
+                   (error "index ~d out of bounds for axis ~d (size ~d)"
 			  idx axis-idx dim))
 		 (incf cur-offset (* idx stride))
 		 (incf axis-idx))))
 
             ;; --- 其他情况报错 ---
-            (t (error "Invalid slice spec: ~A" spec))))
+            (t (error "invalid slice spec: ~a" spec))))
 
 	(%make-vt :data (vt-data vt)
                   :shape (nreverse new-shape)
@@ -758,9 +758,9 @@
 			((vt-p value)
 			 (if (null (vt-shape value))
                              (aref (vt-data value) (vt-offset value))
-                             (error "Cannot assign tensor of shape ~A to scalar slice"
+                             (error "cannot assign tensor of shape ~a to scalar slice"
                                     (vt-shape value))))
-			(t (error "Invalid value ~A for scalar slice" value)))))
+			(t (error "invalid value ~a for scalar slice" value)))))
             (setf (vt-ref target-view) scalar-value))
           ;; 目标为非标量：使用通用拷贝（支持广播）
           (vt-copy-into target-view value)))))
@@ -827,12 +827,12 @@
    ptr-var: 当前元素的物理索引。
    val-var: 当前元素的值。"
   (with-float-safe
-    (let ((rank-sym (gensym "RANK"))
-          (shape-sym (gensym "SHAPE"))
-          (strides-sym (gensym "STRIDES"))
-          (data-sym (gensym "DATA"))
-          (offset-sym (gensym "OFFSET"))
-          (depth-sym (gensym "DEPTH")))
+    (let ((rank-sym (gensym "rank"))
+          (shape-sym (gensym "shape"))
+          (strides-sym (gensym "strides"))
+          (data-sym (gensym "data"))
+          (offset-sym (gensym "offset"))
+          (depth-sym (gensym "depth")))
       `(let* ((,shape-sym (vt-shape ,vt))
               (,strides-sym (vt-strides ,vt))
               (,data-sym (vt-data ,vt))
@@ -854,9 +854,9 @@
            (recurse 0 ,offset-sym))))))
 
 (defun vt-copy-into (dest src)
-  "将 SRC 的数据拷贝到 DEST (支持广播和类型转换).
-   SRC: 源张量或标量数字.
-   DEST: 目标张量视图."  
+  "将 src 的数据拷贝到 dest (支持广播和类型转换).
+   src: 源张量或标量数字.
+   dest: 目标张量视图."  
   ;; === 支持标量输入
   (when (numberp src)
     (setf src (vt-from-sequence (list src)
@@ -869,10 +869,10 @@
   (with-float-safe
     (let ((dest-shape (vt-shape dest))
           (src-shape (vt-shape src)))
-      ;; 确保 Dest 的形状能够容纳 Src 广播后的形状
+      ;; 确保 dest 的形状能够容纳 src 广播后的形状
       (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
 	(unless (equal final-shape dest-shape)
-          (error "Copy-Into 失败: Dest 形状 ~A 无法容纳 Src 广播后的形状 ~A" 
+          (error "copy-into 失败: dest 形状 ~a 无法容纳 src 广播后的形状 ~a" 
 		 dest-shape final-shape))      
 	;; 准备数据
 	(let* ((dest-data (vt-data dest))
@@ -937,7 +937,7 @@
           do (cond ((= dim1 dim2) (push dim1 result))
                    ((or (= dim1 1) (= dim2 1))
 		    (push (max dim1 dim2) result))
-                   (t (error "形状 ~A 和 ~A 无法进行广播" shape1 shape2))))
+                   (t (error "形状 ~a 和 ~a 无法进行广播" shape1 shape2))))
     (the list result)))
 
 
@@ -969,21 +969,21 @@
   "高性能广播宏.
    修复了指针迭代逻辑,确保指针随着循环正确递增."
   (with-float-safe
-    (let ((idx-var (gensym "IDX"))
-          (rank-var (gensym "RANK"))
-          (res-shape (gensym "RES-SHAPE"))
+    (let ((idx-var (gensym "idx"))
+          (rank-var (gensym "rank"))
+          (res-shape (gensym "res-shape"))
           ;; 指针变量
-          (p1 (gensym "P1"))
-          (p2 (gensym "P2"))
-          (pr (gensym "PR"))
+          (p1 (gensym "p1"))
+          (p2 (gensym "p2"))
+          (pr (gensym "pr"))
           ;; 步长变量
-          (s1 (gensym "S1"))
-          (s2 (gensym "S2"))
-          (sr (gensym "SR"))
-          (dim (gensym "DIM"))
-          (data1 (gensym "DATA1"))
-          (data2 (gensym "DATA2"))
-          (data-res (gensym "DATA-RES")))
+          (s1 (gensym "s1"))
+          (s2 (gensym "s2"))
+          (sr (gensym "sr"))
+          (dim (gensym "dim"))
+          (data1 (gensym "data1"))
+          (data2 (gensym "data2"))
+          (data-res (gensym "data-res")))
       `(let* ((,res-shape (vt-shape ,result-vt))
               (,rank-var (length ,res-shape))
               (,data1 (vt-data ,t1))
@@ -1028,7 +1028,7 @@
    支持标量、列表、张量混合输入.
    特性:自动类型转换、广播、指针算术优化、双目运算内联."
   (declare (function fn))
-  ;; 1. [无缝操作] 统一转换输入为 VT
+  ;; 1. [无缝操作] 统一转换输入为 vt
   (with-float-safe
     (let* ((clean-tensors (mapcar #'ensure-vt tensors))
            (n-tensors (length clean-tensors)))    
@@ -1118,7 +1118,7 @@
   (let* ((rank (length shape))
          (real-axis (if (< axis 0) (+ rank axis) axis)))
     (when (or (< real-axis 0) (>= real-axis rank))
-      (error "Axis ~A 越界,张量秩为 ~A" axis rank))))
+      (error "axis ~a 越界,张量秩为 ~a" axis rank))))
 
 (defun vt-compute-logical-strides (shape)
   "计算逻辑步长(用于计算扁平化索引).
@@ -1198,7 +1198,7 @@
 	     (if is-global-reduction
 		 (make-list rank :initial-element 0)
 		 ;; 轴向归约：根据 keepdims 决定索引偏移
-		 ;; keepdims=T: 形状没少，输入第 i 轴直接对应输出第 i 轴
+		 ;; keepdims=t: 形状没少，输入第 i 轴直接对应输出第 i 轴
 		 ;; keepdims=nil: 形状少了一维，跨过归约轴后要 -1
 		 (loop
 		   for i from 0 below rank
@@ -1267,25 +1267,25 @@
             (if return-arg
 		(values final-val (aref res-idx-data (vt-offset res-idx)))
 		final-val))
-          ;; 其余情况（轴向归约，或 keepdims=T），均返回 VT 结构体
+          ;; 其余情况（轴向归约，或 keepdims=t），均返回 vt 结构体
           (values res res-idx)))))
 
 
 (defun vt-matmul (a b)
-  "矩阵乘法，兼容 1D 向量（对标 NumPy 的 @ 运算符）。"
+  "矩阵乘法，兼容 1d 向量（对标 numpy 的 @ 运算符）。"
   (let ((ra (vt-order a))
         (rb (vt-order b)))
     (cond
-      ;; 2D @ 2D → 2D（矩阵乘法）
+      ;; 2d @ 2d → 2d（矩阵乘法）
       ((and (= ra 2) (= rb 2))
        (vt-matmul-df a b))
-      ;; 1D @ 1D → 标量（内积）
+      ;; 1d @ 1d → 标量（内积）
       ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b))
-      ;; 2D @ 1D → 1D（矩阵乘向量）
+      ;; 2d @ 1d → 1d（矩阵乘向量）
       ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b))
-      ;; 1D @ 2D → 1D（向量乘矩阵）
+      ;; 1d @ 2d → 1d（向量乘矩阵）
       ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b))
-      ;; >2D @ >2D → 批量矩阵乘法
+      ;; >2d @ >2d → 批量矩阵乘法
       (t (vt-einsum "...ij,...jk->...ik" a b)))))
 
 
@@ -1359,7 +1359,7 @@
 	      t1 t2))))
 
 (defun vt-where (condition &optional x y)
-  "NumPy 风格的 Where 函数.
+  "numpy 风格的 where 函数.
    模式 1 (查找索引): (vt-where condition)
      返回满足条件的索引.返回一个张量列表,每个张量对应一个维度的索引.
      示例: (vt-where cond) -> (list rows-tensor cols-tensor ...)
@@ -1420,13 +1420,13 @@
                                    :strides '(1)
                                    :offset 0
 				   :etype (array-element-type final-data))))))    
-      (t (error "VT-WHERE 参数错误: 必须只传入 condition,或者同时传入 condition, x, y")))))
+      (t (error "vt-where 参数错误: 必须只传入 condition,或者同时传入 condition, x, y")))))
 
 
 (defun vt-argwhere (condition)
   "查找非零元素的坐标.
    condition: 条件张量.
-   返回: 形状为 (N, Rank) 的二维张量,每一行是一个非零元素的完整坐标.
+   返回: 形状为 (n, rank) 的二维张量,每一行是一个非零元素的完整坐标.
    示例: (vt-argwhere tensor) -> [[0, 1], [2, 3], ...]"
   (declare (type vt condition))
   (with-float-safe
@@ -1479,7 +1479,7 @@
               (loop for i from 0 below total-indices
                     for idx across result-indices
                     do (setf (aref final-data i) idx))
-              ;; 返回 (N, Rank) 形状的张量
+              ;; 返回 (n, rank) 形状的张量
               (%make-vt :data final-data
 			:shape (list count rank)
 			:strides (list rank 1) ; 连续内存
@@ -1530,7 +1530,7 @@
 
 (defun vt-numpy-sort (sequence &optional (predicate #'<))
   "对实数序列（列表或可转为列表的向量）进行排序(默认升序)，
-   将 NaN 放在末尾，保持多个 NaN 的原始相对顺序。
+   将 nan 放在末尾，保持多个 nan 的原始相对顺序。
    返回新列表。"
   (declare (type (or list vector) sequence))
   (assert (or (eq predicate #'<)
@@ -1541,15 +1541,15 @@
     (let ((sequence (coerce sequence 'list))    ; 统一为列表
           non-nans
           nans)
-      ;; 分离 NaN 和非 NaN，按原始顺序
+      ;; 分离 nan 和非 nan，按原始顺序
       (dolist (x sequence (setq non-nans (nreverse non-nans)
 				nans      (nreverse nans)))
 	(if (vt-float-nan-p x)
             (push x nans)
             (push x non-nans)))
-      ;; 只在有限数（含 Inf）上做标准稳定排序
+      ;; 只在有限数（含 inf）上做标准稳定排序
       (setq non-nans (stable-sort non-nans predicate))
-      ;; 拼接：有限数在前，NaN 在后
+      ;; 拼接：有限数在前，nan 在后
       (cond ((or (eq predicate #'<)
 		 (eq predicate '<))
 	     (append non-nans nans))

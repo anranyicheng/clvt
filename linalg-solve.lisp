@@ -7,13 +7,13 @@
 	vt
 	(vt-contiguous vt))))
 
-;;; 部分选主元 LU 分解 (返回 P, L, U，使 P*A = L*U)
+;;; 部分选主元 lu 分解 (返回 p, l, u，使 p*a = l*u)
 (defun vt-lu (matrix)
-  "LU 分解。返回 (P, L, U)，其中 P 为置换矩阵（由行交换向量表示）。"
+  "lu 分解。返回 (p, l, u)，其中 p 为置换矩阵（由行交换向量表示）。"
   (with-float-safe
     (let* ((a (ensure-contiguous-2d-vt matrix))
            (n (first (vt-shape a)))
-           (lu (vt-copy a))          ; 原地存储 L+U
+           (lu (vt-copy a))          ; 原地存储 l+u
            (piv (loop for i from 0 below n collect i)) ; 行交换记录
            (sign 1))
       (unless (eq (vt-element-type matrix) 'double-float)
@@ -26,7 +26,7 @@
                      when (> abs-a max-val)
                        do (setf max-val abs-a max-row i))
                (when (zerop max-val)
-		 (error "矩阵奇异，无法进行 LU 分解"))
+		 (error "矩阵奇异，无法进行 lu 分解"))
                ;; 交换行
                (unless (= max-row k)
 		 (rotatef (nth k piv) (nth max-row piv))
@@ -45,7 +45,7 @@
       (values lu piv sign))))
 
 (defun vt-det (matrix)
-  "基于 LU 分解计算行列式。"
+  "基于 lu 分解计算行列式。"
   (with-float-safe
     (multiple-value-bind (lu piv sign)
 	(vt-lu matrix)
@@ -58,7 +58,7 @@
 
 
 (defun vt-solve (a b)
-  "求解线性方程组 Ax = b（支持多右端项）。"
+  "求解线性方程组 ax = b（支持多右端项）。"
   (with-float-safe
     (let* ((a (ensure-contiguous-2d-vt a))
            (b-vt (ensure-vt b))
@@ -76,9 +76,9 @@
 	(declare (ignore sign))
 	
 	;; ==========================================
-	;; 1. 应用行置换 Pb
-	;; CLTV的piv语义：最终LU的第i行 = 原始A的第piv[i]行
-	;; 所以 Pb 的第 i 行 = 原始 b 的第 piv[i] 行
+	;; 1. 应用行置换 pb
+	;; cltv的piv语义：最终lu的第i行 = 原始a的第piv[i]行
+	;; 所以 pb 的第 i 行 = 原始 b 的第 piv[i] 行
 	;; ==========================================
 	(let ((orig-b (vt-copy b-copy)))
           (loop for i from 0 below n

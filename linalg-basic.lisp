@@ -2,10 +2,10 @@
 
 (defun vt-dot (a b) 
   "点积/内积，支持任意维度： 
-   - 若 a,b 均为 1D → 向量内积，返回数字。 
-   - 若 a 为 2D, b 为 1D → 矩阵乘向量，返回 1D 向量。 
-   - 若 a 为 1D, b 为 2D → 向量乘矩阵，返回 1D 向量。 
-   - 若 a,b 均为 2D → 矩阵乘法 a @ b。 
+   - 若 a,b 均为 1d → 向量内积，返回数字。 
+   - 若 a 为 2d, b 为 1d → 矩阵乘向量，返回 1d 向量。 
+   - 若 a 为 1d, b 为 2d → 向量乘矩阵，返回 1d 向量。 
+   - 若 a,b 均为 2d → 矩阵乘法 a @ b。 
    - 若 a,b 秩均 ≥2 → 批量矩阵乘法 '...ij,...jk->...ik'。 
    其他情况请直接使用 vt-einsum。"
   (with-float-safe
@@ -18,17 +18,17 @@
             ;; ==========================
             ((and (= ra 2) (= rb 2)) (vt-einsum "ij,jk->ik" a b)) 
             ((and (>= ra 2) (>= rb 2)) (vt-einsum "...ij,...jk->...ik" a b)) 
-            (t (error "vt-dot: Unsupported dimensions (a: ~D, b: ~D).
-                     Use vt-einsum directly." ra rb))))))
+            (t (error "vt-dot: unsupported dimensions (a: ~d, b: ~d).
+                     use vt-einsum directly." ra rb))))))
 
 (defun vt-outer (a b &key (flatten t))
   "计算张量外积。
-   flatten = T (默认)
+   flatten = t (默认)
     : 先将输入展平为一维向量，再计算外积，返回二维矩阵。
-      完全兼容 NumPy 的 outer 函数 (支持任意维度输入自动展平)。
-   flatten = NIL
+      完全兼容 numpy 的 outer 函数 (支持任意维度输入自动展平)。
+   flatten = nil
     : 保留输入的每个轴，将所有轴拼接形成新张量。
-      例如 2D 与 3D → 5D 张量。
+      例如 2d 与 3d → 5d 张量。
       等价于 (vt-einsum \"... ,...-> ... ...\"
        无法使用的替代显式下标写法)。"
   (with-float-safe
@@ -44,7 +44,7 @@
     (vt-sum (vt-diagonal matrix))))
 
 (defun vt-norm (vt &key (axis nil))
-  "L2 范数 (欧几里得范数)"
+  "l2 范数 (欧几里得范数)"
   (with-float-safe
     (let ((sq (vt-square vt)))
       (if axis
@@ -52,13 +52,13 @@
           (vt-sqrt (vt-sum sq))))))
 
 (defun vt-l1-norm (vt &key (axis nil))
-  "L1 范数"
+  "l1 范数"
   (with-float-safe
     (if axis
 	(vt-sum (vt-abs vt) :axis axis)
 	(vt-sum (vt-abs vt)))))
 
 (defun vt-frobenius-norm (matrix)
-  "Frobenius 范数 (专用于矩阵)"
+  "frobenius 范数 (专用于矩阵)"
   (with-float-safe
     (vt-norm matrix)))
