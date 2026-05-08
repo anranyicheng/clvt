@@ -559,7 +559,7 @@
             (vt-concatenate ax arr-vt val-vt))))))
 
 (defun vt-insert (arr obj values &key (axis nil))
-  "完全兼容 numpy 的 np.insert。
+ "完全兼容 numpy 的 np.insert。
    obj可以是：
      - 整数：插入单个位置。
      - 整数列表：插入多个位置（值块按原始顺序与位置一一对应）。
@@ -572,29 +572,54 @@
       (if (null axis)
           ;; ---------- 展平模式 ----------
           (let* ((flat-arr (vt-flatten arr-vt))
-                 (flat-val (vt-flatten values-vt)))
-            (flet ((insert-at (base idx)
-                     (let ((current-size (vt-size base)))
-                       (when (or (< idx 0) (> idx current-size))
-                         (error "Index out of bounds"))
-                       (let ((left
-			       (if (> idx 0)
-                                   (vt-slice base (list 0 idx))
-                                   (vt-zeros (list 0)
-					     :type (vt-element-type base))))
-                             (right
-			       (if (< idx current-size)
-                                   (vt-slice base (list idx current-size))
-                                   (vt-zeros (list 0)
-					     :type (vt-element-type base)))))
-                         (vt-concatenate 0 left flat-val right)))))
-              (cond ((integerp obj) (insert-at flat-arr obj))
-                    ((listp obj)
-                     (let ((result flat-arr))
-                       (dolist (idx (stable-sort (copy-list obj) #'>))
-                         (setf result (insert-at result idx)))
-                       result))
-                    (t (error "vt-insert: obj must be integer or list of integers when axis=nil")))))
+                 (flat-val (vt-flatten values-vt))
+                 (val-size (vt-size flat-val)))
+            ;; 情况1：整数索引 → 整个 values 插入到该位置
+            (when (integerp obj)
+              (let ((current-size (vt-size flat-arr)))
+                (when (or (< obj 0) (> obj current-size))
+                  (error "索引 ~A 越界" obj))
+                (if (zerop val-size)
+                    flat-arr
+                    (let ((left (if (> obj 0)
+                                    (vt-slice flat-arr (list 0 obj))
+                                    (vt-zeros (list 0) :type (vt-element-type flat-arr))))
+                          (right (if (< obj current-size)
+                                     (vt-slice flat-arr (list obj current-size))
+                                     (vt-zeros (list 0) :type (vt-element-type flat-arr)))))
+                      (return-from vt-insert
+                        (vt-concatenate 0 left flat-val right))))))
+            ;; 情况2：列表索引
+            (let ((num-insert (length obj)))
+              ;; 检查 values 长度：必须为1（广播）或等于索引数
+              (unless (or (= val-size num-insert) (= val-size 1))
+                (error "FLAT mode: values size ~A ≠ number of indices ~A" val-size num-insert))
+              ;; 构建 (索引 . 值块) 对，并降序排序，从后往前插入避免偏移
+              (let ((sorted-pairs
+                      (stable-sort
+                       (if (= val-size 1)
+                           ;; 单值广播：每个位置都插入同一个 flat-val
+                           (loop for idx in obj collect (cons idx flat-val))
+                           ;; 一一对应：拆分 flat-val 为单个元素
+                           (loop for idx in obj
+                                 for i from 0 below val-size
+                                 collect (cons idx (vt-narrow flat-val 0 i (1+ i)))))
+                       #'> :key #'car))
+                    (result flat-arr))
+                (dolist (pair sorted-pairs)
+                  (let* ((pos (car pair))
+                         (val (cdr pair))
+                         (current-size (vt-size result)))
+                    (when (or (< pos 0) (> pos current-size))
+                      (error "索引 ~A 越界" pos))
+                    (let ((left (if (> pos 0)
+                                    (vt-slice result (list 0 pos))
+                                    (vt-zeros (list 0) :type (vt-element-type result))))
+                          (right (if (< pos current-size)
+                                     (vt-slice result (list pos current-size))
+                                     (vt-zeros (list 0) :type (vt-element-type result)))))
+                      (setf result (vt-concatenate 0 left val right)))))
+                result)))
           ;; ---------- 沿轴插入 ----------
           (let* ((arr-shape (vt-shape arr-vt))
                  (rank (length arr-shape))
@@ -602,12 +627,15 @@
                  (arr-axis-size (nth ax arr-shape))
                  (obj-list (if (listp obj) obj (list obj)))
                  (num-insert (length obj-list))
-                 ;; 计算 values 的目标形状及切片
                  (target-shape (loop for i below rank
-                                     collect (if (= i ax) num-insert
-                                                 (nth i arr-shape))))
-                 (values-reshaped (vt-reshape values-vt target-shape))
-                 ;; 沿轴切分 arr 和 values
+                                     collect (if (= i ax) num-insert (nth i arr-shape))))
+                 ;; 标量广播：若 values 是标量，复制填充至目标形状
+                 (values-vt-broadcast
+                   (if (null (vt-shape values-vt))
+                       (vt-full target-shape (vt-ref values-vt)
+                                :type (vt-element-type values-vt))
+                       values-vt))
+                 (values-reshaped (vt-reshape values-vt-broadcast target-shape))
                  (arr-slices
                    (loop for i from 0 below arr-axis-size
                          collect (vt-narrow arr-vt ax i (1+ i))))
@@ -615,22 +643,21 @@
                    (if (= num-insert 1)
                        (list values-reshaped)
                        (loop for i from 0 below num-insert
-                             collect
-			     (vt-narrow values-reshaped ax i (1+ i)))))
-                 ;; 配对并按位置降序排列
+                             collect (vt-narrow values-reshaped ax i (1+ i)))))
+                 ;; 配对并按位置降序排序
                  (pairs (loop for pos in obj-list
                               for block in value-blocks
                               collect (cons pos block)))
                  (sorted-pairs (stable-sort pairs #'> :key #'car))
-                 ;; 从后往前插入切片
+                 ;; 构造最终切片列表
                  (result-slices
                    (let ((slices (copy-list arr-slices)))
                      (dolist (pair sorted-pairs slices)
                        (let ((pos (car pair))
-                             (blocks (cdr pair)))
+                             (block (cdr pair)))
                          (setf slices
                                (append (subseq slices 0 pos)
-                                       (list blocks)
+                                       (list block)
                                        (subseq slices pos))))))))
             (apply #'vt-concatenate ax result-slices))))))
 

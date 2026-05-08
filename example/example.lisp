@@ -3579,8 +3579,96 @@
             (vt-insert a-flat 6 99)   ; 索引 6 越界（有效 0~5）
             (error "应该抛出越界错误"))
 	(error () t)))
-    (format t "~%vt-insert 全部测试通过~%")
-    t))
+
+ "验证 vt-insert 修复后与 NumPy np.insert 行为一致。"
+  (format t "~%===== 测试 vt-insert =====~%")
+  
+  ;; 辅助函数：将序列转为列表便于比较
+  (labels ((vlist (vt) (vt-to-list vt))
+           (arr (seq &key (type 'fixnum))
+             (vt-from-sequence seq :type type)))
+    
+    ;; ---------- 1. 展平，单索引 ----------
+    (let* ((a (arr '(10 20 30 40)))
+           (res (vt-insert a 2 999 :axis nil)))
+      (assert (equal (vlist res) '(10 20 999 30 40))
+              () "展平单索引插入失败")
+      (format t "Test 1 (flat, single) passed~%"))
+    
+    ;; ---------- 2. 展平，多索引，值用列表 ----------
+    (let* ((a (arr '(10 20 30 40)))
+           (res (vt-insert a '(2 0) '(100 200) :axis nil)))
+      ;; NumPy: np.insert([10,20,30,40],[2,0],[100,200]) => [200 10 20 100 30 40]
+      (assert (equal (vlist res) '(200 10 20 100 30 40))
+              () "展平多索引插入失败（顺序错误）")
+      (format t "Test 2 (flat, multi indices) passed~%"))
+    
+    ;; ---------- 3. 展平，单个索引用列表包裹 ----------
+    (let* ((a (arr '(5 6 7)))
+           (res (vt-insert a '(1) 99 :axis nil)))
+      (assert (equal (vlist res) '(5 99 6 7))
+              () "展平单索引列表插入失败")
+      (format t "Test 3 (flat, list of one index) passed~%"))
+    
+    ;; ---------- 4. 沿轴=0 单索引插入行（值块为1行）----------
+    (let* ((a (arr '((1 2) (3 4))))
+           (row (arr '((10 10))))
+           (res (vt-insert a 1 row :axis 0)))
+      ;; NumPy: np.insert([[1,2],[3,4]], 1, [[10,10]], axis=0) => [[1,2],[10,10],[3,4]]
+      (assert (equal (vlist res) '((1 2) (10 10) (3 4)))
+              () "轴0单行插入失败")
+      (format t "Test 4 (axis=0, single row) passed~%"))
+    
+    ;; ---------- 5. 沿轴=1 多索引插入多列 ----------
+    (let* ((a (arr '((1 2 3) (4 5 6))))
+           (vals (arr '((10 20) (30 40))))
+           (res (vt-insert a '(2 0) vals :axis 1)))
+      ;; NumPy: np.insert([[1,2,3],[4,5,6]], [2,0], [[10,20],[30,40]], axis=1)
+      ;; => [[20,1,2,10,3], [40,4,5,30,6]]
+      (assert (equal (vlist res) '((20 1 2 10 3) (40 4 5 30 6)))
+              () "轴1多列插入失败（值块错位）")
+      (format t "Test 5 (axis=1, multi columns) passed~%"))
+    
+    ;; ---------- 6. 沿轴=1 多索引，但值块顺序倒置（关键）----------
+    ;; 验证插入位置与值块的对应关系完全按原始 obj 顺序，而非排序后盲目对应
+    (let* ((a (arr '((1 2 3 4))))
+           (vals (arr '((100 200 300))))  ; 3个值作为三列
+           (res (vt-insert a '(3 1 2) vals :axis 1)))
+      ;; NumPy: np.insert([[1,2,3,4]], [3,1,2], [[100,200,300]], axis=1)
+      (format t "Test 6 result: ~a~%" (vlist res))
+      ;; 使用 assert 严格检查
+      (assert (equal (vlist res) '((1 200 2 300 3 100 4)))
+              () "复杂多索引顺序插入失败")
+      (format t "Test 6 (axis=1, complex order) passed~%"))
+    
+    ;; ---------- 7. 轴=0，多行插入，验证行块对应关系 ----------
+    (let* ((a (arr '((1 2 3) (4 5 6) (7 8 9))))
+           (vals (arr '((10 10 10) (20 20 20))))
+           (res (vt-insert a '(1 2) vals :axis 0)))
+      ;; NumPy: np.insert([[1,2,3],[4,5,6],[7,8,9]], [1,2], [[10,10,10],[20,20,20]], axis=0)
+      ;; => [[1,2,3],[10,10,10],[4,5,6],[20,20,20],[7,8,9]]
+      (assert (equal (vlist res) '((1 2 3) (10 10 10) (4 5 6) (20 20 20) (7 8 9)))
+              () "轴0多行插入失败")
+      (format t "Test 7 (axis=0, multi rows) passed~%"))
+    
+    ;; ---------- 8. 标量 values 自动广播（展平模式）----------
+    (let* ((a (arr '(10 20 30)))
+           (res (vt-insert a 1 99 :axis nil)))
+      (assert (equal (vlist res) '(10 99 20 30))
+              () "标量 values 插入失败")
+      (format t "Test 8 (scalar value) passed~%"))
+    
+    ;; ---------- 9. 沿轴插入单个值（值块大小为1）----------
+    (let* ((a (arr '((1 2) (3 4))))
+           (res (vt-insert a 0 99 :axis 1)))
+      ;; NumPy: np.insert([[1,2],[3,4]], 0, 99, axis=1) => [[99,1,2],[99,3,4]]
+      ;; 注意：np.insert 会把标量广播为与输入匹配的形状，这里插入列是两行
+      (assert (equalp (vlist res) '((99 1 2) (99 3 4)))
+              () "标量沿轴插入失败")
+      (format t "Test 9 (scalar along axis) passed~%"))
+    
+    (format t "===== 所有 vt-insert 测试通过 =====~%~%")))
+    t)
 
 (defun test-vt-delete ()
   "测试 vt-delete 与 numpy np.delete 行为的一致性。"
