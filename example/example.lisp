@@ -3533,6 +3533,19 @@
       (check "insert_axis0"
              (vt-insert a 1 vals :axis 0)
              '((1 2) (5 6) (3 4))))
+    ;; numpy
+    ;; arr = np.array([[1,2,3],[4,5,6],[7,8,9]])
+    ;; vals = np.array([[10,10,10],[20,20,20]])
+    ;; res = np.insert(arr, [1,2], vals, axis=0)
+    (let* ((arr (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9)) :type 'fixnum))
+	   (vals (vt-from-sequence '((10 10 10) (20 20 20)) :type 'fixnum))
+	   (res (vt-insert arr '(1 2) vals :axis 0)))
+      (assert (equalp (vt-to-list res)
+		      '((1 2 3)
+			(10 10 10)
+			(4 5 6)
+			(20 20 20)
+			(7 8 9)))))
     ;; 测试 1：轴0插入，索引0
     (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
            (res (vt-insert a 0 (vt-from-sequence '(10 11 12) :type 'double-float) :axis 0))

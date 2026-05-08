@@ -559,71 +559,80 @@
             (vt-concatenate ax arr-vt val-vt))))))
 
 (defun vt-insert (arr obj values &key (axis nil))
-  "完全兼容 numpy 的 np.insert。"
+  "完全兼容 numpy 的 np.insert。
+   obj可以是：
+     - 整数：插入单个位置。
+     - 整数列表：插入多个位置（值块按原始顺序与位置一一对应）。
+   values : 要插入的标量、序列或张量。
+   axis   : nil 表示展平后插入；
+            整数表示沿指定轴插入。"
   (with-float-safe
     (let ((arr-vt (ensure-vt arr))
           (values-vt (ensure-vt values)))
       (if (null axis)
           ;; ---------- 展平模式 ----------
           (let* ((flat-arr (vt-flatten arr-vt))
-		 (flat-val (vt-flatten values-vt)))
+                 (flat-val (vt-flatten values-vt)))
             (flet ((insert-at (base idx)
                      (let ((current-size (vt-size base)))
                        (when (or (< idx 0) (> idx current-size))
-			 (error "index out of bounds"))
-                       (let ((left (if (> idx 0)
-                                       (vt-slice base (list 0 idx))
-                                       (vt-zeros (list 0) :type (vt-element-type base))))
-                             (right (if (< idx current-size)
-					(vt-slice base (list idx current-size))
-					(vt-zeros (list 0) :type (vt-element-type base)))))
-			 (vt-concatenate 0 left flat-val right)))))
+                         (error "Index out of bounds"))
+                       (let ((left
+			       (if (> idx 0)
+                                   (vt-slice base (list 0 idx))
+                                   (vt-zeros (list 0)
+					     :type (vt-element-type base))))
+                             (right
+			       (if (< idx current-size)
+                                   (vt-slice base (list idx current-size))
+                                   (vt-zeros (list 0)
+					     :type (vt-element-type base)))))
+                         (vt-concatenate 0 left flat-val right)))))
               (cond ((integerp obj) (insert-at flat-arr obj))
                     ((listp obj)
                      (let ((result flat-arr))
                        (dolist (idx (stable-sort (copy-list obj) #'>))
-			 (setf result (insert-at result idx)))
+                         (setf result (insert-at result idx)))
                        result))
                     (t (error "vt-insert: obj must be integer or list of integers when axis=nil")))))
           ;; ---------- 沿轴插入 ----------
           (let* ((arr-shape (vt-shape arr-vt))
-		 (rank (length arr-shape))
-		 (ax (vt-normalize-axis axis rank))
-		 (arr-axis-size (nth ax arr-shape))
-		 (obj-list (if (listp obj) obj (list obj)))
-		 (num-insert (length obj-list)))
-            (let ((desired-axis-size (if (listp obj) num-insert 1)))
-              (let ((target-shape (loop for i below rank
-					collect (if (= i ax)
-                                                    desired-axis-size
-                                                    (nth i arr-shape)))))
-		(let ((values-total-size (vt-size values-vt))
-                      (target-total-size (reduce #'* target-shape)))
-                  (unless (= values-total-size target-total-size)
-                    (error "cannot reshape values of size ~a to shape ~a"
-			   values-total-size target-shape))
-                  (let ((values-reshaped
-                          (vt-reshape values-vt target-shape)))
-                    ;; 3. 将 arr 沿轴分割成切片列表
-                    (let ((arr-slices (loop for i from 0 below arr-axis-size
-                                            collect (vt-narrow arr-vt ax i (1+ i))))
-                          ;; 将 values-reshaped 沿轴分割成块列表（每个块形状在轴维度为1）
-                          (value-blocks
-                            (if (= desired-axis-size 1)
-				(list values-reshaped)
-				(loop for i from 0 below desired-axis-size
-                                      collect (vt-narrow values-reshaped ax i (1+ i))))))
-                      ;; 4. 构建新切片列表，在 obj-list 指定位置插入对应块
-                      (let ((result-slices (copy-list arr-slices)))
-			(loop for pos in (stable-sort (copy-list obj-list) #'>)
+                 (rank (length arr-shape))
+                 (ax (vt-normalize-axis axis rank))
+                 (arr-axis-size (nth ax arr-shape))
+                 (obj-list (if (listp obj) obj (list obj)))
+                 (num-insert (length obj-list))
+                 ;; 计算 values 的目标形状及切片
+                 (target-shape (loop for i below rank
+                                     collect (if (= i ax) num-insert
+                                                 (nth i arr-shape))))
+                 (values-reshaped (vt-reshape values-vt target-shape))
+                 ;; 沿轴切分 arr 和 values
+                 (arr-slices
+                   (loop for i from 0 below arr-axis-size
+                         collect (vt-narrow arr-vt ax i (1+ i))))
+                 (value-blocks
+                   (if (= num-insert 1)
+                       (list values-reshaped)
+                       (loop for i from 0 below num-insert
+                             collect
+			     (vt-narrow values-reshaped ax i (1+ i)))))
+                 ;; 配对并按位置降序排列
+                 (pairs (loop for pos in obj-list
                               for block in value-blocks
-                              do (setf result-slices
-                                       (append (subseq result-slices 0 pos)
-                                               (list block)
-                                               (subseq result-slices pos))))
-			;; 5. 连接所有切片
-			(apply #'vt-concatenate ax result-slices))))))))))))
-
+                              collect (cons pos block)))
+                 (sorted-pairs (stable-sort pairs #'> :key #'car))
+                 ;; 从后往前插入切片
+                 (result-slices
+                   (let ((slices (copy-list arr-slices)))
+                     (dolist (pair sorted-pairs slices)
+                       (let ((pos (car pair))
+                             (blocks (cdr pair)))
+                         (setf slices
+                               (append (subseq slices 0 pos)
+                                       (list blocks)
+                                       (subseq slices pos))))))))
+            (apply #'vt-concatenate ax result-slices))))))
 
 (defun vt-delete (arr obj &key (axis nil))
   "完全兼容 numpy 的 np.delete。
