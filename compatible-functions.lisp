@@ -662,52 +662,71 @@
             (apply #'vt-concatenate ax result-slices))))))
 
 (defun vt-delete (arr obj &key (axis nil))
-  "完全兼容 numpy 的 np.delete。
+    "完全兼容 numpy 的 np.delete。
    obj 可以是：
      - 整数：删除单个索引。
      - 整数列表：删除多个独立索引（例如 `(0 2)` 删除索引 0 和 2）。
      - 形如 `(:slice start end)` 的列表：删除从 start 到 end-1 的连续切片。
    axis 为 nil 时展平后删除，否则沿指定轴删除。"
   (with-float-safe
-    (let* ((orig (ensure-vt arr))
-           (elem-type (vt-element-type orig))
-           (shape (vt-shape orig))
-           (rank (length shape)))
-      (flet ((to-list (x) (vt-to-list x))
-             (from-list (lst) (vt-from-sequence lst :type elem-type))
-             (normalize-obj (obj len)
-               "返回要删除的索引列表（0‑based）。"
-               (cond ((integerp obj) (list obj))
-                     ((and (listp obj) (= (length obj) 3) (eq (first obj) :slice))
-                      (destructuring-bind (_ start end)
-			  obj
-			(declare (ignorable _))
-			(assert (<= 0 start end len) (start end) "invalid slice")
-			(loop for i from start below end collect i)))
-                     ((listp obj) (copy-list obj))
-                     (t (error "vt-delete: invalid obj")))))
-	(if (null axis)
-            ;; 展平模式
-            (let* ((flat (vt-flatten-sequence (to-list orig)))
-                   (len (length flat))
-                   (del (normalize-obj obj len))
-                   (new (loop for i from 0 below len
-                              unless (member i del) collect (nth i flat))))
-              (from-list new))
-            ;; 沿轴模式
+    (let* ((tensor (ensure-vt arr))
+           (sh (vt-shape tensor))
+           (rank (length sh))
+           (etype (vt-element-type tensor)))
+      (labels ((normalize-index (idx dim)
+                 "将负索引转为非负，并检查是否在 [0, dim-1] 内。"
+                 (let ((nidx (if (minusp idx) (+ idx dim) idx)))
+                   (unless (<= 0 nidx (1- dim))
+                     (error "索引 ~D 越界（轴大小 ~D）" idx dim))
+                   nidx))
+               (normalize-slice-endpoint (idx dim)
+                 "将负索引转为非负，并检查是否在 [0, dim] 内（用于切片端点）。"
+                 (let ((nidx (if (minusp idx) (+ idx dim) idx)))
+                   (unless (<= 0 nidx dim)
+                     (error "切片端点 ~D 越界（轴大小 ~D）" idx dim))
+                   nidx))
+               (obj->keep-indices (obj dim)
+                 "根据 obj 返回保留的索引列表（严格递增）。"
+                 (let ((del-set (make-hash-table :test 'eql)))
+                   (flet ((add-del (i)
+                            (setf (gethash i del-set) t)))
+                     (cond ((integerp obj)
+                            (add-del (normalize-index obj dim)))
+                           ((and (listp obj) (eq (first obj) :slice))
+                            (destructuring-bind (_ start end) obj
+                              (declare (ignore _))
+                              (let ((s (normalize-slice-endpoint start dim))
+                                    (e (normalize-slice-endpoint end dim)))
+                                (when (> s e)
+                                  (error "切片起始 ~D 不能大于终止 ~D" s e))
+                                (loop for i from s below e do (add-del i)))))
+                           ((listp obj)
+                            (dolist (idx obj)
+                              (add-del (normalize-index idx dim))))
+                           (t (error "无效的 obj 类型 ~A" obj))))
+                   ;; 收集所有未被删除的索引
+                   (loop for i from 0 below dim
+                         unless (gethash i del-set) collect i))))
+        (if (null axis)
+            ;; 展平模式：先展平为 1D，然后按保留索引提取
+            (let* ((flat (vt-ravel tensor))          ; 零拷贝视图或连续副本
+                   (flat-size (vt-size flat))
+                   (keep (obj->keep-indices obj flat-size)))
+              (if keep
+                  (vt-take flat (vt-from-sequence keep :type 'fixnum))
+                  (vt-zeros (list 0) :type etype)))
+            ;; 沿轴删除
             (let* ((ax (vt-normalize-axis axis rank))
-                   (axis-size (nth ax shape))
-                   (del (normalize-obj obj axis-size))
-                   (keep (loop for i from 0 below axis-size
-                               unless (member i del) collect i)))
-              (labels ((recurse (lst depth)
-			 (if (= depth ax)
-                             (mapcar (lambda (idx) (nth idx lst)) keep)
-                             (mapcar (lambda (sub) (recurse sub (1+ depth))) lst))))
-		(let ((new (recurse (to-list orig) 0)))
-                  (from-list new)))))))))
-
-
+                   (ax-dim (nth ax sh))
+                   (keep (obj->keep-indices obj ax-dim)))
+              (if keep
+                  (let ((slices (loop for i in keep
+                                      collect (vt-narrow tensor ax i (1+ i)))))
+                    (apply #'vt-concatenate ax slices))
+                  ;; 轴大小变为 0
+                  (let ((new-sh (copy-list sh)))
+                    (setf (nth ax new-sh) 0)
+                    (vt-zeros new-sh :type etype)))))))))
 
 ;;; ===========================================
 ;;; 4. 统计扩展
@@ -1160,7 +1179,6 @@
                (data (coerce (vt-data flat) 'list))
                (sorted (vt-numpy-sort data #'<)))
           (vt-from-sequence sorted :type (vt-element-type tensor))))))
-
 
 (defun vt-argsort (tensor &key (axis -1))
   "返回沿指定轴的排序索引张量，形状与输入相同。

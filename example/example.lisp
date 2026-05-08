@@ -2121,8 +2121,105 @@
 
     (format t "~%all vt-take tests passed!~%")))
 
-
 (defun test-vt-argsort ()
+  "验证 vt-argsort 与 NumPy argsort 行为一致。"
+  (format t "~%===== 测试 vt-argsort =====~%")
+
+  (labels ((vlist (vt) (vt-to-list vt))
+           (arr (seq &key (type 'fixnum))
+             (vt-from-sequence seq :type type)))
+
+    ;; 1. 一维默认轴（即 -1，相当于展平）
+    (let* ((a (arr '(30 10 20)))
+           (res (vt-argsort a)))
+      ;; NumPy: np.argsort([30,10,20]) → [1 2 0]
+      (assert (equal (vlist res) '(1 2 0)) ()
+              "一维 argsort 失败")
+      (format t "Test 1 (1D default) passed~%"))
+
+    ;; 2. 二维 axis=0（沿列排序）
+    (let* ((a (arr '((3 1 2) (6 5 4))))
+           (res (vt-argsort a :axis 0)))
+      ;; NumPy: np.argsort([[3,1,2],[6,5,4]], axis=0)
+      ;; 第一列 [3,6] → [0,1]，第二列 [1,5] → [0,1]，第三列 [2,4] → [0,1]
+      ;; 结果为 [[0,0,0],[1,1,1]]
+      (assert (equal (vlist res) '((0 0 0) (1 1 1))) ()
+              "axis=0 排序失败")
+      (format t "Test 2 (2D axis=0) passed~%"))
+
+    ;; 3. 二维 axis=1（沿行排序）
+    (let* ((a (arr '((3 1 2) (6 5 4))))
+           (res (vt-argsort a :axis 1)))
+      ;; NumPy: np.argsort(..., axis=1)
+      ;; 第一行 [3,1,2] → [1,2,0]，第二行 [6,5,4] → [2,1,0]
+      (assert (equal (vlist res) '((1 2 0) (2 1 0))) ()
+              "axis=1 排序失败")
+      (format t "Test 3 (2D axis=1) passed~%"))
+
+    ;; 4. 负数轴 axis=-1（同 axis=1）
+    (let* ((a (arr '((3 1 2) (6 5 4))))
+           (res (vt-argsort a :axis -1)))
+      (assert (equal (vlist res) '((1 2 0) (2 1 0))) ()
+              "axis=-1 排序失败")
+      (format t "Test 4 (axis=-1) passed~%"))
+
+    ;; 5. 展平模式 axis=nil
+    (let* ((a (arr '((3 1 2) (6 5 4))))
+           (res (vt-argsort a :axis nil)))
+      ;; 展平后为 [3,1,2,6,5,4]，排序索引应为 [1,2,0,5,4,3]
+      (assert (equal (vlist res) '(1 2 0 5 4 3)) ()
+              "展平 argsort 失败")
+      (format t "Test 5 (axis=nil) passed~%"))
+
+    ;; 6. 三维张量 axis=1
+    (let* ((a (arr '(((9 8 7) (6 5 4) (3 2 1))
+                     ((1 2 3) (4 5 6) (7 8 9)))))
+           (res (vt-argsort a :axis 1)))
+      ;; NumPy: axis=1 对第二个轴排序，每个 (3,3) 块按列比较
+      ;; 对于第一个块:
+      ;;   第0列: [9,6,3] → [2,1,0]
+      ;;   第1列: [8,5,2] → [2,1,0]
+      ;;   第2列: [7,4,1] → [2,1,0]
+      ;; 对于第二个块:
+      ;;   第0列: [1,4,7] → [0,1,2]
+      ;;   ... 同理
+      ;; 结果形如:
+      ;; 块0: [[2,2,2],[1,1,1],[0,0,0]]
+      ;; 块1: [[0,0,0],[1,1,1],[2,2,2]]
+      (assert (equal (vlist res)
+                     '(((2 2 2) (1 1 1) (0 0 0))
+                       ((0 0 0) (1 1 1) (2 2 2))))
+              () "3D axis=1 排序失败")
+      (format t "Test 6 (3D axis=1) passed~%"))
+
+    ;; 7. 包含 NaN（NaN 应在末尾）
+    (let* ((a (vt-from-sequence (list 1.0 3.0 +vt-float-nan+ 2.0) :type 'double-float))
+           (res (vt-argsort a)))
+      ;; NumPy: [1.0,3.0,NaN,2.0] → [0,3,1,2]（NaN 索引 2 在末尾）
+      (assert (equal (vlist res) '(0 3 1 2)) ()
+              "NaN 排序失败")
+      (format t "Test 7 (with NaN) passed~%"))
+
+    ;; 8. 负索引 axis=-2（三维张量）
+    (let* ((a (arr '(((30 10) (20 40)) ((60 50) (70 80)))))
+           (res (vt-argsort a :axis -2)))
+      ;; axis=-2 表示倒数第二个轴，对于形状 (2,2,2) 即 axis=1
+      ;; 结果应与 axis=1 相同
+      ;; 第一块: 第0列: [30,20] → [1,0]; 第1列: [10,40] → [0,1]
+      ;; 第二块: 第0列: [60,70] → [0,1]; 第1列: [50,80] → [0,1]
+      ;; 最终: [[[1,0],[0,1]], [[0,0],[1,1]]]
+      (assert (equal (vlist res)
+                     '(((1 0) (0 1)) ((0 0) (1 1))))
+              () "axis=-2 排序失败")
+      (format t "Test 8 (axis=-2) passed~%"))
+
+    ;; 9. 空张量
+    (let* ((a (vt-zeros (list 0)))
+           (res (vt-argsort a)))
+      (assert (equal (vlist res) '()) ()
+              "空张量 argsort 失败")
+      (format t "Test 9 (empty tensor) passed~%")))
+    
   (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
     (assert (equal
 	     (vt-to-list (vt-argsort a :axis -1))
@@ -3715,6 +3812,92 @@
       (check "delete_axis1_slice"
              (vt-delete a '(:slice 0 2) :axis 1)     ; 删除列 0 和 1
              '((3) (6))))
+    
+    (labels ((vlist (vt) (vt-to-list vt))
+             (arr (seq &key (type 'fixnum))
+               (vt-from-sequence seq :type type)))
+      
+      ;; ---------- 1. 展平：删除单个索引 ----------
+      (let* ((a (arr '(10 20 30 40)))
+             (res (vt-delete a 2 :axis nil)))
+	;; NumPy: np.delete([10,20,30,40], 2) => [10 20 40]
+	(assert (equal (vlist res) '(10 20 40)) ()
+		"展平单索引删除失败")
+	(format t "Test 1 (flat, single index) passed~%"))
+      
+      ;; ---------- 2. 展平：删除多个索引 ----------
+      (let* ((a (arr '(10 20 30 40 50)))
+             (res (vt-delete a '(1 3) :axis nil)))
+	;; NumPy: np.delete([10,20,30,40,50], [1,3]) => [10 30 50]
+	(assert (equal (vlist res) '(10 30 50)) ()
+		"展平多索引删除失败")
+	(format t "Test 2 (flat, multiple indices) passed~%"))
+      
+      ;; ---------- 3. 展平：删除负索引 ----------
+      (let* ((a (arr '(10 20 30 40)))
+             (res (vt-delete a -1 :axis nil)))
+	;; NumPy: np.delete([10,20,30,40], -1) => [10 20 30]
+	(assert (equal (vlist res) '(10 20 30)) ()
+		"展平负索引删除失败")
+	(format t "Test 3 (flat, negative index) passed~%"))
+      
+      ;; ---------- 4. 展平：用切片删除 ----------
+      (let* ((a (arr '(10 20 30 40 50)))
+             (res (vt-delete a '(:slice 1 4) :axis nil)))
+	;; NumPy: np.delete([10,20,30,40,50], slice(1,4)) => [10 50]
+	(assert (equal (vlist res) '(10 50)) ()
+		"展平切片删除失败")
+	(format t "Test 4 (flat, slice) passed~%"))
+      
+      ;; ---------- 5. 展平：删除所有元素 ----------
+      (let* ((a (arr '(1 2 3)))
+             (res (vt-delete a '(:slice 0 3) :axis nil)))
+	;; NumPy: np.delete([1,2,3], slice(0,3)) => []
+	(assert (equal (vlist res) '()) ()
+		"展平删除所有元素失败")
+	(format t "Test 5 (flat, delete all) passed~%"))
+      
+      ;; ---------- 6. 沿轴=1：删除列 ----------
+      (let* ((a (arr '((1 2 3) (4 5 6))))
+             (res (vt-delete a 1 :axis 1)))
+	;; NumPy: np.delete([[1,2,3],[4,5,6]], 1, axis=1) => [[1,3],[4,6]]
+	(assert (equal (vlist res) '((1 3) (4 6))) ()
+		"轴1单列删除失败")
+	(format t "Test 6 (axis=1, single col) passed~%"))
+      
+      ;; ---------- 7. 沿轴=0：删除多行 ----------
+      (let* ((a (arr '((1 2) (3 4) (5 6) (7 8))))
+             (res (vt-delete a '(0 2) :axis 0)))
+	;; NumPy: np.delete([[1,2],[3,4],[5,6],[7,8]], [0,2], axis=0)
+	;; => [[3,4],[7,8]]
+	(assert (equal (vlist res) '((3 4) (7 8))) ()
+		"轴0多行删除失败")
+	(format t "Test 7 (axis=0, multiple rows) passed~%"))
+      
+      ;; ---------- 8. 沿轴=-1：删除最后一列 ----------
+      (let* ((a (arr '((1 2 3) (4 5 6))))
+             (res (vt-delete a -1 :axis -1)))
+	;; NumPy: np.delete([[1,2,3],[4,5,6]], -1, axis=-1) => [[1,2],[4,5]]
+	(assert (equal (vlist res) '((1 2) (4 5))) ()
+		"负轴删除失败")
+	(format t "Test 8 (axis=-1, negative index) passed~%"))
+      
+      ;; ---------- 9. 沿轴=1：用切片删除多列 ----------
+      (let* ((a (arr '((1 2 3 4) (5 6 7 8))))
+             (res (vt-delete a '(:slice 1 3) :axis 1)))
+	;; NumPy: np.delete([[1,2,3,4],[5,6,7,8]], slice(1,3), axis=1)
+	;; => [[1,4],[5,8]]
+	(assert (equal (vlist res) '((1 4) (5 8))) ()
+		"轴1切片删除失败")
+	(format t "Test 9 (axis=1, slice) passed~%"))
+      
+      ;; ---------- 10. 沿轴删除所有行 → 形状 (0, 原列数) ----------
+      (let* ((a (arr '((1 2) (3 4))))
+             (res (vt-delete a '(:slice 0 2) :axis 0)))
+	;; NumPy: np.delete([[1,2],[3,4]], slice(0,2), axis=0) => 形状 (0,2)
+	(assert (equal (vt-shape res) '(0 2)) ()
+		"轴0删除所有行形状错误")
+	(format t "Test 10 (axis=0, delete all, shape check) passed~%")))
     t))
 
 ;; --------------------- test vt-flatten ---------------------
