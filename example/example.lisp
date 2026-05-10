@@ -4243,6 +4243,90 @@
                  "nanvar 除零时应为 nan")))
   (format t "~%vt-var / vt-std 全部测试通过~%"))
 
+(defun test-vt-rot90 ()
+  "测试 vt-rot90 函数的各种场景。"
+  (labels ((check (name result expected)
+             (if (equalp result expected)
+                 (format t "~A ... PASS~%" name)
+                 (progn
+                   (format t "~A ... FAIL~%" name)
+                   (format t "  Expected: ~A~%" expected)
+                   (format t "  Got:      ~A~%" result)))))
+
+    ;; 辅助函数：张量->嵌套列表（避免浮点显示差异，统一用 clvt::vt-to-list）
+    (flet ((tensor->list (v) (clvt::vt-to-list v)))
+
+      ;; 测试1：2D矩阵，k=1（逆时针90度）
+      (let* ((m (clvt:vt-from-sequence '((1 2) (3 4))))
+             (rot (clvt::vt-rot90 m :k 1)))
+        (check "2D k=1" (tensor->list rot) '((2 4) (1 3))))
+
+      ;; 测试2：2D矩阵，k=2（180度）
+      (let* ((m (clvt:vt-from-sequence '((1 2) (3 4))))
+             (rot (clvt::vt-rot90 m :k 2)))
+        (check "2D k=2" (tensor->list rot) '((4 3) (2 1))))
+
+      ;; 测试3：2D矩阵，k=3（270度，等价顺时针90度）
+      (let* ((m (clvt:vt-from-sequence '((1 2) (3 4))))
+             (rot (clvt::vt-rot90 m :k 3)))
+        (check "2D k=3" (tensor->list rot) '((3 1) (4 2))))
+
+      ;; 测试4：2D矩阵，k=-1（顺时针90度，应等于k=3）
+      (let* ((m (clvt:vt-from-sequence '((1 2) (3 4))))
+             (rot (clvt::vt-rot90 m :k -1)))
+        (check "2D k=-1" (tensor->list rot) '((3 1) (4 2))))
+
+      ;; 测试5：2D矩阵，axes颠倒 (1 0)
+      (let* ((m (clvt:vt-from-sequence '((1 2) (3 4))))
+             (rot (clvt::vt-rot90 m :k 1 :axes '(1 0))))
+        (check "2D axes=(1 0)" (tensor->list rot) '((3 1) (4 2)))) ; 注意：交换axes相当于反转旋转方向
+
+      ;; 测试6：3D张量，axes=(1 2)，k=1
+      (let* ((m (clvt:vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))))) ; shape (2,2,2)
+             (rot (clvt::vt-rot90 m :k 1 :axes '(1 2))))
+        (check "3D axes=(1 2) k=1"
+               (tensor->list rot)
+               '(((2 4) (1 3)) ((6 8) (5 7)))))
+
+      ;; 测试7：3D张量，axes=(0 1)，k=1
+      (let* ((m (clvt:vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))))) ; shape (2,2,2)
+             (rot (clvt::vt-rot90 m :k 1 :axes '(0 1))))
+        (check "3D axes=(0 1) k=1"
+               (tensor->list rot)
+               '(((3 4) (7 8)) ((1 2) (5 6)))))
+
+      ;; 测试8：使用负数axes，最后两轴旋转
+      (let* ((m (clvt:vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))))) ; shape (2,2,2)
+             (rot (clvt::vt-rot90 m :k 1 :axes '(-2 -1))))
+        (check "3D axes=(-2 -1) k=1"
+               (tensor->list rot)
+               '(((2 4) (1 3)) ((6 8) (5 7))))) ; 与 axes=(1 2) 相同
+
+      ;; 测试9：k=0 应返回原张量（视图）
+      (let* ((m (clvt:vt-from-sequence '((1 2) (3 4))))
+             (rot (clvt::vt-rot90 m :k 0)))
+        (check "2D k=0" (tensor->list rot) '((1 2) (3 4))))
+
+      ;; 测试10：k=4 等价于 k=0
+      (let* ((m (clvt:vt-from-sequence '((1 2) (3 4))))
+             (rot (clvt::vt-rot90 m :k 4)))
+        (check "2D k=4" (tensor->list rot) '((1 2) (3 4))))
+
+      ;; 测试11：rank < 2 应报错
+      (handler-case
+          (progn
+            (clvt::vt-rot90 (clvt:vt-from-sequence '(1 2 3)) :k 1)
+            (format t "1D tensor (should error) ... FAIL~%"))
+        (error (e)
+          (format t "1D tensor (should error) ... PASS (caught error: ~A)~%" e)))
+
+      ;; 测试12：axes 指定相同轴应报错
+      (handler-case
+          (progn
+            (clvt::vt-rot90 (clvt:vt-from-sequence '((1 2) (3 4))) :k 1 :axes '(0 0))
+            (format t "axes equal (should error) ... FAIL~%"))
+        (error (e)
+          (format t "axes equal (should error) ... PASS (caught error: ~A)~%" e))))))
 
 ;; ============================================================
 ;; 运行所有测试
@@ -4340,4 +4424,5 @@
   (test-vt-itemsize-nbytes)
   (test-vt-atan2)
   (test-vt-var-std)
+  (test-vt-rot90)
 )

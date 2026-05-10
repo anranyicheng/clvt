@@ -325,6 +325,35 @@
                            ((= i ax2) ax1)
                            (t i)))))))
 
+(defun vt-rot90 (tensor &key (k 1) (axes '(0 1)))
+  "将张量在 axes 指定的平面内旋转 90 度 k 次。
+   ▪ axes : 长度为 2 的列表，指定旋转平面（默认 (0 1)）。
+   ▪ k    : 旋转次数（正整数为逆时针，负数为顺时针），自动模 4。
+   
+   返回零拷贝视图（当底层操作均为视图时）。
+   行为与 NumPy 的 rot90 完全一致。"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape)))
+    (when (< rank 2)
+      (error "vt-rot90: tensor rank must be >= 2, but got rank ~D" rank))
+    (let ((ax0 (first axes))
+          (ax1 (second axes)))
+      ;; 支持负数轴
+      (setf ax0 (vt-normalize-axis ax0 rank))
+      (setf ax1 (vt-normalize-axis ax1 rank))
+      (when (= ax0 ax1)
+        (error "vt-rot90: axes must be different, but got ~D and ~D" ax0 ax1))
+      ;; k 规范化到 0~3
+      (let ((k (mod k 4)))
+        (when (minusp k)    ; 保证非负
+          (incf k 4))
+        ;; 重复 k 次：先转置，再翻转第一个轴（与 NumPy 一致）
+        (loop with result = tensor
+              repeat k
+              do (setf result (vt-swapaxes result ax0 ax1))
+                 (setf result (vt-flip result :axis ax0))
+              finally (return result))))))
+
 (defun vt-broadcast-to (vt new-shape)
   "将张量广播到新形状，返回零拷贝视图"
   (with-float-safe

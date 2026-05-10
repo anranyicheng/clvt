@@ -53,6 +53,7 @@
    :vt-flatten
    :vt-ravel
    :vt-swapaxes
+   :vt-rot90
    :vt-narrow
    :vt-split
    :vt-vsplit
