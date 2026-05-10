@@ -327,8 +327,8 @@
 
 (defun vt-rot90 (tensor &key (k 1) (axes '(0 1)))
   "将张量在 axes 指定的平面内旋转 90 度 k 次。
-   ▪ axes : 长度为 2 的列表，指定旋转平面（默认 (0 1)）。
-   ▪ k    : 旋转次数（正整数为逆时针，负数为顺时针），自动模 4。
+    axes : 长度为 2 的列表，指定旋转平面（默认 (0 1)）。
+    k    : 旋转次数（正整数为逆时针，负数为顺时针），自动模 4。
    
    返回零拷贝视图（当底层操作均为视图时）。
    行为与 NumPy 的 rot90 完全一致。"
@@ -353,6 +353,106 @@
               do (setf result (vt-swapaxes result ax0 ax1))
                  (setf result (vt-flip result :axis ax0))
               finally (return result))))))
+
+(defun vt-rotate (tensor angle &key (center nil) (order 1) (cval 0.0))
+   "将二维张量按指定角度旋转（对标 scipy.ndimage.rotate）。
+   
+   **旋转中心**：
+   - 默认 center = NIL，旋转中心位于张量的几何中心，即 (rows/2, cols/2)。
+   - 若提供 center 列表 (cy, cx)，则绕该点旋转。例如 '(0 0) 表示绕左上角原点旋转。
+   - 注意：行坐标对应 cy，列坐标对应 cx，与数组索引顺序一致（行在前，列在后）。
+
+   **旋转方向**：
+   - angle 为正时，逆时针旋转；为负时，顺时针旋转（与 scipy 一致）。
+   - 内部通过逆向映射实现：从目标张量的每个像素出发，通过旋转矩阵反推其在原始张量中的对应坐标，然后采样。这保证了旋转后的图像没有空洞，并且不会产生“值变负”的现象（像素值仅为重新定位，不改变自身的数值）。
+
+   **插值方式**：
+   - order = 0 : 最近邻插值（直接取整，速度快，边缘有锯齿）。
+   - order = 1 : 双线性插值（平滑，但计算量稍大）。
+   - 注意：目前仅支持 order 0 和 1，其他值未实现。
+
+   **边界处理**：
+   - 当目标像素映射到原始张量边界之外时，使用 cval 填充。cval 默认为 0.0。
+   - 这意味着旋转后原本在图像角落的像素若被转到图像外，就会“消失”并被填充值替代。例如绕原点旋转 180° 时，除原点外的所有像素都会移到负坐标而被 cval 覆盖，仅原点处的像素保留。
+
+   **返回值**：
+   - 返回一个与输入 tensor 形状完全相同的新张量（非视图）。数据类型固定被强制执行并返回双精度浮点数。
+
+   **注意**：
+   - 该函数为通用任意角度旋转，与仅支持 90° 倍数的 `vt-rot90` 不同，它涉及插值且可能产生边界丢失。
+   - 若要实现类似 `scipy.ndimage.rotate` 的 `reshape=True`（自动扩大画布以包含全部内容），当前函数未提供该选项，需外部手动处理。
+
+   示例：
+   ;; 绕图像中心旋转 45°
+   (let ((m (clvt:vt-from-sequence '((1 0 0) (0 1 0) (0 0 1)))))
+     (vt-rotate m (/ pi 4) :order 0))
+
+   ;; 绕左上角原点旋转 30°
+   (let ((m (clvt:vt-from-sequence '((1 0) (0 1)))))
+     (vt-rotate m (/ pi 6) :order 0))
+"
+  (let* ((shape (vt-shape tensor))
+         (rows (first shape))
+         (cols (second shape))
+         (cos-a (cos angle))
+         (sin-a (sin angle))
+         (cy (if center (first center) (/ rows 2.0)))
+         (cx (if center (second center) (/ cols 2.0))))
+    (vt-from-function
+     shape
+     (lambda (coords)
+       (destructuring-bind (ny nx) coords   ; 行, 列
+         (let* ((dx (- nx cx))
+                (dy (- ny cy))
+                ;; 逆旋转变换：源坐标相对中心的偏移
+                (src-rel-x (+ (* dx cos-a) (* dy sin-a)))
+                (src-rel-y (- (* dy cos-a) (* dx sin-a)))
+                ;; 回到绝对坐标
+                (src-x (+ src-rel-x cx))
+                (src-y (+ src-rel-y cy)))
+           (if (= order 0)
+               ;; 最近邻
+               (let ((ix (round src-x))
+                     (iy (round src-y)))
+                 (if (and (>= ix 0) (< ix cols)
+                          (>= iy 0) (< iy rows))
+                     (clvt::vt-ref tensor iy ix)   ; 注意：行在前
+                     cval))
+               ;; 双线性插值（同样使用修正后的 src-x, src-y）
+               (let* ((x0 (floor src-x))
+                      (y0 (floor src-y))
+                      (x1 (1+ x0))
+                      (y1 (1+ y0))
+                      (fx (- src-x x0))
+                      (fy (- src-y y0))
+                      (fx1 (- 1.0 fx))
+                      (fy1 (- 1.0 fy)))
+                 (if (or (< x0 0) (>= x1 cols)
+                         (< y0 0) (>= y1 rows))
+                     cval
+                     (let ((pxy (clvt::vt-ref tensor y0 x0))
+                           (px1y (if (< x1 cols)
+				     (clvt::vt-ref tensor y0 x1)
+				     0.0))
+                           (pxy1 (if (< y1 rows)
+				     (clvt::vt-ref tensor y1 x0)
+				     0.0))
+                           (px1y1 (if (and (< x1 cols) (< y1 rows))
+                                      (clvt::vt-ref tensor y1 x1)
+                                      0.0)))
+                       (+ (* fx1 fy1 pxy)
+                          (* fx fy1 px1y)
+                          (* fx1 fy pxy1)
+                          (* fx fy px1y1)))))))))
+     :type 'double-float)))
+
+(defun vt-rotate-origin (tensor angle &key (order 0))
+  "绕左上角原点 (0,0) 旋转张量，是 vt-rotate 的便捷版本。
+   等价于 (vt-rotate tensor angle :center '(0 0) :order order)。
+   该函数将张量的 (0,0) 点视为旋转中心，逆时针旋转 angle 弧度。
+   像素值仅位置发生变化，不改变数值。
+   超出原张量边界的部分用 0 填充。"
+  (vt-rotate tensor angle :center '(0 0) :order order))
 
 (defun vt-broadcast-to (vt new-shape)
   "将张量广播到新形状，返回零拷贝视图"
