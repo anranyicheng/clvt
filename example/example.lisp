@@ -3081,7 +3081,7 @@
                    clvt::+vt-float-neg-inf+)))
 	 (re (multiple-value-list
 	      (clvt:vt-histogram a :bins 3 :range '(0.0 1.0)))))
-    (equal (vt-to-list (first re) '(0 0 0))))
+    (equal (vt-to-list (first re)) '(0 0 0)))
 
   (format t "~%all vt-histogram tests passed.~%"))
 
@@ -4447,4 +4447,5 @@
   (test-vt-atan2)
   (test-vt-var-std)
   (test-vt-rot90)
+  (format t "~&~%all test passed")
 )
