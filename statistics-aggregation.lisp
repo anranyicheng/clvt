@@ -26,65 +26,80 @@
 		  :keepdims keepdims)))))
 
 (defun vt-amax (tensor &key axis keepdims)
-  "最大值. 自动适配类型."
+  "最大值，若包含 nan 则结果为 nan（索引指向第一个 nan）。
+   类型自动适配。"
   (with-float-safe
     (let ((element-type (array-element-type (vt-data tensor))))
-      ;; 获取类型匹配的最小值 (如 most-negative-fixnum)
-      (nth-value
-       0 
-       (vt-reduce tensor axis (get-reduction-identity :max element-type)
-                  (lambda (acc val)
-                    (declare (type number acc val))
-                    (if (> val acc)
-			(values val t) ; 返回新值,标记更新索引
-			(values acc nil)))
-                  :return-arg nil
-		  :keepdims keepdims)))))
+      (nth-value 0 
+        (vt-reduce tensor axis (get-reduction-identity :max element-type)
+                   (lambda (acc val)
+                     (declare (type number acc val))
+                     (cond ((vt-float-nan-p val)
+                            ;; 遇到 nan
+                            (if (vt-float-nan-p acc)
+                                (values acc nil) ;; 已为 nan，保持原索引
+                                (values val t))) ;; 首次 nan，更新值并标记更新索引
+                           ((vt-float-nan-p acc)
+                            ;; acc 已是 nan，保持
+                            (values acc nil))
+                           (t
+                            ;; 正常数值比较
+                            (if (> val acc) (values val t) (values acc nil)))))
+                   :return-arg nil :keepdims keepdims)))))
 
 (defun vt-amin (tensor &key axis keepdims)
-  "最小值. 自动适配类型."
+  "最小值，若包含 nan 则结果为 nan（索引指向第一个 nan）。"
   (with-float-safe
     (let ((element-type (array-element-type (vt-data tensor))))
-      ;; 获取类型匹配的最大值
-      (nth-value
-       0 
-       (vt-reduce tensor axis (get-reduction-identity :min element-type)
-                  (lambda (acc val)
-                    (declare (type number acc val))
-                    (if (< val acc)
-			(values val t)
-			(values acc nil)))
-                  :return-arg nil
-		  :keepdims keepdims)))))
+      (nth-value 0 
+        (vt-reduce tensor axis (get-reduction-identity :min element-type)
+                   (lambda (acc val)
+                     (declare (type number acc val))
+                     (cond ((vt-float-nan-p val)
+                            (if (vt-float-nan-p acc)
+                                (values acc nil)
+                                (values val t)))
+                           ((vt-float-nan-p acc)
+                            (values acc nil))
+                           (t
+                            (if (< val acc) (values val t) (values acc nil)))))
+                   :return-arg nil :keepdims keepdims)))))
 
 (defun vt-argmax (tensor &key axis)
-  "最大值索引."
+  "返回最大值索引，如果存在 nan 则返回第一个 nan 的索引。"
   (with-float-safe
     (let ((element-type (array-element-type (vt-data tensor))))
-      ;; 初始值同样需要是最大下界
-      (nth-value
-       1 
-       (vt-reduce tensor axis (get-reduction-identity :max element-type)
-                  (lambda (acc val)
-                    (declare (type number acc val))
-                    (if (> val acc)
-			(values val t) ; 发现更大值,更新值,并通知更新索引
-			(values acc nil)))
-                  :return-arg t)))))
+      (nth-value 1 
+        (vt-reduce tensor axis (get-reduction-identity :max element-type)
+                   (lambda (acc val)
+                     (declare (type number acc val))
+                     (cond ((vt-float-nan-p val)
+                            (if (vt-float-nan-p acc)
+                                (values acc nil)
+                                (values val t)))
+                           ((vt-float-nan-p acc)
+                            (values acc nil))
+                           (t
+                            (if (> val acc) (values val t) (values acc nil)))))
+                   :return-arg t)))))
 
 (defun vt-argmin (tensor &key axis)
-  "最小值索引."
+  "返回最小值索引，如果存在 nan 则返回第一个 nan 的索引。"
   (with-float-safe
     (let ((element-type (array-element-type (vt-data tensor))))
-      (nth-value
-       1 
-       (vt-reduce tensor axis (get-reduction-identity :min element-type)
-                  (lambda (acc val)
-                    (declare (type number acc val))
-                    (if (< val acc)
-			(values val t)
-			(values acc nil)))
-                  :return-arg t)))))
+      (nth-value 1 
+        (vt-reduce tensor axis (get-reduction-identity :min element-type)
+                   (lambda (acc val)
+                     (declare (type number acc val))
+                     (cond ((vt-float-nan-p val)
+                            (if (vt-float-nan-p acc)
+                                (values acc nil)
+                                (values val t)))
+                           ((vt-float-nan-p acc)
+                            (values acc nil))
+                           (t
+                            (if (< val acc) (values val t) (values acc nil)))))
+                   :return-arg t)))))
 
 (defun vt-mean (tensor &key axis keepdims)
   "计算平均值. axis: nil (全局) 或 fixnum (支持负数).

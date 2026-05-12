@@ -416,7 +416,7 @@
                      (iy (round src-y)))
                  (if (and (>= ix 0) (< ix cols)
                           (>= iy 0) (< iy rows))
-                     (clvt::vt-ref tensor iy ix)   ; 注意：行在前
+                     (vt-ref tensor iy ix)   ; 注意：行在前
                      cval))
                ;; 双线性插值（同样使用修正后的 src-x, src-y）
                (let* ((x0 (floor src-x))
@@ -430,15 +430,15 @@
                  (if (or (< x0 0) (>= x1 cols)
                          (< y0 0) (>= y1 rows))
                      cval
-                     (let ((pxy (clvt::vt-ref tensor y0 x0))
+                     (let ((pxy (vt-ref tensor y0 x0))
                            (px1y (if (< x1 cols)
-				     (clvt::vt-ref tensor y0 x1)
+				     (vt-ref tensor y0 x1)
 				     0.0))
                            (pxy1 (if (< y1 rows)
-				     (clvt::vt-ref tensor y1 x0)
+				     (vt-ref tensor y1 x0)
 				     0.0))
                            (px1y1 (if (and (< x1 cols) (< y1 rows))
-                                      (clvt::vt-ref tensor y1 x1)
+                                      (vt-ref tensor y1 x1)
                                       0.0)))
                        (+ (* fx1 fy1 pxy)
                           (* fx fy1 px1y)
@@ -688,7 +688,7 @@
             (vt-concatenate ax arr-vt val-vt))))))
 
 (defun vt-insert (arr obj values &key (axis nil))
- "完全兼容 numpy 的 np.insert。
+  "完全兼容 numpy 的 np.insert。
    obj可以是：
      - 整数：插入单个位置。
      - 整数列表：插入多个位置（值块按原始顺序与位置一一对应）。
@@ -791,7 +791,7 @@
             (apply #'vt-concatenate ax result-slices))))))
 
 (defun vt-delete (arr obj &key (axis nil))
-    "完全兼容 numpy 的 np.delete。
+  "完全兼容 numpy 的 np.delete。
    obj 可以是：
      - 整数：删除单个索引。
      - 整数列表：删除多个独立索引（例如 `(0 2)` 删除索引 0 和 2）。
@@ -1094,53 +1094,77 @@
 
 (defun vt-histogram (tensor &key bins range density)
   "计算直方图。
-   bins : bin 数量（默认 10）。
-   range : (min, max) 范围。
-   density : 若为 t，返回概率密度直方图（总面积=1）。
-   返回：(hist, bin-edges) 两个一维张量。"
-  (declare (list range))
+   bins   : bin 数量（默认 10）。
+   range  : (min, max) 列表。若未提供，要求数据中不含 nan 或 inf。
+   density: 若为 t，返回概率密度直方图（总面积=1）。
+   返回   : (hist, bin-edges) 两个一维张量。
+
+   行为与 numpy 一致：
+   - 不指定 range 时，数据必须全部有限，否则报错。
+   - 指定 range 后，nan 和超出 [min, max] 的值会被忽略。
+   - 注意：bin-edges 包含右边界，最后一个 bin 是闭区间 [edges[-2], edges[-1]]。"
   (with-float-safe
     (let* ((flat (vt-flatten tensor))
            (data (vt-data flat))
            (size (vt-size flat))
-           (bins (or bins 10))
-           (data-min (if range (car range) (vt-amin tensor)))
-           (data-max (if range (cadr range) (vt-amax tensor)))
-           (bin-width (/ (- data-max data-min) bins))
-           (hist (make-array bins :initial-element 0))
-           (bin-edges (make-array (1+ bins) :element-type t)))
+           (bins (or bins 10)))
+      ;; ---------- 自动确定范围 ----------
+      (let ((data-min nil)
+            (data-max nil))
+        (if range
+            (setf data-min (first range)
+                  data-max (second range))
+            (progn
+              ;; 检查是否包含非有限值
+              (let ((finite-check (vt-all (vt-isfinite tensor))))
+                (unless (= (if (numberp finite-check)
+                               finite-check
+                               (aref (vt-data finite-check) 0))
+                           1.0d0)
+                  (error "automatic bin range determination requires finite input.~
+                       ~%  please provide explicit 'range' argument, or remove nan/inf values.")))
+              ;; 数据全为有限值，安全地计算最小最大值
+              (setf data-min (vt-amin tensor)
+                    data-max (vt-amax tensor))))
+        ;; 处理范围相等边界情况（所有值相同）
+        (when (= data-min data-max)
+          (setf data-min (- data-min 0.5)
+                data-max (+ data-max 0.5)))
+        (let* ((bin-width (/ (- data-max data-min) bins))
+               (hist (make-array bins :initial-element 0))
+               (bin-edges (make-array (1+ bins) :element-type t)))
 
-      ;; 生成 bin edges
-      (loop for i from 0 to bins
-            do (setf (aref bin-edges i)
-		     (+ data-min (* i bin-width))))
+          ;; 生成 bin edges
+          (loop for i from 0 to bins
+                do (setf (aref bin-edges i)
+                         (+ data-min (* i bin-width))))
+	  ;; 统计计算
+	  (loop for i from 0 below size
+                for val = (aref data i)
+                when (and (>= val data-min) (<= val data-max))
+                  do (let ((bin-idx (if (= val data-max)
+                                        (1- bins)
+                                        (floor (- val data-min)
+					       bin-width))))
+                       (incf (aref hist bin-idx))))
 
-      ;; 统计计数（左闭右开，但最后一个 bin 包含右边界）
-      (loop for i from 0 below size
-            for val = (aref data i)
-            for bin-idx = (cond ((< val data-min) nil)
-				((>= val data-max) (1- bins))
-				(t (floor (- val data-min) bin-width)))
-            when bin-idx
-              do (incf (aref hist bin-idx)))
+          ;; 密度归一化
+          (when density
+            (let ((total (reduce #'+ hist)))
+              (if (zerop total)
+                  (loop for i from 0 below bins
+                        do (setf (aref hist i) 0.0d0))
+                  (loop for i from 0 below bins
+                        do (setf (aref hist i)
+                                 (/ (aref hist i)
+                                    (* total bin-width)))))))
 
-      ;; 密度归一化
-      (when density
-	(let ((total (reduce #'+ hist)))
-          (if (zerop total)
-              ;; 无数据时，返回平坦密度以避免除零（或全零）
-              (loop for i from 0 below bins
-                    do (setf (aref hist i) 0.0d0))
-              (loop for i from 0 below bins
-                    do (setf (aref hist i)
-                             (/ (aref hist i)
-				(* total bin-width)))))))
+          ;; 返回
+          (values (vt-from-sequence
+		   (coerce hist 'list) :type 'double-float)
+                  (vt-from-sequence
+		   (coerce bin-edges 'list) :type 'double-float)))))))
 
-      ;; 返回两个 vt
-      (values (vt-from-sequence (coerce hist 'list)
-				:type 'double-float)
-              (vt-from-sequence (coerce bin-edges 'list)
-				:type 'double-float)))))
 
 ;;; ===========================================
 ;;; 5. 逻辑运算扩展
@@ -1425,7 +1449,7 @@
           result))))
 
 (defun vt-unique (tensor &key return-index return-inverse return-counts)
-  "返回展平后张量中的唯一元素，自动排序（升序）。
+  "返回展平后张量中的唯一元素，自动排序（升序），所有 nan 视作同一个值。
    支持以下关键字（默认均为 nil）：
    :return-index    - 若为真，返回首次出现索引（与唯一值对应的一维 fixnum 张量）
    :return-inverse  - 若为真，返回逆索引（一维 fixnum 张量，长度等于展平后元素数，
@@ -1437,27 +1461,35 @@
    未请求的项在返回值中不会被提供。
    注意：逆索引始终保持一维，对应展平后的顺序。"
   (with-float-safe
-    (let* ((flat (vt-flatten tensor)) ;; 处理视图，获取扁平数据
-				      (n (vt-size flat))
-				      (src-data (vt-data flat))
-				      (elem-type (vt-element-type flat))
-				      ;; 初始化索引向量 0..n-1
-				      (sorted-idx (make-array n :element-type 'fixnum
-								:initial-contents
-								(loop for i below n collect i))))
+    (let* ((flat (vt-flatten tensor))
+	   (n (vt-size flat))
+	   (src-data (vt-data flat))
+	   (elem-type (vt-element-type flat))
+	   ;; 初始化索引向量 0..n-1
+	   (sorted-idx (make-array n :element-type 'fixnum
+				     :initial-contents
+				     (loop for i below n collect i))))
       (declare (type (simple-array * (*)) src-data)
                (type (simple-array fixnum (*)) sorted-idx)
                (type fixnum n))
-      ;; 稳定排序索引，键为对应的元素值
+
+      ;; nan 安全的排序：将 nan 排在末尾且连续
       (setf sorted-idx
-	    (stable-sort sorted-idx #'< :key (lambda (i) (aref src-data i))))
+	    (sort sorted-idx
+		  (lambda (a b)
+		    (let ((va (aref src-data a))
+			  (vb (aref src-data b)))
+		      (cond ((vt-float-nan-p va) nil)   ; nan 最大
+			    ((vt-float-nan-p vb) t)     ; 其他 < nan
+			    (t (< va vb)))))))
+
       ;; 动态数组收集结果
       (let ((unique-vals (make-array 0 :element-type elem-type
-                                       :adjustable t :fill-pointer t))
+				       :adjustable t :fill-pointer t))
             (first-idx   (make-array 0 :element-type 'fixnum
-                                       :adjustable t :fill-pointer t))
+				       :adjustable t :fill-pointer t))
             (cnts        (make-array 0 :element-type 'fixnum
-                                       :adjustable t :fill-pointer t))
+				       :adjustable t :fill-pointer t))
             (inverse     (make-array n :element-type 'fixnum
 				       :initial-element 0)))
 	(loop with pos = 0
@@ -1468,14 +1500,22 @@
               for start = pos
               do (vector-push-extend val unique-vals)
 		 (vector-push-extend idx0 first-idx)
-		 ;; 处理所有等于当前值的元素并填充逆索引
-		 (loop while (and (< pos n)
-				  (= val
-				     (aref src-data
-					   (aref sorted-idx pos))))
-                       for orig = (aref sorted-idx pos)
-                       do (setf (aref inverse orig) uniq-num)
-                          (incf pos))
+		 ;; 分组：nan 与普通值分开处理
+		 (if (vt-float-nan-p val)
+		     ;; nan 分组：连续 nan 视为同一个值
+		     (loop while (and (< pos n)
+				      (vt-float-nan-p
+                                       (aref src-data (aref sorted-idx pos))))
+			   for orig = (aref sorted-idx pos)
+			   do (setf (aref inverse orig) uniq-num)
+			      (incf pos))
+		     ;; 普通数值分组：依赖数值相等
+		     (loop while (and (< pos n)
+				      (= val
+					 (aref src-data (aref sorted-idx pos))))
+			   for orig = (aref sorted-idx pos)
+			   do (setf (aref inverse orig) uniq-num)
+			      (incf pos)))
 		 (vector-push-extend (- pos start) cnts))
 	;; 转换为 vt
 	(let ((uniq-vt (vt-from-sequence (coerce unique-vals 'list)

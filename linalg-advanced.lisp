@@ -57,18 +57,21 @@
                       (vt-slice r (list 0 k) '(:all))))))))
 
 (defun compute-householder (x)
-  "给定向量 x，返回三个值：v, beta, sigma。
-   其中 sigma = -sign(x[0]) * ||x||，
-   使得 (i - beta * v * v^t) * x = sigma * e1 。"
+  "给定向量 x，返回 v, beta, sigma 使得
+   h = i - beta * v * v^t 满足 h*x = sigma * e1。
+   其中 sigma = -sign(x[0]) * ||x||，β = 2 / ||v||²。
+   当 x 为零向量时返回 beta=0, sigma=0。"
   (with-float-safe
-    (let* ((norm (sqrt (vt-ref (vt-dot x x))))
-           (sx0 (aref (vt-data x) 0))
-           (sigma (if (>= sx0 0.0d0) (- norm) norm)))
-      (let ((v (vt-copy x)))
-	(setf (aref (vt-data v) 0)
-	      (- (aref (vt-data v) 0) sigma))
-	(let ((beta (/ 2.0d0 (vt-ref (vt-dot v v)))))
-          (values v beta sigma))))))
+    (let* ((norm-sq (vt-ref (vt-dot x x)))
+           (norm (sqrt norm-sq)))
+      (if (zerop norm)
+          (values (vt-copy x) 0.0d0 0.0d0)
+          (let* ((sx0 (vt-ref x 0))
+                 (sigma (if (>= sx0 0.0d0) (- norm) norm))
+                 (v (vt-copy x)))
+            (setf (vt-ref v 0) (- sx0 sigma))
+            (let ((beta (/ 2.0d0 (vt-ref (vt-dot v v)))))
+              (values v beta sigma)))))))
 
 (defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50)
                         (tol 1e-10))

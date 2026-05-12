@@ -3061,6 +3061,28 @@
     (assert (equal (vt-to-list hist) '(2.0 2.0 2.0))) ; 0,1,2,3,4,5  -> bin 宽度 1.666..., 计数分别为 2,2,2
     (assert (lists-approx-equal (vt-to-list edges) '(0.0 1.66666667 3.33333333 5.0) :epsilon 1e-6)))
 
+  ;; a = np.array([-np.inf, 0.5, 1.0, np.nan, 2.5, 3.0, np.inf])
+  ;; hist, edges = np.histogram(a, bins=3, range=(0, 3))
+  ;; print(hist)   # [1 1 2]  
+  ;; print(edges)  # [0. 1. 2. 3.]
+  (let* ((a (clvt:vt-from-sequence (list clvt::+vt-float-neg-inf+ 0.5d0 1.0d0
+                                         clvt::+vt-float-nan+ 2.5d0 3.0d0
+                                         clvt::+vt-float-pos-inf+)))
+	 (hist (multiple-value-list (clvt::vt-histogram a :bins 3 :range '(0.0d0 3.0d0)))))
+    (equal (clvt:vt-to-list (car hist))
+	   '(1.0 1.0 2.0))
+    (equal (clvt:vt-to-list (cadr hist))
+	   '(0.0 1.0 2.0 3.0)))
+  ;; a = np.array([np.nan, np.inf, -np.inf])
+  ;; hist, _ = np.histogram(a, bins=3, range=(0, 1))
+  ;; print(hist)
+  (let* ((a (clvt:vt-from-sequence
+	     (list clvt::+vt-float-nan+ clvt::+vt-float-pos-inf+
+                   clvt::+vt-float-neg-inf+)))
+	 (re (multiple-value-list
+	      (clvt:vt-histogram a :bins 3 :range '(0.0 1.0)))))
+    (equal (vt-to-list (first re) '(0 0 0))))
+
   (format t "~%all vt-histogram tests passed.~%"))
 
 
