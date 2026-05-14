@@ -471,6 +471,11 @@
     (assert (equal (vt-to-list (vt-slice c '(:all) '(:all) '(nil nil -1)))
                    '(((3 2 1 0) (7 6 5 4) (11 10 9 8))
                      ((15 14 13 12) (19 18 17 16) (23 22 21 20))))))
+  (let ((a (vt-from-sequence '(0 1 2 3 4))))
+    (equal nil (vt-to-list (vt-slice a '(-6 nil -1)))))
+
+  (let ((a (vt-from-sequence '(0 1 2 3 4))))
+    (equal '(0.0) (vt-to-list (vt-slice a '(0 nil -1)))))
 
   (format t "~%all new vt-slice tests passed.~%")
 
@@ -4350,12 +4355,80 @@
         (error (e)
           (format t "axes equal (should error) ... PASS (caught error: ~A)~%" e))))))
 
+(defun test-vt-copy-into ()
+  ;; ==========================================
+  ;; 测试 1: 正常形状匹配拷贝
+  ;; ==========================================
+  (let ((dest (vt-zeros '(2 3) :type 'double-float))
+        (src (vt-arange 6 :type 'double-float))) ; [0, 1, 2, 3, 4, 5]
+    (setf src (vt-reshape src '(2 3)))
+    (vt-copy-into dest src)
+    (assert (equal (vt-to-list dest) '((0.0d0 1.0d0 2.0d0) (3.0d0 4.0d0 5.0d0))))
+    (format t "✅ 测试 1 通过: 正常形状匹配拷贝~%"))
+
+  ;; ==========================================
+  ;; 测试 2: 广播拷贝 (src 维度为 1，向 dest 广播)
+  ;; ==========================================
+  (let ((dest (vt-zeros '(3 4) :type 'double-float))
+        (src (vt-arange 4 :type 'double-float))) ; [0, 1, 2, 3] shape: (4)
+    (setf src (vt-reshape src '(1 4)))           ; shape: (1, 4) 广播为 (3, 4)
+    (vt-copy-into dest src)
+    ;; 期望 dest 每一行都是 [0, 1, 2, 3]
+    (let ((expected-row '(0.0d0 1.0d0 2.0d0 3.0d0)))
+      (loop for i from 0 below 3 do
+        (assert (equal (vt-to-list (vt-slice dest (list i) '(:all)))
+		       expected-row))))
+    (format t "✅ 测试 2 通过: 广播拷贝~%"))
+
+  ;; ==========================================
+  ;; 测试 3: 标量拷贝 (src 是单个数字)
+  ;; ==========================================
+  (let ((dest (vt-zeros '(2 2) :type 'double-float)))
+    (vt-copy-into dest 99.0d0)
+    (assert (equal (vt-to-list dest) '((99.0d0 99.0d0) (99.0d0 99.0d0))))
+    (format t "✅ 测试 3 通过: 标量拷贝~%"))
+
+  ;; ==========================================
+  ;; 测试 4: 核心防线 - 向 0 步长广播视图写入 (必须报错!)
+  ;; ==========================================
+  (let* ((base (vt-from-sequence '((1.0d0) (2.0d0) (3.0d0)))) ; shape: (3, 1)
+         (dest-view (vt-broadcast-to base '(3 4))))           ; shape: (3, 4), strides: (1, 0)
+    
+    ;; 确认 dest-view 确实是 0 步长视图
+    (assert (equal (vt-strides dest-view) '(1 0)))
+    
+    (let ((src (vt-from-sequence '((10.0d0 20.0d0 30.0d0 40.0d0)
+                                   (50.0d0 60.0d0 70.0d0 80.0d0)
+                                   (90.0d0 100.0d0 110.0d0 120.0d0)))))
+      ;; 期望：因为 dest-view 的第二维步长为 0，写入多列数据会发生物理覆盖，必须被拦截！
+      (handler-case
+          (progn
+            (vt-copy-into dest-view src)
+            (format t "❌ 测试 4 失败: 竟然允许向 0 步长视图写入，未拦截越界覆盖！~%"))
+        (error (c)
+          (format t "✅ 测试 4 通过: 成功拦截向 0 步长视图写入，报错信息: ~a~%" c)))))
+
+  ;; ==========================================
+  ;; 测试 5: 类型转换测试 (fixnum -> double-float，验证移除 vt-astype 后的正确性)
+  ;; ==========================================
+
+  (let ((dest (vt-zeros '(2 2) :type 'double-float))
+        (src (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))) ; fixnum 张量
+    (vt-copy-into dest src)
+    ;; 验证不仅拷贝成功，且 dest 的元素确实变成了 double-float
+    (assert (equal (vt-to-list dest) '((1.0d0 2.0d0) (3.0d0 4.0d0))))
+    (assert (eq (vt-element-type dest) 'double-float))
+    (format t "✅ 测试 5 通过: 降级 coerce 的类型转换拷贝~%"))
+  )
+
+
+
+
+
+
 ;; ============================================================
 ;; 运行所有测试
 ;; ============================================================
-
-
-;; --------------------- 汇总 ---------------------
 
 (defun run-all-tests ()
   (test-vt-ravel)
@@ -4447,5 +4520,8 @@
   (test-vt-atan2)
   (test-vt-var-std)
   (test-vt-rot90)
+  (test-vt-copy-into)
   (format t "~&~%all test passed")
 )
+
+

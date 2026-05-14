@@ -696,8 +696,8 @@
    axis   : nil 表示展平后插入；
             整数表示沿指定轴插入。"
   (with-float-safe
-    (let ((arr-vt (ensure-vt arr))
-          (values-vt (ensure-vt values)))
+    (let* ((arr-vt (ensure-vt arr))
+          (values-vt (ensure-vt values :type (vt-element-type arr-vt))))
       (if (null axis)
           ;; ---------- 展平模式 ----------
           (let* ((flat-arr (vt-flatten arr-vt))

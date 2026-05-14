@@ -655,7 +655,6 @@
             (let ((remaining (- old-rank (- (length expanded-specs) num-newaxis))))
               (dotimes (i remaining)
 		(setf expanded-specs (append expanded-specs '((:all)))))))))
-
       ;; ========== 2. 遍历每个规格 ==========
       (let ((new-shape '())
             (new-strides '())
@@ -701,7 +700,7 @@
                                     (max 0 (min end dim)))))
                    ((< step 0)
                     (setf start (if (null start) (1- dim)
-                                    (max 0 (min start (1- dim)))))
+                                    (max -1 (min start (1- dim)))))
                     (setf end   (if (null end) -1
                                     (max -1 (min end (1- dim)))))))
 		 (let ((slice-dim 0))
@@ -733,7 +732,6 @@
 
             ;; --- 其他情况报错 ---
             (t (error "invalid slice spec: ~a" spec))))
-
 	(%make-vt :data (vt-data vt)
                   :shape (nreverse new-shape)
                   :strides (nreverse new-strides)
@@ -798,28 +796,50 @@
           (vt-copy-into new-vt vt))    
       new-vt)))
 
+(declaim (inline vt-ref))
 (defun vt-ref (vt &rest indices)
-  "获取张量元素(支持高维索引)."
-  (let* ((strides (vt-strides vt))
+  "获取张量元素(支持高维索引，支持负索引)。不包含越界检查以换取极致性能。"
+  (let* ((shape (vt-shape vt))
+         (strides (vt-strides vt))
          (data (vt-data vt))
-         (base-offset (vt-offset vt))
-         (idx-sum (loop for idx in indices
-                        for stride in strides
-                        sum (* idx stride))))
-    (aref data (+ base-offset idx-sum))))
+         (flat-idx (vt-offset vt)))
+    (declare (type fixnum flat-idx))
+    ;; 平行遍历索引、维度和步长，累加物理偏移
+    (loop for idx in indices
+          for dim in shape
+          for stride in strides
+          ;; 负索引规范化：如果是负数就加上维度长度，否则原样使用
+          do (incf flat-idx
+		   (the fixnum
+			(* (the fixnum
+				(if (minusp idx)
+				    (+ idx dim)
+				    idx)) 
+                           (the fixnum stride)))))
+    (aref data flat-idx)))
 
 (defun (setf vt-ref) (value vt &rest indices)
-  "设置张量元素."
+  "设置张量元素(支持高维索引，支持负索引)。不包含越界检查以换取极致性能。"
   (with-float-safe
-    (let* ((strides (vt-strides vt))
+    (let* ((shape (vt-shape vt))
+           (strides (vt-strides vt))
            (data (vt-data vt))
-           (base-offset (vt-offset vt))
-           (flat-idx (+ base-offset
-			(loop for idx in indices
-                              for stride in strides
-                              sum (* idx stride)))))
+           (flat-idx (vt-offset vt)))
+      (declare (type fixnum flat-idx))
+      (loop for idx in indices
+            for dim in shape
+            for stride in strides
+            do (incf flat-idx
+		     (the fixnum
+			  (* (the fixnum
+				  (if (minusp idx)
+				      (+ idx dim)
+				      idx)) 
+                             (the fixnum stride)))))
+      ;; 强制类型转换写入底层内存
       (setf (aref data flat-idx)
 	    (coerce value (vt-element-type vt))))))
+
 
 ;;; --- 高效迭代逻辑  ---
 (defmacro vt-do-each ((ptr-var val-var vt) &body body)
@@ -855,72 +875,66 @@
 
 (defun vt-copy-into (dest src)
   "将 src 的数据拷贝到 dest (支持广播和类型转换).
-   src: 源张量或标量数字.
-   dest: 目标张量视图."  
-  ;; === 支持标量输入
+ src: 源张量或标量数字.
+ dest: 目标张量视图.
+ 注意：dest 不能是带有 0 步长的广播视图(维度>1且步长=0)，否则物理上无法写入不同数据。"
   (when (numberp src)
-    (setf src (vt-from-sequence (list src)
-				:type (if (integerp src)
-					  'fixnum
-					  'double-float))))
-  (unless (eq (vt-element-type dest)
-	      (vt-element-type src))
-    (setf src (vt-astype src (vt-element-type dest))))
+    (setf src (ensure-vt src)))
+  
   (with-float-safe
     (let ((dest-shape (vt-shape dest))
-          (src-shape (vt-shape src)))
-      ;; 确保 dest 的形状能够容纳 src 广播后的形状
+          (src-shape (vt-shape src))) 
+      (loop for d in dest-shape
+            for s in (vt-strides dest)
+            when (and (> d 1) (zerop s))
+              do (error "vt-copy-into: 目标张量 dest 包含 0 步长的广播维度 (大小为 ~a)，无法安全写入各异的数据。" d))
       (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
-	(unless (equal final-shape dest-shape)
-          (error "copy-into 失败: dest 形状 ~a 无法容纳 src 广播后的形状 ~a" 
-		 dest-shape final-shape))      
-	;; 准备数据
-	(let* ((dest-data (vt-data dest))
+        (unless (equal final-shape dest-shape)
+          (error "copy-into 失败: dest 形状 ~a 无法容纳 src 广播后的形状 ~a"
+		 dest-shape final-shape))
+        (let* ((dest-data (vt-data dest))
                (src-data (vt-data src))
-               ;; 使用辅助函数计算广播步长 逻辑更清晰
-               (src-strides (vt-broadcast-strides 
-                             src-shape dest-shape (vt-strides src)))
+               (src-strides
+		 (vt-broadcast-strides
+		  src-shape dest-shape (vt-strides src)))
                (dest-strides (vt-strides dest))
                (dest-offset (vt-offset dest))
                (src-offset (vt-offset src))
                (rank (length dest-shape))
-               (element-type (array-element-type dest-data)))        
-          (labels
-	      ((recurse (depth d-ptr s-ptr)
-		 (declare (type fixnum depth d-ptr s-ptr))
-		 (if (= depth rank)
-                     ;; 叶节点:写入并进行类型转换
-                     (setf (aref dest-data d-ptr)
-                           (coerce (aref src-data s-ptr) element-type))                   
-                     ;; 递归层
-                     (let ((dim (nth depth dest-shape))
-                           (d-stride (nth depth dest-strides))
-                           (s-stride (nth depth src-strides))
-                           (cur-d-ptr d-ptr)
-                           (cur-s-ptr s-ptr))
-                       (declare (type fixnum dim d-stride s-stride))
-                       (loop for i fixnum from 0 below dim do
-			 (recurse (1+ depth) cur-d-ptr cur-s-ptr)
-			 (incf cur-d-ptr d-stride)
-			 (incf cur-s-ptr s-stride))))))          
+               (element-type (array-element-type dest-data)))
+          
+          (labels ((recurse (depth d-ptr s-ptr)
+                     (declare (type fixnum depth d-ptr s-ptr))
+                     (if (= depth rank)
+                         (setf (aref dest-data d-ptr)
+			       (coerce (aref src-data s-ptr) element-type))
+                         (let ((dim (nth depth dest-shape))
+                               (d-stride (nth depth dest-strides))
+                               (s-stride (nth depth src-strides))
+                               (cur-d-ptr d-ptr)
+                               (cur-s-ptr s-ptr))
+                           (declare (type fixnum dim d-stride s-stride))
+                           (loop for i fixnum from 0 below dim do
+                             (recurse (1+ depth) cur-d-ptr cur-s-ptr)
+                             (incf cur-d-ptr d-stride)
+                             (incf cur-s-ptr s-stride))))))
             (recurse 0 dest-offset src-offset))
           dest)))))
 
 ;; 快速类型转换
 (declaim (inline ensure-vt))
-(defun ensure-vt (obj)
+(defun ensure-vt (obj &key (type 'double-float))
   (with-float-safe
     (etypecase obj
       (vt obj)
       (number 
-       (let ((val (coerce obj 'double-float)))
-	 (%make-vt :data (make-array 1 :initial-element val
-				       :element-type 'double-float)
-                   :shape nil
-		   :strides nil
-		   :offset 0
-		   :etype 'double-float)))
-      (sequence (vt-from-sequence obj :type 'double-float)))))
+       (%make-vt :data (make-array 1 :initial-element (coerce obj type)
+				     :element-type type)
+                 :shape nil
+		 :strides nil
+		 :offset 0
+		 :etype type))
+      (sequence (vt-from-sequence obj :type type)))))
 
 (declaim (inline vt-broadcast-shapes))
 (defun vt-broadcast-shapes (shape1 shape2)
@@ -1262,13 +1276,14 @@
 		 res-offset 
 		 (if res-idx (vt-offset res-idx) 0) 
 		 0))
-      (if (and is-global-reduction (not keepdims))
-          (let ((final-val (aref res-data res-offset)))
-            (if return-arg
-		(values final-val (aref res-idx-data (vt-offset res-idx)))
-		final-val))
+      ;; (if (and is-global-reduction (not keepdims))
+      ;;     (let ((final-val (aref res-data res-offset)))
+      ;;       (if return-arg
+      ;; 		(values final-val (aref res-idx-data (vt-offset res-idx)))
+      ;; 		final-val))
           ;; 其余情况（轴向归约，或 keepdims=t），均返回 vt 结构体
-          (values res res-idx)))))
+      (values res res-idx))))
+;;)
 
 
 (defun vt-matmul (a b)
