@@ -757,8 +757,10 @@
                  (obj-list (if (listp obj) obj (list obj)))
                  (num-insert (length obj-list))
                  (target-shape (loop for i below rank
-                                     collect (if (= i ax) num-insert (nth i arr-shape))))
-                 ;; 标量广播：若 values 是标量，复制填充至目标形状
+                                     collect (if (= i ax)
+						 num-insert
+						 (nth i arr-shape))))
+		 ;; 标量广播：若 values 是标量，复制填充至目标形状
                  (values-vt-broadcast
                    (if (null (vt-shape values-vt))
                        (vt-full target-shape (vt-ref values-vt)
@@ -1089,8 +1091,8 @@
     (if axis
 	(vt-- (vt-amax tensor :axis axis)
 	      (vt-amin tensor :axis axis))
-	(- (vt-amax tensor)
-	   (vt-amin tensor)))))
+	(- (vt-item (vt-amax tensor))
+	   (vt-item (vt-amin tensor))))))
 
 (defun vt-histogram (tensor &key bins range density)
   "计算直方图。
@@ -1124,8 +1126,8 @@
                   (error "automatic bin range determination requires finite input.~
                        ~%  please provide explicit 'range' argument, or remove nan/inf values.")))
               ;; 数据全为有限值，安全地计算最小最大值
-              (setf data-min (vt-amin tensor)
-                    data-max (vt-amax tensor))))
+              (setf data-min (vt-item (vt-amin tensor))
+                    data-max (vt-item (vt-amax tensor)))))
         ;; 处理范围相等边界情况（所有值相同）
         (when (= data-min data-max)
           (setf data-min (- data-min 0.5)
@@ -1251,7 +1253,10 @@
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个数组整体是否在容差范围内接近"
   (with-float-safe
-    (= (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol)) 1.0d0)))
+    (= (vt-item
+	(vt-all
+	 (vt-isclose t1 t2 :rtol rtol :atol atol)))
+       1.0d0)))
 
 (defun vt-isfinite (vt)
   "检查是否为有限值（非 nan，非无穷）。跨平台兼容实现。"
@@ -2209,7 +2214,9 @@
   "统计非负整数数组中每个值出现的次数。"
   (with-float-safe
     (let* ((flat (vt-flatten x))
-           (maxval (if (zerop (vt-size flat)) -1 (vt-amax flat)))
+           (maxval (if (zerop (vt-size flat))
+		       -1
+		       (vt-item (vt-amax flat))))
            (size (max (1+ maxval) minlength))
            (result (make-array size :element-type 'fixnum
 				    :initial-element 0)))

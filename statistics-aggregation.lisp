@@ -44,7 +44,9 @@
                             (values acc nil))
                            (t
                             ;; 正常数值比较
-                            (if (> val acc) (values val t) (values acc nil)))))
+                            (if (> val acc)
+				(values val t)
+				(values acc nil)))))
                    :return-arg nil :keepdims keepdims)))))
 
 (defun vt-amin (tensor &key axis keepdims)
@@ -62,7 +64,9 @@
                            ((vt-float-nan-p acc)
                             (values acc nil))
                            (t
-                            (if (< val acc) (values val t) (values acc nil)))))
+                            (if (< val acc)
+				(values val t)
+				(values acc nil)))))
                    :return-arg nil :keepdims keepdims)))))
 
 (defun vt-argmax (tensor &key axis)
@@ -80,7 +84,9 @@
                            ((vt-float-nan-p acc)
                             (values acc nil))
                            (t
-                            (if (> val acc) (values val t) (values acc nil)))))
+                            (if (> val acc)
+				(values val t)
+				(values acc nil)))))
                    :return-arg t)))))
 
 (defun vt-argmin (tensor &key axis)
@@ -98,7 +104,9 @@
                            ((vt-float-nan-p acc)
                             (values acc nil))
                            (t
-                            (if (< val acc) (values val t) (values acc nil)))))
+                            (if (< val acc)
+				(values val t)
+				(values acc nil)))))
                    :return-arg t)))))
 
 (defun vt-mean (tensor &key axis keepdims)
@@ -118,11 +126,9 @@
       (when (= count 0)
 	(return-from vt-mean 0.0d0))
       ;; 执行除法
-      (if (vt-p sum-result)
-          (vt-map (lambda (s)
-		    (/ s (coerce count element-type)))
-		  sum-result)
-          (/ sum-result (coerce count element-type) 1.0d0)))))
+      (vt-map (lambda (s)
+		(/ s (coerce count element-type)))
+	      sum-result))))
 
 (defun vt-average (tensor weights &key axis keepdims)
   "计算加权平均值.
@@ -137,16 +143,12 @@
 				 :keepdims keepdims))
            (sum-weights (vt-sum weights :axis axis
 					:keepdims keepdims)))
-      (if (vt-p weighted-sum)
-          (vt-map (lambda (s w) 
-                    (if (= w 0)
-			0.0d0
-			(/ s w))) 
-                  weighted-sum 
-                  sum-weights)
-          (if (= sum-weights 0)
-              0.0d0 
-              (/ weighted-sum sum-weights 1.0d0))))))
+      (vt-map (lambda (s w) 
+                (if (= w 0)
+		    0.0d0
+		    (/ s w))) 
+              weighted-sum 
+              sum-weights))))
 
 (defun vt-var (tensor &key axis keepdims (ddof 0))
   "计算方差。
@@ -169,26 +171,16 @@
                   (the fixnum (reduce #'* shape))))
            ;; 5. 计算除数
            (divisor (- n ddof)))
-      
       ;; 6. 判断除数是否合法
       (if (<= divisor 0)
-          ;; 分母不合法（<=0），按照 ieee 754 / numpy 规范显式注入 nan
-          (let ((nan-val (vt-float-nan)))
-            (if (vt-p sum-sq)
-		;; 返回一个形状相同、全为 nan 的张量
-		(let* ((out-shape (vt-shape sum-sq))
-                       (out (vt-zeros out-shape :type 'double-float))
-                       (data (vt-data out))
-                       (offset (vt-offset out)))
-                  (dotimes (i (reduce #'* out-shape))
-                    (setf (row-major-aref data (+ i offset)) nan-val))
-                  out)
-		;; 如果是标量，直接返回 nan 数值本身
-		nan-val))
+          ;; 分母不合法（<=0），直接将 sum-sq 映射为全 nan 张量
+          ;; vt-map 天然支持 0 维张量，完美契合 PyTorch 规范
+          (vt-map (lambda (s)
+                    (declare (ignore s))
+                    (vt-float-nan))
+                  sum-sq)
           ;; 分母合法，执行正常除法
-          (if (vt-p sum-sq)
-              (vt-/ sum-sq divisor)
-              (/ sum-sq divisor))))))
+          (vt-/ sum-sq divisor)))))
 
 
 (defun vt-std (tensor &key axis keepdims (ddof 0))
@@ -198,9 +190,7 @@
     (let ((variance (vt-var tensor :axis axis
 				   :keepdims keepdims
 				   :ddof ddof)))
-      (if (vt-p variance)
-          (vt-sqrt variance)
-          (sqrt variance)))))
+      (vt-sqrt variance))))
 
 (defun nan-stats-helpers (tensor &key axis keepdims)
   "返回两个值：将 nan 转为 0 的张量 (形状同 tensor) 和有效元素计数 (标量或张量)。"
@@ -231,15 +221,12 @@
                    (if (zerop c)
                        (vt-float-nan)  ;; 产生 nan
                        (/ s c))))
-          (if (vt-p sum)
-              (vt-map #'safe-div sum count)
-              (safe-div sum count)))))))
-
+              (vt-map #'safe-div sum count))))))
 
 (defun vt-nanvar (tensor &key axis keepdims (ddof 0))
-  "忽略 nan 计算方差。
+  "忽略 nan 计算方差 (对标 PyTorch，归约始终返回张量)。
    ddof ：自由度修正（默认 0，总体方差；1=样本方差）。
-   axis, keepdims 同 numpy。"
+   axis, keepdims 同 PyTorch。"
   (with-float-safe
     (let* ((mask (vt-isnan tensor))
            (not-nan (vt-logical-not mask))  ;; 非 nan 为 1，nan 为 0
@@ -247,28 +234,22 @@
            (count (vt-sum not-nan :axis axis :keepdims keepdims))
            (mean (vt-nanmean tensor :axis axis :keepdims t))
            (squared-diff (vt-* (vt-map (lambda (c m) (* (- c m) (- c m)))
-				       clean mean)
+                                       clean mean)
                                not-nan))
            (sum2 (vt-sum squared-diff :axis axis :keepdims keepdims))
-           (divisor (if (vt-p count)
-			(vt-map (lambda (c) (max 0 (- c ddof))) count)
-			(max 0 (- count ddof)))))
-      (labels ((safe-div (s d)
-		 (if (<= d 0)
-                     (vt-float-nan)
-                     (/ s d))))
-	(if (vt-p sum2)
-            (vt-map #'safe-div sum2 divisor)
-            (safe-div sum2 divisor))))))
+           (divisor (vt-map (lambda (c) (max 0 (- c ddof))) count)))
+      (vt-map (lambda (s d)
+                (if (<= d 0)
+                    (vt-float-nan)
+                    (/ s d)))
+              sum2 divisor))))
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0))
   "忽略 nan 计算标准差。参数同 vt-nanvar。"
   (with-float-safe
     (let ((var (vt-nanvar tensor :axis axis :keepdims keepdims
 				 :ddof ddof)))
-      (if (vt-p var)
-          (vt-map #'sqrt var)
-          (sqrt var)))))
+      (vt-map #'sqrt var))))
 
 (defun vt-nanmax (tensor &key axis keepdims)
   "忽略 nan 的最大值。"

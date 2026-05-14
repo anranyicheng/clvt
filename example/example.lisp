@@ -285,7 +285,7 @@
   (let ((a (vt-arange 10 :type 'fixnum)))
     ;; 1a. 单个整数索引
     ;; a[3] -> 3
-    (assert (= (vt-ref (vt-slice a '(3))) 3))
+    (assert (= (vt-item (vt-slice a '(3))) 3))
     
     ;; 1b. 正向范围
     ;; a[2:7] -> [2,3,4,5,6]
@@ -314,7 +314,7 @@
     
     ;; 1h. 负索引
     ;; a[-1] -> 9
-    (assert (= (vt-ref (vt-slice a '(-1))) 9))
+    (assert (= (vt-item (vt-slice a '(-1))) 9))
     
     ;; a[-3:-1] -> [7,8]
     (assert (equal (vt-to-list (vt-slice a '(-3 -1))) '(7 8)))
@@ -331,7 +331,7 @@
   (let* ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5))))
     ;; 2a. 单个元素
     ;; b[1,2] -> 7
-    (assert (= (vt-ref (vt-slice b '(1) '(2))) 7.0))
+    (assert (= (vt-item (vt-slice b '(1) '(2))) 7.0))
     
     ;; 2b. 取一行
     ;; b[2,:] -> [10,11,12,13,14]
@@ -418,7 +418,7 @@
   (let* ((c (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
     ;; 3a. 取一个元素
     ;; c[0,1,2] -> 6
-    (assert (= (vt-ref (vt-slice c '(0) '(1) '(2))) 6.0))
+    (assert (= (vt-item (vt-slice c '(0) '(1) '(2))) 6.0))
     
     ;; 3b. 取一个平面
     ;; c[1, :, :] -> shape (3,4), 值 12..23
@@ -454,7 +454,7 @@
     
     ;; 3g. 混合整数降维
     ;; c[0, -1, 2] -> 10
-    (assert (= (vt-ref (vt-slice c '(0) '(-1) '(2))) 10.0))
+    (assert (= (vt-item (vt-slice c '(0) '(-1) '(2))) 10.0))
     
     ;; 3h. 省略号处于中间
     ;; c[0, ..., 2] -> 等价 c[0, :, :, 2]？不，这是三维，c[0, :, 2] -> shape (3,)
@@ -848,7 +848,7 @@
   ;; 一维全局求和
   ;; np.sum(np.array([1,2,3,4,5])) -> 15
   (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
-    (assert (= (vt-sum a) 15.0d0)))
+    (assert (= (vt-item (vt-sum a)) 15.0d0)))
 
   ;; 二维沿轴0求和，保持维度
   ;; a = np.arange(6).reshape(2,3)
@@ -874,7 +874,7 @@
   ;; 全局求和（标量形状）
   ;; np.sum(np.array(42)) -> 42
   (let ((a (vt-const '() 42 :type 'fixnum)))
-    (assert (= (vt-sum a) 42.0d0)))
+    (assert (= (vt-item (vt-sum a)) 42.0d0)))
 
   (format t "~%test-vt-sum passed.~%"))
 
@@ -885,11 +885,11 @@
   ;; amax 全局
   ;; np.max(np.array([10,3,7,2,9])) -> 10
   (let ((a (vt-from-sequence '(10 3 7 2 9))))
-    (assert (= (vt-amax a) 10.0d0))
+    (assert (= (vt-item (vt-amax a)) 10.0d0))
 
     ;; amin 全局
     ;; np.min(a) -> 2
-    (assert (= (vt-amin a) 2.0d0)))
+    (assert (= (vt-item (vt-amin a)) 2.0d0)))
 
   ;; 二维沿轴0 amax，不保留维度
   ;; a = np.arange(12).reshape(3,4)
@@ -921,11 +921,11 @@
   ;; a = np.array([1,5,3,9,2])
   ;; np.argmax(a) -> 3
   (let ((a (vt-from-sequence '(1 5 3 9 2))))
-    (assert (= (vt-argmax a) 3))
+    (assert (= (vt-item (vt-argmax a)) 3))
 
     ;; 一维 argmin
     ;; np.argmin(a) -> 0
-    (assert (= (vt-argmin a) 0)))
+    (assert (= (vt-item (vt-argmin a)) 0)))
 
   ;; 二维沿轴0 argmax
   ;; a = np.array([[2,8,4],[7,3,6],[1,5,9]])
@@ -957,7 +957,7 @@
   ;; 全局 argmin（标量）
   ;; np.argmin(np.array(5)) -> 0
   (let ((a (vt-zeros '(1))))
-    (assert (= (vt-argmin a) 0)))
+    (assert (= (vt-item (vt-argmin a)) 0)))
 
   (format t "~%test-vt-argmax-argmin passed.~%"))
 
@@ -1099,7 +1099,7 @@
   (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
          (b (vt-from-sequence '(4 5 6) :type 'fixnum))
          (res (vt-einsum "i,i->" a b)))
-    (assert (= (vt-ref res) 32.0d0)))
+    (assert (= (vt-item res) 32.0d0)))
 
   ;; 矩阵乘法
   ;; a = np.arange(6).reshape(2,3), b = np.arange(6).reshape(3,2)
@@ -1177,7 +1177,7 @@
 
   ;; 测试 6：迹 "ii->"
   (let* ((a (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9))))
-         (trace (vt-ref (vt-einsum "ii->" a))))
+         (trace (vt-item (vt-einsum "ii->" a))))
     (assert-ok (approx= trace (+ 1 5 9)) "迹 einsum 失败"))
 
   ;; 测试 7：批量矩阵乘法 "...ij,...jk->...ik"
@@ -1198,7 +1198,7 @@
   ;; 测试 8：向量内积 "i,i->"
   (let* ((a (vt-from-sequence '(1 2 3)))
          (b (vt-from-sequence '(4 5 6)))
-         (res (vt-ref (vt-einsum "i,i->" a b))))
+         (res (vt-item (vt-einsum "i,i->" a b))))
     (assert-ok (approx= res 32.0) "向量内积 einsum 失败"))
   (format t "~%test-vt-einsum passed.~%"))
 
@@ -1212,7 +1212,7 @@
   (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
          (b (vt-from-sequence '(4 5 6) :type 'fixnum))
          (res (vt-dot a b)))
-    (assert (= (vt-ref res) 32.0d0)))
+    (assert (= (vt-item res) 32.0d0)))
 
   ;; 矩阵乘法 (2d)
   ;; a = np.arange(6).reshape(2,3), b = np.arange(6).reshape(3,2)
@@ -1235,7 +1235,7 @@
   ;; 测试 1：两个一维向量 → 标量数值
   (let* ((a (vt-from-sequence '(1.0 2.0 3.0)))
          (b (vt-from-sequence '(4.0 5.0 6.0)))
-         (res (vt-ref (vt-dot a b))))
+         (res (vt-item (vt-dot a b))))
     (assert-ok (and (numberp res) (approx= res 32.0))
                "向量点积应返回标量数字"))
 
@@ -1364,11 +1364,11 @@
   ;; 向量 l2 范数
   ;; np.linalg.norm(np.array([3,4])) -> 5.0
   (let ((v (vt-from-sequence '(3 4) :type 'double-float)))
-    (assert (= (vt-ref (vt-norm v)) 5.0d0)))
+    (assert (= (vt-item (vt-norm v)) 5.0d0)))
   ;; 矩阵 l2 范数 (全局) 默认是 frobenius? 根据代码 vt-norm 是 l2 范数 (vt-sqrt(vt-sum(sq)))，对于矩阵是 frobenius。
   ;; np.linalg.norm(np.array([[1,2],[3,4]])) -> 5.477225575051661
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
-    (assert (lists-approx-equal (list (vt-ref (vt-norm a)))
+    (assert (lists-approx-equal (list (vt-item (vt-norm a)))
 				(list (sqrt 30.0d0)) :epsilon 1e-6)))
   ;; 沿轴计算 l2 范数
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), axis=1) -> [2.23606798, 5.0]
@@ -1384,7 +1384,7 @@
   ;; 矩阵 frobenius 范数
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), 'fro') -> 5.477225575051661
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
-    (assert (lists-approx-equal (list (vt-ref (vt-frobenius-norm a)))
+    (assert (lists-approx-equal (list (vt-item (vt-frobenius-norm a)))
 				(list (sqrt 30.0d0)) :epsilon 1e-6)))
   (format t "~%test-vt-frobenius-norm passed.~%"))
 
@@ -1394,11 +1394,11 @@
 (defun test-vt-trace ()
   ;; a = [[1,2],[3,4]] -> trace = 5.0
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
-    (assert (= (vt-trace a) 5.0d0)))
+    (assert (= (vt-item (vt-trace a)) 5.0d0)))
   ;; 非方阵应报错或只取 min 对角线? 根据代码，vt-trace 调用 vt-diagonal 然后 sum，vt-diagonal 需要 rank>=2，会自动取 min 对角线。我们测试一个矩形矩阵。
   ;; np.trace(np.arange(6).reshape(2,3)) -> 0+4 = 4.0
   (let ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3))))
-    (assert (= (vt-trace a) 4.0d0)))
+    (assert (= (vt-item (vt-trace a)) 4.0d0)))
   (format t "~%test-vt-trace passed.~%"))
 
 ;; ============================================================
@@ -1987,7 +1987,7 @@
            (p (vt-pad a '((2 2) (3 3)) :mode :reflect)))
       ;; 只验证中心区域未变，并验证几个特征点（numpy 可生成完整预期，此处省略）
       (assert (vt= (vt-slice p '(2 4) '(3 6)) a))
-      (assert (= 189 (vt-sum p)))
+      (assert (= 189 (vt-item (vt-sum p))))
       )
 
     (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
@@ -2547,7 +2547,7 @@
       (format t "~2%data values: ~{~a ~}~%" (vt-to-list data))
       
       ;; ---- test vt-nansum ----
-      (let ((s-global (vt-nansum data))
+      (let ((s-global (vt-item (vt-nansum data)))
             (s-axis0 (vt-nansum data :axis 0))
             (s-axis1 (vt-nansum data :axis 1))
             (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
@@ -2559,7 +2559,7 @@
 	(format t "~%vt-nansum: pass~%"))
 
       ;; ---- test vt-nanmean ----
-      (let ((m-global (vt-nanmean data))
+      (let ((m-global (vt-item (vt-nanmean data)))
             (m-axis0 (vt-nanmean data :axis 0))
             (m-axis1 (vt-nanmean data :axis 1)))
 	(assert (< (abs (- m-global (/ 16.0d0 5))) 1d-10))
@@ -2568,7 +2568,7 @@
 	(format t "vt-nanmean: pass~%"))
 
       ;; ---- test vt-nanvar (ddof=0, default) ----
-      (let* ((v-global (vt-nanvar data))
+      (let* ((v-global (vt-item (vt-nanvar data)))
              (expected (/ (+ (expt (- 1 3.2) 2)
 			     (expt (- 2 3.2) 2)
                              (expt (- 3 3.2) 2)
@@ -2598,19 +2598,19 @@
 	(format t "vt-nanvar: pass~%")
 
 	;; ---- test vt-nanstd ----
-	(let ((std-global (vt-nanstd data)))
+	(let ((std-global (vt-item (vt-nanstd data))))
 	  (assert (< (abs (- std-global (sqrt expected))) 1d-10))
 	  (format t "vt-nanstd: pass~%")))
 
       ;; ---- test vt-nanmax ----
-      (let ((mx-global (vt-nanmax data))
+      (let ((mx-global (vt-item (vt-nanmax data)))
             (mx-axis0 (vt-nanmax data :axis 0)))
 	(assert (= mx-global 6.0d0))
 	(assert (equalp (vt-to-list mx-axis0) '(4.0 2.0 6.0)))
 	(format t "vt-nanmax: pass~%"))
 
       ;; ---- test vt-nanmin ----
-      (let ((mn-global (vt-nanmin data))
+      (let ((mn-global (vt-item (vt-nanmin data)))
             (mn-axis0 (vt-nanmin data :axis 0)))
 	(assert (= mn-global 1.0d0))
 	(assert (equalp (vt-to-list mn-axis0) '(1.0 2.0 3.0)))
@@ -2625,11 +2625,11 @@
 	
 
 
-	(let ((s (vt-nansum all-nan))
-	      (m (vt-nanmean all-nan))
-	      (v (vt-nanvar all-nan))
-	      (mx (vt-nanmax all-nan))
-	      (mn (vt-nanmin all-nan)))
+	(let ((s (vt-item (vt-nansum all-nan)))
+	      (m (vt-item (vt-nanmean all-nan)))
+	      (v (vt-item (vt-nanvar all-nan)))
+	      (mx (vt-item (vt-nanmax all-nan)))
+	      (mn (vt-item (vt-nanmin all-nan))))
 	  ;; 检查标量
 	  (assert (/= m m))                 ; m 是 nan
 	  (assert (= s 0.0d0))
@@ -2646,9 +2646,11 @@
 
       ;; ---- 边界情况：无 nan ----
       (let* ((clean (vt-arange 6 :step 1 :type 'double-float)))
-	(assert (= (vt-nansum clean) 15.0d0))
-	(assert (= (vt-nanmean clean) 2.5d0))
-	(assert (< (abs (- (vt-nanvar clean) (vt-var clean))) 1d-10))
+	(assert (= (vt-item (vt-nansum clean)) 15.0d0))
+	(assert (= (vt-item (vt-nanmean clean)) 2.5d0))
+	(assert (< (abs (- (vt-item (vt-nanvar clean))
+			   (vt-item (vt-var clean))))
+		   1d-10))
 	(format t "no-nan edge cases: pass~%")))
 
     (format t "~%all nan statistics tests passed!~%")
@@ -2899,7 +2901,7 @@
   (format t "~%--- testing vt-trapz ---~%")
   ;; 1. 一维数组，默认 dx=1
   (let* ((y (vt-from-sequence '(1 2 3 4) :type 'double-float))
-         (trap (vt-ref (vt-trapz y))))
+         (trap (vt-item (vt-trapz y))))
     ;; 梯形积分： (1+2)/2 + (2+3)/2 + (3+4)/2 = 1.5+2.5+3.5 = 7.5
     (assert (floatp trap))
     (assert (< (abs (- trap 7.5d0)) 1d-10))
@@ -2908,7 +2910,7 @@
   ;; 2. 指定 x 坐标
   (let* ((x (vt-from-sequence '(0 2 3 5) :type 'double-float))
          (y (vt-from-sequence '(1 2 3 4) :type 'double-float))
-         (trap (vt-ref (vt-trapz y :x x))))
+         (trap (vt-item (vt-trapz y :x x))))
     ;; 梯度：dx1=2, dx2=1, dx3=2
     ;; 积分 = (1+2)/2*2 + (2+3)/2*1 + (3+4)/2*2 = 3*2 + 2.5*1 + 3.5*2 = 6+2.5+7 = 12.5
     (assert (< (abs (- trap 12.5d0)) 1d-10))
@@ -3172,7 +3174,7 @@
 	 (probs (vt-softmax logits :axis -1))
 	 (true (vt-from-sequence '((0.0 1.0 0.0) (0.0 1.0 0.0))
 				 :type 'double-float))
-	 (loss (vt-cross-entropy true probs)))
+	 (loss (vt-item (vt-cross-entropy true probs))))
     ;; 损失应为正数（大约 0.874）
     (assert (> loss 0.0d0))
     (assert (< loss 5.0d0)))
@@ -3183,7 +3185,7 @@
   ;; 二元交叉熵
   (let* ((y-true (vt-from-sequence '(1 0 1) :type 'double-float))
 	 (y-pred (vt-from-sequence '(0.9 0.1 0.8) :type 'double-float))
-	 (bce (vt-binary-cross-entropy y-true y-pred)))
+	 (bce (vt-item (vt-binary-cross-entropy y-true y-pred))))
     ;; 正确期望值：三个样本损失的平均
     (let ((expected (/ (+ (- (log 0.9d0))   ; 样本1
                           (- (log 0.9d0))   ; 样本2 (1-0.1=0.9)
@@ -3232,14 +3234,14 @@
   ;; np.average(a, weights=weights) -> (1*1+2*2+3*1)/(1+2+1) = 2.0
   (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
          (w (vt-from-sequence '(1 2 1) :type 'double-float))
-         (avg (vt-average a w)))
+         (avg (vt-item (vt-average a w))))
     (assert (= avg 2.0d0)))
 
   ;; vt-var / vt-std
   ;; a = [1,2,3,4]  有偏方差 = mean((x-mean)^2) = 1.25, std=sqrt(1.25)
   (let* ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
-         (v (vt-var a))
-         (s (vt-std a)))
+         (v (vt-item (vt-var a)))
+         (s (vt-item (vt-std a))))
     (assert (lists-approx-equal (list v)
 				'(1.25d0) :epsilon 1e-6))
     (assert (lists-approx-equal (list s)
@@ -3248,7 +3250,7 @@
   ;; vt-prod
   ;; np.prod([1,2,3,4]) -> 24
   (let ((a (vt-from-sequence '(1 2 3 4) :type 'fixnum)))
-    (assert (= (vt-prod a) 24.0d0)))
+    (assert (= (vt-item (vt-prod a)) 24.0d0)))
 
   ;; vt-prod axis
   ;; a = np.array([[1,2],[3,4]])
@@ -3266,18 +3268,18 @@
   ;; vt-all
   ;; np.all([true, true, false]) -> false
   (let ((a (vt-from-sequence '(1 1 0) :type 'double-float)))
-    (assert (= (vt-all a) 0.0d0)))
+    (assert (= (vt-item (vt-all a)) 0.0d0)))
 
   ;; vt-any
   ;; np.any([0,0,1]) -> true
   (let ((a (vt-from-sequence '(0 0 1) :type 'double-float)))
-    (assert (= (vt-any a) 1.0d0)))
+    (assert (= (vt-item (vt-any a)) 1.0d0)))
 
   ;; vt-isclose
   ;; np.isclose(1.0, 1.000001) -> true
   (let ((a (vt-const '() 1.0d0))
         (b (vt-const '() 1.000001d0)))
-    (assert (= (vt-ref (vt-isclose a b) 0) 1.0d0)))
+    (assert (= (vt-item (vt-isclose a b)) 1.0d0)))
 
   ;; vt-allclose
   (let ((a (vt-from-sequence '(1 2 3) :type 'double-float))
@@ -4019,15 +4021,15 @@
   ;; a = np.array([1, 2, 3, 4])
   ;; np.var(a) -> 1.25 (总体方差)
   (let* ((a (vt-from-sequence '(1.0 2.0 3.0 4.0)))
-         (var-pop (vt-var a)))
+         (var-pop (vt-item (vt-var a))))
     (assert (< (abs (- var-pop 1.25d0)) 1e-9)))
   ;; np.var(a, ddof=1) -> 1.666666... (样本方差)
   (let* ((a (vt-from-sequence '(1.0 2.0 3.0 4.0)))
-         (var-sample (vt-var a :ddof 1)))
+         (var-sample (vt-item (vt-var a :ddof 1))))
     (assert (< (abs (- var-sample (/ 5.0d0 3.0d0))) 1e-9)))
   ;; np.std(a, ddof=1) -> sqrt(1.666...) -> 1.29099...
   (let* ((a (vt-from-sequence '(1.0 2.0 3.0 4.0)))
-         (std-sample (vt-std a :ddof 1)))
+         (std-sample (vt-item (vt-std a :ddof 1))))
     (assert (< (abs (- std-sample (sqrt (/ 5.0d0 3.0d0)))) 1e-9)))
   (format t "~%test-vt-var-std-ddof passed.~%"))
 
@@ -4036,11 +4038,11 @@
   ;; a = np.array([2, 3, 4])
   ;; np.prod(a) -> 24
   (let* ((a (vt-from-sequence '(2 3 4) :type 'fixnum))
-         (p (vt-prod a)))
+         (p (vt-item (vt-prod a))))
     (assert (= p 24)))
   ;; np.ptp(a) -> 4 - 2 = 2 (峰峰值)
   (let* ((a (vt-from-sequence '(2 3 4) :type 'fixnum))
-         (p (vt-ptp a)))
+         (p (vt-item (vt-ptp a))))
     (assert (= p 2)))
   (format t "~%test-vt-prod-ptp passed.~%"))
 
@@ -4232,17 +4234,17 @@
 (defun test-vt-var-std ()
   ;; 测试 1：总体方差
   (let* ((data (vt-from-sequence '(1 2 3)))
-         (var (vt-var data :ddof 0)))
+         (var (vt-item (vt-var data :ddof 0))))
     (assert-ok (approx= var (/ 2.0 3.0)) "总体方差错误"))
 
   ;; 测试 2：样本方差 ddof=1
   (let* ((data (vt-from-sequence '(1 2 3)))
-         (var (vt-var data :ddof 1)))
+         (var (vt-item (vt-var data :ddof 1))))
     (assert-ok (approx= var 1.0) "样本方差错误"))
 
   ;; 测试 3：除数为 0 (ddof = 数据个数)
   (let* ((data (vt-from-sequence '(1 2 3)))
-         (var (vt-var data :ddof 3)))
+         (var (vt-item (vt-var data :ddof 3))))
     ;; 应返回 nan (common lisp 的 (coerce (/ 0.0d0 0.0d0) 'double-float) 就是 nan)
     (assert-ok (not (vt-float-nan-= var var)) "ddof=3 时应返回 nan"))
 
@@ -4257,17 +4259,14 @@
 
   ;; 测试 5：标准差除零
   (let* ((data (vt-from-sequence '(1 2 3)))
-         (std (vt-nanstd data :ddof 3)))
+         (std (vt-item (vt-nanstd data :ddof 3))))
     (assert-ok (not (vt-float-nan-= std std)) "标准差除零时应返回 nan"))
 
   ;; 测试 6：nanvar 除零
   (let* ((data-nan (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0)))  ; 注意 nan 需要由 (/ 0.0d0 0.0d0) 生成
          (nanvar (vt-nanvar data-nan :ddof 2)))  ; 有效样本数=2, ddof=2 导致除数0
-      (if (vt-p nanvar)
-      (assert-ok (not (vt-float-nan-= (vt-ref nanvar 0) (vt-ref nanvar 0)))
-                 "nanvar 除零时应为 nan")
-      (assert-ok (not (vt-float-nan-= nanvar nanvar)) ; nan 永远不等于自身
-                 "nanvar 除零时应为 nan")))
+      (assert-ok (not (vt-float-nan-= (vt-item nanvar) (vt-item nanvar)))
+                 "nanvar 除零时应为 nan"))
   (format t "~%vt-var / vt-std 全部测试通过~%"))
 
 (defun test-vt-rot90 ()

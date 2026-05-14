@@ -82,6 +82,7 @@
    ;; 索引、切片与选择
    :vt-ref   ;; (setf :vt-ref
    :vt-slice ;; (setf :vt-slice
+   :vt-item
    :vt-take
    :vt-put
    :vt-where

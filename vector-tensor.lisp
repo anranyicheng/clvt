@@ -840,6 +840,13 @@
       (setf (aref data flat-idx)
 	    (coerce value (vt-element-type vt))))))
 
+(declaim (inline vt-item))
+(defun vt-item (x)
+  "解包 0 维张量为原生数字，其他原样返回。专为 repl 和条件判断设计。"
+  (if (and (vt-p x)
+	   (null (vt-shape x)))
+      (vt-ref x)
+      x))
 
 ;;; --- 高效迭代逻辑  ---
 (defmacro vt-do-each ((ptr-var val-var vt) &body body)
@@ -1276,13 +1283,7 @@
 		 res-offset 
 		 (if res-idx (vt-offset res-idx) 0) 
 		 0))
-      (if (and is-global-reduction (not keepdims))
-          (let ((final-val (aref res-data res-offset)))
-            (if return-arg
-		(values final-val (aref res-idx-data (vt-offset res-idx)))
-		final-val))
-          ;; 其余情况（轴向归约，或 keepdims=t），均返回 vt 结构体
-      (values res res-idx)))))
+      (values res res-idx))))
 
 (defun vt-matmul (a b)
   "矩阵乘法，兼容 1d 向量（对标 numpy 的 @ 运算符）。"

@@ -39,5 +39,6 @@
   (with-float-safe
     (let* ((p-clipped (vt-clip y-pred eps (- 1.0d0 eps)))
            (log-prob (vt-log p-clipped))
-           (loss-per-sample (vt-- (vt-sum (vt-* y-true log-prob) :axis -1))))
+           (loss-per-sample
+	     (vt-- (vt-sum (vt-* y-true log-prob) :axis -1))))
       (vt-mean loss-per-sample))))
