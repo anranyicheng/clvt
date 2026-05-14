@@ -1004,11 +1004,13 @@
                (vals (vt-numpy-sort (loop for i below size
 					  collect (aref (vt-data flat) i))
 				    #'<)))
-          (if (oddp size)
-              (coerce (nth (floor size 2) vals) 'double-float)
-              (/ (+ (coerce (nth (1- (floor size 2)) vals) 'double-float)
-                    (coerce (nth (floor size 2) vals) 'double-float))
-		 2.0d0))))))
+	   (if (oddp size)
+               (make-vt nil (coerce (nth (floor size 2) vals) 'double-float)
+			:type 'double-float)
+            (make-vt nil (/ (+ (coerce (nth (1- (floor size 2)) vals) 'double-float)
+                               (coerce (nth (floor size 2) vals) 'double-float))
+                            2.0d0)
+                     :type 'double-float))))))
 
 
 (defun percent-from-sorted (sorted q interpolation)
@@ -1076,7 +1078,8 @@
 		 (vals (vt-numpy-sort (loop for i below size
 					    collect (aref (vt-data flat) i))
 				      #'<)))
-            (percent-from-sorted vals q interpolation))))))
+	    (make-vt nil (percent-from-sorted vals q interpolation)
+		     :type 'double-float))))))
 
 (defun vt-quantile (tensor q &key axis (interpolation :linear))
   "计算分位数.
@@ -1119,10 +1122,7 @@
             (progn
               ;; 检查是否包含非有限值
               (let ((finite-check (vt-all (vt-isfinite tensor))))
-                (unless (= (if (numberp finite-check)
-                               finite-check
-                               (aref (vt-data finite-check) 0))
-                           1.0d0)
+		  (unless (= (vt-item finite-check) 1.0d0)
                   (error "automatic bin range determination requires finite input.~
                        ~%  please provide explicit 'range' argument, or remove nan/inf values.")))
               ;; 数据全为有限值，安全地计算最小最大值
@@ -1826,7 +1826,8 @@
 				(aref (vt-data idx-vt) 0))))
                   (unless (<= 0 idx (1- size))
                     (error "索引 ~d 越界，展平大小 ~d" idx size))
-                  (aref (vt-data flat) idx))
+		  (make-vt nil (aref (vt-data flat) idx)
+			   :type (vt-element-type tensor)))
 		;; 非标量索引：保留形状
 		(let* ((flat (vt-ravel tensor))
                        (size (vt-size flat))
@@ -2479,7 +2480,7 @@
                              (+ low (random range rng)))
                            (vt-zeros size :type type))
                    type)
-        (coerce (+ low (random range rng)) type))))
+	 (make-vt nil (+ low (random range rng)) :type type))))
 
 (defun vt-random-integers (low high &key (size nil) (type 'fixnum)
 				      (rng *vt-default-random-state*))

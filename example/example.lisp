@@ -709,12 +709,12 @@
   ;; 全局中位数（一维向量）
   ;; np.median(np.array([5, 2, 8, 1, 9])) -> 5.0
   (let ((a (vt-from-sequence '(5 2 8 1 9))))
-    (assert (= (vt-median a) 5.0d0)))
+    (assert (= (vt-item (vt-median a)) 5.0d0)))
 
   ;; 全局中位数（偶数个元素）
   ;; np.median(np.array([1, 2, 3, 4])) -> 2.5
   (let ((a (vt-from-sequence '(1 2 3 4))))
-    (assert (= (vt-median a) 2.5d0)))
+    (assert (= (vt-item (vt-median a)) 2.5d0)))
 
   ;; 二维张量，沿 axis=0 求中位数
   ;; a = np.arange(30).reshape(5,6)
@@ -753,7 +753,7 @@
   ;; 全局中位数（标量）作为数字返回
   ;; np.median(np.array([1.0])) -> 1.0
   (let ((a (vt-zeros '(1))))
-    (assert (= (vt-median a) 0.0d0)))
+    (assert (= (vt-item (vt-median a)) 0.0d0)))
   (print "test vt-median passed")
   )
 ;; ============================================================
@@ -764,27 +764,35 @@
   ;; a = np.array([1, 2, 3, 4, 5])
   ;; np.percentile(a, 50) -> 3.0
   (let ((a (vt-from-sequence '(1 2 3 4 5))))
-    (assert (= (vt-percentile a 50) 3.0d0)))
+    (assert (= (vt-item (vt-percentile a 50)) 3.0d0)))
 
   ;; 一维向量，lower 方法
   ;; np.percentile(a, 40, interpolation='lower') -> 2
   (let ((a (vt-from-sequence '(1 2 3 4 5))))
-    (assert (= (vt-percentile a 40 :interpolation :lower) 2.0d0)))
+    (assert (= (vt-item
+		(vt-percentile a 40 :interpolation :lower))
+	       2.0d0)))
 
   ;; 一维向量，higher 方法
   ;; np.percentile(a, 40, interpolation='higher') -> 3
   (let ((a (vt-from-sequence '(1 2 3 4 5))))
-    (assert (= (vt-percentile a 40 :interpolation :higher) 3.0d0)))
+    (assert (= (vt-item
+		(vt-percentile a 40 :interpolation :higher))
+	       3.0d0)))
 
   ;; 一维向量，midpoint 方法
   ;; np.percentile(a, 40, interpolation='midpoint') -> 2.5
   (let ((a (vt-from-sequence '(1 2 3 4 5))))
-    (assert (= (vt-percentile a 40 :interpolation :midpoint) 2.5d0)))
+    (assert (= (vt-item
+		(vt-percentile a 40 :interpolation :midpoint))
+	       2.5d0)))
 
   ;; 一维向量，nearest 方法
   ;; np.percentile(a, 40, interpolation='nearest') -> 2  (since idx=1.6, frac=0.6 > 0.5 -> upper=2?)
   (let ((a (vt-from-sequence '(1 2 3 4 5))))
-    (assert (= (vt-percentile a 40 :interpolation :nearest) 3.0d0)))  ; idx=1.6, frac=0.6>0.5 => upper=2?
+    (assert (= (vt-item
+		(vt-percentile a 40 :interpolation :nearest))
+	       3.0d0)))  ; idx=1.6, frac=0.6>0.5 => upper=2?
 
   ;; 二维轴向：axis=1，线性
   ;; a = np.arange(30).reshape(5,6)
@@ -836,7 +844,7 @@
   ;; 全局百分位数，标量输入
   ;; np.percentile(np.array(42), 50) -> 42.0
   (let ((a (vt-const '() 42 :type 'double-float)))  ; 标量张量
-    (assert (= (vt-percentile a 50) 42.0d0)))
+    (assert (= (vt-item (vt-percentile a 50)) 42.0d0)))
 
   (format t "vt-percentile tests passed.~%")
   )
@@ -2052,7 +2060,7 @@
     ;; np: a = np.arange(20).reshape(4,5); a.take(0)  => np.int64(0)
     ;; ================================================================
     (let ((result (vt-take m 0)))
-      (assert (= result 0)
+      (assert (= (vt-item result) 0)
               () "take(0) failed: expected 0, got ~a" result))
 
     ;; ================================================================
