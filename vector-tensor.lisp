@@ -1276,15 +1276,13 @@
 		 res-offset 
 		 (if res-idx (vt-offset res-idx) 0) 
 		 0))
-      ;; (if (and is-global-reduction (not keepdims))
-      ;;     (let ((final-val (aref res-data res-offset)))
-      ;;       (if return-arg
-      ;; 		(values final-val (aref res-idx-data (vt-offset res-idx)))
-      ;; 		final-val))
+      (if (and is-global-reduction (not keepdims))
+          (let ((final-val (aref res-data res-offset)))
+            (if return-arg
+		(values final-val (aref res-idx-data (vt-offset res-idx)))
+		final-val))
           ;; 其余情况（轴向归约，或 keepdims=t），均返回 vt 结构体
-      (values res res-idx))))
-;;)
-
+      (values res res-idx)))))
 
 (defun vt-matmul (a b)
   "矩阵乘法，兼容 1d 向量（对标 numpy 的 @ 运算符）。"
