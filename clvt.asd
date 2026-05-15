@@ -15,6 +15,4 @@
 	       (:file "compatible-functions")
 	       (:file "activation")
 	       (:file "loss-probability")
-	       (:file "linalg-basic")
-	       (:file "linalg-solve")
-	       (:file "linalg-advanced")))
+	       (:file "linalg")))

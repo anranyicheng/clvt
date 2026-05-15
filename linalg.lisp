@@ -1,4 +1,189 @@
 (in-package :clvt)
+;;; 1. 基础操作
+
+(defun vt-dot (a b) 
+  "点积/内积，支持任意维度： 
+   - 若 a,b 均为 1d → 向量内积，返回数字。 
+   - 若 a 为 2d, b 为 1d → 矩阵乘向量，返回 1d 向量。 
+   - 若 a 为 1d, b 为 2d → 向量乘矩阵，返回 1d 向量。 
+   - 若 a,b 均为 2d → 矩阵乘法 a @ b。 
+   - 若 a,b 秩均 ≥2 → 批量矩阵乘法 '...ij,...jk->...ik'。 
+   其他情况请直接使用 vt-einsum。"
+  (with-float-safe
+    (let ((ra (length (vt-shape a))) 
+          (rb (length (vt-shape b)))) 
+      (cond ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b)) 
+            ;; === 新增以下两个分支 ===
+            ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b)) 
+            ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b)) 
+            ;; ==========================
+            ((and (= ra 2) (= rb 2)) (vt-einsum "ij,jk->ik" a b)) 
+            ((and (>= ra 2) (>= rb 2)) (vt-einsum "...ij,...jk->...ik" a b)) 
+            (t (error "vt-dot: unsupported dimensions (a: ~d, b: ~d).
+                     use vt-einsum directly." ra rb))))))
+
+(defun vt-outer (a b &key (flatten t))
+  "计算张量外积。
+   flatten = t (默认)
+    : 先将输入展平为一维向量，再计算外积，返回二维矩阵。
+      完全兼容 numpy 的 outer 函数 (支持任意维度输入自动展平)。
+   flatten = nil
+    : 保留输入的每个轴，将所有轴拼接形成新张量。
+      例如 2d 与 3d → 5d 张量。
+      等价于 (vt-einsum \"... ,...-> ... ...\"
+       无法使用的替代显式下标写法)。"
+  (with-float-safe
+    (if flatten
+	(let ((flat-a (vt-flatten a))
+              (flat-b (vt-flatten b)))
+          (vt-einsum "i,j->ij" flat-a flat-b))
+	(vt-einsum "...i,...j->...ij" a b))))
+
+(defun vt-trace (matrix)
+  "矩阵迹: 对角线元素之和"
+  (with-float-safe
+    (vt-sum (vt-diagonal matrix))))
+
+(defun vt-norm (vt &key (axis nil))
+  "l2 范数 (欧几里得范数)"
+  (with-float-safe
+    (let ((sq (vt-square vt)))
+      (if axis
+          (vt-sqrt (vt-sum sq :axis axis))
+          (vt-sqrt (vt-sum sq))))))
+
+(defun vt-l1-norm (vt &key (axis nil))
+  "l1 范数"
+  (with-float-safe
+    (if axis
+	(vt-sum (vt-abs vt) :axis axis)
+	(vt-sum (vt-abs vt)))))
+
+(defun vt-frobenius-norm (matrix)
+  "frobenius 范数 (专用于矩阵)"
+  (with-float-safe
+    (vt-norm matrix)))
+
+;;; 2. 方程求解与矩阵分析
+
+(defun ensure-contiguous-2d-vt (vt)
+  "确保矩阵在内存中是连续的."
+  (with-float-safe
+    (if (vt-contiguous-p vt)
+	vt
+	(vt-contiguous vt))))
+
+;;; 部分选主元 lu 分解 (返回 p, l, u，使 p*a = l*u)
+(defun vt-lu (matrix)
+  "lu 分解。返回 (p, l, u)，其中 p 为置换矩阵（由行交换向量表示）。"
+  (with-float-safe
+    (let* ((a (ensure-contiguous-2d-vt matrix))
+           (n (first (vt-shape a)))
+           (lu (vt-copy a))          ; 原地存储 l+u
+           (piv (loop for i from 0 below n collect i)) ; 行交换记录
+           (sign 1))
+      (unless (eq (vt-element-type matrix) 'double-float)
+	(setf lu (vt-astype lu 'double-float)))
+      (loop for k from 0 below n
+            for max-row = k
+            for max-val = (abs (vt-ref lu k k))
+            do (loop for i from (1+ k) below n
+                     for abs-a = (abs (vt-ref lu i k))
+                     when (> abs-a max-val)
+                       do (setf max-val abs-a max-row i))
+               (when (zerop max-val)
+		 (error "矩阵奇异，无法进行 lu 分解"))
+               ;; 交换行
+               (unless (= max-row k)
+		 (rotatef (nth k piv) (nth max-row piv))
+		 (setf sign (- sign))
+		 (loop for j from 0 below n
+                       do (rotatef (vt-ref lu k j)
+				   (vt-ref lu max-row j))))
+               ;; 消元
+               (let ((pivot (vt-ref lu k k)))
+		 (loop for i from (1+ k) below n
+                       for multiplier = (/ (vt-ref lu i k) pivot)
+                       do (setf (vt-ref lu i k) multiplier)
+                          (loop for j from (1+ k) below n
+				do (decf (vt-ref lu i j)
+					 (* multiplier (vt-ref lu k j)))))))
+      (values lu piv sign))))
+
+(defun vt-det (matrix)
+  "基于 lu 分解计算行列式。"
+  (with-float-safe
+    (multiple-value-bind (lu piv sign)
+	(vt-lu matrix)
+      (declare (ignore piv))
+      (let ((n (first (vt-shape lu)))
+            (det sign))
+	(dotimes (i n)
+          (setf det (* det (vt-ref lu i i))))
+	det))))
+
+(defun vt-solve (a b)
+  "求解线性方程组 ax = b（支持多右端项）。"
+  (with-float-safe
+    (let* ((a (ensure-contiguous-2d-vt a))
+           (b-vt (ensure-vt b))
+           (n (first (vt-shape a)))
+           (nrhs (if (> (length (vt-shape b-vt)) 1)
+                     (second (vt-shape b-vt))
+                     1))
+           (b-copy (if (= nrhs 1)
+                       (vt-reshape (vt-copy b-vt) (list n 1))
+                       (vt-copy b-vt))))
+      (unless (eq (vt-element-type b-copy) 'double-float)
+	(setf b-copy (vt-astype b-copy 'double-float)))
+      (multiple-value-bind (lu piv sign)
+	  (vt-lu a)
+	(declare (ignore sign))
+	
+	;; ==========================================
+	;; 1. 应用行置换 pb
+	;; cltv的piv语义：最终lu的第i行 = 原始a的第piv[i]行
+	;; 所以 pb 的第 i 行 = 原始 b 的第 piv[i] 行
+	;; ==========================================
+	(let ((orig-b (vt-copy b-copy)))
+          (loop for i from 0 below n
+		do (loop for j from 0 below nrhs
+			 do (setf (vt-ref b-copy i j)
+                                  (vt-ref orig-b (nth i piv) j)))))
+	
+	;; 2. 前代
+	(loop for k from 0 below n
+              do (loop for i from (1+ k) below n
+                       for multiplier = (vt-ref lu i k)
+                       do (loop for j from 0 below nrhs
+				do (decf (vt-ref b-copy i j)
+					 (* multiplier (vt-ref b-copy k j))))))
+	
+	;; 3. 回代
+	(loop for k from (1- n) downto 0
+              do (loop for j from 0 below nrhs
+                       do (setf (vt-ref b-copy k j)
+				(/ (vt-ref b-copy k j)
+                                   (vt-ref lu k k))))
+		 (loop for i from 0 below k
+                       for factor = (vt-ref lu i k)
+                       do (loop for j from 0 below nrhs
+				do (decf (vt-ref b-copy i j)
+					 (* factor (vt-ref b-copy k j))))))
+	
+	(if (= nrhs 1)
+            (vt-reshape b-copy (list n))
+            b-copy)))))
+
+(defun vt-inv (matrix)
+  "矩阵求逆。"
+  (with-float-safe
+    (let* ((n (first (vt-shape matrix)))
+           (identity (vt-eye n :type (vt-element-type matrix))))
+      (vt-solve matrix identity))))
+
+
+;;; 3. 矩阵分解
 
 (defun vt-qr (matrix &key (mode :reduced))
   "矩阵 qr 分解。
@@ -185,6 +370,21 @@
                       ((< m n)
                        (values u-k s-vt vt))))))))))))
 
+(defun vt-matrix-rank (matrix &optional (tol 1e-10))
+  "计算矩阵的秩 (线性代数定义：线性无关的行/列数)。
+   基于 svd 分解，统计大于 tol 的奇异值个数。
+   等价于 numpy.linalg.matrix_rank。"
+  (assert (= 2 (length (vt-shape matrix))) 
+          (matrix) "vt-matrix-rank requires a 2d tensor")
+  (with-float-safe
+    (multiple-value-bind (u s vt) (vt-svd matrix :full-matrices nil)
+      (declare (ignore u vt))
+      (let ((rank 0)
+            (s-data (vt-data s)))
+        (dotimes (i (vt-size s))
+          (when (> (aref s-data i) tol)
+            (incf rank)))
+        rank))))
 
 (defun extend-orthogonal-basis (u-econ &key (rng *vt-default-random-state*))
   "将 m×k 的 u_econ 通过随机向量 + gram-schmidt 补全为 m×m 正交矩阵。"

@@ -894,7 +894,7 @@
       (loop for d in dest-shape
             for s in (vt-strides dest)
             when (and (> d 1) (zerop s))
-              do (error "vt-copy-into: 目标张量 dest 包含 0 步长的广播维度 (大小为 ~a)，无法安全写入各异的数据。" d))
+              do  (error "vt-copy-into: Assignment destination is read-only: 无法对广播产生的视图 (含有大小为 ~a 的广播维度) 进行赋值。若需修改，请先对源张量进行操作或使用 (vt-copy) 生成独立副本。" d))
       (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
         (unless (equal final-shape dest-shape)
           (error "copy-into 失败: dest 形状 ~a 无法容纳 src 广播后的形状 ~a"
