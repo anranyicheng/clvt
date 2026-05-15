@@ -372,19 +372,68 @@
 
 (defun vt-matrix-rank (matrix &optional (tol 1e-10))
   "计算矩阵的秩 (线性代数定义：线性无关的行/列数)。
-   基于 svd 分解，统计大于 tol 的奇异值个数。
+   基于带部分选主元的高斯消元法，统计非零主元的数量。
    等价于 numpy.linalg.matrix_rank。"
   (assert (= 2 (length (vt-shape matrix))) 
-          (matrix) "vt-matrix-rank requires a 2d tensor")
+          (matrix) "vt-matrix-rank requires a 2D tensor")
   (with-float-safe
-    (multiple-value-bind (u s vt) (vt-svd matrix :full-matrices nil)
-      (declare (ignore u vt))
-      (let ((rank 0)
-            (s-data (vt-data s)))
-        (dotimes (i (vt-size s))
-          (when (> (aref s-data i) tol)
-            (incf rank)))
-        rank))))
+    (let* ((m (first (vt-shape matrix)))
+           (n (second (vt-shape matrix)))
+           ;; 复制一份，避免破坏原矩阵
+           (a (vt-astype matrix 'double-float))
+           (a-data (vt-data a))
+           (a-offset (vt-offset a))
+           (s0 (first (vt-strides a))) ; 行步长
+           (s1 (second (vt-strides a))); 列步长
+           (rank 0)
+           (row 0))
+      ;; 从第一列到最后一列进行消元
+      (loop for col from 0 below n
+            while (< row m) do
+        ;; 1. 在当前列及以下的行中，寻找绝对值最大的主元 (部分选主元)
+        (let ((max-val 0.0d0)
+              (max-row row))
+          (loop for i from row below m
+                for val = (abs (aref a-data (+ a-offset
+					       (* i s0)
+					       (* col s1))))
+                when (> val max-val)
+                do (setf max-val val max-row i))
+          
+          ;; 2. 判断主元是否足够大 (大于容差 tol)
+          (if (> max-val tol)
+              (progn
+                (incf rank)
+                ;; 3. 如果最大主元不在当前行，则交换行
+                (unless (= max-row row)
+                  (loop for j from col below n
+                        for off1 = (+ a-offset (* row s0) (* j s1))
+                        for off2 = (+ a-offset (* max-row s0) (* j s1))
+                        do (rotatef (aref a-data off1) (aref a-data off2))))
+                ;; 4. 消元：将当前列下方的元素清零
+                (let ((pivot (aref a-data (+ a-offset
+					     (* row s0)
+					     (* col s1)))))
+                  (loop for i from (1+ row) below m
+                        for multiplier = (/ (aref a-data (+ a-offset (* i s0)
+							    (* col s1)))
+					    pivot)
+                        do (loop for j from (1+ col) below n
+                                 for off-target = (+ a-offset (* i s0) (* j s1))
+                                 for off-source = (+ a-offset (* row s0) (* j s1))
+                                 do (decf (aref a-data off-target)
+					  (* multiplier (aref a-data off-source)))))
+                  ;; 物理上将下方元素置零，保证数值干净
+                  (loop for i from (1+ row) below m
+                        do (setf (aref a-data (+ a-offset (* i s0)
+						 (* col s1)))
+				 0.0d0)))
+                ;; 5. 处理下一行
+                (incf row))
+              ;; 如果主元太小，说明该列线性相关，跳过该列，继续看下一列
+              nil)))
+      rank)))
+
 
 (defun extend-orthogonal-basis (u-econ &key (rng *vt-default-random-state*))
   "将 m×k 的 u_econ 通过随机向量 + gram-schmidt 补全为 m×m 正交矩阵。"

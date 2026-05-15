@@ -216,6 +216,7 @@
    :vt-diagonal
    :vt-qr
    :vt-svd
+   :vt-matrix-rank
 
    ;; 激活函数
    :vt-sigmoid
@@ -261,7 +262,10 @@
    :vt-float-neg-inf-p
    :vt-float-inf-=
    :vt-float-nan-inf-=
-
+   :+vt-float-nan+
+   :+vt-float-pos-inf+
+   :+vt-float-neg-inf+
+   
    ;; 核心迭代与映射
    :vt-map
    :vt-do-each

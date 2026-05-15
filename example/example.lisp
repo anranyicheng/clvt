@@ -4429,7 +4429,36 @@
   )
 
 
-
+(defun test-vt-matrix-rank ()
+  "测试 vt-matrix-rank 函数的三种典型情况"
+  (format t "~%--- Testing vt-matrix-rank ---~%")
+  
+  ;; 测试 1: 满秩方阵 (3x3 单位矩阵，秩应为 3)
+  (let* ((mat1 (vt-eye 3))
+         (rank1 (vt-matrix-rank mat1)))
+    (assert (= rank1 3) (rank1)
+            "Test 1 Failed: 3x3 Identity matrix should have rank 3, got ~a" rank1)
+    (format t "Test 1 Passed: 3x3 Identity matrix rank = ~a~%" rank1))
+  
+  ;; 测试 2: 亏秩方阵 (3x3 矩阵，第二行是第一行的2倍，秩应为 2)
+  (let* ((mat2 (vt-from-sequence '((1 2 3) 
+                                   (2 4 6) 
+                                   (7 8 9))))
+         (rank2 (vt-matrix-rank mat2)))
+    (assert (= rank2 2) (rank2)
+            "Test 2 Failed: Matrix with proportional rows should have rank 2, got ~a" rank2)
+    (format t "Test 2 Passed: Rank-deficient matrix rank = ~a~%" rank2))
+  
+  ;; 测试 3: 满秩矩形矩阵 (2x4 宽矩阵，最大可能秩为 2)
+  (let* ((mat3 (vt-from-sequence '((1 2 3 4) 
+                                   (5 6 7 8))))
+         (rank3 (vt-matrix-rank mat3)))
+    (assert (= rank3 2) (rank3)
+            "Test 3 Failed: 2x4 full-rank matrix should have rank 2, got ~a" rank3)
+    (format t "Test 3 Passed: 2x4 rectangular matrix rank = ~a~%" rank3))
+  
+  (format t "--- All vt-matrix-rank tests passed! ---~%")
+  t)
 
 
 
@@ -4528,6 +4557,7 @@
   (test-vt-var-std)
   (test-vt-rot90)
   (test-vt-copy-into)
+  (test-vt-matrix-rank)
   (format t "~&~%all test passed")
 )
 
