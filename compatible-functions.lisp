@@ -355,7 +355,7 @@
               finally (return result))))))
 
 (defun vt-rotate (tensor angle &key (center nil) (order 1) (cval 0.0))
-   "将二维张量按指定角度旋转（对标 scipy.ndimage.rotate）。
+  "将二维张量按指定角度旋转（对标 scipy.ndimage.rotate）。
    
    **旋转中心**：
    - 默认 center = NIL，旋转中心位于张量的几何中心，即 (rows/2, cols/2)。
@@ -697,7 +697,7 @@
             整数表示沿指定轴插入。"
   (with-float-safe
     (let* ((arr-vt (ensure-vt arr))
-          (values-vt (ensure-vt values :type (vt-element-type arr-vt))))
+           (values-vt (ensure-vt values :type (vt-element-type arr-vt))))
       (if (null axis)
           ;; ---------- 展平模式 ----------
           (let* ((flat-arr (vt-flatten arr-vt))
@@ -1004,13 +1004,13 @@
                (vals (vt-numpy-sort (loop for i below size
 					  collect (aref (vt-data flat) i))
 				    #'<)))
-	   (if (oddp size)
-               (make-vt nil (coerce (nth (floor size 2) vals) 'double-float)
-			:type 'double-float)
-            (make-vt nil (/ (+ (coerce (nth (1- (floor size 2)) vals) 'double-float)
-                               (coerce (nth (floor size 2) vals) 'double-float))
-                            2.0d0)
-                     :type 'double-float))))))
+	  (if (oddp size)
+              (make-vt nil (coerce (nth (floor size 2) vals) 'double-float)
+		       :type 'double-float)
+              (make-vt nil (/ (+ (coerce (nth (1- (floor size 2)) vals) 'double-float)
+				 (coerce (nth (floor size 2) vals) 'double-float))
+                              2.0d0)
+                       :type 'double-float))))))
 
 
 (defun percent-from-sorted (sorted q interpolation)
@@ -1122,7 +1122,7 @@
             (progn
               ;; 检查是否包含非有限值
               (let ((finite-check (vt-all (vt-isfinite tensor))))
-		  (unless (= (vt-item finite-check) 1.0d0)
+		(unless (= (vt-item finite-check) 1.0d0)
                   (error "automatic bin range determination requires finite input.~
                        ~%  please provide explicit 'range' argument, or remove nan/inf values.")))
               ;; 数据全为有限值，安全地计算最小最大值
@@ -2480,7 +2480,7 @@
                              (+ low (random range rng)))
                            (vt-zeros size :type type))
                    type)
-	 (make-vt nil (+ low (random range rng)) :type type))))
+	(make-vt nil (+ low (random range rng)) :type type))))
 
 (defun vt-random-integers (low high &key (size nil) (type 'fixnum)
 				      (rng *vt-default-random-state*))
