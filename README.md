@@ -130,7 +130,6 @@ vt-nbytes
 vt-contiguous-p
 vt-shape-to-size
 vt-compute-strides
-vt-compute-logical-strides
 
 ;; 张量创建
 vt-zeros

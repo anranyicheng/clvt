@@ -1141,19 +1141,6 @@
     (when (or (< real-axis 0) (>= real-axis rank))
       (error "axis ~a 越界,张量秩为 ~a" axis rank))))
 
-(defun vt-compute-logical-strides (shape)
-  "计算逻辑步长(用于计算扁平化索引).
-   例如 shape (3 4) -> strides (4 1).
-   这意味着第0轴每走一步,线性索引+4；第1轴每走一步,线性索引+1."
-  (if (null shape)
-      nil
-      (loop with rank = (length shape)
-            with strides = (make-list rank)
-            for i from (1- rank) downto 0
-            for acc = 1 then (* acc (nth (1+ i) shape))
-            do (setf (nth i strides) acc)
-            finally (return strides))))
-
 (declaim (inline get-reduction-identity))
 (defun get-reduction-identity (op element-type)
   "根据操作类型和元素类型,返回正确的初始值."
