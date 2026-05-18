@@ -147,7 +147,7 @@
 	;; 重塑并广播相乘，最后 reshape 到目标形状
 	(let ((a-reshaped (vt-reshape a a-new-shape))
               (b-reshaped (vt-reshape b b-new-shape)))
-          (vt-reshape (vt-* a-reshaped b-reshaped) final-shape))))))
+          (vt-view (vt-* a-reshaped b-reshaped) final-shape))))))
 
 (defun vt-from-function (shape fn &key (type 'double-float))
   "根据函数创建数组.
@@ -231,18 +231,14 @@
   "将多维数组降为一维(返回副本).
   vt: 输入张量
   返回: 一维张量"
-  (vt-reshape vt (list (vt-size vt))))
+  (vt-view (vt-copy vt) (list (vt-size vt))))
 
 (defun vt-ravel (vt)
   "返回展平后的视图(尽量不复制数据).
   如果输入是连续的,返回视图；否则返回副本."
   (if (vt-contiguous-p vt)
       ;; 连续内存:直接创建视图
-      (%make-vt :data (vt-data vt)
-                :shape (list (vt-size vt))
-                :strides '(1)
-                :offset (vt-offset vt)
-		:etype (vt-element-type vt))
+      (vt-view vt (list (vt-size vt)))
       ;; 非连续:创建副本
       (vt-flatten vt)))
 
@@ -540,7 +536,7 @@
               do (let ((parts (loop repeat rep collect result)))
                    (setf result (apply #'vt-concatenate axis parts))))
       ;; 最终形状
-      (vt-reshape result (mapcar #'* padded-sh padded-reps)))))
+      (vt-view result (mapcar #'* padded-sh padded-reps)))))
 
 ;;; ===========================================
 ;;; 3. 数组连接与分割

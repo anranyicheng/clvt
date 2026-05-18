@@ -493,6 +493,22 @@
         (vt-copy-into new-vt vt)
         new-vt)))
 
+(defun vt-view (vt new-shape)
+  "零拷贝重塑视图。对标 PyTorch 的 tensor.view()。
+  要求输入张量必须是内存连续的，否则报错。
+  用于确保操作不会产生隐式的数据拷贝。"
+  (let ((old-size (vt-shape-to-size (vt-shape vt)))
+        (new-size (vt-shape-to-size new-shape)))
+    (unless (= old-size new-size)
+      (error "view 失败: 元素总数不一致 (旧: ~a, 新: ~a)" old-size new-size))
+    (unless (vt-contiguous-p vt)
+      (error "view 失败: 张量内存不连续! 请先调用 或使用 柔性重塑。"))
+    (%make-vt :data (vt-data vt)
+              :shape new-shape
+              :strides (vt-compute-strides new-shape)
+              :offset (vt-offset vt)
+              :etype (vt-element-type vt))))
+
 (defun vt-reshape (vt new-shape)
   "重塑形状.
    如果张量是连续的,则创建视图(零拷贝)；

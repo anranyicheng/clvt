@@ -156,6 +156,7 @@ vt-to-array
 vt-astype
 
 ;; 形状操作与视图
+vt-view
 vt-reshape
 vt-transpose
 vt-squeeze
