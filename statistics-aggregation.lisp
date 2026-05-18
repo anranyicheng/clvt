@@ -124,7 +124,9 @@
                       (the fixnum (reduce #'* shape)))))
       ;; 避免除以 0
       (when (= count 0)
-	(return-from vt-mean (vt-zeros nil :type element-type)))
+	(return-from vt-mean
+          (vt-map (lambda (s) (declare (ignore s)) +vt-float-nan+)
+		  sum-result)))
       ;; 执行除法
       (vt-map (lambda (s)
 		(/ s (coerce count element-type)))

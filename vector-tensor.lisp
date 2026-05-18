@@ -820,6 +820,8 @@
          (data (vt-data vt))
          (flat-idx (vt-offset vt)))
     (declare (type fixnum flat-idx))
+    (when (zerop (vt-size vt))
+      (error "Cannot index into an empty tensor (size 0)"))
     ;; 平行遍历索引、维度和步长，累加物理偏移
     (loop for idx in indices
           for dim in shape
@@ -961,9 +963,8 @@
 
 (declaim (inline vt-broadcast-shapes))
 (defun vt-broadcast-shapes (shape1 shape2)
-  "计算广播结果形状."
-  (declare (list shape1 shape2)
-	   (optimize (speed 3)))
+  "计算广播结果形状，严格对标 NumPy 规范（完美支持 0 尺寸维度）。"
+  (declare (list shape1 shape2) (optimize (speed 3)))
   (let ((len1 (length shape1))
         (len2 (length shape2))
         (result '()))
@@ -971,11 +972,13 @@
     (loop for i fixnum from 1 to (max len1 len2)
           for dim1 fixnum = (if (<= i len1) (nth (- len1 i) shape1) 1)
           for dim2 fixnum = (if (<= i len2) (nth (- len2 i) shape2) 1)
-          do (cond ((= dim1 dim2) (push dim1 result))
-                   ((or (= dim1 1) (= dim2 1))
-		    (push (max dim1 dim2) result))
-                   (t (error "形状 ~a 和 ~a 无法进行广播" shape1 shape2))))
+          do (cond ((= dim1 dim2) (push dim1 result)) ;; 规则1: 相等则取其一 (0=0 -> 0)
+                   ((= dim1 1) (push dim2 result))    ;; 规则2: dim1为1，取dim2 (1,0->0; 1,3->3)
+                   ((= dim2 1) (push dim1 result))    ;; 规则2: dim2为1，取dim1 (0,1->0; 3,1->3)
+                   (t (error "形状 ~a 和 ~a 无法进行广播，维度 ~a 和 ~a 不兼容" 
+                             shape1 shape2 dim1 dim2)))) ;; 规则3: 其他报错 (0,3报错)
     (the list result)))
+
 
 
 (declaim (inline vt-broadcast-strides))
@@ -1244,9 +1247,25 @@
 			   if (= i real-axis)
 			     collect 1
 			   else collect 0))
-		 (make-list rank :initial-element 0))))      
+		 (make-list rank :initial-element 0)))
+	   (axis-size
+	     (if real-axis
+                 (the fixnum (nth real-axis in-shape))
+                 (the fixnum (reduce #'* in-shape :initial-value 1)))))      
       (declare (type (simple-array * (*)) in-data res-data)
                (type list out-strides-map in-strides arg-strides in-shape))
+      ;; 当归约轴大小为 0 时，直接根据操作类型填充默认值返回，不进入递归
+      (when (zerop axis-size)
+        (let ((empty-result-val
+                ;; 遵循 pytorch 规范：sum为0，max/min为nan
+                (cond ((eq init-val 0) (coerce 0 element-type)) ; sum 操作
+                      ((or (eq init-val most-positive-double-float)
+                           (eq init-val most-negative-double-float))
+                       (vt-float-nan)) ; max/min 操作返回 nan
+                      (t (coerce init-val element-type))))) ; 其他操作保守返回初始值
+          (return-from vt-reduce
+            (values (make-vt out-shape empty-result-val :type element-type)
+                    (when return-arg (make-vt out-shape 0 :type 'fixnum))))))
       (labels
 	  ((recurse (depth in-ptr out-ptr out-idx-ptr current-arg-val)
              (declare (type fixnum depth in-ptr out-ptr out-idx-ptr
@@ -1375,70 +1394,64 @@
 		(if (>= a b) true-result false-result))
 	      t1 t2))))
 
-(defun vt-where (condition &optional x y)
-  "numpy 风格的 where 函数.
-   模式 1 (查找索引): (vt-where condition)
-     返回满足条件的索引.返回一个张量列表,每个张量对应一个维度的索引.
-     示例: (vt-where cond) -> (list rows-tensor cols-tensor ...)
-   模式 2 (三元选择): (vt-where condition x y)
-     根据 condition 从 x 或 y 中选择元素.支持广播.
-     示例: (vt-where cond t1 t2) -> 新张量"
-  (with-float-safe
-    (cond
-      ;; === 模式 2: 三元选择 (condition, x, y) ===
-      ((and x y)
-       (vt-map (lambda (c val-x val-y)
-		 (if (/= c 0) val-x val-y))
-               condition x y))    
-      ;; === 模式 1: 查找索引 ===
-      ((and (not x) (not y))
-       (let* ((shape (vt-shape condition))
-              (rank (length shape))
-              (data (vt-data condition))
-              (strides (vt-strides condition))
-              (offset (vt-offset condition))
-              ;; 为每个维度准备一个动态数组收集索引
-              (buffers
-		(loop for i from 0 below rank
-                      collect (make-array 0 :element-type 'fixnum 
-                                            :fill-pointer t 
-                                            :adjustable t))))
-	 
-	 (declare (type (simple-array double-float (*)) data)
-                  (type list shape strides buffers))       
-	 (labels
-	     ((recurse (depth current-ptr coords)
-		(declare (type fixnum depth current-ptr))
-		(if (= depth rank)
-                    ;; 叶节点:如果非零,记录坐标
-                    (when (/= (aref data current-ptr) 0.0d0)
-                      (loop for c in coords
-                            for buf in buffers
-                            do (vector-push-extend c buf)))                      
-                    ;; 递归层
-                    (let ((dim (nth depth shape))
-                          (stride (nth depth strides)))
-                      (declare (type fixnum dim stride))
-                      (loop for i fixnum from 0 below dim do
-			(recurse (1+ depth)
-				 (+ current-ptr (* i stride))
-				 (append coords (list i))))))))
-           (recurse 0 offset nil))
-	 ;; 将收集到的索引数组转换为张量列表
-	 (loop for buf in buffers
-               collect (let* ((len (length buf))
-                              (final-data (make-array
-					   len :element-type 'fixnum)))
-			 (loop for i from 0 below len
-                               for idx across buf
-                               do (setf (aref final-data i) idx))
-			 (%make-vt :data final-data
-                                   :shape (list len)
-                                   :strides '(1)
-                                   :offset 0
-				   :etype (array-element-type final-data))))))    
-      (t (error "vt-where 参数错误: 必须只传入 condition,或者同时传入 condition, x, y")))))
-
+(defun vt-where (condition x y)
+  "三元条件选择，对标 PyTorch 的 torch.where 和 NumPy 的 np.where(cond, x, y)。
+   根据 condition 的元素真假，从 x 或 y 中选择对应元素组成新张量。
+   condition, x, y 会自动广播到同一形状。
+   注意：如需查找非零元素的索引，请使用 vt-nonzero"
+  (with-float-safe    
+    ;; 统一转换为张量
+    (setf condition (if (numberp condition)
+			(ensure-vt condition)
+			condition))
+    (setf x (if (numberp x) (ensure-vt x) x))
+    (setf y (if (numberp y) (ensure-vt y) y))
+    ;; 计算广播形状和步长
+    (let* ((target-shape (vt-broadcast-shapes
+			  (vt-shape condition)
+                          (vt-broadcast-shapes
+			   (vt-shape x)
+			   (vt-shape y))))
+           (element-type (vt-element-type x)) ; 以 x 的类型为主
+           (result (vt-zeros target-shape :type element-type))
+           (cond-strides
+	     (vt-broadcast-strides
+	      (vt-shape condition) target-shape (vt-strides condition)))
+           (x-strides (vt-broadcast-strides
+		       (vt-shape x) target-shape (vt-strides x)))
+           (y-strides (vt-broadcast-strides
+		       (vt-shape y) target-shape (vt-strides y)))
+           (res-strides (vt-strides result))
+           (rank (length target-shape)))
+      
+      (labels
+	  ((recurse (depth c-ptr x-ptr y-ptr r-ptr)
+             (if (= depth rank)
+		 ;; 叶节点：根据 condition 决定取 x 还是 y
+		 (setf (aref (vt-data result) r-ptr)
+                       (coerce (if (not (zerop (aref (vt-data condition)
+						     c-ptr)))
+                                   (aref (vt-data x) x-ptr)
+                                   (aref (vt-data y) y-ptr))
+                               element-type))
+		 ;; 分支节点：递归遍历
+		 (let ((dim (nth depth target-shape))
+                       (c-stride (nth depth cond-strides))
+                       (x-stride (nth depth x-strides))
+                       (y-stride (nth depth y-strides))
+                       (r-stride (nth depth res-strides)))
+                   (loop for i fixnum from 0 below dim do
+                     (recurse (1+ depth)
+                              (+ c-ptr (* i c-stride))
+                              (+ x-ptr (* i x-stride))
+                              (+ y-ptr (* i y-stride))
+                              (+ r-ptr (* i r-stride))))))))
+	(recurse 0
+		 (vt-offset condition)
+		 (vt-offset x)
+		 (vt-offset y)
+		 (vt-offset result)))
+      result)))
 
 (defun vt-argwhere (condition)
   "查找非零元素的坐标.

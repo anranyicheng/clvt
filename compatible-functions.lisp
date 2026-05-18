@@ -1544,8 +1544,63 @@
               uniq-vt))))))
 
 (defun vt-nonzero (condition)
-  "返回非零元素的索引(已存在 vt-where)"
-  (vt-where condition))
+  "查找张量中非零(真)元素的索引。对标 NumPy 的 np.where(cond) 和
+   PyTorch 的 torch.nonzero(as_tuple=True)。
+   返回一个列表，列表长度等于 condition 的维度数。
+   列表中的每个元素是一个 1D fixnum 张量，包含该维度上的逻辑索引。"
+  (with-float-safe
+    (let* ((condition (if (numberp condition)
+			  (ensure-vt condition)
+			  condition))
+           (shape (vt-shape condition))
+           (rank (length shape))
+           (data (vt-data condition))
+           (offset (vt-offset condition))
+           (in-strides (vt-strides condition))
+           ;; 用于累加计算逻辑一维索引的步长因子
+           (logic-strides (vt-compute-strides shape)) 
+           (nz-indices '())) ; 临时存放非零元素的扁平逻辑索引      
+      ;; 步骤1：遍历找到所有非零元素的逻辑索引
+      (labels ((recurse (depth logic-idx ptr)
+		 (if (= depth rank)
+                     (unless (zerop (aref data ptr))
+                       (push logic-idx nz-indices))
+                     (let ((dim (nth depth shape))
+                           (in-stride (nth depth in-strides))
+                           (logic-stride (nth depth logic-strides)))
+                       (loop for i fixnum from 0 below dim do
+			 (recurse (1+ depth)
+                                  (+ logic-idx (* i logic-stride))
+                                  (+ ptr (* i in-stride))))))))
+	(recurse 0 0 offset))      
+      (setf nz-indices (nreverse nz-indices)) ; 保持发现顺序      
+      ;; 步骤2：构建结果列表
+      (let ((num-nz (length nz-indices)))
+	(if (zerop num-nz)
+            ;; 如果没有非零元素，返回全空 1D 张量列表
+            (loop repeat rank collect (vt-zeros '(0)))
+            ;; 如果有非零元素，将扁平索引拆解为多维坐标
+            (let ((result-arrays
+		    (loop repeat rank
+			  collect
+			  (make-array num-nz :element-type 'fixnum))))
+              (loop
+		for flat-idx in nz-indices
+                for i fixnum from 0
+                do (let ((rem flat-idx))
+		     (loop
+		       for d from 0 below rank
+                       for stride in logic-strides
+                       do (let ((coord (the fixnum (floor rem stride))))
+                            (setf (aref (nth d result-arrays) i) coord)
+                            (decf rem (the fixnum (* coord stride)))))))
+              (loop for arr in result-arrays
+                    collect (%make-vt :data arr
+				      :shape (list num-nz)
+				      :strides '(1)
+				      :offset 0
+				      :etype 'fixnum))))))))
+
 
 (defun vt-extract (condition tensor)
   "根据条件从数组中提取元素"
@@ -2470,6 +2525,9 @@
   返回: 张量"
   (declare (random-state rng))
   (let ((range (- high low)))
+    (assert (>= range 0)
+	    (high low)
+	    "high: ~a less than low: ~a" high low)
     (if size
         (vt-astype (vt-map (lambda (x)
                              (declare (ignore x))

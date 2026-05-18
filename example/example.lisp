@@ -969,15 +969,13 @@
 
   (format t "~%test-vt-argmax-argmin passed.~%"))
 
-;; ============================================================
-;; test-vt-where （三元选择模式与仅条件模式）
-;; ============================================================
-(defun test-vt-where ()
+;; where 的条件模式拆分为 nonzero
+(defun test-vt-nonzero ()
   ;; 模式1：单条件，返回索引列表
   ;; a = np.array([0,1,2,0,3,0])
   ;; np.where(a != 0) -> (array([1,2,4]),)
   (let* ((a (vt-from-sequence '(0 1 2 0 3 0)))
-         (indices (vt-where (vt-> a (vt-const '() 0)))))  ; 条件：a>0
+         (indices (vt-nonzero (vt-> a (vt-const '() 0)))))  ; 条件：a>0
     ;; 对于一维，应返回一个列表，含一个形状 (3,) 的索引张量
     (assert (= (length indices) 1))
     (let ((idx-tensor (first indices)))
@@ -987,10 +985,17 @@
   ;; a = np.array([[1,0],[0,1]])
   ;; np.where(a) -> (array([0,1]), array([0,1]))
   (let* ((a (vt-from-sequence '((1 0) (0 1))))
-         (indices (vt-where a)))   ; 条件就是 a 本身（非零即为真）
+         (indices (vt-nonzero a)))   ; 条件就是 a 本身（非零即为真）
     (assert (= (length indices) 2))
     (assert (equal (vt-to-list (first indices)) '(0 1)))    ; 行索引
     (assert (equal (vt-to-list (second indices)) '(0 1))))  ; 列索引
+
+  (format t "~%test-vt-nonzero passed.~%"))
+  
+;; ============================================================
+;; test-vt-where 三元选择模式
+;; ============================================================
+(defun test-vt-where ()
   ;; a = np.array([1,2,3,4])
   ;; cond = np.array([true, false, true, false]);
   ;; np.where(cond, a, -a)
@@ -4486,6 +4491,7 @@
   (test-vt-sum)
   (test-vt-amax-amin)
   (test-vt-argmax-argmin)
+  (test-vt-nonzero)
   (test-vt-where)
   (test-vt-argwhere)
   (test-vt-meshgrid)
