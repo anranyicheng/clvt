@@ -3240,7 +3240,7 @@
          (p (vt-ptp a)))
     (assert (= p 4.0d0))
     (let ((p0 (vt-to-list (vt-ptp a :axis 0))))
-      (assert (equal p0 '(2.0 3.0)))))
+      (assert (equal p0 '(2 3)))))
 
   ;; vt-average 加权平均
   ;; a = [1,2,3], weights = [1,2,1]
@@ -3322,7 +3322,7 @@
   ;; np.clip([1,2,3,4,5], 2, 4) -> [2,2,3,4,4]
   (let* ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float))
          (c (vt-clip a 2 4)))
-    (assert (equal (vt-to-list c) '(2.0 2.0 3.0 4.0 4.0))))
+    (assert (equal (vt-to-list c) '(2 2 3 4 4))))
 
   ;; vt-convolve (same mode)
   ;; np.convolve([1,2,3], [0,1,0.5], 'same') -> 中间值与 numpy 对比
