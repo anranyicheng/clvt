@@ -1394,6 +1394,13 @@
 		(if (>= a b) true-result false-result))
 	      t1 t2))))
 
+(defun vt-promote-type (&rest types)
+  "推断运算结果类型。对标 NumPy: 只要有浮点数就提升为浮点数"
+  (cond
+    ((member 'double-float types) 'double-float)
+    ((member 'single-float types) 'single-float)
+    (t 'fixnum)))
+
 (defun vt-where (condition x y)
   "三元条件选择，对标 PyTorch 的 torch.where 和 NumPy 的 np.where(cond, x, y)。
    根据 condition 的元素真假，从 x 或 y 中选择对应元素组成新张量。
@@ -1412,7 +1419,8 @@
                           (vt-broadcast-shapes
 			   (vt-shape x)
 			   (vt-shape y))))
-           (element-type (vt-element-type x)) ; 以 x 的类型为主
+	   (element-type (vt-promote-type (vt-element-type x)
+					  (vt-element-type y)))
            (result (vt-zeros target-shape :type element-type))
            (cond-strides
 	     (vt-broadcast-strides
