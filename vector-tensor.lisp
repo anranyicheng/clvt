@@ -4,6 +4,14 @@
   `(sb-int:with-float-traps-masked (:invalid :divide-by-zero)
      ,@body))
 
+(defun fixnump (num)
+  "判断数字是不是fixnum类型"
+  (typep num 'fixnum))
+
+(defun double-float-p (num)
+  "判断数字是不是double-float类型"
+  (typep num 'double-float))
+
 (defstruct (vt (:constructor %make-vt))
   "n维张量结构.
    data: 存储数据的一维简单数组.
@@ -903,9 +911,7 @@
  src: 源张量或标量数字.
  dest: 目标张量视图.
  注意：dest 不能是带有 0 步长的广播视图(维度>1且步长=0)，否则物理上无法写入不同数据。"
-  (when (numberp src)
-    (setf src (ensure-vt src)))
-  
+  (setf src (ensure-vt src))  
   (with-float-safe
     (let ((dest-shape (vt-shape dest))
           (src-shape (vt-shape src))) 
@@ -948,18 +954,28 @@
 
 ;; 快速类型转换
 (declaim (inline ensure-vt))
-(defun ensure-vt (obj &key (type 'double-float))
+(defun ensure-vt (obj &key (type nil))
   (with-float-safe
     (etypecase obj
       (vt obj)
-      (number 
+      (number
+       (if (null type)
+	   (setf type
+		 (cond ((fixnump obj) 'fixnum)
+		       (t 'double-float))))
        (%make-vt :data (make-array 1 :initial-element (coerce obj type)
 				     :element-type type)
                  :shape nil
 		 :strides nil
 		 :offset 0
 		 :etype type))
-      (sequence (vt-from-sequence obj :type type)))))
+      (sequence
+       (if (null type)
+	   (let* ((data (vt-flatten-sequence obj)))
+	     (if (every #'fixnump data)
+		 (setf type 'fixnum)
+		 (setf type 'double-float))))       
+       (vt-from-sequence obj :type type)))))
 
 (declaim (inline vt-broadcast-shapes))
 (defun vt-broadcast-shapes (shape1 shape2)
@@ -1072,7 +1088,8 @@
   (declare (function fn)
            (optimize (safety 0)))
   (with-float-safe
-    (let* ((clean-tensors (mapcar #'ensure-vt tensors))
+    (let* ((clean-tensors
+	     (mapcar #'ensure-vt tensors))
            (n-tensors (length clean-tensors)))
       (when (= n-tensors 0)
         (error "vt-map requires at least one tensor"))
@@ -1107,7 +1124,10 @@
             (if (zerop size)
                 (let ((pt (apply #'vt-promote-type
 			         (mapcar #'vt-element-type clean-tensors))))
-                  (values (if (eq pt 'fixnum) 'fixnum 'double-float) nil))
+                  (values (if (eq pt 'fixnum)
+			      'fixnum
+			      'double-float)
+			  nil))
                 (let* ((first-vals
 			 (loop for k fixnum from 0 below n-tensors
                                collect
@@ -1274,11 +1294,11 @@
     (let* ((in-shape (vt-shape tensor))
            (element-type (vt-element-type tensor))
            (rank (length in-shape))
-	       (real-axis (vt-normalize-axis axis rank))
+	   (real-axis (vt-normalize-axis axis rank))
            (is-global-reduction (null real-axis))
-	       ;; 1. 输出形状
-	       (out-shape
-	         (cond
+	   ;; 1. 输出形状
+	   (out-shape
+	     (cond
                ((and is-global-reduction (not keepdims)) nil)
                (is-global-reduction (make-list rank :initial-element 1))
                ((not keepdims)
@@ -1289,22 +1309,22 @@
                (t (loop for d in in-shape
 			for i from 0
 		        collect (if (= i real-axis) 1 d)))))
-	       ;; 2. 输入属性
-	       (in-data (vt-data tensor))
-	       (in-strides (vt-strides tensor))
-	       (in-offset (vt-offset tensor))           
-	       ;; 3. 索引步长映射 (用于计算 argmax/argmin 的逻辑位置)
-	       (arg-strides
-	         (if return-arg 
-		     (if is-global-reduction
-		         (vt-compute-strides in-shape)
-		         (loop for i from 0 below rank
+	   ;; 2. 输入属性
+	   (in-data (vt-data tensor))
+	   (in-strides (vt-strides tensor))
+	   (in-offset (vt-offset tensor))           
+	   ;; 3. 索引步长映射 (用于计算 argmax/argmin 的逻辑位置)
+	   (arg-strides
+	     (if return-arg 
+		 (if is-global-reduction
+		     (vt-compute-strides in-shape)
+		     (loop for i from 0 below rank
 			   if (= i real-axis) collect 1
-			   else collect 0))
-		     (make-list rank :initial-element 0)))
-	       ;; 4. 归约轴大小
-	       (axis-size
-	         (if real-axis
+			     else collect 0))
+		 (make-list rank :initial-element 0)))
+	   ;; 4. 归约轴大小
+	   (axis-size
+	     (if real-axis
                  (the fixnum (nth real-axis in-shape))
                  (the fixnum (reduce #'* in-shape :initial-value 1)))))      
       
@@ -1360,41 +1380,41 @@
                      (make-list rank :initial-element 0)
                      (loop for i from 0 below rank
                            if (= i real-axis) collect 0
-                           else collect
-                                (let ((out-idx (if keepdims
-						   i
-						   (if (< i real-axis)
-						       i
-						       (1- i)))))
-                                  (nth out-idx (vt-strides res)))))))
+                             else collect
+                                  (let ((out-idx (if keepdims
+						     i
+						     (if (< i real-axis)
+							 i
+							 (1- i)))))
+                                    (nth out-idx (vt-strides res)))))))
 
           (declare (type (simple-array * (*)) res-data)
                    (type list out-strides-map))
 
           ;; 宏消除递归冗余
           (macrolet
-            ((gen-reduce (leaf-body)
-               `(labels
-                    ((recurse (depth in-ptr out-ptr out-idx-ptr current-arg-val)
-                       (declare (type fixnum depth in-ptr out-ptr out-idx-ptr current-arg-val))
-                       (if (= depth rank)
-                           ,leaf-body
-                           (let* ((dim (nth depth in-shape))
-                                  (in-stride (nth depth in-strides))
-                                  (out-stride (nth depth out-strides-map))
-                                  (arg-stride (nth depth arg-strides)))
-                             (declare (type fixnum dim in-stride out-stride arg-stride))
-                             (loop for i fixnum from 0 below dim do
-                               (recurse (1+ depth)
-                                        in-ptr
-                                        out-ptr
-                                        out-idx-ptr
-                                        (+ current-arg-val (* i arg-stride)))
-                               (incf in-ptr in-stride)
-                               (incf out-ptr out-stride)
-                               (when return-arg
-                                 (incf out-idx-ptr out-stride)))))))
-                  (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
+              ((gen-reduce (leaf-body)
+		 `(labels
+                      ((recurse (depth in-ptr out-ptr out-idx-ptr current-arg-val)
+			 (declare (type fixnum depth in-ptr out-ptr out-idx-ptr current-arg-val))
+			 (if (= depth rank)
+                             ,leaf-body
+                             (let* ((dim (nth depth in-shape))
+                                    (in-stride (nth depth in-strides))
+                                    (out-stride (nth depth out-strides-map))
+                                    (arg-stride (nth depth arg-strides)))
+                               (declare (type fixnum dim in-stride out-stride arg-stride))
+                               (loop for i fixnum from 0 below dim do
+				 (recurse (1+ depth)
+                                          in-ptr
+                                          out-ptr
+                                          out-idx-ptr
+                                          (+ current-arg-val (* i arg-stride)))
+				 (incf in-ptr in-stride)
+				 (incf out-ptr out-stride)
+				 (when return-arg
+                                   (incf out-idx-ptr out-stride)))))))
+                    (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
 
             ;; 热路径特化
             (ecase effective-out-type
@@ -1418,10 +1438,10 @@
                       (funcall reducer-fn cur-acc val)
                     (setf (aref (the (simple-array fixnum (*)) res-data) out-ptr)
                           (the fixnum
-                            (if (and (integerp new-acc)
-                                     (<= most-negative-fixnum new-acc most-positive-fixnum))
-                                new-acc
-                                (truncate new-acc))))
+                               (if (and (integerp new-acc)
+					(<= most-negative-fixnum new-acc most-positive-fixnum))
+                                   new-acc
+                                   (truncate new-acc))))
                     (when (and return-arg do-update-idx res-idx-data)
                       (setf (aref (the (simple-array fixnum (*)) res-idx-data) out-idx-ptr)
                             current-arg-val))))))))
@@ -1529,11 +1549,9 @@
    注意：如需查找非零元素的索引，请使用 vt-nonzero"
   (with-float-safe    
     ;; 统一转换为张量
-    (setf condition (if (numberp condition)
-			(ensure-vt condition)
-			condition))
-    (setf x (if (numberp x) (ensure-vt x) x))
-    (setf y (if (numberp y) (ensure-vt y) y))
+    (setf condition (ensure-vt condition))
+    (setf x (ensure-vt x))
+    (setf y (ensure-vt y))
     ;; 计算广播形状和步长
     (let* ((target-shape (vt-broadcast-shapes
 			  (vt-shape condition)

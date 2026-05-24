@@ -1601,7 +1601,6 @@
 				      :offset 0
 				      :etype 'fixnum))))))))
 
-
 (defun vt-extract (condition tensor)
   "根据条件从数组中提取元素"
   (with-float-safe
@@ -1614,7 +1613,8 @@
       (loop for i from 0 below size
             when (/= (aref cond-data i) 0)
               do (push (aref tensor-data i) result-list))
-      (vt-from-sequence (nreverse result-list)))))
+      (vt-from-sequence (nreverse result-list)
+			:type (vt-element-type tensor)))))
 
 (defun vt-searchsorted (tensor values &key side)
   "在有序数组中查找插入点"
