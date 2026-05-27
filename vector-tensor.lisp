@@ -1091,23 +1091,20 @@
                     (vt-offset ,result-vt)))))))
 
 (defun vt-map (fn &rest tensors)
-  "高效映射函数.
+   "高效映射函数.
    支持标量、列表、张量混合输入.
    特性:自动类型转换、广播、指针算术优化、双目运算内联
-   极致优化：试探性推断输出类型与布尔语义，热路径对写入零分支特化。
+   极致优化：试探性推断输出类型与布尔语义，统一遍历骨架，将类型分发延迟到叶子节点
    输入读取不再做类型强转假设，彻底杜绝跨类型内存乱读。"
-  (declare (function fn)
-           (optimize (safety 0)))
+  (declare (function fn) (optimize (safety 0)))
   (with-float-safe
-    (let* ((clean-tensors
-	     (mapcar #'ensure-vt tensors))
+    (let* ((clean-tensors (mapcar #'ensure-vt tensors))
            (n-tensors (length clean-tensors)))
       (when (= n-tensors 0)
         (error "vt-map requires at least one tensor"))
       
-      (let* ((out-shape
-	       (reduce #'vt-broadcast-shapes
-		       (mapcar #'vt-shape clean-tensors)))
+      (let* ((out-shape (reduce #'vt-broadcast-shapes
+				(mapcar #'vt-shape clean-tensors)))
              (rank (length out-shape))
              (size (vt-shape-to-size out-shape))
              (ins-data (map 'vector #'vt-data clean-tensors))
@@ -1115,7 +1112,9 @@
              (ins-strides
 	       (map 'vector (lambda (vt)
 			      (vt-broadcast-strides
-			       (vt-shape vt) out-shape (vt-strides vt)))
+			       (vt-shape vt)
+			       out-shape
+			       (vt-strides vt)))
 		    clean-tensors))
              (cur-ptrs (make-array n-tensors :element-type 'fixnum
 					     :initial-element 0)))
@@ -1125,16 +1124,16 @@
                  (type list out-shape)
                  (type fixnum rank n-tensors size))
         
-        (loop for i fixnum from 0 below n-tensors
-              do (setf (aref cur-ptrs i) (aref ins-offs i)))
+        (loop for i fixnum from 0 below n-tensors do
+          (setf (aref cur-ptrs i) (aref ins-offs i)))
         
-        ;; ==============================================================
-        ;; 阶段 1：冷路径 - 试探性执行、类型与布尔语义推断
-        ;; ==============================================================
+        ;; ==============================================================      
+        ;; 阶段 1：冷路径 - 试探性推断累加器类型
+        ;; ==============================================================      
         (multiple-value-bind (effective-out-type is-boolean-fn)
             (if (zerop size)
                 (let ((pt (apply #'vt-promote-type
-			         (mapcar #'vt-element-type clean-tensors))))
+				 (mapcar #'vt-element-type clean-tensors))))
                   (values (if (eq pt 'fixnum)
 			      'fixnum
 			      'double-float)
@@ -1142,129 +1141,116 @@
                 (let* ((first-vals
 			 (loop for k fixnum from 0 below n-tensors
                                collect
-			       (aref (the simple-array (aref ins-data k)) 
-                                     (aref cur-ptrs k)))))
+			       (aref (the simple-array (aref ins-data k))
+				     (aref cur-ptrs k)))))
                   (let ((first-result (apply fn first-vals)))
                     (cond
-                      ;; 优先拦截布尔返回值 (如 #'>, #'< 等)
-                      ((or (eq first-result t) (null first-result))
-                       (values 'double-float t))
-                      ;; 拦截标准 Fixnum
-                      ((and (integerp first-result) 
-                            (<= most-negative-fixnum
+                      ((or (eq first-result t)
+			   (null first-result))
+		       (values 'double-float t))
+                      ((and (integerp first-result)
+			    (<= most-negative-fixnum
 				first-result
 				most-positive-fixnum))
                        (values 'fixnum nil))
-                      ;; 其他一切 (Float, Bignum, Ratio) 统按 Double-Float 处理
-                      (t
-                       (values 'double-float nil))))))
+                      (t (values 'double-float nil))))))
           
           (let* ((res (vt-zeros out-shape :type effective-out-type))
                  (res-data (vt-data res))
                  (res-strides (vt-strides res)))
             
-            ;; 使用宏消除分支递归的冗余代码
+            ;; ==============================================================      
+            ;; 阶段 2：热路径 - 统一遍历骨架 (代码只生成一次！)
+            ;; ==============================================================      
+            ;; 宏的作用仅限于生成递归骨架，不再包含业务逻辑分支
             (macrolet
-		((gen-loop (&body body)
+		((gen-unified-loop (&body leaf-body)
                    `(labels
 			((recurse (depth out-ptr)
                            (declare (type fixnum depth out-ptr))
                            (if (= depth rank)
-                               (progn ,@body)
+                               (progn ,@leaf-body) ; <--- 只有这里不同
                                (let* ((dim (the fixnum (nth depth out-shape)))
-                                      (res-stride (the fixnum (nth depth res-strides)))
+                                      (res-stride
+					(the fixnum (nth depth res-strides)))
                                       (strides-at-depth
-					(loop
-					  for k fixnum from 0 below n-tensors
-                                          collect
-					  (the fixnum
-					       (nth depth (aref ins-strides k))))))
+					(loop for k fixnum from 0 below n-tensors
+                                              collect
+					      (the fixnum
+						   (nth depth (aref ins-strides k))))))
                                  (declare (type fixnum dim res-stride)
                                           (dynamic-extent strides-at-depth))
-                                 (loop
-				   for i fixnum from 0 below dim
-                                   do (recurse (1+ depth) out-ptr)
-                                      (incf out-ptr res-stride)
-                                      (loop
-					for k fixnum from 0 below n-tensors
-                                        for s fixnum in strides-at-depth
-                                        do (incf (aref cur-ptrs k) s)))
+                                 (loop for i fixnum from 0 below dim do
+                                   (recurse (1+ depth) out-ptr)
+                                   (incf out-ptr res-stride)
+                                   (loop for k fixnum from 0 below n-tensors
+                                         for s fixnum in strides-at-depth do
+                                           (incf (aref cur-ptrs k) s)))
+                                 ;; 指针回溯
                                  (decf out-ptr (the fixnum (* dim res-stride)))
-                                 (loop
-				   for k fixnum from 0 below n-tensors
-                                   for s fixnum in strides-at-depth
-                                   do (decf (aref cur-ptrs k)
-					    (the fixnum (* dim s))))))))
+                                 (loop for k fixnum from 0 below n-tensors
+                                       for s fixnum in strides-at-depth do
+                                         (decf (aref cur-ptrs k)
+					       (the fixnum (* dim s))))))))
                       (recurse 0 0))))
               
-              ;; ==============================================================
-              ;; 阶段 2：热路径 - 根据推断类型与布尔标记执行特化循环
-              ;; ==============================================================
-              (ecase effective-out-type
-                (double-float
-                 (if is-boolean-fn
-                     ;; 修复2: 布尔特化路径消除 apply 和 loop collect，零分配
-                     (gen-loop
-                      (setf (aref (the (simple-array double-float (*)) res-data)
-				  out-ptr)
-                            (the double-float 
-				 (if (case n-tensors
-                                       (1 (funcall fn (aref (the simple-array (aref ins-data 0))
-							    (aref cur-ptrs 0))))
-                                       (2 (funcall fn (aref (the simple-array (aref ins-data 0))
-							    (aref cur-ptrs 0))
-                                                   (aref (the simple-array (aref ins-data 1))
-							 (aref cur-ptrs 1))))
-                                       (otherwise
-					(apply fn (loop for k fixnum from 0 below n-tensors
-                                                        collect
-							(aref (the simple-array (aref ins-data k)) 
-                                                              (aref cur-ptrs k))))))
-                                     1.0d0
-                                     0.0d0))))
-                     ;; 常规 Double-Float 路径
-                     (gen-loop
-                      (let ((d0 (aref (the simple-array (aref ins-data 0))
-				      (aref cur-ptrs 0))))
-                        (setf (aref (the (simple-array double-float (*)) res-data)
-				    out-ptr)
-                              (the double-float 
-                                   (coerce 
-                                    (case n-tensors
-                                      (1 (funcall fn d0))
-                                      (2 (let ((d1 (aref (the simple-array (aref ins-data 1))
-							 (aref cur-ptrs 1))))
-                                           (funcall fn d0 d1)))
-                                      (otherwise
-				       (apply fn (loop for k fixnum from 0 below n-tensors
-                                                       collect
-						       (aref (the simple-array (aref ins-data k)) 
-                                                             (aref cur-ptrs k))))))
-                                    'double-float)))))))
-
-                (fixnum
-                 (gen-loop
-                  (let ((d0 (aref (the simple-array (aref ins-data 0)) (aref cur-ptrs 0))))
-                    (setf (aref (the (simple-array fixnum (*)) res-data) out-ptr)
-                          (the fixnum 
-			       (let ((raw-val
-				       (case n-tensors
-                                         (1 (funcall fn d0))
-                                         (2 (let ((d1 (aref (the simple-array (aref ins-data 1))
-							    (aref cur-ptrs 1))))
-                                              (funcall fn d0 d1)))
-                                         (otherwise
-					  (apply fn (loop for k fixnum from 0 below n-tensors
-                                                          collect
-							  (aref (the simple-array (aref ins-data k)) 
-                                                                (aref cur-ptrs k))))))))
-				 (if (and (integerp raw-val)
-					  (<= most-negative-fixnum raw-val most-positive-fixnum))
-                                     raw-val
-                                     ;; 饱和截断：确保大整数或浮点数绝不被强行写入 Fixnum 槽位
-                                     (max most-negative-fixnum
-                                          (min most-positive-fixnum (truncate raw-val)))))))))))
-              res)))))))
+              ;; 调用宏，传入统一的叶子节点逻辑
+              (gen-unified-loop
+               ;; ==============================================================      
+               ;; 统一的叶子节点逻辑：先求值，再根据预推断的类型写入
+               ;; ==============================================================      
+               (let ((raw-result
+                       ;; 1. 统一读取输入并计算
+                       (case n-tensors
+                         (1 (funcall
+			     fn
+			     (aref (the simple-array (aref ins-data 0))
+				   (aref cur-ptrs 0))))
+                         (2 (funcall
+			     fn 
+                             (aref (the simple-array (aref ins-data 0))
+				   (aref cur-ptrs 0))
+                             (aref (the simple-array (aref ins-data 1))
+				   (aref cur-ptrs 1))))
+                         (otherwise 
+                          (apply
+			   fn
+			   (loop for k fixnum from 0 below n-tensors
+                                 collect
+				 (aref (the simple-array (aref ins-data k))
+				       (aref cur-ptrs k))))))))
+                  
+                  ;; 2. 根据冷路径推断的类型，将结果安全写入
+                  ;; 此处 ecase 分支预测命中率达 100%，零性能损耗
+                  (ecase effective-out-type
+                    (double-float
+                     (if is-boolean-fn
+                         (setf (aref (the (simple-array double-float (*))
+					  res-data)
+				     out-ptr)
+                               (the double-float
+				    (if raw-result 1.0d0 0.0d0)))
+                         (setf (aref (the (simple-array double-float (*))
+					  res-data)
+				     out-ptr)
+                               (the double-float
+				    (coerce raw-result 'double-float)))))
+                    (fixnum
+                     (setf (aref (the (simple-array fixnum (*))
+				      res-data)
+				 out-ptr)
+                           (the fixnum
+                                (if (and (integerp raw-result)
+                                         (<= most-negative-fixnum
+					     raw-result
+					     most-positive-fixnum))
+                                    raw-result
+                                    ;; 饱和截断保护
+                                    (max most-negative-fixnum 
+                                         (min most-positive-fixnum
+					      (truncate raw-result)))))))))))
+            
+            res))))))
 
 
 (defun vt-ensure-shape-compatible (shape axis)

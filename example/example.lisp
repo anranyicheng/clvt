@@ -1097,9 +1097,9 @@
     ;; 预期：第一个批次 a[0]=[[0,1],[2,3]] b[0]=[[0,1],[2,3]] -> [[2,3],[6,11]]
     ;; 第二个批次 a[1]=[[4,5],[6,7]] b[1]=[[4,5],[6,7]] -> [[46,55],[66,79]]
     (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
-		   '((2.0 3.0) (6.0 11.0))))
+		   '((2 3) (6 11))))
     (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
-		   '((46.0 55.0) (66.0 79.0)))))
+		   '((46 55) (66 79)))))
   (format t "~%test-vt-matmul passed.~%"))
 
 ;; ============================================================
@@ -1120,7 +1120,7 @@
   (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
          (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
          (c (vt-einsum "ij,jk->ik" a b)))
-    (assert (equal (vt-to-list c) '((10.0 13.0) (28.0 40.0)))))
+    (assert (equal (vt-to-list c) '((10 13) (28 40)))))
 
   ;; 批量矩阵乘法
   ;; a = np.arange(12).reshape(2,2,3), b = np.arange(18).reshape(2,3,3)
@@ -1131,16 +1131,16 @@
          (b (vt-reshape (vt-arange 18 :type 'fixnum) '(2 3 3)))
          (c (vt-einsum "bij,bjk->bik" a b)))
     (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
-		   '((15.0 18.0 21.0) (42.0 54.0 66.0))))
+		   '((15 18 21) (42 54 66))))
     (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
-		   '((258.0 279.0 300.0) (366.0 396.0 426.0)))))
+		   '((258 279 300) (366 396 426)))))
 
   ;; 对角线提取
   ;; a = np.arange(9).reshape(3,3)
   ;; np.einsum('ii->i', a) -> [0,4,8]
   (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
          (diag (vt-einsum "ii->i" a)))
-    (assert (equal (vt-to-list diag) '(0.0 4.0 8.0))))
+    (assert (equal (vt-to-list diag) '(0 4 8))))
 
   ;; 外积
   ;; a = np.array([1,2,3]), b = np.array([4,5])
@@ -1149,7 +1149,7 @@
          (b (vt-from-sequence '(4 5) :type 'fixnum))
          (outer (vt-einsum "i,j->ij" a b)))
     (assert (equal (vt-to-list outer)
-		   '((4.0 5.0) (8.0 10.0) (12.0 15.0)))))
+		   '((4 5) (8 10) (12 15)))))
   ;; 测试 1：标准矩阵乘法
   (let* ((a (vt-from-sequence '((1 2) (3 4) (5 6))))
          (b (vt-from-sequence '((7 8 9) (10 11 12))))
@@ -1233,7 +1233,7 @@
   (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
          (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
          (c (vt-dot a b)))
-    (assert (equal (vt-to-list c) '((10.0 13.0) (28.0 40.0)))))
+    (assert (equal (vt-to-list c) '((10 13) (28 40)))))
 
   ;; 批量矩阵乘法 (秩 >= 2)
   ;;  a = np.arange(8).reshape(2,2,2)
@@ -1242,9 +1242,9 @@
          (b (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
          (c (vt-dot a b)))  ;;   (vt-einsum "...ij,...jk->...ik" a b)
     (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
-		   '((2.0 3.0) (6.0 11.0))))
+		   '((2 3) (6 11))))
     (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
-		   '((46.0 55.0) (66.0 79.0)))))
+		   '((46 55) (66 79)))))
   ;; 测试 1：两个一维向量 → 标量数值
   (let* ((a (vt-from-sequence '(1.0 2.0 3.0)))
          (b (vt-from-sequence '(4.0 5.0 6.0)))
@@ -1424,7 +1424,7 @@
          (b (vt-from-sequence '(3 4 5) :type 'fixnum))
          (outer (vt-outer a b)))
     (assert (equal (vt-to-list outer)
-		   '((3.0 4.0 5.0) (6.0 8.0 10.0)))))
+		   '((3 4 5) (6 8 10)))))
   ;; 不展平：保留形状
   ;; a = np.array([1,2]), b = np.array([3,4,5])
   ;; np.multiply.outer(a,b) 相当于 a[:,none] * b[none,:] 得到二维矩阵，与 flatten 相同
@@ -1440,7 +1440,7 @@
     ;; 检查值：a[i,j] * b[k] 存储在 outer[i,j,k]
     ;; 0*1=0, 0*2=0, 1*1=1, 1*2=2, 2*1=2, 2*2=4 ...
     (assert (equal (vt-to-list (vt-slice outer '(0) '(:all) '(:all)))
-		   '((0.0 0.0) (1.0 2.0) (2.0 4.0)))))
+		   '((0 0) (1 2) (2 4)))))
   (format t "~%test-vt-outer passed.~%"))
 
 

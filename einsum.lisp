@@ -157,8 +157,8 @@
 				     'simple-vector)))
             (values all-labels label-dims final-output-subs)))))))
 
-(defun einsum-execute
-    (all-labels-vec label-dims-vec output-subs input-subs vts)
+(defun einsum-execute (all-labels-vec label-dims-vec output-subs
+                       input-subs vts)
   (declare (type simple-vector all-labels-vec)
            (type (simple-array fixnum (*)) label-dims-vec)
            (type list output-subs input-subs vts))
@@ -169,116 +169,118 @@
            (_ (loop for i fixnum from 0 below rank
                     for label fixnum = (svref all-labels-vec i)
                     do (setf (aref dims-vec i)
-			     (aref label-dims-vec
-				   (if (< label 0)
-				       (+ 256 label)
-				       label)))))
-           (strides-mat (make-array (list n-vts rank) :element-type 'fixnum))
-           (in-data-vec (make-array n-vts))
-           (in-offsets-vec (make-array n-vts :element-type 'fixnum)))
+                             (aref label-dims-vec
+                                   (if (< label 0)
+                                       (+ 256 label)
+                                       label))))))
       (declare (ignorable _))
-      ;; 构建每个输入张量在逻辑轴上的步长
-      (loop
-	for sub list in input-subs
-        for tns in vts
-        for t-idx fixnum from 0
-        do (let ((phys-strides (vt-strides tns))
-		 (phys-shape (vt-shape tns)))
-             (declare (list phys-strides phys-shape))
-             (setf (aref in-data-vec t-idx)
-		   (vt-data tns))
-             (setf (aref in-offsets-vec t-idx)
-		   (vt-offset tns))
-             (loop
-	       for lbl fixnum across all-labels-vec
-               for logical-idx fixnum from 0
-               do (let ((p-stride-sum 0))
+      (let* ((strides-mat (make-array (list n-vts rank)
+                                      :element-type 'fixnum))
+             (in-data-vec (make-array n-vts))
+             (in-offsets-vec (make-array n-vts :element-type 'fixnum)))
+        ;; 构建每个输入张量在逻辑轴上的步长
+        (loop for sub list in input-subs
+              for tns in vts
+              for t-idx fixnum from 0 do
+          (let ((cont-tns (vt-contiguous tns)))
+            (let ((phys-strides (vt-strides cont-tns))
+                  (phys-shape (vt-shape cont-tns)))
+              (declare (list phys-strides phys-shape))
+              (setf (aref in-data-vec t-idx) (vt-data cont-tns))
+              (setf (aref in-offsets-vec t-idx) (vt-offset cont-tns))
+              (let ((p-strides-arr (coerce phys-strides 'simple-vector))
+                    (p-shape-arr (coerce phys-shape 'simple-vector)))
+                (declare (type simple-vector p-strides-arr p-shape-arr))
+                (loop for lbl fixnum across all-labels-vec
+                      for logical-idx fixnum from 0 do
+                  (let ((p-stride-sum 0))
                     (declare (fixnum p-stride-sum))
-                    (loop
-		      for pos fixnum from 0
-                      for sub-lbl fixnum in sub
-                      when (eql sub-lbl lbl)
-                        do (let ((p-dim (nth pos phys-shape))
-                                 (p-stride (nth pos phys-strides)))
-                             (declare (fixnum p-dim p-stride))
-                             (incf p-stride-sum
-                                   (if (and (= p-dim 1)
-                                            (> (aref dims-vec logical-idx) 1))
-                                       0 p-stride))))
+                    (loop for pos fixnum from 0 below (length sub)
+                          for sub-lbl fixnum = (nth pos sub)
+                          when (eql sub-lbl lbl) do
+                            (let ((p-dim (the fixnum
+                                             (svref p-shape-arr pos)))
+                                  (p-stride (the fixnum
+                                               (svref p-strides-arr pos))))
+                              (incf p-stride-sum
+                                    (if (and (= p-dim 1)
+                                             (> (aref dims-vec logical-idx)
+                                                1))
+                                        0
+                                        p-stride))))
                     (setf (aref strides-mat t-idx logical-idx)
-                          p-stride-sum)))))
+                          p-stride-sum))))))) 
+        ;; 类型推导与输出张量构建
+        (let* ((all-fix-p (every #'(lambda (vt)
+                                     (eq (vt-element-type vt) 'fixnum))
+                                 vts))
+               (all-f64-p (every #'(lambda (vt)
+                                     (eq (vt-element-type vt) 'double-float))
+                                 vts))
+               (effective-out-type (cond (all-fix-p 'fixnum)
+                                         (all-f64-p 'double-float)
+                                         (t 'double-float)))
+               (out-shape
+                 (loop for lbl fixnum across all-labels-vec
+                       when (member lbl output-subs)
+                       collect (the fixnum
+                                   (aref label-dims-vec
+                                         (if (< lbl 0)
+                                             (+ 256 lbl)
+                                             lbl)))))
+               (output (vt-zeros out-shape :type effective-out-type))
+               (out-offset (vt-offset output))
+               (out-data (vt-data output))
+               (out-strides-vec (make-array rank :element-type 'fixnum)))
+          (declare (type boolean all-fix-p all-f64-p)
+                   (type fixnum out-offset))
 
-      ;; 输出张量构建
-      (let* ((out-shape
-	       (loop for lbl fixnum across all-labels-vec
-                     when (member lbl output-subs)
-		       collect (the fixnum
-				    (aref label-dims-vec
-					  (if (< lbl 0)
-					      (+ 256 lbl)
-					      lbl)))))
-             (output (vt-zeros out-shape))
-             (out-offset (vt-offset output))
-             (out-data (vt-data output))
-             (out-strides-vec (make-array rank :element-type 'fixnum)))
-        (declare (type (simple-array double-float (*)) out-data)
-                 (type fixnum out-offset))
-
-        ;; 计算输出步长
-        (let ((acc 1))
-          (declare (fixnum acc))
-          (loop for i fixnum from (1- rank) downto 0
-                for dim = (aref dims-vec i)
-                do (if (member (svref all-labels-vec i) output-subs)
-                       (progn
-			 (setf (aref out-strides-vec i) acc)
-			 (setf acc (the fixnum (* acc dim))))
-                       (setf (aref out-strides-vec i) 0))))
-
-        (let ((all-double-float-p
-                (every #'(lambda (vt)
-			   (eq (vt-element-type vt) 'double-float))
-                       vts)))
-          (declare (type boolean all-double-float-p))
-          ;; ---------- 矩阵乘法快速通道 ----------
-          ;; 触发条件：两个输入、秩=3、两个输出、全是double-float、输入长度均为2
+          ;; 计算输出步长
+          (let ((acc 1))
+            (declare (fixnum acc))
+            (loop for i fixnum from (1- rank) downto 0
+                  for dim = (aref dims-vec i) do
+              (if (member (svref all-labels-vec i) output-subs)
+                  (progn
+                    (setf (aref out-strides-vec i) acc)
+                    (setf acc (the fixnum (* acc dim))))
+                  (setf (aref out-strides-vec i) 0))))
+          ;; Double-Float 矩阵乘法快速通道
           (when (and (= n-vts 2)
                      (= rank 3)
                      (= (length output-subs) 2)
-                     all-double-float-p
+                     all-f64-p
                      (= (length (first input-subs)) 2)
                      (= (length (second input-subs)) 2))
             (let* ((sub1 (first input-subs))
                    (sub2 (second input-subs))
-                   ;; 寻找缩并标签 j：同时出现在 sub1 和 sub2 中的下标
-                   (j (cond ((eql (first sub1) (first sub2)) (first sub1))
-                            ((eql (first sub1) (second sub2)) (first sub1))
-                            ((eql (second sub1) (first sub2)) (second sub1))
-                            ((eql (second sub1) (second sub2)) (second sub1))
+                   (j (cond ((eql (first sub1) (first sub2))
+                             (first sub1))
+                            ((eql (first sub1) (second sub2))
+                             (first sub1))
+                            ((eql (second sub1) (first sub2))
+                             (second sub1))
+                            ((eql (second sub1) (second sub2))
+                             (second sub1))
                             (t nil))))
               (when j
                 (let* ((i (if (eql (first sub1) j)
-			      (second sub1)
-			      (first sub1)))
+                              (second sub1) (first sub1)))
                        (k (if (eql (first sub2) j)
-			      (second sub2)
-			      (first sub2)))
+                              (second sub2) (first sub2)))
                        (o1 (first output-subs))
                        (o2 (second output-subs)))
-                  ;; 验证模式：输出下标必须恰好是 (i k)，且 i ≠ k
-                  (when (and (eql i o1)
-                             (eql k o2)
-                             (not (eql i k)))
+                  (when (and (eql i o1) (eql k o2) (not (eql i k)))
                     (let* ((pos-i (position i all-labels-vec :test #'eql))
                            (pos-k (position k all-labels-vec :test #'eql))
                            (pos-j (position j all-labels-vec :test #'eql)))
                       (when (and pos-i pos-k pos-j)
                         (let* ((data-a (the (simple-array double-float (*))
-					    (aref in-data-vec 0)))
+                                            (aref in-data-vec 0)))
                                (data-b (the (simple-array double-float (*))
-					    (aref in-data-vec 1)))
+                                            (aref in-data-vec 1)))
                                (data-c (the (simple-array double-float (*))
-					    out-data))
+                                            out-data))
                                (d-i (aref dims-vec pos-i))
                                (d-j (aref dims-vec pos-j))
                                (d-k (aref dims-vec pos-k))
@@ -290,77 +292,216 @@
                                (sO-k (aref out-strides-vec pos-k))
                                (off-A (aref in-offsets-vec 0))
                                (off-B (aref in-offsets-vec 1)))
-                          (declare (type fixnum d-i d-j d-k
-				         sA-i sA-j sB-j sB-k
-				         sO-i sO-k off-A off-B)
-                                   (type (simple-array double-float (*))
-				         data-a data-b data-c))
-                          ;; 手动展开的矩阵乘法内核 (i-k-j 循环)
-                          (loop
-			    for i-idx fixnum from 0 below d-i
-                            do (let ((ptr-a-row-start
-				       (+ off-A (the fixnum (* i-idx sA-i))))
-                                     (ptr-c-row-start
-				       (the fixnum (+ out-offset
-						      (the fixnum (* i-idx sO-i))))))
-                                 (declare (type fixnum ptr-a-row-start ptr-c-row-start))
-                                 (loop
-				   for j-idx fixnum from 0 below d-j
-                                   do (let ((val-a
-					      (aref data-a
-						    (+ ptr-a-row-start
-						       (the fixnum (* j-idx sA-j)))))
-					    (ptr-b-start
-					      (+ off-B (the fixnum (* j-idx sB-j))))
-                                            (ptr-c-start ptr-c-row-start))
-                                        (declare (type double-float val-a)
-						 (type fixnum ptr-b-start ptr-c-start))
-                                        (loop
-					  for k-idx fixnum from 0 below d-k
-                                          do (incf (aref data-c ptr-c-start)
-						   (* val-a (aref data-b ptr-b-start)))
-                                             (incf ptr-b-start sB-k)
-                                             (incf ptr-c-start sO-k)))))))
-                        (return-from einsum-execute output)))))))))
+                          (declare
+                           (type fixnum d-i d-j d-k sA-i sA-j sB-j
+                                 sB-k sO-i sO-k off-A off-B)
+                           (type (simple-array double-float (*))
+                                 data-a data-b data-c))
+                          (loop for i-idx fixnum from 0 below d-i do
+                            (let ((ptr-a-row-start
+                                    (+ off-A
+                                       (the fixnum (* i-idx sA-i))))
+                                  (ptr-c-row-start
+                                    (the fixnum
+                                         (+ out-offset
+                                            (the fixnum
+                                                 (* i-idx sO-i))))))
+                              (declare (type fixnum ptr-a-row-start
+                                             ptr-c-row-start))
+                              (loop for j-idx fixnum
+                                    from 0 below d-j do
+                                (let ((val-a
+                                        (aref data-a
+                                              (+ ptr-a-row-start
+                                                 (the fixnum
+                                                      (* j-idx sA-j)))))
+                                      (ptr-b-start
+                                        (+ off-B
+                                           (the fixnum (* j-idx sB-j))))
+                                      (ptr-c-start ptr-c-row-start))
+                                  (declare (type double-float val-a)
+                                           (type fixnum ptr-b-start
+                                                 ptr-c-start))
+                                  (loop for k-idx fixnum
+                                        from 0 below d-k do
+                                    (incf (aref data-c ptr-c-start)
+                                          (* val-a
+                                             (aref data-b ptr-b-start)))
+                                    (incf ptr-b-start sB-k)
+                                    (incf ptr-c-start sO-k))))))
+                          (return-from einsum-execute output)))))))))
+          ;; Fixnum 矩阵乘法快速通道
+          (when (and (= n-vts 2)
+                     (= rank 3)
+                     (= (length output-subs) 2)
+                     all-fix-p
+                     (= (length (first input-subs)) 2)
+                     (= (length (second input-subs)) 2))
+            (let* ((sub1 (first input-subs))
+                   (sub2 (second input-subs))
+                   (j (cond ((eql (first sub1) (first sub2))
+                             (first sub1))
+                            ((eql (first sub1) (second sub2))
+                             (first sub1))
+                            ((eql (second sub1) (first sub2))
+                             (second sub1))
+                            ((eql (second sub1) (second sub2))
+                             (second sub1))
+                            (t nil))))
+              (when j
+                (let* ((i (if (eql (first sub1) j)
+                              (second sub1) (first sub1)))
+                       (k (if (eql (first sub2) j)
+                              (second sub2) (first sub2)))
+                       (o1 (first output-subs))
+                       (o2 (second output-subs)))
+                  (when (and (eql i o1) (eql k o2) (not (eql i k)))
+                    (let* ((pos-i (position i all-labels-vec :test #'eql))
+                           (pos-k (position k all-labels-vec :test #'eql))
+                           (pos-j (position j all-labels-vec :test #'eql)))
+                      (when (and pos-i pos-k pos-j)
+                        (let* ((data-a (the (simple-array fixnum (*))
+                                            (aref in-data-vec 0)))
+                               (data-b (the (simple-array fixnum (*))
+                                            (aref in-data-vec 1)))
+                               (data-c (the (simple-array fixnum (*))
+                                            out-data))
+                               (d-i (aref dims-vec pos-i))
+                               (d-j (aref dims-vec pos-j))
+                               (d-k (aref dims-vec pos-k))
+                               (sA-i (aref strides-mat 0 pos-i))
+                               (sA-j (aref strides-mat 0 pos-j))
+                               (sB-j (aref strides-mat 1 pos-j))
+                               (sB-k (aref strides-mat 1 pos-k))
+                               (sO-i (aref out-strides-vec pos-i))
+                               (sO-k (aref out-strides-vec pos-k))
+                               (off-A (aref in-offsets-vec 0))
+                               (off-B (aref in-offsets-vec 1)))
+                          (declare
+                           (type fixnum d-i d-j d-k sA-i sA-j sB-j
+                                 sB-k sO-i sO-k off-A off-B)
+                           (type (simple-array fixnum (*))
+                                 data-a data-b data-c))
+                          (loop for i-idx fixnum from 0 below d-i do
+                            (let ((ptr-a-row-start
+                                    (+ off-A
+                                       (the fixnum (* i-idx sA-i))))
+                                  (ptr-c-row-start
+                                    (the fixnum
+                                         (+ out-offset
+                                            (the fixnum
+                                                 (* i-idx sO-i))))))
+                              (declare (type fixnum ptr-a-row-start
+                                             ptr-c-row-start))
+                              (loop for j-idx fixnum
+                                    from 0 below d-j do
+                                (let ((val-a
+                                        (the fixnum
+                                             (aref data-a
+                                                   (+ ptr-a-row-start
+                                                      (the fixnum
+                                                           (* j-idx sA-j))))))
+                                      (ptr-b-start
+                                        (+ off-B
+                                           (the fixnum (* j-idx sB-j))))
+                                      (ptr-c-start ptr-c-row-start))
+                                  (declare (type fixnum val-a ptr-b-start
+                                                 ptr-c-start))
+                                  (loop for k-idx fixnum
+                                        from 0 below d-k do
+                                    (incf (aref data-c ptr-c-start)
+                                          (sb-ext:truly-the fixnum
+                                            (* val-a
+                                               (the fixnum
+                                                    (aref data-b
+                                                          ptr-b-start)))))
+                                    (incf ptr-b-start sB-k)
+                                    (incf ptr-c-start sO-k))))))
+                          (return-from einsum-execute output)))))))))
+          ;; 通用 Einsum 路径 (极简迭代状态机，严格等价于原递归)
+          (let ((cur-ptrs (make-array n-vts :element-type 'fixnum
+                                           :initial-element 0)))
+            (declare (type (simple-array fixnum (*)) cur-ptrs))
+            (loop for k fixnum from 0 below n-vts
+                  do (setf (aref cur-ptrs k) (aref in-offsets-vec k)))
+            (let ((indices (make-array rank :element-type 'fixnum
+                                            :initial-element 0))
+                  (depth 0)
+                  (out-ptr out-offset))
+              (declare (type (simple-array fixnum (*)) indices)
+                       (type fixnum depth out-ptr))
+              (loop
+                (cond
+                  ((= depth rank)
+                   ;; 抵达叶子节点：累加乘积
+                   (cond
+                     (all-f64-p
+                      (let ((product 1.0d0))
+                        (declare (type double-float product))
+                        (loop for k fixnum from 0 below n-vts do
+                          (setf product
+                                (* product
+                                   (aref (the (simple-array double-float (*))
+                                              (aref in-data-vec k))
+                                         (aref cur-ptrs k)))))
+                        (incf (the double-float
+                                   (aref (the (simple-array double-float (*))
+                                              out-data)
+					 out-ptr))
+                              product)))
+                     (all-fix-p
+                      (let ((product 1))
+                        (declare (type fixnum product))
+                        (loop for k fixnum from 0 below n-vts do
+                          (setf product
+                                (sb-ext:truly-the fixnum
+                                  (* product
+                                     (the fixnum
+                                          (aref (the (simple-array fixnum (*))
+                                                     (aref in-data-vec k))
+                                                 (aref cur-ptrs k)))))))
+                        (incf (the fixnum
+                                   (aref (the (simple-array fixnum (*))
+                                              out-data)
+					 out-ptr))
+                              product)))
+                     (t (let ((product 1))
+                          (loop for k fixnum from 0 below n-vts do
+                            (setf product
+                                  (* product
+                                     (aref (aref in-data-vec k)
+                                           (aref cur-ptrs k)))))
+                          (incf (aref out-data out-ptr) product))))
+                   ;; 回溯逻辑
+                   (loop
+                     (decf depth)
+                     (when (< depth 0) (return-from einsum-execute output))
+                     (let ((d depth))
+                       (if (< (aref indices d) (1- (aref dims-vec d)))
+                           ;; 当前层循环未结束，步进指针，准备下一次递归
+                           (progn
+                             (incf out-ptr (aref out-strides-vec d))
+                             (loop for k fixnum from 0 below n-vts do
+                               (incf (aref cur-ptrs k) (aref strides-mat k d)))
+                             (incf (aref indices d))
+                             (incf depth)
+                             (return))
+                           ;; 当前层循环结束，回溯指针，重置索引
+                           (progn
+                             (decf out-ptr
+                                   (the fixnum
+                                        (* (aref indices d)
+                                           (aref out-strides-vec d))))
+                             (loop for k fixnum from 0 below n-vts do
+                               (decf (aref cur-ptrs k)
+                                     (the fixnum
+                                          (* (aref indices d)
+                                             (aref strides-mat k d)))))
+                             (setf (aref indices d) 0))))))
+                  (t
+                   ;; 向下深入下一层
+                   (incf depth)))))))))))
 
-        ;; 通用 Einsum 路径（与原代码完全一致）
-        (let ((cur-ptrs (make-array n-vts :element-type 'fixnum
-					  :initial-element 0)))
-          (declare (type (simple-array fixnum (*)) cur-ptrs))
-          (loop for k fixnum from 0 below n-vts
-                do (setf (aref cur-ptrs k) (aref in-offsets-vec k)))
-          (labels
-	      ((recurse (depth out-ptr)
-                 (declare (type fixnum depth out-ptr))
-                 (if (= depth rank)
-                     (let ((product 1.0d0))
-                       (declare (type double-float product))
-                       (loop
-			 for k fixnum from 0 below n-vts
-                         do (setf product
-				  (* product
-				     (aref (aref in-data-vec k)
-					   (aref cur-ptrs k)))))
-                       (incf (aref out-data out-ptr) product))
-                     (let* ((dim (aref dims-vec depth))
-                            (out-stride (aref out-strides-vec depth)))
-                       (declare (type fixnum dim out-stride))
-                       (loop
-			 for i fixnum from 0 below dim
-                         do (recurse (1+ depth) out-ptr)
-                            (loop for k fixnum from 0 below n-vts
-                                  do (incf (aref cur-ptrs k)
-					   (aref strides-mat k depth)))
-                            (incf out-ptr out-stride))
-                       (loop
-			 for k fixnum from 0 below n-vts
-                         do (decf (aref cur-ptrs k)
-				  (the fixnum
-				       (* dim (aref strides-mat k depth)))))
-                       (decf out-ptr
-			     (the fixnum (* dim out-stride)))))))
-            (recurse 0 out-offset)))
-	output))))
 
 (defun vt-einsum (subscripts &rest vts)
   "高性能 einsum 接口."
