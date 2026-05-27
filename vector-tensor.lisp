@@ -1,7 +1,8 @@
 (in-package #:clvt)
 
 (defmacro with-float-safe (&body body)
-  `(sb-int:with-float-traps-masked (:invalid :divide-by-zero)
+  `(sb-int:with-float-traps-masked
+       (:invalid :divide-by-zero :overflow :underflow)
      ,@body))
 
 (defun fixnump (num)
@@ -995,30 +996,40 @@
                              shape1 shape2 dim1 dim2)))) ;; 规则3: 其他报错 (0,3报错)
     (the list result)))
 
-
-
 (declaim (inline vt-broadcast-strides))
 (defun vt-broadcast-strides (orig-shape target-shape orig-strides)
-  "计算广播后的步长.总是返回列表."
+  "计算广播后的步长. 添加形状兼容性校验，避免静默越界。"
   (declare (list orig-shape target-shape orig-strides))
-  (declare (optimize (speed 3)))
+  (declare (optimize (speed 3) (safety 1))) ; 开启基础安全检查
   (let ((rank-diff (- (length target-shape) (length orig-shape))))
     (declare (fixnum rank-diff))
-    (loop for i fixnum from 0 below (length target-shape)
-          ;; 规则:如果该维度是广播出来的(前面补0),或者原维度为1(被广播),
-          ;; 步长为0.否则使用原步长.
-          collect (cond
-                    ;; 1. 原维度不够长,前面补的维度,步长为 0
-                    ((< i rank-diff) 0)
-                    (t
-                     (let* ((orig-idx (- i rank-diff))
-                            (orig-dim (nth orig-idx orig-shape)))
-		       (declare (fixnum orig-dim orig-idx))
-                       ;; 2. 原维度为1,被广播扩展,步长为 0
-                       (if (= orig-dim 1)
-                           0
-                           ;; 3. 正常维度,使用原步长
-                           (nth orig-idx orig-strides))))))))
+    (when (minusp rank-diff)
+      (error "vt-broadcast-strides: orig-shape ~a rank > target-shape ~a rank" 
+             orig-shape target-shape))
+    
+    ;; 预分配固定数组，避免 cons 分配 (可进一步优化为 simple-vector)
+    (let ((result (make-list (length target-shape))))
+      (loop
+	for i fixnum from 0 below (length target-shape)
+        for tail-ptr = (nthcdr i result)
+        do (setf (car tail-ptr)
+                 (cond
+                   ((< i rank-diff) 0)
+                   (t (let* ((orig-idx
+			       (the fixnum (- i rank-diff)))
+                             (orig-dim
+			       (the fixnum (nth orig-idx orig-shape)))
+                             (target-dim
+			       (the fixnum (nth i target-shape))))
+                        (unless (or (= orig-dim target-dim)
+				    (= orig-dim 1))
+                          (error "vt-broadcast-strides: shape mismatch! orig-dim ~a vs target-dim ~a at axis ~a"
+                                 orig-dim target-dim i))
+                        (if (= orig-dim 1)
+			    0
+			    (nth orig-idx orig-strides)))))))
+      result)))
+
 
 ;; 核心宏:高性能广播迭代 
 (defmacro with-broadcasting-ptrs ((t1 t2 result-vt) &body body)
