@@ -410,7 +410,7 @@
                                   (loop for k-idx fixnum
                                         from 0 below d-k do
                                     (incf (aref data-c ptr-c-start)
-                                          (sb-ext:truly-the fixnum
+                                          (the fixnum
                                             (* val-a
                                                (the fixnum
                                                     (aref data-b
@@ -454,7 +454,7 @@
                         (declare (type fixnum product))
                         (loop for k fixnum from 0 below n-vts do
                           (setf product
-                                (sb-ext:truly-the fixnum
+                                (the fixnum
                                   (* product
                                      (the fixnum
                                           (aref (the (simple-array fixnum (*))
