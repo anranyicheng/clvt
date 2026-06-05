@@ -133,24 +133,48 @@
 	      sum-result))))
 
 (defun vt-average (tensor weights &key axis keepdims)
-  "计算加权平均值.
-   tensor: 输入张量.
-   weights: 权重张量 (形状必须可与 tensor 广播).
-   axis: 归约轴.
-   keepdims: 是否保持维度."
+  "计算加权平均值. 严格对标 NumPy:
+  - axis 为整数时: weights 必须为 1D 且长度等于 a.shape[axis]，沿 axis 广播
+  - axis 为 nil  时: weights 必须与 tensor 形状完全一致
+  - 权重和为零时抛出异常"
   (declare (vt tensor weights))
   (with-float-safe
-    (let* ((weighted-sum (vt-sum (vt-map #'* tensor weights)
-				 :axis axis
-				 :keepdims keepdims))
-           (sum-weights (vt-sum weights :axis axis
-					:keepdims keepdims)))
-      (vt-map (lambda (s w) 
-                (if (= w 0)
-		    0.0d0
-		    (/ s w))) 
-              weighted-sum 
-              sum-weights))))
+    (let ((a-shape (vt-shape tensor))
+          (w-shape (vt-shape weights)))
+      (if axis
+          (let* ((rank (length a-shape))
+                 (ax (vt-normalize-axis axis rank))
+                 (ax-size (nth ax a-shape)))
+            (unless (and (= (length w-shape) 1)
+                         (= (first w-shape) ax-size))
+              (error "ValueError: 1D weights expected when axis is specified.~@
+                      weights shape ~a does not match a.shape[~a] = ~a"
+                     w-shape ax ax-size))
+            (let* ((expanded-shape (loop for i below rank
+                                         collect (if (= i ax) ax-size 1)))
+                   (expanded-w (vt-reshape weights expanded-shape))                   
+                   (weighted-sum (vt-sum (vt-map #'* tensor expanded-w)
+                                         :axis ax :keepdims keepdims))
+                   (sum-weights (vt-item (vt-sum weights)))) ;; 权重和始终是标量
+              (when (zerop sum-weights)
+                (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
+              (vt-map (lambda (s)
+			(/ s sum-weights))
+		      weighted-sum)))
+          
+          (progn
+            (unless (equal w-shape a-shape)
+              (error "ValueError: weights must have the same shape as a when axis is None.~@
+                      weights shape ~a vs a shape ~a"
+                     w-shape a-shape))
+            (let* ((weighted-sum
+		     (vt-sum (vt-map #'* tensor weights) :keepdims keepdims))
+                   (sum-weights (vt-item (vt-sum weights))))
+              (when (zerop sum-weights)
+                (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
+              (vt-map (lambda (s)
+			(/ s sum-weights))
+		      weighted-sum)))))))
 
 (defun vt-var (tensor &key axis keepdims (ddof 0))
   "计算方差。
@@ -254,18 +278,33 @@
       (vt-map #'sqrt var))))
 
 (defun vt-nanmax (tensor &key axis keepdims)
-  "忽略 nan 的最大值。"
+  "忽略 nan 的最大值。对标 NumPy: 若沿轴全为 nan 则返回 nan。"
   (with-float-safe
     (let* ((mask (vt-isnan tensor))
-           ;; 将 nan 替换为 -∞，不影响 max 计算
+           ;; 找出沿指定轴哪些切片全为 nan（1.0 表示全为 nan，0.0 表示不全为）
+           (all-nan-along-axis (vt-all mask :axis axis :keepdims keepdims))
+           ;; 常规逻辑：替换 nan 为 -∞
            (inf-sub (vt-full-like tensor most-negative-double-float))
-           (clean (vt-where mask inf-sub tensor)))
-      (vt-amax clean :axis axis :keepdims keepdims))))
+           (clean (vt-where mask inf-sub tensor))
+           ;; 计算忽略 nan 后的最大值
+           (result (vt-amax clean :axis axis :keepdims keepdims)))
+      ;; 后处理：如果是全为 nan 的切片，用 nan 覆盖掉 -∞
+      (vt-where all-nan-along-axis
+                (vt-full-like result (vt-float-nan))
+                result))))
 
 (defun vt-nanmin (tensor &key axis keepdims)
-  "忽略 nan 的最小值。"
+  "忽略 nan 的最小值。对标 NumPy: 若沿轴全为 nan 则返回 nan。"
   (with-float-safe
     (let* ((mask (vt-isnan tensor))
+           ;; 找出沿指定轴哪些切片全为 nan
+           (all-nan-along-axis (vt-all mask :axis axis :keepdims keepdims))
+           ;; 常规逻辑：替换 nan 为 +∞
            (inf-sub (vt-full-like tensor most-positive-double-float))
-           (clean (vt-where mask inf-sub tensor)))
-      (vt-amin clean :axis axis :keepdims keepdims))))
+           (clean (vt-where mask inf-sub tensor))
+           ;; 计算忽略 nan 后的最小值
+           (result (vt-amin clean :axis axis :keepdims keepdims)))
+      ;; 后处理：如果是全为 nan 的切片，用 nan 覆盖掉 +∞
+      (vt-where all-nan-along-axis
+                (vt-full-like result (vt-float-nan))
+                result))))

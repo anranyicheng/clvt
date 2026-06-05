@@ -991,7 +991,7 @@
     (assert (equal (vt-to-list (second indices)) '(0 1))))  ; 列索引
 
   (format t "~%test-vt-nonzero passed.~%"))
-  
+
 ;; ============================================================
 ;; test-vt-where 三元选择模式
 ;; ============================================================
@@ -1195,9 +1195,9 @@
 
   ;; 测试 7：批量矩阵乘法 "...ij,...jk->...ik"
   (let* ((batch-a (vt-from-sequence '(((1 2) (3 4))   ; 2x2x2
-                                        ((5 6) (7 8)))))
+                                      ((5 6) (7 8)))))
          (batch-b (vt-from-sequence '(((9 10) (11 12))
-                                        ((13 14) (15 16)))))
+                                      ((13 14) (15 16)))))
          (out-einsum (vt-einsum "...ij,...jk->...ik" batch-a batch-b)))
     ;; 如果 vt-matmul 不支持批量，可以手动验证
     (assert-ok (and (approx= (vt-slice out-einsum '(0) '(:all) '(:all))
@@ -2074,7 +2074,7 @@
     (let* ((result (vt-take m (list 0 5)))
            (expected (vt-from-sequence '(0 5) :type 'fixnum)))
       (assert (equal (funcall to-list result)
-                      (funcall to-list expected))
+                     (funcall to-list expected))
               () "take([0,5]) failed"))
 
     ;; ================================================================
@@ -2086,7 +2086,7 @@
       (assert (equal (vt-shape result) '(2 2))
               () "take with 2d indices: shape mismatch ~a" (vt-shape result))
       (assert (equal (vt-to-list result)
-                      '((1 3) (1 5)))
+                     '((1 3) (1 5)))
               () "take with 2d indices: values mismatch"))
 
     ;; ================================================================
@@ -2097,7 +2097,7 @@
            (result (vt-take m indices :axis 0)))
       (assert (equal (vt-shape result) '(2 5)) () "axis=0 shape failed")
       (assert (equal (vt-to-list result)
-                      '((5 6 7 8 9) (15 16 17 18 19)))
+                     '((5 6 7 8 9) (15 16 17 18 19)))
               () "axis=0 values failed"))
 
     ;; ================================================================
@@ -2108,7 +2108,7 @@
            (result (vt-take m indices :axis 1)))
       (assert (equal (vt-shape result) '(4 2)) () "axis=1 shape failed")
       (assert (equal (vt-to-list result)
-                      '((0 2) (5 7) (10 12) (15 17)))
+                     '((0 2) (5 7) (10 12) (15 17)))
               () "axis=1 values failed"))
 
     ;; ================================================================
@@ -2121,8 +2121,8 @@
       (assert (equal (vt-shape result) '(4 2 2))
               () "axis=-1 with 2d indices: shape mismatch ~a" (vt-shape result))
       (assert (equal (vt-to-list result)
-                      '(((0 2) (1 3)) ((5 7) (6 8))
-                        ((10 12) (11 13)) ((15 17) (16 18))))
+                     '(((0 2) (1 3)) ((5 7) (6 8))
+                       ((10 12) (11 13)) ((15 17) (16 18))))
               () "axis=-1 with 2d indices: values mismatch"))
 
     ;; ================================================================
@@ -2133,7 +2133,7 @@
            (expected (vt-from-sequence '(10 11 12 13 14) :type 'fixnum)))
       (assert (equal (vt-shape result) '(5)) () "axis=-2 shape failed")
       (assert (equal (funcall to-list result)
-                      (funcall to-list expected))
+                     (funcall to-list expected))
               () "axis=-2 values failed"))
 
     (format t "~%all vt-take tests passed!~%")))
@@ -2236,7 +2236,7 @@
       (assert (equal (vlist res) '()) ()
               "空张量 argsort 失败")
       (format t "Test 9 (empty tensor) passed~%")))
-    
+  
   (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
     (assert (equal
 	     (vt-to-list (vt-argsort a :axis -1))
@@ -2282,7 +2282,7 @@
 	;; 按照行优先内存布局，预期的扁平列表应该是：
 	(let ((expected-flat '(0 1 0 0 0 0 1 0 1 1 1 1)))
           (format t "预期扁平: ~a~%" expected-flat)))))
-    (print "passed test vt-argsort"))
+  (print "passed test vt-argsort"))
 
 
 (defun test-vt-sort ()
@@ -2486,7 +2486,7 @@
               (vt-put a 100 42))
 	  (simple-error (e)
 	    (format t "test 7 passed: caught out-of-bounds error: ~a~%" e))))))
-      
+  
   ;; 测试 1：连续数组上 put (完全正确，不用改)
   (let* ((a (vt-arange 12 :type 'double-float))
          (indices '(2 5 10))
@@ -2535,6 +2535,62 @@
 (defun both-nan-p (a b)
   (and (/= a a) (/= b b)))
 
+(defmacro assert-nan (expr)
+  `(assert (vt-float-nan-p (vt-item ,expr))))
+
+(defun test-vt-nanmax-nanmin ()
+  ;; ==========================================
+  ;; 测试 1: 1D 全 NaN (当前实现会错误返回 ±∞)
+  ;; ==========================================
+  (let ((a (vt-from-sequence (list (vt-float-nan) (vt-float-nan)))))
+    (assert-nan (vt-nanmax a))   ; 预期: nan，当前漏洞返回: -∞
+    (assert-nan (vt-nanmin a)))  ; 预期: nan，当前漏洞返回: +∞
+
+  ;; ==========================================
+  ;; 测试 2: 1D 混合 (存在有效数值，原有逻辑正常)
+  ;; ==========================================
+  (let ((a (vt-from-sequence (list 1.0d0 (vt-float-nan) -2.0d0))))
+    (assert (= (vt-item (vt-nanmax a)) 1.0d0))
+    (assert (= (vt-item (vt-nanmin a)) -2.0d0)))
+
+  ;; ==========================================
+  ;; 测试 3: 2D 全 NaN 全局归约
+  ;; ==========================================
+  (let ((a (vt-from-sequence (list (list (vt-float-nan) (vt-float-nan))
+                                   (list (vt-float-nan) (vt-float-nan))))))
+    (assert-nan (vt-nanmax a))
+    (assert-nan (vt-nanmin a)))
+
+  ;; ==========================================
+  ;; 测试 4: 2D 混合 沿轴归约 (关键漏洞暴露点)
+  ;; ==========================================
+  (let ((a (vt-from-sequence (list (list 1.0d0 (vt-float-nan))
+                                   (list (vt-float-nan) (vt-float-nan))))))
+    
+    ;; --- 沿 axis=1 (按行归约) ---
+    ;; 第0行有1.0，第1行全为NaN
+    (let ((res-max-1 (vt-nanmax a :axis 1))
+          (res-min-1 (vt-nanmin a :axis 1)))
+      ;; 第0行结果应为 1.0
+      (assert (= (vt-item (vt-slice res-max-1 '(0))) 1.0d0))
+      (assert (= (vt-item (vt-slice res-min-1 '(0))) 1.0d0))
+      ;; 第1行结果应为 NaN (当前漏洞返回 ±∞)
+      (assert-nan (vt-slice res-max-1 '(1)))
+      (assert-nan (vt-slice res-min-1 '(1))))
+
+    ;; --- 沿 axis=0 (按列归约) ---
+    ;; 第0列有1.0，第1列全为NaN
+    (let ((res-max-0 (vt-nanmax a :axis 0))
+          (res-min-0 (vt-nanmin a :axis 0)))
+      ;; 第0列结果应为 1.0
+      (assert (= (vt-item (vt-slice res-max-0 '(0))) 1.0d0))
+      (assert (= (vt-item (vt-slice res-min-0 '(0))) 1.0d0))
+      ;; 第1列结果应为 NaN (当前漏洞返回 ±∞)
+      (assert-nan (vt-slice res-max-0 '(1)))
+      (assert-nan (vt-slice res-min-0 '(1)))))
+
+  (print "✅ All vt-nanmax/nanmin tests passed!")
+  )
 (defun test-nan-functions ()
   (format t "~%--- testing nan statistics functions ---~%")
   (sb-vm::with-float-traps-masked (:invalid :divide-by-zero :overflow)
@@ -2592,23 +2648,23 @@
               (v-axis1 (vt-nanvar data :axis 1 :ddof 1)))
           ;; axis0: 每列包含 nan 被忽略，列0:[1,4] 有效数2，列1:[2] 有效数1，列2:[3,6] 有效数2
           (assert (equal (vt-to-list v-axis0) 
-                          (list (/ (+ (expt (- 1 2.5) 2)
-				      (expt (- 4 2.5) 2))
-				   2)
-				;; 列1只有一个数，方差应为0
-				0.0d0
-				(/ (+ (expt (- 3 4.5) 2)
-				      (expt (- 6 4.5) 2))
-				   2))))
+                         (list (/ (+ (expt (- 1 2.5) 2)
+				     (expt (- 4 2.5) 2))
+				  2)
+			       ;; 列1只有一个数，方差应为0
+			       0.0d0
+			       (/ (+ (expt (- 3 4.5) 2)
+				     (expt (- 6 4.5) 2))
+				  2))))
           ;; axis1: [1,2,3] variance=? 和 [4,6] variance=?  sample var (ddof=1)
 	  (assert (equal (vt-to-list v-axis1)
-			  (list (/ (+ (expt (- 1 2) 2)
-				      (expt (- 2 2) 2)
-				      (expt (- 3 2) 2))
-				   2.0)
-				(/ (+ (expt (- 4 5) 2)
-				      (expt (- 6 5) 2))
-				   1.0)))))
+			 (list (/ (+ (expt (- 1 2) 2)
+				     (expt (- 2 2) 2)
+				     (expt (- 3 2) 2))
+				  2.0)
+			       (/ (+ (expt (- 4 5) 2)
+				     (expt (- 6 5) 2))
+				  1.0)))))
 	(format t "vt-nanvar: pass~%")
 
 	;; ---- test vt-nanstd ----
@@ -3229,6 +3285,79 @@
 
   (format t "~%test-activation-loss passed.~%"))
 
+(defun test-vt-average ()
+  ;; vt-average 加权平均
+  ;; a = [1,2,3], weights = [1,2,1]
+  ;; np.average(a, weights=weights) -> (1*1+2*2+3*1)/(1+2+1) = 2.0
+  (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
+         (w (vt-from-sequence '(1 2 1) :type 'double-float))
+         (avg (vt-item (vt-average a w))))
+    (assert (= avg 2.0d0)))
+  ;; ==========================================
+  ;; 测试 1: 基础 1D 数组 - 等权重 (等同于求均值)
+  ;; ==========================================
+  (let ((a (vt-from-sequence '(1.0 2.0 3.0)))
+	(w (vt-from-sequence '(1.0 1.0 1.0)))
+	(expected (vt-from-sequence '(2.0))))
+    (assert (vt-allclose (vt-average a w) expected)))
+
+  ;; ==========================================
+  ;; 测试 2: 基础 1D 数组 - 不等权重
+  ;; ==========================================
+  (let ((a (vt-from-sequence '(1.0 2.0 3.0)))
+	(w (vt-from-sequence '(1.0 2.0 3.0)))
+	(expected (vt-from-sequence '(2.3333333333333335)))) ; (1*1+2*2+3*3)/(1+2+3) = 14/6
+    (assert (vt-allclose (vt-average a w) expected)))
+
+  ;; ==========================================
+  ;; 测试 3: 2D 数组全局加权平均 (axis = nil)
+  ;; ==========================================
+  (let ((a (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+	(w (vt-from-sequence '((1.0 2.0) (3.0 4.0)))))
+    ;; 预期结果: 3.0 -> (1*1 + 2*2 + 3*3 + 4*4) / (1+2+3+4) = 30/10
+    (assert (< (abs (- (vt-item (vt-average a w)) 3.0)) 1e-9)))
+
+  ;; ==========================================
+  ;; 测试 4: 2D 数组沿 axis=0 加权平均 (自动沿列方向广播)
+  ;; ==========================================
+  (let ((a (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+	(w (vt-from-sequence '(1.0 2.0))) 
+	(expected (vt-from-sequence '((2.3333333333333335 3.3333333333333335)))))
+    ;; 第0列: (1*1 + 3*2) / 3 = 7/3, 第1列: (2*1 + 4*2) / 3 = 10/3
+    (assert (vt-allclose (vt-average a w :axis 0) expected)))
+
+  ;; ==========================================
+  ;; 测试 5: 2D 数组沿 axis=1 加权平均 + keepdims
+  ;; ==========================================
+  (let ((a (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+	(w (vt-from-sequence '(0.5 1.5))) 
+	(expected (vt-from-sequence '((1.75) (3.75)))))
+    ;; 第0行: (1*0.5 + 2*1.5) / 2.0 = 1.75, 第1行: (3*0.5 + 4*1.5) / 2.0 = 3.75
+    (assert (vt-allclose (vt-average a w :axis 1 :keepdims t) expected)))
+
+  ;; ==========================================
+  ;; 测试 6: 核心边界测试 - 权重和为零 (应抛出异常)
+  ;; ==========================================
+  (let ((a (vt-from-sequence '(1.0 2.0 3.0)))
+	(w (vt-from-sequence '(0.0 0.0 0.0))))
+    ;; 断言: 执行 vt-average 必定抛出 error
+    (assert (handler-case 
+		(progn (vt-average a w) nil) ; 如果没报错返回 nil，断言失败
+              (error () t))))                ; 如果报错返回 t，断言成功
+
+  ;; ==========================================
+  ;; 测试 7: 形状校验 - 2D weights 配合 axis=1 (应抛出异常)
+  ;; ==========================================
+  (let ((a (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+	(w (vt-from-sequence '((0.5) (1.5))))) ;; 2D 权重，NumPy 规范下非法
+    ;; 断言: 必定抛出 error
+    (assert (handler-case 
+		(progn (vt-average a w :axis 1) nil)
+              (error () t))))
+
+  (print "✅ All vt-average tests passed!")
+  )
+
 ;; --------------------------------------------------------------------
 ;; 统计补充
 ;; --------------------------------------------------------------------
@@ -3242,15 +3371,6 @@
     (assert (= p 4.0d0))
     (let ((p0 (vt-to-list (vt-ptp a :axis 0))))
       (assert (equal p0 '(2 3)))))
-
-  ;; vt-average 加权平均
-  ;; a = [1,2,3], weights = [1,2,1]
-  ;; np.average(a, weights=weights) -> (1*1+2*2+3*1)/(1+2+1) = 2.0
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
-         (w (vt-from-sequence '(1 2 1) :type 'double-float))
-         (avg (vt-item (vt-average a w))))
-    (assert (= avg 2.0d0)))
-
   ;; vt-var / vt-std
   ;; a = [1,2,3,4]  有偏方差 = mean((x-mean)^2) = 1.25, std=sqrt(1.25)
   (let* ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
@@ -3681,11 +3801,11 @@
 	   (vals (vt-from-sequence '((10 10 10) (20 20 20)) :type 'fixnum))
 	   (res (vt-insert arr '(1 2) vals :axis 0)))
       (assert (equal (vt-to-list res)
-		      '((1 2 3)
-			(10 10 10)
-			(4 5 6)
-			(20 20 20)
-			(7 8 9)))))
+		     '((1 2 3)
+		       (10 10 10)
+		       (4 5 6)
+		       (20 20 20)
+		       (7 8 9)))))
     ;; 测试 1：轴0插入，索引0
     (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
            (res (vt-insert a 0 (vt-from-sequence '(10 11 12) :type 'double-float) :axis 0))
@@ -3720,95 +3840,95 @@
             (error "应该抛出越界错误"))
 	(error () t)))
 
- "验证 vt-insert 修复后与 NumPy np.insert 行为一致。"
-  (format t "~%===== 测试 vt-insert =====~%")
-  
-  ;; 辅助函数：将序列转为列表便于比较
-  (labels ((vlist (vt) (vt-to-list vt))
-           (arr (seq &key (type 'fixnum))
-             (vt-from-sequence seq :type type)))
+    "验证 vt-insert 修复后与 NumPy np.insert 行为一致。"
+    (format t "~%===== 测试 vt-insert =====~%")
     
-    ;; ---------- 1. 展平，单索引 ----------
-    (let* ((a (arr '(10 20 30 40)))
-           (res (vt-insert a 2 999 :axis nil)))
-      (assert (equal (vlist res) '(10 20 999 30 40))
-              () "展平单索引插入失败")
-      (format t "Test 1 (flat, single) passed~%"))
-    
-    ;; ---------- 2. 展平，多索引，值用列表 ----------
-    (let* ((a (arr '(10 20 30 40)))
-           (res (vt-insert a '(2 0) '(100 200) :axis nil)))
-      ;; NumPy: np.insert([10,20,30,40],[2,0],[100,200]) => [200 10 20 100 30 40]
-      (assert (equal (vlist res) '(200 10 20 100 30 40))
-              () "展平多索引插入失败（顺序错误）")
-      (format t "Test 2 (flat, multi indices) passed~%"))
-    
-    ;; ---------- 3. 展平，单个索引用列表包裹 ----------
-    (let* ((a (arr '(5 6 7)))
-           (res (vt-insert a '(1) 99 :axis nil)))
-      (assert (equal (vlist res) '(5 99 6 7))
-              () "展平单索引列表插入失败")
-      (format t "Test 3 (flat, list of one index) passed~%"))
-    
-    ;; ---------- 4. 沿轴=0 单索引插入行（值块为1行）----------
-    (let* ((a (arr '((1 2) (3 4))))
-           (row (arr '((10 10))))
-           (res (vt-insert a 1 row :axis 0)))
-      ;; NumPy: np.insert([[1,2],[3,4]], 1, [[10,10]], axis=0) => [[1,2],[10,10],[3,4]]
-      (assert (equal (vlist res) '((1 2) (10 10) (3 4)))
-              () "轴0单行插入失败")
-      (format t "Test 4 (axis=0, single row) passed~%"))
-    
-    ;; ---------- 5. 沿轴=1 多索引插入多列 ----------
-    (let* ((a (arr '((1 2 3) (4 5 6))))
-           (vals (arr '((10 20) (30 40))))
-           (res (vt-insert a '(2 0) vals :axis 1)))
-      ;; NumPy: np.insert([[1,2,3],[4,5,6]], [2,0], [[10,20],[30,40]], axis=1)
-      ;; => [[20,1,2,10,3], [40,4,5,30,6]]
-      (assert (equal (vlist res) '((20 1 2 10 3) (40 4 5 30 6)))
-              () "轴1多列插入失败（值块错位）")
-      (format t "Test 5 (axis=1, multi columns) passed~%"))
-    
-    ;; ---------- 6. 沿轴=1 多索引，但值块顺序倒置（关键）----------
-    ;; 验证插入位置与值块的对应关系完全按原始 obj 顺序，而非排序后盲目对应
-    (let* ((a (arr '((1 2 3 4))))
-           (vals (arr '((100 200 300))))  ; 3个值作为三列
-           (res (vt-insert a '(3 1 2) vals :axis 1)))
-      ;; NumPy: np.insert([[1,2,3,4]], [3,1,2], [[100,200,300]], axis=1)
-      (format t "Test 6 result: ~a~%" (vlist res))
-      ;; 使用 assert 严格检查
-      (assert (equal (vlist res) '((1 200 2 300 3 100 4)))
-              () "复杂多索引顺序插入失败")
-      (format t "Test 6 (axis=1, complex order) passed~%"))
-    
-    ;; ---------- 7. 轴=0，多行插入，验证行块对应关系 ----------
-    (let* ((a (arr '((1 2 3) (4 5 6) (7 8 9))))
-           (vals (arr '((10 10 10) (20 20 20))))
-           (res (vt-insert a '(1 2) vals :axis 0)))
-      ;; NumPy: np.insert([[1,2,3],[4,5,6],[7,8,9]], [1,2], [[10,10,10],[20,20,20]], axis=0)
-      ;; => [[1,2,3],[10,10,10],[4,5,6],[20,20,20],[7,8,9]]
-      (assert (equal (vlist res) '((1 2 3) (10 10 10) (4 5 6) (20 20 20) (7 8 9)))
-              () "轴0多行插入失败")
-      (format t "Test 7 (axis=0, multi rows) passed~%"))
-    
-    ;; ---------- 8. 标量 values 自动广播（展平模式）----------
-    (let* ((a (arr '(10 20 30)))
-           (res (vt-insert a 1 99 :axis nil)))
-      (assert (equal (vlist res) '(10 99 20 30))
-              () "标量 values 插入失败")
-      (format t "Test 8 (scalar value) passed~%"))
-    
-    ;; ---------- 9. 沿轴插入单个值（值块大小为1）----------
-    (let* ((a (arr '((1 2) (3 4))))
-           (res (vt-insert a 0 99 :axis 1)))
-      ;; NumPy: np.insert([[1,2],[3,4]], 0, 99, axis=1) => [[99,1,2],[99,3,4]]
-      ;; 注意：np.insert 会把标量广播为与输入匹配的形状，这里插入列是两行
-      (assert (equal (vlist res) '((99 1 2) (99 3 4)))
-              () "标量沿轴插入失败")
-      (format t "Test 9 (scalar along axis) passed~%"))
-    
-    (format t "===== 所有 vt-insert 测试通过 =====~%~%")))
-    t)
+    ;; 辅助函数：将序列转为列表便于比较
+    (labels ((vlist (vt) (vt-to-list vt))
+             (arr (seq &key (type 'fixnum))
+               (vt-from-sequence seq :type type)))
+      
+      ;; ---------- 1. 展平，单索引 ----------
+      (let* ((a (arr '(10 20 30 40)))
+             (res (vt-insert a 2 999 :axis nil)))
+	(assert (equal (vlist res) '(10 20 999 30 40))
+		() "展平单索引插入失败")
+	(format t "Test 1 (flat, single) passed~%"))
+      
+      ;; ---------- 2. 展平，多索引，值用列表 ----------
+      (let* ((a (arr '(10 20 30 40)))
+             (res (vt-insert a '(2 0) '(100 200) :axis nil)))
+	;; NumPy: np.insert([10,20,30,40],[2,0],[100,200]) => [200 10 20 100 30 40]
+	(assert (equal (vlist res) '(200 10 20 100 30 40))
+		() "展平多索引插入失败（顺序错误）")
+	(format t "Test 2 (flat, multi indices) passed~%"))
+      
+      ;; ---------- 3. 展平，单个索引用列表包裹 ----------
+      (let* ((a (arr '(5 6 7)))
+             (res (vt-insert a '(1) 99 :axis nil)))
+	(assert (equal (vlist res) '(5 99 6 7))
+		() "展平单索引列表插入失败")
+	(format t "Test 3 (flat, list of one index) passed~%"))
+      
+      ;; ---------- 4. 沿轴=0 单索引插入行（值块为1行）----------
+      (let* ((a (arr '((1 2) (3 4))))
+             (row (arr '((10 10))))
+             (res (vt-insert a 1 row :axis 0)))
+	;; NumPy: np.insert([[1,2],[3,4]], 1, [[10,10]], axis=0) => [[1,2],[10,10],[3,4]]
+	(assert (equal (vlist res) '((1 2) (10 10) (3 4)))
+		() "轴0单行插入失败")
+	(format t "Test 4 (axis=0, single row) passed~%"))
+      
+      ;; ---------- 5. 沿轴=1 多索引插入多列 ----------
+      (let* ((a (arr '((1 2 3) (4 5 6))))
+             (vals (arr '((10 20) (30 40))))
+             (res (vt-insert a '(2 0) vals :axis 1)))
+	;; NumPy: np.insert([[1,2,3],[4,5,6]], [2,0], [[10,20],[30,40]], axis=1)
+	;; => [[20,1,2,10,3], [40,4,5,30,6]]
+	(assert (equal (vlist res) '((20 1 2 10 3) (40 4 5 30 6)))
+		() "轴1多列插入失败（值块错位）")
+	(format t "Test 5 (axis=1, multi columns) passed~%"))
+      
+      ;; ---------- 6. 沿轴=1 多索引，但值块顺序倒置（关键）----------
+      ;; 验证插入位置与值块的对应关系完全按原始 obj 顺序，而非排序后盲目对应
+      (let* ((a (arr '((1 2 3 4))))
+             (vals (arr '((100 200 300))))  ; 3个值作为三列
+             (res (vt-insert a '(3 1 2) vals :axis 1)))
+	;; NumPy: np.insert([[1,2,3,4]], [3,1,2], [[100,200,300]], axis=1)
+	(format t "Test 6 result: ~a~%" (vlist res))
+	;; 使用 assert 严格检查
+	(assert (equal (vlist res) '((1 200 2 300 3 100 4)))
+		() "复杂多索引顺序插入失败")
+	(format t "Test 6 (axis=1, complex order) passed~%"))
+      
+      ;; ---------- 7. 轴=0，多行插入，验证行块对应关系 ----------
+      (let* ((a (arr '((1 2 3) (4 5 6) (7 8 9))))
+             (vals (arr '((10 10 10) (20 20 20))))
+             (res (vt-insert a '(1 2) vals :axis 0)))
+	;; NumPy: np.insert([[1,2,3],[4,5,6],[7,8,9]], [1,2], [[10,10,10],[20,20,20]], axis=0)
+	;; => [[1,2,3],[10,10,10],[4,5,6],[20,20,20],[7,8,9]]
+	(assert (equal (vlist res) '((1 2 3) (10 10 10) (4 5 6) (20 20 20) (7 8 9)))
+		() "轴0多行插入失败")
+	(format t "Test 7 (axis=0, multi rows) passed~%"))
+      
+      ;; ---------- 8. 标量 values 自动广播（展平模式）----------
+      (let* ((a (arr '(10 20 30)))
+             (res (vt-insert a 1 99 :axis nil)))
+	(assert (equal (vlist res) '(10 99 20 30))
+		() "标量 values 插入失败")
+	(format t "Test 8 (scalar value) passed~%"))
+      
+      ;; ---------- 9. 沿轴插入单个值（值块大小为1）----------
+      (let* ((a (arr '((1 2) (3 4))))
+             (res (vt-insert a 0 99 :axis 1)))
+	;; NumPy: np.insert([[1,2],[3,4]], 0, 99, axis=1) => [[99,1,2],[99,3,4]]
+	;; 注意：np.insert 会把标量广播为与输入匹配的形状，这里插入列是两行
+	(assert (equal (vlist res) '((99 1 2) (99 3 4)))
+		() "标量沿轴插入失败")
+	(format t "Test 9 (scalar along axis) passed~%"))
+      
+      (format t "===== 所有 vt-insert 测试通过 =====~%~%")))
+  t)
 
 (defun test-vt-delete ()
   "测试 vt-delete 与 numpy np.delete 行为的一致性。"
@@ -4279,8 +4399,8 @@
   ;; 测试 6：nanvar 除零
   (let* ((data-nan (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0)))  ; 注意 nan 需要由 (/ 0.0d0 0.0d0) 生成
          (nanvar (vt-nanvar data-nan :ddof 2)))  ; 有效样本数=2, ddof=2 导致除数0
-      (assert-ok (not (vt-float-nan-= (vt-item nanvar) (vt-item nanvar)))
-                 "nanvar 除零时应为 nan"))
+    (assert-ok (not (vt-float-nan-= (vt-item nanvar) (vt-item nanvar)))
+               "nanvar 除零时应为 nan"))
   (format t "~%vt-var / vt-std 全部测试通过~%"))
 
 (defun test-vt-rot90 ()
@@ -4522,6 +4642,7 @@
   (test-vt-argsort)
   (test-vt-argsort-multi-axis)
   (test-vt-put)
+  (test-vt-nanmax-nanmin)
   (test-nan-functions)
   (test-vt-logspace)
   (test-vt-linspace)
@@ -4535,6 +4656,7 @@
   ;; vt-setdiff1d vt-setxor1d vt-in1d
   (test-set-ops)
   (test-activation-loss)
+  (test-vt-average)
   (test-stats-more)
   (test-logical)
   (test-math-ops)
@@ -4566,6 +4688,6 @@
   (test-vt-copy-into)
   (test-vt-matrix-rank)
   (format t "~&~%all test passed")
-)
+  )
 
 

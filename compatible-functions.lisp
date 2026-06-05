@@ -1204,7 +1204,7 @@
 		  0.0d0)) 
             t1 t2)))
 
-(defun vt-all (condition &key axis)
+(defun vt-all (condition &key axis keepdims)
   "检查所有元素是否为真"
   (with-float-safe
     (nth-value
@@ -1214,9 +1214,10 @@
                     (values (if (and (/= acc 0) (/= val 0))
 				1.0d0 0.0d0)
 			    nil))
-                  :return-arg nil))))
+                  :return-arg nil
+		  :keepdims keepdims))))
 
-(defun vt-any (condition &key axis)
+(defun vt-any (condition &key axis keepdims)
   "检查是否存在任一元素为真"
   (with-float-safe
     (nth-value
@@ -1226,7 +1227,8 @@
                     (values (if (or (/= acc 0) (/= val 0))
 				1.0d0 0.0d0)
 			    nil))
-                  :return-arg nil))))
+                  :return-arg nil
+		  :keepdims keepdims))))
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个数组元素是否在容差范围内接近。
