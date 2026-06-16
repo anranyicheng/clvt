@@ -1621,29 +1621,6 @@
   (declare (ignore side))
   (with-float-safe
     (let* ((flat (vt-flatten tensor))
-           (data (vt-data flat))
-           (size (vt-size flat))
-           (values-flat (vt-flatten values))
-           (v-data (vt-data values-flat))
-           (v-size (vt-size values-flat))
-           (result (make-array v-size :element-type 'fixnum)))
-      (loop for i from 0 below v-size
-            for val = (aref v-data i)
-            do (setf (aref result i)
-                     (loop for j from 0 below size
-                           when (>= (aref data j) val)
-                             return j
-                           finally (return size))))
-      (%make-vt :data result
-		:shape (list v-size)
-		:strides '(1)
-		:offset 0
-		:etype 'fixnum))))
-
-(defun vt-searchsorted (tensor values &key side)
-  (declare (ignore side))
-  (with-float-safe
-    (let* ((flat (vt-flatten tensor))
            (data (vt-data flat)) (size (vt-size flat))
            (v-data (vt-data (vt-flatten values)))
            (v-size (vt-size values))
@@ -1657,13 +1634,12 @@
               (if (>= (aref data mid) val)
                   (setf hi mid)
                   (setf lo (1+ mid))))
-          (setf (aref result i) lo)))
+          (setf (aref result i) lo))))
 	(%make-vt :data result
 		  :shape (list v-size)
 		  :strides '(1)
 		  :offset 0
-		  :etype 'fixnum)))))
-
+		  :etype 'fixnum))))
 
 ;;; ===========================================
 ;;; 7. 数据类型转换
