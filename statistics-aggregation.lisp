@@ -279,32 +279,28 @@
 
 (defun vt-nanmax (tensor &key axis keepdims)
   "忽略 nan 的最大值。对标 NumPy: 若沿轴全为 nan 则返回 nan。"
-  (with-float-safe
-    (let* ((mask (vt-isnan tensor))
-           ;; 找出沿指定轴哪些切片全为 nan（1.0 表示全为 nan，0.0 表示不全为）
-           (all-nan-along-axis (vt-all mask :axis axis :keepdims keepdims))
-           ;; 常规逻辑：替换 nan 为 -∞
-           (inf-sub (vt-full-like tensor most-negative-double-float))
-           (clean (vt-where mask inf-sub tensor))
-           ;; 计算忽略 nan 后的最大值
-           (result (vt-amax clean :axis axis :keepdims keepdims)))
-      ;; 后处理：如果是全为 nan 的切片，用 nan 覆盖掉 -∞
-      (vt-where all-nan-along-axis
-                (vt-full-like result (vt-float-nan))
-                result))))
+  (if (eq (vt-element-type tensor) 'fixnum)
+      (vt-amax tensor :axis axis :keepdims keepdims)
+      (with-float-safe
+        (let* ((mask (vt-isnan tensor))
+               (inf-sub (vt-full-like tensor most-negative-double-float
+				      :type 'double-float))
+               (clean (vt-where mask inf-sub tensor))
+               (result (vt-amax clean :axis axis :keepdims keepdims)))
+          (vt-where (vt-all mask :axis axis :keepdims keepdims)
+                    (vt-full-like result (vt-float-nan) :type 'double-float)
+                    result)))))
 
 (defun vt-nanmin (tensor &key axis keepdims)
   "忽略 nan 的最小值。对标 NumPy: 若沿轴全为 nan 则返回 nan。"
-  (with-float-safe
-    (let* ((mask (vt-isnan tensor))
-           ;; 找出沿指定轴哪些切片全为 nan
-           (all-nan-along-axis (vt-all mask :axis axis :keepdims keepdims))
-           ;; 常规逻辑：替换 nan 为 +∞
-           (inf-sub (vt-full-like tensor most-positive-double-float))
-           (clean (vt-where mask inf-sub tensor))
-           ;; 计算忽略 nan 后的最小值
-           (result (vt-amin clean :axis axis :keepdims keepdims)))
-      ;; 后处理：如果是全为 nan 的切片，用 nan 覆盖掉 +∞
-      (vt-where all-nan-along-axis
-                (vt-full-like result (vt-float-nan))
-                result))))
+  (if (eq (vt-element-type tensor) 'fixnum)
+      (vt-amin tensor :axis axis :keepdims keepdims)
+      (with-float-safe
+        (let* ((mask (vt-isnan tensor))
+               (inf-sub (vt-full-like tensor most-positive-double-float
+				      :type 'double-float))
+               (clean (vt-where mask inf-sub tensor))
+               (result (vt-amin clean :axis axis :keepdims keepdims)))
+          (vt-where (vt-all mask :axis axis :keepdims keepdims)
+                    (vt-full-like result (vt-float-nan) :type 'double-float)
+                    result)))))

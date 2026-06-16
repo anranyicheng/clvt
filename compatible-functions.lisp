@@ -351,7 +351,7 @@
               finally (return result))))))
 
 (defun vt-rotate (tensor angle &key (center nil) (order 1) (cval 0.0))
-  "将二维张量按指定角度旋转（对标 scipy.ndimage.rotate）。
+   "将二维张量按指定角度旋转（对标 scipy.ndimage.rotate）。
    
    **旋转中心**：
    - 默认 center = NIL，旋转中心位于张量的几何中心，即 (rows/2, cols/2)。
@@ -387,60 +387,58 @@
    (let ((m (clvt:vt-from-sequence '((1 0) (0 1)))))
      (vt-rotate m (/ pi 6) :order 0))
 "
-  (let* ((shape (vt-shape tensor))
+   (let* ((shape (vt-shape tensor))
          (rows (first shape))
          (cols (second shape))
          (cos-a (cos angle))
          (sin-a (sin angle))
-         (cy (if center (first center) (/ rows 2.0)))
-         (cx (if center (second center) (/ cols 2.0))))
-    (vt-from-function
-     shape
-     (lambda (coords)
-       (destructuring-bind (ny nx) coords   ; 行, 列
-         (let* ((dx (- nx cx))
-                (dy (- ny cy))
-                ;; 逆旋转变换：源坐标相对中心的偏移
-                (src-rel-x (+ (* dx cos-a) (* dy sin-a)))
-                (src-rel-y (- (* dy cos-a) (* dx sin-a)))
-                ;; 回到绝对坐标
-                (src-x (+ src-rel-x cx))
-                (src-y (+ src-rel-y cy)))
-           (if (= order 0)
-               ;; 最近邻
-               (let ((ix (round src-x))
-                     (iy (round src-y)))
-                 (if (and (>= ix 0) (< ix cols)
-                          (>= iy 0) (< iy rows))
-                     (vt-ref tensor iy ix)   ; 注意：行在前
-                     cval))
-               ;; 双线性插值（同样使用修正后的 src-x, src-y）
-               (let* ((x0 (floor src-x))
-                      (y0 (floor src-y))
-                      (x1 (1+ x0))
-                      (y1 (1+ y0))
-                      (fx (- src-x x0))
-                      (fy (- src-y y0))
-                      (fx1 (- 1.0 fx))
-                      (fy1 (- 1.0 fy)))
-                 (if (or (< x0 0) (>= x1 cols)
-                         (< y0 0) (>= y1 rows))
-                     cval
-                     (let ((pxy (vt-ref tensor y0 x0))
-                           (px1y (if (< x1 cols)
-				     (vt-ref tensor y0 x1)
-				     0.0))
-                           (pxy1 (if (< y1 rows)
-				     (vt-ref tensor y1 x0)
-				     0.0))
-                           (px1y1 (if (and (< x1 cols) (< y1 rows))
-                                      (vt-ref tensor y1 x1)
-                                      0.0)))
-                       (+ (* fx1 fy1 pxy)
-                          (* fx fy1 px1y)
-                          (* fx1 fy pxy1)
-                          (* fx fy px1y1)))))))))
-     :type 'double-float)))
+         (cy (if center (first center) (/ rows 2.0d0)))
+         (cx (if center (second center) (/ cols 2.0d0)))
+         ;; 提取底层 1D 数据与步长
+         (in-data (vt-data tensor))
+         (s0 (first (vt-strides tensor)))
+         (s1 (second (vt-strides tensor)))
+         (off (vt-offset tensor))
+         ;; 预分配输出张量
+         (out-vt (vt-zeros shape :type (vt-element-type tensor)))
+         (out-data (vt-data out-vt))
+         ;; 将 cval 预先转为双精度浮点，避免在热循环中频繁转换
+         (cval-d (coerce cval 'double-float)))
+    (loop for ny fixnum from 0 below rows do
+      (loop for nx fixnum from 0 below cols do
+        (let* ((dx (- nx cx))
+               (dy (- ny cy))
+               (src-x (+ cx (* dx cos-a) (* (- dy) sin-a)))
+               (src-y (+ cy (* dx sin-a) (* dy cos-a))))
+          (setf (aref out-data (+ (* ny cols) nx))
+                 (if (= order 0)
+                     ;; === 最近邻插值 ===
+                     (let ((ix (round src-x))
+                           (iy (round src-y)))
+                       (if (and (>= ix 0) (< ix cols) (>= iy 0) (< iy rows))
+                           (aref in-data (+ off (* iy s0) (* ix s1)))
+                           cval-d))
+                     ;; === 双线性插值 ===
+                     (let* ((x0 (floor src-x))
+                            (y0 (floor src-y))
+                            (x1 (1+ x0))
+                            (y1 (1+ y0))
+                            (fx (- src-x x0))
+                            (fy (- src-y y0))
+                            (fx1 (- 1.0d0 fx))
+                            (fy1 (- 1.0d0 fy)))
+                       (if (or (< x0 0) (>= x1 cols) (< y0 0) (>= y1 rows))
+                           cval-d
+                           (let ((p00 (aref in-data (+ off (* y0 s0) (* x0 s1))))
+                                 (p10 (aref in-data (+ off (* y0 s0) (* x1 s1))))
+                                 (p01 (aref in-data (+ off (* y1 s0) (* x0 s1))))
+                                 (p11 (aref in-data (+ off (* y1 s0) (* x1 s1)))))
+                             (+ (* fx1 fy1 p00)
+				(* fx  fy1 p10)
+				(* fx1 fy  p01)
+				(* fx  fy  p11))))))
+	  ))))
+     out-vt))
 
 (defun vt-rotate-origin (tensor angle &key (order 0))
   "绕左上角原点 (0,0) 旋转张量，是 vt-rotate 的便捷版本。
@@ -1642,6 +1640,31 @@
 		:offset 0
 		:etype 'fixnum))))
 
+(defun vt-searchsorted (tensor values &key side)
+  (declare (ignore side))
+  (with-float-safe
+    (let* ((flat (vt-flatten tensor))
+           (data (vt-data flat)) (size (vt-size flat))
+           (v-data (vt-data (vt-flatten values)))
+           (v-size (vt-size values))
+           (result (make-array v-size :element-type 'fixnum)))
+      (loop for i fixnum from 0 below v-size
+            for val = (aref v-data i) do
+        ;; 二分搜索
+        (let ((lo 0) (hi size))
+          (loop while (< lo hi) do
+            (let ((mid (ash (+ lo hi) -1)))
+              (if (>= (aref data mid) val)
+                  (setf hi mid)
+                  (setf lo (1+ mid))))
+          (setf (aref result i) lo)))
+	(%make-vt :data result
+		  :shape (list v-size)
+		  :strides '(1)
+		  :offset 0
+		  :etype 'fixnum)))))
+
+
 ;;; ===========================================
 ;;; 7. 数据类型转换
 ;;; ===========================================
@@ -1744,10 +1767,10 @@
 ;;; 9. 其他数学运算
 ;;; ===========================================
 
-(defun vt-clip (tensor min max)
+(defun vt-clip (tensor min-val max-val)
   "将数值限制在指定范围内"
   (with-float-safe
-    (vt-map (lambda (x) (max min (min max x))) tensor)))
+    (vt-map (lambda (x) (max min-val (min max-val x))) tensor)))
 
 (defun vt-gradient (tensor &key (spacing 1.0d0) axis)
   "计算张量的梯度（沿指定轴的二阶中心差分）。
@@ -2398,29 +2421,50 @@
           (vt-sum integrand :axis ax))))))
 
 (defun vt-interp (x xp fp &key (left nil) (right nil))
-  "一维线性插值。x, xp, fp 均为 1d 张量。"
+  "一维线性插值。x, xp, fp 均为 1d 张量"
   (with-float-safe
-    (let* ((xp-data (vt-data xp))
-           (fp-data (vt-data fp))
-           (n (vt-size xp)))
-      (assert (= (vt-size fp) n))
-      (vt-map
-       (lambda (xi)
-	 (if (<= xi (aref xp-data 0))
-             (if left left (aref fp-data 0))
-             (if (>= xi (aref xp-data (1- n)))
-		 (if right right (aref fp-data (1- n)))
-		 (loop for i from 0 below (1- n)
-                       when (and (>= xi (aref xp-data i))
-				 (<= xi (aref xp-data (1+ i))))
-			 return
-			 (+ (aref fp-data i)
-			    (* (- (aref fp-data (1+ i))
-				  (aref fp-data i))
-                               (/ (- xi (aref xp-data i))
-                                  (- (aref xp-data (1+ i))
-				     (aref xp-data i)))))))))
-       x))))
+    (let* ((xp-vt (if (eq (vt-element-type xp) 'double-float)
+		      xp (vt-astype xp 'double-float)))
+           (fp-vt (if (eq (vt-element-type fp) 'double-float)
+		      fp (vt-astype fp 'double-float)))
+           (x-vt (ensure-vt x :type 'double-float))           
+           (xp-data (vt-data xp-vt))
+           (fp-data (vt-data fp-vt))
+           (n (vt-size xp-vt))
+           (x-data (vt-data x-vt))
+           (x-size (vt-size x-vt))
+           (out-vt (vt-zeros (vt-shape x-vt) :type 'double-float))
+           (out-data (vt-data out-vt))
+           (xp0 (aref xp-data 0))
+           (fp0 (aref fp-data 0))
+           (xp-end (aref xp-data (1- n)))
+           (fp-end (aref fp-data (1- n)))
+           (left-val (if left (coerce left 'double-float) fp0))
+           (right-val (if right (coerce right 'double-float) fp-end)))
+      (loop for i fixnum from 0 below x-size do
+        (let ((xi (aref x-data i)))
+          (setf (aref out-data i)
+                (cond
+                  ((<= xi xp0) left-val)
+                  ((>= xi xp-end) right-val)
+                  (t
+                   (let ((lo 0) (hi (- n 2)))
+                     (declare (type fixnum lo hi))
+                     (loop while (< lo hi) do
+                       (let ((mid (the fixnum (ash (+ lo hi 1) -1))))
+                         (if (<= (aref xp-data mid) xi)
+                             (setf lo mid)
+                             (setf hi (1- mid)))))
+                     (let* ((x-left (aref xp-data lo))
+                            (x-right (aref xp-data (+ lo 1)))
+                            (y-left (aref fp-data lo))
+                            (y-right (aref fp-data (+ lo 1)))
+                            (denom (- x-right x-left)))
+                       (if (zerop denom)
+                           y-left
+                           (+ y-left (* (- y-right y-left)
+                                        (/ (- xi x-left) denom)))))))))))
+      out-vt)))
 
 (defun vt-hypot (t1 &optional t2)
   "计算 (|t1|^2 + |t2|^2)^0.5。支持广播。"

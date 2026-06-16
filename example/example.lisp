@@ -4554,6 +4554,21 @@
     (format t "✅ 测试 5 通过: 降级 coerce 的类型转换拷贝~%"))
   )
 
+(defun test-vt-rotate ()
+  ;; 正确性测试：90度旋转
+  (let* ((mat (vt-from-sequence '((1 2 3)
+                                  (4 5 6)
+                                  (7 8 9))
+				:type 'fixnum))
+         ;; 绕中心 (1.0, 1.0) 逆时针旋转 90 度
+         (rot (vt-rotate mat (/ pi 2) :order 0 :center '(1 1))))
+    
+    ;; 自动化断言验证
+    (let ((expected (vt-from-sequence '((3 6 9)
+                                        (2 5 8)
+                                        (1 4 7)))))
+      (assert (vt-allclose rot expected)))
+    (print "test vt-rotate passed")))
 
 (defun test-vt-matrix-rank ()
   "测试 vt-matrix-rank 函数的三种典型情况"
@@ -4685,6 +4700,7 @@
   (test-vt-atan2)
   (test-vt-var-std)
   (test-vt-rot90)
+  (test-vt-rotate)
   (test-vt-copy-into)
   (test-vt-matrix-rank)
   (format t "~&~%all test passed")
