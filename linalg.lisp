@@ -75,105 +75,142 @@
 
 ;;; 部分选主元 lu 分解 (返回 p, l, u，使 p*a = l*u)
 (defun vt-lu (matrix)
-  "lu 分解。返回 (p, l, u)，其中 p 为置换矩阵（由行交换向量表示）。"
+  "lu 分解。返回 (p, l, u)，其中 p 为置换矩阵(由行交换向量表示)"
   (with-float-safe
-    (let* ((a (ensure-contiguous-2d-vt matrix))
+    (let* ((a (ensure-contiguous-2d-vt (vt-astype matrix 'double-float)))
            (n (first (vt-shape a)))
-           (lu (vt-copy a))          ; 原地存储 l+u
-           (piv (loop for i from 0 below n collect i)) ; 行交换记录
+           (data (vt-data a))
+           (s0 (first (vt-strides a))) ; 行步长
+           (s1 (second (vt-strides a))) ; 列步长
+           (off (vt-offset a))
+           (piv (loop for i from 0 below n collect i))
            (sign 1))
-      (unless (eq (vt-element-type matrix) 'double-float)
-	(setf lu (vt-astype lu 'double-float)))
+      (declare (type (simple-array double-float (*)) data)
+               (type fixnum n s0 s1 off))
       (loop for k from 0 below n
             for max-row = k
-            for max-val = (abs (vt-ref lu k k))
+            for max-val = (abs (aref data (+ off (* k s0) (* k s1))))
             do (loop for i from (1+ k) below n
-                     for abs-a = (abs (vt-ref lu i k))
-                     when (> abs-a max-val)
-                       do (setf max-val abs-a max-row i))
+                     for val = (abs (aref data (+ off (* i s0) (* k s1))))
+                     when (> val max-val)
+                     do (setf max-val val max-row i))
                (when (zerop max-val)
-		 (error "矩阵奇异，无法进行 lu 分解"))
+                 (error "矩阵奇异，无法进行 lu 分解"))
                ;; 交换行
                (unless (= max-row k)
-		 (rotatef (nth k piv) (nth max-row piv))
-		 (setf sign (- sign))
-		 (loop for j from 0 below n
-                       do (rotatef (vt-ref lu k j)
-				   (vt-ref lu max-row j))))
+                 (rotatef (nth k piv) (nth max-row piv))
+                 (setf sign (- sign))
+                 (loop for j from 0 below n
+                       for ptr1 = (+ off (* k s0) (* j s1))
+                       for ptr2 = (+ off (* max-row s0) (* j s1))
+                       do (rotatef (aref data ptr1) (aref data ptr2))))
                ;; 消元
-               (let ((pivot (vt-ref lu k k)))
-		 (loop for i from (1+ k) below n
-                       for multiplier = (/ (vt-ref lu i k) pivot)
-                       do (setf (vt-ref lu i k) multiplier)
+               (let ((pivot (aref data (+ off (* k s0) (* k s1)))))
+                 (loop for i from (1+ k) below n
+                       for ptr-ik = (+ off (* i s0) (* k s1))
+                       for multiplier = (/ (aref data ptr-ik) pivot)
+                       do (setf (aref data ptr-ik) multiplier)
                           (loop for j from (1+ k) below n
-				do (decf (vt-ref lu i j)
-					 (* multiplier (vt-ref lu k j)))))))
-      (values lu piv sign))))
+                                for ptr-ij = (+ off (* i s0) (* j s1))
+                                for ptr-kj = (+ off (* k s0) (* j s1))
+                                do (decf (aref data ptr-ij)
+					 (* multiplier (aref data ptr-kj)))))))
+      (values a piv sign))))
 
 (defun vt-det (matrix)
-  "基于 lu 分解计算行列式。"
+  "基于 lu 分解计算行列式"
   (with-float-safe
     (multiple-value-bind (lu piv sign)
-	(vt-lu matrix)
+        (vt-lu matrix)
       (declare (ignore piv))
-      (let ((n (first (vt-shape lu)))
-            (det sign))
-	(dotimes (i n)
-          (setf det (* det (vt-ref lu i i))))
-	det))))
+      (let* ((n (first (vt-shape lu)))
+             (data (vt-data lu))
+             (s0 (first (vt-strides lu)))
+             (s1 (second (vt-strides lu)))
+             (off (vt-offset lu))
+             (det sign))
+        (loop for i from 0 below n do
+          (setf det (* det (aref data (+ off (* i s0)
+					 (* i s1))))))
+        det))))
 
 (defun vt-solve (a b)
-  "求解线性方程组 ax = b（支持多右端项）。"
+  "求解线性方程组 ax = b (支持多右端项)"
   (with-float-safe
     (let* ((a (ensure-contiguous-2d-vt a))
            (b-vt (ensure-vt b))
            (n (first (vt-shape a)))
-           (nrhs (if (> (length (vt-shape b-vt)) 1)
-                     (second (vt-shape b-vt))
-                     1))
+           (b-shape (vt-shape b-vt))
+           (nrhs (if (> (length b-shape) 1) (second b-shape) 1))
            (b-copy (if (= nrhs 1)
-                       (vt-reshape (vt-copy b-vt) (list n 1))
-                       (vt-copy b-vt))))
-      (unless (eq (vt-element-type b-copy) 'double-float)
-	(setf b-copy (vt-astype b-copy 'double-float)))
+                       (vt-reshape (vt-astype (vt-copy b-vt) 'double-float)
+				   (list n 1))
+                       (vt-astype (vt-copy b-vt) 'double-float)))
+           (orig-b (vt-copy b-copy)))
       (multiple-value-bind (lu piv sign)
-	  (vt-lu a)
-	(declare (ignore sign))
-	
-	;; ==========================================
-	;; 1. 应用行置换 pb
-	;; cltv的piv语义：最终lu的第i行 = 原始a的第piv[i]行
-	;; 所以 pb 的第 i 行 = 原始 b 的第 piv[i] 行
-	;; ==========================================
-	(let ((orig-b (vt-copy b-copy)))
-          (loop for i from 0 below n
-		do (loop for j from 0 below nrhs
-			 do (setf (vt-ref b-copy i j)
-                                  (vt-ref orig-b (nth i piv) j)))))
-	
-	;; 2. 前代
-	(loop for k from 0 below n
-              do (loop for i from (1+ k) below n
-                       for multiplier = (vt-ref lu i k)
-                       do (loop for j from 0 below nrhs
-				do (decf (vt-ref b-copy i j)
-					 (* multiplier (vt-ref b-copy k j))))))
-	
-	;; 3. 回代
-	(loop for k from (1- n) downto 0
-              do (loop for j from 0 below nrhs
-                       do (setf (vt-ref b-copy k j)
-				(/ (vt-ref b-copy k j)
-                                   (vt-ref lu k k))))
-		 (loop for i from 0 below k
-                       for factor = (vt-ref lu i k)
-                       do (loop for j from 0 below nrhs
-				do (decf (vt-ref b-copy i j)
-					 (* factor (vt-ref b-copy k j))))))
-	
-	(if (= nrhs 1)
-            (vt-reshape b-copy (list n))
-            b-copy)))))
+          (vt-lu a)
+        (declare (ignore sign))
+        (let ((lu-data (vt-data lu))
+              (lu-s0 (first (vt-strides lu)))
+              (lu-s1 (second (vt-strides lu)))
+              (lu-off (vt-offset lu))
+              (b-data (vt-data b-copy))
+              (b-s0 (first (vt-strides b-copy)))
+              (b-s1 (second (vt-strides b-copy)))
+              (b-off (vt-offset b-copy))
+              (ob-data (vt-data orig-b))
+              (ob-s0 (first (vt-strides orig-b)))
+              (ob-s1 (second (vt-strides orig-b)))
+              (ob-off (vt-offset orig-b)))          
+          ;; 1. 应用行置换 pb
+          (loop for i from 0 below n do
+            (loop for j from 0 below nrhs do
+              (setf (aref b-data (+ b-off
+				    (* i b-s0)
+				    (* j b-s1)))
+                    (aref ob-data (+ ob-off
+				     (* (nth i piv) ob-s0)
+				     (* j ob-s1))))))          
+          ;; 2. 前代
+          (loop for k from 0 below n do
+            (loop for i from (1+ k) below n
+                  for mult = (aref lu-data (+ lu-off
+					      (* i lu-s0)
+					      (* k lu-s1)))
+                  do (loop for j from 0 below nrhs do
+                    (decf (aref b-data (+ b-off
+					  (* i b-s0)
+					  (* j b-s1)))
+                          (* mult (aref b-data (+ b-off
+						  (* k b-s0)
+						  (* j b-s1))))))))          
+          ;; 3. 回代
+          (loop for k from (1- n) downto 0 do
+            (let ((pivot (aref lu-data (+ lu-off
+					  (* k lu-s0)
+					  (* k lu-s1)))))
+              (loop for j from 0 below nrhs do
+                (setf (aref b-data (+ b-off
+				      (* k b-s0)
+				      (* j b-s1)))
+                      (/ (aref b-data (+ b-off
+					 (* k b-s0)
+					 (* j b-s1)))
+			 pivot)))
+              (loop for i from 0 below k
+                    for factor = (aref lu-data (+ lu-off
+						  (* i lu-s0)
+						  (* k lu-s1)))
+                    do (loop for j from 0 below nrhs do
+                      (decf (aref b-data (+ b-off
+					    (* i b-s0)
+					    (* j b-s1)))
+                            (* factor (aref b-data (+ b-off
+						      (* k b-s0)
+						      (* j b-s1)))))))))
+          (if (= nrhs 1)
+              (vt-reshape b-copy (list n))
+              b-copy))))))
 
 (defun vt-inv (matrix)
   "矩阵求逆。"
@@ -247,16 +284,34 @@
    其中 sigma = -sign(x[0]) * ||x||，β = 2 / ||v||²。
    当 x 为零向量时返回 beta=0, sigma=0。"
   (with-float-safe
-    (let* ((norm-sq (vt-ref (vt-dot x x)))
-           (norm (sqrt norm-sq)))
-      (if (zerop norm)
-          (values (vt-copy x) 0.0d0 0.0d0)
-          (let* ((sx0 (vt-ref x 0))
-                 (sigma (if (>= sx0 0.0d0) (- norm) norm))
-                 (v (vt-copy x)))
-            (setf (vt-ref v 0) (- sx0 sigma))
-            (let ((beta (/ 2.0d0 (vt-ref (vt-dot v v)))))
-              (values v beta sigma)))))))
+    (let* ((x-data (vt-data x))
+           (x-stride (first (vt-strides x)))
+           (x-off (vt-offset x))
+           (size (vt-size x))
+           (norm-sq 0.0d0))
+      (loop for i from 0 below size
+            for ptr = (+ x-off (* i x-stride))
+            for val = (aref x-data ptr)
+            do (incf norm-sq (* val val)))
+      (let ((norm (sqrt norm-sq)))
+        (if (zerop norm)
+            (values (vt-copy x) 0.0d0 0.0d0)
+            (let* ((sx0 (aref x-data x-off))
+                   (sigma (if (>= sx0 0.0d0) (- norm) norm))
+                   (v (vt-copy x))
+                   (v-data (vt-data v)))
+              (setf (aref v-data 0) (- sx0 sigma))
+              (let* ((beta-num 0.0d0)
+                     (v-stride (first (vt-strides v)))
+                     (v-off (vt-offset v)))
+                (loop for i from 0 below size
+                      for ptr = (+ v-off (* i v-stride))
+                      for val = (aref v-data ptr)
+                      do (incf beta-num (* val val)))
+                (let ((beta (/ 2.0d0 beta-num)))
+                  (values v beta sigma)))))))))
+
+
 
 (defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50)
                         (tol 1e-10))
@@ -287,40 +342,52 @@
              (col-dot (m c1 c2)
                (vt-ref (vt-dot (vt-slice m '(:all) (list c1))
 			       (vt-slice m '(:all) (list c2))))))
-
 	(let* ((u (vt-copy mat))   ; m×n
                (v (vt-eye n :type 'double-float))
                (changed t)
                (sweep 0))
-          ;; jacobi 旋转
-          (loop while (and changed (< sweep max-sweeps)) do
-            (setf changed nil)
-            (loop for i from 0 below (1- n) do
-              (loop for j from (1+ i) below n
-                    for alpha = (col-norm-sq u i)
-                    for beta  = (col-norm-sq u j)
-                    for gamma = (col-dot u i j)
-                    when (> (abs gamma) (* tol (sqrt (* alpha beta))))
-                      do (setf changed t)
-			 (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
-				(t-abs (/ 1.0d0 (+ (abs zeta) (sqrt (+ 1 (* zeta zeta))))))
-				(t-val (if (>= zeta 0) t-abs (- t-abs)))
-				(c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
-				(s (* c t-val)))
-                           (let ((old-i (vt-copy (vt-slice u '(:all) (list i))))
-				 (old-j (vt-copy (vt-slice u '(:all) (list j)))))
-                             (setf (vt-slice u '(:all) (list i))
-				   (vt-- (vt-scale old-i c) (vt-scale old-j s)))
-                             (setf (vt-slice u '(:all) (list j))
-				   (vt-+ (vt-scale old-i s) (vt-scale old-j c))))
-                           (let ((old-i (vt-copy (vt-slice v '(:all) (list i))))
-				 (old-j (vt-copy (vt-slice v '(:all) (list j)))))
-                             (setf (vt-slice v '(:all) (list i))
-				   (vt-- (vt-scale old-i c) (vt-scale old-j s)))
-                             (setf (vt-slice v '(:all) (list j))
-				   (vt-+ (vt-scale old-i s) (vt-scale old-j c)))))))
-            (incf sweep))
 
+	  ;; 提取 u 和 v 的底层 1D 数据
+          (let ((u-data (vt-data u))
+                (u-s0 (first (vt-strides u)))
+                (u-s1 (second (vt-strides u)))
+                (u-off (vt-offset u))
+                (v-data (vt-data v))
+                (v-s0 (first (vt-strides v)))
+                (v-s1 (second (vt-strides v)))
+                (v-off (vt-offset v)))            
+            ;; jacobi 旋转
+            (loop while (and changed (< sweep max-sweeps)) do
+              (setf changed nil)
+              (loop for i from 0 below (1- n) do
+                (loop for j from (1+ i) below n
+                      for alpha = (col-norm-sq u i)
+                      for beta = (col-norm-sq u j)
+                      for gamma = (col-dot u i j)
+                      when (> (abs gamma) (* tol (sqrt (* alpha beta)))) do
+                        (setf changed t)
+                        (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
+                               (t-abs (/ 1.0d0 (+ (abs zeta) (sqrt (+ 1 (* zeta zeta))))))
+                               (t-val (if (>= zeta 0) t-abs (- t-abs)))
+                               (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
+                               (s (* c t-val)))
+                          ;; 原地更新 u 的列 i 和 j
+                          (loop for r from 0 below m do
+                            (let* ((ptr-i (+ u-off (* r u-s0) (* i u-s1)))
+                                   (ptr-j (+ u-off (* r u-s0) (* j u-s1)))
+                                   (ui (aref u-data ptr-i))
+                                   (uj (aref u-data ptr-j)))
+                              (setf (aref u-data ptr-i) (- (* ui c) (* uj s)))
+                              (setf (aref u-data ptr-j) (+ (* ui s) (* uj c)))))
+                          ;; 原地更新 v 的列 i 和 j
+                          (loop for r from 0 below n do
+                            (let* ((ptr-i (+ v-off (* r v-s0) (* i v-s1)))
+                                   (ptr-j (+ v-off (* r v-s0) (* j v-s1)))
+                                   (vi (aref v-data ptr-i))
+                                   (vj (aref v-data ptr-j)))
+                              (setf (aref v-data ptr-i) (- (* vi c) (* vj s)))
+                              (setf (aref v-data ptr-j) (+ (* vi s) (* vj c))))))))
+              (incf sweep)))
           ;; 提取奇异值并排序
           (let* ((s-vec (make-array k :element-type 'double-float))
 		 (u-k (vt-zeros (list m k) :type 'double-float))

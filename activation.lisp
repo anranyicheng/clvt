@@ -44,7 +44,7 @@
            (inner (vt-+ vt (vt-scale x-cubed 0.044715d0)))
            (tanh-val (vt-tanh (vt-scale inner c))))
       (vt-scale (vt-* vt
-		      (vt-+ (vt-ones-like vt) tanh-val))
+		      (vt-+ 1.0 tanh-val))
 		0.5d0))))
 
 (defun vt-mish (vt)
