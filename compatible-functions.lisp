@@ -2191,54 +2191,67 @@
     (let* ((shape (vt-shape vt))
            (rank (length shape))
            (pad (normalize-pad-width pad-width rank))
-           
            (cv-list (if (listp constant-values)
 			constant-values
 			(list constant-values constant-values)))
            (c-left (first cv-list))
            (c-right (second cv-list))
-           
-           (new-shape (loop for s in shape for (b a) in pad
-			    collect (+ s b a))))
-      
-      (when (and (listp constant-values) (not (= (length cv-list) 2)))
-	(error "constant-values must be a scalar or a list of exactly 2 elements"))
-      
-      (vt-from-function 
-       new-shape
-       (lambda (out-idxs)
-	 (let ((const-val nil)
-               (src-idxs (make-list rank)))
-           (loop
-	     for d from 0 below rank
-             for ok = (nth d out-idxs)
-             for (bk ak) in pad
-             for sk = (nth d shape)
-             do (let ((offset (- ok bk)))
-                  (declare (fixnum offset))
+           (new-shape (loop for s in shape for (b a) in pad collect (+ s b a)))
+           (out-etype (vt-element-type vt))
+           (out-vt (vt-zeros new-shape :type out-etype))
+           (out-data (vt-data out-vt))
+           (in-data (vt-data vt))
+           (in-offset (vt-offset vt))
+           (out-size (vt-size out-vt))
+           (out-strides-arr
+	     (make-array rank :element-type 'fixnum
+			      :initial-contents (vt-compute-strides new-shape)))
+           (in-shape-arr
+	     (make-array rank :element-type 'fixnum
+			      :initial-contents shape))
+           (in-strides-arr
+	     (make-array rank :element-type 'fixnum
+			      :initial-contents (vt-strides vt)))
+           (pad-before-arr
+	     (make-array rank :element-type 'fixnum
+			      :initial-contents (mapcar #'first pad)))
+           (c-left-conv (coerce c-left out-etype))
+           (c-right-conv (coerce c-right out-etype)))
+      (loop for out-ptr fixnum from 0 below out-size do
+        (let ((rem out-ptr)
+              (in-ptr in-offset)
+              (is-const nil)
+              (const-val c-left-conv))
+          (declare (type fixnum rem in-ptr))
+          (loop for d fixnum from 0 below rank do
+            (let ((stride (aref out-strides-arr d))) ; 正确获取步长
+              (multiple-value-bind (out-idx r) (floor rem stride)
+                (setf rem r)
+                (let* ((bk (aref pad-before-arr d))
+                       (sk (aref in-shape-arr d))
+                       (offset (- out-idx bk))
+                       (in-stride (aref in-strides-arr d))
+                       (src-idx 0)) ; 初始化源索引为 0
+                  (declare (type fixnum out-idx bk sk offset in-stride src-idx))
                   (cond
-                    ;; 左侧填充区：将负数 offset 转化为正向距离 dist
                     ((< offset 0)
                      (if (eq mode :constant)
-			 (unless const-val (setf const-val c-left))
-			 (setf (nth d src-idxs) 
-                               (apply-pad-mode mode (- offset) sk :left))))
-                    ;; 右侧填充区：将越界 offset 转化为正向距离 dist
+                         (unless is-const ; 保证第一个越界维度决定常量值
+                           (setf is-const t)
+                           (setf const-val c-left-conv))
+                         ;; 调用原函数获取映射后的源索引
+                         (setf src-idx (apply-pad-mode mode (- offset) sk :left))))
                     ((>= offset sk)
                      (if (eq mode :constant)
-			 (unless const-val (setf const-val c-right))
-			 (setf (nth d src-idxs) 
-                               ;; cl中 (- a b -1) 等价于 a - b + 1
-                               (apply-pad-mode
-				mode (- offset sk -1) sk :right))))
-                    ;; 原始数据区
-                    (t
-                     (setf (nth d src-idxs) offset)))))
-           
-           (if const-val
-               const-val
-               (apply #'vt-ref vt src-idxs))))
-       :type (vt-element-type vt)))))
+                         (unless is-const
+                           (setf is-const t)
+                           (setf const-val c-right-conv))
+                         (setf src-idx (apply-pad-mode mode (- offset sk -1) sk :right))))
+                    (t (setf src-idx offset)))
+                  (incf in-ptr (* src-idx in-stride))))))
+          (setf (aref out-data out-ptr)
+                (if is-const const-val (aref in-data in-ptr)))))
+      out-vt)))
 
 (defun vt-diff (vt &key (axis -1) (n 1))
   "沿指定轴计算 n 阶差分，与 numpy.diff 兼容。"
