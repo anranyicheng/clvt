@@ -93,28 +93,27 @@
             do (loop for i from (1+ k) below n
                      for val = (abs (aref data (+ off (* i s0) (* k s1))))
                      when (> val max-val)
-                     do (setf max-val val max-row i))
-               (when (zerop max-val)
-                 (error "矩阵奇异，无法进行 lu 分解"))
-               ;; 交换行
-               (unless (= max-row k)
-                 (rotatef (nth k piv) (nth max-row piv))
-                 (setf sign (- sign))
-                 (loop for j from 0 below n
-                       for ptr1 = (+ off (* k s0) (* j s1))
-                       for ptr2 = (+ off (* max-row s0) (* j s1))
-                       do (rotatef (aref data ptr1) (aref data ptr2))))
-               ;; 消元
-               (let ((pivot (aref data (+ off (* k s0) (* k s1)))))
-                 (loop for i from (1+ k) below n
-                       for ptr-ik = (+ off (* i s0) (* k s1))
-                       for multiplier = (/ (aref data ptr-ik) pivot)
-                       do (setf (aref data ptr-ik) multiplier)
-                          (loop for j from (1+ k) below n
-                                for ptr-ij = (+ off (* i s0) (* j s1))
-                                for ptr-kj = (+ off (* k s0) (* j s1))
-                                do (decf (aref data ptr-ij)
-					 (* multiplier (aref data ptr-kj)))))))
+                       do (setf max-val val max-row i))
+	       (unless (zerop max-val)
+		 ;; 交换行
+		 (unless (= max-row k)
+                   (rotatef (nth k piv) (nth max-row piv))
+                   (setf sign (- sign))
+                   (loop for j from 0 below n
+			 for ptr1 = (+ off (* k s0) (* j s1))
+			 for ptr2 = (+ off (* max-row s0) (* j s1))
+			 do (rotatef (aref data ptr1) (aref data ptr2))))
+		 ;; 消元
+		 (let ((pivot (aref data (+ off (* k s0) (* k s1)))))
+                   (loop for i from (1+ k) below n
+			 for ptr-ik = (+ off (* i s0) (* k s1))
+			 for multiplier = (/ (aref data ptr-ik) pivot)
+			 do (setf (aref data ptr-ik) multiplier)
+                            (loop for j from (1+ k) below n
+                                  for ptr-ij = (+ off (* i s0) (* j s1))
+                                  for ptr-kj = (+ off (* k s0) (* j s1))
+                                  do (decf (aref data ptr-ij)
+					   (* multiplier (aref data ptr-kj))))))))
       (values a piv sign))))
 
 (defun vt-det (matrix)
@@ -129,9 +128,14 @@
              (s1 (second (vt-strides lu)))
              (off (vt-offset lu))
              (det sign))
-        (loop for i from 0 below n do
-          (setf det (* det (aref data (+ off (* i s0)
-					 (* i s1))))))
+        (loop for i from 0 below n
+	      for pivot = (aref data (+ off
+					(* i s0)
+					(* i s1)))
+	      when (zerop pivot)
+		do (return-from vt-det 0.0d0)
+		   do
+		      (setf det (* det pivot)))
         det))))
 
 (defun vt-solve (a b)

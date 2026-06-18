@@ -26,13 +26,13 @@
 (defun vt-binary-cross-entropy (y-true y-pred &key (eps 1e-7))
   "二元交叉熵: -[y*log(p) + (1-y)*log(1-p)]"
   (with-float-safe
-    (let* ((p-clipped (vt-clip y-pred eps (- 1.0d0 eps)))
-           (one-minus-p (vt-clip (vt-- 1.0d0 p-clipped) eps 1.0d0))
-           (term1 (vt-* y-true (vt-log p-clipped)))
-           (term2 (vt-* (vt-- 1.0d0 y-true)
-			(vt-log one-minus-p)))
-           (loss (vt-- (vt-+ term1 term2))))
-      (vt-mean loss))))
+    (vt-mean
+     (vt-map (lambda (y p)
+               (let* ((pc (max eps (min (- 1.0d0 eps) p)))
+                      (omp (max eps (- 1.0d0 pc))))
+                 (- (+ (* y (log pc))
+		       (* (- 1.0d0 y) (log omp))))))
+             y-true y-pred))))
 
 (defun vt-cross-entropy (y-true y-pred &key (eps 1e-7))
   "多分类交叉熵: -sum(y_true * log(y_pred))"

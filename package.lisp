@@ -118,7 +118,7 @@
    :vt-round
    :vt-floor
    :vt-ceiling
-   :vt-trancate
+   :vt-truncate
    :vt-rint
    :vt-log
    :vt-log2

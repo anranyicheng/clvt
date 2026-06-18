@@ -404,13 +404,14 @@
          (out-data (vt-data out-vt))
          ;; 将 cval 预先转为双精度浮点，避免在热循环中频繁转换
          (cval-d (coerce cval 'double-float)))
-    (loop for ny fixnum from 0 below rows do
+     (loop for ny fixnum from 0 below rows
+	   for row-off = (* ny cols) do
       (loop for nx fixnum from 0 below cols do
         (let* ((dx (- nx cx))
                (dy (- ny cy))
                (src-x (+ cx (* dx cos-a) (* (- dy) sin-a)))
                (src-y (+ cy (* dx sin-a) (* dy cos-a))))
-          (setf (aref out-data (+ (* ny cols) nx))
+          (setf (aref out-data (+ row-off nx))
                  (if (= order 0)
                      ;; === 最近邻插值 ===
                      (let ((ix (round src-x))

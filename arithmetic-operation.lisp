@@ -182,7 +182,7 @@
   (with-float-safe
     (vt-map (lambda (x) (float (round x) x)) vt)))
 
-(defun vt-trancate (vt &optional (divisor 1))
+(defun vt-truncate (vt &optional (divisor 1))
   "向0取整"
   (with-float-safe
     (vt-map (lambda (x) (truncate x divisor)) vt)))

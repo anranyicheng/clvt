@@ -38,14 +38,14 @@
 (defun vt-gelu (vt)
   "gelu (高斯误差线性单元): 使用 tanh 近似，pytorch 默认方式
    0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3)))"
-  (with-float-safe
-    (let* ((c (sqrt (/ 2.0d0 (coerce pi 'double-float))))
-           (x-cubed (vt-expt vt 3.0d0))
-           (inner (vt-+ vt (vt-scale x-cubed 0.044715d0)))
-           (tanh-val (vt-tanh (vt-scale inner c))))
-      (vt-scale (vt-* vt
-		      (vt-+ 1.0 tanh-val))
-		0.5d0))))
+  (let ((c (sqrt (/ 2.0d0 (coerce pi 'double-float)))))
+    (with-float-safe
+      (vt-map (lambda (x)
+                (let* ((x3 (* x x x))
+                       (inner (+ x (* 0.044715d0 x3)))
+                       (tanh-val (tanh (* c inner))))
+                  (* 0.5d0 x (+ 1.0d0 tanh-val))))
+              vt))))
 
 (defun vt-mish (vt)
   "mish: x * tanh(softplus(x))"
