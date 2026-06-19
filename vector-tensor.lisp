@@ -1717,7 +1717,7 @@
           nans)
       ;; 分离 nan 和非 nan，按原始顺序
       (dolist (x sequence (setq non-nans (nreverse non-nans)
-				nans      (nreverse nans)))
+				nans     (nreverse nans)))
 	(if (vt-float-nan-p x)
             (push x nans)
             (push x non-nans)))
@@ -1729,4 +1729,4 @@
 	     (append non-nans nans))
 	    ((or (eq predicate #'>)
 		 (eq predicate '>))
-	     (append nans (nreverse non-nans)))))))
+	     (append nans non-nans))))))

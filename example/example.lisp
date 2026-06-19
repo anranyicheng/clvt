@@ -4263,6 +4263,15 @@
          (vals (vt-from-sequence '(3 0 6) :type 'fixnum))
          (res (vt-searchsorted a vals)))
     (assert (equal (vt-to-list res) '(2 0 5))))
+
+  (let* ((a (vt-from-sequence '(1 2 2 3 4 5) :type 'fixnum))
+	 (b (vt-from-sequence '(2 5 0 6) :type 'fixnum))
+	 (left (vt-searchsorted a b :side :left))
+	 (right (vt-searchsorted a b :side :right)))
+    (assert (equal (vt-to-list left)
+		   '(1 5 0 6)))
+    (assert (equal (vt-to-list right)
+		   '(3 6 0 6))))  
   (format t "~%test-vt-searchsorted passed.~%"))
 
 ;; --------------------- test vt-extract ---------------------
@@ -4600,7 +4609,6 @@
   
   (format t "--- All vt-matrix-rank tests passed! ---~%")
   t)
-
 
 
 ;; ============================================================

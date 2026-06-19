@@ -570,7 +570,8 @@
                             (lambda (s)
                               (nth real-axis s))
                             shapes)))
-             (result-type (vt-element-type (car vts))))
+	     (result-type (apply #'vt-promote-type
+				 (mapcar #'vt-element-type vts))))
 	(setf (nth real-axis new-shape) total-axis-size)
 	(let ((result (vt-zeros new-shape :type result-type))
               (cur-offset 0))
@@ -1617,30 +1618,38 @@
       (vt-from-sequence (nreverse result-list)
 			:type (vt-element-type tensor)))))
 
-(defun vt-searchsorted (tensor values &key side)
-  "在有序数组中查找插入点"
-  (declare (ignore side))
-  (with-float-safe
+(defun vt-searchsorted (tensor values &key (side :left))
+  "在有序数组中查找插入点。
+   side :left (默认) : 返回第一个等于或大于 values 的索引（即插入到相等元素的左侧）。
+        :right        : 返回第一个大于 values 的索引（即插入到相等元素的右侧）。"
+  (declare (type (member :left :right) side))
+  (with-float-safe 
     (let* ((flat (vt-flatten tensor))
-           (data (vt-data flat)) (size (vt-size flat))
-           (v-data (vt-data (vt-flatten values)))
-           (v-size (vt-size values))
+           (data (vt-data flat))
+           (size (vt-size flat))
+           ;; 预处理 values，支持标量、列表或张量输入
+           (val-vt (ensure-vt values))
+           (v-flat (vt-flatten val-vt))
+           (v-data (vt-data v-flat))
+           (v-size (vt-size v-flat))
            (result (make-array v-size :element-type 'fixnum)))
       (loop for i fixnum from 0 below v-size
-            for val = (aref v-data i) do
-        ;; 二分搜索
-        (let ((lo 0) (hi size))
-          (loop while (< lo hi) do
-            (let ((mid (ash (+ lo hi) -1)))
-              (if (>= (aref data mid) val)
-                  (setf hi mid)
-                  (setf lo (1+ mid))))
-          (setf (aref result i) lo))))
-	(%make-vt :data result
-		  :shape (list v-size)
-		  :strides '(1)
-		  :offset 0
-		  :etype 'fixnum))))
+            for val = (aref v-data i)
+            do (let ((lo 0) (hi size))
+                 (loop while (< lo hi) do
+                   (let ((mid (ash (+ lo hi) -1)))
+                     ;; 根据 side 参数选择比较条件
+                     (if (if (eq side :right)
+                             (> (aref data mid) val)   ; right: 严格大于才收缩右边界
+                             (>= (aref data mid) val)) ; left: 大于等于即收缩右边界
+                         (setf hi mid)
+                         (setf lo (1+ lo)))))
+                 (setf (aref result i) lo)))
+      (%make-vt :data result
+		:shape (list v-size)
+		:strides '(1)
+		:offset 0
+		:etype 'fixnum))))
 
 ;;; ===========================================
 ;;; 7. 数据类型转换
