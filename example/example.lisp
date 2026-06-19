@@ -3206,6 +3206,25 @@
          (res (vt-in1d a b)))
     (assert (equal (vt-to-list res) '(0.0 1.0 0.0))))
 
+  ;; test nan 
+  (let* ((a (vt-from-sequence (list 1 3 4.0
+				    +vt-float-nan+ 
+				    +vt-float-neg-inf+ 
+				    +vt-float-pos-inf+))))
+    (assert (equal (vt-to-list (vt-intersect1d a a))
+		   (list
+		     sb-kernel::double-float-negative-infinity
+		     1.0 3.0 4.0
+		     sb-kernel::double-float-positive-infinity
+		     +vt-float-nan+)))
+    (assert (equal (vt-to-list (vt-setdiff1d a a))
+		   nil))
+    (assert (equal (vt-to-list (vt-setxor1d a a))
+		   nil))
+    (assert (equal (vt-to-list (vt-in1d a a))
+		   '(1.0 1.0 1.0 1.0 1.0 1.0))))
+    
+
   (format t "~%test-set-ops passed.~%"))
 
 
