@@ -700,20 +700,23 @@
                  (flat-val (vt-flatten values-vt))
                  (val-size (vt-size flat-val)))
             ;; 情况1：整数索引 → 整个 values 插入到该位置
-            (when (integerp obj)
-              (let ((current-size (vt-size flat-arr)))
-                (when (or (< obj 0) (> obj current-size))
-                  (error "索引 ~A 越界" obj))
-                (if (zerop val-size)
-                    flat-arr
-                    (let ((left (if (> obj 0)
-                                    (vt-slice flat-arr (list 0 obj))
-                                    (vt-zeros (list 0) :type (vt-element-type flat-arr))))
-                          (right (if (< obj current-size)
-                                     (vt-slice flat-arr (list obj current-size))
-                                     (vt-zeros (list 0) :type (vt-element-type flat-arr)))))
-                      (return-from vt-insert
-                        (vt-concatenate 0 left flat-val right))))))
+	    (when (integerp obj)
+	      (let* ((current-size (vt-size flat-arr))
+		     ;; 【增加负索引规范化】
+		     (norm-obj (if (minusp obj) (+ current-size obj) obj)))
+		;; 修改越界检查的判定条件
+		(when (or (< norm-obj 0) (> norm-obj current-size))
+		  (error "索引 ~A 越界" obj))
+		(if (zerop val-size)
+		    flat-arr
+		    ;; 下面的切片逻辑全部使用 norm-obj 代替 obj
+		    (let ((left (if (> norm-obj 0) 
+				    (vt-slice flat-arr (list 0 norm-obj)) 
+				    (vt-zeros (list 0) :type (vt-element-type flat-arr))))
+			  (right (if (< norm-obj current-size) 
+				     (vt-slice flat-arr (list norm-obj current-size)) 
+				     (vt-zeros (list 0) :type (vt-element-type flat-arr)))))
+		      (return-from vt-insert (vt-concatenate 0 left flat-val right))))))
             ;; 情况2：列表索引
             (let ((num-insert (length obj)))
               ;; 检查 values 长度：必须为1（广播）或等于索引数
@@ -2106,11 +2109,18 @@
       (cond
 	;; 多轴模式：axis 为列表
 	((and axis (listp axis))
-	 (let ((result (vt-copy vt)))
-           (loop for s in shift-list
-		 for ax in axis
-		 do (setf result (vt-roll result s :axis ax)))
-           result))
+	(let* ((result (vt-copy vt))
+               ;; 【增加广播逻辑】如果 shift 是单整数，广播为与 axis 等长的列表
+               (shifts (if (listp shift) 
+			   shift 
+			   (make-list (length axis) :initial-element shift))))
+	  ;; 增加长度一致性校验
+	  (unless (= (length shifts) (length axis))
+	    (error "shift 和 axis 的长度必须一致"))
+	  (loop for s in shifts
+		for ax in axis
+		do (setf result (vt-roll result s :axis ax)))
+	  result))
 	;; 单轴模式：axis 为整数
 	(axis
 	 (let* ((sh (vt-shape vt))

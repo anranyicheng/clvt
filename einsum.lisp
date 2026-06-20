@@ -144,13 +144,19 @@
         
         (let* ((final-output-subs output-subs)
                (explicit-mode (if final-output-subs t nil)))
-          (unless explicit-mode
-            (setf final-output-subs
-                  (sort (loop for i from 0 below 256
-                              when (and (= (aref label-counts i) 1)
-					(find i all-labels-list))
-				collect i)
-                        #'<)))
+	  (unless explicit-mode
+	    (let ((ellipsis-subs nil)
+		  (normal-subs nil))
+	      (loop for label fixnum in all-labels-list
+		    for mapped-idx = (if (< label 0) (+ 256 label) label)
+		    when (= (aref label-counts mapped-idx) 1)
+		      do (if (< label 0)
+			     (push label ellipsis-subs)
+			     (push label normal-subs)))
+	      (setf final-output-subs
+		    (append (sort ellipsis-subs #'>)
+			    (sort normal-subs #'<)))))
+
           (let* ((sum-labels (set-difference all-labels-list
 					     final-output-subs))
                  (all-labels (coerce (append final-output-subs sum-labels)
@@ -245,6 +251,9 @@
                     (setf (aref out-strides-vec i) acc)
                     (setf acc (the fixnum (* acc dim))))
                   (setf (aref out-strides-vec i) 0))))
+	  (when (or (zerop (vt-size output))
+                    (some #'zerop out-shape))
+            (return-from einsum-execute output))
           ;; Double-Float 矩阵乘法快速通道
           (when (and (= n-vts 2)
                      (= rank 3)

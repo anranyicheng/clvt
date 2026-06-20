@@ -145,7 +145,16 @@
     (assert (equal (vt-to-list r) '((2 0 1) (5 3 4)))))
 
   ;; 多元轴滚动 (列表 shift 和 axis)
-  ;; a = np.eye(3) 循环移动两个轴 略，只需确保不报错
+  ;;   arr = np.array([[1, 2, 3],
+  ;;                 [4, 5, 6]])
+  ;; # 将数组同时在轴0和轴1上滚动1步
+  ;; res = np.roll(arr, 1, axis=(0, 1))
+  ;; print(res)
+  (let* ((arr (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum)))
+    (assert (equal (vt-to-list (vt-roll arr 1 :axis '(0 1)))
+		   '((6 4 5)
+		     (3 1 2)))))
+
   (format t "~%test-vt-roll passed.~%"))
 
 ;; ============================================================
@@ -1213,6 +1222,35 @@
          (b (vt-from-sequence '(4 5 6)))
          (res (vt-item (vt-einsum "i,i->" a b))))
     (assert-ok (approx= res 32.0) "向量内积 einsum 失败"))
+
+  
+  ;; # A 形状为 (2, 3), 省略号代表第0轴 (大小为2)
+  ;; A = np.arange(6).reshape(2, 3)
+  ;; # B 形状为 (3,), 只有 i 轴
+  ;; B = np.array([10, 20, 30])
+  ;; # 隐式输出：省略号轴(...)和 i 轴。
+  ;; # 语义：对 A[..., i] 和 B[i] 逐元素相乘，i 轴因为出现两次被消去，省略号轴保留。
+  ;; res = np.einsum("...,i", A, B)
+  ;; print("NumPy 结果形状:", res.shape)
+  ;; print("NumPy 结果值:\n", res)
+  (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
+	 (b (vt-from-sequence '(10 20 30))))
+    ;; 隐式输出：不提供 ->
+    (assert
+     (equal (vt-to-list (vt-einsum "...,i" a b))
+	    '(((0.0 0.0 0.0) (10.0 20.0 30.0) (20.0 40.0 60.0))
+	      ((30.0 60.0 90.0) (40.0 80.0 120.0) (50.0 100.0 150.0))))))
+  ;; a = np.zeros((0, 3))
+  ;; b = np.zeros((3, 4))
+  ;; c = np.einsum('ij,jk->ik', a, b)
+  ;; print(c.shape) # 可能输出 (0, 4)
+  (let* ((a (vt-zeros '(0 3)))
+	 (b (vt-zeros '(3 4))))
+    (assert
+     (equal (vt-shape (vt-einsum "ij,jk->ik" A B)) '(0 4)))
+    (assert
+     (equal (vt-to-list (vt-einsum "ij,jk->ik" A B)) nil)))	  
+  
   (format t "~%test-vt-einsum passed.~%"))
 
 ;; ============================================================
@@ -3945,6 +3983,16 @@
 	(assert (equal (vlist res) '((99 1 2) (99 3 4)))
 		() "标量沿轴插入失败")
 	(format t "Test 9 (scalar along axis) passed~%"))
+
+      ;; arr = np.array([1, 2, 3, 4, 5])
+      ;; # 使用负数索引 -1，期望在最后一个元素(5)前面插入 99
+      ;; res = np.insert(arr, -1, 99)
+      ;; print("NumPy 结果:", res)
+      ;; # 期望输出: [ 1  2  3  4 99  5]
+      (let* ((arr (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
+	(assert (equal (vt-to-list (vt-insert arr -1 99))
+		       '(1 2 3 4 99 5))))
+		       
       
       (format t "===== 所有 vt-insert 测试通过 =====~%~%")))
   t)
