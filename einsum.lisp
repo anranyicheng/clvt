@@ -109,56 +109,60 @@
                     (when output-sub
 		      (expand-sub output-sub max-implicit-rank)))))))))
 
-(defun analyze-einsum (input-subs output-subs vts)
+(defun analyze-einsum (input-subs output-subs vts explicit-p)
   (declare (type list input-subs output-subs vts))
+  (declare (type boolean explicit-p))
   (declare (optimize (speed 3)))
   (with-float-safe
     (let ((label-dims (make-array 266 :element-type 'fixnum
-				      :initial-element 0))
+				      :initial-element -1))
           (label-counts (make-array 266 :element-type 'fixnum
 					:initial-element 0))
           (all-labels-list nil))
-      (macrolet ((to-idx (code)
-		   `(the fixnum (if (< ,code 0)
-				    (+ 256 ,code)
-				    ,code))))
+      (macrolet
+	  ((to-idx (code)
+	     `(the fixnum (if (< ,code 0) (+ 256 ,code) ,code))))
         (loop for sub list in input-subs
-	      for tns in vts for shape = (vt-shape tns)
+              for tns in vts
+              for shape = (vt-shape tns)
               do (unless (= (length sub) (length shape))
-		   (error "subscript dimension mismatch"))
-                 (loop for label fixnum in sub for dim fixnum in shape
-                       do (incf (aref label-counts (to-idx label)))
-                          (pushnew label all-labels-list)
-                          (let ((old-dim (aref label-dims (to-idx label))))
-                            (when (and (> old-dim 1)
-				       (> dim 1)
-				       (/= old-dim dim))
-                              (error "dimension conflict for label ~a: ~a vs ~a" 
-                                     (if (< label 0)
-					 (format nil "ellipsis-dim(~a)"
-						 label)
-					 (string (code-char label)))
-                                     old-dim dim))
-                            (setf (aref label-dims (to-idx label))
-				  (max old-dim dim)))))
-        
+                   (error "subscript dimension mismatch"))
+                 (loop for label fixnum in sub
+                       for dim fixnum in shape do
+                         (incf (aref label-counts (to-idx label)))
+                         (pushnew label all-labels-list)
+                         (let ((old-dim (aref label-dims (to-idx label))))
+                           (when (and (/= old-dim -1)
+                                      (/= dim 1)
+                                      (/= old-dim 1)
+                                      (/= old-dim dim))
+                             (error "dimension conflict for label ~a: ~a vs ~a"
+                                    (if (< label 0)
+					(format nil "ellipsis-dim(~a)" label)
+					(string (code-char label)))
+                                    old-dim dim))
+                           (setf (aref label-dims (to-idx label))
+                                 (if (= old-dim -1)
+				     dim
+				     (max old-dim dim))))))
         (let* ((final-output-subs output-subs)
-               (explicit-mode (if final-output-subs t nil)))
-	  (unless explicit-mode
-	    (let ((ellipsis-subs nil)
-		  (normal-subs nil))
-	      (loop for label fixnum in all-labels-list
-		    for mapped-idx = (if (< label 0) (+ 256 label) label)
-		    when (= (aref label-counts mapped-idx) 1)
-		      do (if (< label 0)
-			     (push label ellipsis-subs)
-			     (push label normal-subs)))
-	      (setf final-output-subs
+               (explicit-mode explicit-p))
+          (unless explicit-mode
+            (let ((ellipsis-subs nil)
+                  (normal-subs nil))
+              (loop for label fixnum in all-labels-list
+                    for mapped-idx = (if (< label 0)
+					 (+ 256 label)
+					 label)
+                    when (or (< label 0)
+			     (= (aref label-counts mapped-idx) 1))
+                    do (if (< label 0)
+                           (push label ellipsis-subs)
+                           (push label normal-subs)))
+              (setf final-output-subs
 		    (append (sort ellipsis-subs #'>)
 			    (sort normal-subs #'<)))))
-
-          (let* ((sum-labels (set-difference all-labels-list
-					     final-output-subs))
+          (let* ((sum-labels (set-difference all-labels-list final-output-subs))
                  (all-labels (coerce (append final-output-subs sum-labels)
 				     'simple-vector)))
             (values all-labels label-dims final-output-subs)))))))
@@ -519,10 +523,11 @@
     (unless (= (length raw-inputs) (length vts))
       (error "提供的张量数量 ~a 与子脚标 ~a 不匹配" (length vts) raw-inputs))
     (multiple-value-bind (input-subs output-subs)
-	(expand-ellipsis raw-inputs raw-output vts)
-      (unless explicit-p (setf output-subs nil))
+        (expand-ellipsis raw-inputs raw-output vts)
+      (unless explicit-p
+        (setf output-subs nil))
       (multiple-value-bind (all-labels label-dims output-subs-final)
-	  (analyze-einsum input-subs output-subs vts)
+          (analyze-einsum input-subs output-subs vts explicit-p)
         (einsum-execute
 	 all-labels label-dims output-subs-final input-subs vts)))))
 

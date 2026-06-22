@@ -1474,7 +1474,10 @@
     (cond
       ;; 2d @ 2d → 2d（矩阵乘法）
       ((and (= ra 2) (= rb 2))
-       (vt-matmul-df a b))
+       (if (and (equal (vt-element-type a) 'fixnum)
+		(equal (vt-element-type b) 'fixnum))
+	   (vt-einsum "ij,jk->ik" a b)
+	   (vt-matmul-df a b)))
       ;; 1d @ 1d → 标量（内积）
       ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b))
       ;; 2d @ 1d → 1d（矩阵乘向量）
@@ -1600,57 +1603,68 @@
            (in-data (vt-data condition))
            (in-strides (vt-strides condition))
            (in-offset (vt-offset condition))
-           ;; 使用动态数组收集结果坐标
-           (result-indices (make-array 0 :element-type 'fixnum 
-					 :fill-pointer t 
-					 :adjustable t)))
+           (result-indices
+	     (make-array 0 :element-type 'fixnum
+			   :fill-pointer t :adjustable t))
+           (coord-buffer (make-array rank :element-type 'fixnum)))
+      (macrolet
+	  ((gen-recurse (test-fn)
+             ;; test-fn 是针对特定类型的安全比较闭包/函数
+             `(labels
+		  ((recurse (depth current-ptr)
+                     (declare (type fixnum depth current-ptr))
+                     (if (= depth rank)
+                         ;; 安全地调用传入的测试逻辑
+                         (when (funcall ,test-fn in-data current-ptr)
+                           (loop for c across coord-buffer
+				 do (vector-push-extend c result-indices)))
+                         (let ((dim (nth depth in-shape))
+                               (stride (nth depth in-strides)))
+                           (declare (type fixnum dim stride))
+                           (loop for i fixnum from 0 below dim do
+                             (setf (aref coord-buffer depth) i)
+                             (recurse (1+ depth)
+				      (+ current-ptr (* i stride))))))))
+                (recurse 0 in-offset))))
+        
+        ;; 冷路径：根据真实数组类型派发，确保安全与性能兼顾
+        (etypecase in-data
+          ((simple-array double-float (*))
+           (gen-recurse
+	    (lambda (data ptr)
+              (declare (type (simple-array double-float (*)) data)
+                       (type fixnum ptr))
+              (/= (aref data ptr) 0.0d0))))
+          ((simple-array fixnum (*))
+           (gen-recurse
+	    (lambda (data ptr)
+              (declare (type (simple-array fixnum (*)) data)
+                       (type fixnum ptr))
+              (/= (the fixnum (aref data ptr)) 0))))
+          ((simple-array single-float (*))
+           (gen-recurse
+	    (lambda (data ptr)
+              (declare (type (simple-array single-float (*)) data)
+                       (type fixnum ptr))
+              (/= (aref data ptr) 0.0f0))))))
       
-      (declare (type (simple-array double-float (*)) in-data)
-               (type list in-shape in-strides)
-               (type (vector fixnum) result-indices))
-      
-      ;; 使用固定大小的坐标缓冲区,避免递归中频繁分配列表
-      (let ((coord-buffer (make-array rank :element-type 'fixnum)))
-	(declare (type (simple-array fixnum (*)) coord-buffer))
-	(labels
-	    ((recurse (depth current-ptr)
-               (declare (type fixnum depth current-ptr))
-               (if (= depth rank)
-                   ;; 叶节点:检查值
-                   (when (/= (aref in-data current-ptr) 0.0d0)
-                     ;; 记录当前坐标缓冲区的内容
-                     (loop for c across coord-buffer do
-                       (vector-push-extend c result-indices)))
-                   ;; 中间节点:遍历维度
-                   (let ((dim (nth depth in-shape))
-			 (stride (nth depth in-strides)))
-                     (declare (type fixnum dim stride))
-                     (loop for i fixnum from 0 below dim do
-                       ;; 更新当前层坐标
-                       (setf (aref coord-buffer depth) i)
-                       (recurse (1+ depth)
-				(+ current-ptr (* i stride))))))))
-          (recurse 0 in-offset)))    
-      ;; 结果封装
+      ;; 结果封装部分保持不变...
       (let* ((total-indices (length result-indices))
              (count (if (zerop rank)
-			total-indices (floor total-indices rank))))
-	;; 如果没有找到元素,返回空张量
-	(if (zerop count)
+			total-indices
+			(floor total-indices rank))))
+        (if (zerop count)
             (vt-zeros (list 0 rank))
             (let ((final-data
 		    (make-array total-indices :element-type 'fixnum)))
-              ;; 转换类型
               (loop for i from 0 below total-indices
-                    for idx across result-indices
-                    do (setf (aref final-data i) idx))
-              ;; 返回 (n, rank) 形状的张量
+		    for idx across result-indices do
+                (setf (aref final-data i) idx))
               (%make-vt :data final-data
 			:shape (list count rank)
-			:strides (list rank 1) ; 连续内存
+			:strides (list rank 1)
 			:offset 0
-			:etype (array-element-type final-data))))))))
-
+			:etype 'fixnum)))))))
 
 ;;;; 关于nan的相关定义
 (eval-when (:compile-toplevel :load-toplevel :execute)
