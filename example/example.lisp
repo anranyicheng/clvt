@@ -3625,7 +3625,7 @@
          (r (vt-round a))
          (f (vt-floor a))
          (c (vt-ceiling a))
-         (e (vt-trancate a)))
+         (e (vt-truncate a)))
     (assert (lists-approx-equal (vt-to-list r) '(-1.0 3.0)))
     (assert (lists-approx-equal (vt-to-list f) '(-2.0 2.0)))
     (assert (lists-approx-equal (vt-to-list c) '(-1.0 3.0)))
@@ -4210,11 +4210,11 @@
          (eq (vt-= a b))
          (lt (vt-< a b))
          (gt (vt-> a b)))
-    (assert (equal (vt-to-list eq) '(1 0 0)))
+    (assert (equal (vt-to-list eq) '(1.0 0.0 0.0)))
     ;; a < b -> [false, true, false]
-    (assert (equal (vt-to-list lt) '(0 1 0)))
+    (assert (equal (vt-to-list lt) '(0.0 1.0 0.0)))
     ;; a > b -> [false, false, true]
-    (assert (equal (vt-to-list gt) '(0 0 1))))
+    (assert (equal (vt-to-list gt) '(0.0 0.0 1.0))))
   (format t "~%test-vt-comparison passed.~%"))
 
 ;; --------------------- test vt-var-std-ddof ---------------------
@@ -4637,14 +4637,192 @@
                                   (7 8 9))
 				:type 'fixnum))
          ;; 绕中心 (1.0, 1.0) 逆时针旋转 90 度
-         (rot (vt-rotate mat (/ pi 2) :order 0 :center '(1 1))))
+         (rot (vt-rotate mat 90 :order 0 :center '(1 1))))
     
     ;; 自动化断言验证
     (let ((expected (vt-from-sequence '((3 6 9)
                                         (2 5 8)
                                         (1 4 7)))))
-      (assert (vt-allclose rot expected)))
-    (print "test vt-rotate passed")))
+      (assert (vt-allclose rot expected))))
+  #|
+
+  ;; ============ 矩阵 1: 5x5 double-float ============
+  (defparameter *m1*
+  (vt-from-sequence '((1 2 3 4 5)
+  (6 7 8 9 10)
+  (11 12 13 14 15)
+  (16 17 18 19 20)
+  (21 22 23 24 25)) :type 'double-float))
+
+  ;; ============ 矩阵 2: 4x4 fixnum ============
+  (defparameter *m2*
+  (vt-from-sequence '((1 2 3 4)
+  (5 6 7 8)
+  (9 10 11 12)
+  (13 14 15 16)) :type 'fixnum))
+
+  ;; ============ 矩阵 3: 3x6 double-float (非对称) ============
+  (defparameter *m3*
+  (vt-from-sequence '((1 2 3 4 5 6)
+  (7 8 9 10 11 12)
+  (13 14 15 16 17 18)) :type 'double-float))
+
+  (format t "=== 矩阵 1: 5x5 double-float ===")
+  (print *m1*)
+
+  (defun test-lisp (m name angle reshape order mode cval)
+  (format t "~%~%--- matrix=~a, angle=~a, reshape=~a, order=~a, mode=~a, cval=~a ---"
+  name angle reshape order mode cval)
+  (print (vt-rotate m angle 
+  :reshape reshape 
+  :order order 
+  :mode mode 
+  :cval cval)))
+
+  ;; --- 5x5 浮点矩阵测试 (20 cases) ---
+  (test-lisp *m1* "m1" 15 nil 0 :constant 0.0)
+  (test-lisp *m1* "m1" 30 nil 1 :constant 0.0)
+  (test-lisp *m1* "m1" -25 nil 0 :reflect 0.0)
+  (test-lisp *m1* "m1" -25 nil 1 :reflect 0.0)
+  (test-lisp *m1* "m1" 45 t 0 :mirror 0.0)
+  (test-lisp *m1* "m1" 45 t 1 :mirror 0.0)
+  (test-lisp *m1* "m1" 60 t 0 :wrap 0.0)
+  (test-lisp *m1* "m1" 60 t 1 :wrap 0.0)
+  (test-lisp *m1* "m1" 90 nil 0 :constant 0.0)
+  (test-lisp *m1* "m1" 90 nil 1 :nearest 0.0)
+  (test-lisp *m1* "m1" 180 nil 1 :constant 0.0)
+  (test-lisp *m1* "m1" -135 t 1 :nearest 0.0)
+  (test-lisp *m1* "m1" 200 t 1 :constant -1.0)
+  (test-lisp *m1* "m1" 37 t 0 :constant 0.0)
+  (test-lisp *m1* "m1" 37 t 1 :constant 0.0)
+  (test-lisp *m1* "m1" -50 nil 0 :wrap 0.0)
+  (test-lisp *m1* "m1" -50 nil 1 :wrap 0.0)
+  (test-lisp *m1* "m1" 75 t 1 :mirror 0.0)
+  (test-lisp *m1* "m1" 120 t 0 :reflect 0.0)
+  (test-lisp *m1* "m1" -75 t 1 :reflect 0.0)
+
+  (format t "~%~%=== 矩阵 2: 4x4 fixnum ===")
+  (print *m2*)
+
+  ;; --- 4x4 整型矩阵测试 (9 cases) ---
+  (test-lisp *m2* "m2" 15 nil 0 :constant 0.0)
+  (test-lisp *m2* "m2" 30 t 0 :constant 0.0)
+  (test-lisp *m2* "m2" -45 t 0 :reflect 0.0)
+  (test-lisp *m2* "m2" 90 nil 0 :wrap 0.0)
+  (test-lisp *m2* "m2" 90 nil 1 :mirror 0.0)
+  (test-lisp *m2* "m2" -60 t 1 :wrap 0.0)
+  (test-lisp *m2* "m2" 135 t 1 :nearest 0.0)
+  (test-lisp *m2* "m2" 180 nil 1 :constant 0.0)
+  (test-lisp *m2* "m2" -120 nil 1 :mirror 0.0)
+
+  (format t "~%~%=== 矩阵 3: 3x6 double-float (非对称) ===")
+  (print *m3*)
+
+  ;; --- 3x6 非对称矩阵测试 (14 cases) ---
+  (test-lisp *m3* "m3" 15 nil 0 :constant 0.0)
+  (test-lisp *m3* "m3" 15 nil 1 :constant 0.0)
+  (test-lisp *m3* "m3" 30 t 0 :reflect 0.0)
+  (test-lisp *m3* "m3" 30 t 1 :reflect 0.0)
+  (test-lisp *m3* "m3" -45 t 0 :mirror 0.0)
+  (test-lisp *m3* "m3" -45 t 1 :mirror 0.0)
+  (test-lisp *m3* "m3" 60 t 0 :wrap 0.0)
+  (test-lisp *m3* "m3" 60 t 1 :wrap 0.0)
+  (test-lisp *m3* "m3" 90 nil 0 :constant 0.0)
+  (test-lisp *m3* "m3" 90 nil 1 :nearest 0.0)
+  (test-lisp *m3* "m3" -135 t 1 :nearest 0.0)
+  (test-lisp *m3* "m3" 200 t 1 :constant -1.0)
+
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  import numpy as np
+  from scipy import ndimage
+
+  # 矩阵 1: 5x5 float64
+  m1 = np.array([
+  [ 1.,  2.,  3.,  4.,  5.],
+  [ 6.,  7.,  8.,  9., 10.],
+  [11., 12., 13., 14., 15.],
+  [16., 17., 18., 19., 20.],
+  [21., 22., 23., 24., 25.]
+  ], dtype=np.float64)
+
+  # 矩阵 2: 4x4 int64
+  m2 = np.array([
+  [ 1,  2,  3,  4],
+  [ 5,  6,  7,  8],
+  [ 9, 10, 11, 12],
+  [13, 14, 15, 16]
+  ], dtype=np.int64)
+
+  # 矩阵 3: 3x6 float64 (非对称)
+  m3 = np.array([
+  [1., 2., 3., 4., 5., 6.],
+  [7., 8., 9., 10., 11., 12.],
+  [13., 14., 15., 16., 17., 18.]
+  ], dtype=np.float64)
+
+  def test_scipy(m, name, angle, reshape, order, mode, cval=0.0):
+  result = ndimage.rotate(m, angle, reshape=reshape, order=order, mode=mode, cval=cval)
+  print(f"\n--- matrix={name}, angle={angle}, reshape={reshape}, order={order}, mode='{mode}', cval={cval} ---")
+  print(repr(result))
+
+  print("=== 矩阵 1: 5x5 float64 ===")
+  print(repr(m1))
+
+  # 5x5 浮点矩阵测试 (20 cases)
+  test_scipy(m1, "m1", 15, False, 0, 'constant', 0.0)
+  test_scipy(m1, "m1", 30, False, 1, 'constant', 0.0)
+  test_scipy(m1, "m1", -25, False, 0, 'reflect', 0.0)
+  test_scipy(m1, "m1", -25, False, 1, 'reflect', 0.0)
+  test_scipy(m1, "m1", 45, True, 0, 'mirror', 0.0)
+  test_scipy(m1, "m1", 45, True, 1, 'mirror', 0.0)
+  test_scipy(m1, "m1", 60, True, 0, 'wrap', 0.0)
+  test_scipy(m1, "m1", 60, True, 1, 'wrap', 0.0)
+  test_scipy(m1, "m1", 90, False, 0, 'constant', 0.0)
+  test_scipy(m1, "m1", 90, False, 1, 'nearest', 0.0)
+  test_scipy(m1, "m1", 180, False, 1, 'constant', 0.0)
+  test_scipy(m1, "m1", -135, True, 1, 'nearest', 0.0)
+  test_scipy(m1, "m1", 200, True, 1, 'constant', -1.0)
+  test_scipy(m1, "m1", 37, True, 0, 'constant', 0.0)
+  test_scipy(m1, "m1", 37, True, 1, 'constant', 0.0)
+  test_scipy(m1, "m1", -50, False, 0, 'wrap', 0.0)
+  test_scipy(m1, "m1", -50, False, 1, 'wrap', 0.0)
+  test_scipy(m1, "m1", 75, True, 1, 'mirror', 0.0)
+  test_scipy(m1, "m1", 120, True, 0, 'reflect', 0.0)
+  test_scipy(m1, "m1", -75, True, 1, 'reflect', 0.0)
+
+  print("\n=== 矩阵 2: 4x4 int64 ===")
+  print(repr(m2))
+
+  # 4x4 整型矩阵测试 (9 cases)
+  test_scipy(m2, "m2", 15, False, 0, 'constant', 0.0)
+  test_scipy(m2, "m2", 30, True, 0, 'constant', 0.0)
+  test_scipy(m2, "m2", -45, True, 0, 'reflect', 0.0)
+  test_scipy(m2, "m2", 90, False, 0, 'wrap', 0.0)
+  test_scipy(m2, "m2", 90, False, 1, 'mirror', 0.0)
+  test_scipy(m2, "m2", -60, True, 1, 'wrap', 0.0)
+  test_scipy(m2, "m2", 135, True, 1, 'nearest', 0.0)
+  test_scipy(m2, "m2", 180, False, 1, 'constant', 0.0)
+  test_scipy(m2, "m2", -120, False, 1, 'mirror', 0.0)
+
+  print("\n=== 矩阵 3: 3x6 float64 (非对称) ===")
+  print(repr(m3))
+
+  # 3x6 非对称矩阵测试 (14 cases)
+  test_scipy(m3, "m3", 15, False, 0, 'constant', 0.0)
+  test_scipy(m3, "m3", 15, False, 1, 'constant', 0.0)
+  test_scipy(m3, "m3", 30, True, 0, 'reflect', 0.0)
+  test_scipy(m3, "m3", 30, True, 1, 'reflect', 0.0)
+  test_scipy(m3, "m3", -45, True, 0, 'mirror', 0.0)
+  test_scipy(m3, "m3", -45, True, 1, 'mirror', 0.0)
+  test_scipy(m3, "m3", 60, True, 0, 'wrap', 0.0)
+  test_scipy(m3, "m3", 60, True, 1, 'wrap', 0.0)
+  test_scipy(m3, "m3", 90, False, 0, 'constant', 0.0)
+  test_scipy(m3, "m3", 90, False, 1, 'nearest', 0.0)
+  test_scipy(m3, "m3", -135, True, 1, 'nearest', 0.0)
+  test_scipy(m3, "m3", 200, True, 1, 'constant', -1.0)
+  |#
+    (print "test vt-rotate passed"))
 
 (defun test-vt-matrix-rank ()
   "测试 vt-matrix-rank 函数的三种典型情况"

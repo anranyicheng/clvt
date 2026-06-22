@@ -41,6 +41,23 @@
   "返回数组元素的类型"
   (vt-etype vt))
 
+(defun vt-promote-type (&rest types)
+  "推断运算结果类型。对标 NumPy: 只要有浮点数就提升为浮点数"
+  (cond
+    ((member 'double-float types) 'double-float)
+    ((member 'single-float types) 'single-float)
+    (t 'fixnum)))
+
+(defun vt-coerce-to-tensor-type (val type-spec)
+  "安全地将值转换为张量指定的元素类型。
+   对于整数类型，执行向0截断（与 C 语言 (int)val 行为一致）。"
+  (cond
+    ((subtypep type-spec 'double-float) (coerce val 'double-float))
+    ((subtypep type-spec 'single-float) (coerce val 'single-float))
+    ((subtypep type-spec 'integer)
+     (if (floatp val) (truncate val) val))
+    (t val)))
+
 (defun vt-shape-to-size (shape)
   "计算形状对应的总元素个数."
   (declare (list shape))
@@ -314,20 +331,25 @@
   (with-float-safe
     (let* ((in-data (vt-data vector-tensor))
            (n (car (vt-shape vector-tensor)))
+           (in-offset (vt-offset vector-tensor))
+           (in-stride (first (vt-strides vector-tensor))) ; 获取 1d 张量的实际步长
            (res (make-vt (list n n) 0
 			 :type (vt-element-type vector-tensor)))
            (res-data (vt-data res))
-           (res-strides (vt-strides res)))    
-      (declare (type fixnum n))
+           (res-strides (vt-strides res)))
+      (declare (type fixnum n in-offset in-stride))
       (let ((row-stride (first res-strides))
-            (col-stride (second res-strides)))      
-	(declare (type fixnum row-stride col-stride))
-	;; 填充对角线
-	(loop for i fixnum from 0 below n
-              for src-off fixnum from 0
+            (col-stride (second res-strides)))
+        (declare (type fixnum row-stride col-stride))
+        ;; 填充对角线
+        (loop for i fixnum from 0 below n
+              ;; 基于输入的 offset 和 stride 计算正确的物理偏移
+              for src-off fixnum = (+ in-offset (* i in-stride))
               for dst-off fixnum = 0 then (+ dst-off row-stride col-stride)
-              do (setf (aref res-data dst-off) (aref in-data src-off))))    
+              do (setf (aref res-data dst-off)
+		       (aref in-data src-off))))
       res)))
+
 
 (defun vt-triu (tensor &key (k 0) (in-place nil))
   "返回上三角矩阵.
@@ -1467,77 +1489,46 @@
   (vt-matmul vt1 vt2))
 
 (defun vt-= (t1 t2)
-  "逐元素相等比较.
-   支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe
-    (let* ((result-element-type (vt-element-type t1))
-	   (true-result (coerce 1 result-element-type))
-	   (false-result (coerce 0 result-element-type)))
-      (vt-map (lambda (a b)
-		(if (= a b) true-result false-result))
-	      t1 t2))))
+  "逐元素相等比较. 支持广播.返回布尔张量(1.0或0.0)."
+  (with-float-safe 
+    (vt-map (lambda (a b) (if (= a b) 1.0d0 0.0d0)) 
+            (ensure-vt t1) 
+            (ensure-vt t2))))
 
 (defun vt-/= (t1 t2)
-  "逐元素不相等比较.
-   支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe
-    (let* ((result-element-type (vt-element-type t1))
-	   (true-result (coerce 1 result-element-type))
-	   (false-result (coerce 0 result-element-type)))
-      (vt-map (lambda (a b)
-		(if (/= a b) true-result false-result))
-	      t1 t2))))
+  "逐元素不相等比较. 支持广播.返回布尔张量(1.0或0.0)."
+  (with-float-safe 
+    (vt-map (lambda (a b) (if (/= a b) 1.0d0 0.0d0)) 
+            (ensure-vt t1) 
+            (ensure-vt t2))))
 
 (defun vt-< (t1 t2)
-  "逐元素小于比较.
-   支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe
-    (let* ((result-element-type (vt-element-type t1))
-	   (true-result (coerce 1 result-element-type))
-	   (false-result (coerce 0 result-element-type)))
-      (vt-map (lambda (a b)
-		(if (< a b) true-result false-result))
-	      t1 t2))))
+  "逐元素小于比较. 支持广播.返回布尔张量(1.0或0.0)."
+  (with-float-safe 
+    (vt-map (lambda (a b) (if (< a b) 1.0d0 0.0d0)) 
+            (ensure-vt t1) 
+            (ensure-vt t2))))
 
 (defun vt-<= (t1 t2)
-  "逐元素小于等于比较.
-   支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe
-    (let* ((result-element-type (vt-element-type t1))
-	   (true-result (coerce 1 result-element-type))
-	   (false-result (coerce 0 result-element-type)))
-      (vt-map (lambda (a b)
-		(if (<= a b) true-result false-result))
-	      t1 t2))))
+  "逐元素小于等于比较. 支持广播.返回布尔张量(1.0或0.0)."
+  (with-float-safe 
+    (vt-map (lambda (a b) (if (<= a b) 1.0d0 0.0d0)) 
+            (ensure-vt t1) 
+            (ensure-vt t2))))
 
 (defun vt-> (t1 t2)
-  "逐元素大于比较.
-   支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe
-    (let* ((result-element-type (vt-element-type t1))
-	   (true-result (coerce 1 result-element-type))
-	   (false-result (coerce 0 result-element-type)))
-      (vt-map (lambda (a b)
-		(if (> a b) true-result false-result))
-	      t1 t2))))
+  "逐元素大于比较. 支持广播.返回布尔张量(1.0或0.0)."
+  (with-float-safe 
+    (vt-map (lambda (a b) (if (> a b) 1.0d0 0.0d0)) 
+            (ensure-vt t1) 
+            (ensure-vt t2))))
 
 (defun vt->= (t1 t2)
-  "逐元素大于等于比较.
-   支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe
-    (let* ((result-element-type (vt-element-type t1))
-	   (true-result (coerce 1 result-element-type))
-	   (false-result (coerce 0 result-element-type)))
-      (vt-map (lambda (a b)
-		(if (>= a b) true-result false-result))
-	      t1 t2))))
-
-(defun vt-promote-type (&rest types)
-  "推断运算结果类型。对标 NumPy: 只要有浮点数就提升为浮点数"
-  (cond
-    ((member 'double-float types) 'double-float)
-    ((member 'single-float types) 'single-float)
-    (t 'fixnum)))
+  "逐元素大于等于比较. 支持广播.返回布尔张量(1.0或0.0)."
+  (with-float-safe 
+    (vt-map (lambda (a b) (if (>= a b) 1.0d0 0.0d0)) 
+            (ensure-vt t1) 
+            (ensure-vt t2))))
 
 (defun vt-where (condition x y)
   "三元条件选择，对标 PyTorch 的 torch.where 和 NumPy 的 np.where(cond, x, y)。
