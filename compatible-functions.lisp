@@ -506,11 +506,13 @@
          (ob00 0.0d0)
          (ob01 (* sin-a (coerce ix 'double-float)))
          (ob02 (* cos-a (coerce iy 'double-float)))
-         (ob03 (+ (* cos-a (coerce iy 'double-float)) (* sin-a (coerce ix 'double-float))))
+         (ob03 (+ (* cos-a (coerce iy 'double-float))
+		  (* sin-a (coerce ix 'double-float))))
          (ob10 0.0d0)
          (ob11 (* cos-a (coerce ix 'double-float)))
          (ob12 (* (- sin-a) (coerce iy 'double-float)))
-         (ob13 (+ (* (- sin-a) (coerce iy 'double-float)) (* cos-a (coerce ix 'double-float))))
+         (ob13 (+ (* (- sin-a) (coerce iy 'double-float))
+		  (* cos-a (coerce ix 'double-float))))
          (ptp0 (- (max ob00 ob01 ob02 ob03) (min ob00 ob01 ob02 ob03)))
          (ptp1 (- (max ob10 ob11 ob12 ob13) (min ob10 ob11 ob12 ob13))))
     (values (max 1 (floor (+ ptp0 0.5d0)))
@@ -593,7 +595,8 @@
                        do (let* (;; 关键：复刻 C 代码的运算顺序
                                  ;; tmp = shift; tmp += ny*c; tmp += nx*s;
                                  (src-y (+ off-y (* ny cos-a) (* nx sin-a)))
-                                 (src-x (+ off-x (* ny (- sin-a)) (* nx cos-a))))
+                                 (src-x (+ off-x (* ny (- sin-a))
+					   (* nx cos-a))))
                             (setf (aref out-data (+ (* ny out-cols) nx))
                                   (vt-coerce-to-tensor-type
 				   (sample-pixel src-x src-y rows cols
@@ -644,9 +647,13 @@
                 (let ((iy start-y) (ix start-x))
                   (declare (type fixnum iy ix))
                   (when edge-y
-                    (setq iy (truncate (map-coordinate (coerce start-y 'double-float) rows spline-mode))))
+                    (setq iy (truncate (map-coordinate
+					(coerce start-y 'double-float)
+					rows spline-mode))))
                   (when edge-x
-                    (setq ix (truncate (map-coordinate (coerce start-x 'double-float) cols spline-mode))))
+                    (setq ix (truncate (map-coordinate
+					(coerce start-x 'double-float)
+					cols spline-mode))))
                   (aref in-data (+ off (* iy s0) (* ix s1))))
                 ;; order=1: 双线性
                 (let* (;; spline weights: fc = cc - floor(cc)
@@ -660,11 +667,19 @@
                            (type fixnum y0 y1 x0 x1))
                   ;; edge 映射使用 spline_mode
                   (when edge-y
-                    (setq y0 (truncate (map-coordinate (coerce y0 'double-float) rows spline-mode)))
-                    (setq y1 (truncate (map-coordinate (coerce y1 'double-float) rows spline-mode))))
+                    (setq y0 (truncate (map-coordinate
+					(coerce y0 'double-float)
+					rows spline-mode)))
+                    (setq y1 (truncate (map-coordinate
+					(coerce y1 'double-float)
+					rows spline-mode))))
                   (when edge-x
-                    (setq x0 (truncate (map-coordinate (coerce x0 'double-float) cols spline-mode)))
-                    (setq x1 (truncate (map-coordinate (coerce x1 'double-float) cols spline-mode))))
+                    (setq x0 (truncate (map-coordinate
+					(coerce x0 'double-float)
+					cols spline-mode)))
+                    (setq x1 (truncate (map-coordinate
+					(coerce x1 'double-float)
+					cols spline-mode))))
                   (let ((p00 (aref in-data (+ off (* y0 s0) (* x0 s1))))
                         (p10 (aref in-data (+ off (* y0 s0) (* x1 s1))))
                         (p01 (aref in-data (+ off (* y1 s0) (* x0 s1))))
@@ -679,7 +694,8 @@
         ;; 触发 cval
         cval)))
 
-    (defun vt-rotate-origin (tensor angle &key (order 0) (reshape nil) (mode :constant) (cval 0.0))
+(defun vt-rotate-origin
+    (tensor angle &key (order 0) (reshape nil) (mode :constant) (cval 0.0))
       "绕左上角原点 (0,0) 旋转张量，是 vt-rotate 的便捷版本。
        等价于 (vt-rotate tensor angle :center '(0 0) :order order ...)。
        该函数将张量的 (0,0) 点视为旋转中心，逆时针旋转 angle 度（注意是度数，不是弧度）。
@@ -692,67 +708,6 @@
                  :reshape reshape 
                  :mode mode 
                  :cval cval))
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 (defun vt-broadcast-to (vt new-shape)
   "将张量广播到新形状，返回零拷贝视图"
