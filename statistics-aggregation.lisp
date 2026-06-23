@@ -1,14 +1,22 @@
 (in-package :clvt)
 
 (defun vt-maximum (t1 t2)
-  "逐元素取两数组中较大者"
-  (with-float-safe
-  (vt-map (lambda (a b) (max a b)) t1 t2)))
+  "逐元素取两数组中较大者。NaN 会传播。"
+  (with-float-safe 
+    (vt-map (lambda (a b)
+              (cond ((vt-float-nan-p a) a) ; 如果 a 是 NaN，返回 NaN
+                    ((vt-float-nan-p b) b) ; 如果 b 是 NaN，返回 NaN
+                    (t (max a b))))
+            t1 t2)))
 
 (defun vt-minimum (t1 t2)
-  "逐元素取两数组中较小者"
-  (with-float-safe
-    (vt-map (lambda (a b) (min a b)) t1 t2)))
+  "逐元素取两数组中较小者。NaN 会传播。"
+  (with-float-safe 
+    (vt-map (lambda (a b)
+              (cond ((vt-float-nan-p a) a) ; 如果 a 是 NaN，返回 NaN
+                    ((vt-float-nan-p b) b) ; 如果 b 是 NaN，返回 NaN
+                    (t (min a b))))
+            t1 t2)))
 
 (defun vt-sum (tensor &key axis keepdims)
   "求和. 自动适配 int/float 类型."
@@ -132,48 +140,58 @@
 	      sum-result))))
 
 (defun vt-average (tensor weights &key axis keepdims)
-  "计算加权平均值. 严格对标 NumPy:
+  "计算加权平均值.
+  严格对标 NumPy:
   - axis 为整数时: weights 必须为 1D 且长度等于 a.shape[axis]，沿 axis 广播
-  - axis 为 nil  时: weights 必须与 tensor 形状完全一致
-  - 权重和为零时抛出异常"
+  - axis 为 nil 时: weights 必须与 tensor 形状完全一致
+  - 权重和为零或 NaN 时：返回 NaN（数值库惯例）或抛出错误。"
   (declare (vt tensor weights))
   (with-float-safe
     (let ((a-shape (vt-shape tensor))
           (w-shape (vt-shape weights)))
       (if axis
+          ;; === 分支 1: 沿指定轴 ===
           (let* ((rank (length a-shape))
                  (ax (vt-normalize-axis axis rank))
                  (ax-size (nth ax a-shape)))
-            (unless (and (= (length w-shape) 1)
-                         (= (first w-shape) ax-size))
+            ;; 形状校验
+            (unless (and (= (length w-shape) 1) (= (first w-shape) ax-size))
               (error "ValueError: 1D weights expected when axis is specified.~@
                       weights shape ~a does not match a.shape[~a] = ~a"
-                     w-shape ax ax-size))
-            (let* ((expanded-shape (loop for i below rank
-                                         collect (if (= i ax) ax-size 1)))
-                   (expanded-w (vt-reshape weights expanded-shape))                   
-                   (weighted-sum (vt-sum (vt-map #'* tensor expanded-w)
-                                         :axis ax :keepdims keepdims))
-                   (sum-weights (vt-item (vt-sum weights)))) ;; 权重和始终是标量
-              (when (zerop sum-weights)
-                (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
-              (vt-map (lambda (s)
-			(/ s sum-weights 1.0d0))
-		      weighted-sum)))
-          
+                     w-shape ax ax-size))            
+            (let* ((expanded-shape (loop for i below rank collect (if (= i ax) ax-size 1)))
+                   (expanded-w (vt-reshape weights expanded-shape))
+                   ;; 计算加权和
+                   (weighted-sum (vt-sum (vt-map #'* tensor expanded-w) :axis ax :keepdims keepdims))
+                   ;; 计算权重和 (标量)
+                   (sum-weights (vt-item (vt-sum weights))))              
+              (cond
+                ;; 情况 1: 权重和为 NaN -> 结果传播 NaN
+                ((vt-float-nan-p sum-weights)
+                 (vt-full (vt-shape weighted-sum) +vt-float-nan+ :type 'double-float))
+                ;; 情况 2: 权重和为 0 -> 报错 (NumPy 标准行为)
+                ((zerop sum-weights)
+                 (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
+                ;; 情况 3: 正常计算
+                (t
+                 (vt-map (lambda (s) (/ s sum-weights 1.0d0)) weighted-sum)))))          
+          ;; === 分支 2: 全局 (axis=nil) ===
           (progn
+            ;; 形状校验
             (unless (equal w-shape a-shape)
               (error "ValueError: weights must have the same shape as a when axis is None.~@
-                      weights shape ~a vs a shape ~a"
-                     w-shape a-shape))
-            (let* ((weighted-sum
-		     (vt-sum (vt-map #'* tensor weights) :keepdims keepdims))
+                      weights shape ~a vs a shape ~a" w-shape a-shape))            
+            (let* ((weighted-sum (vt-sum (vt-map #'* tensor weights) :keepdims keepdims))
                    (sum-weights (vt-item (vt-sum weights))))
-              (when (zerop sum-weights)
-                (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
-              (vt-map (lambda (s)
-			(/ s sum-weights 1.0d0))
-		      weighted-sum)))))))
+              (cond
+                ((vt-float-nan-p sum-weights)
+                 (vt-full (vt-shape weighted-sum) +vt-float-nan+ :type 'double-float))
+                ((zerop sum-weights)
+                 (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
+                (t
+                 (vt-map (lambda (s) (/ s sum-weights 1.0d0)) weighted-sum)))
+              ))))))
+
 
 (defun vt-var (tensor &key axis keepdims (ddof 0))
   "计算方差。
@@ -202,7 +220,7 @@
           ;; vt-map 天然支持 0 维张量，完美契合 PyTorch 规范
           (vt-map (lambda (s)
                     (declare (ignore s))
-                    (vt-float-nan))
+                    +vt-float-nan+)
                   sum-sq)
           ;; 分母合法，执行正常除法
           (vt-/ sum-sq divisor)))))
@@ -224,7 +242,7 @@
            ;; 非 nan 位置为 1，nan 位置为 0
            (not-nan (vt-logical-not mask))
            ;; clean: nan 处填 0，其余不变
-           (clean (vt-where mask (vt-zeros-like tensor) tensor))
+           (clean (vt-where mask 0.0d0 tensor))
            ;; 有效计数
            (count (vt-sum not-nan :axis axis :keepdims keepdims)))
       (values clean count))))
@@ -282,12 +300,10 @@
       (vt-amax tensor :axis axis :keepdims keepdims)
       (with-float-safe
         (let* ((mask (vt-isnan tensor))
-               (inf-sub (vt-full-like tensor most-negative-double-float
-				      :type 'double-float))
-               (clean (vt-where mask inf-sub tensor))
+               (clean (vt-where mask +vt-float-neg-inf+ tensor))
                (result (vt-amax clean :axis axis :keepdims keepdims)))
           (vt-where (vt-all mask :axis axis :keepdims keepdims)
-                    (vt-full-like result (vt-float-nan) :type 'double-float)
+                    +vt-float-nan+
                     result)))))
 
 (defun vt-nanmin (tensor &key axis keepdims)
@@ -296,10 +312,8 @@
       (vt-amin tensor :axis axis :keepdims keepdims)
       (with-float-safe
         (let* ((mask (vt-isnan tensor))
-               (inf-sub (vt-full-like tensor most-positive-double-float
-				      :type 'double-float))
-               (clean (vt-where mask inf-sub tensor))
+               (clean (vt-where mask +vt-float-pos-inf+ tensor))
                (result (vt-amin clean :axis axis :keepdims keepdims)))
           (vt-where (vt-all mask :axis axis :keepdims keepdims)
-                    (vt-full-like result (vt-float-nan) :type 'double-float)
+                    +vt-float-nan+
                     result)))))

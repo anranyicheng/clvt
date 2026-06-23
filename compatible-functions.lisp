@@ -1495,19 +1495,17 @@
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个数组元素是否在容差范围内接近。
-   注意：此实现采用对称容差 (使用 max(|a|, |b|))，与 pytorch 一致。"
+   注意：此实现采用对称容差 (使用 max(|a|, |b|))，与 pytorch 一致"
   (with-float-safe
     (vt-map (lambda (a b)
-              ;; 1. 利用 cl 的 = 运算符：inf == inf 为 t，nan == nan 为 nil
-              ;; 这一步直接拦截了无穷大相等的情况，并加速了完全相同的元素
-              (if (vt-float-nan-inf-= a b)
-                  1.0d0
-                  ;; 2. 对于不相等的有限浮点数，进行容差比较
-                  ;; (如果包含 nan，- 运算会得到 nan，随后的 <= 会返回 nil，逻辑依然正确)
-                  (let ((diff (abs (- a b))))
-                    (if (<= diff (+ atol (* rtol (max (abs a) (abs b)))))
-			1.0d0 
-			0.0d0))))
+              (cond 
+                ((or (vt-float-nan-p a) (vt-float-nan-p b)) 0.0d0)
+                ((or (vt-float-inf-p a) (vt-float-inf-p b))
+                 (if (= a b) 1.0d0 0.0d0))
+                (t
+                 (let ((diff (abs (- a b))))
+                   (if (<= diff (+ atol (* rtol (max (abs a) (abs b)))))
+                       1.0d0 0.0d0)))))
             t1 t2)))
 
 
@@ -1520,33 +1518,27 @@
        1.0d0)))
 
 (defun vt-isfinite (vt)
-  "检查是否为有限值（非 nan，非无穷）。跨平台兼容实现。"
-  (with-float-safe
-    (let ((pos-inf (vt-float-pos-inf))
-          (neg-inf (vt-float-neg-inf)))
-      (vt-map (lambda (x)
-		(if (and (vt-float-nan-= x x) ; 排除 nan
-			 (not (vt-float-inf-= x pos-inf))
-			 (not (vt-float-inf-= x neg-inf)))
-                    1.0d0 0.0d0))
-              vt))))
+  "检查是否为有限值（非 nan，非无穷）。"
+  (with-float-safe 
+    (vt-map (lambda (x) 
+              (if (and (not (vt-float-nan-p x))
+                       (not (vt-float-inf-p x)))
+                  1.0d0 
+                  0.0d0)) vt)))
 
 (defun vt-isinf (vt)
   "检查是否为无穷。"
-  (with-float-safe
-    (let ((pos-inf (vt-float-pos-inf))
-          (neg-inf (vt-float-neg-inf)))
-      (vt-map (lambda (x)
-		(if (or (vt-float-nan-= x pos-inf)
-			(vt-float-inf-= x neg-inf))
-                    1.0d0 0.0d0))
-              vt))))
+  (with-float-safe 
+    (vt-map (lambda (x) 
+              (if (vt-float-inf-p x)
+		  1.0d0 0.0d0))
+	    vt)))
 
 (defun vt-isnan (vt)
   "检查是否为 nan"
   (with-float-safe
     (vt-map (lambda (x)
-              (if (not (vt-float-nan-= x x))  ; nan 不等于自身
+              (if (vt-float-nan-p x)
                   1.0d0 0.0d0))
             vt)))
 

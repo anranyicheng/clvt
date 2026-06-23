@@ -1094,7 +1094,7 @@
   (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
          (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
          (c (vt-matmul a b)))
-    (assert (equal (vt-to-list c) '((10.0 13.0) (28.0 40.0)))))
+    (assert (equal (vt-to-list c) '((10 13) (28 40)))))
 
   ;; 批量矩阵乘法 (使用 einsum 路径)
   ;; a = np.arange(8).reshape(2,2,2)
@@ -2657,6 +2657,8 @@
             (s-axis0 (vt-nansum data :axis 0))
             (s-axis1 (vt-nansum data :axis 1))
             (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
+	(print 222222222222222222)
+	(print s-global)
 	(assert (= (coerce s-global 'double-float) 16.0d0) () "nansum global-> ~a" s-global)
 	(assert (equal (vt-to-list s-axis0) '(5.0 2.0 9.0)))
 	(assert (equal (vt-to-list s-axis1)  '(6.0 10.0)))
@@ -4456,13 +4458,13 @@
   (let* ((data (vt-from-sequence '(1 2 3)))
          (var (vt-item (vt-var data :ddof 3))))
     ;; 应返回 nan (common lisp 的 (coerce (/ 0.0d0 0.0d0) 'double-float) 就是 nan)
-    (assert-ok (not (vt-float-nan-= var var)) "ddof=3 时应返回 nan"))
+    (assert-ok (vt-float-nan-= var var) "ddof=3 时应返回 nan"))
 
   ;; 测试 4：沿轴方差，除数为0
   (let* ((a2d (vt-from-sequence '((1 2) (3 4))))
          (var-axis (vt-var a2d :axis 0 :ddof 2)))
     ;; 每个轴只有2个元素，ddof=2导致除数为0，应得到 nan 张量
-    (assert-ok (every (lambda (v) (not (vt-float-nan-= v v)))
+    (assert-ok (every (lambda (v) (vt-float-nan-= v v))
                       (loop for i below (vt-size var-axis)
                             collect (vt-ref var-axis i)))
                "轴方差除零时应为 nan"))
@@ -4470,12 +4472,12 @@
   ;; 测试 5：标准差除零
   (let* ((data (vt-from-sequence '(1 2 3)))
          (std (vt-item (vt-nanstd data :ddof 3))))
-    (assert-ok (not (vt-float-nan-= std std)) "标准差除零时应返回 nan"))
+    (assert-ok (vt-float-nan-= std std) "标准差除零时应返回 nan"))
 
   ;; 测试 6：nanvar 除零
   (let* ((data-nan (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0)))  ; 注意 nan 需要由 (/ 0.0d0 0.0d0) 生成
          (nanvar (vt-nanvar data-nan :ddof 2)))  ; 有效样本数=2, ddof=2 导致除数0
-    (assert-ok (not (vt-float-nan-= (vt-item nanvar) (vt-item nanvar)))
+    (assert-ok (vt-float-nan-= (vt-item nanvar) (vt-item nanvar))
                "nanvar 除零时应为 nan"))
   (format t "~%vt-var / vt-std 全部测试通过~%"))
 

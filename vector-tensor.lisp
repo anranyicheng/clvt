@@ -1336,18 +1336,35 @@
 
 (declaim (inline get-reduction-identity))
 (defun get-reduction-identity (op element-type)
-  "根据操作类型和元素类型,返回正确的初始值."
-  (case op
-    (:sum
-     (coerce 0 element-type))
-    (:max
-     (cond ((eq element-type 'double-float) most-negative-double-float)
-           ((eq element-type 'fixnum) most-negative-fixnum)
-           (t 0)))
-    (:min
-     (cond ((eq element-type 'double-float) most-positive-double-float)
-           ((eq element-type 'fixnum) most-positive-fixnum)
-           (t 0)))))
+  "根据操作类型和元素类型,返回正确的初始值。
+   修复：使用 IEEE 无穷大作为浮点数归约初始值，以支持输入中的 Inf。"
+  (with-float-safe
+    (case op
+      (:sum
+       (coerce 0 element-type))
+      (:max
+       (cond ((eq element-type 'double-float) 
+              ;; 修复：使用负无穷大，而不是 most-negative-double-float
+              ;; 在 SBCL 中可直接访问
+              #+sbcl sb-ext:double-float-negative-infinity
+              ;; 非 SBCL 的兜底方案：生成一个负无穷大
+              #-sbcl (/ -1.0d0 0.0d0))
+             ((eq element-type 'fixnum) most-negative-fixnum)
+             ((eq element-type 'single-float)
+              #+sbcl sb-ext:single-float-negative-infinity
+              #-sbcl (/ -1.0f0 0.0f0))
+             (t 0)))
+      (:min
+       (cond ((eq element-type 'double-float)
+              ;; 修复：使用正无穷大
+              #+sbcl sb-ext:double-float-positive-infinity
+              #-sbcl (/ 1.0d0 0.0d0))
+             ((eq element-type 'fixnum) most-positive-fixnum)
+             ((eq element-type 'single-float)
+              #+sbcl sb-ext:single-float-positive-infinity
+              #-sbcl (/ 1.0f0 0.0f0))
+             (t 0))))))
+
 
 (declaim (inline vt-reduce))
 (defun vt-reduce
@@ -1619,8 +1636,8 @@
              (if (= depth rank)
 		 ;; 叶节点：根据 condition 决定取 x 还是 y
 		 (setf (aref (vt-data result) r-ptr)
-                       (coerce (if (not (zerop (aref (vt-data condition)
-						     c-ptr)))
+                       (coerce (if (/= (aref (vt-data condition) c-ptr)
+				       0.0d0)
                                    (aref (vt-data x) x-ptr)
                                    (aref (vt-data y) y-ptr))
                                element-type))
@@ -1745,10 +1762,12 @@
   (defun vt-float-inf-= (inf-a inf-b)
     (with-float-safe
       (= inf-a inf-b)))
-
+  
   (defun vt-float-nan-inf-= (a b)
-    (with-float-safe
-      (= a b))))
+    (cond
+      ((and (vt-float-nan-p a) (vt-float-nan-p b)) t)  ; 两个NaN视为相等
+      ((or (vt-float-nan-p a) (vt-float-nan-p b)) nil) ; 一个NaN一个非NaN不相等
+      (t (= a b)))))
 
 (defconstant +vt-float-nan+
   (load-time-value (vt-float-nan)))
