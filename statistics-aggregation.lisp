@@ -118,18 +118,17 @@
            (real-axis (vt-normalize-axis axis rank))
            (sum-result
 	     (vt-sum tensor :axis real-axis :keepdims keepdims))
-           (element-type (vt-element-type tensor))
            (count (if real-axis
                       (the fixnum (nth real-axis shape))
                       (the fixnum (reduce #'* shape)))))
       ;; 避免除以 0
       (when (= count 0)
 	(return-from vt-mean
-          (vt-map (lambda (s) (declare (ignore s)) +vt-float-nan+)
-		  sum-result)))
+	  (vt-full (vt-shape sum-result)
+		   +vt-float-nan+ :type 'double-float)))
       ;; 执行除法
       (vt-map (lambda (s)
-		(/ s (coerce count element-type)))
+		(/ s (coerce count 'double-float)))
 	      sum-result))))
 
 (defun vt-average (tensor weights &key axis keepdims)
@@ -159,7 +158,7 @@
               (when (zerop sum-weights)
                 (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
               (vt-map (lambda (s)
-			(/ s sum-weights))
+			(/ s sum-weights 1.0d0))
 		      weighted-sum)))
           
           (progn
@@ -173,7 +172,7 @@
               (when (zerop sum-weights)
                 (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
               (vt-map (lambda (s)
-			(/ s sum-weights))
+			(/ s sum-weights 1.0d0))
 		      weighted-sum)))))))
 
 (defun vt-var (tensor &key axis keepdims (ddof 0))
