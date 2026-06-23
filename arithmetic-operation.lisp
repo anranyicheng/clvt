@@ -33,14 +33,18 @@
   (apply #'vt-- vt args))
 
 (defun vt-/ (vt &rest args)
-  "逐元素除法.
-   单参数: 倒数.
-   多参数: a / b / c ... "
-  (with-float-safe
+  "逐元素除法. 单参数: 倒数. 多参数: a / b / c ... "
+  (with-float-safe 
     (let ((first-vt (ensure-vt vt)))
       (if (null args)
           (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
-          (apply #'vt-map #'/ first-vt args)))))
+          ;; 使用 reduce 依次执行两两除法
+          (reduce (lambda (acc x) 
+                    (vt-map (lambda (a b)
+			      (/ (coerce a 'double-float) b)) 
+                            acc (ensure-vt x)))
+                  args
+                  :initial-value first-vt)))))
 
 (defun vt-div (vt &rest args)
   (apply #'vt-/ vt args))
@@ -99,7 +103,11 @@
 
 (defun vt-sqrt (vt)
   "计算逐元素平方根."
-  (vt-map #'sqrt vt))
+   (vt-map (lambda (x) 
+            (if (minusp x) 
+                +vt-float-nan+
+                (sqrt x)))
+	   vt))
 
 (defun vt-abs (vt)
   "计算逐元素绝对值."
@@ -156,10 +164,13 @@
   (with-float-safe
     (vt-map (lambda (x) (rem x divisor)) vt)))
 
-(defun vt-atan2 (vty x)
-  "逐元素计算 atan2(y, x). 支持广播."
-  (with-float-safe
-    (vt-map (lambda (y vax) (atan y vax)) vty x)))
+(defun vt-atan2 (vty vtx)
+  "逐元素计算 atan2(y, x). 支持广播.
+   参数 vty 代表 y 轴坐标，参数 x 代表 x 轴坐标。"
+  (with-float-safe 
+    (vt-map (lambda (y-coord x-coord) 
+              (atan y-coord x-coord)) 
+            vty vtx)))
 
 (defun vt-floor (vt &optional (divisor 1))
   "向下取整."
@@ -178,9 +189,12 @@
 
 (defun vt-rint (vt)
   "四舍五入到最接近的整数 (浮点数返回值)."
-  ;; common lisp 没有直接的 rint,使用 round 然后 float 化
-  (with-float-safe
-    (vt-map (lambda (x) (float (round x) x)) vt)))
+  (with-float-safe 
+    (vt-map (lambda (x) 
+              (let ((res (nth-value 0 (round x))))
+                (if (floatp x)
+		    (float res 1.0d0) res))) 
+            vt)))
 
 (defun vt-truncate (vt &optional (divisor 1))
   "向0取整"
@@ -188,14 +202,18 @@
     (vt-map (lambda (x) (truncate x divisor)) vt)))
 
 (defun vt-log (vt &optional base)
-  "以 base 为底的对数."
-  (with-float-safe
+  "以 base 为底的对数. (非正数返回 nan)"
+  (with-float-safe 
     (if base
-	(vt-map (lambda (val)
-		  (log val base))
+        (vt-map (lambda (val)
+		  (if (<= val 0)
+		      +vt-float-nan+
+		      (log val base)))
 		vt)
-	(vt-map (lambda (val)
-		  (log val))
+        (vt-map (lambda (val)
+		  (if (<= val 0)
+		      +vt-float-nan+
+		      (log val)))
 		vt))))
 
 (defun vt-log10 (vt)

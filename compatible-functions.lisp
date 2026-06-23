@@ -354,14 +354,14 @@
 ;; 1. cephes cosdg/sindg 绝对精准复刻
 ;; ===================================================================
 
-(defconstant +pi180+ 1.74532925199432957692d-2)
+(defparameter *clvt-pi180* 1.74532925199432957692d-2)
 
-(defconstant +sincof+
+(defparameter *clvt-sincof*
   #(1.58962301572218447952d-10 -2.50507477628503540135d-8
     2.75573136213856773549d-6 -1.98412698295895384658d-4
     8.33333333332211858862d-3 -1.66666666666666307295d-1))
 
-(defconstant +coscof+
+(defparameter *clvt-coscof*
   #(1.13678171382044553091d-11 -2.08758833757683644217d-9
     2.75573155429816611547d-7 -2.48015872936186303776d-5
     1.38888888888806666760d-3 -4.16666666666666348141d-2
@@ -397,11 +397,11 @@
       (when (> j 3)
         (setf sign (- sign))
         (decf j 4))
-      (let* ((x2 (* (- xx (* y 45d0)) +pi180+))
+      (let* ((x2 (* (- xx (* y 45d0)) *clvt-pi180*))
              (zz (* x2 x2))
              (res (if (or (= j 1) (= j 2))
-                      (- 1d0 (* zz (cephes-polevl zz +coscof+ 6)))
-                      (+ x2 (* x2 (* zz (cephes-polevl zz +sincof+ 5)))))))
+                      (- 1d0 (* zz (cephes-polevl zz *clvt-coscof* 6)))
+                      (+ x2 (* x2 (* zz (cephes-polevl zz *clvt-sincof* 5)))))))
         (declare (type double-float res))
         (if (< sign 0) (- res) res)))))
 
@@ -425,11 +425,11 @@
         (decf j 4))
       (when (> j 1)
         (setf sign (- sign)))
-      (let* ((x2 (* (- xx (* y 45d0)) +pi180+))
+      (let* ((x2 (* (- xx (* y 45d0)) *clvt-pi180*))
              (zz (* x2 x2))
              (res (if (or (= j 1) (= j 2))
-                      (+ x2 (* x2 (* zz (cephes-polevl zz +sincof+ 5))))
-                      (- 1d0 (* zz (cephes-polevl zz +coscof+ 6))))))
+                      (+ x2 (* x2 (* zz (cephes-polevl zz *clvt-sincof* 5))))
+                      (- 1d0 (* zz (cephes-polevl zz *clvt-coscof* 6))))))
         (declare (type double-float res))
         (if (< sign 0) (- res) res)))))
 

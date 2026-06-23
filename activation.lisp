@@ -1,11 +1,14 @@
 (in-package :clvt)
 
 (defun vt-sigmoid (vt)
-  "sigmoid: 1 / (1 + exp(-x))"
-  (with-float-safe
+  "sigmoid: 1 / (1 + exp(-x)) —— 数值稳定版"
+  (with-float-safe 
     (vt-map (lambda (x)
-	      (/ 1.0d0 (+ 1.0d0 (exp (- x)))))
-	    vt)))
+              (if (>= x 0)
+                  (/ 1.0d0 (+ 1.0d0 (exp (- x))))
+                  (let ((exp-x (exp x)))
+                    (/ exp-x (+ 1.0d0 exp-x)))))
+            vt)))
 
 (defun vt-relu (vt)
   "relu: max(0, x)"
@@ -16,7 +19,7 @@
   "leaky relu: max(alpha * x, x)"
   (with-float-safe
     (vt-map (lambda (x)
-	      (if (> x 0.0d0) x (* alpha x)))
+	      (if (> x 0.0d0) (* x 1.0d0) (* alpha x)))
 	    vt)))
 
 (defun vt-swish (vt)
