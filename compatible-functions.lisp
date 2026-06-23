@@ -327,23 +327,23 @@
     k    : 旋转次数（正整数为逆时针，负数为顺时针），自动模 4。
    
    返回零拷贝视图（当底层操作均为视图时）。
-   行为与 NumPy 的 rot90 完全一致。"
+   行为与 numpy 的 rot90 完全一致。"
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (when (< rank 2)
-      (error "vt-rot90: tensor rank must be >= 2, but got rank ~D" rank))
+      (error "vt-rot90: tensor rank must be >= 2, but got rank ~d" rank))
     (let ((ax0 (first axes))
           (ax1 (second axes)))
       ;; 支持负数轴
       (setf ax0 (vt-normalize-axis ax0 rank))
       (setf ax1 (vt-normalize-axis ax1 rank))
       (when (= ax0 ax1)
-        (error "vt-rot90: axes must be different, but got ~D and ~D" ax0 ax1))
+        (error "vt-rot90: axes must be different, but got ~d and ~d" ax0 ax1))
       ;; k 规范化到 0~3
       (let ((k (mod k 4)))
         (when (minusp k)    ; 保证非负
           (incf k 4))
-        ;; 重复 k 次：先转置，再翻转第一个轴（与 NumPy 一致）
+        ;; 重复 k 次：先转置，再翻转第一个轴（与 numpy 一致）
         (loop with result = tensor
               repeat k
               do (setf result (vt-swapaxes result ax0 ax1))
@@ -351,7 +351,7 @@
               finally (return result))))))
 
 ;; ===================================================================
-;; 1. Cephes cosdg/sindg 绝对精准复刻
+;; 1. cephes cosdg/sindg 绝对精准复刻
 ;; ===================================================================
 
 (defconstant +pi180+ 1.74532925199432957692d-2)
@@ -368,7 +368,7 @@
     4.99999999999999999798d-1))
 
 (defun cephes-polevl (x coef n)
-  "Cephes Horner 多项式求值: coef[0]*x^n + ... + coef[n]"
+  "cephes horner 多项式求值: coef[0]*x^n + ... + coef[n]"
   (let ((ans (aref coef 0)))
     (do ((i 1 (1+ i)))
         ((> i n) ans)
@@ -376,7 +376,7 @@
       (setf ans (+ (* ans x) (aref coef i))))))
 
 (defun cephes-sindg (x)
-  "完全复刻 C 源码 sindg"
+  "完全复刻 c 源码 sindg"
   (declare (type double-float x))
   (let ((sign 1d0)
         (xx x))
@@ -406,7 +406,7 @@
         (if (< sign 0) (- res) res)))))
 
 (defun cephes-cosdg (x)
-  "完全复刻 C 源码 cosdg"
+  "完全复刻 c 源码 cosdg"
   (declare (type double-float x))
   (let* ((sign 1d0)
          (xx (if (< x 0d0) (- x) x)))
@@ -435,7 +435,7 @@
 
 
 ;; ===================================================================
-;; 2. map_coordinate (1:1 复刻 C 源码边界逻辑)
+;; 2. map_coordinate (1:1 复刻 c 源码边界逻辑)
 ;; ===================================================================
 
 (defun map-coordinate (in len mode)
@@ -446,7 +446,7 @@
        (:mirror
         (if (<= len 1) 0.0d0
             (let* ((sz2 (- (* 2 len) 2))  ;; 2*len - 2
-                   (n (truncate (/ (- in) sz2))))
+					  (n (truncate (/ (- in) sz2))))
               (declare (type fixnum sz2 n))
               (setq in (+ (* sz2 n) in))
               (if (<= in (- 1 len)) (+ in sz2) (- in)))))
@@ -501,55 +501,55 @@
 ;; ===================================================================
 
 (defun compute-rotated-shape (rows cols cos-a sin-a)
-  "复刻 Python: out_bounds = rot_matrix @ corners; shape = floor(ptp + 0.5)"
+  "复刻 python: out_bounds = rot_matrix @ corners; shape = floor(ptp + 0.5)"
   (let* ((iy rows) (ix cols)
-         (ob00 0.0d0)
-         (ob01 (* sin-a (coerce ix 'double-float)))
-         (ob02 (* cos-a (coerce iy 'double-float)))
-         (ob03 (+ (* cos-a (coerce iy 'double-float))
-		  (* sin-a (coerce ix 'double-float))))
-         (ob10 0.0d0)
-         (ob11 (* cos-a (coerce ix 'double-float)))
-         (ob12 (* (- sin-a) (coerce iy 'double-float)))
-         (ob13 (+ (* (- sin-a) (coerce iy 'double-float))
-		  (* cos-a (coerce ix 'double-float))))
-         (ptp0 (- (max ob00 ob01 ob02 ob03) (min ob00 ob01 ob02 ob03)))
-         (ptp1 (- (max ob10 ob11 ob12 ob13) (min ob10 ob11 ob12 ob13))))
+		   (ob00 0.0d0)
+		   (ob01 (* sin-a (coerce ix 'double-float)))
+		   (ob02 (* cos-a (coerce iy 'double-float)))
+		   (ob03 (+ (* cos-a (coerce iy 'double-float))
+			    (* sin-a (coerce ix 'double-float))))
+		   (ob10 0.0d0)
+		   (ob11 (* cos-a (coerce ix 'double-float)))
+		   (ob12 (* (- sin-a) (coerce iy 'double-float)))
+		   (ob13 (+ (* (- sin-a) (coerce iy 'double-float))
+			    (* cos-a (coerce ix 'double-float))))
+		   (ptp0 (- (max ob00 ob01 ob02 ob03) (min ob00 ob01 ob02 ob03)))
+		   (ptp1 (- (max ob10 ob11 ob12 ob13) (min ob10 ob11 ob12 ob13))))
     (values (max 1 (floor (+ ptp0 0.5d0)))
             (max 1 (floor (+ ptp1 0.5d0))))))
 
 (defun vt-rotate (tensor angle &key
-                  (reshape nil)
-                  (order 1)
-                  (mode :constant)
-                  (cval 0.0)
-                  (center nil))
+				 (reshape nil)
+				 (order 1)
+				 (mode :constant)
+				 (cval 0.0)
+				 (center nil))
   "将二维张量按指定角度旋转（完全对标 scipy.ndimage.rotate 的行为与精度）。
    
    **角度单位与方向**：
-   - angle 的单位为**度（Degrees）**，而非弧度。
+   - angle 的单位为**度（degrees）**，而非弧度。
    - angle 为正时表示逆时针旋转，为负时表示顺时针旋转。
-   - 底层调用精准复刻的 Cephes sindg/cosdg 算法，确保与 SciPy 浮点结果按位级一致。
+   - 底层调用精准复刻的 cephes sindg/cosdg 算法，确保与 scipy 浮点结果按位级一致。
 
    **旋转中心**：
-   - 默认 center = NIL，旋转中心位于张量的几何中心，即坐标 ((rows-1)/2, (cols-1)/2)。
+   - 默认 center = nil，旋转中心位于张量的几何中心，即坐标 ((rows-1)/2, (cols-1)/2)。
    - 若提供 center 列表 (cy, cx)，则绕该指定点旋转。例如 '(0 0) 表示绕左上角原点旋转。
    - 注意：行坐标对应 cy，列坐标对应 cx，与数组索引顺序一致（行在前，列在后）。
 
    **画布大小**：
-   - reshape = NIL (默认)：保持原始张量的形状不变，旋转后超出边界的部分会被截断。
-   - reshape = T：自动扩大输出张量的画布（形状重新计算），以完整包含旋转后的所有内容。
+   - reshape = nil (默认)：保持原始张量的形状不变，旋转后超出边界的部分会被截断。
+   - reshape = t：自动扩大输出张量的画布（形状重新计算），以完整包含旋转后的所有内容。
 
    **插值方式**：
    - order = 0 : 最近邻插值（直接取整，速度快，边缘有锯齿，像素值不改变）。
    - order = 1 : 双线性插值（平滑过渡，但计算量稍大，会产生新的像素值）。
-   - 注意：目前仅支持 order 0 和 1，底层采用与 SciPy 完全一致的样条权重计算逻辑。
+   - 注意：目前仅支持 order 0 和 1，底层采用与 scipy 完全一致的样条权重计算逻辑。
 
    **边界处理**：
    - 当目标像素映射到原始张量边界之外时，根据 mode 参数处理：
      - :constant (默认): 使用 cval 填充边界（默认 0.0）。
      - :nearest, :mirror, :reflect, :wrap, :grid-wrap, :grid-constant: 
-       提供与 SciPy.ndimage 完全一致的边界反射与平铺模式。
+       提供与 scipy.ndimage 完全一致的边界反射与平铺模式。
    - 内部通过逆向映射实现：从目标张量的每个像素出发反推原始坐标进行采样，保证旋转后图像无空洞。
 
    **返回值**：
@@ -568,7 +568,7 @@
          (rows (first shape))
          (cols (second shape))
          (angle-d (coerce angle 'double-float))
-         ;; 使用精准复刻的 Cephes cosdg/sindg
+         ;; 使用精准复刻的 cephes cosdg/sindg
          (cos-a (cephes-cosdg angle-d))
          (sin-a (cephes-sindg angle-d))
          (in-data (vt-data tensor))
@@ -592,7 +592,7 @@
              (out-data (vt-data out-vt)))
         (loop for ny fixnum from 0 below out-rows
               do (loop for nx fixnum from 0 below out-cols
-                       do (let* (;; 关键：复刻 C 代码的运算顺序
+                       do (let* (;; 关键：复刻 c 代码的运算顺序
                                  ;; tmp = shift; tmp += ny*c; tmp += nx*s;
                                  (src-y (+ off-y (* ny cos-a) (* nx sin-a)))
                                  (src-x (+ off-x (* ny (- sin-a))
@@ -600,18 +600,18 @@
                             (setf (aref out-data (+ (* ny out-cols) nx))
                                   (vt-coerce-to-tensor-type
 				   (sample-pixel src-x src-y rows cols
-                                                        in-data s0 s1 off
-                                                        order mode cval-d)
-                                          out-type)))))
+                                                 in-data s0 s1 off
+                                                 order mode cval-d)
+                                   out-type)))))
         out-vt))))
 
 
 ;; ===================================================================
-;; 4. 像素采样函数 (1:1 复刻 C 源码 NI_GeometricTransform)
+;; 4. 像素采样函数 (1:1 复刻 c 源码 ni_geometrictransform)
 ;; ===================================================================
 
 (defun get-spline-boundary-mode (mode)
-  "C 源码中，constant 和 wrap 的样条边界模式会被强制改为 mirror"
+  "c 源码中，constant 和 wrap 的样条边界模式会被强制改为 mirror"
   (if (or (eq mode :constant) (eq mode :wrap))
       :mirror
       mode))
@@ -627,7 +627,7 @@
       (setq cc-y (map-coordinate src-y rows mode))
       (setq cc-x (map-coordinate src-x cols mode)))
     
-    ;; 2. 检查是否触发 constant 边界 (C: if cc > -1.0 || grid_const || nearest)
+    ;; 2. 检查是否触发 constant 边界 (c: if cc > -1.0 || grid_const || nearest)
     (if (or (eq mode :grid-constant) (eq mode :nearest)
             (and (> cc-y -1.0d0) (> cc-x -1.0d0)))
         ;; 3. 计算 start 索引
@@ -684,7 +684,7 @@
                         (p10 (aref in-data (+ off (* y0 s0) (* x1 s1))))
                         (p01 (aref in-data (+ off (* y1 s0) (* x0 s1))))
                         (p11 (aref in-data (+ off (* y1 s0) (* x1 s1)))))
-                    ;; 关键：复刻 C 代码的乘法和加法顺序
+                    ;; 关键：复刻 c 代码的乘法和加法顺序
                     ;; coeff = pixel; coeff *= splvals[0]; coeff *= splvals[1];
                     ;; t += coeff;
                     (+ (* (* p00 fy0) fx0)
@@ -696,18 +696,18 @@
 
 (defun vt-rotate-origin
     (tensor angle &key (order 0) (reshape nil) (mode :constant) (cval 0.0))
-      "绕左上角原点 (0,0) 旋转张量，是 vt-rotate 的便捷版本。
+  "绕左上角原点 (0,0) 旋转张量，是 vt-rotate 的便捷版本。
        等价于 (vt-rotate tensor angle :center '(0 0) :order order ...)。
        该函数将张量的 (0,0) 点视为旋转中心，逆时针旋转 angle 度（注意是度数，不是弧度）。
        如果 order=0（默认），像素值仅位置发生变化，不改变数值；
        如果 order=1，则进行双线性插值，像素值会发生变化。
        超出原张量边界的部分用 cval 填充（默认为 0）。"
-      (vt-rotate tensor angle 
-                 :center (list 0.0d0 0.0d0) 
-                 :order order 
-                 :reshape reshape 
-                 :mode mode 
-                 :cval cval))
+  (vt-rotate tensor angle 
+             :center (list 0.0d0 0.0d0) 
+             :order order 
+             :reshape reshape 
+             :mode mode 
+             :cval cval))
 
 (defun vt-broadcast-to (vt new-shape)
   "将张量广播到新形状，返回零拷贝视图"
@@ -966,7 +966,7 @@
 		     (norm-obj (if (minusp obj) (+ current-size obj) obj)))
 		;; 修改越界检查的判定条件
 		(when (or (< norm-obj 0) (> norm-obj current-size))
-		  (error "索引 ~A 越界" obj))
+		  (error "索引 ~a 越界" obj))
 		(if (zerop val-size)
 		    flat-arr
 		    ;; 下面的切片逻辑全部使用 norm-obj 代替 obj
@@ -981,7 +981,7 @@
             (let ((num-insert (length obj)))
               ;; 检查 values 长度：必须为1（广播）或等于索引数
               (unless (or (= val-size num-insert) (= val-size 1))
-                (error "FLAT mode: values size ~A ≠ number of indices ~A" val-size num-insert))
+                (error "flat mode: values size ~a ≠ number of indices ~a" val-size num-insert))
               ;; 构建 (索引 . 值块) 对，并降序排序，从后往前插入避免偏移
               (let ((sorted-pairs
                       (stable-sort
@@ -999,7 +999,7 @@
                          (val (cdr pair))
                          (current-size (vt-size result)))
                     (when (or (< pos 0) (> pos current-size))
-                      (error "索引 ~A 越界" pos))
+                      (error "索引 ~a 越界" pos))
                     (let ((left (if (> pos 0)
                                     (vt-slice result (list 0 pos))
                                     (vt-zeros (list 0) :type (vt-element-type result))))
@@ -1067,13 +1067,13 @@
                  "将负索引转为非负，并检查是否在 [0, dim-1] 内。"
                  (let ((nidx (if (minusp idx) (+ idx dim) idx)))
                    (unless (<= 0 nidx (1- dim))
-                     (error "索引 ~D 越界（轴大小 ~D）" idx dim))
+                     (error "索引 ~d 越界（轴大小 ~d）" idx dim))
                    nidx))
                (normalize-slice-endpoint (idx dim)
                  "将负索引转为非负，并检查是否在 [0, dim] 内（用于切片端点）。"
                  (let ((nidx (if (minusp idx) (+ idx dim) idx)))
                    (unless (<= 0 nidx dim)
-                     (error "切片端点 ~D 越界（轴大小 ~D）" idx dim))
+                     (error "切片端点 ~d 越界（轴大小 ~d）" idx dim))
                    nidx))
                (obj->keep-indices (obj dim)
                  "根据 obj 返回保留的索引列表（严格递增）。"
@@ -1088,17 +1088,17 @@
                               (let ((s (normalize-slice-endpoint start dim))
                                     (e (normalize-slice-endpoint end dim)))
                                 (when (> s e)
-                                  (error "切片起始 ~D 不能大于终止 ~D" s e))
+                                  (error "切片起始 ~d 不能大于终止 ~d" s e))
                                 (loop for i from s below e do (add-del i)))))
                            ((listp obj)
                             (dolist (idx obj)
                               (add-del (normalize-index idx dim))))
-                           (t (error "无效的 obj 类型 ~A" obj))))
+                           (t (error "无效的 obj 类型 ~a" obj))))
                    ;; 收集所有未被删除的索引
                    (loop for i from 0 below dim
                          unless (gethash i del-set) collect i))))
         (if (null axis)
-            ;; 展平模式：先展平为 1D，然后按保留索引提取
+            ;; 展平模式：先展平为 1d，然后按保留索引提取
             (let* ((flat (vt-ravel tensor))          ; 零拷贝视图或连续副本
                    (flat-size (vt-size flat))
                    (keep (obj->keep-indices obj flat-size)))
@@ -1809,10 +1809,10 @@
               uniq-vt))))))
 
 (defun vt-nonzero (condition)
-  "查找张量中非零(真)元素的索引。对标 NumPy 的 np.where(cond) 和
-   PyTorch 的 torch.nonzero(as_tuple=True)。
+  "查找张量中非零(真)元素的索引。对标 numpy 的 np.where(cond) 和
+   pytorch 的 torch.nonzero(as_tuple=true)。
    返回一个列表，列表长度等于 condition 的维度数。
-   列表中的每个元素是一个 1D fixnum 张量，包含该维度上的逻辑索引。"
+   列表中的每个元素是一个 1d fixnum 张量，包含该维度上的逻辑索引。"
   (with-float-safe
     (let* ((condition (if (numberp condition)
 			  (ensure-vt condition)
@@ -1842,7 +1842,7 @@
       ;; 步骤2：构建结果列表
       (let ((num-nz (length nz-indices)))
 	(if (zerop num-nz)
-            ;; 如果没有非零元素，返回全空 1D 张量列表
+            ;; 如果没有非零元素，返回全空 1d 张量列表
             (loop repeat rank collect (vt-zeros '(0)))
             ;; 如果有非零元素，将扁平索引拆解为多维坐标
             (let ((result-arrays
@@ -2146,9 +2146,12 @@
 		;; 标量索引：直接返回数值
 		(let* ((flat (vt-ravel tensor))
                        (size (vt-size flat))
-                       (idx (if (eq (vt-element-type idx-vt) 'double-float)
-				(truncate (aref (vt-data idx-vt) 0))
-				(aref (vt-data idx-vt) 0))))
+                       (raw-idx (if (eq (vt-element-type idx-vt) 'double-float)
+				    (truncate (aref (vt-data idx-vt) 0))
+				    (aref (vt-data idx-vt) 0)))
+		       (idx (if (minusp raw-idx)
+				(+ raw-idx size)
+				raw-idx)))
                   (unless (<= 0 idx (1- size))
                     (error "索引 ~d 越界，展平大小 ~d" idx size))
 		  (make-vt nil (aref (vt-data flat) idx)
@@ -2166,7 +2169,10 @@
                     (let ((flat-data (vt-data flat))
                           (out-data (vt-data out)))
                       (dotimes (i idx-len)
-			(let ((idx (aref idx-arr i)))
+			(let* ((raw-idx (aref idx-arr i))
+			       (idx (if (minusp raw-idx)
+					(+ raw-idx size)
+					raw-idx)))
                           (unless (<= 0 idx (1- size))
                             (error "索引 ~d 越界，展平大小 ~d" idx size))
                           (setf (aref out-data i) (aref flat-data idx)))))
@@ -2219,7 +2225,10 @@
                                           (+ out-ptr (* i out-str))))))))
                    (walk-idx (d idx-off in-ptr out-base)
                      (if (= d idx-len)
-			 (let ((idx (aref idx-arr idx-off)))
+			 (let* ((raw-idx (aref idx-arr idx-off))
+				(idx (if (minusp raw-idx)
+					 (+ raw-idx ax-dim)
+					 raw-idx)))
                            (unless (<= 0 idx (1- ax-dim))
                              (error "索引 ~d 越界，轴 ~d 大小 ~d"
 				    idx ax ax-dim))
@@ -2273,6 +2282,8 @@
             ;; 优化：用 mod 递增代替 (nth (mod i n) list)，保证 o(1) 取值
             for val = (nth (mod val-idx n-values) val-list)
             do (let ((idx raw-idx))
+		 (when (and (minusp idx) (>= idx (- total-size)))
+                   (incf idx total-size))
 		 ;; 处理越界模式
 		 (cond
                    ((and (>= idx 0) (< idx total-size)) nil) ; 合法，什么都不做
@@ -2303,7 +2314,10 @@
            (result-data (make-array idx-size
 				    :element-type 'double-float)))
       (loop for i from 0 below idx-size
-            for idx = (aref idx-data i)
+	    for raw-idx = (aref idx-data i)
+            for idx = (if (minusp raw-idx)
+			  (+ raw-idx n-choices)
+			  raw-idx)
             do (when (or (< idx 0) (>= idx n-choices))
 		 (error "选择索引 ~a 越界" idx))
                (setf (aref result-data i)
@@ -2369,48 +2383,52 @@
       (cond
 	;; 多轴模式：axis 为列表
 	((and axis (listp axis))
-	(let* ((result (vt-copy vt))
-               ;; 【增加广播逻辑】如果 shift 是单整数，广播为与 axis 等长的列表
-               (shifts (if (listp shift) 
-			   shift 
-			   (make-list (length axis) :initial-element shift))))
-	  ;; 增加长度一致性校验
-	  (unless (= (length shifts) (length axis))
-	    (error "shift 和 axis 的长度必须一致"))
-	  (loop for s in shifts
-		for ax in axis
-		do (setf result (vt-roll result s :axis ax)))
-	  result))
+	 (let* ((result (vt-copy vt))
+		;; 【增加广播逻辑】如果 shift 是单整数，广播为与 axis 等长的列表
+		(shifts (if (listp shift) 
+			    shift 
+			    (make-list (length axis) :initial-element shift))))
+	   ;; 增加长度一致性校验
+	   (unless (= (length shifts) (length axis))
+	     (error "shift 和 axis 的长度必须一致"))
+	   (loop for s in shifts
+		 for ax in axis
+		 do (setf result (vt-roll result s :axis ax)))
+	   result))
 	;; 单轴模式：axis 为整数
 	(axis
 	 (let* ((sh (vt-shape vt))
 		(ax (vt-normalize-axis axis (length sh)))
-		(n (nth ax sh))
-		(s (mod (car shift-list) n)))
-           (if (zerop s)
-               vt
-               (vt-concatenate
-		ax
-		(apply #'vt-slice vt
-                       (loop for i from 0 below (length sh)
-                             collect (if (= i ax)
-					 `(,(- n s) ,n) '(:all))))
-		(apply #'vt-slice vt
-                       (loop for i from 0 below (length sh)
-                             collect (if (= i ax)
-					 `(0 ,(- n s)) '(:all))))))))
+		(n (nth ax sh)))
+	   (if (zerop n)
+	       vt
+	       (let ((s (mod (car shift-list) n)))
+		 (if (zerop s)
+		     vt
+		     (vt-concatenate
+		      ax
+		      (apply #'vt-slice vt
+			     (loop for i from 0 below (length sh)
+				   collect (if (= i ax)
+					       `(,(- n s) ,n) '(:all))))
+		      (apply #'vt-slice vt
+			     (loop for i from 0 below (length sh)
+				   collect (if (= i ax)
+					       `(0 ,(- n s)) '(:all))))))))))
 	;; axis = nil：展平后滚动并恢复形状
 	(t
 	 (let* ((flat (vt-flatten vt))
-		(n (vt-size flat))
-		(s (mod (car shift-list) n)))
-           (if (zerop s)
-               (vt-reshape flat (vt-shape vt))
-               (vt-reshape (vt-concatenate
-			    0
-                            (vt-slice flat `(,(- n s) ,n))
-                            (vt-slice flat `(0 ,(- n s))))
-                           (vt-shape vt)))))))))
+		(n (vt-size flat)))
+	   (if (zerop n)
+	       (vt-reshape flat (vt-shape vt))
+	       (let ((s (mod (car shift-list) n)))
+		 (if (zerop s)
+		     (vt-reshape flat (vt-shape vt))
+		     (vt-reshape (vt-concatenate
+				  0
+				  (vt-slice flat `(,(- n s) ,n))
+				  (vt-slice flat `(0 ,(- n s))))
+				 (vt-shape vt)))))))))))
 
 
 (defun normalize-pad-width (pad-width rank)
@@ -2795,7 +2813,7 @@
 (defun %normal-rand (state)
   "box-muller 方法生成标准正态分布随机数。"
   (declare (random-state state))
-  (let ((u1 (random 1.0d0 state))
+  (let ((u1 (max least-positive-double-float (random 1.0d0 state)))
         (u2 (random 1.0d0 state)))
     (* (sqrt (* -2.0d0 (log u1)))
        (cos (* 2.0d0 pi u2)))))
