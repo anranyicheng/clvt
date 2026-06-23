@@ -502,9 +502,37 @@
             finally (return (reverse strides)))))
 
 (defun vt-contiguous-p (vt)
-  "检查张量是否在内存中连续.
-   只有连续的张量才能安全地重塑为任意形状."
-  (equal (vt-strides vt) (vt-compute-strides (vt-shape vt))))
+  "检查张量是否在内存中连续 只有连续的张量才能安全地重塑为任意形状.
+   (对标 NumPy 的 C_CONTIGUOUS 判定逻辑)。
+   忽略大小为 1 的维度的步长比较，以避免对 (3, 1) 等形状的误判。"
+  (let ((shape (vt-shape vt))
+        (strides (vt-strides vt)))
+    (if (null shape)
+        t ; 0 维张量（标量）必然连续
+        (let ((expected-stride 1)
+              (contiguous t))
+          (declare (type fixnum expected-stride))
+          ;; 从最后一个维度向前检查
+          (loop for i fixnum from (1- (length shape)) downto 0
+                for dim fixnum = (the fixnum (nth i shape))
+                for stride fixnum = (the fixnum (nth i strides))
+                do (cond
+                     ((zerop dim)
+                      ;; 维度大小为 0，张量不占用实质内存，必然连续
+                      (setf contiguous t))
+                     ((= dim 1)
+                      ;; 维度大小为 1，步长无意义，跳过检查，不增加 expected-stride
+                      nil)
+                     ((= stride expected-stride)
+                      ;; 匹配连续预期，更新前一个维度的预期步长
+                      (setf expected-stride
+			    (the fixnum (* expected-stride dim))))
+                     (t
+                      ;; 步长不匹配，非连续
+                      (setf contiguous nil)
+                      )))
+          contiguous))))
+
 
 (defun vt-contiguous (vt)
   "返回一个内存连续的副本.如果原张量已连续,可能返回自身或副本.
@@ -568,19 +596,34 @@
 
 (defun vt-transpose (vt &optional (perm nil))
   "零拷贝转置.仅交换步长和形状维度,不移动数据.
-   perm: 排列列表,例如 (1 0) 表示交换维度0和1."
-  (let* ((rank (length (vt-shape vt)))
-         (perm-real
-	   (or perm
-	       (loop for i from (1- rank) downto 0 collect i))))
-    (unless (= (length perm-real) rank)
-      (error "置换维度数量与张量秩不匹配"))
-    (%make-vt
-     :data (vt-data vt)
-     :shape (loop for p in perm-real collect (nth p (vt-shape vt)))
-     :strides (loop for p in perm-real collect (nth p (vt-strides vt)))
-     :offset (vt-offset vt)
-     :etype (vt-element-type vt))))
+   perm: 排列列表,例如 (1 0) 表示交换维度0和1.
+   如果不提供 perm，默认反转所有轴 (对标 NumPy 的 np.transpose 默认行为)。"
+  (let* ((shape (vt-shape vt))
+         (strides (vt-strides vt))
+         (rank (length shape)))    
+    ;; 1. 若未提供 perm，默认反转所有轴
+    (unless perm
+      (setf perm (loop for i from (1- rank) downto 0 collect i)))
+    ;; 2. 检查长度是否匹配
+    (unless (= (length perm) rank)
+      (error "perm 的长度 ~a 必须等于张量维度数 ~a" (length perm) rank))
+    ;; 3. 检查范围合法性与去重
+    (let ((seen (make-array rank :element-type 'bit :initial-element 0)))
+      (dolist (p perm)
+        (unless (and (integerp p) (>= p 0) (< p rank))
+          (error "perm 中的值 ~a 超出合法范围 [0, ~a]" p (1- rank)))
+        (when (= (aref seen p) 1)
+          (error "perm 中存在重复的轴索引: ~a" p))
+        (setf (aref seen p) 1)))    
+    ;; 4. 执行转置逻辑 (零拷贝视图操作)
+    (let ((new-shape (mapcar #'(lambda (p) (nth p shape)) perm))
+          (new-strides (mapcar #'(lambda (p) (nth p strides)) perm)))
+      (%make-vt :data (vt-data vt)
+                :shape new-shape
+                :strides new-strides
+                :offset (vt-offset vt)
+                :etype (vt-element-type vt)))))
+
 
 (defun vt-normalize-axis (axis rank)
   "将可能为负数的 axis 转换为严格正数，并进行越界检查。
@@ -619,34 +662,43 @@
 	 :etype (vt-element-type vt))))))
 
 (defun vt-split (tensor indices-or-sections &key (axis 0))
-  "模仿 numpy 的 split，支持负数 axis
-   沿轴分割张量.
-   indices-or-sections: 整数n(等分)或索引列表
-   axis: 分割轴
-   返回: 张量列表"
+  "沿指定轴分割张量 (对标 numpy 的 array_split)。
+  indices-or-sections:
+  - 整数 n: 分割成 n 个块。如果无法整除，前 (dim % n) 块会比后面的块多 1 个元素。
+  - 列表: 按照列表中的索引位置进行切分。
+  axis: 分割轴，支持负数。
+  返回: 张量列表"
   (with-float-safe
     (let* ((shape (vt-shape tensor))
            (rank (length shape))
            (ax (vt-normalize-axis axis rank))
-           (dim-size (nth ax shape)))    
+           (dim-size (nth ax shape)))
       (cond
-	;; ========== 情况 a：均分 ==========
-	((integerp indices-or-sections)
-	 (let* ((n indices-or-sections)
-		(chunk-size (floor dim-size n)))
-           (unless (zerop (rem dim-size n))
-             (error "数组沿轴 ~a 的大小 ~a 不能被 ~a 整除" ax dim-size n))
-           (loop for i from 0 below n
-		 collect (vt-narrow tensor ax 
-                                    (* i chunk-size) 
-                                    (* (1+ i) chunk-size)))))      
-	;; ========== 情况 b：指定位置下刀 ==========
-	((listp indices-or-sections)
-	 (let ((points (append (list 0) indices-or-sections (list dim-size))))
+        ;; ========== 情况 a：分成 n 个块 (允许不均等) ==========
+        ((integerp indices-or-sections)
+         (let ((n indices-or-sections))
+           (when (<= n 0)
+             (error "分割块数 n 必须是正整数: ~a" n))
+           ;; 如果 n >= dim-size，退化为每块最多1个元素
+           (let ((base (floor dim-size n))
+                 (rem (rem dim-size n))
+                 (cur-start 0)
+                 (result nil))
+             (declare (type fixnum base rem cur-start))
+             (dotimes (i n (nreverse result))
+               ;; 前 rem 块大小为 base + 1，其余为 base
+               (let* ((chunk (the fixnum (if (< i rem) (1+ base) base)))
+                      (end (the fixnum (+ cur-start chunk))))
+                 (push (vt-narrow tensor ax cur-start end) result)
+                 (setf cur-start end))))))        
+        ;; ========== 情况 b：指定位置下刀 ==========
+        ((listp indices-or-sections)
+         (let ((points (append (list 0) indices-or-sections (list dim-size))))
            (loop for (start end) on points by #'cdr
-		 while end
-		 collect (vt-narrow tensor ax start end))))      
-	(t (error "indices-or-sections 必须是整数或整数列表"))))))
+                 while end
+                 collect (vt-narrow tensor ax start end))))
+        (t (error "indices-or-sections 必须是整数或整数列表"))))))
+
 
 (defun vt-slice (vt &rest specs)
   "通用切片函数（统一列表接口）。
@@ -845,27 +897,26 @@
 
 (declaim (inline vt-ref))
 (defun vt-ref (vt &rest indices)
-  "获取张量元素(支持高维索引，支持负索引)。不包含越界检查以换取极致性能。"
+  "获取张量指定位置的元素 (无深度边界检查以换取极致性能)。"
+  ;; 1. 防崩检查：拦截空张量访问
+  (when (zerop (vt-size vt))
+    (error "Cannot index into an empty tensor (size 0)"))  
   (let* ((shape (vt-shape vt))
          (strides (vt-strides vt))
-         (data (vt-data vt))
-         (flat-idx (vt-offset vt)))
-    (declare (type fixnum flat-idx))
-    (when (zerop (vt-size vt))
-      (error "Cannot index into an empty tensor (size 0)"))
-    ;; 平行遍历索引、维度和步长，累加物理偏移
-    (loop for idx in indices
-          for dim in shape
-          for stride in strides
-          ;; 负索引规范化：如果是负数就加上维度长度，否则原样使用
-          do (incf flat-idx
-		   (the fixnum
-			(* (the fixnum
-				(if (minusp idx)
-				    (+ idx dim)
-				    idx)) 
-                           (the fixnum stride)))))
-    (aref data flat-idx)))
+         (offset (vt-offset vt)))    
+    ;; 2. 防崩检查：确保维度数量匹配，避免底层 nil 算术运算导致崩溃
+    (unless (= (length indices) (length shape))
+      (error "索引数量 ~a 与张量维度数 ~a 不匹配"
+	     (length indices) (length shape)))
+    (let ((ptr offset))
+      (declare (type fixnum ptr))
+      (loop for idx in indices
+            for stride in strides do
+              (setf ptr (the fixnum
+			     (+ ptr (the fixnum
+					 (* (the fixnum idx)
+					    (the fixnum stride)))))))
+      (aref (vt-data vt) ptr))))
 
 (defun (setf vt-ref) (value vt &rest indices)
   "设置张量元素(支持高维索引，支持负索引)。不包含越界检查以换取极致性能。"
@@ -1365,7 +1416,7 @@
       ;; ==============================================================
       ;; 阶段 1：冷路径 - 试探性推断累加器类型
       ;; ==============================================================
-      (let* ((first-val (aref in-data 0))
+      (let* ((first-val (aref in-data in-offset))
              (first-result (funcall reducer-fn init-val first-val))
              (effective-out-type
                (cond
@@ -1677,7 +1728,7 @@
 
   (defun vt-float-nan-= (nan-a nan-b)
     (with-float-safe
-      (= nan-a nan-b)))
+      (and (vt-float-nan-p nan-a) (vt-float-nan-p nan-b))))
 
   (defun vt-float-pos-inf ()
     (with-float-safe
