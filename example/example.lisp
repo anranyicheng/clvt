@@ -2657,8 +2657,6 @@
             (s-axis0 (vt-nansum data :axis 0))
             (s-axis1 (vt-nansum data :axis 1))
             (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
-	(print 222222222222222222)
-	(print s-global)
 	(assert (= (coerce s-global 'double-float) 16.0d0) () "nansum global-> ~a" s-global)
 	(assert (equal (vt-to-list s-axis0) '(5.0 2.0 9.0)))
 	(assert (equal (vt-to-list s-axis1)  '(6.0 10.0)))
