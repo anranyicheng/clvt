@@ -216,7 +216,10 @@
                  (prog1 (aref data idx) (incf idx))
                  (let* ((n (first dims))
                         (sub-dims (rest dims))
-                        (sub-block-size (/ block-size n))
+                        (sub-block-size
+			  (if (zerop n)
+			      0
+			      (/ block-size n)))
                         result)
                    (dotimes (i n)    ;; 遍历当前维度的每个块
 		     (declare (fixnum i)
@@ -502,37 +505,30 @@
             finally (return (reverse strides)))))
 
 (defun vt-contiguous-p (vt)
-  "检查张量是否在内存中连续 只有连续的张量才能安全地重塑为任意形状.
-   (对标 NumPy 的 C_CONTIGUOUS 判定逻辑)。
-   忽略大小为 1 的维度的步长比较，以避免对 (3, 1) 等形状的误判。"
+   "检查张量是否在内存中连续 只有连续的张量才能安全地重塑为任意形状.
+   (对标 NumPy 的 C_CONTIGUOUS 判定逻辑)"
   (let ((shape (vt-shape vt))
         (strides (vt-strides vt)))
     (if (null shape)
         t ; 0 维张量（标量）必然连续
-        (let ((expected-stride 1)
-              (contiguous t))
-          (declare (type fixnum expected-stride))
-          ;; 从最后一个维度向前检查
-          (loop for i fixnum from (1- (length shape)) downto 0
-                for dim fixnum = (the fixnum (nth i shape))
-                for stride fixnum = (the fixnum (nth i strides))
-                do (cond
-                     ((zerop dim)
-                      ;; 维度大小为 0，张量不占用实质内存，必然连续
-                      (setf contiguous t))
-                     ((= dim 1)
-                      ;; 维度大小为 1，步长无意义，跳过检查，不增加 expected-stride
-                      nil)
-                     ((= stride expected-stride)
-                      ;; 匹配连续预期，更新前一个维度的预期步长
-                      (setf expected-stride
-			    (the fixnum (* expected-stride dim))))
-                     (t
-                      ;; 步长不匹配，非连续
-                      (setf contiguous nil)
-                      )))
-          contiguous))))
-
+        ;; 零尺寸张量一律视为连续 (对标 NumPy 行为)
+        (if (some #'zerop shape)
+            t
+            (let ((expected-stride 1)
+                  (contiguous t))
+              (declare (type fixnum expected-stride))
+              (loop for i fixnum from (1- (length shape)) downto 0
+                    for dim fixnum = (the fixnum (nth i shape))
+                    for stride fixnum = (the fixnum (nth i strides))
+                    do (cond
+                         ((= dim 1)
+                          nil) ; 维度大小为 1，步长无意义，跳过
+                         ((= stride expected-stride)
+                          (setf expected-stride
+				(the fixnum (* expected-stride dim))))
+                         (t
+                          (setf contiguous nil))))
+              contiguous)))))
 
 (defun vt-contiguous (vt)
   "返回一个内存连续的副本.如果原张量已连续,可能返回自身或副本.
@@ -897,25 +893,30 @@
 
 (declaim (inline vt-ref))
 (defun vt-ref (vt &rest indices)
-  "获取张量指定位置的元素 (无深度边界检查以换取极致性能)。"
+  "获取张量指定位置的元素 (支持高维索引，支持负索引。无深度越界检查以换取极致性能)。"
   ;; 1. 防崩检查：拦截空张量访问
   (when (zerop (vt-size vt))
-    (error "Cannot index into an empty tensor (size 0)"))  
+    (error "Cannot index into an empty tensor (size 0)"))
   (let* ((shape (vt-shape vt))
          (strides (vt-strides vt))
-         (offset (vt-offset vt)))    
+         (offset (vt-offset vt)))
     ;; 2. 防崩检查：确保维度数量匹配，避免底层 nil 算术运算导致崩溃
     (unless (= (length indices) (length shape))
       (error "索引数量 ~a 与张量维度数 ~a 不匹配"
 	     (length indices) (length shape)))
     (let ((ptr offset))
       (declare (type fixnum ptr))
+      ;; 3. 引入 dim 用于处理负索引
       (loop for idx in indices
-            for stride in strides do
-              (setf ptr (the fixnum
-			     (+ ptr (the fixnum
-					 (* (the fixnum idx)
-					    (the fixnum stride)))))))
+            for dim in shape
+            for stride in strides
+            do (setf ptr
+		     (the fixnum 
+                          (+ ptr 
+                             (the fixnum 
+                                  (* (the fixnum (if (minusp idx)
+						     (+ idx dim) idx)) 
+				     (the fixnum stride)))))))
       (aref (vt-data vt) ptr))))
 
 (defun (setf vt-ref) (value vt &rest indices)
@@ -1759,30 +1760,33 @@
   (load-time-value (vt-float-neg-inf)))
 
 (defun vt-numpy-sort (sequence &optional (predicate #'<))
-  "对实数序列（列表或可转为列表的向量）进行排序(默认升序)，
-   将 nan 放在末尾，保持多个 nan 的原始相对顺序。
-   返回新列表。"
+  "对实数序列（列表或可转为列表的向量）进行排序(默认升序)。  
+  NaN 处理语义（严格对标 NumPy）：
+  - 升序 (#'<)：有限数升序排列，NaN 放在末尾。
+  - 降序 (#'>)：等价于 NumPy 的 np.sort(arr)[::-1]。
+    由于是对升序结果进行整体反转，NaN 会出现在开头。
+  保持多个 nan 的原始相对顺序。返回新列表。"
   (declare (type (or list vector) sequence))
-  (assert (or (eq predicate #'<)
-	      (eq predicate '<)
-	      (eq predicate #'>)
-	      (eq predicate '>)))
+  (assert (or (eq predicate #'<) (eq predicate '<)
+              (eq predicate #'>) (eq predicate '>)))
   (with-float-safe
-    (let ((sequence (coerce sequence 'list))    ; 统一为列表
-          non-nans
-          nans)
+    (let ((sequence (coerce sequence 'list)) ; 统一为列表
+          non-nans nans)
       ;; 分离 nan 和非 nan，按原始顺序
       (dolist (x sequence (setq non-nans (nreverse non-nans)
-				nans     (nreverse nans)))
-	(if (vt-float-nan-p x)
+                                nans (nreverse nans)))
+        (if (vt-float-nan-p x)
             (push x nans)
             (push x non-nans)))
       ;; 只在有限数（含 inf）上做标准稳定排序
       (setq non-nans (stable-sort non-nans predicate))
-      ;; 拼接：有限数在前，nan 在后
-      (cond ((or (eq predicate #'<)
-		 (eq predicate '<))
-	     (append non-nans nans))
-	    ((or (eq predicate #'>)
-		 (eq predicate '>))
-	     (append nans non-nans))))))
+      ;; 拼接逻辑：
+      ;; 对标 NumPy 行为，NumPy 的降序是通过升序后反转 [::-1] 实现的，
+      ;; 因此降序时 NaN 会被反转到开头。
+      (cond 
+        ;; 升序：有限数在前，nan 在后
+        ((or (eq predicate #'<) (eq predicate '<)) 
+         (append non-nans nans))
+        ;; 降序：对标 NumPy 的 [::-1] 反转，nan 在前，有限数降序在后
+        ((or (eq predicate #'>) (eq predicate '>)) 
+         (append nans non-nans))))))
