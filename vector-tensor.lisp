@@ -689,8 +689,11 @@
                  (setf cur-start end))))))        
         ;; ========== 情况 b：指定位置下刀 ==========
         ((listp indices-or-sections)
-         (let ((points (append (list 0) indices-or-sections (list dim-size))))
-           (loop for (start end) on points by #'cdr
+         (let* ((raw-points (append (list 0) indices-or-sections (list dim-size)))
+		(clamped-points (mapcar (lambda (p)
+					  (max 0 (min p dim-size)))
+					raw-points)))
+           (loop for (start end) on clamped-points by #'cdr
                  while end
                  collect (vt-narrow tensor ax start end))))
         (t (error "indices-or-sections 必须是整数或整数列表"))))))
@@ -1165,7 +1168,7 @@
                     (vt-offset ,result-vt)))))))
 
 (defun vt-map (fn &rest tensors)
-   "高效映射函数.
+  "高效映射函数.
    支持标量、列表、张量混合输入.
    特性:自动类型转换、广播、指针算术优化、双目运算内联
    极致优化：试探性推断输出类型与布尔语义，统一遍历骨架，将类型分发延迟到叶子节点
@@ -1196,14 +1199,10 @@
                  (type (simple-array t (*)) ins-strides)
                  (type (simple-array fixnum (*)) cur-ptrs)
                  (type list out-shape)
-                 (type fixnum rank n-tensors size))
-        
+                 (type fixnum rank n-tensors size))        
         (loop for i fixnum from 0 below n-tensors do
           (setf (aref cur-ptrs i) (aref ins-offs i)))
-        
-        ;; ==============================================================      
         ;; 阶段 1：冷路径 - 试探性推断累加器类型
-        ;; ==============================================================      
         (multiple-value-bind (effective-out-type is-boolean-fn)
             (if (zerop size)
                 (let ((pt (apply #'vt-promote-type
@@ -1227,15 +1226,11 @@
 				first-result
 				most-positive-fixnum))
                        (values 'fixnum nil))
-                      (t (values 'double-float nil))))))
-          
+                      (t (values 'double-float nil))))))          
           (let* ((res (vt-zeros out-shape :type effective-out-type))
                  (res-data (vt-data res))
                  (res-strides (vt-strides res)))
-            
-            ;; ==============================================================      
             ;; 阶段 2：热路径 - 统一遍历骨架 (代码只生成一次！)
-            ;; ==============================================================      
             ;; 宏的作用仅限于生成递归骨架，不再包含业务逻辑分支
             (macrolet
 		((gen-unified-loop (&body leaf-body)
@@ -1266,13 +1261,10 @@
                                        for s fixnum in strides-at-depth do
                                          (decf (aref cur-ptrs k)
 					       (the fixnum (* dim s))))))))
-                      (recurse 0 0))))
-              
+                      (recurse 0 0))))              
               ;; 调用宏，传入统一的叶子节点逻辑
               (gen-unified-loop
-               ;; ==============================================================      
                ;; 统一的叶子节点逻辑：先求值，再根据预推断的类型写入
-               ;; ==============================================================      
                (let ((raw-result
                        ;; 1. 统一读取输入并计算
                        (case n-tensors
@@ -1292,40 +1284,39 @@
 			   (loop for k fixnum from 0 below n-tensors
                                  collect
 				 (aref (the simple-array (aref ins-data k))
-				       (aref cur-ptrs k))))))))
-                  
-                  ;; 2. 根据冷路径推断的类型，将结果安全写入
-                  ;; 此处 ecase 分支预测命中率达 100%，零性能损耗
-                  (ecase effective-out-type
-                    (double-float
-                     (if is-boolean-fn
-                         (setf (aref (the (simple-array double-float (*))
-					  res-data)
-				     out-ptr)
-                               (the double-float
-				    (if raw-result 1.0d0 0.0d0)))
-                         (setf (aref (the (simple-array double-float (*))
-					  res-data)
-				     out-ptr)
-                               (the double-float
-				    (coerce raw-result 'double-float)))))
-                    (fixnum
-                     (setf (aref (the (simple-array fixnum (*))
-				      res-data)
-				 out-ptr)
-                           (the fixnum
-                                (if (and (integerp raw-result)
-                                         (<= most-negative-fixnum
-					     raw-result
-					     most-positive-fixnum))
-                                    raw-result
-                                    ;; 饱和截断保护
-                                    (max most-negative-fixnum 
-                                         (min most-positive-fixnum
-					      (truncate raw-result)))))))))))
+				       (aref cur-ptrs k))))))))                 
+                 ;; 2. 根据冷路径推断的类型，将结果安全写入
+                 ;; 此处 ecase 分支预测命中率达 100%，零性能损耗
+                 (ecase effective-out-type
+                   (double-float
+                    (if is-boolean-fn
+                        (setf (aref (the (simple-array double-float (*))
+					 res-data)
+				    out-ptr)
+                              (the double-float
+				   (if raw-result 1.0d0 0.0d0)))
+                        (setf (aref (the (simple-array double-float (*))
+					 res-data)
+				    out-ptr)
+                              (the double-float
+				   (coerce raw-result 'double-float)))))
+                   (fixnum
+                    (setf (aref (the (simple-array fixnum (*))
+				     res-data)
+				out-ptr)
+			  (the fixnum 
+			       (typecase raw-result
+				 ;; 1. 绝大多数情况：纯整数计算，且在 fixnum 范围内，直接返回 (最快路径)
+				 (fixnum raw-result)
+				 ;; 2. 罕见情况：返回布尔值，转为 0 或 1
+				 (null 0)
+				 ((eql t) 1)
+				 ;; 3. 兜底：浮点数或 bignum，进行安全截断
+				 (t (max most-negative-fixnum 
+					 (min most-positive-fixnum (truncate raw-result))))))))
+		   ))))
             
             res))))))
-
 
 (defun vt-ensure-shape-compatible (shape axis)
   "检查 axis 是否合法. 支持负数轴."
@@ -1415,25 +1406,20 @@
 	     (if real-axis
                  (the fixnum (nth real-axis in-shape))
                  (the fixnum (reduce #'* in-shape :initial-value 1)))))      
-      
       (declare (type (simple-array * (*)) in-data)
                (type list in-strides arg-strides in-shape))
-
       ;; 当归约轴大小为 0 时，直接返回
       (when (zerop axis-size)
         (let ((empty-result-val
-                (cond ((eq init-val 0) (coerce 0 element-type))
-                      ((or (eq init-val most-positive-double-float)
-                           (eq init-val most-negative-double-float))
-                       (vt-float-nan))
+                (cond ((eq init-val 0)
+		       (coerce 0 element-type))
+                      ((vt-float-inf-p init-val)
+		       +vt-float-nan+)
                       (t (coerce init-val element-type)))))
           (return-from vt-reduce
             (values (make-vt out-shape empty-result-val :type element-type)
                     (when return-arg (make-vt out-shape 0 :type 'fixnum))))))
-
-      ;; ==============================================================
       ;; 阶段 1：冷路径 - 试探性推断累加器类型
-      ;; ==============================================================
       (let* ((first-val (aref in-data in-offset))
              (first-result (funcall reducer-fn init-val first-val))
              (effective-out-type
@@ -1442,27 +1428,28 @@
 		      (null first-result))
 		  'double-float)
                  ((and (integerp first-result)
-                       (<= most-negative-fixnum first-result most-positive-fixnum))
+                       (<= most-negative-fixnum
+			   first-result
+			   most-positive-fixnum))
                   'fixnum)
                  (t 'double-float)))
              ;; 安全的初始值转换
              (safe-init-val
                (if (eq effective-out-type 'fixnum)
                    (if (and (integerp init-val)
-                            (<= most-negative-fixnum init-val most-positive-fixnum))
+                            (<= most-negative-fixnum
+				init-val
+				most-positive-fixnum))
                        init-val
                        (truncate init-val))
                    (coerce init-val 'double-float))))
-        
-        ;; ==============================================================
         ;; 阶段 2：分配结果与步长映射，执行热路径
-        ;; ==============================================================
         (let* ((res (make-vt out-shape safe-init-val :type effective-out-type))
                (res-data (vt-data res))
                (res-offset (vt-offset res))           
                (res-idx (when return-arg (make-vt out-shape 0 :type 'fixnum)))
                (res-idx-data (when res-idx (vt-data res-idx)))
-               ;; 关键修正: out-strides-map 必须在 res 分配之后计算
+               ;; out-strides-map 必须在 res 分配之后计算
                (out-strides-map
                  (if is-global-reduction
                      (make-list rank :initial-element 0)
@@ -1475,23 +1462,23 @@
 							 i
 							 (1- i)))))
                                     (nth out-idx (vt-strides res)))))))
-
           (declare (type (simple-array * (*)) res-data)
                    (type list out-strides-map))
-
           ;; 宏消除递归冗余
           (macrolet
               ((gen-reduce (leaf-body)
 		 `(labels
                       ((recurse (depth in-ptr out-ptr out-idx-ptr current-arg-val)
-			 (declare (type fixnum depth in-ptr out-ptr out-idx-ptr current-arg-val))
+			 (declare
+			  (type fixnum depth in-ptr out-ptr out-idx-ptr current-arg-val))
 			 (if (= depth rank)
                              ,leaf-body
                              (let* ((dim (nth depth in-shape))
                                     (in-stride (nth depth in-strides))
                                     (out-stride (nth depth out-strides-map))
                                     (arg-stride (nth depth arg-strides)))
-                               (declare (type fixnum dim in-stride out-stride arg-stride))
+                               (declare
+				(type fixnum dim in-stride out-stride arg-stride))
                                (loop for i fixnum from 0 below dim do
 				 (recurse (1+ depth)
                                           in-ptr
@@ -1502,36 +1489,44 @@
 				 (incf out-ptr out-stride)
 				 (when return-arg
                                    (incf out-idx-ptr out-stride)))))))
-                    (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
+                    (recurse
+		     0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
 
             ;; 热路径特化
             (ecase effective-out-type
               (double-float
                (gen-reduce
                 (let ((val (aref (the simple-array in-data) in-ptr))
-                      (cur-acc (aref (the (simple-array double-float (*)) res-data) out-ptr)))
+                      (cur-acc (aref (the (simple-array double-float (*)) res-data)
+				     out-ptr)))
                   (multiple-value-bind (new-acc do-update-idx)
                       (funcall reducer-fn cur-acc val)
-                    (setf (aref (the (simple-array double-float (*)) res-data) out-ptr)
+                    (setf (aref (the (simple-array double-float (*)) res-data)
+				out-ptr)
                           (the double-float (coerce new-acc 'double-float)))
                     (when (and return-arg do-update-idx res-idx-data)
-                      (setf (aref (the (simple-array fixnum (*)) res-idx-data) out-idx-ptr)
+                      (setf (aref (the (simple-array fixnum (*)) res-idx-data)
+				  out-idx-ptr)
                             current-arg-val))))))
 
               (fixnum
                (gen-reduce
                 (let ((val (aref (the simple-array in-data) in-ptr))
-                      (cur-acc (aref (the (simple-array fixnum (*)) res-data) out-ptr)))
+                      (cur-acc (aref (the (simple-array fixnum (*)) res-data)
+				     out-ptr)))
                   (multiple-value-bind (new-acc do-update-idx)
                       (funcall reducer-fn cur-acc val)
                     (setf (aref (the (simple-array fixnum (*)) res-data) out-ptr)
                           (the fixnum
                                (if (and (integerp new-acc)
-					(<= most-negative-fixnum new-acc most-positive-fixnum))
+					(<= most-negative-fixnum
+					    new-acc
+					    most-positive-fixnum))
                                    new-acc
                                    (truncate new-acc))))
                     (when (and return-arg do-update-idx res-idx-data)
-                      (setf (aref (the (simple-array fixnum (*)) res-idx-data) out-idx-ptr)
+                      (setf (aref (the (simple-array fixnum (*)) res-idx-data)
+				  out-idx-ptr)
                             current-arg-val))))))))
 
           (values res res-idx))))))
@@ -1555,7 +1550,6 @@
       ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b))
       ;; >2d @ >2d → 批量矩阵乘法
       (t (vt-einsum "...ij,...jk->...ik" a b)))))
-
 
 (defun vt-@ (vt1 vt2)
   (vt-matmul vt1 vt2))
@@ -1685,8 +1679,10 @@
                      (if (= depth rank)
                          ;; 安全地调用传入的测试逻辑
                          (when (funcall ,test-fn in-data current-ptr)
-                           (loop for c across coord-buffer
-				 do (vector-push-extend c result-indices)))
+			   (if (zerop rank)
+			       (vector-push-extend 0 result-indices)
+                               (loop for c across coord-buffer
+				     do (vector-push-extend c result-indices))))
                          (let ((dim (nth depth in-shape))
                                (stride (nth depth in-strides)))
                            (declare (type fixnum dim stride))
