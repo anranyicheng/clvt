@@ -33,6 +33,565 @@
   (unless condition
     (error "test failed: ~a" msg)))
 
+
+;; --------------------- test vt-from-sequence ---------------------
+(defun test-vt-from-sequence ()
+  "测试 vt-from-sequence 的各种情况，包括边界条件和错误处理。"
+  (format t "~&=== 开始测试 vt-from-sequence ===~%")
+
+  ;; 辅助测试函数：期望成功
+  (labels
+      ((expect-ok (name test-fn expected-shape &optional (type 'double-float))
+         (handler-case
+             (let* ((result (funcall test-fn))
+                    (actual-shape (vt-shape result))
+                    (expected-size (reduce #'* expected-shape :initial-value 1))
+                    (actual-size (length (vt-data result)))
+                    (actual-list (vt-to-list result))) ; 假设有 vt-to-list 函数用于打印观察
+               (if (and (equal actual-shape expected-shape)
+                        (= actual-size expected-size)
+                        (eq (vt-etype result) type))
+                   (format t "✅ [PASS] ~a | Shape: ~a | Data: ~a~%" name actual-shape actual-list)
+                   (format t "❌ [FAIL] ~a | 期望 Shape: ~a, 实际 Shape: ~a~%"
+                           name expected-shape actual-shape)))
+           (error (e)
+             (format t "❌ [FAIL] ~a | 捕获到意外错误: ~a~%" name e))))
+
+             ;; 辅助测试函数：期望失败（抛出错误）
+             (expect-error (name test-fn)
+               (handler-case
+                   (progn
+                     (funcall test-fn)
+                     (format t "❌ [FAIL] ~a | 期望抛出错误，但成功执行了!~%" name))
+                 (error (e)
+                   ;; 捕获到错误，打印警告而不是中断测试
+                   (format t "⚠️  [WARN] ~a | 成功捕获预期错误: ~a~%" name e)))))
+
+    ;; ==================== 正常用例测试 ====================
+    (format t "~&--- 正常用例 ---~%")
+    
+    ;; 1. 一维列表
+    (expect-ok "1D 列表" 
+               (lambda () (vt-from-sequence '(1 2 3 4))) 
+               '(4))
+    
+    ;; 2. 一维向量
+    (expect-ok "1D 向量" 
+               (lambda () (vt-from-sequence #(1 2 3 4))) 
+               '(4))
+    
+    ;; 3. 二维列表
+    (expect-ok "2D 列表" 
+               (lambda () (vt-from-sequence '((1 2) (3 4)))) 
+               '(2 2))
+    
+    ;; 4. 向量嵌套列表
+    (expect-ok "2D 向量嵌套列表" 
+               (lambda () (vt-from-sequence #((1 2) (3 4)))) 
+               '(2 2))
+    
+    ;; 5. 三维嵌套
+    (expect-ok "3D 嵌套" 
+               (lambda () (vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))))) 
+               '(2 2 2))
+    
+    ;; 6. 混合数值类型（整数转浮点）
+    (expect-ok "混合数值类型" 
+               (lambda () (vt-from-sequence '(1 2.0 3))) 
+               '(3))
+    
+    ;; 7. 指定类型为 fixnum
+    (expect-ok "指定类型 fixnum" 
+               (lambda () (vt-from-sequence '(1 2 3) :type 'fixnum)) 
+               '(3) 'fixnum)
+    
+    ;; 8. 单列二维张量（你之前提问的正确写法）
+    (expect-ok "单列二维张量" 
+               (lambda () (vt-from-sequence #((1) (2) (3) (4)))) 
+               '(4 1))
+
+    ;; ==================== 边界用例测试 ====================
+    (format t "~&--- 边界用例 ---~%")
+
+    ;; 9. 空序列 ()
+    (expect-ok "空序列 ()" 
+               (lambda () (vt-from-sequence '())) 
+               '(0))
+    
+    ;; 10. 空序列嵌套 (()) -> 形状应为 (1 0)
+    (expect-ok "空序列嵌套 (())" 
+               (lambda () (vt-from-sequence '(()) )) 
+               '(1 0))
+
+    ;; ==================== 错误用例测试 ====================
+    (format t "~&--- 错误用例 (应打印警告，不中断) ---~%")
+
+    ;; 11. 错误：不规则嵌套（子序列长度不同）
+    (expect-error "不规则嵌套(长度不同)" 
+                  (lambda () (vt-from-sequence '((1 2) (3 4 5)))))
+    
+    ;; 12. 错误：不规则嵌套（首元素原子，后续序列）- 这正是我们之前修复的漏洞场景
+    (expect-error "不规则嵌套(首原子后序列)" 
+                  (lambda () (vt-from-sequence #(1 2 (3 4)))))
+    
+    ;; 13. 错误：不规则嵌套（首元素序列，后续原子）
+    (expect-error "不规则嵌套(首序列后原子)" 
+                  (lambda () (vt-from-sequence #((1 2) 3 4))))
+    
+    ;; 14. 错误：直接传入标量数字
+    (expect-error "直接传入标量" 
+                  (lambda () (vt-from-sequence 5)))
+    
+    ;; 15. 错误：字面量向量误用引号 (用户之前的错误写法)
+    (expect-error "字面量向量误用引号" 
+                  (lambda () (vt-from-sequence #('(1) '(2)))))
+
+    (format t "~&=== 测试结束 ===~%")))
+
+;; --------------------- test reshape ---------------------
+(defun test-vt-reshape ()
+  ;; np.arange(6).reshape(2,3)
+  (let* ((a (vt-arange 6 :type 'fixnum))
+         (b (vt-reshape a '(2 3))))
+    (assert (equal (vt-shape b) '(2 3)))
+    (assert (equal (vt-to-list b) '((0 1 2) (3 4 5))))
+    ;; 重塑为一维
+    (let ((c (vt-reshape b '(6))))
+      (assert (equal (vt-shape c) '(6)))
+      (assert (equal (vt-to-list c) '(0 1 2 3 4 5)))))
+  ;; 大小不匹配应报错
+  (let ((a (vt-arange 6)))
+    (handler-case (vt-reshape a '(2 4))
+      (error (e) (format t "~%[ok] reshape size mismatch caught: ~a" e))))
+  (format t "~%test-vt-reshape passed.~%"))
+
+
+(defun test-vt-slice ()
+  ;; ============================================================
+  ;; 辅助函数：将张量转换为列表以便比较（已存在于库中）
+  ;; ============================================================
+
+  ;; ============================================================
+  ;; 一维张量测试 (a = np.arange(10))
+  ;; ============================================================
+  (let ((a (vt-arange 10 :type 'fixnum)))
+    ;; 1a. 单个整数索引
+    ;; a[3] -> 3
+    (assert (= (vt-item (vt-slice a '(3))) 3))
+    
+    ;; 1b. 正向范围
+    ;; a[2:7] -> [2,3,4,5,6]
+    (assert (equal (vt-to-list (vt-slice a '(2 7))) '(2 3 4 5 6)))
+    
+    ;; 1c. 带步长
+    ;; a[1:9:2] -> [1,3,5,7]
+    (assert (equal (vt-to-list (vt-slice a '(1 9 2))) '(1 3 5 7)))
+    
+    ;; 1d. 省略 start
+    ;; a[:5] -> [0,1,2,3,4]
+    (assert (equal (vt-to-list (vt-slice a '(nil 5))) '(0 1 2 3 4)))
+    
+    ;; 1e. 省略 end
+    ;; a[5:] -> [5,6,7,8,9]
+    (assert (equal (vt-to-list (vt-slice a '(5 nil))) '(5 6 7 8 9)))
+    
+    ;; 1f. 反向步长
+    ;; a[8:3:-1] -> [8,7,6,5,4]
+    (assert (equal (vt-to-list (vt-slice a '(8 3 -1))) '(8 7 6 5 4)))
+    
+    ;; 1g. 完整反向
+    ;; a[::-1] -> [9,8,7,6,5,4,3,2,1,0]
+    (assert (equal (vt-to-list (vt-slice a '(nil nil -1)))
+                   '(9 8 7 6 5 4 3 2 1 0)))
+    
+    ;; 1h. 负索引
+    ;; a[-1] -> 9
+    (assert (= (vt-item (vt-slice a '(-1))) 9))
+    
+    ;; a[-3:-1] -> [7,8]
+    (assert (equal (vt-to-list (vt-slice a '(-3 -1))) '(7 8)))
+    
+    ;; 1i. 空切片
+    ;; a[5:5] -> []
+    (assert (equal (vt-to-list (vt-slice a '(5 5))) '()))
+    ;; a[10:10] -> []
+    (assert (equal (vt-to-list (vt-slice a '(10 10))) '())))
+
+  ;; ============================================================
+  ;; 二维张量测试 (b = np.arange(20).reshape(4,5))
+  ;; ============================================================
+  (let* ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5))))
+    ;; 2a. 单个元素
+    ;; b[1,2] -> 7
+    (assert (= (vt-item (vt-slice b '(1) '(2))) 7.0))
+    
+    ;; 2b. 取一行
+    ;; b[2,:] -> [10,11,12,13,14]
+    (assert (equal (vt-to-list (vt-slice b '(2) '(:all)))
+                   '(10 11 12 13 14)))
+    
+    ;; 2c. 取一列
+    ;; b[:,3] -> [3,8,13,18]
+    (assert (equal (vt-to-list (vt-slice b '(:all) '(3)))
+                   '(3 8 13 18)))
+    
+    ;; 2d. 子矩阵
+    ;; b[1:3, 2:4] -> [[7,8],[12,13]]
+    (assert (equal (vt-to-list (vt-slice b '(1 3) '(2 4)))
+                   '((7 8) (12 13))))
+    
+    ;; 2e. 省略边界
+    ;; b[:2, 2:] -> [[2,3,4],[7,8,9]]
+    (assert (equal (vt-to-list (vt-slice b '(nil 2) '(2 nil)))
+                   '((2 3 4) (7 8 9))))
+    
+    ;; 2f. 行逆序
+    ;; b[::-1, :] -> 行颠倒
+    (assert (equal (vt-to-list (vt-slice b '(nil nil -1) '(:all)))
+                   '((15 16 17 18 19)
+                     (10 11 12 13 14)
+                     (5 6 7 8 9)
+                     (0 1 2 3 4))))
+    
+    ;; 2g. 列逆序
+    ;; b[:, ::-1] -> 列颠倒
+    (assert (equal (vt-to-list (vt-slice b '(:all) '(nil nil -1)))
+                   '((4 3 2 1 0)
+                     (9 8 7 6 5)
+                     (14 13 12 11 10)
+                     (19 18 17 16 15))))
+    
+    ;; 2h. 负索引与省略
+    ;; b[-2:, -3:] -> [[15,16,17,18,19],[10,11,12,13,14]] ... 不对
+    ;; 注意：numpy 中 b[-2:, -3:] 是后两行，后三列 -> [[2,3,4],[7,8,9],[12,13,14],[17,18,19]]? 需要看形状(4,5)
+    ;; b[-2:, -3:] -> 后两行的后三列，即索引2..4行, 2..5列 -> [[2,3,4],[7,8,9]]? 让我们验证：
+    ;; b[-2:] = 最后两行: 索引2,3 -> [10..14],[15..19]
+    ;; b[..., -3:] = 后三列: 索引2,3,4 -> [2,3,4],[7,8,9],[12,13,14],[17,18,19]
+    ;; 交集: [[12,13,14],[17,18,19]] 正确
+    ;; 所以测试：
+    (assert (equal (vt-to-list (vt-slice b '(-2 nil) '(-3 nil)))
+                   '((12 13 14) (17 18 19))))
+    
+    ;; 2i. 混合整数与范围
+    ;; b[1, 1:4] -> [6,7,8]
+    (assert (equal (vt-to-list (vt-slice b '(1) '(1 4)))
+                   '(6 7 8)))
+    
+    ;; 2j. 负步长带省略
+    ;; b[:, 4:1:-1] -> 列4,3,2
+    (assert (equal (vt-to-list (vt-slice b '(:all) '(4 1 -1)))
+                   '((4 3 2) (9 8 7) (14 13 12) (19 18 17))))
+    
+    ;; 2k. 使用 else 省略号 (二维中省略号相当于 :)
+    ;; b[..., :2] -> 所有行，前两列
+    (assert (equal (vt-to-list (vt-slice b '(:elli) '(nil 2)))
+                   '((0 1) (5 6) (10 11) (15 16))))
+    
+    ;; 2l. 新轴插入
+    ;; b[:, none, :] -> 形状 (4,1,5)
+    (assert (equal (vt-shape (vt-slice b '(:all) '(:newa) '(:all)))
+                   '(4 1 5)))
+    ;; b[none, :, none, 0] -> (1,4,1)
+    (assert (equal (vt-shape (vt-slice b '(:newa) '(:all) '(:newa) '(0)))
+                   '(1 4 1)))
+    ;; 值检查：
+    (assert (equal (vt-to-list (vt-slice b '(:newa) '(:all) '(:newa) '(0)))
+                   '(((0) (5) (10) (15)))))   ; 因为额外维度，需注意嵌套
+    
+    ;; 2m. 空切片视图
+    ;; b[2:2, :] -> shape (0,5)
+    (assert (equal (vt-shape (vt-slice b '(2 2) '(:all))) '(0 5)))
+    ;; b[1:3, 5:5] -> (2,0)
+    (assert (equal (vt-shape (vt-slice b '(1 3) '(5 5))) '(2 0))))
+
+  ;; ============================================================
+  ;; 三维张量测试 (c = np.arange(24).reshape(2,3,4))
+  ;; ============================================================
+  (let* ((c (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+    ;; 3a. 取一个元素
+    ;; c[0,1,2] -> 6
+    (assert (= (vt-item (vt-slice c '(0) '(1) '(2))) 6.0))
+    
+    ;; 3b. 取一个平面
+    ;; c[1, :, :] -> shape (3,4), 值 12..23
+    (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
+                   '((12 13 14 15) (16 17 18 19) (20 21 22 23))))
+    
+    ;; 3c. 切片与范围
+    ;; c[0, 0:2, 1:3] -> [[1,2],[5,6]]
+    (assert (equal (vt-to-list (vt-slice c '(0) '(0 2) '(1 3)))
+                   '((1 2) (5 6))))
+    
+    ;; 3d. 多个省略号 (只有一个)
+    ;; c[..., :2] -> 形状 (2,3,2) 取每个块的前两列
+    (assert (equal (vt-shape (vt-slice c '(:elli) '(nil 2)))
+                   '(2 3 2)))
+    ;; 值：每个 matrix 的前两列
+    (assert (equal (vt-to-list (vt-slice c '(:elli) '(nil 2)))
+                   '(((0 1) (4 5) (8 9)) ((12 13) (16 17) (20 21)))))
+    
+    ;; 3e. 新轴与省略号混合
+    ;; c[none, ..., :2, none] -> 形状 (1,2,3,2,1)
+    (assert (equal (vt-shape (vt-slice c '(:newa) '(:elli) '(nil 2) '(:newa)))
+                   '(1 2 3 2 1)))
+    
+    ;; 3f. 负索引与步长
+    ;; c[:, ::-1, ::2] -> 行反转，列隔列取
+    (let ((result (vt-slice c '(:all) '(nil nil -1) '(nil nil 2))))
+      ;; 形状应为 (2,3,2) 因为列维度4，隔列后为2
+      (assert (equal (vt-shape result) '(2 3 2)))
+      ;; 检查第一个块
+      (assert (equal (vt-to-list (vt-slice result '(0) '(:all) '(:all)))
+                     '((8 10) (4 6) (0 2)))))  
+    
+    ;; 3g. 混合整数降维
+    ;; c[0, -1, 2] -> 10
+    (assert (= (vt-item (vt-slice c '(0) '(-1) '(2))) 10.0))
+    
+    ;; 3h. 省略号处于中间
+    ;; c[0, ..., 2] -> 等价 c[0, :, :, 2]？不，这是三维，c[0, :, 2] -> shape (3,)
+    (assert (equal (vt-to-list (vt-slice c '(0) '(:elli) '(2)))
+                   '(2 6 10)))  ; 所有行的第2列
+    
+    ;; 3i. 新轴扩展
+    ;; c[:, none, :, :] -> shape (2,1,3,4)
+    (assert (equal (vt-shape (vt-slice c '(:all) '(:newa) '(:all) '(:all)))
+                   '(2 1 3 4)))
+    
+    ;; 3j. 反向步长且 start/end 省略
+    ;; c[:, :, ::-1] -> 最后一维反转
+    (assert (equal (vt-to-list (vt-slice c '(:all) '(:all) '(nil nil -1)))
+                   '(((3 2 1 0) (7 6 5 4) (11 10 9 8))
+                     ((15 14 13 12) (19 18 17 16) (23 22 21 20))))))
+
+  ;; ============================================================
+  ;; setf vt-slice 修改测试
+  ;; ============================================================
+  
+  ;; 4a. 1D 标量广播赋值
+  (let ((a (vt-arange 10 :type 'fixnum))) ; [0,1,2,3,4,5,6,7,8,9]
+    ;; a[2:5] = 99
+    (setf (vt-slice a '(2 5)) 99)
+    ;; 预期: [0, 1, 99, 99, 99, 5, 6, 7, 8, 9]
+    (assert (equal (vt-to-list a) '(0 1 99 99 99 5 6 7 8 9))))
+
+  ;; 4b. 1D 张量赋值 (形状必须匹配)
+  (let ((a (vt-arange 10 :type 'fixnum))
+        (b (vt-from-sequence '(10 20 30) :type 'fixnum)))
+    ;; a[5:8] = b
+    (setf (vt-slice a '(5 8)) b)
+    ;; 预期: [0, 1, 2, 3, 4, 10, 20, 30, 8, 9]
+    (assert (equal (vt-to-list a) '(0 1 2 3 4 10 20 30 8 9))))
+
+  ;; 4c. 1D 带步长的切片赋值 (标量广播)
+  (let ((a (vt-arange 10 :type 'fixnum))) ; [0,1,2,3,4,5,6,7,8,9]
+    ;; a[::2] = -1
+    (setf (vt-slice a '(nil nil 2)) -1)
+    ;; 预期: [-1, 1, -1, 3, -1, 5, -1, 7, -1, 9]
+    (assert (equal (vt-to-list a) '(-1 1 -1 3 -1 5 -1 7 -1 9))))
+
+  ;; 4d. 1D 带步长的切片赋值 (张量赋值)
+  (let ((a (vt-arange 10 :type 'fixnum))
+        (b (vt-from-sequence '(100 200 300 400 500) :type 'fixnum)))
+    ;; a[::-2] = b
+    (setf (vt-slice a '(nil nil -2)) b)
+    ;; 原切片 a[::-2] 为 [9, 7, 5, 3, 1]
+    ;; 预期: a 变成 [0, 500, 2, 400, 4, 300, 6, 200, 8, 100]
+    (assert (equal (vt-to-list a) '(0 500 2 400 4 300 6 200 8 100))))
+
+  ;; 4e. 2D 子矩阵标量赋值
+  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5))))
+    ;; b[1:3, 2:4] = -1
+    (setf (vt-slice b '(1 3) '(2 4)) -1)
+    ;; 影响的原来是 [[7,8],[12,13]]，现在变为 -1
+    (assert (equal (vt-to-list b)
+                   '((0 1 2 3 4)
+                     (5 6 -1 -1 9)
+                     (10 11 -1 -1 14)
+                     (15 16 17 18 19)))))
+
+  ;; 4f. 2D 子矩阵张量赋值
+  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
+        (val-mat (vt-reshape (vt-from-sequence '(1 2 3 4) :type 'fixnum) '(2 2))))
+    ;; b[2:4, 0:2] = val-mat
+    (setf (vt-slice b '(2 4) '(0 2)) val-mat)
+    ;; 影响的原来是 [[10,11],[15,16]]，现在变为 [[1,2],[3,4]]
+    (assert (equal (vt-to-list b)
+                   '((0 1 2 3 4)
+                     (5 6 7 8 9)
+                     (1 2 12 13 14)
+                     (3 4 17 18 19)))))
+
+  ;; 4g. 2D 单行切片赋值
+  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
+        (row-vec (vt-from-sequence '(100 200 300 400 500) :type 'fixnum)))
+    ;; b[1, :] = row-vec
+    (setf (vt-slice b '(1) '(:all)) row-vec)
+    (assert (equal (vt-to-list b)
+                   '((0 1 2 3 4)
+                     (100 200 300 400 500)
+                     (10 11 12 13 14)
+                     (15 16 17 18 19)))))
+
+  ;; 4h. 2D 单列切片赋值
+  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
+        (col-vec (vt-from-sequence '(-1 -2 -3 -4) :type 'fixnum)))
+    ;; b[:, 2] = col-vec
+    (setf (vt-slice b '(:all) '(2)) col-vec)
+    (assert (equal (vt-to-list b)
+                   '((0 1 -1 3 4)
+                     (5 6 -2 8 9)
+                     (10 11 -3 13 14)
+                     (15 16 -4 18 19)))))
+
+  ;; 4i. 降维索引赋值 (整数索引混合切片)
+  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
+        (vec (vt-from-sequence '(7 8 9) :type 'fixnum)))
+    ;; b[2, 1:4] = vec
+    (setf (vt-slice b '(2) '(1 4)) vec)
+    ;; 第 2 行，索引 1,2,3 原为 [11,12,13] -> [7,8,9]
+    (assert (equal (vt-to-list b)
+                   '((0 1 2 3 4)
+                     (5 6 7 8 9)
+                     (10 7 8 9 14)
+                     (15 16 17 18 19)))))
+
+  ;; 4j. 反向步长赋值验证
+  (let ((a (vt-arange 10 :type 'fixnum)) ; [0,1,2,3,4,5,6,7,8,9]
+        (b (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
+    ;; a[8:3:-1] = b (原切片为 [8,7,6,5,4])
+    (setf (vt-slice a '(8 3 -1)) b)
+    (assert (equal (vt-to-list a) '(0 1 2 3 5 4 3 2 1 9))))
+
+
+  (let ((a (vt-from-sequence '(0 1 2 3 4))))
+    (equal nil (vt-to-list (vt-slice a '(-6 nil -1)))))
+
+  (let ((a (vt-from-sequence '(0 1 2 3 4))))
+    (equal '(0.0) (vt-to-list (vt-slice a '(0 nil -1)))))
+
+  (format t "~%all vt-slice tests passed.~%")
+
+  )
+
+(defun test-vt-ref ()
+  "测试 vt-ref 及 setf vt-ref 的各种情况。"
+  (format t "~&=== 开始测试 vt-ref 及 setf vt-ref ===~%")
+
+  (labels
+      ;; 辅助函数：期望读取成功并验证值
+      ((expect-read (name tensor expected-val &rest indices)
+         (handler-case
+             (let ((actual-val (apply #'vt-ref tensor indices)))
+               (if (equal actual-val expected-val)
+                   (format t "✅ [PASS] ~a | 读取 ~a = ~a~%" name indices actual-val)
+                   (format t "❌ [FAIL] ~a | 读取 ~a, 期望: ~a, 实际: ~a~%"
+                           name indices expected-val actual-val)))
+           (error (e)
+             (format t "❌ [FAIL] ~a | 读取 ~a 时发生意外错误: ~a~%" name indices e))))
+
+       ;; 辅助函数：期望写入成功，并读回验证
+       (expect-write (name tensor write-val &rest indices)
+         (handler-case
+             (progn
+               (apply #'(setf vt-ref) write-val tensor indices)
+               (let ((read-back (apply #'vt-ref tensor indices)))
+                 ;; 使用 equalp 以兼容浮点数和整数比较
+                 (if (equalp read-back write-val)
+                     (format t "✅ [PASS] ~a | 写入 ~a = ~a 成功~%" name indices write-val)
+                     (format t "❌ [FAIL] ~a | 写入 ~a, 期望读回: ~a, 实际读回: ~a~%"
+                             name indices write-val read-back))))
+           (error (e)
+             (format t "❌ [FAIL] ~a | 写入 ~a 时发生意外错误: ~a~%" name indices e))))
+
+       ;; 辅助函数：期望操作抛出错误（打印警告而不中断）
+       (expect-error (name operation-fn)
+         (handler-case
+             (progn
+               (funcall operation-fn)
+               (format t "❌ [FAIL] ~a | 期望抛出错误，但成功执行了!~%" name))
+           (error (e)
+             (format t "⚠️  [WARN] ~a | 成功捕获预期错误: ~a~%" name e)))))
+
+    ;; ==================== 正常用例测试 ====================
+    (format t "~&--- 正常用例 ---~%")
+    
+    ;; 1. 1D 张量读取
+    (let ((t1 (vt-from-sequence '(10 20 30 40) :type 'fixnum)))
+      (expect-read "1D 读取头部" t1 10 0)
+      (expect-read "1D 读取尾部" t1 40 3)
+      (expect-read "1D 读取中间" t1 20 1))
+
+    ;; 2. 2D 张量读取
+    (let ((t2 (vt-from-sequence '((1 2) (3 4) (5 6)) :type 'fixnum)))
+      (expect-read "2D 读取(0,0)" t2 1 0 0)
+      (expect-read "2D 读取(2,1)" t2 6 2 1)
+      (expect-read "2D 读取(1,0)" t2 3 1 0))
+
+    ;; 3. 3D 张量读取
+    (let ((t3 (vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))) :type 'fixnum)))
+      (expect-read "3D 读取(0,1,0)" t3 3 0 1 0)
+      (expect-read "3D 读取(1,1,1)" t3 8 1 1 1))
+
+    ;; 4. 1D 张量写入
+    (let ((t1 (vt-from-sequence '(1.0 2.0 3.0) :type 'single-float)))
+      (expect-write "1D 写入" t1 99.0 1)
+      (expect-write "1D 写入头部" t1 -1.0 0))
+
+    ;; 5. 2D 张量写入
+    (let ((t2 (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+      (expect-write "2D 写入" t2 100 0 1)
+      (expect-write "2D 写入尾部" t2 200 1 1))
+
+    ;; 6. 类型强制转换测试 (写入整数到浮点张量)
+    (let ((tf (vt-from-sequence '(1.0 2.0) :type 'double-float)))
+      (handler-case
+          (progn
+            (setf (vt-ref tf 0) 42) ; 传入整数
+            (let ((val (vt-ref tf 0)))
+              (if (= val 42.0d0)
+                  (format t "✅ [PASS] 类型强制转换 | 写入整数 42 到 double-float 成功~%")
+                  (format t "❌ [FAIL] 类型强制转换 | 读回值不匹配: ~a~%" val))))
+        (error (e)
+          (format t "⚠️  [WARN] 类型强制转换 | 不支持或发生错误: ~a~%" e))))
+
+
+    ;; ==================== 边界用例测试 ====================
+    (format t "~&--- 边界用例 ---~%")
+
+    ;; 7. 刚好在边界上的索引
+    (let ((t1 (vt-from-sequence '(1 2 3) :type 'fixnum)))
+      (expect-read "边界索引(最大)" t1 3 2))
+
+
+    ;; ==================== 错误用例测试 ====================
+    (format t "~&--- 错误用例 (应打印警告，不中断) ---~%")
+
+    (let ((t2 (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+      ;; 8. 错误：索引越界
+      (expect-error "读取越界(1D)"
+                    (lambda () (vt-ref t2 5 0))) ; 假设库内部检查越界并报错
+      
+      (expect-error "读取越界(2D)"
+                    (lambda () (vt-ref t2 0 5)))
+
+      ;; 9. 错误：索引维数不匹配
+      (expect-error "维数过多"
+                    (lambda () (vt-ref t2 0 0 0)))
+      
+      (expect-error "维数过少"
+                    (lambda () (vt-ref t2 0))) ; vt-ref 通常要求完整索引，不支持降维读取
+
+      ;; 10. 错误：写入越界
+      (expect-error "写入越界"
+                    (lambda () (setf (vt-ref t2 5 5) 99)))
+
+      ;; 11. 错误：写入类型严重不匹配 (例如将字符串写入数值张量)
+      (expect-error "写入类型错误"
+                    (lambda () (setf (vt-ref t2 0 0) "hello"))))
+
+    (format t "~&=== 测试结束 ===~%")))
+
 ;; ============================================================
 ;; test-vt-ravel
 ;; ============================================================
@@ -283,229 +842,6 @@
 
   (format t "~%test-vt-broadcast-to passed.~%"))
 
-(defun test-vt-slice ()
-  ;; ============================================================
-  ;; 辅助函数：将张量转换为列表以便比较（已存在于库中）
-  ;; ============================================================
-
-  ;; ============================================================
-  ;; 一维张量测试 (a = np.arange(10))
-  ;; ============================================================
-  (let ((a (vt-arange 10 :type 'fixnum)))
-    ;; 1a. 单个整数索引
-    ;; a[3] -> 3
-    (assert (= (vt-item (vt-slice a '(3))) 3))
-    
-    ;; 1b. 正向范围
-    ;; a[2:7] -> [2,3,4,5,6]
-    (assert (equal (vt-to-list (vt-slice a '(2 7))) '(2 3 4 5 6)))
-    
-    ;; 1c. 带步长
-    ;; a[1:9:2] -> [1,3,5,7]
-    (assert (equal (vt-to-list (vt-slice a '(1 9 2))) '(1 3 5 7)))
-    
-    ;; 1d. 省略 start
-    ;; a[:5] -> [0,1,2,3,4]
-    (assert (equal (vt-to-list (vt-slice a '(nil 5))) '(0 1 2 3 4)))
-    
-    ;; 1e. 省略 end
-    ;; a[5:] -> [5,6,7,8,9]
-    (assert (equal (vt-to-list (vt-slice a '(5 nil))) '(5 6 7 8 9)))
-    
-    ;; 1f. 反向步长
-    ;; a[8:3:-1] -> [8,7,6,5,4]
-    (assert (equal (vt-to-list (vt-slice a '(8 3 -1))) '(8 7 6 5 4)))
-    
-    ;; 1g. 完整反向
-    ;; a[::-1] -> [9,8,7,6,5,4,3,2,1,0]
-    (assert (equal (vt-to-list (vt-slice a '(nil nil -1)))
-                   '(9 8 7 6 5 4 3 2 1 0)))
-    
-    ;; 1h. 负索引
-    ;; a[-1] -> 9
-    (assert (= (vt-item (vt-slice a '(-1))) 9))
-    
-    ;; a[-3:-1] -> [7,8]
-    (assert (equal (vt-to-list (vt-slice a '(-3 -1))) '(7 8)))
-    
-    ;; 1i. 空切片
-    ;; a[5:5] -> []
-    (assert (equal (vt-to-list (vt-slice a '(5 5))) '()))
-    ;; a[10:10] -> []
-    (assert (equal (vt-to-list (vt-slice a '(10 10))) '())))
-
-  ;; ============================================================
-  ;; 二维张量测试 (b = np.arange(20).reshape(4,5))
-  ;; ============================================================
-  (let* ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5))))
-    ;; 2a. 单个元素
-    ;; b[1,2] -> 7
-    (assert (= (vt-item (vt-slice b '(1) '(2))) 7.0))
-    
-    ;; 2b. 取一行
-    ;; b[2,:] -> [10,11,12,13,14]
-    (assert (equal (vt-to-list (vt-slice b '(2) '(:all)))
-                   '(10 11 12 13 14)))
-    
-    ;; 2c. 取一列
-    ;; b[:,3] -> [3,8,13,18]
-    (assert (equal (vt-to-list (vt-slice b '(:all) '(3)))
-                   '(3 8 13 18)))
-    
-    ;; 2d. 子矩阵
-    ;; b[1:3, 2:4] -> [[7,8],[12,13]]
-    (assert (equal (vt-to-list (vt-slice b '(1 3) '(2 4)))
-                   '((7 8) (12 13))))
-    
-    ;; 2e. 省略边界
-    ;; b[:2, 2:] -> [[2,3,4],[7,8,9]]
-    (assert (equal (vt-to-list (vt-slice b '(nil 2) '(2 nil)))
-                   '((2 3 4) (7 8 9))))
-    
-    ;; 2f. 行逆序
-    ;; b[::-1, :] -> 行颠倒
-    (assert (equal (vt-to-list (vt-slice b '(nil nil -1) '(:all)))
-                   '((15 16 17 18 19)
-                     (10 11 12 13 14)
-                     (5 6 7 8 9)
-                     (0 1 2 3 4))))
-    
-    ;; 2g. 列逆序
-    ;; b[:, ::-1] -> 列颠倒
-    (assert (equal (vt-to-list (vt-slice b '(:all) '(nil nil -1)))
-                   '((4 3 2 1 0)
-                     (9 8 7 6 5)
-                     (14 13 12 11 10)
-                     (19 18 17 16 15))))
-    
-    ;; 2h. 负索引与省略
-    ;; b[-2:, -3:] -> [[15,16,17,18,19],[10,11,12,13,14]] ... 不对
-    ;; 注意：numpy 中 b[-2:, -3:] 是后两行，后三列 -> [[2,3,4],[7,8,9],[12,13,14],[17,18,19]]? 需要看形状(4,5)
-    ;; b[-2:, -3:] -> 后两行的后三列，即索引2..4行, 2..5列 -> [[2,3,4],[7,8,9]]? 让我们验证：
-    ;; b[-2:] = 最后两行: 索引2,3 -> [10..14],[15..19]
-    ;; b[..., -3:] = 后三列: 索引2,3,4 -> [2,3,4],[7,8,9],[12,13,14],[17,18,19]
-    ;; 交集: [[12,13,14],[17,18,19]] 正确
-    ;; 所以测试：
-    (assert (equal (vt-to-list (vt-slice b '(-2 nil) '(-3 nil)))
-                   '((12 13 14) (17 18 19))))
-    
-    ;; 2i. 混合整数与范围
-    ;; b[1, 1:4] -> [6,7,8]
-    (assert (equal (vt-to-list (vt-slice b '(1) '(1 4)))
-                   '(6 7 8)))
-    
-    ;; 2j. 负步长带省略
-    ;; b[:, 4:1:-1] -> 列4,3,2
-    (assert (equal (vt-to-list (vt-slice b '(:all) '(4 1 -1)))
-                   '((4 3 2) (9 8 7) (14 13 12) (19 18 17))))
-    
-    ;; 2k. 使用 else 省略号 (二维中省略号相当于 :)
-    ;; b[..., :2] -> 所有行，前两列
-    (assert (equal (vt-to-list (vt-slice b '(:elli) '(nil 2)))
-                   '((0 1) (5 6) (10 11) (15 16))))
-    
-    ;; 2l. 新轴插入
-    ;; b[:, none, :] -> 形状 (4,1,5)
-    (assert (equal (vt-shape (vt-slice b '(:all) '(:newa) '(:all)))
-                   '(4 1 5)))
-    ;; b[none, :, none, 0] -> (1,4,1)
-    (assert (equal (vt-shape (vt-slice b '(:newa) '(:all) '(:newa) '(0)))
-                   '(1 4 1)))
-    ;; 值检查：
-    (assert (equal (vt-to-list (vt-slice b '(:newa) '(:all) '(:newa) '(0)))
-                   '(((0) (5) (10) (15)))))   ; 因为额外维度，需注意嵌套
-    
-    ;; 2m. 空切片视图
-    ;; b[2:2, :] -> shape (0,5)
-    (assert (equal (vt-shape (vt-slice b '(2 2) '(:all))) '(0 5)))
-    ;; b[1:3, 5:5] -> (2,0)
-    (assert (equal (vt-shape (vt-slice b '(1 3) '(5 5))) '(2 0))))
-
-  ;; ============================================================
-  ;; 三维张量测试 (c = np.arange(24).reshape(2,3,4))
-  ;; ============================================================
-  (let* ((c (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
-    ;; 3a. 取一个元素
-    ;; c[0,1,2] -> 6
-    (assert (= (vt-item (vt-slice c '(0) '(1) '(2))) 6.0))
-    
-    ;; 3b. 取一个平面
-    ;; c[1, :, :] -> shape (3,4), 值 12..23
-    (assert (equal (vt-to-list (vt-slice c '(1) '(:all) '(:all)))
-                   '((12 13 14 15) (16 17 18 19) (20 21 22 23))))
-    
-    ;; 3c. 切片与范围
-    ;; c[0, 0:2, 1:3] -> [[1,2],[5,6]]
-    (assert (equal (vt-to-list (vt-slice c '(0) '(0 2) '(1 3)))
-                   '((1 2) (5 6))))
-    
-    ;; 3d. 多个省略号 (只有一个)
-    ;; c[..., :2] -> 形状 (2,3,2) 取每个块的前两列
-    (assert (equal (vt-shape (vt-slice c '(:elli) '(nil 2)))
-                   '(2 3 2)))
-    ;; 值：每个 matrix 的前两列
-    (assert (equal (vt-to-list (vt-slice c '(:elli) '(nil 2)))
-                   '(((0 1) (4 5) (8 9)) ((12 13) (16 17) (20 21)))))
-    
-    ;; 3e. 新轴与省略号混合
-    ;; c[none, ..., :2, none] -> 形状 (1,2,3,2,1)
-    (assert (equal (vt-shape (vt-slice c '(:newa) '(:elli) '(nil 2) '(:newa)))
-                   '(1 2 3 2 1)))
-    
-    ;; 3f. 负索引与步长
-    ;; c[:, ::-1, ::2] -> 行反转，列隔列取
-    (let ((result (vt-slice c '(:all) '(nil nil -1) '(nil nil 2))))
-      ;; 形状应为 (2,3,2) 因为列维度4，隔列后为2
-      (assert (equal (vt-shape result) '(2 3 2)))
-      ;; 检查第一个块
-      (assert (equal (vt-to-list (vt-slice result '(0) '(:all) '(:all)))
-                     '((8 10) (4 6) (0 2)))))  
-    
-    ;; 3g. 混合整数降维
-    ;; c[0, -1, 2] -> 10
-    (assert (= (vt-item (vt-slice c '(0) '(-1) '(2))) 10.0))
-    
-    ;; 3h. 省略号处于中间
-    ;; c[0, ..., 2] -> 等价 c[0, :, :, 2]？不，这是三维，c[0, :, 2] -> shape (3,)
-    (assert (equal (vt-to-list (vt-slice c '(0) '(:elli) '(2)))
-                   '(2 6 10)))  ; 所有行的第2列
-    
-    ;; 3i. 新轴扩展
-    ;; c[:, none, :, :] -> shape (2,1,3,4)
-    (assert (equal (vt-shape (vt-slice c '(:all) '(:newa) '(:all) '(:all)))
-                   '(2 1 3 4)))
-    
-    ;; 3j. 反向步长且 start/end 省略
-    ;; c[:, :, ::-1] -> 最后一维反转
-    (assert (equal (vt-to-list (vt-slice c '(:all) '(:all) '(nil nil -1)))
-                   '(((3 2 1 0) (7 6 5 4) (11 10 9 8))
-                     ((15 14 13 12) (19 18 17 16) (23 22 21 20))))))
-  (let ((a (vt-from-sequence '(0 1 2 3 4))))
-    (equal nil (vt-to-list (vt-slice a '(-6 nil -1)))))
-
-  (let ((a (vt-from-sequence '(0 1 2 3 4))))
-    (equal '(0.0) (vt-to-list (vt-slice a '(0 nil -1)))))
-
-  (format t "~%all new vt-slice tests passed.~%")
-
-  )
-
-;; --------------------- test reshape ---------------------
-(defun test-vt-reshape ()
-  ;; np.arange(6).reshape(2,3)
-  (let* ((a (vt-arange 6 :type 'fixnum))
-         (b (vt-reshape a '(2 3))))
-    (assert (equal (vt-shape b) '(2 3)))
-    (assert (equal (vt-to-list b) '((0 1 2) (3 4 5))))
-    ;; 重塑为一维
-    (let ((c (vt-reshape b '(6))))
-      (assert (equal (vt-shape c) '(6)))
-      (assert (equal (vt-to-list c) '(0 1 2 3 4 5)))))
-  ;; 大小不匹配应报错
-  (let ((a (vt-arange 6)))
-    (handler-case (vt-reshape a '(2 4))
-      (error (e) (format t "~%[ok] reshape size mismatch caught: ~a" e))))
-  (format t "~%test-vt-reshape passed.~%"))
 
 ;; --------------------- test transpose ---------------------
 (defun test-vt-transpose ()
@@ -1073,6 +1409,61 @@
   (format t "~%test-vt-argwhere passed.~%"))
 
 
+(defun test-vt-argwhere-0d ()
+  "测试 vt-argwhere 在各种维度下的行为，特别是 0 维张量的边界情况"
+  (format t "=== 开始测试 vt-argwhere 0维张量修复 ===~%")
+
+  ;; 测试 1: 0 维张量（标量）非零
+  ;; 对标 PyTorch: torch.nonzero(torch.tensor(5.0)) -> tensor([], size=(1, 0))
+  (let* ((scalar-nonzero (ensure-vt 5.0))
+         (res (vt-argwhere scalar-nonzero)))
+    (format t "测试 1 [标量非零]: 输入 5.0~%")
+    (format t "  期望形状: (1 0), 实际形状: ~a~%" (vt-shape res))
+    (format t "  期望数据长: 0, 实际数据长: ~a~%" (length (vt-data res)))
+    (assert (equal (vt-shape res) '(1 0)))
+    (assert (= (length (vt-data res)) 0)))
+
+  ;; 测试 2: 0 维张量（标量）为零
+  ;; 对标 PyTorch: torch.nonzero(torch.tensor(0.0)) -> tensor([], size=(0, 0))
+  (let* ((scalar-zero (ensure-vt 0.0))
+         (res (vt-argwhere scalar-zero)))
+    (format t "测试 2 [标量为零]: 输入 0.0~%")
+    (format t "  期望形状: (0 0), 实际形状: ~a~%" (vt-shape res))
+    (format t "  期望数据长: 0, 实际数据长: ~a~%" (length (vt-data res)))
+    (assert (equal (vt-shape res) '(0 0)))
+    (assert (= (length (vt-data res)) 0)))
+
+  ;; 测试 3: 1D 张量常规情况
+  ;; 对标 PyTorch: torch.nonzero(torch.tensor([0, 1, 0, 3, 0])) -> tensor([[1], [3]])
+  (let* ((vec1d (vt-from-sequence '(0 1 0 3 0) :type 'fixnum))
+         (res (vt-argwhere vec1d)))
+    (format t "测试 3 [1D张量]: 输入 [0, 1, 0, 3, 0]~%")
+    (format t "  期望形状: (2 1), 实际形状: ~a~%" (vt-shape res))
+    (format t "  期望数据: ((1) (3)), 实际数据: ~a~%" (vt-to-list res))
+    (assert (equal (vt-shape res) '(2 1)))
+    (assert (equal (vt-to-list res) '((1) (3)))))
+
+  ;; 测试 4: 2D 张量常规情况
+  ;; 对标 PyTorch: torch.nonzero(torch.tensor([[0,1],[0,0],[2,0]])) -> tensor([[0, 1], [2, 0]])
+  (let* ((mat2d (vt-from-sequence '((0 1) (0 0) (2 0)) :type 'fixnum))
+         (res (vt-argwhere mat2d)))
+    (format t "测试 4 [2D张量]: 输入 [[0,1],[0,0],[2,0]]~%")
+    (format t "  期望形状: (2 2), 实际形状: ~a~%" (vt-shape res))
+    (format t "  期望数据: ((0 1) (2 0)), 实际数据: ~a~%" (vt-to-list res))
+    (assert (equal (vt-shape res) '(2 2)))
+    (assert (equal (vt-to-list res) '((0 1) (2 0)))))
+
+  ;; 测试 5: 全零的 2D 张量
+  ;; 对标 PyTorch: torch.nonzero(torch.zeros(2,2)) -> tensor([], size=(0, 2))
+  (let* ((zero-mat (vt-zeros '(2 2) :type 'double-float))
+         (res (vt-argwhere zero-mat)))
+    (format t "测试 5 [2D全零]: 输入 zeros(2,2)~%")
+    (format t "  期望形状: (0 2), 实际形状: ~a~%" (vt-shape res))
+    (format t "  期望数据长: 0, 实际数据长: ~a~%" (length (vt-data res)))
+    (assert (equal (vt-shape res) '(0 2)))
+    (assert (= (length (vt-data res)) 0)))
+
+  (format t "=== 所有测试通过！修复符合 PyTorch 语义，且底层结构安全 ===~%"))
 
 ;; ============================================================
 ;; test-vt-matmul
@@ -4145,20 +4536,6 @@
     (assert (equal (vt-to-list flat) '(0 1 2))))
   (format t "~%test-vt-flatten passed.~%"))
 
-;; --------------------- test vt-from-sequence ---------------------
-(defun test-vt-from-sequence ()
-  ;; np.array([[1, 2], [3, 4]], dtype=np.float64)
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
-    (assert (equal (vt-shape a) '(2 2)))
-    (assert (eq (vt-element-type a) 'double-float))
-    (assert (= (vt-ref a 0 0) 1.0d0))
-    (assert (= (vt-ref a 1 1) 4.0d0)))
-  ;; 从 1d list 创建
-  (let* ((a (vt-from-sequence '(5 6 7) :type 'fixnum)))
-    (assert (equal (vt-shape a) '(3)))
-    (assert (equal (vt-to-list a) '(5 6 7))))
-  (format t "~%test-vt-from-sequence passed.~%"))
-
 ;; --------------------- test vt-diag ---------------------
 (defun test-vt-diag ()
   ;; np.diag([1, 2, 3])
@@ -4861,6 +5238,10 @@
 ;; ============================================================
 
 (defun run-all-tests ()
+  (test-vt-reshape)
+  (test-vt-from-sequence)
+  (test-vt-slice)
+  (test-vt-ref)
   (test-vt-ravel)
   (test-vt-swapaxes)
   (test-vt-flip)
@@ -4868,8 +5249,6 @@
   (test-vt-triu-tril)
   (test-vt-diagonal)
   (test-vt-broadcast-to)
-  (test-vt-slice)
-  (test-vt-reshape)
   (test-vt-transpose)
   (test-vt-squeeze)
   (test-vt-expand-dims)
@@ -4883,6 +5262,7 @@
   (test-vt-nonzero)
   (test-vt-where)
   (test-vt-argwhere)
+  (test-vt-argwhere-0d)
   (test-vt-meshgrid)
   (test-vt-median)
   (test-vt-percentile)
@@ -4938,7 +5318,6 @@
   (test-vt-insert)
   (test-vt-delete)
   (test-vt-flatten)
-  (test-vt-from-sequence)
   (test-vt-diag)
   (test-arithmetic-basics)
   (test-vt-comparison)

@@ -81,7 +81,6 @@
 		:offset 0
 		:etype tmp-type))))
 
-
 (defun vt-flatten-sequence (seq)
   "深度优先遍历 seq 及其嵌套序列,返回所有原子元素的列表.
    支持列表、向量、多维数组、位数组等序列类型,按行优先顺序处理."
@@ -130,7 +129,9 @@
 (defun vt-from-sequence (contents &key (type 'double-float))
   "从嵌套序列创建张量。支持任意维度的规则嵌套列表或向量。
    例如 (vt-from-sequence '((1 2) (3 4))) 返回形状为 (2 2) 的张量。
-   若传入一维序列，返回一维张量。"
+   若传入一维序列，返回一维张量。
+   注意: 空序列 () 或 #() 将被视为形状 (0) 的一维张量。
+   不规则嵌套报错 如: (vt-from-sequence  #(1 '(2) 3 4))"
   ;; 辅助函数：递归推断形状并收集元素
   (with-float-safe
     (labels
@@ -157,8 +158,14 @@
 					      rest-shape sub-shape)
                                   finally (return rest-shape)))
                            ;; 叶子：一维
-                           (list len)))))
-	       ;; 不是序列（但这种情况不应该发生，因为顶层是序列）
+                           (progn
+                             ;; === 修复漏洞：确保所有元素都是原子数字，而非混合序列 ===
+                             (loop for i from 1 below len
+                                   for sub = (elt seq i)
+                                   when (or (listp sub) (typep sub 'vector))
+                                   do (error "不规则嵌套: 期望原子元素但得到序列 ~a" sub))
+                             (list len))))))
+	       ;; 不是序列
 	       (error "无法从 ~a 创建张量" seq)))
 	 (fill-tensor (data seq shape strides depth flat-idx)
            (if (null shape)
@@ -1419,13 +1426,18 @@
           (return-from vt-reduce
             (values (make-vt out-shape empty-result-val :type element-type)
                     (when return-arg (make-vt out-shape 0 :type 'fixnum))))))
+      ;; 拦截输入总大小为 0 但 axis-size > 0 的情况（如 shape=(0,5), axis=1）===
+      (when (zerop (vt-size tensor))
+        (return-from vt-reduce
+	  (values (make-vt out-shape 0 :type element-type)
+                  (when return-arg (make-vt out-shape 0 :type 'fixnum)))))
       ;; 阶段 1：冷路径 - 试探性推断累加器类型
       (let* ((first-val (aref in-data in-offset))
              (first-result (funcall reducer-fn init-val first-val))
+	     (is-boolean-fn (or (eq first-result t) (null first-result)))
              (effective-out-type
                (cond
-                 ((or (eq first-result t)
-		      (null first-result))
+                 (is-boolean-fn
 		  'double-float)
                  ((and (integerp first-result)
                        (<= most-negative-fixnum
@@ -1442,7 +1454,9 @@
 				most-positive-fixnum))
                        init-val
                        (truncate init-val))
-                   (coerce init-val 'double-float))))
+		   (if is-boolean-fn
+                       (if init-val 1.0d0 0.0d0)
+                       (coerce init-val 'double-float)))))
         ;; 阶段 2：分配结果与步长映射，执行热路径
         (let* ((res (make-vt out-shape safe-init-val :type effective-out-type))
                (res-data (vt-data res))
@@ -1503,7 +1517,10 @@
                       (funcall reducer-fn cur-acc val)
                     (setf (aref (the (simple-array double-float (*)) res-data)
 				out-ptr)
-                          (the double-float (coerce new-acc 'double-float)))
+                          (the double-float
+			       (if is-boolean-fn
+                                   (if new-acc 1.0d0 0.0d0)
+                                   (coerce new-acc 'double-float))))
                     (when (and return-arg do-update-idx res-idx-data)
                       (setf (aref (the (simple-array fixnum (*)) res-idx-data)
 				  out-idx-ptr)
@@ -1657,9 +1674,14 @@
 
 (defun vt-argwhere (condition)
   "查找非零元素的坐标.
-   condition: 条件张量.
-   返回: 形状为 (n, rank) 的二维张量,每一行是一个非零元素的完整坐标.
-   示例: (vt-argwhere tensor) -> [[0, 1], [2, 3], ...]"
+condition: 条件张量.
+返回: 形状为 (n, rank) 的二维张量,每一行是一个非零元素的完整坐标.
+示例: (vt-argwhere tensor) -> [[0, 1], [2, 3], ...]
+
+注意 (对标 PyTorch/NumPy):
+如果输入是 0 维张量 (标量), rank 为 0。
+- 若标量非零: 返回形状为 (1, 0) 的张量 (表示找到 1 个结果, 但坐标维度为 0, data 长度为 0)。
+- 若标量为零: 返回形状为 (0, 0) 的张量。"
   (declare (type vt condition))
   (with-float-safe
     (let* ((in-shape (vt-shape condition))
@@ -1667,70 +1689,83 @@
            (in-data (vt-data condition))
            (in-strides (vt-strides condition))
            (in-offset (vt-offset condition))
-           (result-indices
-	     (make-array 0 :element-type 'fixnum
-			   :fill-pointer t :adjustable t))
+           (result-indices (make-array 0 :element-type 'fixnum
+					 :fill-pointer t :adjustable t))
            (coord-buffer (make-array rank :element-type 'fixnum)))
+
+      ;; 宏定义：处理 0 维张量时，通过推入占位符记录命中次数
       (macrolet
 	  ((gen-recurse (test-fn)
-             ;; test-fn 是针对特定类型的安全比较闭包/函数
              `(labels
 		  ((recurse (depth current-ptr)
                      (declare (type fixnum depth current-ptr))
                      (if (= depth rank)
                          ;; 安全地调用传入的测试逻辑
                          (when (funcall ,test-fn in-data current-ptr)
-			   (if (zerop rank)
-			       (vector-push-extend 0 result-indices)
-                               (loop for c across coord-buffer
-				     do (vector-push-extend c result-indices))))
+                           (if (zerop rank)
+                               ;; 0维张量匹配时，推入占位符使 count 计算为 1
+                               (vector-push-extend 0 result-indices)
+                               (loop for c across coord-buffer do 
+                                 (vector-push-extend c result-indices))))
                          (let ((dim (nth depth in-shape))
                                (stride (nth depth in-strides)))
                            (declare (type fixnum dim stride))
-                           (loop for i fixnum from 0 below dim do
-                             (setf (aref coord-buffer depth) i)
-                             (recurse (1+ depth)
-				      (+ current-ptr (* i stride))))))))
+                           (loop for i fixnum from 0 below dim
+                                 do (setf (aref coord-buffer depth) i)
+                                    (recurse (1+ depth)
+					     (+ current-ptr (* i stride))))))))
                 (recurse 0 in-offset))))
         
-        ;; 冷路径：根据真实数组类型派发，确保安全与性能兼顾
+        ;; 冷路径：根据真实数组类型派发
         (etypecase in-data
           ((simple-array double-float (*))
            (gen-recurse
 	    (lambda (data ptr)
               (declare (type (simple-array double-float (*)) data)
-                       (type fixnum ptr))
+		       (type fixnum ptr))
               (/= (aref data ptr) 0.0d0))))
           ((simple-array fixnum (*))
            (gen-recurse
 	    (lambda (data ptr)
               (declare (type (simple-array fixnum (*)) data)
-                       (type fixnum ptr))
+		       (type fixnum ptr))
               (/= (the fixnum (aref data ptr)) 0))))
           ((simple-array single-float (*))
            (gen-recurse
 	    (lambda (data ptr)
               (declare (type (simple-array single-float (*)) data)
-                       (type fixnum ptr))
-              (/= (aref data ptr) 0.0f0))))))
-      
-      ;; 结果封装部分保持不变...
-      (let* ((total-indices (length result-indices))
-             (count (if (zerop rank)
-			total-indices
-			(floor total-indices rank))))
-        (if (zerop count)
-            (vt-zeros (list 0 rank))
-            (let ((final-data
-		    (make-array total-indices :element-type 'fixnum)))
-              (loop for i from 0 below total-indices
-		    for idx across result-indices do
-                (setf (aref final-data i) idx))
-              (%make-vt :data final-data
-			:shape (list count rank)
-			:strides (list rank 1)
-			:offset 0
-			:etype 'fixnum)))))))
+		       (type fixnum ptr))
+              (/= (aref data ptr) 0.0f0)))))
+        ;; 结果封装逻辑
+        (let* ((total-indices (length result-indices))
+               ;; 当 rank=0 时，count 直接等于 total-indices (非零时为1，为零时为0)
+               (count (if (zerop rank)
+			  total-indices
+			  (floor total-indices rank))))
+          (cond 
+            ;; 情况 A：完全没有匹配
+            ((zerop count)
+             (vt-zeros (list 0 rank) :type 'fixnum)) ; 标量返回 (0, 0)，多维返回 (0, rank)
+            ;; 情况 B：有匹配，且 rank > 0（常规情况）
+            ((> rank 0)
+             (let ((final-data (make-array total-indices :element-type 'fixnum)))
+               (loop for i from 0 below total-indices
+                     for idx across result-indices
+                     do (setf (aref final-data i) idx))
+               (%make-vt :data final-data 
+                         :shape (list count rank) 
+                         :strides (list rank 1) 
+                         :offset 0 
+                         :etype 'fixnum)))            
+            ;; 情况 C：有匹配，且 rank = 0（标量非零）
+            ;; 完美对标 PyTorch: 返回 (1, 0) 形状，data 长度为 0 满足底层不变量
+            (t 
+             (%make-vt :data (make-array 0 :element-type 'fixnum) ; 空数据
+                       :shape (list count 0)                       ; 形状 (1, 0)
+                       :strides (list 0 1) 
+                       :offset 0 
+                       :etype 'fixnum))))))))
+
 
 ;;;; 关于nan的相关定义
 (eval-when (:compile-toplevel :load-toplevel :execute)
