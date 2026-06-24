@@ -1,7 +1,7 @@
 (in-package :clvt)
 
-(defvar *vt-print-threshold* 4)
-(defvar *vt-print-precision* 4)
+(defvar *vt-print-threshold* 3 "显示多少位置的数之后开始省略")
+(defvar *vt-print-precision* 6 "显示精度")
 (defvar *vt-indent-step* 1)
 
 ;; 辅助函数: 判断类型类别
