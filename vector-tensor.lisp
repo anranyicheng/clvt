@@ -1523,7 +1523,8 @@
 					    new-acc
 					    most-positive-fixnum))
                                    new-acc
-                                   (truncate new-acc))))
+                                   (min most-positive-fixnum
+					(truncate new-acc)))))
                     (when (and return-arg do-update-idx res-idx-data)
                       (setf (aref (the (simple-array fixnum (*)) res-idx-data)
 				  out-idx-ptr)

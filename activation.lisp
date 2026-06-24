@@ -34,8 +34,8 @@
   (with-float-safe
     (vt-map (lambda (x) 
               (if (> x 20.0d0) 
-                  x 
-                  (log (+ 1.0d0 (exp x)))))
+                  (* x 1.0d0)
+                  (* 1.0d0 (log (+ 1.0d0 (exp x))))))
             vt)))
 
 (defun vt-gelu (vt)

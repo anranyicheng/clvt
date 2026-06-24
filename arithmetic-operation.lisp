@@ -174,18 +174,43 @@
 
 (defun vt-floor (vt &optional (divisor 1))
   "向下取整."
-  (with-float-safe
-    (vt-map (lambda (x) (floor x divisor)) vt)))
+  (with-float-safe 
+    (vt-map (lambda (x) 
+              (let ((res (nth-value 0 (floor x divisor))))
+                (if (floatp x)
+		    (float res 1.0d0)
+		    res)))
+	    vt)))
 
 (defun vt-ceiling (vt &optional (divisor 1))
   "向上取整."
-  (with-float-safe
-    (vt-map (lambda (x) (ceiling x divisor)) vt)))
+  (with-float-safe 
+    (vt-map (lambda (x) 
+              (let ((res (nth-value 0 (ceiling x divisor))))
+                (if (floatp x)
+		    (float res 1.0d0)
+		    res)))
+	    vt)))
 
 (defun vt-round (vt &optional (divisor 1))
   "四舍五入."
-  (with-float-safe
-    (vt-map (lambda (x) (round x divisor)) vt)))
+  (with-float-safe 
+    (vt-map (lambda (x) 
+              (let ((res (nth-value 0 (round x divisor))))
+                (if (floatp x)
+		    (float res 1.0d0)
+		    res)))
+	    vt)))
+
+(defun vt-truncate (vt &optional (divisor 1))
+  "向0取整"
+  (with-float-safe 
+    (vt-map (lambda (x) 
+              (let ((res (nth-value 0 (truncate x divisor))))
+                (if (floatp x)
+		    (float res 1.0d0)
+		    res)))
+	    vt)))
 
 (defun vt-rint (vt)
   "四舍五入到最接近的整数 (浮点数返回值)."
@@ -193,13 +218,9 @@
     (vt-map (lambda (x) 
               (let ((res (nth-value 0 (round x))))
                 (if (floatp x)
-		    (float res 1.0d0) res))) 
+		    (float res 1.0d0)
+		    res))) 
             vt)))
-
-(defun vt-truncate (vt &optional (divisor 1))
-  "向0取整"
-  (with-float-safe
-    (vt-map (lambda (x) (truncate x divisor)) vt)))
 
 (defun vt-log (vt &optional base)
   "以 base 为底的对数. (非正数返回 nan)"
@@ -208,13 +229,14 @@
         (vt-map (lambda (val)
 		  (if (<= val 0)
 		      +vt-float-nan+
-		      (log val base)))
+		      (* 1.0d0 (log val base))))
 		vt)
         (vt-map (lambda (val)
 		  (if (<= val 0)
 		      +vt-float-nan+
-		      (log val)))
+		      (* 1.0d0 (log val))))
 		vt))))
+
 
 (defun vt-log10 (vt)
   "以 10 为底的对数."

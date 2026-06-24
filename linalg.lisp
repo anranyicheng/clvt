@@ -344,141 +344,6 @@
                 (let ((beta (/ 2.0d0 beta-num)))
                   (values v beta sigma)))))))))
 
-(defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50) (tol 1e-10))
-  "奇异值分解 a = u s v^t。
-   full-matrices : t 则返回完整尺寸 u(m×m), s(k), vt(n×n)  (k = min(m,n))
-                  : nil 返回经济尺寸 u(m×k), s(k), vt(k×n)
-   max-sweeps    : jacobi 最大扫描次数
-   tol           : 收敛容差"
-  (assert (= 2 (vt-order matrix)))
-  (with-float-safe 
-    (let* ((mat (vt-astype matrix 'double-float))
-           (m (first (vt-shape mat)))
-           (n (second (vt-shape mat)))
-           (k (min m n)))
-      
-      (when (and (= m 1) (= n 1))
-        (let ((val (aref (vt-data mat) 0)))
-          (return-from vt-svd 
-            (values (vt-const '(1 1) 1.0d0 :type 'double-float)
-                    (vt-const '(1) (abs val) :type 'double-float)
-                    (if (>= val 0) 
-                        (vt-ones '(1 1) :type 'double-float)
-                        (vt-const '(1 1) -1.0d0 :type 'double-float))))))
-      
-      (flet ((col-norm-sq (m col) 
-               (vt-ref (vt-dot (vt-slice m '(:all) (list col))
-			       (vt-slice m '(:all) (list col)))))
-             (col-dot (m c1 c2) 
-               (vt-ref (vt-dot (vt-slice m '(:all) (list c1))
-			       (vt-slice m '(:all) (list c2))))))
-        (let* ((u (vt-copy mat))
-               (v (vt-eye n :type 'double-float))
-               (changed t)
-               (sweep 0))
-          
-          (let ((u-data (vt-data u))
-                (u-s0 (first (vt-strides u)))
-                (u-s1 (second (vt-strides u)))
-                (u-off (vt-offset u))
-                (v-data (vt-data v))
-                (v-s0 (first (vt-strides v)))
-                (v-s1 (second (vt-strides v)))
-                (v-off (vt-offset v)))
-            
-            (loop while (and changed (< sweep max-sweeps)) do
-              (setf changed nil)
-              (loop for i from 0 below (1- n) do
-                (loop for j from (1+ i) below n
-                      for alpha = (col-norm-sq u i)
-                      for beta = (col-norm-sq u j)
-                      for gamma = (col-dot u i j)
-                      when (> (abs gamma) (* tol (sqrt (* alpha beta)))) do
-                        (setf changed t)
-                        (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
-                               (t-abs (/ 1.0d0 (+ (abs zeta)
-						  (sqrt (+ 1 (* zeta zeta))))))
-                               (t-val (if (>= zeta 0) t-abs (- t-abs)))
-                               (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
-                               (s (* c t-val)))
-                          (loop for r from 0 below m do
-                            (let* ((ptr-i (+ u-off (* r u-s0) (* i u-s1)))
-                                   (ptr-j (+ u-off (* r u-s0) (* j u-s1)))
-                                   (ui (aref u-data ptr-i))
-                                   (uj (aref u-data ptr-j)))
-                              (setf (aref u-data ptr-i) (- (* ui c) (* uj s)))
-                              (setf (aref u-data ptr-j) (+ (* ui s) (* uj c)))))
-                          (loop for r from 0 below n do
-                            (let* ((ptr-i (+ v-off (* r v-s0) (* i v-s1)))
-                                   (ptr-j (+ v-off (* r v-s0) (* j v-s1)))
-                                   (vi (aref v-data ptr-i))
-                                   (vj (aref v-data ptr-j)))
-                              (setf (aref v-data ptr-i) (- (* vi c) (* vj s)))
-                              (setf (aref v-data ptr-j) (+ (* vi s) (* vj c))))))))
-              (incf sweep)))
-          
-          (let* ((s-vec (make-array k :element-type 'double-float))
-                 (u-k (vt-zeros (list m k) :type 'double-float))
-                 ;; 修复1：遍历所有 n 列
-                 (pairs (sort (loop for col from 0 below n
-				    collect 
-				    (cons (sqrt (col-norm-sq u col)) col)) 
-                              #'> :key #'car)))
-            
-            (dotimes (new-i k)
-              (destructuring-bind (val . old-col) (nth new-i pairs)
-                (setf (aref s-vec new-i) val)
-                (setf (vt-slice u-k '(:all) (list new-i)) 
-                      (vt-slice u '(:all) (list old-col)))))
-            
-            ;; 修复2：零奇异值必须补全正交基，不能乘 0
-            (dotimes (i k)
-              (if (zerop (aref s-vec i))
-                  (let ((random-v
-			  (vt-random (list m) :rng *vt-default-random-state*)))
-                    (loop repeat 2 do
-                      (dotimes (j i)
-                        (let* ((uj (vt-slice u-k '(:all) (list j)))
-                               (proj (vt-ref (vt-dot uj random-v))))
-                          (setf random-v (vt-- random-v (vt-scale uj proj))))))
-                    (let ((norm (sqrt (vt-ref (vt-dot random-v random-v)))))
-                      (if (> norm 1e-12)
-                          (setf (vt-slice u-k '(:all) (list i))
-				(vt-scale random-v (/ 1.0d0 norm)))
-                          (setf (vt-slice u-k '(:all) (list i)) random-v))))
-                  (let ((inv (/ 1.0d0 (aref s-vec i))))
-                    (setf (vt-slice u-k '(:all) (list i)) 
-                          (vt-scale (vt-slice u-k '(:all) (list i)) inv)))))
-            
-            (let* ((v-sorted (vt-zeros (list n n) :type 'double-float))
-                   (used-cols nil))
-              (dotimes (new-i k)
-                (let ((old-col (cdr (nth new-i pairs))))
-                  (push old-col used-cols)
-                  (setf (vt-slice v-sorted '(:all) (list new-i)) 
-                        (vt-slice v '(:all) (list old-col)))))
-              
-              (let ((rest-cols (loop for col from 0 below n 
-                                     unless (member col used-cols) 
-                                       collect col)))
-                (loop for offset from 0 for col in rest-cols do
-                  (setf (vt-slice v-sorted '(:all) (list (+ k offset))) 
-                        (vt-slice v '(:all) (list col)))))
-              
-              (let ((s-vt (vt-from-sequence (coerce s-vec 'list)
-					    :type 'double-float))
-                    (vt (vt-transpose v-sorted)))
-                (if (not full-matrices)
-                    (let ((vt-k (vt-slice vt (list 0 k) '(:all))))
-                      (values u-k s-vt vt-k))
-                    (cond ((= m n) 
-                           (values u-k s-vt vt))
-                          ((> m n) 
-                           (let ((u-full (extend-orthogonal-basis u-k)))
-                             (values u-full s-vt vt)))
-                          ((< m n) 
-                           (values u-k s-vt vt))))))))))))
-
 (defun vt-matrix-rank (matrix &optional (tol 1e-10))
   "计算矩阵的秩 (线性代数定义：线性无关的行/列数)。
    基于带部分选主元的高斯消元法，统计非零主元的数量。
@@ -543,7 +408,6 @@
               nil)))
       rank)))
 
-
 (defun extend-orthogonal-basis (u-econ &key (rng *vt-default-random-state*))
   "将 m×k 的 u_econ 通过随机向量 + gram-schmidt 补全为 m×m 正交矩阵。"
   (declare (random-state rng))
@@ -551,22 +415,149 @@
     (let* ((m (first (vt-shape u-econ)))
            (k (second (vt-shape u-econ)))
            (extra (- m k)))
-      (if (zerop extra)
-          u-econ
+      (if (zerop extra) u-econ
           (let ((u-full (vt-zeros (list m m) :type 'double-float)))
             (dotimes (i k)
               (setf (vt-slice u-full '(:all) (list i))
                     (vt-slice u-econ '(:all) (list i))))
             (loop for col from k below m
-                  for v = (vt-random (list m) :rng rng)
-                  do (loop repeat 2
-                           do (dotimes (j col)
-                                (let* ((uj (vt-slice u-full '(:all) (list j)))
-                                       (proj (vt-ref (vt-dot uj v))))
-                                  (setf v (vt-- v (vt-scale uj proj))))))
-                     (let ((norm (sqrt (vt-ref (vt-dot v v)))))
-                       (if (> norm 1e-12)
-                           (setf (vt-slice u-full '(:all) (list col))
-                                 (vt-scale v (/ 1.0 norm)))
-                           (error "failed to generate orthogonal vector"))))
+                  for v = (vt-random (list m) :rng rng) do
+                    (loop repeat 2 do
+                      (dotimes (j col)
+                        ;; flatten 避免 2D-1D 广播分配
+                        (let* ((uj (vt-flatten
+				    (vt-slice u-full '(:all) (list j))))
+                               (proj (vt-ref (vt-dot uj v))))
+                          (setf v (vt-- v (vt-scale uj proj))))))
+                    (let ((norm (sqrt (vt-ref (vt-dot v v)))))
+                      (if (> norm 1e-12)
+                          (setf (vt-slice u-full '(:all) (list col))
+                                (vt-scale v (/ 1.0 norm)))
+                          (error "failed to generate orthogonal vector"))))
             u-full)))))
+
+
+(defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50) (tol 1e-10))
+  "奇异值分解 a = u s v^t。
+  full-matrices : t 则返回完整尺寸 u(m×m), s(k), vt(n×n) (k = min(m,n))
+                  : nil 返回经济尺寸 u(m×k), s(k), vt(k×n)
+  max-sweeps : jacobi 最大扫描次数
+  tol : 收敛容差"
+  (assert (= 2 (vt-order matrix)))
+  (with-float-safe
+    (let* ((mat (vt-astype matrix 'double-float))
+           (m (first (vt-shape mat)))
+           (n (second (vt-shape mat)))
+           (k (min m n)))
+      (when (and (= m 1) (= n 1))
+        (let ((val (aref (vt-data mat) 0)))
+          (return-from vt-svd
+            (values (vt-const '(1 1) 1.0d0 :type 'double-float)
+                    (vt-const '(1) (abs val) :type 'double-float)
+                    (if (>= val 0) (vt-ones '(1 1) :type 'double-float)
+                        (vt-const '(1 1) -1.0d0 :type 'double-float))))))
+      (let* ((u (vt-copy mat))
+             (v (vt-eye n :type 'double-float))
+             (changed t)
+             (sweep 0))
+        (let ((u-data (vt-data u))
+              (u-s0 (first (vt-strides u)))
+              (u-s1 (second (vt-strides u)))
+              (u-off (vt-offset u))
+              (v-data (vt-data v))
+              (v-s0 (first (vt-strides v)))
+              (v-s1 (second (vt-strides v)))
+              (v-off (vt-offset v)))
+          (flet ((col-norm-sq (col)
+                   (let ((sum 0.0d0))
+                     (loop for r from 0 below m
+                           for ptr = (+ u-off (* r u-s0) (* col u-s1))
+                           do (incf sum (expt (aref u-data ptr) 2)))
+                     sum))
+                 (col-dot (c1 c2)
+                   (let ((sum 0.0d0))
+                     (loop for r from 0 below m
+                           for ptr1 = (+ u-off (* r u-s0) (* c1 u-s1))
+                           for ptr2 = (+ u-off (* r u-s0) (* c2 u-s1))
+                           do (incf sum (* (aref u-data ptr1)
+                                           (aref u-data ptr2))))
+                     sum)))
+            (loop while (and changed (< sweep max-sweeps)) do
+              (setf changed nil)
+              (loop for i from 0 below (1- n) do
+                (loop for j from (1+ i) below n
+                      for alpha = (col-norm-sq i)
+                      for beta = (col-norm-sq j)
+                      for gamma = (col-dot i j)
+                      when (> (abs gamma) (* tol (sqrt (* alpha beta)))) do
+                        (setf changed t)
+                        (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
+                               (t-abs (/ 1.0d0 (+ (abs zeta)
+                                                 (sqrt (+ 1 (* zeta zeta))))))
+                               (t-val (if (>= zeta 0) t-abs (- t-abs)))
+                               (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
+                               (s (* c t-val)))
+                          (loop for r from 0 below m do
+                            (let* ((ptr-i (+ u-off (* r u-s0) (* i u-s1)))
+                                   (ptr-j (+ u-off (* r u-s0) (* j u-s1)))
+                                   (ui (aref u-data ptr-i))
+                                   (uj (aref u-data ptr-j)))
+                              (setf (aref u-data ptr-i) (- (* ui c) (* uj s)))
+                              (setf (aref u-data ptr-j) (+ (* ui s) (* uj c)))))
+                          (loop for r from 0 below n do
+                            (let* ((ptr-i (+ v-off (* r v-s0) (* i v-s1)))
+                                   (ptr-j (+ v-off (* r v-s0) (* j v-s1)))
+                                   (vi (aref v-data ptr-i))
+                                   (vj (aref v-data ptr-j)))
+                              (setf (aref v-data ptr-i) (- (* vi c) (* vj s)))
+                              (setf (aref v-data ptr-j) (+ (* vi s) (* vj c))))))))
+              (incf sweep))
+            (let* ((s-vec (make-array k :element-type 'double-float))
+                   (u-k (vt-zeros (list m k) :type 'double-float))
+                   (pairs (sort (loop for col from 0 below n
+                                      collect (cons (sqrt (col-norm-sq col)) col))
+                                #'> :key #'car)))
+              (dotimes (new-i k)
+                (destructuring-bind (val . old-col) (nth new-i pairs)
+                  (setf (aref s-vec new-i) val)
+                  (setf (vt-slice u-k '(:all) (list new-i))
+                        (vt-slice u '(:all) (list old-col)))))
+              (dotimes (i k)
+                (if (zerop (aref s-vec i))
+                    (let ((random-v (vt-random (list m) :rng *vt-default-random-state*)))
+                      (loop repeat 2 do
+                        (dotimes (j i)
+                          ;; flatten 避免 2D-1D 广播分配
+                          (let* ((uj (vt-flatten (vt-slice u-k '(:all) (list j))))
+                                 (proj (vt-ref (vt-dot uj random-v))))
+                            (setf random-v (vt-- random-v (vt-scale uj proj))))))
+                      (let ((norm (sqrt (vt-ref (vt-dot random-v random-v)))))
+                        (if (> norm 1e-12)
+                            (setf (vt-slice u-k '(:all) (list i))
+                                  (vt-scale random-v (/ 1.0d0 norm)))
+                            (setf (vt-slice u-k '(:all) (list i)) random-v))))
+                    (let ((inv (/ 1.0d0 (aref s-vec i))))
+                      (setf (vt-slice u-k '(:all) (list i))
+                            (vt-scale (vt-slice u-k '(:all) (list i)) inv)))))
+              (let* ((v-sorted (vt-zeros (list n n) :type 'double-float))
+                     (used-cols nil))
+                (dotimes (new-i k)
+                  (let ((old-col (cdr (nth new-i pairs))))
+                    (push old-col used-cols)
+                    (setf (vt-slice v-sorted '(:all) (list new-i))
+                          (vt-slice v '(:all) (list old-col)))))
+                (let ((rest-cols (loop for col from 0 below n
+                                       unless (member col used-cols) collect col)))
+                  (loop for offset from 0 for col in rest-cols do
+                    (setf (vt-slice v-sorted '(:all) (list (+ k offset)))
+                          (vt-slice v '(:all) (list col)))))
+                (let ((s-vt (vt-from-sequence (coerce s-vec 'list) :type 'double-float))
+                      (vt (vt-transpose v-sorted)))
+                  (if (not full-matrices)
+                      (let ((vt-k (vt-slice vt (list 0 k) '(:all))))
+                        (values u-k s-vt vt-k))
+                      (cond ((= m n) (values u-k s-vt vt))
+                            ((> m n) (let ((u-full (extend-orthogonal-basis u-k)))
+                                       (values u-full s-vt vt)))
+                            ((< m n) (values u-k s-vt vt))))))))))))) 
+
