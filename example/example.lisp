@@ -34,6 +34,200 @@
     (error "test failed: ~a" msg)))
 
 
+(defun test-vt-map ()
+  "测试 vt-map 的动态类型提升和边界处理。"
+  (format t "~&开始运行 vt-map 测试...~%")
+  
+  ;; 辅助断言函数：同时验证值和类型
+  (flet ((check (expected-list expected-type tensor desc)
+           (let ((actual-list (vt-to-list tensor))
+                 (actual-type (vt-element-type tensor)))
+             (assert (equal actual-list expected-list) ()
+                     "~A: 值断言失败。预期 ~A, 实际 ~A" desc expected-list actual-list)
+             (assert (eq actual-type expected-type) ()
+                     "~A: 类型断言失败。预期 ~A, 实际 ~A" desc expected-type actual-type))))
+    
+    ;; ----------------------------------------------------
+    ;; 1. 纯整数路径 (不触发提升，极速路径)
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (* x 2)) (vt-from-sequence '(1 2 3) :type 'fixnum))))
+      (check '(2 4 6) 'fixnum res "纯整数路径"))
+
+    ;; ----------------------------------------------------
+    ;; 2. 纯浮点路径 (不触发提升，冷启动直接推断为浮点)
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-from-sequence '(1 2 3) :type 'fixnum))))
+      (check '(2.0 4.0 6.0) 'double-float res "纯浮点路径"))
+
+    ;; ----------------------------------------------------
+    ;; 3. 【核心修复】动态提升：首个整数，后续浮点
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (if (= x 0) 0 (/ 1.0 x))) 
+                       (vt-from-sequence '(0 2 4) :type 'fixnum))))
+      (check '(0.0 0.5 0.25) 'double-float res "动态提升(整数->浮点)"))
+
+    ;; ----------------------------------------------------
+    ;; 4. 【核心修复】动态提升：首个整数，后续分数
+    ;; CL原生除法在不整除时返回 ratio，必须触发提升
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (if (= x 0) 0 (/ 1 x))) 
+                       (vt-from-sequence '(0 2 4) :type 'fixnum))))
+      (check '(0.0 0.5 0.25) 'double-float res "动态提升(整数->分数)"))
+
+    ;; ----------------------------------------------------
+    ;; 5. 布尔语义 (首元素返回布尔值，冷启动直接推断为浮点)
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (> x 5)) (vt-from-sequence '(1 6 2 7) :type 'fixnum))))
+      (check '(0.0 1.0 0.0 1.0) 'double-float res "布尔冷启动"))
+
+    ;; ----------------------------------------------------
+    ;; 6. 混合布尔语义 (首元素整数，后续布尔值，不触发提升，优雅降级为 0/1)
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (if (> x 5) t 0)) 
+                       (vt-from-sequence '(1 6 2 7) :type 'fixnum))))
+      (check '(0 1 0 1) 'fixnum res "混合布尔(不触发提升)"))
+ ;; ----------------------------------------------------
+    ;; 7. Bignum 溢出提升 (首个是 fixnum，后续超出 fixnum 范围)
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (if (= x 0) 0 (* x 1000000000000000000000))) 
+                       (vt-from-sequence '(0 2) :type 'fixnum))))
+      ;; 首元素返回 0 (fixnum)
+      ;; 第二个元素返回 2000000000000000000000 (明确超出 64位 fixnum 的 bignum) -> 触发提升
+      (check '(0.0 2.0e21) 'double-float res "Bignum 溢出提升"))
+
+    ;; ----------------------------------------------------
+    ;; 8. 多参数动态提升 (广播与类型混合)
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (a b) (if (= a 0) 0 (+ a (/ 1.0 b))))
+                       (vt-from-sequence '(0 2) :type 'fixnum)
+                       (vt-from-sequence '(1 2) :type 'fixnum))))
+      (check '(0.0 2.5) 'double-float res "多参数动态提升"))
+ ;; ----------------------------------------------------
+    ;; 9. 空张量推断 (size=0, 依靠 promote-type)
+    ;; ----------------------------------------------------
+    ;; 输入为 fixnum，由于无元素可计算，只能基于输入推断为 fixnum
+    (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-zeros '(0) :type 'fixnum))))
+      (check '() 'fixnum res "空张量(基于fixnum输入)"))
+      
+    ;; 输入为 double-float，基于输入推断为 double-float
+    (let ((res (vt-map (lambda (x) (* x 2)) (vt-zeros '(0) :type 'double-float))))
+      (check '() 'double-float res "空张量(基于double-float输入)"))
+
+    (format t "~&所有 vt-map 测试通过！~%")))
+
+
+
+(defun test-vt-reduce ()
+  "全面测试 vt-reduce 的核心功能与边界情况。"
+  (format t "~&开始运行 vt-reduce 测试...~%")
+  
+  ;; 辅助断言函数：同时验证值和类型
+  (flet ((check (expected-list expected-type res desc)
+           (let ((actual-list (vt-to-list res))
+                 (actual-type (vt-etype res)))
+             (assert (equal actual-list expected-list) ()
+                     "~A: 值断言失败。预期 ~A, 实际 ~A" desc expected-list actual-list)
+             (assert (eq actual-type expected-type) ()
+                     "~A: 类型断言失败。预期 ~A, 实际 ~A" desc expected-type actual-type))))
+    
+    ;; ----------------------------------------------------
+    ;; 1. 全局归约基础测试
+    ;; ----------------------------------------------------
+    (let ((res (vt-reduce (vt-from-sequence '(1 2 3 4) :type 'fixnum) nil 0 #'+)))
+      (check 10 'fixnum res "全局归约-纯整数"))
+    
+    (let ((res (vt-reduce (vt-from-sequence '(1.0 2.0 3.0) :type 'double-float) nil 0.0 #'+)))
+      (check 6.0 'double-float res "全局归约-纯浮点"))
+      
+    ;; 【核心修复】浮点初始值强制提升
+    (let ((res (vt-reduce (vt-from-sequence '(1 2 3) :type 'fixnum) nil 0.0 #'+)))
+      (check 6.0 'double-float res "全局归约-浮点初始值提升"))
+
+    ;; ----------------------------------------------------
+    ;; 2. 指定轴归约
+    ;; ----------------------------------------------------
+    (let ((a2 (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+      (let ((res (vt-reduce a2 0 0 #'+)))
+        (check '(4 6) 'fixnum res "指定轴-axis0求和"))
+      (let ((res (vt-reduce a2 1 0 #'+)))
+        (check '(3 7) 'fixnum res "指定轴-axis1求和"))
+      (let ((res (vt-reduce a2 0 0 #'+ :keepdims t)))
+        (check '((4 6)) 'fixnum res "指定轴-keepdims")))
+
+    ;; ----------------------------------------------------
+    ;; 3. 【核心修复】动态类型提升 (累加溢出)
+    ;; ----------------------------------------------------
+    ;; 3.1 全局乘法溢出
+    (let ((res (vt-reduce (vt-from-sequence '(1000000000000 1000000000000 1000000000000) :type 'fixnum) 
+                          nil 1 #'*)))
+      (check 1.0e36 'double-float res "动态提升-全局乘法溢出"))
+    
+    ;; 3.2 沿轴乘法溢出
+    (let ((a2 (vt-from-sequence '((1000000000000 1000000000000) (2 2)) :type 'fixnum)))
+      (let ((res (vt-reduce a2 1 1 #'*)))
+        (check '(1.0e24 4.0) 'double-float res "动态提升-沿轴乘法溢出")))
+
+      ;; ----------------------------------------------------
+    ;; 4. Return-arg (argmax / argmin 模拟)
+    ;; ----------------------------------------------------
+    (let ((a1 (vt-from-sequence '(1 5 3 2) :type 'fixnum)))
+      ;; 1D Argmax
+      (multiple-value-bind (res idx) 
+          (vt-reduce a1 nil 0 (lambda (acc val) (if (> val acc) (values val t) (values acc nil))) :return-arg t)
+        (check 5 'fixnum res "1D-Argmax-值")
+        ;; 标量张量返回单值，不是列表
+        (assert (equal (vt-to-list idx) 1) () "1D-Argmax-索引断言失败"))
+      
+      ;; 1D Argmin
+      (multiple-value-bind (res idx) 
+          (vt-reduce a1 nil most-positive-fixnum (lambda (acc val) (if (< val acc) (values val t) (values acc nil))) :return-arg t)
+        (check 1 'fixnum res "1D-Argmin-值")
+        (assert (equal (vt-to-list idx) 0) () "1D-Argmin-索引断言失败")))
+    
+    (let ((a2 (vt-from-sequence '((1 5 3) (7 2 4)) :type 'fixnum)))
+      ;; 2D Argmax along axis 1 (按行找最大值)
+      (multiple-value-bind (res idx)
+          (vt-reduce a2 1 0 (lambda (acc val) (if (> val acc) (values val t) (values acc nil))) :return-arg t)
+        (check '(5 7) 'fixnum res "2D-Argmax-值")
+        (assert (equal (vt-to-list idx) '(1 0)) () "2D-Argmax-索引断言失败"))
+      
+      ;; 2D Argmin along axis 0 (按列找最小值)
+      (multiple-value-bind (res idx)
+          (vt-reduce a2 0 most-positive-fixnum (lambda (acc val) (if (< val acc) (values val t) (values acc nil))) :return-arg t)
+        (check '(1 2 3) 'fixnum res "2D-Argmin-值")
+        (assert (equal (vt-to-list idx) '(0 1 0)) () "2D-Argmin-索引断言失败")))
+
+
+    ;; ----------------------------------------------------
+    ;; 5. 布尔语义归约 (测试冷路径推断)
+    ;; ----------------------------------------------------
+    (let ((res (vt-reduce (vt-from-sequence '(1 0 2) :type 'fixnum) nil nil 
+                          (lambda (acc x) (or acc (> x 0))))))
+      (check 1.0 'double-float res "布尔归约-含非零"))
+
+    (let ((res (vt-reduce (vt-from-sequence '(0 0 0) :type 'fixnum) nil nil 
+                          (lambda (acc x) (or acc (> x 0))))))
+      (check 0.0 'double-float res "布尔归约-全零"))
+
+    ;; ----------------------------------------------------
+    ;; 6. 空维度与边界处理
+    ;; ----------------------------------------------------
+    ;; 归约轴大小为 0
+    (let ((a-empty (vt-zeros '(2 0) :type 'fixnum)))
+      (let ((res (vt-reduce a-empty 1 0 #'+)))
+        (check '(0 0) 'fixnum res "空维度-axis归约")))
+    
+    ;; 输入总大小为 0
+    (let ((a-empty (vt-zeros '(0 3) :type 'fixnum)))
+      (let ((res (vt-reduce a-empty 1 0 #'+)))
+        (check '() 'fixnum res "空维度-总大小为0")))
+        
+    (let ((a-empty (vt-zeros '(0) :type 'fixnum)))
+      (let ((res (vt-reduce a-empty nil 0 #'+)))
+        (check 0 'fixnum res "空维度-全局归约")))
+
+    (format t "~&所有 vt-reduce 测试通过！~%")))
+
 ;; --------------------- test vt-from-sequence ---------------------
 (defun test-vt-from-sequence ()
   "测试 vt-from-sequence 的各种情况，包括边界条件和错误处理。"
@@ -2219,6 +2413,91 @@
     (format t "~%all advanced gradient tests passed!~%")))
 
 
+(defun run-pad-tests ()
+  "运行 vt-pad 的全面测试，使用 assert 进行断言验证。"
+  (format t "~&开始运行 pad 测试...~%")
+  
+  ;; 辅助函数：断言给定的表达式会抛出 error
+  (flet ((assert-error (input pad-width mode)
+           (handler-case
+               (progn
+                 (vt-pad input pad-width :mode mode)
+                 nil) ; 如果没有报错，返回 nil
+             (error () t)))) ; 如果捕获到 error，返回 t
+    
+    ;; ==================================================
+    ;; 1. 1D 数组基础模式测试 (使用 NumPy 扁平写法 (2 3))
+    ;; ==================================================
+    (let ((a1 (vt-from-sequence '(1 2 3))))
+      (assert (equal (vt-to-list (vt-pad a1 '(2 3) :mode :constant))   '(0.0 0.0 1.0 2.0 3.0 0.0 0.0 0.0)))
+      (assert (equal (vt-to-list (vt-pad a1 '(2 3) :mode :edge))       '(1.0 1.0 1.0 2.0 3.0 3.0 3.0 3.0)))
+      (assert (equal (vt-to-list (vt-pad a1 '(2 3) :mode :wrap))       '(2.0 3.0 1.0 2.0 3.0 1.0 2.0 3.0)))
+      (assert (equal (vt-to-list (vt-pad a1 '(2 3) :mode :reflect))    '(3.0 2.0 1.0 2.0 3.0 2.0 1.0 2.0)))
+      (assert (equal (vt-to-list (vt-pad a1 '(2 3) :mode :symmetric))  '(2.0 1.0 1.0 2.0 3.0 3.0 2.0 1.0))))
+
+    ;; ==================================================
+    ;; 2. 多维数组广播测试 (验证新版本的核心改进)
+    ;; ==================================================
+    (let ((a2 (vt-from-sequence '((1 2) (3 4)))))
+      ;; 1. (2 3) 应该广播为 ((2 3) (2 3))，结果是 7x7
+      (assert (equal (vt-to-list (vt-pad a2 '(2 3) :mode :constant))
+                     '((0.0 0.0 0.0 0.0 0.0 0.0 0.0)
+                       (0.0 0.0 0.0 0.0 0.0 0.0 0.0)
+                       (0.0 0.0 1.0 2.0 0.0 0.0 0.0)
+                       (0.0 0.0 3.0 4.0 0.0 0.0 0.0)
+                       (0.0 0.0 0.0 0.0 0.0 0.0 0.0)
+                       (0.0 0.0 0.0 0.0 0.0 0.0 0.0)
+                       (0.0 0.0 0.0 0.0 0.0 0.0 0.0))))
+      
+      ;; 2. (2) 应该广播为 ((2 2) (2 2))，结果是 6x6
+      (assert (equal (vt-to-list (vt-pad a2 '(2) :mode :edge))
+                     '((1.0 1.0 1.0 2.0 2.0 2.0)
+                       (1.0 1.0 1.0 2.0 2.0 2.0)
+                       (1.0 1.0 1.0 2.0 2.0 2.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0))))
+      
+      ;; 3. ((2 3)) 也应该广播为 ((2 3) (2 3))，结果是 7x7
+      (assert (equal (vt-to-list (vt-pad a2 '((2 3)) :mode :edge))
+                     '((1.0 1.0 1.0 2.0 2.0 2.0 2.0)
+                       (1.0 1.0 1.0 2.0 2.0 2.0 2.0)
+                       (1.0 1.0 1.0 2.0 2.0 2.0 2.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0 4.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0 4.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0 4.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0 4.0))))
+      
+      ;; 4. 传统写法仍然有效，结果是 4x6
+      (assert (equal (vt-to-list (vt-pad a2 '((1 1) (2 2)) :mode :edge))
+                     '((1.0 1.0 1.0 2.0 2.0 2.0)
+                       (1.0 1.0 1.0 2.0 2.0 2.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0)
+                       (3.0 3.0 3.0 4.0 4.0 4.0)))))
+
+    ;; ==================================================
+    ;; 3. 空维度测试 (使用扁平写法)
+    ;; ==================================================
+    (let ((a-empty (vt-zeros '(0))))
+      (assert (equal (vt-to-list (vt-pad a-empty '(2 2) :mode :constant)) '(0.0 0.0 0.0 0.0)))
+      ;; 这些模式必须抛出错误
+      (assert (assert-error a-empty '(2 2) :edge))
+      (assert (assert-error a-empty '(2 2) :wrap))
+      (assert (assert-error a-empty '(2 2) :reflect))
+      (assert (assert-error a-empty '(2 2) :symmetric)))
+
+    ;; ==================================================
+    ;; 4. 维度大小为 1 的测试
+    ;; ==================================================
+    (let ((a-one (vt-from-sequence '(5))))
+      (assert (equal (vt-to-list (vt-pad a-one '(2 2) :mode :edge))      '(5.0 5.0 5.0 5.0 5.0)))
+      (assert (equal (vt-to-list (vt-pad a-one '(2 2) :mode :wrap))      '(5.0 5.0 5.0 5.0 5.0)))
+      ;; reflect 模式在维度为 1 时必须抛出错误
+      (assert (assert-error a-one '(2 2) :reflect))
+      (assert (equal (vt-to-list (vt-pad a-one '(2 2) :mode :symmetric)) '(5.0 5.0 5.0 5.0 5.0))))
+
+    (format t "~&所有 pad 测试通过！~%")))
+
 (defun test-vt-pad ()
   "测试 vt-pad 的各种填充模式"
   (format t "~%=== testing vt-pad ===")
@@ -3891,7 +4170,7 @@
   ;; np.clip([1,2,3,4,5], 2, 4) -> [2,2,3,4,4]
   (let* ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float))
          (c (vt-clip a 2 4)))
-    (assert (equal (vt-to-list c) '(2 2 3 4 4))))
+    (assert (equal (vt-to-list c) '(2.0 2.0 3.0 4.0 4.0))))
 
   ;; vt-convolve (same mode)
   ;; np.convolve([1,2,3], [0,1,0.5], 'same') -> 中间值与 numpy 对比
@@ -5238,6 +5517,8 @@
 ;; ============================================================
 
 (defun run-all-tests ()
+  (test-vt-map)
+  (test-vt-reduce)
   (test-vt-reshape)
   (test-vt-from-sequence)
   (test-vt-slice)
@@ -5282,6 +5563,7 @@
   (run-svd-tests)
   (test-vt-gradient)
   (test-vt-gradient-advanced)
+  (run-pad-tests)
   (test-vt-pad)
   (test-all-pad)
   (test-pad-thorough)

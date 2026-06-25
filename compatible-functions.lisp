@@ -2450,55 +2450,79 @@
 				  (vt-slice flat `(0 ,(- n s))))
 				 (vt-shape vt)))))))))))
 
-
 (defun normalize-pad-width (pad-width rank)
-  "将 pad-width 标准化为 列表。"
+  "将 pad-width 标准化为 ((before_1 after_1) ... (before_n after_n)) 列表。
+  完全对标 numpy 的 pad_width 广播规则：
+    1. 整数 n           -> 所有轴均为 (n, n)
+    2. (n,)             -> 所有轴均为 (n, n)
+    3. (a, b)           -> 所有轴均为 (a, b)  [广播到所有轴]
+    4. ((a, b),)        -> 所有轴均为 (a, b)  [广播到所有轴]
+    5. ((a, b), ...)    -> 各轴独立指定，长度须等于 rank
+       元素可为整数 n (等价 (n, n)) 或 (before, after) 对。"
   (with-float-safe
-    (let ((pw-list (if (integerp pad-width)
-                       (make-list rank :initial-element pad-width)
-                       pad-width)))
-      (unless (= (length pw-list) rank)
-	(error "pad-width length ~a does not match tensor rank ~a"
-	       (length pw-list) rank))
-      (mapcar (lambda (x)
-		(cond ((integerp x) 
-                       (if (< x 0)
-			   (error "negative padding is not supported")
-			   (list x x)))
-                      ((and (consp x) (= (length x) 2))
-                       (if (or (< (first x) 0) (< (second x) 0))
-                           (error "negative padding is not supported")
-                           x))
-                      (t (error "invalid pad-width element: ~a" x))))
-              pw-list))))
+    (labels ((valid-int-p (x)
+               (and (integerp x) (>= x 0)))
+             (valid-pair-p (x)
+               (and (consp x) (= (length x) 2)
+                    (every #'integerp x)
+                    (>= (first x) 0) (>= (second x) 0)))
+             (normalize-element (x)
+               (cond ((valid-int-p x) (list x x))
+                     ((valid-pair-p x) x)
+                     ((integerp x)
+                      (error "negative padding is not supported"))
+                     ((and (consp x) (= (length x) 2) (every #'integerp x))
+                      (error "negative padding is not supported"))
+                     (t (error "invalid pad-width element: ~a" x)))))
+      (cond
+        ;; 规则 1: 整数 n -> 所有轴 (n, n)
+        ((integerp pad-width)
+         (make-list rank :initial-element (normalize-element pad-width)))
+        ;; 规则 2: (n,) -> 所有轴 (n, n)
+        ((and (listp pad-width) (= (length pad-width) 1)
+              (integerp (first pad-width)))
+         (make-list rank :initial-element (normalize-element (first pad-width))))
+        ;; 规则 3: (a, b) -> 所有轴 (a, b) [广播]
+        ((and (listp pad-width) (= (length pad-width) 2)
+              (every #'integerp pad-width))
+         (make-list rank :initial-element (normalize-element pad-width)))
+        ;; 规则 4: ((a, b),) -> 所有轴 (a, b) [广播]
+        ((and (listp pad-width) (= (length pad-width) 1)
+              (consp (first pad-width)) (= (length (first pad-width)) 2)
+              (every #'integerp (first pad-width)))
+         (make-list rank :initial-element (normalize-element (first pad-width))))
+        ;; 规则 5: 各轴独立指定，长度须等于 rank
+        ((and (listp pad-width) (= (length pad-width) rank))
+         (mapcar #'normalize-element pad-width))
+        (t
+         (error "pad-width length ~a does not match tensor rank ~a"
+                (length pad-width) rank))))))
 
 (defun apply-pad-mode (mode dist sk side)
-  "纯坐标映射：dist 表示距离边缘的距离 (1, 2, 3...)。
-   sk 是源张量维度大小。"
+  "纯坐标映射：dist 表示距离边缘的距离 (1, 2, 3...)。 sk 是源张量维度大小。"
+  (when (and (<= sk 0) (not (eq mode :constant)))
+    (error
+     "valueerror: can't extend empty axis 0 using modes other than 'constant' or 'empty'"))
   (with-float-safe
     (ecase mode
       (:edge (if (eq side :left) 0 (1- sk)))
-      
-      (:wrap 
+      (:wrap
        ;; wrap 左侧起点 sk-1 向左递减；右侧起点 0 向右递增
        (let ((x (if (eq side :left) (- sk dist) (1- dist))))
-	 (mod x sk)))
-      
+         (mod x sk)))
       (:reflect
        ;; reflect 左侧起点 1 向左递增；右侧起点 sk-2 向右递减
-       (when (<= sk 1)
-	 (error "cannot reflect on dimension with size <= 1"))
+       (when (<= sk 1) (error "cannot reflect on dimension with size <= 1"))
        (let* ((period (* 2 (1- sk)))
               (x (if (eq side :left) dist (- sk 1 dist)))
               (idx (mod x period)))
-	 (if (< idx sk) idx (- period idx))))
-      
+         (if (< idx sk) idx (- period idx))))
       (:symmetric
        ;; symmetric 左侧起点 0 向左递增；右侧起点 sk-1 向右递减
        (let* ((period (* 2 sk))
               (x (if (eq side :left) (- dist) (+ sk dist -1)))
               (idx (mod x period)))
-	 (if (< idx sk) idx (- period idx 1)))))))
+         (if (< idx sk) idx (- period idx 1)))))))
 
 (defun vt-pad (vt pad-width &key (mode :constant) (constant-values 0))
   "对张量进行填充，返回新张量。

@@ -34,17 +34,12 @@
 
 (defun vt-/ (vt &rest args)
   "逐元素除法. 单参数: 倒数. 多参数: a / b / c ... "
-  (with-float-safe 
+  (with-float-safe
     (let ((first-vt (ensure-vt vt)))
       (if (null args)
           (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
-          ;; 使用 reduce 依次执行两两除法
-          (reduce (lambda (acc x) 
-                    (vt-map (lambda (a b)
-			      (/ (coerce a 'double-float) b)) 
-                            acc (ensure-vt x)))
-                  args
-                  :initial-value first-vt)))))
+          (reduce (lambda (acc x) (vt-map #'/ acc (ensure-vt x))) 
+                  args :initial-value first-vt)))))
 
 (defun vt-div (vt &rest args)
   (apply #'vt-/ vt args))
