@@ -965,35 +965,40 @@
 
 ;;; --- 高效迭代逻辑  ---
 (defmacro vt-do-each ((ptr-var val-var vt) &body body)
-  "高效遍历宏。
+  "高效遍历宏 (支持非连续内存视图)。
    ptr-var: 当前元素的物理索引。
    val-var: 当前元素的值。"
-  (with-float-safe
-    (let ((rank-sym (gensym "rank"))
-          (shape-sym (gensym "shape"))
-          (strides-sym (gensym "strides"))
-          (data-sym (gensym "data"))
-          (offset-sym (gensym "offset"))
-          (depth-sym (gensym "depth")))
-      `(let* ((,shape-sym (vt-shape ,vt))
-              (,strides-sym (vt-strides ,vt))
-              (,data-sym (vt-data ,vt))
-              (,offset-sym (vt-offset ,vt))
-              (,rank-sym (length ,shape-sym)))
-	 (labels ((recurse (,depth-sym current-ptr)
-                    (if (= ,depth-sym ,rank-sym)
-			;; 到达最内层：绑定为普通变量，允许 declare ignore
-			(let ((,ptr-var current-ptr)
-                              (,val-var (aref ,data-sym current-ptr)))
-                          (declare (ignorable ,ptr-var ,val-var))
-                          ,@body)
-			;; 中间维度：循环并累加指针
-			(let ((dim (nth ,depth-sym ,shape-sym))
-                              (stride (nth ,depth-sym ,strides-sym)))
-                          (loop for i from 0 below dim do
-                            (recurse (1+ ,depth-sym) current-ptr)
-                            (incf current-ptr stride))))))
-           (recurse 0 ,offset-sym))))))
+  (let ((shape-sym (gensym "shape"))
+        (strides-sym (gensym "strides"))
+        (data-sym (gensym "data"))
+        (offset-sym (gensym "offset"))
+        (rank-sym (gensym "rank"))
+        (dims-vec (gensym "dims-vec"))
+        (strs-vec (gensym "strs-vec"))
+        (depth-sym (gensym "depth")))
+    `(let* ((,shape-sym (vt-shape ,vt))
+            (,strides-sym (vt-strides ,vt))
+            (,data-sym (vt-data ,vt))
+            (,offset-sym (vt-offset ,vt))
+            (,rank-sym (length ,shape-sym))
+            ;; 预提取为简单向量，使用 svref 达到 O(1) 访问速度
+            (,dims-vec (coerce ,shape-sym 'simple-vector))
+            (,strs-vec (coerce ,strides-sym 'simple-vector)))
+       (labels
+	   ((recurse (,depth-sym current-ptr)
+              (if (= ,depth-sym ,rank-sym)
+                  ;; 到达最内层：绑定为普通变量，允许 declare ignore
+                  (let ((,ptr-var current-ptr)
+                        (,val-var (aref (the simple-array ,data-sym) current-ptr)))
+                    (declare (ignorable ,ptr-var ,val-var))
+                    ,@body)
+                  ;; 中间维度：循环并累加指针
+                  (let ((dim (svref ,dims-vec ,depth-sym))
+                        (stride (svref ,strs-vec ,depth-sym)))
+                    (loop for i from 0 below dim do
+                      (recurse (1+ ,depth-sym) current-ptr)
+                      (incf current-ptr stride))))))
+         (recurse 0 ,offset-sym)))))
 
 (defun vt-copy-into (dest src)
   "将 src 的数据拷贝到 dest (支持广播和类型转换).
