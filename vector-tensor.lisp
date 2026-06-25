@@ -696,10 +696,14 @@
                  (setf cur-start end))))))        
         ;; ========== 情况 b：指定位置下刀 ==========
         ((listp indices-or-sections)
-         (let* ((raw-points (append (list 0) indices-or-sections (list dim-size)))
+         (let* ((raw-points
+		  (append (list 0) indices-or-sections (list dim-size)))
+		 (normalized-points (mapcar (lambda (p)
+                                    (if (minusp p) (+ p dim-size) p))
+					    raw-points))
 		(clamped-points (mapcar (lambda (p)
 					  (max 0 (min p dim-size)))
-					raw-points)))
+					normalized-points)))
            (loop for (start end) on clamped-points by #'cdr
                  while end
                  collect (vt-narrow tensor ax start end))))

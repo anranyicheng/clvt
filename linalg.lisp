@@ -146,26 +146,28 @@
       (values a piv sign))))
 
 (defun vt-det (matrix)
-  "基于 lu 分解计算行列式"
+  "基于 lu 分解计算行列式，返回 0 维张量"
   (with-float-safe
-    (multiple-value-bind (lu piv sign)
-        (vt-lu matrix)
+    (multiple-value-bind (lu piv sign) (vt-lu matrix)
       (declare (ignore piv))
       (let* ((n (first (vt-shape lu)))
              (data (vt-data lu))
              (s0 (first (vt-strides lu)))
-             (s1 (second (vt-strides lu)))
-             (off (vt-offset lu))
-             (det sign))
+             (s1 (second (vt-strides lu))) 
+             (off (vt-offset lu))          
+             (det sign))                   
         (loop for i from 0 below n
-	      for pivot = (aref data (+ off
+              for pivot = (aref data (+ off
 					(* i s0)
 					(* i s1)))
-	      when (zerop pivot)
-		do (return-from vt-det 0.0d0)
-		   do
-		      (setf det (* det pivot)))
-        det))))
+              when (zerop pivot)
+                ;; 遇到零主元，说明是奇异矩阵，行列式为 0，包装为 0 维张量返回
+                do (return-from vt-det
+		     (make-vt nil 0.0d0 :type 'double-float))
+              do (setf det (* det pivot)))
+        ;; 将最终标量结果包装为 0 维张量
+        (make-vt nil det :type 'double-float)))))
+
 
 (defun vt-solve (a b)
   "求解线性方程组 ax = b (支持多右端项)"
@@ -222,6 +224,9 @@
             (let ((pivot (aref lu-data (+ lu-off
 					  (* k lu-s0)
 					  (* k lu-s1)))))
+	      (when (or (zerop pivot)
+			(< (abs pivot) 1.0d-12)) ; 阈值可根据需求调整，防止极小数除法引发数值不稳定
+		(error "LinAlgError: Singular matrix. Cannot solve or invert."))
               (loop for j from 0 below nrhs do
                 (setf (aref b-data (+ b-off
 				      (* k b-s0)

@@ -1965,6 +1965,31 @@
     (assert-ok (approx= (vt-@ a x) b) "整数矩阵求解失败"))
   (format t "~%test-vt-solve passed.~%"))
 
+(defun test-vt-solve-singular ()
+  "测试 vt-solve 和 vt-inv 对奇异矩阵的报错"
+  
+  ;; 构造一个 2x2 奇异矩阵 (行成比例，行列式为 0)
+  ;; | 1 2 |
+  ;; | 2 4 |
+  (let ((singular-mat (vt-from-sequence '((1 2) (2 4)) :type 'double-float))
+        (b-vec (vt-from-sequence '(5 10) :type 'double-float)))
+    
+    ;; 1. 测试 vt-solve 是否抛出错误
+    (handler-case 
+        (progn
+          (vt-solve singular-mat b-vec)
+          (error "测试失败: vt-solve 未对奇异矩阵报错！"))
+      (error (e)
+        (format t "✅ vt-solve 正确拦截奇异矩阵: ~a~%" e)))
+
+    ;; 2. 测试 vt-inv 是否抛出错误
+    (handler-case 
+        (progn
+          (vt-inv singular-mat)
+          (error "测试失败: vt-inv 未对奇异矩阵报错！"))
+      (error (e)
+        (format t "✅ vt-inv 正确拦截奇异矩阵: ~a~%" e)))))
+
 ;; ============================================================
 ;; test-vt-inv
 ;; ============================================================
@@ -1985,12 +2010,34 @@
 (defun test-vt-det ()
   ;; a = [[1,2],[3,4]] -> det = -2.0
   (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
-    (assert (= (vt-det a) -2.0d0)))
+    (assert (= (vt-item (vt-det a)) -2.0d0)))
   ;; 三维矩阵
   ;; a = [[6,1,1],[4,-2,5],[2,8,7]] -> det = -306.0? 计算一下：6*(-14-40) -1*(28-10) +1*(32+4) = 6*(-54) -18 +36 = -324 -18+36 = -306.0
-  (let ((a (vt-from-sequence '((6 1 1) (4 -2 5) (2 8 7)) :type 'double-float)))
-    (assert (lists-approx-equal (list (vt-det a))
+  (let ((a (vt-from-sequence '((6 1 1) (4 -2 5) (2 8 7))
+			     :type 'double-float)))
+    (assert (lists-approx-equal (list (vt-item (vt-det a)))
 				'(-306.0) :epsilon 1e-6)))
+  "测试 vt-det 返回 0 维张量且值正确"
+  ;; 测试 1: 正常矩阵
+  ;; |1 2|
+  ;; |3 4| 行列式 = 1*4 - 2*3 = -2
+  (let* ((m1 (vt-from-sequence '((1 2) (3 4))))
+         (det1 (vt-det m1)))
+    (assert (vt-p det1) (det1)
+            "vt-det 应返回张量, 但得到 ~a" (type-of det1))
+    (assert (= (vt-item det1) -2.0d0) (det1)
+            "vt-det 值错误: 期望 -2.0, 得到 ~a" (vt-item det1)))
+
+  ;; 测试 2: 奇异矩阵 (行列式为 0)
+  ;; |1 2|
+  ;; |2 4| 行列式 = 1*4 - 2*2 = 0
+  (let* ((m2 (vt-from-sequence '((1 2) (2 4))))
+         (det2 (vt-det m2)))
+    (assert (vt-p det2) (det2)
+            "vt-det 奇异矩阵应返回张量, 但得到 ~a" (type-of det2))
+    (assert (= (vt-item det2) 0.0d0) (det2)
+            "vt-det 奇异矩阵值错误: 期望 0.0, 得到 ~a" (vt-item det2)))
+  
   (format t "~%test-vt-det passed.~%"))
 
 ;; ============================================================
@@ -2114,7 +2161,9 @@
   ;; 空轴切片（形状某维为0）
   (let* ((a (vt-zeros '(2 0 3)))
          (res (vt-cumsum a :axis 1)))
-    (assert (equal (vt-shape res) '(2 0 3)))))
+    (assert (equal (vt-shape res) '(2 0 3))))
+ (format t "~%test-vt-cumsum passed.~%")
+  )
 
 
 (defun test-vt-cumprod ()
@@ -2135,7 +2184,52 @@
   ;; 确保输出类型与输入一致 (fixnum)
   (let* ((a (vt-ones '(3) :type 'fixnum))
          (res (vt-cumprod a)))
-    (assert (eq (vt-element-type res) 'fixnum))))
+    (assert (eq (vt-element-type res) 'fixnum)))
+   (format t "~%test-vt-cumprod passed.~%"))
+
+
+(defun test-vt-cumsum-cumprod ()
+  "测试 cumsum 和 cumprod 的类型保持与溢出提升"
+  
+  ;; 1. 不溢出的 cumsum，类型应保持 fixnum
+  (let* ((arr (vt-from-sequence '(1 2 3) :type 'fixnum))
+         (res (vt-cumsum arr)))
+    (assert (eq (vt-element-type res) 'fixnum) (res)
+            "cumsum 类型错误: 期望 fixnum, 得到 ~a" (vt-element-type res))
+    (assert (equal (vt-to-list res) '(1 3 6)) (res)
+            "cumsum 数值错误: 期望 (1 3 6), 得到 ~a" (vt-to-list res)))
+
+  ;; 2. 溢出的 cumsum，应自动提升为 double-float 且数值正确
+  (let* ((arr (vt-from-sequence (list most-positive-fixnum 1) :type 'fixnum))
+         (res (vt-cumsum arr)))
+    (assert (eq (vt-element-type res) 'double-float) (res)
+            "cumsum 溢出提升错误: 期望 double-float, 得到 ~a" (vt-element-type res))
+    (assert (equal (vt-to-list res) (list (coerce most-positive-fixnum 'double-float)
+                                          (+ 1.0d0 (coerce most-positive-fixnum 'double-float))))
+            (res) "cumsum 溢出数值错误: 得到 ~a" (vt-to-list res)))
+
+  ;; 3. 沿 axis 溢出的 cumsum 测试
+  (let* ((arr (vt-from-sequence (list (list most-positive-fixnum 1)
+                                      (list 0 most-positive-fixnum)) :type 'fixnum))
+         (res (vt-cumsum arr :axis 1)))
+    (assert (eq (vt-element-type res) 'double-float) (res)
+            "cumsum axis 溢出提升错误: 期望 double-float, 得到 ~a" (vt-element-type res)))
+
+  ;; 4. 不溢出的 cumprod，类型保持 fixnum
+  (let* ((arr (vt-from-sequence '(1 2 3 4) :type 'fixnum))
+         (res (vt-cumprod arr)))
+    (assert (eq (vt-element-type res) 'fixnum) (res)
+            "cumprod 类型错误: 期望 fixnum, 得到 ~a" (vt-element-type res))
+    (assert (equal (vt-to-list res) '(1 2 6 24)) (res)
+            "cumprod 数值错误: 期望 (1 2 6 24), 得到 ~a" (vt-to-list res)))
+
+  ;; 5. 溢出的 cumprod (连乘极易溢出)，应自动提升
+  (let* ((arr (vt-from-sequence (list 2 2 2 most-positive-fixnum) :type 'fixnum))
+         (res (vt-cumprod arr)))
+    (assert (eq (vt-element-type res) 'double-float) (res)
+            "cumprod 溢出提升错误: 期望 double-float, 得到 ~a" (vt-element-type res)))
+
+  (format t "✅ test-vt-cumsum-cumprod 测试通过！~%"))
 
 
 ;;----------------------测试 vt-qr vt-svd ---------------------
@@ -5512,6 +5606,121 @@
   t)
 
 
+(defun test-vt-split ()
+  "测试 vt-split 的负索引和正索引行为是否一致且正确"
+  (let* ((arr (vt-arange 5)) ; [0.0, 1.0, 2.0, 3.0, 4.0]
+         ;; 在索引 -2 处切分，期望分为 [0, 1, 2] 和 [3, 4]
+         (results-neg (vt-split arr (list -2)))
+         ;; 在对应的正索引 3 处切分，作为对照组
+         (results-pos (vt-split arr (list 3))))
+    
+    ;; 1. 断言切分出来的块数为 2
+    (assert (= (length results-neg) 2)
+            (results-neg)
+            "负索引切分失败: 期望得到 2 块, 实际得到 ~a 块" (length results-neg))
+    
+    (assert (= (length results-pos) 2)
+            (results-pos)
+            "正索引切分失败: 期望得到 2 块, 实际得到 ~a 块" (length results-pos))
+    
+    ;; 2. 断言负索引切分的第一块内容等于 [0, 1, 2]
+    (assert (equal (vt-to-list (first results-neg)) '(0.0 1.0 2.0))
+            (results-neg)
+            "负索引切分第一块错误: 期望 (0.0 1.0 2.0), 得到 ~a" 
+            (vt-to-list (first results-neg)))
+            
+    ;; 3. 断言负索引切分的第二块内容等于 [3, 4]
+    (assert (equal (vt-to-list (second results-neg)) '(3.0 4.0))
+            (results-neg)
+            "负索引切分第二块错误: 期望 (3.0 4.0), 得到 ~a" 
+            (vt-to-list (second results-neg)))
+            
+    ;; 4. 断言正索引切分的结果与负索引完全一致
+    (assert (equal (vt-to-list (first results-pos)) '(0.0 1.0 2.0))
+            (results-pos)
+            "正索引切分第一块错误: 期望 (0.0 1.0 2.0), 得到 ~a" 
+            (vt-to-list (first results-pos)))
+            
+    (assert (equal (vt-to-list (second results-pos)) '(3.0 4.0))
+            (results-pos)
+            "正索引切分第二块错误: 期望 (3.0 4.0), 得到 ~a" 
+            (vt-to-list (second results-pos)))
+            
+    (format t "✅ test-vt-split 测试通过！~%")))
+
+(defun test-vt-choose ()
+  "测试 vt-choose 的类型推断、负索引以及非连续内存安全性"
+  
+  ;; ==========================================
+  ;; 场景 1: 基础功能、动态类型提升与负索引
+  ;; ==========================================
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :type 'fixnum))      ; fixnum
+         (c2 (vt-from-sequence '((1.0 2.0) (3.0 4.0))))  ; double-float
+         ;; 索引含义：
+         ;; 0 选 c1, 1 选 c2
+         ;; -1 选倒数第1个(即 c2), -2 选倒数第2个(即 c1)
+         (idx (vt-from-sequence '(0 1 -1 -2) :type 'fixnum))
+         
+         ;; 执行：混合类型应自动提升为 double-float
+         (res-mixed (vt-choose (list c1 c2) idx)))
+    
+    ;; 断言类型提升正确
+    (assert (eq (vt-element-type res-mixed) 'double-float)
+            (res-mixed) "类型提升错误: 期望 double-float, 得到 ~a" (vt-element-type res-mixed))
+    
+    ;; 断言数据提取正确
+    ;; i=0 (idx=0) -> c1[0] = 10
+    ;; i=1 (idx=1) -> c2[1] = 2.0
+    ;; i=2 (idx=-1->1) -> c2[2] = 3.0
+    ;; i=3 (idx=-2->0) -> c1[3] = 40
+    (assert (equal (vt-to-list res-mixed) '(10.0 2.0 3.0 40.0))
+            (res-mixed) "混合结果错误: 期望 (10.0 2.0 3.0 40.0), 得到 ~a" (vt-to-list res-mixed)))
+
+
+  ;; ==========================================
+  ;; 场景 2: 纯 fixnum 类型保持
+  ;; ==========================================
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :type 'fixnum))
+         (c2 (vt-from-sequence '((100 200) (300 400)) :type 'fixnum))
+         (idx (vt-from-sequence '(0 1 1 0) :type 'fixnum))
+         (res-fix (vt-choose (list c1 c2) idx)))
+    
+    ;; 断言类型被正确保持为 fixnum，没有被强制转为 double-float
+    (assert (eq (vt-element-type res-fix) 'fixnum)
+            (res-fix) "类型保持错误: 期望 fixnum, 得到 ~a" (vt-element-type res-fix))
+    
+    (assert (equal (vt-to-list res-fix) '(10 200 300 40))
+            (res-fix) "Fixnum 结果错误: 期望 (10 200 300 40), 得到 ~a" (vt-to-list res-fix)))
+
+
+  ;; ==========================================
+  ;; 场景 3: 非连续内存视图安全性测试 (核心缺陷验证)
+  ;; ==========================================
+  (let* ((base (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum)) ; shape (2, 3)
+         ;; 转置后 shape 变为 (3, 2)，底层 strides 改变，属于非连续视图
+         ;; view-a 的逻辑内容是 ((1 4) (2 5) (3 6))
+         ;; 展平后逻辑顺序应为 (1 4 2 5 3 6)
+         (view-a (vt-transpose base)) 
+         
+         (c2 (vt-zeros '(3 2) :type 'fixnum))
+         ;; idx 全为 0，强制只从 view-a 中取值
+         (idx (vt-from-sequence '(0 0 0 0 0 0) :type 'fixnum))
+         
+         (res-view (vt-choose (list view-a c2) idx)))
+    
+    (assert (eq (vt-element-type res-view) 'fixnum)
+            (res-view) "视图类型错误: 期望 fixnum, 得到 ~a" (vt-element-type res-view))
+    
+    ;; 如果没有修复 (没有调用 vt-flatten)，直接按 i 读取底层物理内存，
+    ;; 读到的会是 base 的原始连续数据 (1 2 3 4 5 6)，而不是逻辑视图的 (1 4 2 5 3 6)
+    (assert (equal (vt-to-list res-view) '(1 4 2 5 3 6))
+            (res-view) "非连续视图读取错误: 期望 (1 4 2 5 3 6), 得到 ~a" (vt-to-list res-view)))
+
+  (format t "✅ test-vt-choose 所有测试通过！~%"))
+
+
+
+
 ;; ============================================================
 ;; 运行所有测试
 ;; ============================================================
@@ -5552,6 +5761,7 @@
   (test-vt-dot)
   (test-vt-solve)
   (test-vt-inv)
+  (test-vt-solve-singular)
   (test-vt-det)
   (test-vt-norm)
   (test-vt-frobenius-norm)
@@ -5559,6 +5769,7 @@
   (test-vt-outer)
   (test-vt-cumsum)
   (test-vt-cumprod)
+  (test-vt-cumsum-cumprod)
   (test-vt-qr)
   (run-svd-tests)
   (test-vt-gradient)
@@ -5617,7 +5828,8 @@
   (test-vt-rotate)
   (test-vt-copy-into)
   (test-vt-matrix-rank)
+  (test-vt-split)
+  (test-vt-choose)
   (format t "~&~%all test passed")
   )
-
 

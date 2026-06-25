@@ -1154,81 +1154,143 @@
                     idx))))
 
 (defun vt-cumsum (tensor &key axis)
-  "累积和。axis 支持负数，返回与输入同类型的新张量。"
+  "累积和。axis 支持负数。包含动态类型提升防止 fixnum 溢出导致数据损坏。"
   (with-float-safe
     (if axis
-	(let* ((shape (vt-shape tensor))
+        (let* ((shape (vt-shape tensor))
                (rank (length shape))
                (ax (vt-normalize-axis axis rank))
                (axis-size (nth ax shape))
-               ;; 创建输出张量，初始化为零
-               (result (vt-zeros shape :type (vt-element-type tensor)))
+               (element-type (vt-element-type tensor))
+               (current-type element-type)
+               (result (vt-zeros shape :type current-type))
                (out-strides (vt-strides result)))
           (vt-do-each (ptr val result)
             (declare (ignore val))
             (let ((full-idx (vt-unravel-index ptr shape out-strides)))
-              ;; 仅处理每条纤维的起点，避免重复计算
               (when (= (nth ax full-idx) 0)
-		(let* ((specs (loop for i from 0 below rank
+                (let* ((specs (loop for i from 0 below rank
                                     if (= i ax) collect '(:all)
-                                      else collect (list (nth i full-idx))))
+                                    else collect (list (nth i full-idx))))
                        (fiber (apply #'vt-slice tensor specs))
-                       (cum (coerce 0 (vt-element-type tensor))))
+                       (cum (coerce 0 element-type)))
                   (loop for i from 0 below axis-size
-			for val = (vt-ref fiber i)
-			do (setf cum (+ cum val))
-                           ;; 写入输出对应位置
+                        for val = (vt-ref fiber i)
+                        do (setf cum (+ cum val))
                            (let ((pos-idx (copy-list full-idx)))
                              (setf (nth ax pos-idx) i)
-                             (setf (apply #'vt-ref result pos-idx) cum)))))))
+                             ;; 动态提升检测
+                             (if (eq current-type 'double-float)
+                                 (setf (apply #'vt-ref result pos-idx)
+				       (coerce cum 'double-float))
+                                 (if (typep cum 'fixnum)
+                                     (setf (apply #'vt-ref result pos-idx) cum)
+                                     ;; 触发动态提升：fixnum 溢出为 bignum
+                                     (let ((new-vt (vt-zeros shape :type 'double-float)))
+                                       (vt-copy-into new-vt result) ; 拷贝已有数据
+                                       (setf (vt-data result) (vt-data new-vt))
+                                       (setf (vt-etype result) 'double-float)
+                                       (setf current-type 'double-float)
+                                       (setf (apply #'vt-ref result pos-idx)
+					     (coerce cum 'double-float)))))))))))
           result)
-	;; axis = nil：展平后续累积和
-	(let* ((flat (vt-flatten tensor))
+        ;; axis = nil：展平后续累积和
+        (let* ((flat (vt-flatten tensor))
                (size (vt-size flat))
-               (result (vt-zeros (list size) :type (vt-element-type tensor)))
                (in-data (vt-data flat))
+               (element-type (vt-element-type flat))
+               (current-type element-type)
+               (result (vt-zeros (list size) :type current-type))
                (out-data (vt-data result))
-               (cum (coerce 0 (vt-element-type tensor))))
+               (cum (coerce 0 element-type)))
           (loop for i fixnum from 0 below size
-		do (setf cum (+ cum (aref in-data i)))
-                   (setf (aref out-data i) cum))
+                do (setf cum (+ cum (aref in-data i)))
+                   (if (eq current-type 'double-float)
+                       (setf (aref (the (simple-array double-float (*)) out-data) i)
+			     (coerce cum 'double-float))
+                       (if (typep cum 'fixnum)
+                           (setf (aref (the (simple-array fixnum (*)) out-data) i) cum)
+                           ;; 触发动态提升
+                           (let ((new-data (make-array size :element-type 'double-float
+							    :initial-element 0.0d0)))
+                             (loop for j fixnum from 0 below i
+                                   do (setf (aref new-data j)
+					    (coerce (aref (the (simple-array fixnum (*))
+							       out-data)
+							  j)
+						    'double-float)))
+                             (setf (aref new-data i) (coerce cum 'double-float))
+                             (setf out-data new-data)
+                             (setf current-type 'double-float)
+                             (setf cum (coerce cum 'double-float))))))
+          ;; 如果发生了提升，需将新数组绑定回结果张量
+          (unless (eq (vt-data result) out-data)
+            (setf (vt-data result) out-data)
+            (setf (vt-etype result) 'double-float))
           result))))
 
 (defun vt-cumprod (tensor &key axis)
-  "累积积。axis 支持负数，返回与输入同类型的新张量。"
+  "累积积。axis 支持负数。包含动态类型提升防止 fixnum 溢出导致数据损坏。"
   (with-float-safe
     (if axis
-	(let* ((shape (vt-shape tensor))
+        (let* ((shape (vt-shape tensor))
                (rank (length shape))
                (ax (vt-normalize-axis axis rank))
                (axis-size (nth ax shape))
-               (result (vt-zeros shape :type (vt-element-type tensor))) ; 实际会被重写
+               (element-type (vt-element-type tensor))
+               (current-type element-type)
+               (result (vt-zeros shape :type current-type))
                (out-strides (vt-strides result)))
           (vt-do-each (ptr val result)
             (declare (ignore val))
             (let ((full-idx (vt-unravel-index ptr shape out-strides)))
               (when (= (nth ax full-idx) 0)
-		(let* ((specs (loop for i from 0 below rank
+                (let* ((specs (loop for i from 0 below rank
                                     if (= i ax) collect '(:all)
-                                      else collect (list (nth i full-idx))))
+                                    else collect (list (nth i full-idx))))
                        (fiber (apply #'vt-slice tensor specs))
-                       (cum (coerce 1 (vt-element-type tensor)))) ; 初始值为 1
+                       (cum (coerce 1 element-type))) ; 初始值为 1
                   (loop for i from 0 below axis-size
-			for val = (vt-ref fiber i)
-			do (setf cum (* cum val))
+                        for val = (vt-ref fiber i)
+                        do (setf cum (* cum val))
                            (let ((pos-idx (copy-list full-idx)))
                              (setf (nth ax pos-idx) i)
-                             (setf (apply #'vt-ref result pos-idx) cum)))))))
+                             (if (eq current-type 'double-float)
+                                 (setf (apply #'vt-ref result pos-idx) (coerce cum 'double-float))
+                                 (if (typep cum 'fixnum)
+                                     (setf (apply #'vt-ref result pos-idx) cum)
+                                     (let ((new-vt (vt-zeros shape :type 'double-float)))
+                                       (vt-copy-into new-vt result)
+                                       (setf (vt-data result) (vt-data new-vt))
+                                       (setf (vt-etype result) 'double-float)
+                                       (setf current-type 'double-float)
+                                       (setf (apply #'vt-ref result pos-idx) (coerce cum 'double-float)))))))))))
           result)
-	(let* ((flat (vt-flatten tensor))
+        ;; axis = nil：展平后续累积积
+        (let* ((flat (vt-flatten tensor))
                (size (vt-size flat))
-               (result (vt-zeros (list size) :type (vt-element-type tensor)))
                (in-data (vt-data flat))
+               (element-type (vt-element-type flat))
+               (current-type element-type)
+               (result (vt-zeros (list size) :type current-type))
                (out-data (vt-data result))
-               (cum (coerce 1 (vt-element-type tensor))))
+               (cum (coerce 1 element-type))) ; 初始值为 1
           (loop for i fixnum from 0 below size
-		do (setf cum (* cum (aref in-data i)))
-                   (setf (aref out-data i) cum))
+                do (setf cum (* cum (aref in-data i)))
+                   (if (eq current-type 'double-float)
+                       (setf (aref (the (simple-array double-float (*)) out-data) i) (coerce cum 'double-float))
+                       (if (typep cum 'fixnum)
+                           (setf (aref (the (simple-array fixnum (*)) out-data) i) cum)
+                           (let ((new-data (make-array size :element-type 'double-float :initial-element 0.0d0)))
+                             (loop for j fixnum from 0 below i
+                                   do (setf (aref new-data j) (coerce (aref (the (simple-array fixnum (*)) out-data) j) 'double-float)))
+                             (setf (aref new-data i) (coerce cum 'double-float))
+                             (setf out-data new-data)
+                             (setf current-type 'double-float)
+                             (setf cum (coerce cum 'double-float))))))
+          (unless (eq (vt-data result) out-data)
+            (setf (vt-data result) out-data)
+            (setf (vt-etype result) 'double-float))
           result))))
 
 (defun vt-median (tensor &key axis)
@@ -2328,40 +2390,50 @@
   "根据索引数组从多个数组中选择值"
   (with-float-safe
     (let* ((n-choices (length choices))
-           (idx-flat (vt-flatten indices))
-           (idx-data (vt-data idx-flat))
-           (idx-size (vt-size idx-flat))
-           (result-data (make-array idx-size
-				    :element-type 'double-float)))
+           (flat-idx (vt-flatten indices))
+           (flat-choices (mapcar #'vt-flatten choices))
+           (idx-data (vt-data flat-idx))
+           (idx-size (vt-size flat-idx))
+           (result-type
+	     (apply #'vt-promote-type
+		    (mapcar #'vt-element-type flat-choices)))
+           (result-data (make-array idx-size :element-type result-type)))
       (loop for i from 0 below idx-size
-	    for raw-idx = (aref idx-data i)
+            for raw-idx = (truncate (aref idx-data i))
             for idx = (if (minusp raw-idx)
 			  (+ raw-idx n-choices)
 			  raw-idx)
             do (when (or (< idx 0) (>= idx n-choices))
-		 (error "选择索引 ~a 越界" idx))
+                 (error "选择索引 ~a 越界" idx))
                (setf (aref result-data i)
-                     (aref (vt-data (nth idx choices)) i)))
+                     (vt-coerce-to-tensor-type
+		      (aref (vt-data (nth idx flat-choices)) i)
+		      result-type)))
       (%make-vt :data result-data
 		:shape (list idx-size)
 		:strides '(1)
 		:offset 0
-		:etype 'double-float))))
+		:etype result-type))))
 
-(defun vt-select (condlist choicelist &key default)
+(defun vt-select (condlist choicelist &key (default 0))
   "根据多个条件从多个数组中选择值"
-  (declare (ignore default))
-  (with-float-safe   
+  (with-float-safe
     (let* ((n-conds (length condlist))
            (shape (vt-shape (car condlist)))
-           (result (vt-zeros shape)))
+           (types (append (mapcar #'vt-element-type choicelist)
+                          (list (if (fixnump default)
+				    'fixnum
+				    'double-float))))
+           (result-type (apply #'vt-promote-type types))
+           ;; 创建结果张量时，显式指定推导出的类型
+           (result (vt-full shape default :type result-type)))
       (vt-do-each (ptr val result)
-	(declare (ignorable  val))
-	(loop for i from 0 below n-conds
-	      when (/= (aref (vt-data (nth i condlist)) ptr) 0)
-		do (setf (aref (vt-data result) ptr)
-			 (aref (vt-data (nth i choicelist)) ptr))
-		   (return)))
+        (declare (ignorable val))
+        (loop for i from 0 below n-conds
+              when (/= (aref (vt-data (nth i condlist)) ptr) 0)
+              do (setf (aref (vt-data result) ptr)
+                       (aref (vt-data (nth i choicelist)) ptr))
+                 (return)))
       result)))
 
 (defun vt-flip (vt &key axis)
