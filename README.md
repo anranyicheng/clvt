@@ -205,7 +205,6 @@ vt-extract
 vt-searchsorted
 vt-digitize
 vt-bincount
-vt-ensure-shape-compatible
 vt-normalize-axis
 
 ;; 算术运算
@@ -391,7 +390,6 @@ vt-broadcast-shapes
 vt-broadcast-strides
 vt-compute-strides
 vt-compute-logical-strides
-vt-ensure-shape-compatible
 with-float-safe
 
 

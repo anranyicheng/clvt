@@ -1,30 +1,35 @@
 (in-package #:clvt)
 
-(defmacro with-float-safe (&body body)
-  `(sb-int:with-float-traps-masked
-       (:invalid :divide-by-zero :overflow :underflow)
-     ,@body))
-
-(defun fixnump (num)
-  "判断数字是不是fixnum类型"
-  (typep num 'fixnum))
-
-(defun double-float-p (num)
-  "判断数字是不是double-float类型"
-  (typep num 'double-float))
-
 (defstruct (vt (:constructor %make-vt))
   "n维张量结构.
    data: 存储数据的一维简单数组.
    shape: 形状列表.
    strides: 步长列表.
    offset: 起始偏移量,支持切片视图不复制数据.
-   etype: 元素类型符号, 如 'double-float, 'fixnum 等"
+   dtype: 元素数据类型, 如 (:int32, :int64, :float32, :float64) 等"
   (data (make-array 0) :type (simple-array *))
   (shape nil :type list)
   (strides nil :type list)
   (offset 0 :type fixnum)
-  (etype 'double-float :type symbol))
+  (dtype :float64 :type symbol))
+
+(defun vt-itemsize (vt)
+  "返回每个元素的字节大小."
+  (let ((dtype (vt-dtype vt)))
+    (cond ((eq dtype :float64) 8)
+          ((eq dtype :float32) 4)
+          ((eq dtype :int64)
+           #+sbcl sb-vm:n-word-bytes #-sbcl 8)
+          ((eq dtype :int32) 4)
+          ((eq dtype :uint8) 1)
+          ((eq dtype :int8) 1)
+          ((eq dtype :uint16) 2)
+          ((eq dtype :int16) 2)
+          (t 8)))) ; 默认8字节
+
+(defun vt-nbytes (vt)
+  "返回张量占用的总字节数."
+  (* (vt-size vt) (vt-itemsize vt)))
 
 (declaim (inline vt-element-type
 		 vt-shape
@@ -32,54 +37,130 @@
 		 vt-strides
 		 vt-data
 		 vt-reshape
-		 vt-etype
+		 vt-dtype
 		 make-vt
-		 vt-zeros
 		 vt-shape-to-size))
 
+(defun vt-dtype->lisp-type (dtype)
+  "将内部 dtype 符号映射为 CL 数组元素类型。"
+  (ecase dtype
+    (:float64 'double-float)
+    (:float32 'single-float)
+    (:int64 '(signed-byte 64))
+    (:int32 '(signed-byte 32))
+    (t 'double-float)))
+
 (defun vt-element-type (vt)
-  "返回数组元素的类型"
-  (vt-etype vt))
+  "返回张量底层物理数组的 Lisp 元素类型。"
+  (vt-dtype->lisp-type (vt-dtype vt)))
 
-(defun vt-promote-type (&rest types)
-  "推断运算结果类型。对标 numpy: 只要有浮点数就提升为浮点数"
-  (cond
-    ((member 'double-float types) 'double-float)
-    ((member 'single-float types) 'single-float)
-    (t 'fixnum)))
+(defun vt-order (vt)
+  "张量的维度大小"
+  (length (vt-shape vt)))
 
-(defun vt-coerce-to-tensor-type (val type-spec)
-  "安全地将值转换为张量指定的元素类型。
-   对于整数类型，执行向0截断（与 c 语言 (int)val 行为一致）。"
-  (cond
-    ((subtypep type-spec 'double-float) (coerce val 'double-float))
-    ((subtypep type-spec 'single-float) (coerce val 'single-float))
-    ((subtypep type-spec 'integer)
-     (if (floatp val) (truncate val) val))
-    (t val)))
+(defun vt-size (vt)
+  "张量的数据大小"
+  (reduce #'* (vt-shape vt) :initial-value 1))
 
 (defun vt-shape-to-size (shape)
   "计算形状对应的总元素个数."
   (declare (list shape))
   (reduce #'* shape :initial-value 1))
 
-(defun make-vt (shape initial-element &key (type 'double-float))
-  "创建一个指定形状的张量,填充初始值."
-  (declare (list shape))
-  (with-float-safe
-    (let* ((size (vt-shape-to-size shape))
-	   (tmp-type (if (eq type 'fixnum)
-			 'fixnum
-			 'double-float))
-           (data (make-array size :element-type tmp-type
-				  :initial-element
-				  (coerce initial-element tmp-type)))
-           (strides (vt-compute-strides shape)))
-      (%make-vt :data data
-		:shape shape
-		:strides strides
-		:offset 0
-		:etype tmp-type))))
+(defun vt-promote-type (&rest dtypes)
+  "推断运算结果类型。严格对标 NumPy 类型提升规则。
+   覆盖 :int32, :int64, :float32, :float64。"
+  (let ((has-f64 (member :float64 dtypes))
+        (has-f32 (member :float32 dtypes))
+        (has-i64 (member :int64 dtypes))
+        (has-i32 (member :int32 dtypes)))
+    (cond
+      ;; 1. 任何 float64 参与运算，结果必为 float64
+      (has-f64 :float64)
+      ;; 2. float32 与 int64 运算，NumPy 提升为 float64 防止精度丢失
+      ((and has-f32 has-i64) :float64)
+      ;; 3. 纯 float32 运算
+      (has-f32 :float32)
+      ;; 4. 整数运算提升链: i64 -> i32
+      (has-i64 :int64)
+      (has-i32 :int32)
+      ;; 5. 默认回退 (如空列表)：对标 NumPy 默认浮点类型
+      (t :float64))))
+
+(defun vt-promote-type (&rest dtypes)
+  "推断运算结果类型。严格对标 NumPy 类型提升规则。"
+  (let ((has-f64 (member :float64 dtypes))
+        (has-f32 (member :float32 dtypes))
+        (has-i64 (member :int64 dtypes))
+        (has-i32 (member :int32 dtypes)))
+    (cond
+      ;; 任何 float64 参与运算，结果必为 float64
+      (has-f64 :float64)
+      ;; float32 与 int64 运算，NumPy 会提升为 float64 防止精度丢失
+      ((and has-f32 has-i64) :float64)
+      ;; 纯 float32 运算
+      (has-f32 :float32)
+      ;; 整数运算提升
+      (has-i64 :int64)
+      (t :int32))))
+
+(defun vt-cast (val dtype)
+  "安全类型转换。对标 NumPy，浮点转整数时执行截断 (truncate)。"
+  (ecase dtype
+    (:int32 (truncate val))
+    (:int64 (truncate val))
+    (:float32 (coerce val 'single-float))
+    (:float64 (coerce val 'double-float))))
+
+(defun vt-cast-fun (dtype)
+  "安全类型转换。对标 NumPy，浮点转整数时执行截断 (truncate)。"
+  (ecase dtype
+    (:int32 #'truncate)
+    (:int64 #'truncate)
+    (:float32 (lambda (val) (coerce val 'single-float)))
+    (:float64 (lambda (val) (coerce val 'double-float)))))
+
+
+
+(defun make-vt (shape initial-element &key (dtype :float64))
+  "创建一个指定形状和类型的张量，并用初始值填充。"
+  (let* ((size (vt-shape-to-size shape))
+         (lisp-type (vt-dtype->lisp-type dtype))
+         (data (make-array size
+                           :element-type lisp-type
+                           :initial-element
+			   (coerce initial-element lisp-type)))
+         (strides (vt-compute-strides shape)))
+    (%make-vt :data data
+              :shape shape
+              :strides strides
+              :offset 0
+              :dtype dtype)))
+
+
+(defun ensure-vt (obj &key (dtype nil))
+  "将标量转换为 0 维张量。显式 dtype 优先，否则基于 Lisp 原生类型推断。"
+  (etypecase obj
+    (vt
+     (if (and dtype (not (eq (vt-dtype obj) dtype)))
+	 (vt-copy-into (make-vt (vt-shape obj) 0 :dtype dtype) obj) ; 强制转换
+	 obj))
+    (number
+     (let* ((infer-dtype (cond
+                           ((typep obj 'single-float) :float32)
+                           ((typep obj 'double-float) :float64)
+                           ((typep obj 'integer)      :int64)
+                           (t                         :float64)))
+            (final-dtype (or dtype infer-dtype))
+            (lisp-type (vt-dtype->lisp-type final-dtype)))
+       (%make-vt :data (make-array 1
+                                   :initial-element (coerce obj lisp-type)
+                                   :element-type lisp-type)
+                 :shape nil
+                 :strides nil
+                 :offset 0
+                 :dtype final-dtype
+                 )))))
 
 (defun vt-flatten-sequence (seq)
   "深度优先遍历 seq 及其嵌套序列,返回所有原子元素的列表.
@@ -126,95 +207,137 @@
                   (t (error "~s 不是序列" s)))))
             (nreverse result))))))
 
-(defun vt-from-sequence (contents &key (type 'double-float))
+(defun vt-from-sequence (contents &key (dtype :float64))
   "从嵌套序列创建张量。支持任意维度的规则嵌套列表或向量。
    例如 (vt-from-sequence '((1 2) (3 4))) 返回形状为 (2 2) 的张量。
    若传入一维序列，返回一维张量。
    注意: 空序列 () 或 #() 将被视为形状 (0) 的一维张量。
    不规则嵌套报错 如: (vt-from-sequence  #(1 '(2) 3 4))"
-  ;; 辅助函数：递归推断形状并收集元素
   (with-float-safe
     (labels
-	((infer-shape (seq)
-           "返回形状列表，同时检查是否规则。"
-           (if (or (listp seq)
-		   (typep seq 'vector))
-	       (let ((len (length seq)))
-		 (if (zerop len)
-                     (list 0)   ; 空序列作为一维0尺寸
-                     (let* ((first (elt seq 0))
-                            (rest-shape (when (or (listp first)
-						  (typep first 'vector))
-                                          (infer-shape first))))
-		       (if rest-shape
-                           ;; 嵌套：所有子序列必须形状一致
-                           (cons
-			    len
-			    (loop for i from 1 below len
-                                  for sub = (elt seq i)
-                                  for sub-shape = (infer-shape sub)
-                                  unless (equal sub-shape rest-shape)
-                                    do (error "不规则嵌套: 期望 ~a 但得到 ~a"
-					      rest-shape sub-shape)
-                                  finally (return rest-shape)))
-                           ;; 叶子：一维
-                           (progn
-                             ;; === 确保所有元素都是原子数字，而非混合序列 ===
-                             (loop for i from 1 below len
-                                   for sub = (elt seq i)
-                                   when (or (listp sub) (typep sub 'vector))
-                                   do (error "不规则嵌套: 期望原子元素但得到序列 ~a" sub))
-                             (list len))))))
-	       ;; 不是序列
-	       (error "无法从 ~a 创建张量" seq)))
-	 (fill-tensor (data seq shape strides depth flat-idx)
+        ((infer-shape (seq)
+           (typecase seq
+             (list
+              (if (null seq)
+                  (list 0)
+                  (let* ((first (car seq))
+                         (rest-shape (typecase first
+                                       (list (infer-shape first))
+                                       (vector (infer-shape first))
+                                       (t nil))))
+                    (if rest-shape
+                        ;; 存在嵌套，校验后续元素形状
+                        (cons (length seq)
+                              (loop for sub in (cdr seq)
+                                    unless (equal (infer-shape sub) rest-shape)
+                                      do (error "不规则嵌套")
+                                    finally (return rest-shape)))
+                        ;; 无嵌套，确保后续元素也不是序列
+                        (progn
+                          (loop for sub in (cdr seq)
+                                when (or (listp sub) (typep sub 'vector))
+                                  do (error "不规则嵌套"))
+                          (list (length seq)))))))
+             (vector
+              (let ((len (length seq)))
+                (if (zerop len) (list 0)
+                    (let* ((first (aref seq 0))
+                           (rest-shape (typecase first
+                                         (list (infer-shape first))
+                                         (vector (infer-shape first))
+                                         (t nil))))
+                      (if rest-shape
+                          (cons len
+                                (loop for i from 1 below len
+                                      for sub = (aref seq i)
+                                      unless (equal (infer-shape sub) rest-shape)
+                                        do (error "不规则嵌套")
+                                      finally (return rest-shape)))
+                          (progn
+                            (loop for i from 1 below len
+                                  for sub = (aref seq i)
+                                  when (or (listp sub) (typep sub 'vector))
+                                    do (error "不规则嵌套"))
+                            (list len)))))))
+             (t (error "无法创建张量"))))
+         
+         ;; 保持原有 5 个参数签名不变，内部优化遍历逻辑
+         (fill-tensor (data seq shape strides flat-idx)
+           (declare (type list shape strides)
+                    (type fixnum flat-idx))
            (if (null shape)
-	       ;; 到达叶子：写入元素
-	       (setf (aref data flat-idx) (coerce seq type))
-	       (let ((len (first shape))
-                     (stride (first strides)))
-		 (loop for i from 0 below len
-		       for elem = (if (and (or (listp seq)
-					       (typep seq 'vector))
-                                           (< i (length seq)))
-				      (elt seq i)
-				      (error "序列长度不匹配"))
-		       for offset = (+ flat-idx (* i stride))
-		       do (fill-tensor data elem (rest shape) (rest strides)
-				       (1+ depth) offset))))))
+               ;; 叶子节点：直接赋值并强制类型转换
+               (setf (aref data flat-idx)
+                     (coerce seq (vt-dtype->lisp-type dtype)))
+               ;; 非叶子节点：遍历当前维度
+               (let ((stride (the fixnum (first strides)))
+                     (current-offset flat-idx))
+                 (declare (type fixnum stride current-offset))
+                 (typecase seq
+                   (list
+                    (loop for elem in seq do
+                      (fill-tensor data elem (rest shape) (rest strides) current-offset)
+                      ;; 增量累加偏移量，消除循环内的乘法
+                      (incf current-offset stride)))
+                   (vector
+                    (loop for elem across seq do
+                      (fill-tensor data elem (rest shape) (rest strides) current-offset)
+                      (incf current-offset stride)))
+                   (t (error "fill-tensor: 不支持的序列类型")))))))
+      
       (let* ((shape (infer-shape contents))
              (size (reduce #'* shape :initial-value 1))
-             (data (make-array size :element-type type
-				    :initial-element (coerce 0 type)))
+             (lisp-type (vt-dtype->lisp-type dtype))
+             (data (make-array size
+                               :element-type lisp-type
+                               :initial-element (coerce 0 lisp-type)))
              (strides (vt-compute-strides shape)))
-	(fill-tensor data contents shape strides 0 0)
-	(%make-vt :data data
-		  :shape shape
-		  :strides strides
-		  :offset 0
-		  :etype type)))))
+        (fill-tensor data contents shape strides 0)
+        (%make-vt :data data
+                  :shape shape
+                  :strides strides
+                  :offset 0
+                  :dtype dtype)))))
 
-(defun vt-from-array (arr)
-  "从数组转vt, 维度不变"
-  (declare (array arr))
-  (with-float-safe
-    (let* ((shape (array-dimensions arr))
-	   (type (if (eq (array-element-type arr) 'fixnum)
-		     'fixnum
-		     'double-float))
-	   (vt (vt-zeros shape :type type)))
-      (dotimes (idx (reduce #'* shape))
-	(declare (fixnum idx))
-	(setf (row-major-aref (vt-data vt) idx)
-	      (coerce (row-major-aref arr idx) type)))
-      vt)))
+(defun vt-from-array (arr &key (dtype nil))
+  "从标准 CL 多维数组创建张量，保持维度不变。
+   自动推断元素类型，支持通过 :dtype 强制覆盖。
+   若发生类型不兼容转换 (如浮点强转整数)，将直接抛出类型错误快速失败。"
+  (declare (type array arr) (optimize (safety 1)))
+  (let* ((shape (array-dimensions arr))
+         (size (reduce #'* shape :initial-value 1))
+         (cl-etype (array-element-type arr))
+         ;; 映射 CL 数组类型到内部 dtype
+         (infer-dtype (cond
+                        ((subtypep cl-etype 'double-float) :float64)
+                        ((subtypep cl-etype 'single-float) :float32)
+                        ((subtypep cl-etype '(signed-byte 32)) :int32)
+                        ((subtypep cl-etype '(signed-byte 64)) :int64)
+			((subtypep cl-etype '(unsigned-byte 8)) :int32)
+			((subtypep cl-etype 'fixnum) :int64)
+                        ;; 兜底未知或通用类型
+                        (t :float64)))
+         (final-dtype (or dtype infer-dtype))
+         (lisp-type (vt-dtype->lisp-type final-dtype))
+         (data (make-array size :element-type lisp-type))
+         (strides (vt-compute-strides shape)))
+    (declare (type fixnum size))
+    ;; 逐元素拷贝并强制类型转换
+    (dotimes (i size)
+      (setf (aref data i)
+            (vt-cast (row-major-aref arr i) final-dtype)))
+    (%make-vt :data data
+              :shape shape
+              :strides strides
+              :offset 0
+              :dtype final-dtype)))
 
 (defun vt-flatten-to-nested (dims data)
   "将按行主序存储的一维向量 data 转换为符合 dims 维度的嵌套列表.
    (vt-flatten-to-nested (vt-shape vt) (vt-data vt))"
   (with-float-safe
     (let ((total-size (reduce #'* dims))    ;; 总元素数
-					    (idx 0))                          ;; 当前读取位置
+	  (idx 0))                          ;; 当前读取位置
       (assert (= total-size (length data)) (data)
               "数据长度与维度乘积不匹配")
       (labels
@@ -267,236 +390,368 @@
             ;; 0 维张量（标量）直接返回值
             (aref data offset))))))
 
-(defun vt-to-array (vt)
-  "将张量转化为同维度的数组"
-  (make-array (vt-shape vt)
-	      :element-type (vt-element-type vt)
-	      :initial-contents (vt-to-list vt)))
+(defun vt-to-array (vt &key dtype)
+  "将张量转换为原生多维数组。零中间 List 分配，直接进行内存级搬运。
+   - vt: 输入张量。
+   - dtype: 指定输出数组的元素类型。
+            如果提供，张量会先转换为该类型，再转换为数组。"
+  (declare (type vt vt) (optimize (safety 0)))
+  (if dtype (setf vt (vt-astype vt dtype)))
+  (let ((shape (vt-shape vt)))
+    (macrolet
+	((gen-to-array (lisp-type)
+           `(let ((arr (make-array shape :element-type ',lisp-type))
+                  (in-data (the (simple-array ,lisp-type (*)) (vt-data vt)))
+                  (out-strides (vt-compute-strides shape)))
+	      (declare (type (simple-array ,lisp-type) arr)           
+                       (type (simple-array ,lisp-type (*)) in-data))
+              (labels ((recurse (depth in-ptr out-ptr)
+                         (declare (type fixnum depth in-ptr out-ptr))
+                         (if (= depth (length shape))
+                             (setf (row-major-aref arr out-ptr)
+                                   (aref in-data in-ptr))
+                             (let ((dim (the fixnum (nth depth shape)))
+                                   (in-stride (the fixnum (nth depth (vt-strides vt))))
+                                   (out-stride (the fixnum (nth depth out-strides)))
+                                   (cur-in in-ptr)
+                                   (cur-out out-ptr))
+                               (declare (type fixnum dim in-stride out-stride cur-in cur-out))
+                               (loop for i fixnum from 0 below dim do
+                                 (recurse (1+ depth) cur-in cur-out)
+                                 (incf cur-in in-stride)
+                                 (incf cur-out out-stride))))))
+                (recurse 0 (the fixnum (vt-offset vt)) 0))
+              arr)))
+      (etypecase (vt-data vt)
+        ((simple-array double-float (*))
+         (gen-to-array double-float))
+        ((simple-array single-float (*))
+         (gen-to-array single-float))
+        ((simple-array (signed-byte 64) (*))
+         (gen-to-array (signed-byte 64)))
+        ((simple-array (signed-byte 32) (*))
+         (gen-to-array (signed-byte 32)))
+	((simple-array (unsigned-byte 8) (*))
+         (gen-to-array (unsigned-byte 8)))
+        (simple-vector
+         (let ((arr (make-array shape :element-type t))
+               (in-data (vt-data vt))
+               (out-strides (vt-compute-strides shape)))
+           (declare (type simple-vector in-data))
+           (labels ((recurse (depth in-ptr out-ptr)
+                      (declare (type fixnum depth in-ptr out-ptr))
+                      (if (= depth (length shape))
+                          (setf (row-major-aref arr out-ptr)
+                                (aref in-data in-ptr))
+                          (let ((dim (the fixnum (nth depth shape)))
+                                (in-stride (the fixnum (nth depth (vt-strides vt))))
+                                (out-stride (the fixnum (nth depth out-strides)))
+                                (cur-in in-ptr)
+                                (cur-out out-ptr))
+                            (declare (type fixnum dim in-stride out-stride cur-in cur-out))
+                            (loop for i fixnum from 0 below dim do
+                              (recurse (1+ depth) cur-in cur-out)
+                              (incf cur-in in-stride)
+                              (incf cur-out out-stride))))))
+             (recurse 0 (the fixnum (vt-offset vt)) 0))
+           arr))))))
 
-(defun vt-order (vt)
-  "张量的维度大小"
-  (length (vt-shape vt)))
 
-(defun vt-size (vt)
-  "张量的数据大小"
-  (reduce #'* (vt-shape vt) :initial-value 1))
 
-(defun vt-arange (n &key (start 0) (step 1) (type 'double-float))
+(defun vt-arange (n &key (start 0) (step 1) (dtype :float64))
   "创建一个包含范围值的一维张量."
   (declare (fixnum n))
-  (let* ((data (make-array n :element-type type))
+  (let* ((data (make-array n :element-type (vt-dtype->lisp-type dtype)))
          (shape (list n)))
     (loop for i fixnum below n
-          do (setf (aref data i) (coerce (+ start (* i step)) type)))
+          do (setf (aref data i)
+		   (vt-cast (+ start (* i step)) dtype)))
     (%make-vt :data data
 	      :shape shape
 	      :strides (vt-compute-strides shape)
-	      :etype type)))
+	      :dtype dtype)))
 
-(defun vt-zeros (shape &key (type 'double-float))
+(defun vt-zeros (shape &key (dtype :float64))
   "创建全0张量."
   (declare (list shape))
-  (make-vt shape 0 :type type))
+  (make-vt shape 0 :dtype dtype))
 
-(defun vt-ones (shape &key (type 'double-float))
+(defun vt-ones (shape &key (dtype :float64))
   "创建全1张量."
   (declare (list shape))
-  (make-vt shape 1 :type type))
+  (make-vt shape 1 :dtype dtype))
 
-(defun vt-const (shape value &key (type 'double-float))
+(defun vt-const (shape value &key (dtype :float64))
   (declare (list shape))
-  (make-vt shape value :type type))
+  (make-vt shape value :dtype dtype))
 
-(defun vt-eye (n &key (m n) (value 1) (type 'double-float))
-  "创建单位矩阵 或矩形矩阵.
-   n: 行数.
-   m: 列数 (默认为 n).
-   value: 对角线填充值 (默认 1.0)."
+(defun vt-full (shape fill-value &key (dtype :float64))
+  "创建指定值填充的数组.
+  shape: 形状列表
+  fill-value: 填充值
+  返回: 张量"
   (with-float-safe
-    (let* ((rows n)
-           (cols m)
-           ;; 简单情况:2d 矩阵
-           (shape (list rows cols))
-           (res (vt-zeros shape :type type))
-           (data (vt-data res))
-           (strides (vt-strides res)))    
-      (declare (type (simple-array * (*)) data)
-               (type list strides))
-      ;; 对于行优先,data[i, i] 的偏移是 i * row_stride + i * col_stride
-      ;; row_stride 通常是 cols (对于密集矩阵), col_stride 是 1
-      (let ((row-stride (first strides)) ;; 第一维步长
-					 (col-stride (second strides)) ;; 第二维步长
-					 (diagonal-len (min rows cols)))      
-	(declare (type fixnum row-stride col-stride diagonal-len))
-	;; 沿对角线填充
-	(loop for i fixnum from 0 below diagonal-len
-              for offset fixnum = 0 then (+ offset row-stride col-stride)
-              do (setf (aref data offset) (coerce value type))))
-      res)))
+    (make-vt shape fill-value :dtype dtype)))
 
-(defun vt-diag (vector-tensor)
-  "从 1d 张量 (向量) 创建方阵对角矩阵.
-   输入: 形状为 的张量.
-   输出: 形状为 的张量,非对角线为 0."
+(defun vt-empty (shape &key (dtype :float64))
+  "创建未初始化数组(实际用 0 填充,避免垃圾数据).
+  shape: 形状列表
+  返回: 张量"
+  (vt-zeros shape :dtype dtype))
+
+(defun vt-zeros-like (vt &key dtype)
+  "创建与给定数组形状相同的全零数组.
+  vt: 输入张量
+  dtype: 数据类型(默认与输入相同)
+  返回: 张量"
+  (vt-zeros (vt-shape vt)
+	    :dtype (or dtype (vt-dtype vt))))
+
+(defun vt-ones-like (vt &key dtype)
+  "创建与给定数组形状相同的全一数组."
+  (vt-ones (vt-shape vt)
+	   :dtype (or dtype (vt-dtype vt))))
+
+(defun vt-full-like (vt fill-value &key dtype)
+  "创建与给定数组形状相同的填充数组."
   (with-float-safe
-    (let* ((in-data (vt-data vector-tensor))
-           (n (car (vt-shape vector-tensor)))
-           (in-offset (vt-offset vector-tensor))
-           (in-stride (first (vt-strides vector-tensor))) ; 获取 1d 张量的实际步长
-           (res (make-vt (list n n) 0
-			 :type (vt-element-type vector-tensor)))
-           (res-data (vt-data res))
-           (res-strides (vt-strides res)))
-      (declare (type fixnum n in-offset in-stride))
-      (let ((row-stride (first res-strides))
-            (col-stride (second res-strides)))
-        (declare (type fixnum row-stride col-stride))
-        ;; 填充对角线
-        (loop for i fixnum from 0 below n
-              ;; 基于输入的 offset 和 stride 计算正确的物理偏移
-              for src-off fixnum = (+ in-offset (* i in-stride))
-              for dst-off fixnum = 0 then (+ dst-off row-stride col-stride)
-              do (setf (aref res-data dst-off)
-		       (aref in-data src-off))))
-      res)))
+    (vt-full (vt-shape vt)
+	     fill-value
+	     :dtype (or dtype (vt-dtype vt)))))
+
+(defun vt-empty-like (vt &key dtype)
+  "创建与给定数组形状相同的未初始化数组."
+  (vt-empty (vt-shape vt)
+	    :dtype (or dtype (vt-dtype vt))))
 
 
-(defun vt-triu (tensor &key (k 0) (in-place nil))
-  "返回上三角矩阵.
-   k: 对角线偏移 (0=主对角线, 1=主对角线之上).
-   in-place: 如果为 t,直接修改原张量；否则返回副本.
-   支持 batch (rank >= 2)."
-  (with-float-safe
-    (let* ((res (if in-place tensor (vt-copy tensor)))
-	   ;; vt-copy 需自行实现或用 vt-map identity
-	   (res-data (vt-data res))
-	   (res-shape (vt-shape res))
-	   (res-strides (vt-strides res))
-	   (rank (length res-shape)))    
-      (when (< rank 2) (error "vt-triu requires rank >= 2"))
-      (labels
-	  ((recurse (depth ptr)
-             (declare (type fixnum depth ptr))
-             (if (= depth (- rank 2))
-		 ;; === 底层矩阵操作 ===
-		 (let* ((rows (nth depth res-shape))
-			(cols (nth (1+ depth) res-shape))
-			(stride-row (nth depth res-strides))
-			(stride-col (nth (1+ depth) res-strides)))
-                   (declare (type fixnum rows cols stride-row stride-col))                 
-                   (loop
-		     for r fixnum from 0 below rows
-                     for row-ptr fixnum = ptr then (+ row-ptr stride-row) do
-                       (loop for c fixnum from 0 below cols do
-			 ;; 判断条件:列号 >= 行号 + k
-			 (when (< c (+ r k))
-                           ;; 置零
-                           (setf (aref res-data 
-				       (+ row-ptr (* c stride-col)))
-				 (coerce 0 (vt-element-type tensor)))))))               
-		 ;; === 高维递归 ===
-		 (let ((dim (nth depth res-shape))
-                       (stride (nth depth res-strides)))
-                   (loop for i fixnum from 0 below dim do
-                     (recurse (1+ depth) ptr)
-                     (incf ptr stride))))))      
-	(recurse 0 (vt-offset res)))    
-      res)))
+(defun vt-identity (n &key dtype)
+  "创建 n×n 单位矩阵。"
+  (vt-eye n :dtype dtype))
 
-(defun vt-tril (tensor &key (k 0) (in-place nil))
-  "返回下三角矩阵.
-   k: 对角线偏移 (0=主对角线, -1=主对角线之下).
-   支持 batch."
-  (with-float-safe
-    (let* ((res (if in-place tensor (vt-copy tensor)))
-           (res-data (vt-data res))
-           (res-shape (vt-shape res))
-           (res-strides (vt-strides res))
-           (rank (length res-shape)))    
-      (when (< rank 2) (error "vt-tril requires rank >= 2"))
-      (labels 
-	  ((recurse (depth ptr)
-             (declare (type fixnum depth ptr))
-             (if (= depth (- rank 2))
-		 ;; === 底层矩阵操作 ===
-		 (let* ((rows (nth depth res-shape))
-			(cols (nth (1+ depth) res-shape))
-			(stride-row (nth depth res-strides))
-			(stride-col (nth (1+ depth) res-strides)))
-                   (declare (type fixnum rows cols stride-row stride-col))                 
-                   (loop
-		     for r fixnum from 0 below rows
-                     for row-ptr fixnum = ptr then (+ row-ptr stride-row) do
-                       (loop for c fixnum from 0 below cols do
-			 ;; 判断条件:列号 <= 行号 + k
-			 (when (> c (+ r k))
-                           ;; 置零
-                           (setf (aref res-data 
-				       (+ row-ptr (* c stride-col)))
-				 (coerce 0 (vt-element-type tensor)))))))               
-		 ;; === 高维递归 ===
-		 (let ((dim (nth depth res-shape))
-                       (stride (nth depth res-strides)))
-                   (loop for i fixnum from 0 below dim do
-                     (recurse (1+ depth) ptr)
-                     (incf ptr stride))))))      
-	(recurse 0 (vt-offset res)))    
-      res)))
+(defun vt-eye (rows &key (cols rows) (value 1) (dtype :float64))
+  "创建单位矩阵或矩形对角矩阵。
+   rows: 行数。
+   cols: 列数 (默认为 rows)。
+   value: 对角线填充值 (默认 1)。"
+  (declare (type fixnum rows cols))
+  (let* ((shape (list rows cols))
+         (lisp-type (vt-dtype->lisp-type dtype))
+         ;; 直接分配底层连续物理数组，避免 vt-zeros 二次解析
+         (data (make-array (* rows cols)
+                           :element-type lisp-type
+                           :initial-element (coerce 0 lisp-type)))
+         (strides (vt-compute-strides shape))
+         (res (%make-vt :data data
+                        :shape shape
+                        :strides strides
+                        :offset 0
+                        :dtype dtype
+                        )))
+    (declare (type (simple-array * (*)) data)
+             (type list strides))
+    ;; 对于行优先，data[i, i] 的偏移是 i * row_stride + i * col_stride
+    (let ((row-stride (first strides))
+          (col-stride (second strides))
+          (diagonal-len (min rows cols)))
+      (declare (type fixnum row-stride col-stride diagonal-len))
+      ;; 沿对角线极速填充
+      (loop for i fixnum from 0 below diagonal-len
+            for offset fixnum = 0 then (+ offset row-stride col-stride)
+            do (setf (aref data offset)
+                     (coerce value lisp-type))))
+    res))
+
+(defun vt-diag (tensor &key (k 0))
+  "提取对角线或构造对角矩阵。严格对标 NumPy 的 np.diag。
+  - 输入 1D (n): 返回 2D (n+|k|, n+|k|) 对角矩阵，k 指定偏移。
+  - 输入 2D (m, n): 返回 1D (min(m, n)-|k|) 对角线向量，k 指定偏移。
+  k: 对角线偏移量，正数表示主对角线之上，负数表示之下。默认为 0。
+  "
+  (declare (type fixnum k))
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape)))
+    (cond
+      ;; === 1D -> 2D: 构造对角矩阵 ===
+      ((= rank 1)
+       (let* ((n (the fixnum (first shape)))
+              (dim (the fixnum (+ n (abs k)))) ; 矩阵维度需扩大以容纳偏移
+              (dtype (vt-dtype tensor))
+              (res (vt-zeros (list dim dim) :dtype dtype))
+              (res-data (vt-data res))
+              (res-strides (vt-strides res))
+              (in-data (vt-data tensor))
+              (in-offset (vt-offset tensor))
+              (in-stride (first (vt-strides tensor))))
+         (declare (type fixnum dim n in-offset in-stride))
+         (let ((row-stride (first res-strides))
+               (col-stride (second res-strides)))
+           (declare (type fixnum row-stride col-stride))
+           ;; 计算偏移后的起始物理地址
+           ;; k > 0: 右上方，起点在第 0 行，第 k 列
+           ;; k < 0: 左下方，起点在第 |k| 行，第 0 列
+           (let ((start-offset (the fixnum 
+                                    (if (> k 0) 
+                                        (* k col-stride) 
+                                        (* (- k) row-stride)))))
+             (declare (type fixnum start-offset))
+             ;; 基于步长极速填充对角线
+             (loop for i fixnum from 0 below n
+                   for src-off fixnum = (+ in-offset (* i in-stride))
+                   for dst-off fixnum = start-offset
+		     then (+ dst-off row-stride col-stride)
+                   do (setf (aref res-data dst-off)
+			    (aref in-data src-off))))
+           res)))
+      
+      ;; === 2D -> 1D: 提取对角线 ===
+      ((= rank 2)
+       ;; 复用已有的高效提取函数 vt-diagonal
+       (vt-diagonal tensor :offset k))
+      
+      ;; === 其他维度报错 ===
+      (t (error "vt-diag 仅支持 1D 或 2D 张量输入，当前维度为: ~a" rank)))))
+
+
+(defun vt-triu (tensor &key (k 0))
+  "返回上三角矩阵。
+   k: 对角线偏移 (0=主对角线, 1=主对角线之上)。
+   支持 batch (rank >= 2)。"
+  (let* ((res (vt-copy tensor))
+         (res-data (vt-data res))
+         (rank (length (vt-shape res)))
+         ;; 预提取为 simple-vector，消灭循环内的 nth 开销
+         (shape-vec (coerce (vt-shape res) 'simple-vector))
+         (strs-vec (coerce (vt-strides res) 'simple-vector))
+         ;; 预先将 0 转换为目标类型，避免循环内反复 coerce
+         (zero-val (coerce 0 (vt-element-type res))))
+    (declare (type simple-vector shape-vec strs-vec)
+             (type fixnum rank))
+    (when (< rank 2)
+      (error "vt-triu requires rank >= 2"))
+    (labels
+        ((recurse (depth ptr)
+           (declare (type fixnum depth ptr))
+           (if (= depth (- rank 2))
+               ;; === 底层矩阵操作 ===
+               (let* ((rows (svref shape-vec depth))
+                      (cols (svref shape-vec (1+ depth)))
+                      (str-r (svref strs-vec depth))
+                      (str-c (svref strs-vec (1+ depth))))
+                 (declare (type fixnum rows cols str-r str-c))
+                 (loop for r fixnum from 0 below rows
+                       for row-ptr fixnum = ptr then (+ row-ptr str-r) do
+                         (loop for c fixnum from 0 below cols do
+                           ;; 列号 >= 行号 + k
+                           (when (< c (+ r k))
+                             (setf (aref res-data
+                                         (+ row-ptr (* c str-c)))
+                                   zero-val)))))
+               ;; === 高维递归 ===
+               (let ((dim (svref shape-vec depth))
+                     (stride (svref strs-vec depth)))
+                 (declare (type fixnum dim stride))
+                 (loop for i fixnum from 0 below dim do
+                   (recurse (1+ depth) ptr)
+                   (incf ptr stride))))))
+      (recurse 0 (vt-offset res)))
+    res))
+
+(defun vt-tril (tensor &key (k 0))
+  "返回下三角矩阵。
+   k: 对角线偏移 (0=主对角线, -1=主对角线之下)。
+   支持 batch。"
+  (let* ((res (vt-copy tensor))
+         (res-data (vt-data res))
+         (rank (length (vt-shape res)))
+         (shape-vec (coerce (vt-shape res) 'simple-vector))
+         (strs-vec (coerce (vt-strides res) 'simple-vector))
+         (zero-val (coerce 0 (vt-element-type res))))
+    (declare (type simple-vector shape-vec strs-vec)
+             (type fixnum rank))
+    (when (< rank 2)
+      (error "vt-tril requires rank >= 2"))
+    (labels
+        ((recurse (depth ptr)
+           (declare (type fixnum depth ptr))
+           (if (= depth (- rank 2))
+               ;; === 底层矩阵操作 ===
+               (let* ((rows (svref shape-vec depth))
+                      (cols (svref shape-vec (1+ depth)))
+                      (str-r (svref strs-vec depth))
+                      (str-c (svref strs-vec (1+ depth))))
+                 (declare (type fixnum rows cols str-r str-c))
+                 (loop for r fixnum from 0 below rows
+                       for row-ptr fixnum = ptr then (+ row-ptr str-r) do
+                         (loop for c fixnum from 0 below cols do
+                           ;; 列号 <= 行号 + k
+                           (when (> c (+ r k))
+                             (setf (aref res-data
+                                         (+ row-ptr (* c str-c)))
+                                   zero-val)))))
+               ;; === 高维递归 ===
+               (let ((dim (svref shape-vec depth))
+                     (stride (svref strs-vec depth)))
+                 (declare (type fixnum dim stride))
+                 (loop for i fixnum from 0 below dim do
+                   (recurse (1+ depth) ptr)
+                   (incf ptr stride))))))
+      (recurse 0 (vt-offset res)))
+    res))
 
 (defun vt-diagonal (tensor &key (offset 0))
-  "提取对角线元素.
-   返回一个 1d 张量 (向量),如果是 batch 输入则返回 2d 张量.
-   offset: 对角线偏移."
-  (with-float-safe
-    (let* ((in-shape (vt-shape tensor))
-           (rank (length in-shape)))    
-      (when (< rank 2) (error "vt-diagonal requires rank >= 2"))
-      (let* ((rows (nth (- rank 2) in-shape))
-             (cols (nth (- rank 1) in-shape))
-             ;; 计算对角线长度
-             (diag-len (max 0 (- (min rows cols) (abs offset))))
-	     (type (vt-element-type tensor))
-             ;; 确定输出形状:batch 维度 + 对角线长度
-             (out-shape
-	       (append (subseq in-shape 0 (- rank 2))
-		       (list diag-len)))
-             (res (vt-zeros out-shape :type type))
-             (res-data (vt-data res))
-             (in-data (vt-data tensor))
-             (in-strides (vt-strides tensor)))
-	(labels 
-	    ((recurse (depth in-ptr out-ptr)
-               (declare (type fixnum depth in-ptr out-ptr))
-               (if (= depth (- rank 2))
-                   ;; === 底层:提取对角线 ===
-                   (let ((stride-row (nth depth in-strides))
-			 (stride-col (nth (1+ depth) in-strides)))
-                     (declare (type fixnum stride-row stride-col))
-                     (loop
-		       for i fixnum from 0 below diag-len
-                       ;; 根据偏移量计算起点和步长
-                       ;; offset > 0: 向右偏移,起点 (0, offset)
-                       ;; offset < 0: 向下偏移,起点
-                       for r fixnum = (if (> offset 0) 0 (- offset))
-                       for c fixnum = (if (> offset 0) offset 0)
-                       ;; 计算指针位置
-                       for src-off fixnum = (+ in-ptr 
-                                               (* (+ r i) stride-row) 
-                                               (* (+ c i) stride-col))
-                       do (setf (aref res-data out-ptr)
-				(aref in-data src-off))
-                          (incf out-ptr)))
-                   ;; === 高维递归 ===
-                   (let ((dim (nth depth in-shape))
-			 (stride (nth depth in-strides))
-			 (out-stride
-			   (nth depth (vt-strides res)))) ;; res strides 对应 batch 维
-                     (loop for i fixnum from 0 below dim do
-                       (recurse (1+ depth) in-ptr out-ptr)
-                       (incf in-ptr stride)
-                       (incf out-ptr out-stride))))))
-          (recurse 0 (vt-offset tensor) 0))      
-	res))))
+  "提取对角线元素。
+   返回一个 1d 张量 (向量), 如果是 batch 输入则返回 2d 张量。
+   offset: 对角线偏移。"
+  (let* ((in-shape (vt-shape tensor))
+         (rank (length in-shape)))
+    (declare (type fixnum rank))
+    (when (< rank 2)
+      (error "vt-diagonal requires rank >= 2"))
+    (let* ((rows (nth (- rank 2) in-shape))
+           (cols (nth (- rank 1) in-shape))
+           (diag-len (max 0 (- (min rows cols) (abs offset))))
+           (dtype (vt-dtype tensor))
+           (out-shape (append (subseq in-shape 0 (- rank 2))
+                              (list diag-len)))
+           (res (vt-zeros out-shape :dtype dtype))
+           (res-data (vt-data res))
+           (in-data (vt-data tensor))
+           (in-strs (coerce (vt-strides tensor) 'simple-vector))
+           (out-strs (coerce (vt-strides res) 'simple-vector))
+           (in-shp-vec (coerce in-shape 'simple-vector))
+           ;; 预计算起点偏移量
+           (r-init (if (> offset 0) 0 (- offset)))
+           (c-init (if (> offset 0) offset 0)))
+      (declare (type simple-vector in-strs out-strs in-shp-vec)
+               (type fixnum r-init c-init))
+      (labels
+          ((recurse (depth in-ptr out-ptr)
+             (declare (type fixnum depth in-ptr out-ptr))
+             (if (= depth (- rank 2))
+                 ;; === 底层: 提取对角线 ===
+                 (let ((str-r (svref in-strs depth))
+                       (str-c (svref in-strs (1+ depth))))
+                   (declare (type fixnum str-r str-c))
+                   (loop for i fixnum from 0 below diag-len
+                         for src-off fixnum = (+ in-ptr
+                                                 (* (+ r-init i) str-r)
+                                                 (* (+ c-init i) str-c))
+                         do (setf (aref res-data out-ptr)
+                                  (aref in-data src-off))
+                            (incf out-ptr)))
+                 ;; === 高维递归 ===
+                 (let ((dim (svref in-shp-vec depth))
+                       (in-str (svref in-strs depth))
+                       (out-str (svref out-strs depth)))
+                   (declare (type fixnum dim in-str out-str))
+                   (loop for i fixnum from 0 below dim do
+                     (recurse (1+ depth) in-ptr out-ptr)
+                     (incf in-ptr in-str)
+                     (incf out-ptr out-str))))))
+        (recurse 0 (vt-offset tensor) 0))
+      res)))
+
 
 ;; 1. 选用正确的步长计算函数
 (defun vt-compute-strides (shape)
@@ -512,7 +767,7 @@
             finally (return (reverse strides)))))
 
 (defun vt-contiguous-p (vt)
-   "检查张量是否在内存中连续 只有连续的张量才能安全地重塑为任意形状.
+  "检查张量是否在内存中连续 只有连续的张量才能安全地重塑为任意形状.
    (对标 numpy 的 c_contiguous 判定逻辑)"
   (let ((shape (vt-shape vt))
         (strides (vt-strides vt)))
@@ -550,7 +805,7 @@
                       :shape (vt-shape vt)
                       :strides (vt-compute-strides (vt-shape vt))
                       :offset 0
-		      :etype (vt-element-type vt))))
+		      :dtype (vt-dtype vt))))
         ;; 高效拷贝:利用迭代器填充新数据
         (vt-copy-into new-vt vt)
         new-vt)))
@@ -559,6 +814,28 @@
   "零拷贝重塑视图。对标 pytorch 的 tensor.view()。
   要求输入张量必须是内存连续的，否则报错。
   用于确保操作不会产生隐式的数据拷贝。"
+  
+  (let ((neg-idx (position -1 new-shape)))
+    (when neg-idx
+      (let ((known-size (reduce #'* (remove -1 new-shape) :initial-value 1))
+            (total-size (vt-shape-to-size (vt-shape vt))))
+	(cond
+          ;; 情况 1: 已知维度乘积为 0
+          ((zerop known-size)
+           ;; 如果总元素也是 0，将 -1 替换为 0 (如 (0,3) -> (-1, 0) => (0, 0))
+           (if (zerop total-size)
+               (setf new-shape (substitute 0 -1 new-shape))
+               ;; 如果总元素非 0 却要求已知维度乘积为 0，则是非法请求
+               (error "无法将形状 ~A 重塑为含 -1 的 ~A" (vt-shape vt) new-shape)))
+          ;; 情况 2: 无法整除
+          ((not (zerop (rem total-size known-size)))
+           (error "无法将形状 ~A 重塑为含 -1 的 ~A" (vt-shape vt) new-shape))
+          ;; 情况 3: 正常计算
+          (t
+           (setf new-shape
+		 (substitute (/ total-size known-size) -1 new-shape)))))))
+
+
   (let ((old-size (vt-shape-to-size (vt-shape vt)))
         (new-size (vt-shape-to-size new-shape)))
     (unless (= old-size new-size)
@@ -569,13 +846,33 @@
               :shape new-shape
               :strides (vt-compute-strides new-shape)
               :offset (vt-offset vt)
-              :etype (vt-element-type vt))))
+              :dtype (vt-dtype vt))))
 
 (defun vt-reshape (vt new-shape)
   "重塑形状.
    如果张量是连续的,则创建视图(零拷贝)；
    否则自动创建连续副本后重塑.
    这解决了原代码在非连续内存上重塑导致的数据错误问题."
+  (let ((neg-idx (position -1 new-shape)))
+    (when neg-idx
+      (let ((known-size (reduce #'* (remove -1 new-shape) :initial-value 1))
+            (total-size (vt-shape-to-size (vt-shape vt))))
+	(cond
+          ;; 情况 1: 已知维度乘积为 0
+          ((zerop known-size)
+           ;; 如果总元素也是 0，将 -1 替换为 0 (如 (0,3) -> (-1, 0) => (0, 0))
+           (if (zerop total-size)
+               (setf new-shape (substitute 0 -1 new-shape))
+               ;; 如果总元素非 0 却要求已知维度乘积为 0，则是非法请求
+               (error "无法将形状 ~A 重塑为含 -1 的 ~A" (vt-shape vt) new-shape)))
+          ;; 情况 2: 无法整除
+          ((not (zerop (rem total-size known-size)))
+           (error "无法将形状 ~A 重塑为含 -1 的 ~A" (vt-shape vt) new-shape))
+          ;; 情况 3: 正常计算
+          (t
+           (setf new-shape
+		 (substitute (/ total-size known-size) -1 new-shape)))))))
+
   (let ((old-size (vt-shape-to-size (vt-shape vt)))
         (new-size (vt-shape-to-size new-shape)))
     (unless (= old-size new-size)
@@ -587,7 +884,7 @@
          :shape new-shape
          :strides (vt-compute-strides new-shape)
          :offset (vt-offset vt)
-	 :etype (vt-element-type vt))
+	 :dtype (vt-dtype vt))
         ;; 安全路径:先内存整理,再重塑
         (let ((cont-vt (vt-contiguous vt)))
           (%make-vt
@@ -595,7 +892,7 @@
            :shape new-shape
            :strides (vt-compute-strides new-shape)
            :offset 0
-	   :etype (vt-element-type cont-vt))))))
+	   :dtype (vt-dtype cont-vt))))))
 
 (defun vt-transpose (vt &optional (perm nil))
   "零拷贝转置.仅交换步长和形状维度,不移动数据.
@@ -625,8 +922,7 @@
                 :shape new-shape
                 :strides new-strides
                 :offset (vt-offset vt)
-                :etype (vt-element-type vt)))))
-
+                :dtype (vt-dtype vt)))))
 
 (defun vt-normalize-axis (axis rank)
   "将可能为负数的 axis 转换为严格正数，并进行越界检查。
@@ -662,7 +958,7 @@
 	 :shape new-shape
 	 :strides strides 
 	 :offset new-offset
-	 :etype (vt-element-type vt))))))
+	 :dtype (vt-dtype vt))))))
 
 (defun vt-split (tensor indices-or-sections &key (axis 0))
   "沿指定轴分割张量 (对标 numpy 的 array_split)。
@@ -698,9 +994,9 @@
         ((listp indices-or-sections)
          (let* ((raw-points
 		  (append (list 0) indices-or-sections (list dim-size)))
-		 (normalized-points (mapcar (lambda (p)
-                                    (if (minusp p) (+ p dim-size) p))
-					    raw-points))
+		(normalized-points (mapcar (lambda (p)
+					     (if (minusp p) (+ p dim-size) p))
+					   raw-points))
 		(clamped-points (mapcar (lambda (p)
 					  (max 0 (min p dim-size)))
 					normalized-points)))
@@ -759,11 +1055,12 @@
 		(dotimes (i needed-all)
                   (push '(:all) expanded-specs))
 		(push s expanded-specs)))
-          (setf expanded-specs (nreverse expanded-specs))
-          (unless ellipsis-pos
-            (let ((remaining (- old-rank (- (length expanded-specs) num-newaxis))))
+	  (unless ellipsis-pos
+            (let ((remaining (- old-rank (- (length specs) num-newaxis))))
               (dotimes (i remaining)
-		(setf expanded-specs (append expanded-specs '((:all)))))))))
+		(push '(:all) expanded-specs))))                     
+          (setf expanded-specs (nreverse expanded-specs))))
+      
       ;; ========== 2. 遍历每个规格 ==========
       (let ((new-shape '())
             (new-strides '())
@@ -845,7 +1142,7 @@
                   :shape (nreverse new-shape)
                   :strides (nreverse new-strides)
                   :offset cur-offset
-		  :etype (vt-element-type vt))))))
+		  :dtype (vt-dtype vt))))))
 
 (defun (setf vt-slice) (value vt &rest specs)
   "设置切片区域的值。value 可以是数字或张量。
@@ -872,38 +1169,138 @@
           ;; 目标为非标量：使用通用拷贝（支持广播）
           (vt-copy-into target-view value)))))
 
-(defun vt-copy (vt)
+(defun vt-astype (tensor new-dtype)
+  "将张量转换为新类型。浮点数→整数时使用截断 (truncate)，其余使用 coerce。"
+  (with-float-safe
+    (let* ((shape (vt-shape tensor))
+           (new (vt-zeros shape :dtype new-dtype))
+           (new-data (vt-data new))
+           (offset (vt-offset new))
+           (in-data (vt-data tensor))
+           (in-strides (vt-strides tensor))
+           (in-offset (vt-offset tensor))
+           (rank (length shape))
+           (converter (vt-cast-fun new-dtype)))
+      (labels ((copy-rec (depth in-ptr out-ptr)
+		 (if (= depth rank)
+                     (setf (aref new-data out-ptr)
+			   (funcall converter (aref in-data in-ptr)))
+                     (let ((dim (nth depth shape))
+                           (in-stride (nth depth in-strides))
+                           (out-stride (nth depth (vt-strides new))))
+                       (loop for i below dim do
+			 (copy-rec (1+ depth) in-ptr out-ptr)
+			 (incf in-ptr in-stride)
+			 (incf out-ptr out-stride))))))
+	(copy-rec 0 in-offset offset))
+      new)))
+
+(defun vt-copy (vt &key dtype)
   "深度拷贝张量.
    返回一个全新的、内存连续的张量副本.
    副本与原张量完全独立,修改副本不会影响原张量.
-   自动处理视图:如果原张量是切片或转置,返回的是落地后的连续数据."
+   自动处理视图:如果原张量是切片或转置,返回的是落地后的连续数据.
+   Parameters:
+   - dtype: (可选) 指定新张量的数据类型。如果与原张量不同，将进行类型转换。"
   (with-float-safe
-    (let* ((shape (vt-shape vt))
-           (src-data (vt-data vt))
-           (element-type (vt-element-type vt))
-           (size (vt-shape-to-size shape))
-           ;; 分配全新的内存空间
-           (new-data (make-array size :element-type element-type))
-           ;; 构建新张量结构 (总是连续的)
-           (new-vt (%make-vt :data new-data
-                             :shape (copy-list shape) ; 复制列表防止共享结构
-                             :strides (vt-compute-strides shape)
-                             :offset 0
-			     :etype (vt-element-type vt))))
-      (declare (type (simple-array *) src-data new-data)
-               (type fixnum size)
-	       (type vt new-vt))
-      ;; 核心拷贝逻辑:分情况优化
-      (if (vt-contiguous-p vt)
-          ;; === 优化路径:连续内存 ===
-          ;; 直接使用 replace 进行内存块拷贝,速度最快
-          (replace new-data src-data
-		   :start2 (vt-offset vt)
-		   :end2 (+ (vt-offset vt) size))
-          ;; === 通用路径:非连续视图 ===
-          ;; 使用已有的迭代拷贝逻辑
-          (vt-copy-into new-vt vt))    
-      new-vt)))
+    (let* ((target-dtype (or dtype (vt-dtype vt))))
+      (declare (type (member :int32 :int64 :float32 :float64) target-dtype))
+      
+      (if (eq target-dtype (vt-dtype vt))
+          ;; === 场景 1: 类型未变 (包括未指定 dtype) ===
+          (let* ((shape (vt-shape vt))
+                 (src-data (vt-data vt))
+                 (element-type (vt-element-type vt))
+                 (size (vt-shape-to-size shape))
+                 (new-data (make-array size :element-type element-type))
+                 (new-vt (%make-vt :data new-data
+                                   :shape (copy-list shape)
+                                   :strides (vt-compute-strides shape)
+                                   :offset 0
+                                   :dtype target-dtype)))
+            (declare (type (simple-array *) src-data new-data)
+                     (type fixnum size))
+            
+            (if (vt-contiguous-p vt)
+                ;; 快速路径: 内存块拷贝
+                (replace new-data src-data
+                         :start2 (vt-offset vt)
+                         :end2 (+ (vt-offset vt) size))
+                ;; 通用路径: 处理非连续视图
+                (vt-copy-into new-vt vt))
+            new-vt)
+          ;; === 场景 2: 需要类型转换 ===
+          (vt-astype vt target-dtype)))))
+
+(defun vt-copy-into (dest src)
+  "将 src 的数据拷贝到 dest (支持广播和类型转换).
+   极致优化:连续内存走 replace (memcpy),非连续走展开循环。"
+  (setf src (ensure-vt src))  
+  (let ((dest-shape (vt-shape dest))
+        (src-shape (vt-shape src)))     
+    ;; 1. 安全检查：防止写入 0 步长的广播视图
+    (loop for d in dest-shape
+          for s in (vt-strides dest)
+          when (and (> d 1) (zerop s))
+            do (error "vt-copy-into: 目标视图是只读的广播视图 (含有大小为 ~a 的广播维度)" d))            
+    (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
+      (unless (equal final-shape dest-shape)
+        (error "copy-into 失败: dest 形状 ~a 无法容纳 src 广播后的形状 ~a"
+               dest-shape final-shape))               
+      (let* ((dest-data (vt-data dest))
+             (src-data (vt-data src))
+             (dest-etype (array-element-type dest-data))
+             (src-etype (array-element-type src-data))
+             ;; 预计算广播后的源步长 (不分配新张量,零开销)
+             (src-strides
+	       (vt-broadcast-strides src-shape dest-shape (vt-strides src)))
+             (size (vt-shape-to-size dest-shape)))        
+        (cond
+          ;; 极速路径: 完全连续 且 类型一致
+          ;; 直接调用底层内存块拷贝 (等价于 C 的 memcpy)
+          ((and (vt-contiguous-p dest)
+		(vt-contiguous-p src)
+		(equal dest-shape src-shape)
+		(equal dest-etype src-etype))
+           (replace dest-data src-data
+                    :start1 (vt-offset dest)
+                    :end1 (+ (vt-offset dest) size)
+                    :start2 (vt-offset src)
+                    :end2 (+ (vt-offset src) size)))
+          ;; 中速路径: 连续内存 但类型不同 (单层线性循环)
+          ((and (vt-contiguous-p dest)
+		(vt-contiguous-p src)
+		(equal dest-shape src-shape))
+           (let ((d-off (vt-offset dest))
+                 (s-off (vt-offset src)))
+             (declare (type fixnum d-off s-off size))
+             (loop for i fixnum from 0 below size do
+               (setf (aref dest-data (+ d-off i))
+                     (coerce (aref src-data (+ s-off i)) dest-etype)))))
+          ;; 慢速路径: 非连续/需要广播 (N维指针推进)
+          (t
+           (let* ((shape-vec (coerce dest-shape 'simple-vector))
+                  (d-strs-vec (coerce (vt-strides dest) 'simple-vector))
+                  (s-strs-vec (coerce src-strides 'simple-vector))
+                  (rank (length dest-shape)))
+             (declare (type simple-vector shape-vec d-strs-vec s-strs-vec)
+                      (type fixnum rank))
+             (labels ((recurse (depth d-ptr s-ptr)
+			(declare (type fixnum depth d-ptr s-ptr))
+			(if (= depth rank)
+                            (setf (aref dest-data d-ptr)
+                                  (coerce (aref src-data s-ptr) dest-etype))
+                            (let ((dim (svref shape-vec depth))
+                                  (d-str (svref d-strs-vec depth))
+                                  (s-str (svref s-strs-vec depth)))
+                              (declare (type fixnum dim d-str s-str))
+                              (loop for i fixnum from 0 below dim do
+				(recurse (1+ depth) d-ptr s-ptr)
+				(incf d-ptr d-str)
+				(incf s-ptr s-str))))))
+               (recurse 0 (vt-offset dest) (vt-offset src))))))
+        
+        dest))))
 
 (declaim (inline vt-ref))
 (defun vt-ref (vt &rest indices)
@@ -936,24 +1333,30 @@
 (defun (setf vt-ref) (value vt &rest indices)
   "设置张量元素(支持高维索引，支持负索引)。不包含越界检查以换取极致性能。"
   (with-float-safe
+    (when (zerop (vt-size vt))
+      (error "cannot index into an empty tensor (size 0)"))    
     (let* ((shape (vt-shape vt))
            (strides (vt-strides vt))
            (data (vt-data vt))
            (flat-idx (vt-offset vt)))
       (declare (type fixnum flat-idx))
+      (unless (= (length indices) (length shape))
+        (error "索引数量 ~a 与张量维度数 ~a 不匹配"
+               (length indices) (length shape)))
+      
       (loop for idx in indices
             for dim in shape
             for stride in strides
             do (incf flat-idx
-		     (the fixnum
-			  (* (the fixnum
-				  (if (minusp idx)
-				      (+ idx dim)
-				      idx)) 
+                     (the fixnum
+                          (* (the fixnum
+                                  (if (minusp idx)
+                                      (+ idx dim)
+                                      idx))
                              (the fixnum stride)))))
       ;; 强制类型转换写入底层内存
       (setf (aref data flat-idx)
-	    (coerce value (vt-element-type vt))))))
+            (coerce value (vt-element-type vt))))))
 
 (declaim (inline vt-item))
 (defun vt-item (x)
@@ -962,114 +1365,6 @@
 	   (null (vt-shape x)))
       (vt-ref x)
       x))
-
-;;; --- 高效迭代逻辑  ---
-(defmacro vt-do-each ((ptr-var val-var vt) &body body)
-  "高效遍历宏 (支持非连续内存视图)。
-   ptr-var: 当前元素的物理索引。
-   val-var: 当前元素的值。"
-  (let ((shape-sym (gensym "shape"))
-        (strides-sym (gensym "strides"))
-        (data-sym (gensym "data"))
-        (offset-sym (gensym "offset"))
-        (rank-sym (gensym "rank"))
-        (dims-vec (gensym "dims-vec"))
-        (strs-vec (gensym "strs-vec"))
-        (depth-sym (gensym "depth")))
-    `(let* ((,shape-sym (vt-shape ,vt))
-            (,strides-sym (vt-strides ,vt))
-            (,data-sym (vt-data ,vt))
-            (,offset-sym (vt-offset ,vt))
-            (,rank-sym (length ,shape-sym))
-            ;; 预提取为简单向量，使用 svref 达到 O(1) 访问速度
-            (,dims-vec (coerce ,shape-sym 'simple-vector))
-            (,strs-vec (coerce ,strides-sym 'simple-vector)))
-       (labels
-	   ((recurse (,depth-sym current-ptr)
-              (if (= ,depth-sym ,rank-sym)
-                  ;; 到达最内层：绑定为普通变量，允许 declare ignore
-                  (let ((,ptr-var current-ptr)
-                        (,val-var (aref (the simple-array ,data-sym) current-ptr)))
-                    (declare (ignorable ,ptr-var ,val-var))
-                    ,@body)
-                  ;; 中间维度：循环并累加指针
-                  (let ((dim (svref ,dims-vec ,depth-sym))
-                        (stride (svref ,strs-vec ,depth-sym)))
-                    (loop for i from 0 below dim do
-                      (recurse (1+ ,depth-sym) current-ptr)
-                      (incf current-ptr stride))))))
-         (recurse 0 ,offset-sym)))))
-
-(defun vt-copy-into (dest src)
-  "将 src 的数据拷贝到 dest (支持广播和类型转换).
- src: 源张量或标量数字.
- dest: 目标张量视图.
- 注意：dest 不能是带有 0 步长的广播视图(维度>1且步长=0)，否则物理上无法写入不同数据。"
-  (setf src (ensure-vt src))  
-  (with-float-safe
-    (let ((dest-shape (vt-shape dest))
-          (src-shape (vt-shape src))) 
-      (loop for d in dest-shape
-            for s in (vt-strides dest)
-            when (and (> d 1) (zerop s))
-              do  (error "vt-copy-into: assignment destination is read-only: 无法对广播产生的视图 (含有大小为 ~a 的广播维度) 进行赋值。若需修改，请先对源张量进行操作或使用 (vt-copy) 生成独立副本。" d))
-      (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
-        (unless (equal final-shape dest-shape)
-          (error "copy-into 失败: dest 形状 ~a 无法容纳 src 广播后的形状 ~a"
-		 dest-shape final-shape))
-        (let* ((dest-data (vt-data dest))
-               (src-data (vt-data src))
-               (src-strides
-		 (vt-broadcast-strides
-		  src-shape dest-shape (vt-strides src)))
-               (dest-strides (vt-strides dest))
-               (dest-offset (vt-offset dest))
-               (src-offset (vt-offset src))
-               (rank (length dest-shape))
-               (element-type (array-element-type dest-data)))
-          
-          (labels ((recurse (depth d-ptr s-ptr)
-                     (declare (type fixnum depth d-ptr s-ptr))
-                     (if (= depth rank)
-                         (setf (aref dest-data d-ptr)
-			       (coerce (aref src-data s-ptr) element-type))
-                         (let ((dim (nth depth dest-shape))
-                               (d-stride (nth depth dest-strides))
-                               (s-stride (nth depth src-strides))
-                               (cur-d-ptr d-ptr)
-                               (cur-s-ptr s-ptr))
-                           (declare (type fixnum dim d-stride s-stride))
-                           (loop for i fixnum from 0 below dim do
-                             (recurse (1+ depth) cur-d-ptr cur-s-ptr)
-                             (incf cur-d-ptr d-stride)
-                             (incf cur-s-ptr s-stride))))))
-            (recurse 0 dest-offset src-offset))
-          dest)))))
-
-;; 快速类型转换
-(declaim (inline ensure-vt))
-(defun ensure-vt (obj &key (type nil))
-  (with-float-safe
-    (etypecase obj
-      (vt obj)
-      (number
-       (if (null type)
-	   (setf type
-		 (cond ((fixnump obj) 'fixnum)
-		       (t 'double-float))))
-       (%make-vt :data (make-array 1 :initial-element (coerce obj type)
-				     :element-type type)
-                 :shape nil
-		 :strides nil
-		 :offset 0
-		 :etype type))
-      (sequence
-       (if (null type)
-	   (let* ((data (vt-flatten-sequence obj)))
-	     (if (every #'fixnump data)
-		 (setf type 'fixnum)
-		 (setf type 'double-float))))       
-       (vt-from-sequence obj :type type)))))
 
 (declaim (inline vt-broadcast-shapes))
 (defun vt-broadcast-shapes (shape1 shape2)
@@ -1181,715 +1476,3 @@
                     (vt-offset ,t1)
                     (vt-offset ,t2)
                     (vt-offset ,result-vt)))))))
-
-(defun vt-map (fn &rest tensors)
-   "高效映射函数.
-  支持标量、列表、张量混合输入，并自动进行多维广播.
-  参数:
-    - fn: 映射函数。接受与输入张量数量相同的参数，返回单个标量值.
-    - &rest tensors: 一个或多个标量、列表或张量。内部会自动调用 ensure-vt 转换.
-  返回值:
-    - 结果张量。形状为所有输入张量广播后的最大形状.
-  核心特性与注意事项:
-    1. [动态类型提升] 杜绝静默截断与崩溃:
-       - 采用“首元素推断 + 运行时动态提升”策略。初始基于首元素推测为 fixnum 或 double-float.
-       - 在 fixnum 快速路径中，若某元素返回浮点数或大整数，会触发一次性动态提升，
-         将整个结果数组安全拷贝并转换为 double-float，彻底解决类型冲突导致的静默截断或崩溃.
-       - 若遇到非连续内存视图，全量拷贝逻辑亦能保证数据完整无缺.
-    2. [布尔语义] 自动安全降级:
-       - 若 fn 返回 t 或 nil，底层会自动将结果推断并提升为 double-float (存储 1.0/0.0).
-       - 避免了在纯数值数组中混入布尔值导致的类型错误.
-    3. [空张量推断] 无元素时的安全回退:
-       - 若输入总大小为 0 (空张量)，因无首元素可供试探，此时基于输入张量类型的提升规则 进行推断.
-    4. [极致性能优化]
-       - 支持标量、张量混合广播，底层通过统一的指针算术 驱动."
-  (declare (function fn) (optimize (safety 0)))
-  (with-float-safe
-    (let* ((clean-tensors (mapcar #'ensure-vt tensors))
-           (n-tensors (length clean-tensors)))
-      (when (= n-tensors 0)
-        (error "vt-map requires at least one tensor"))
-      
-      (let* ((out-shape (reduce #'vt-broadcast-shapes
-				(mapcar #'vt-shape clean-tensors)))
-             (rank (length out-shape))
-             (size (vt-shape-to-size out-shape))
-             (ins-data (map 'vector #'vt-data clean-tensors))
-             (ins-offs (map 'vector #'vt-offset clean-tensors))
-             (ins-strides
-	       (map 'vector (lambda (vt)
-			      (vt-broadcast-strides
-			       (vt-shape vt)
-			       out-shape
-			       (vt-strides vt)))
-		    clean-tensors))
-             (cur-ptrs (make-array n-tensors :element-type 'fixnum
-					     :initial-element 0)))
-        (declare (type (simple-array t (*)) ins-data)
-                 (type (simple-array t (*)) ins-strides)
-                 (type (simple-array fixnum (*)) cur-ptrs)
-                 (type list out-shape)
-                 (type fixnum rank n-tensors size))        
-        (loop for i fixnum from 0 below n-tensors do
-          (setf (aref cur-ptrs i) (aref ins-offs i)))
-        
-        ;; 阶段 1：冷路径 - 试探性推断累加器类型
-        (multiple-value-bind (effective-out-type is-boolean-fn)
-            (if (zerop size)
-                (let ((pt (apply #'vt-promote-type
-				 (mapcar #'vt-element-type clean-tensors))))
-                  (values (if (eq pt 'fixnum)
-			      'fixnum
-			      'double-float)
-			  nil))
-                (let* ((first-vals
-			 (loop for k fixnum from 0 below n-tensors
-                               collect
-			       (aref (the simple-array (aref ins-data k))
-				     (aref cur-ptrs k)))))
-                  (let ((first-result (apply fn first-vals)))
-                    (cond
-                      ((or (eq first-result t)
-			   (null first-result))
-		       (values 'double-float t))
-                      ((and (integerp first-result)
-			    (<= most-negative-fixnum
-				first-result
-				most-positive-fixnum))
-                       (values 'fixnum nil))
-                      (t (values 'double-float nil))))))          
-          (let* ((res (vt-zeros out-shape :type effective-out-type))
-                 (res-data (vt-data res))
-                 (res-strides (vt-strides res))
-                 ;; 追踪当前实际的存储类型
-                 (current-type effective-out-type))
-            
-            (declare (type (member fixnum double-float) current-type))
-            
-            ;; 阶段 2：热路径 - 统一遍历骨架
-            (macrolet
-		((gen-unified-loop (&body leaf-body)
-                   `(labels
-			((recurse (depth out-ptr)
-                           (declare (type fixnum depth out-ptr))
-                           (if (= depth rank)
-                               (progn ,@leaf-body)
-                               (let* ((dim (the fixnum (nth depth out-shape)))
-                                      (res-stride
-					(the fixnum (nth depth res-strides)))
-                                      (strides-at-depth
-					(loop for k fixnum from 0 below n-tensors
-                                              collect
-					      (the fixnum
-						   (nth depth (aref ins-strides k))))))
-                                 (declare (type fixnum dim res-stride)
-                                          (dynamic-extent strides-at-depth))
-                                 (loop for i fixnum from 0 below dim do
-                                   (recurse (1+ depth) out-ptr)
-                                   (incf out-ptr res-stride)
-                                   (loop for k fixnum from 0 below n-tensors
-                                         for s fixnum in strides-at-depth do
-                                           (incf (aref cur-ptrs k) s)))
-                                 ;; 指针回溯
-                                 (decf out-ptr (the fixnum (* dim res-stride)))
-                                 (loop for k fixnum from 0 below n-tensors
-                                       for s fixnum in strides-at-depth do
-                                         (decf (aref cur-ptrs k)
-					       (the fixnum (* dim s))))))))
-                      (recurse 0 0))))              
-              
-              (gen-unified-loop
-               (let ((raw-result
-                       ;; 1. 统一读取输入并计算
-                       (case n-tensors
-                         (1 (funcall
-			     fn
-			     (aref (the simple-array (aref ins-data 0))
-				   (aref cur-ptrs 0))))
-                         (2 (funcall
-			     fn 
-                             (aref (the simple-array (aref ins-data 0))
-				   (aref cur-ptrs 0))
-                             (aref (the simple-array (aref ins-data 1))
-				   (aref cur-ptrs 1))))
-                         (otherwise 
-                          (apply
-			   fn
-			   (loop for k fixnum from 0 below n-tensors
-                                 collect
-				 (aref (the simple-array (aref ins-data k))
-				       (aref cur-ptrs k))))))))                 
-                 
-                 ;; 2. 根据当前类型，将结果安全写入；遇到类型冲突时动态提升
-                 (if (eq current-type 'double-float)
-                     ;; 浮点热路径 (已被提升，或初始推断为浮点)
-                     (setf (aref (the (simple-array double-float (*)) res-data) out-ptr)
-                           (the double-float
-                                (if is-boolean-fn
-                                    (if raw-result 1.0d0 0.0d0)
-                                    (coerce raw-result 'double-float))))
-                     
-                     ;; 整数热路径 (乐观路径)
-                     (typecase raw-result
-                       (fixnum 
-                        (setf (aref (the (simple-array fixnum (*)) res-data) out-ptr) raw-result))
-                       (null   
-                        (setf (aref (the (simple-array fixnum (*)) res-data) out-ptr) 0))
-                       ((eql t)
-                        (setf (aref (the (simple-array fixnum (*)) res-data) out-ptr) 1))
-                       
-                       (t 
-                        ;; 触发动态提升！
-                        ;; 遇到浮点数、分数等非 fixnum 类型，立即升级整个结果数组
-                        (let ((new-data (make-array size :element-type 'double-float :initial-element 0.0d0)))
-                          ;; 拷贝之前所有数据。
-                          ;; 必须全量拷贝，因为张量可能是非连续视图，访问顺序是跳跃的！
-                          (loop for i fixnum from 0 below size do
-                            (setf (aref new-data i) 
-                                  (coerce (aref (the (simple-array fixnum (*)) res-data) i) 'double-float)))
-                          ;; 写入触发提升的当前元素
-                          (setf (aref new-data out-ptr)
-                                (coerce raw-result 'double-float))
-                          ;; 切换底层数组与状态标记
-                          (setf res-data new-data)
-                          (setf current-type 'double-float))))))))
-            
-            ;; 如果发生了动态提升，需将新数组绑定回结果张量
-            (unless (eq (vt-data res) res-data)
-              (setf (vt-data res) res-data)
-              (setf (vt-etype res) 'double-float))
-            res))))))
-
-(defun vt-ensure-shape-compatible (shape axis)
-  "检查 axis 是否合法. 支持负数轴."
-  (let* ((rank (length shape))
-         (real-axis (if (< axis 0) (+ rank axis) axis)))
-    (when (or (< real-axis 0) (>= real-axis rank))
-      (error "axis ~a 越界,张量秩为 ~a" axis rank))))
-
-(declaim (inline get-reduction-identity))
-(defun get-reduction-identity (op element-type)
-  "根据操作类型和元素类型,返回正确的初始值。
-   使用 ieee 无穷大作为浮点数归约初始值，以支持输入中的 inf。"
-  (with-float-safe
-    (case op
-      (:sum
-       (coerce 0 element-type))
-      (:max
-       (cond ((eq element-type 'double-float) 
-              ;; 使用负无穷大，而不是 most-negative-double-float
-              ;; 在 sbcl 中可直接访问
-              #+sbcl sb-ext:double-float-negative-infinity
-              ;; 非 sbcl 的兜底方案：生成一个负无穷大
-              #-sbcl (/ -1.0d0 0.0d0))
-             ((eq element-type 'fixnum) most-negative-fixnum)
-             ((eq element-type 'single-float)
-              #+sbcl sb-ext:single-float-negative-infinity
-              #-sbcl (/ -1.0f0 0.0f0))
-             (t 0)))
-      (:min
-       (cond ((eq element-type 'double-float)
-              ;; ：使用正无穷大
-              #+sbcl sb-ext:double-float-positive-infinity
-              #-sbcl (/ 1.0d0 0.0d0))
-             ((eq element-type 'fixnum) most-positive-fixnum)
-             ((eq element-type 'single-float)
-              #+sbcl sb-ext:single-float-positive-infinity
-              #-sbcl (/ 1.0f0 0.0f0))
-             (t 0))))))
-
-
-(declaim (inline vt-reduce))
-(defun vt-reduce
-    (tensor axis init-val reducer-fn &key return-arg keepdims)
-  "通用归约核心. 支持多维指定轴归约与全局归约.
-  参数:
-    - tensor: 输入张量.
-    - axis: 归约轴 (fixnum)。若为 nil，则进行全局归约.
-    - init-val: 累加器初始值。可为数值或 nil (常用于布尔归约).
-    - reducer-fn: 归约函数，签名 (acc val) => new-acc.
-    - :return-arg: 若为 t，则追踪并返回归约极值索引 (如 argmax/argmin).
-                   此时 reducer-fn 必须返回 (values new-acc update-flag).
-                   update-flag 为非 nil 时，将更新对应索引.
-    - :keepdims: 若为 t，归约后保留该轴为 1，否则移除该轴.
-  返回值:
-    - values (结果张量) (索引张量) : 若 :return-arg 为 t.
-    - 结果张量 : 若 :return-arg 为 nil.
-  核心特性与注意事项:
-    1. [动态类型提升] 杜绝静默截断:
-       - 若累加结果溢出 fixnum 范围，底层会自动将整个结果数组提升为 double-float。
-       - 若 init-val 传入浮点数，强制推断为 double-float 路径。
-       - 绝不会发生 fixnum 溢出导致的静默数据损坏。
-    2. [布尔语义] 累加器状态还原:
-       - 若 reducer-fn 返回 t 或 nil，底层会推断为布尔语义，并将结果张量提升为 double-float (存储 1.0/0.0).
-       - 底层将 1.0/0.0 传给下一次 reducer-fn 迭代前，会自动还原为 t/nil。
-         这避免了 lisp 中 '0.0 即为真' 的陷阱，确保用户的 (or acc ...) 等逻辑不会短路失效。
-    3. [nil 初始值] 安全处理:
-       - 允许 init-val 为 nil (常配合布尔归约使用).
-       - 底层在调用数值运算 (如 coerce, truncate) 前会进行短路保护，不会触发类型冲突警告或崩溃.
-    4. [空张量防御]:
-       - 归约轴大小为 0 或输入总大小为 0 时，安全返回初始化后的空张量，不会引发越界访问.
-    5. [性能优化]:
-       - 热路径采用宏展开消除递归冗余，使用 (safety 0) 优化.
-       - 冷路径仅执行一次试探性计算以推断累加器类型."
-  (declare (type vt tensor)
-           (type (or null fixnum) axis)
-           (type function reducer-fn)
-           (optimize (safety 0)))
-  (with-float-safe
-    (let* ((in-shape (vt-shape tensor))
-           (element-type (vt-element-type tensor))
-           (rank (length in-shape))
-	   (real-axis (vt-normalize-axis axis rank))
-           (is-global-reduction (null real-axis))
-	   (out-shape
-	     (cond
-               ((and is-global-reduction (not keepdims)) nil)
-               (is-global-reduction (make-list rank :initial-element 1))
-               ((not keepdims)
-		(loop for d in in-shape
-		      for i from 0
-		      unless (= i real-axis)
-			collect d))
-               (t (loop for d in in-shape
-			for i from 0
-			collect (if (= i real-axis) 1 d)))))
-	   (in-data (vt-data tensor))
-	   (in-strides (vt-strides tensor))
-	   (in-offset (vt-offset tensor))           
-	   (arg-strides
-	     (if return-arg 
-		 (if is-global-reduction
-		     (vt-compute-strides in-shape)
-		     (loop for i from 0 below rank
-			   if (= i real-axis) collect 1
-			     else collect 0))
-		 (make-list rank :initial-element 0)))
-	   (axis-size
-	     (if real-axis
-		 (the fixnum (nth real-axis in-shape))
-		 (the fixnum (reduce #'* in-shape :initial-value 1)))))      
-      (declare (type (simple-array * (*)) in-data)
-               (type list in-strides arg-strides in-shape))
-      
-      (when (zerop axis-size)
-	(let ((empty-result-val
-		(cond ((or (null init-val) (eq init-val 0))
-		       (coerce 0 element-type))
-                      ((and init-val (vt-float-inf-p init-val))
-		       +vt-float-nan+)
-                      (t (coerce init-val element-type)))))
-          (return-from vt-reduce
-            (values (make-vt out-shape empty-result-val :type element-type)
-                    (when return-arg (make-vt out-shape 0 :type 'fixnum))))))
-      
-      (when (zerop (vt-size tensor))
-	(return-from vt-reduce
-	  (values (make-vt out-shape 0 :type element-type)
-                  (when return-arg (make-vt out-shape 0 :type 'fixnum)))))
-      
-      ;; 阶段 1：冷路径 - 试探性推断累加器类型
-      (let* ((init-is-float (and init-val
-				 (or (floatp init-val)
-				     (vt-float-inf-p init-val))))
-             (first-val (aref in-data in-offset))
-             (first-result (funcall reducer-fn init-val first-val))
-	     (is-boolean-fn (or (eq first-result t) (null first-result)))
-             (effective-out-type
-               (cond
-		 (is-boolean-fn 'double-float)
-		 (init-is-float 'double-float)
-		 ((and (integerp first-result)
-                       (<= most-negative-fixnum first-result most-positive-fixnum))
-                  'fixnum)
-		 (t 'double-float)))
-             (safe-init-val
-               (if (eq effective-out-type 'fixnum)
-                   (let ((iv (or init-val 0))) ; 处理 nil
-                     (if (and (integerp iv)
-                              (<= most-negative-fixnum iv most-positive-fixnum))
-			 iv
-			 (truncate iv)))
-		   (if is-boolean-fn
-                       (if init-val 1.0d0 0.0d0)
-                       (if (vt-float-inf-p init-val)
-                           init-val
-                           (coerce (or init-val 0) 'double-float)))))) ; 处理 nil
-	(let* ((res (make-vt out-shape safe-init-val :type effective-out-type))
-               (res-data (vt-data res))
-               (res-offset (vt-offset res))           
-               (res-idx (when return-arg (make-vt out-shape 0 :type 'fixnum)))
-               (res-idx-data (when res-idx (vt-data res-idx)))
-               (out-strides-map
-		 (if is-global-reduction
-                     (make-list rank :initial-element 0)
-                     (loop for i from 0 below rank
-                           if (= i real-axis) collect 0
-                             else collect
-                                  (let ((out-idx (if keepdims
-						     i
-						     (if (< i real-axis)
-							 i
-							 (1- i)))))
-                                    (nth out-idx (vt-strides res)))))))
-          (declare (type (simple-array * (*)) res-data)
-                   (type list out-strides-map))
-          
-          (macrolet
-              ((gen-reduce (leaf-body)
-		 `(labels
-                      ((recurse (depth in-ptr out-ptr out-idx-ptr current-arg-val)
-			 (declare (type fixnum depth in-ptr out-ptr out-idx-ptr current-arg-val))
-			 (if (= depth rank)
-                             ,leaf-body
-                             (let* ((dim (nth depth in-shape))
-                                    (in-stride (nth depth in-strides))
-                                    (out-stride (nth depth out-strides-map))
-                                    (arg-stride (nth depth arg-strides)))
-                               (declare (type fixnum dim in-stride out-stride arg-stride))
-                               (loop for i fixnum from 0 below dim do
-				 (recurse (1+ depth) in-ptr out-ptr out-idx-ptr
-                                          (+ current-arg-val (* i arg-stride)))
-				 (incf in-ptr in-stride)
-				 (incf out-ptr out-stride)
-				 (when return-arg
-                                   (incf out-idx-ptr out-stride)))))))
-                    (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
-
-            (let ((current-type effective-out-type))
-              (declare (type (member fixnum double-float) current-type))
-              (gen-reduce
-               (let* ((val (aref (the simple-array in-data) in-ptr))
-                      (raw-acc (if (eq current-type 'double-float)
-                                   (aref (the (simple-array double-float (*)) res-data) out-ptr)
-                                   (aref (the (simple-array fixnum (*)) res-data) out-ptr)))
-                      ;; 如果 is-boolean-fn，必须将 1.0d0/0.0d0 还原为 t/nil 传给 lambda
-                      (acc-for-user (if is-boolean-fn (not (zerop raw-acc)) raw-acc)))
-		 
-		 (multiple-value-bind (new-acc do-update-idx)
-                     (funcall reducer-fn acc-for-user val)
-                   (if (eq current-type 'double-float)
-                       (setf (aref (the (simple-array double-float (*)) res-data) out-ptr)
-                             (the double-float
-                                  (if is-boolean-fn
-                                      (if new-acc 1.0d0 0.0d0)
-                                      (coerce new-acc 'double-float))))
-                       
-                       ;; fixnum 热路径
-                       (if (and (integerp new-acc)
-				(<= most-negative-fixnum new-acc most-positive-fixnum))
-                           (setf (aref (the (simple-array fixnum (*)) res-data) out-ptr) new-acc)
-                           ;; 触发动态提升
-                           (let ((new-data (make-array (length res-data)
-						       :element-type 'double-float :initial-element 0.0d0)))
-                             (loop for i fixnum from 0 below (length res-data) do
-                               (setf (aref new-data i)
-                                     (coerce (aref (the (simple-array fixnum (*)) res-data) i) 'double-float)))
-                             (setf res-data new-data)
-                             (setf current-type 'double-float)
-                             (setf (vt-etype res) 'double-float)
-                             (setf (aref (the (simple-array double-float (*)) res-data) out-ptr)
-                                   (coerce new-acc 'double-float)))))
-                   
-                   (when (and return-arg do-update-idx res-idx-data)
-                     (setf (aref (the (simple-array fixnum (*)) res-idx-data) out-idx-ptr)
-                           current-arg-val))))))
-            
-            (unless (eq (vt-data res) res-data)
-              (setf (vt-data res) res-data)
-	      (setf (vt-etype res) 'double-float)))
-          
-          (values res res-idx))))))
-
-(defun vt-matmul (a b)
-  "矩阵乘法，兼容 1d 向量（对标 numpy 的 @ 运算符）。"
-  (let ((ra (vt-order a))
-        (rb (vt-order b)))
-    (cond
-      ;; 2d @ 2d → 2d（矩阵乘法）
-      ((and (= ra 2) (= rb 2))
-       (if (and (equal (vt-element-type a) 'fixnum)
-		(equal (vt-element-type b) 'fixnum))
-	   (vt-einsum "ij,jk->ik" a b)
-	   (vt-matmul-df a b)))
-      ;; 1d @ 1d → 标量（内积）
-      ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b))
-      ;; 2d @ 1d → 1d（矩阵乘向量）
-      ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b))
-      ;; 1d @ 2d → 1d（向量乘矩阵）
-      ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b))
-      ;; >2d @ >2d → 批量矩阵乘法
-      (t (vt-einsum "...ij,...jk->...ik" a b)))))
-
-(defun vt-@ (vt1 vt2)
-  (vt-matmul vt1 vt2))
-
-(defun vt-= (t1 t2)
-  "逐元素相等比较. 支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe 
-    (vt-map (lambda (a b) (if (= a b) 1.0d0 0.0d0)) 
-            (ensure-vt t1) 
-            (ensure-vt t2))))
-
-(defun vt-/= (t1 t2)
-  "逐元素不相等比较. 支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe 
-    (vt-map (lambda (a b) (if (/= a b) 1.0d0 0.0d0)) 
-            (ensure-vt t1) 
-            (ensure-vt t2))))
-
-(defun vt-< (t1 t2)
-  "逐元素小于比较. 支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe 
-    (vt-map (lambda (a b) (if (< a b) 1.0d0 0.0d0)) 
-            (ensure-vt t1) 
-            (ensure-vt t2))))
-
-(defun vt-<= (t1 t2)
-  "逐元素小于等于比较. 支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe 
-    (vt-map (lambda (a b) (if (<= a b) 1.0d0 0.0d0)) 
-            (ensure-vt t1) 
-            (ensure-vt t2))))
-
-(defun vt-> (t1 t2)
-  "逐元素大于比较. 支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe 
-    (vt-map (lambda (a b) (if (> a b) 1.0d0 0.0d0)) 
-            (ensure-vt t1) 
-            (ensure-vt t2))))
-
-(defun vt->= (t1 t2)
-  "逐元素大于等于比较. 支持广播.返回布尔张量(1.0或0.0)."
-  (with-float-safe 
-    (vt-map (lambda (a b) (if (>= a b) 1.0d0 0.0d0)) 
-            (ensure-vt t1) 
-            (ensure-vt t2))))
-
-(defun vt-where (condition x y)
-  "三元条件选择，对标 pytorch 的 torch.where 和 numpy 的 np.where(cond, x, y)。
-   根据 condition 的元素真假，从 x 或 y 中选择对应元素组成新张量。
-   condition, x, y 会自动广播到同一形状。
-   注意：如需查找非零元素的索引，请使用 vt-nonzero"
-  (with-float-safe    
-    ;; 统一转换为张量
-    (setf condition (ensure-vt condition))
-    (setf x (ensure-vt x))
-    (setf y (ensure-vt y))
-    ;; 计算广播形状和步长
-    (let* ((target-shape (vt-broadcast-shapes
-			  (vt-shape condition)
-                          (vt-broadcast-shapes
-			   (vt-shape x)
-			   (vt-shape y))))
-	   (element-type (vt-promote-type (vt-element-type x)
-					  (vt-element-type y)))
-           (result (vt-zeros target-shape :type element-type))
-           (cond-strides
-	     (vt-broadcast-strides
-	      (vt-shape condition) target-shape (vt-strides condition)))
-           (x-strides (vt-broadcast-strides
-		       (vt-shape x) target-shape (vt-strides x)))
-           (y-strides (vt-broadcast-strides
-		       (vt-shape y) target-shape (vt-strides y)))
-           (res-strides (vt-strides result))
-           (rank (length target-shape)))
-      
-      (labels
-	  ((recurse (depth c-ptr x-ptr y-ptr r-ptr)
-             (if (= depth rank)
-		 ;; 叶节点：根据 condition 决定取 x 还是 y
-		 (setf (aref (vt-data result) r-ptr)
-                       (coerce (if (/= (aref (vt-data condition) c-ptr)
-				       0.0d0)
-                                   (aref (vt-data x) x-ptr)
-                                   (aref (vt-data y) y-ptr))
-                               element-type))
-		 ;; 分支节点：递归遍历
-		 (let ((dim (nth depth target-shape))
-                       (c-stride (nth depth cond-strides))
-                       (x-stride (nth depth x-strides))
-                       (y-stride (nth depth y-strides))
-                       (r-stride (nth depth res-strides)))
-                   (loop for i fixnum from 0 below dim do
-                     (recurse (1+ depth)
-                              (+ c-ptr (* i c-stride))
-                              (+ x-ptr (* i x-stride))
-                              (+ y-ptr (* i y-stride))
-                              (+ r-ptr (* i r-stride))))))))
-	(recurse 0
-		 (vt-offset condition)
-		 (vt-offset x)
-		 (vt-offset y)
-		 (vt-offset result)))
-      result)))
-
-(defun vt-argwhere (condition)
-  "查找非零元素的坐标.
-condition: 条件张量.
-返回: 形状为 (n, rank) 的二维张量,每一行是一个非零元素的完整坐标.
-示例: (vt-argwhere tensor) -> [[0, 1], [2, 3], ...]
-
-注意 (对标 pytorch/numpy):
-如果输入是 0 维张量 (标量), rank 为 0。
-- 若标量非零: 返回形状为 (1, 0) 的张量 (表示找到 1 个结果, 但坐标维度为 0, data 长度为 0)。
-- 若标量为零: 返回形状为 (0, 0) 的张量。"
-  (declare (type vt condition))
-  (with-float-safe
-    (let* ((in-shape (vt-shape condition))
-           (rank (length in-shape))
-           (in-data (vt-data condition))
-           (in-strides (vt-strides condition))
-           (in-offset (vt-offset condition))
-           (result-indices (make-array 0 :element-type 'fixnum
-					 :fill-pointer t :adjustable t))
-           (coord-buffer (make-array rank :element-type 'fixnum)))
-
-      ;; 宏定义：处理 0 维张量时，通过推入占位符记录命中次数
-      (macrolet
-	  ((gen-recurse (test-fn)
-             `(labels
-		  ((recurse (depth current-ptr)
-                     (declare (type fixnum depth current-ptr))
-                     (if (= depth rank)
-                         ;; 安全地调用传入的测试逻辑
-                         (when (funcall ,test-fn in-data current-ptr)
-                           (if (zerop rank)
-                               ;; 0维张量匹配时，推入占位符使 count 计算为 1
-                               (vector-push-extend 0 result-indices)
-                               (loop for c across coord-buffer do 
-                                 (vector-push-extend c result-indices))))
-                         (let ((dim (nth depth in-shape))
-                               (stride (nth depth in-strides)))
-                           (declare (type fixnum dim stride))
-                           (loop for i fixnum from 0 below dim
-                                 do (setf (aref coord-buffer depth) i)
-                                    (recurse (1+ depth)
-					     (+ current-ptr (* i stride))))))))
-                (recurse 0 in-offset))))
-        
-        ;; 冷路径：根据真实数组类型派发
-        (etypecase in-data
-          ((simple-array double-float (*))
-           (gen-recurse
-	    (lambda (data ptr)
-              (declare (type (simple-array double-float (*)) data)
-		       (type fixnum ptr))
-              (/= (aref data ptr) 0.0d0))))
-          ((simple-array fixnum (*))
-           (gen-recurse
-	    (lambda (data ptr)
-              (declare (type (simple-array fixnum (*)) data)
-		       (type fixnum ptr))
-              (/= (the fixnum (aref data ptr)) 0))))
-          ((simple-array single-float (*))
-           (gen-recurse
-	    (lambda (data ptr)
-              (declare (type (simple-array single-float (*)) data)
-		       (type fixnum ptr))
-              (/= (aref data ptr) 0.0f0)))))
-        ;; 结果封装逻辑
-        (let* ((total-indices (length result-indices))
-               ;; 当 rank=0 时，count 直接等于 total-indices (非零时为1，为零时为0)
-               (count (if (zerop rank)
-			  total-indices
-			  (floor total-indices rank))))
-          (cond 
-            ;; 情况 a：完全没有匹配
-            ((zerop count)
-             (vt-zeros (list 0 rank) :type 'fixnum)) ; 标量返回 (0, 0)，多维返回 (0, rank)
-            ;; 情况 b：有匹配，且 rank > 0（常规情况）
-            ((> rank 0)
-             (let ((final-data (make-array total-indices :element-type 'fixnum)))
-               (loop for i from 0 below total-indices
-                     for idx across result-indices
-                     do (setf (aref final-data i) idx))
-               (%make-vt :data final-data 
-                         :shape (list count rank) 
-                         :strides (list rank 1) 
-                         :offset 0 
-                         :etype 'fixnum)))            
-            ;; 情况 c：有匹配，且 rank = 0（标量非零）
-            ;; 完美对标 pytorch: 返回 (1, 0) 形状，data 长度为 0 满足底层不变量
-            (t 
-             (%make-vt :data (make-array 0 :element-type 'fixnum) ; 空数据
-                       :shape (list count 0)                       ; 形状 (1, 0)
-                       :strides (list 0 1) 
-                       :offset 0 
-                       :etype 'fixnum))))))))
-
-
-;;;; 关于nan的相关定义
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun vt-float-nan ()
-    (with-float-safe
-      (/ 0.0d0 0.0d0)))
-
-  (defun vt-float-nan-p (x)
-    (sb-kernel::float-nan-p (coerce x 'double-float)))
-
-  (defun vt-float-nan-= (nan-a nan-b)
-    (with-float-safe
-      (and (vt-float-nan-p nan-a) (vt-float-nan-p nan-b))))
-
-  (defun vt-float-pos-inf ()
-    (with-float-safe
-      (* sb-kernel::double-float-positive-infinity 2.0d0)))
-
-  (defun vt-float-neg-inf ()
-    (with-float-safe
-      (* sb-kernel::double-float-negative-infinity 2.0d0)))
-
-  (defun vt-float-inf-p (x)
-    (sb-kernel::float-infinity-p (coerce x 'double-float)))
-
-  (defun vt-float-inf-= (inf-a inf-b)
-    (with-float-safe
-      (= inf-a inf-b)))
-  
-  (defun vt-float-nan-inf-= (a b)
-    (cond
-      ((and (vt-float-nan-p a) (vt-float-nan-p b)) t)  ; 两个nan视为相等
-      ((or (vt-float-nan-p a) (vt-float-nan-p b)) nil) ; 一个nan一个非nan不相等
-      (t (= a b)))))
-
-(defconstant +vt-float-nan+
-  (load-time-value (vt-float-nan)))
-
-(defconstant +vt-float-pos-inf+
-  (load-time-value (vt-float-pos-inf)))
-
-(defconstant +vt-float-neg-inf+
-  (load-time-value (vt-float-neg-inf)))
-
-(defun vt-numpy-sort (sequence &optional (predicate #'<))
-  "对实数序列（列表或可转为列表的向量）进行排序(默认升序)。  
-  nan 处理语义（严格对标 numpy）：
-  - 升序 (#'<)：有限数升序排列，nan 放在末尾。
-  - 降序 (#'>)：等价于 numpy 的 np.sort(arr)[::-1]。
-    由于是对升序结果进行整体反转，nan 会出现在开头。
-  保持多个 nan 的原始相对顺序。返回新列表。"
-  (declare (type (or list vector) sequence))
-  (assert (or (eq predicate #'<) (eq predicate '<)
-              (eq predicate #'>) (eq predicate '>)))
-  (with-float-safe
-    (let ((sequence (coerce sequence 'list)) ; 统一为列表
-          non-nans nans)
-      ;; 分离 nan 和非 nan，按原始顺序
-      (dolist (x sequence (setq non-nans (nreverse non-nans)
-                                nans (nreverse nans)))
-        (if (vt-float-nan-p x)
-            (push x nans)
-            (push x non-nans)))
-      ;; 只在有限数（含 inf）上做标准稳定排序
-      (setq non-nans (stable-sort non-nans predicate))
-      ;; 拼接逻辑：
-      ;; 对标 numpy 行为，numpy 的降序是通过升序后反转 [::-1] 实现的，
-      ;; 因此降序时 nan 会被反转到开头。
-      (cond 
-        ;; 升序：有限数在前，nan 在后
-        ((or (eq predicate #'<) (eq predicate '<)) 
-         (append non-nans nans))
-        ;; 降序：对标 numpy 的 [::-1] 反转，nan 在前，有限数降序在后
-        ((or (eq predicate #'>) (eq predicate '>)) 
-         (append nans non-nans))))))

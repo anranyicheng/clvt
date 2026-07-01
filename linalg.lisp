@@ -1,9 +1,8 @@
 (in-package :clvt)
-;;; 1. 基础操作
 
-(defun vt-dot (a b) 
+(defun vt-dot (a b &key dtype out) 
   "点积/内积，支持任意维度： 
-   - 若 a,b 均为 1d → 向量内积，返回数字。 
+   - 若 a,b 均为 1d → 向量内积，返回 0 维张量。 
    - 若 a 为 2d, b 为 1d → 矩阵乘向量，返回 1d 向量。 
    - 若 a 为 1d, b 为 2d → 向量乘矩阵，返回 1d 向量。 
    - 若 a,b 均为 2d → 矩阵乘法 a @ b。 
@@ -12,88 +11,89 @@
   (with-float-safe
     (let ((ra (length (vt-shape (ensure-vt a)))) 
           (rb (length (vt-shape (ensure-vt b)))))
-      (cond ((and (= ra 0) (= rb 0)) (vt-* a b))
-	    ((and (= ra 1) (= rb 1)) (vt-einsum "i,i->" a b)) 
-            ;; === 新增以下两个分支 ===
-            ((and (= ra 2) (= rb 1)) (vt-einsum "ij,j->i" a b)) 
-            ((and (= ra 1) (= rb 2)) (vt-einsum "i,ij->j" a b)) 
-            ;; ==========================
-            ((and (= ra 2) (= rb 2)) (vt-einsum "ij,jk->ik" a b)) 
-            ((and (>= ra 2) (>= rb 2)) (vt-einsum "...ij,...jk->...ik" a b)) 
+      (cond ((and (= ra 0) (= rb 0)) 
+             (vt-* a b :dtype dtype :out out))
+            ((and (= ra 1) (= rb 1)) 
+             (vt-einsum "i,i->" a b :dtype dtype :out out)) 
+            ((and (= ra 2) (= rb 1)) 
+             (vt-einsum "ij,j->i" a b :dtype dtype :out out)) 
+            ((and (= ra 1) (= rb 2)) 
+             (vt-einsum "i,ij->j" a b :dtype dtype :out out)) 
+            ((and (= ra 2) (= rb 2)) 
+             (vt-einsum "ij,jk->ik" a b :dtype dtype :out out)) 
+            ((and (>= ra 2) (>= rb 2)) 
+             (vt-einsum "...ij,...jk->...ik" a b :dtype dtype :out out)) 
             (t (error "vt-dot: unsupported dimensions (a: ~d, b: ~d).
-                     use vt-einsum directly." ra rb))))))
+                      use vt-einsum directly." ra rb))))))
 
-(defun vt-outer (a b &key (flatten t))
-   "计算张量外积。
+(defun vt-outer (a b &key (flatten t) dtype out)
+  "计算张量外积。
   flatten = t (默认):
     先将输入展平为一维向量，再计算外积，返回二维矩阵。
     完全兼容 numpy 的 outer 函数 (支持任意维度输入自动展平)。
-    例如：标量 3 和 4 -> shape (1, 1)；2d 和 3d -> shape (size_a, size_b)。
   flatten = nil:
     保留输入的每个轴，将所有轴拼接形成新张量。
-    例如：2d 与 3d 计算后得到 5d 张量；若包含标量(0维)，则直接广播相乘。
-    注：此模式通过在维度末尾/开头补 1 并利用广播乘法实现，无法用单一的标准 einsum 字符串直接表达。"
+    例如：2d 与 3d 计算后得到 5d 张量；若包含标量(0维)，则直接广播相乘。"
   (with-float-safe
     (let* ((a-vt (ensure-vt a))
            (b-vt (ensure-vt b))
            (shape-a (vt-shape a-vt))
            (shape-b (vt-shape b-vt)))
-      
       (if flatten
-          ;; flatten = t: 完全对标 np.outer，输出必定为 2D 矩阵
           (let ((1d-a (if (null shape-a) 
                           (vt-reshape a-vt '(1)) 
                           (vt-flatten a-vt)))
                 (1d-b (if (null shape-b) 
                           (vt-reshape b-vt '(1)) 
                           (vt-flatten b-vt))))
-            (vt-einsum "i,j->ij" 1d-a 1d-b))          
-          ;; flatten = nil: 保留原轴拼接 (纯数学张量外积)
+            (vt-einsum "i,j->ij" 1d-a 1d-b :dtype dtype :out out))          
           (if (or (null shape-a) (null shape-b))
-              ;; 只要包含标量，直接广播相乘
-              (vt-* a-vt b-vt)
-              ;; 均为非标量时，通过补 1 广播拼接所有轴
+              (vt-* a-vt b-vt :dtype dtype :out out)
               (let* ((rank-a (length shape-a))
                      (rank-b (length shape-b))
                      (a-reshaped
-		       (vt-reshape
-			a-vt
-			(append shape-a
-				(make-list rank-b :initial-element 1))))
+                       (vt-reshape a-vt
+                                   (append shape-a
+                                           (make-list rank-b 
+                                                      :initial-element 1))))
                      (b-reshaped
-		       (vt-reshape
-			b-vt
-			(append (make-list rank-a :initial-element 1)
-				shape-b))))
-                (vt-* a-reshaped b-reshaped)))))))
+                       (vt-reshape b-vt
+                                   (append (make-list rank-a 
+                                                      :initial-element 1)
+                                           shape-b))))
+                (vt-* a-reshaped b-reshaped :dtype dtype :out out)))))))
 
 
-(defun vt-trace (matrix)
+(defun vt-trace (matrix &key dtype out)
   "矩阵迹: 对角线元素之和"
   (with-float-safe
-    (vt-sum (vt-diagonal matrix))))
+    (vt-sum (vt-diagonal matrix) :dtype dtype :out out)))
 
-(defun vt-norm (vt &key (axis nil))
-  "l2 范数 (欧几里得范数)"
+(defun vt-norm (vt &key axis keepdims dtype out)
+  "l2 范数 (欧几里得范数)
+   优化: 如果提供 out，求和与开方将原地执行，零临时内存分配。"
   (with-float-safe
     (let ((sq (vt-square vt)))
       (if axis
-          (vt-sqrt (vt-sum sq :axis axis))
-          (vt-sqrt (vt-sum sq))))))
+          (let ((sum-res (vt-sum sq :axis axis :keepdims keepdims
+                                 :dtype dtype :out out)))
+            (vt-sqrt sum-res :dtype (vt-dtype sum-res) :out sum-res))
+          (let ((sum-res (vt-sum sq :dtype dtype :out out)))
+            (vt-sqrt sum-res :dtype (vt-dtype sum-res) :out sum-res))))))
 
-(defun vt-l1-norm (vt &key (axis nil))
+(defun vt-l1-norm (vt &key axis keepdims dtype out)
   "l1 范数"
   (with-float-safe
-    (if axis
-	(vt-sum (vt-abs vt) :axis axis)
-	(vt-sum (vt-abs vt)))))
+    (vt-sum (vt-abs vt) :axis axis :keepdims keepdims
+            :dtype dtype :out out)))
 
-(defun vt-frobenius-norm (matrix)
+(defun vt-frobenius-norm (matrix &key dtype out)
   "frobenius 范数 (专用于矩阵)"
   (with-float-safe
-    (vt-norm matrix)))
+    (vt-norm matrix :dtype dtype :out out)))
 
-;;; 2. 方程求解与矩阵分析
+
+;;; 方程求解与矩阵分析
 
 (defun ensure-contiguous-2d-vt (vt)
   "确保矩阵在内存中是连续的."
@@ -106,7 +106,8 @@
 (defun vt-lu (matrix)
   "lu 分解。返回 (p, l, u)，其中 p 为置换矩阵(由行交换向量表示)"
   (with-float-safe
-    (let* ((a (ensure-contiguous-2d-vt (vt-astype matrix 'double-float)))
+    (let* ((a (ensure-contiguous-2d-vt
+	       (vt-astype matrix :float64)))
            (n (first (vt-shape a)))
            (data (vt-data a))
            (s0 (first (vt-strides a))) ; 行步长
@@ -145,31 +146,33 @@
 					   (* multiplier (aref data ptr-kj))))))))
       (values a piv sign))))
 
-(defun vt-det (matrix)
+(defun vt-det (matrix &key out)
   "基于 lu 分解计算行列式，返回 0 维张量"
   (with-float-safe
-    (multiple-value-bind (lu piv sign) (vt-lu matrix)
+    (multiple-value-bind (lu piv sign)
+	(vt-lu matrix)
       (declare (ignore piv))
       (let* ((n (first (vt-shape lu)))
              (data (vt-data lu))
              (s0 (first (vt-strides lu)))
-             (s1 (second (vt-strides lu))) 
-             (off (vt-offset lu))          
-             (det sign))                   
+             (s1 (second (vt-strides lu)))
+             (off (vt-offset lu))
+             (det sign))
         (loop for i from 0 below n
               for pivot = (aref data (+ off
 					(* i s0)
 					(* i s1)))
               when (zerop pivot)
-                ;; 遇到零主元，说明是奇异矩阵，行列式为 0，包装为 0 维张量返回
                 do (return-from vt-det
-		     (make-vt nil 0.0d0 :type 'double-float))
+                     (if out
+                         (vt-fill out 0.0d0)
+                         (make-vt nil 0.0d0 :dtype :float64)))
               do (setf det (* det pivot)))
-        ;; 将最终标量结果包装为 0 维张量
-        (make-vt nil det :type 'double-float)))))
+        (if out
+            (vt-fill out det)
+            (make-vt nil det :dtype :float64))))))
 
-
-(defun vt-solve (a b)
+(defun vt-solve (a b &key out)
   "求解线性方程组 ax = b (支持多右端项)"
   (with-float-safe
     (let* ((a (ensure-contiguous-2d-vt a))
@@ -178,9 +181,9 @@
            (b-shape (vt-shape b-vt))
            (nrhs (if (> (length b-shape) 1) (second b-shape) 1))
            (b-copy (if (= nrhs 1)
-                       (vt-reshape (vt-astype (vt-copy b-vt) 'double-float)
+                       (vt-reshape (vt-astype (vt-copy b-vt) :float64)
 				   (list n 1))
-                       (vt-astype (vt-copy b-vt) 'double-float)))
+                       (vt-astype (vt-copy b-vt) :float64)))
            (orig-b (vt-copy b-copy)))
       (multiple-value-bind (lu piv sign)
           (vt-lu a)
@@ -246,15 +249,18 @@
                             (* factor (aref b-data (+ b-off
 						      (* k b-s0)
 						      (* j b-s1)))))))))
-          (if (= nrhs 1)
-              (vt-reshape b-copy (list n))
-              b-copy))))))
+	  (let ((res (if (= nrhs 1)
+                         (vt-reshape b-copy (list n))
+                         b-copy)))
+            (if out
+                (vt-map #'identity res :out out)
+                res)))))))
 
 (defun vt-inv (matrix)
   "矩阵求逆。"
   (with-float-safe
     (let* ((n (first (vt-shape matrix)))
-           (identity (vt-eye n :type (vt-element-type matrix))))
+           (identity (vt-eye n :dtype (vt-dtype matrix))))
       (vt-solve matrix identity))))
 
 
@@ -268,15 +274,15 @@
    返回 (values q r)。"
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
-    (let* ((m (first (vt-shape matrix)))
-           (n (second (vt-shape matrix)))
-           (k (min m n))
-           (r (vt-astype matrix 'double-float))
+    (let* ((row (first (vt-shape matrix)))
+           (col (second (vt-shape matrix)))
+           (k (min row col))
+           (r (vt-astype matrix :float64))
            (vlist (make-array k :initial-element nil))
            (betas (make-array k :element-type 'double-float)))
       ;; ---- 1. 正向分解，更新 r ----
       (loop for i from 0 below k
-            for x = (vt-slice r (list i m) (list i))
+            for x = (vt-slice r (list i row) (list i))
 	    ;; 第 i 列，i 行开始，形状 (m-i)
             do (if (<= (vt-size x) 1)
                    (setf (aref betas i) 0.0d0)
@@ -286,31 +292,31 @@
                      (setf (aref vlist i) v
                            (aref betas i) beta)
                      ;; 对子矩阵 r(i:m , i:n) 应用反射
-                     (let ((subr (vt-slice r (list i m) (list i n))))
+                     (let ((subr (vt-slice r (list i row) (list i col))))
                        (let* ((w (vt-einsum "i,ij->j" v subr))
 			      ;; 长度 (n-i)
 			      (wsize (vt-size w))
 			      (vcol (vt-reshape v (list (vt-size v) 1)))
 			      (wrow (vt-reshape w (list 1 wsize)))
 			      (update (vt-outer vcol wrow)))
-			 (setf (vt-slice r (list i m) (list i n))
+			 (setf (vt-slice r (list i row) (list i col))
                                (vt-- subr (vt-scale update beta))))))))
       ;; ---- 2. 反向累积 q (必须从 k-1 到 0) ----
       (let* ((need-full (eq mode :full))
              (q (if need-full
-                    (vt-eye m :m m :type 'double-float)
-                    (vt-eye m :m k :type 'double-float))))
+                    (vt-eye row :cols row  :dtype :float64)
+                    (vt-eye row :cols col :dtype :float64))))
 	(loop for i from (1- k) downto 0  ;; 反向循环
               for beta = (aref betas i)
               for v = (aref vlist i)
               when (and v (> beta 0.0d0))
-		do (let ((qsub (vt-slice q (list i m) '(:all))))
+		do (let ((qsub (vt-slice q (list i row) '(:all))))
                      (let* ((w (vt-einsum "i,ij->j" v qsub))
 			    (wsize (vt-size w))
                             (vcol (vt-reshape v (list (vt-size v) 1)))
                             (wrow (vt-reshape w (list 1 wsize)))
                             (update (vt-outer vcol wrow)))
-                       (setf (vt-slice q (list i m) '(:all))
+                       (setf (vt-slice q (list i row) '(:all))
                              (vt-- qsub (vt-scale update beta))))))
 	(values q (if need-full
                       r
@@ -359,7 +365,7 @@
     (let* ((m (first (vt-shape matrix)))
            (n (second (vt-shape matrix)))
            ;; 复制一份，避免破坏原矩阵
-           (a (vt-astype matrix 'double-float))
+           (a (vt-astype matrix :float64))
            (a-data (vt-data a))
            (a-offset (vt-offset a))
            (s0 (first (vt-strides a))) ; 行步长
@@ -421,7 +427,7 @@
            (k (second (vt-shape u-econ)))
            (extra (- m k)))
       (if (zerop extra) u-econ
-          (let ((u-full (vt-zeros (list m m) :type 'double-float)))
+          (let ((u-full (vt-zeros (list m m) :dtype :float64)))
             (dotimes (i k)
               (setf (vt-slice u-full '(:all) (list i))
                     (vt-slice u-econ '(:all) (list i))))
@@ -457,12 +463,12 @@
       (when (and (= m 1) (= n 1))
         (let ((val (aref (vt-data mat) 0)))
           (return-from vt-svd
-            (values (vt-const '(1 1) 1.0d0 :type 'double-float)
-                    (vt-const '(1) (abs val) :type 'double-float)
-                    (if (>= val 0) (vt-ones '(1 1) :type 'double-float)
-                        (vt-const '(1 1) -1.0d0 :type 'double-float))))))
+            (values (vt-const '(1 1) 1.0d0 :dtype :float64)
+                    (vt-const '(1) (abs val) :dtype :float64)
+                    (if (>= val 0) (vt-ones '(1 1) :dtype :float64)
+                        (vt-const '(1 1) -1.0d0 :dtype :float64))))))
       (let* ((u (vt-copy mat))
-             (v (vt-eye n :type 'double-float))
+             (v (vt-eye n :dtype :float64))
              (changed t)
              (sweep 0))
         (let ((u-data (vt-data u))
@@ -518,7 +524,7 @@
                               (setf (aref v-data ptr-j) (+ (* vi s) (* vj c))))))))
               (incf sweep))
             (let* ((s-vec (make-array k :element-type 'double-float))
-                   (u-k (vt-zeros (list m k) :type 'double-float))
+                   (u-k (vt-zeros (list m k) :dtype :float64))
                    (pairs (sort (loop for col from 0 below n
                                       collect (cons (sqrt (col-norm-sq col)) col))
                                 #'> :key #'car)))
@@ -544,7 +550,7 @@
                     (let ((inv (/ 1.0d0 (aref s-vec i))))
                       (setf (vt-slice u-k '(:all) (list i))
                             (vt-scale (vt-slice u-k '(:all) (list i)) inv)))))
-              (let* ((v-sorted (vt-zeros (list n n) :type 'double-float))
+              (let* ((v-sorted (vt-zeros (list n n) :dtype :float64))
                      (used-cols nil))
                 (dotimes (new-i k)
                   (let ((old-col (cdr (nth new-i pairs))))
@@ -556,7 +562,7 @@
                   (loop for offset from 0 for col in rest-cols do
                     (setf (vt-slice v-sorted '(:all) (list (+ k offset)))
                           (vt-slice v '(:all) (list col)))))
-                (let ((s-vt (vt-from-sequence (coerce s-vec 'list) :type 'double-float))
+                (let ((s-vt (vt-from-sequence (coerce s-vec 'list) :dtype :float64))
                       (vt (vt-transpose v-sorted)))
                   (if (not full-matrices)
                       (let ((vt-k (vt-slice vt (list 0 k) '(:all))))
