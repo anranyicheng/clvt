@@ -456,7 +456,7 @@
   tol : 收敛容差"
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
-    (let* ((mat (vt-astype matrix 'double-float))
+    (let* ((mat (vt-astype matrix :float64))
            (m (first (vt-shape mat)))
            (n (second (vt-shape mat)))
            (k (min m n)))
