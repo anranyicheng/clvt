@@ -1,19 +1,18 @@
 # clvt
 clvt (common lisp vector tensor) library.
-这是一个纯 common lisp 语言编写的张量库，是使用'智谱清言'AI(GLM5.1)和'DeepSeek'(v4pro) AI共同编写，目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。虽然 lisp 社区拥有 magicl 和 numcl 这两个比较流行的库，但是 magicl 缺乏对高维张量的支持以及缺少一些重要的函数，numcl 注重类型推理并且一些函数接口和CL语言标准重合。clvt 这库的核心基础是 vt-einsum，vt-map, vt-reduce 三个函数, 其余操作大多数都是基于这三个核心函数组合完成，易于理解，同时这个库有完美的打印输出功能。目前这个库已经实现了许多张量的基础操作，未来将进一步完善，目标是尽可能实现 numpy 众多功能, 部分函数功能向pytorch看齐。这个库的函数都是以 vt- 开头，配合 slime 一起使用非常方便，易于查看已经实现了哪些函数。目前在sbcl上完成了大部分的测试。
+这是一个纯 common lisp 语言编写的张量库，是使用'智谱清言'AI(GLM5+)和'DeepSeek'(v4pro) AI共同编写，目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。虽然 lisp 社区拥有 magicl 和 numcl 这两个比较流行的库，但是 magicl 缺乏对高维张量的支持以及缺少一些重要的函数，numcl 注重类型推理并且一些函数接口和CL语言标准重合。clvt 这库的核心基础是 vt-einsum，vt-map, vt-reduce 三个函数, 其余操作大多数都是基于这三个核心函数组合完成，易于理解，同时这个库有完美的打印输出功能。目前这个库已经实现了许多张量的基础操作，未来将进一步完善，目标是尽可能实现 numpy 众多功能, 部分函数功能向pytorch看齐。这个库的函数都是以 vt- 开头，配合 slime 一起使用非常方便，易于查看已经实现了哪些函数。目前在sbcl上完成了大部分的测试。
 
-This is a tensor library written entirely in Common Lisp, collaboratively developed by the AI 'Zhipu Qingyan' (GLM5.1) and 'DeepSeek' (v4pro). The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community already has two relatively popular libraries, magicl and numcl, magicl lacks support for high-dimensional tensors and some important functions, while numcl emphasizes type inference and has some function interfaces that overlap with standard CL functions. The core foundation of the clvt library consists of three functions: vt-einsum, vt-map, and vt-reduce. Most other operations are built by combining these three core functions, making them easy to understand. Additionally, this library features excellent pretty-printing capabilities. Currently, the library has already implemented many basic tensor operations, and further improvements will be made in the future, aiming to implement as many NumPy features as possible, with some functions modeled after PyTorch. Functions in this library are all prefixed with vt-, which, when used with Slime, makes it very convenient to see which functions have been implemented. The majority of tests have been completed on SBCL.
+This is a tensor library written entirely in Common Lisp, collaboratively developed by the AI 'Zhipu Qingyan' (GLM5+) and 'DeepSeek' (v4pro). The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community already has two relatively popular libraries, magicl and numcl, magicl lacks support for high-dimensional tensors and some important functions, while numcl emphasizes type inference and has some function interfaces that overlap with standard CL functions. The core foundation of the clvt library consists of three functions: vt-einsum, vt-map, and vt-reduce. Most other operations are built by combining these three core functions, making them easy to understand. Additionally, this library features excellent pretty-printing capabilities. Currently, the library has already implemented many basic tensor operations, and further improvements will be made in the future, aiming to implement as many NumPy features as possible, with some functions modeled after PyTorch. Functions in this library are all prefixed with vt-, which, when used with Slime, makes it very convenient to see which functions have been implemented. The majority of tests have been completed on SBCL.
 
 clvt 举例:
 ``` commmon lisp
-
-CLVT> (defparameter *m* (vt-arange 27 :start 0 :step 1 :type 'fixnum))
+CLVT> (defparameter *m* (vt-arange 27 :start 0 :step 1 :dtype :int32))
 *M*
 CLVT> *m*
-#<VT shape:(27) dtype:FIXNUM 
-  [ 0,  1,  2,  3, ..., 23, 24, 25, 26]>
+#<VT shape:(27) dtype:(SIGNED-BYTE 32) 
+  [ 0,  1,  2, ..., 24, 25, 26]>
 CLVT> (setf *m* (vt-reshape *m* '(3 3 3)))
-#<VT shape:(3 3 3) dtype:FIXNUM 
+#<VT shape:(3 3 3) dtype:(SIGNED-BYTE 32) 
   [[[  0,   1,   2],
     [  3,   4,   5],
     [  6,   7,   8]],
@@ -24,26 +23,26 @@ CLVT> (setf *m* (vt-reshape *m* '(3 3 3)))
     [ 21,  22,  23],
     [ 24,  25,  26]]]>
 CLVT> (vt-amax *m*)
-#<VT shape:NIL dtype:FIXNUM 26>
+#<VT shape:NIL dtype:(SIGNED-BYTE 32) 26>
 CLVT> (vt-amax *m* :axis 0)
-#<VT shape:(3 3) dtype:FIXNUM 
+#<VT shape:(3 3) dtype:(SIGNED-BYTE 32) 
   [[ 18,  19,  20],
    [ 21,  22,  23],
    [ 24,  25,  26]]>
 CLVT> (vt-argmin *m* :axis 0)
-#<VT shape:(3 3) dtype:FIXNUM 
+#<VT shape:(3 3) dtype:(SIGNED-BYTE 32) 
   [[ 0,  0,  0],
    [ 0,  0,  0],
    [ 0,  0,  0]]>
 CLVT> (vt-sum *m*)
-#<VT shape:NIL dtype:FIXNUM 351>
+#<VT shape:NIL dtype:(SIGNED-BYTE 32) 351>
 CLVT> (vt-sum *m* :axis 0)
-#<VT shape:(3 3) dtype:FIXNUM 
+#<VT shape:(3 3) dtype:(SIGNED-BYTE 32) 
   [[ 27,  30,  33],
    [ 36,  39,  42],
    [ 45,  48,  51]]>
 CLVT> (vt-+ *m* 5)
-#<VT shape:(3 3 3) dtype:FIXNUM 
+#<VT shape:(3 3 3) dtype:(SIGNED-BYTE 64) 
   [[[  5,   6,   7],
     [  8,   9,  10],
     [ 11,  12,  13]],
@@ -54,7 +53,7 @@ CLVT> (vt-+ *m* 5)
     [ 26,  27,  28],
     [ 29,  30,  31]]]>
 CLVT> (vt-+ *m* *m*)
-#<VT shape:(3 3 3) dtype:FIXNUM 
+#<VT shape:(3 3 3) dtype:(SIGNED-BYTE 32) 
   [[[  0,   2,   4],
     [  6,   8,  10],
     [ 12,  14,  16]],
@@ -65,7 +64,7 @@ CLVT> (vt-+ *m* *m*)
     [ 42,  44,  46],
     [ 48,  50,  52]]]>
 CLVT> (vt-* *m* *m*)
-#<VT shape:(3 3 3) dtype:FIXNUM 
+#<VT shape:(3 3 3) dtype:(SIGNED-BYTE 32) 
   [[[   0,    1,    4],
     [   9,   16,   25],
     [  36,   49,   64]],
@@ -75,30 +74,41 @@ CLVT> (vt-* *m* *m*)
    [[ 324,  361,  400],
     [ 441,  484,  529],
     [ 576,  625,  676]]]>
+CLVT> (vt-* *m* 5)
+#<VT shape:(3 3 3) dtype:(SIGNED-BYTE 64) 
+  [[[   0,    5,   10],
+    [  15,   20,   25],
+    [  30,   35,   40]],
+   [[  45,   50,   55],
+    [  60,   65,   70],
+    [  75,   80,   85]],
+   [[  90,   95,  100],
+    [ 105,  110,  115],
+    [ 120,  125,  130]]]>
 CLVT> (vt-sin *m*)
 #<VT shape:(3 3 3) dtype:DOUBLE-FLOAT 
-  [[[     0.0,   0.8415,   0.9093],
-    [  0.1411,  -0.7568,  -0.9589],
-    [ -0.2794,    0.657,   0.9894]],
-   [[  0.4121,   -0.544,     -1.0],
-    [ -0.5366,   0.4202,   0.9906],
-    [  0.6503,  -0.2879,  -0.9614]],
-   [[  -0.751,   0.1499,   0.9129],
-    [  0.8367,  -0.0089,  -0.8462],
-    [ -0.9056,  -0.1324,   0.7626]]]>
+  [[[       0.0,   0.841471,   0.909297],
+    [   0.14112,  -0.756802,  -0.958924],
+    [ -0.279415,   0.656987,   0.989358]],
+   [[  0.412118,  -0.544021,   -0.99999],
+    [ -0.536573,   0.420167,   0.990607],
+    [  0.650288,  -0.287903,  -0.961397]],
+   [[ -0.750987,   0.149877,   0.912945],
+    [  0.836656,  -0.008851,   -0.84622],
+    [ -0.905578,  -0.132352,   0.762558]]]>
 CLVT> (vt-slice *m* '(0))
-#<VT shape:(3 3) dtype:FIXNUM 
+#<VT shape:(3 3) dtype:(SIGNED-BYTE 32) 
   [[ 0,  1,  2],
    [ 3,  4,  5],
    [ 6,  7,  8]]>
 CLVT> (setf (vt-slice *m* '(1))
 	    (vt-slice *m* '(0)))
-#<VT shape:(3 3) dtype:FIXNUM 
+#<VT shape:(3 3) dtype:(SIGNED-BYTE 32) 
   [[ 0,  1,  2],
    [ 3,  4,  5],
    [ 6,  7,  8]]>
 CLVT> *m*
-#<VT shape:(3 3 3) dtype:FIXNUM 
+#<VT shape:(3 3 3) dtype:(SIGNED-BYTE 32) 
   [[[  0,   1,   2],
     [  3,   4,   5],
     [  6,   7,   8]],
@@ -108,6 +118,7 @@ CLVT> *m*
    [[ 18,  19,  20],
     [ 21,  22,  23],
     [ 24,  25,  26]]]>
+CLVT> 
 
 ```
 
