@@ -761,7 +761,7 @@
           (let* ((ax (vt-normalize-axis axis rank))
                  (ax-dim (nth ax shape))
                  ;; 使用一维数组作为多维迭代器，记录非 ax 维度的当前坐标
-                 (indices (make-array rank :element-type 'fixnum :initial-element 0)))
+                 (indices (make-array rank :element-type '(signed-byte 64) :initial-element 0)))
             
             (labels ((advance ()
                        "推进迭代器，跳过 ax 维度。返回 nil 表示遍历结束。"
@@ -1033,36 +1033,6 @@
 
 
 ;;; 逻辑运算扩展
-(defun vt-logical-and (t1 t2 &key out)
-  "逻辑与"
-  (with-float-safe
-    (vt-map (lambda (a b)
-	      (if (and (/= a 0) (/= b 0)) 1.0d0 0.0d0))
-	    t1 t2 :dtype :float64 :out out)))
-
-(defun vt-logical-or (t1 t2 &key out)
-  "逻辑或"
-  (with-float-safe
-    (vt-map (lambda (a b)
-	      (if (or (/= a 0) (/= b 0)) 1.0d0 0.0d0))
-	    t1 t2 :dtype :float64 :out out)))
-
-(defun vt-logical-not (vt &key out)
-  "逻辑非"
-  (with-float-safe
-    (vt-map (lambda (a) (if (= a 0) 1.0d0 0.0d0))
-	    vt :dtype :float64 :out out)))
-
-(defun vt-logical-xor (t1 t2 &key out)
-  "逻辑异或"
-  (with-float-safe
-    (vt-map (lambda (a b)
-	      (if (/= (if (= a 0) 0 1)
-		      (if (= b 0) 0 1))
-		  1.0d0 0.0d0))
-	    t1 t2 :dtype :float64 :out out)))
-
-
 (defun vt-all (condition &key axis keepdims)
   "检查所有元素是否为真 (返回 :int32 张量，1 表示真，0 表示假)"
   (with-float-safe
@@ -1216,12 +1186,12 @@
             (setq non-nans (stable-sort non-nans #'< :key #'car))
             ;; 拼接：升序时 nan 在末尾
             (let ((sorted-indices (mapcar #'cdr (append non-nans nans))))
-              (%make-vt :data (make-array n :element-type 'fixnum
+              (%make-vt :data (make-array n :element-type '(signed-byte 64)
                                             :initial-contents sorted-indices)
                         :shape (list n)
                         :strides '(1)
                         :offset 0
-                        :dtype 'fixnum))))
+                        :dtype :int64))))
 
         ;; ========== 沿轴排序 ==========
         (let* ((shape (vt-shape tensor))
@@ -1325,11 +1295,11 @@
 	   (dtype (vt-dtype flat))
 	   (elem-type (vt-element-type flat))
 	   ;; 初始化索引向量 0..n-1
-	   (sorted-idx (make-array n :element-type 'fixnum
+	   (sorted-idx (make-array n :element-type '(signed-byte 64) 
 				     :initial-contents
 				     (loop for i below n collect i))))
       (declare (type (simple-array * (*)) src-data)
-               (type (simple-array fixnum (*)) sorted-idx)
+               (type (simple-array (signed-byte 64) (*)) sorted-idx)
                (type fixnum n))
 
       ;; nan 安全的排序：将 nan 排在末尾且连续
@@ -1345,11 +1315,11 @@
       ;; 动态数组收集结果
       (let ((unique-vals (make-array 0 :element-type elem-type
 				       :adjustable t :fill-pointer t))
-            (first-idx   (make-array 0 :element-type 'fixnum
+            (first-idx   (make-array 0 :element-type '(signed-byte 64) 
 				       :adjustable t :fill-pointer t))
-            (cnts        (make-array 0 :element-type 'fixnum
+            (cnts        (make-array 0 :element-type '(signed-byte 64) 
 				       :adjustable t :fill-pointer t))
-            (inverse     (make-array n :element-type 'fixnum
+            (inverse     (make-array n :element-type '(signed-byte 64) 
 				       :initial-element 0)))
 	(loop with pos = 0
               while (< pos n)
@@ -1381,7 +1351,7 @@
               (idx-vt  (when return-index
 			 (vt-from-sequence first-idx :dtype :int64)))
               (inv-vt  (when return-inverse
-			 (let ((v (make-array n :element-type 'fixnum)))
+			 (let ((v (make-array n :element-type '(signed-byte 64) )))
                            (dotimes (i n) (setf (aref v i)
 						(aref inverse i)))
                            (%make-vt :data v
@@ -1433,12 +1403,12 @@
       (let ((num-nz (length nz-indices)))
 	(if (zerop num-nz)
             ;; 如果没有非零元素，返回全空 1d 张量列表
-            (loop repeat rank collect (vt-zeros '(0)))
+            (loop repeat rank collect (vt-zeros '(0) :dtype :int64))
             ;; 如果有非零元素，将扁平索引拆解为多维坐标
             (let ((result-arrays
 		    (loop repeat rank
 			  collect
-			  (make-array num-nz :element-type 'fixnum))))
+			  (make-array num-nz :element-type '(signed-byte 64) ))))
               (loop
 		for flat-idx in nz-indices
                 for i fixnum from 0
@@ -1485,7 +1455,7 @@
            (v-flat (vt-flatten val-vt))
            (v-data (vt-data v-flat))
            (v-size (vt-size v-flat))
-           (result (make-array v-size :element-type 'fixnum)))
+           (result (make-array v-size :element-type '(signed-byte 64))))
       (loop for i fixnum from 0 below v-size
             for val = (aref v-data i)
             do (let ((lo 0) (hi size))
@@ -1570,12 +1540,6 @@
 
 
 ;;; 其他数学运算
-(defun vt-clip (tensor min-val max-val &key dtype out)
-  "将数值限制在指定范围内"
-  (with-float-safe
-    (vt-map (lambda (x) (max min-val (min max-val x)))
-	    tensor :dtype dtype :out out)))
-
 (defun vt-gradient (tensor &key (spacing 1.0d0) axis)
   "计算张量的梯度（沿指定轴的二阶中心差分）。
    axis  : nil → 全部轴, 整数或整数列表 → 指定轴（支持负数）。
@@ -1679,12 +1643,11 @@
   "从张量中按索引取值。支持多维 indices 和负数 axis。
    当 axis=nil 且 indices 为标量数字时，直接返回数值；
    否则返回张量。"
-  ;; 帮助函数：将任意形式的 indices 转为 fixnum 简单数组
   (with-float-safe
     (labels
 	((ensure-fixnum-1d (vt)
            (let* ((len (vt-size vt))
-                  (arr (make-array len :element-type 'fixnum)))
+                  (arr (make-array len :element-type '(signed-byte 64) )))
              (if (eq (vt-dtype vt) :float64)
 		 (dotimes (i len)
                    (setf (aref arr i) (truncate (aref (vt-data vt) i))))
@@ -1699,9 +1662,7 @@
 		;; 标量索引：直接返回数值
 		(let* ((flat (vt-ravel tensor))
                        (size (vt-size flat))
-                       (raw-idx (if (eq (vt-dtype idx-vt) :float64)
-				    (truncate (aref (vt-data idx-vt) 0))
-				    (aref (vt-data idx-vt) 0)))
+                       (raw-idx (truncate (aref (vt-data idx-vt) 0)))
 		       (idx (if (minusp raw-idx)
 				(+ raw-idx size)
 				raw-idx)))
@@ -1745,7 +1706,7 @@
                                     (subseq shape (1+ ax))))
 		 (out (vt-zeros out-shape :dtype (vt-dtype tensor)))
 		 (idx-strides (vt-compute-strides idx-shape))
-		 (idx-arr (make-array idx-size :element-type 'fixnum)))
+		 (idx-arr (make-array idx-size :element-type '(signed-byte 64))))
             ;; 填充 idx-arr
             (let ((raw (vt-data (vt-flatten idx-vt))))
               (if (eq (vt-dtype idx-vt) :float64)
@@ -2091,16 +2052,16 @@
            (in-offset (vt-offset vt))
            (out-size (vt-size out-vt))
            (out-strides-arr
-	     (make-array rank :element-type 'fixnum
+	     (make-array rank :element-type '(signed-byte 64)
 			      :initial-contents (vt-compute-strides new-shape)))
            (in-shape-arr
-	     (make-array rank :element-type 'fixnum
+	     (make-array rank :element-type '(signed-byte 64)
 			      :initial-contents shape))
            (in-strides-arr
-	     (make-array rank :element-type 'fixnum
+	     (make-array rank :element-type '(signed-byte 64)
 			      :initial-contents (vt-strides vt)))
            (pad-before-arr
-	     (make-array rank :element-type 'fixnum
+	     (make-array rank :element-type '(signed-byte 64)
 			      :initial-contents (mapcar #'first pad)))
            (c-left-conv (vt-cast c-left out-dtype))
            (c-right-conv (vt-cast c-right out-dtype)))
@@ -2171,7 +2132,7 @@
 		       -1
 		       (vt-item (vt-amax flat))))
            (size (max (1+ maxval) minlength))
-           (result (make-array size :element-type 'fixnum
+           (result (make-array size :element-type '(signed-byte 64)
 				    :initial-element 0)))
       (vt-do-each (ptr val flat)
 	(declare (ignore ptr))
@@ -2195,7 +2156,7 @@
            (bin-data (vt-data flat-bins))
            (nbins (vt-size flat-bins))
            (result (make-array (vt-size flat-x)
-			       :element-type 'fixnum)))
+			       :element-type '(signed-byte 64))))
       (vt-do-each (ptr val flat-x)
 	(let ((idx (loop for i from 0 below nbins
 			 until (if right
@@ -2346,13 +2307,6 @@
                            (+ y-left (* (- y-right y-left)
                                         (/ (- xi x-left) denom)))))))))))
       out-vt)))
-
-(defun vt-hypot (t1 &key t2 out)
-  "计算 (|t1|^2 + |t2|^2)^0.5。支持广播。"
-  (with-float-safe
-    (vt-sqrt (vt-+ (vt-square t1)
-		   (vt-square (if t2 t2 0)))
-	     :out out)))
 
 (defun vt-sinc (tensor &key out)
   "计算 sinc(x) = sin(pi*x) / (pi*x)，对 x=0 返回 1。"

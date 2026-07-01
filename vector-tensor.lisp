@@ -87,23 +87,6 @@
       ;; 5. 默认回退 (如空列表)：对标 NumPy 默认浮点类型
       (t :float64))))
 
-(defun vt-promote-type (&rest dtypes)
-  "推断运算结果类型。严格对标 NumPy 类型提升规则。"
-  (let ((has-f64 (member :float64 dtypes))
-        (has-f32 (member :float32 dtypes))
-        (has-i64 (member :int64 dtypes))
-        (has-i32 (member :int32 dtypes)))
-    (cond
-      ;; 任何 float64 参与运算，结果必为 float64
-      (has-f64 :float64)
-      ;; float32 与 int64 运算，NumPy 会提升为 float64 防止精度丢失
-      ((and has-f32 has-i64) :float64)
-      ;; 纯 float32 运算
-      (has-f32 :float32)
-      ;; 整数运算提升
-      (has-i64 :int64)
-      (t :int32))))
-
 (defun vt-cast (val dtype)
   "安全类型转换。对标 NumPy，浮点转整数时执行截断 (truncate)。"
   (ecase dtype
@@ -119,8 +102,6 @@
     (:int64 #'truncate)
     (:float32 (lambda (val) (coerce val 'single-float)))
     (:float64 (lambda (val) (coerce val 'double-float)))))
-
-
 
 (defun make-vt (shape initial-element &key (dtype :float64))
   "创建一个指定形状和类型的张量，并用初始值填充。"

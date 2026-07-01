@@ -461,7 +461,7 @@
            (n (second (vt-shape mat)))
            (k (min m n)))
       (when (and (= m 1) (= n 1))
-        (let ((val (aref (vt-data mat) 0)))
+        (let ((val (aref (vt-data mat) (vt-offset mat))))
           (return-from vt-svd
             (values (vt-const '(1 1) 1.0d0 :dtype :float64)
                     (vt-const '(1) (abs val) :dtype :float64)

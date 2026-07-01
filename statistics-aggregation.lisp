@@ -1,23 +1,5 @@
 (in-package :clvt)
 
-(defun vt-maximum (t1 t2 &key out dtype)
-  "逐元素取两数组中较大者。NaN 会传播。"
-  (with-float-safe
-    (vt-map (lambda (a b)
-              (cond ((vt-float-nan-p a) a)
-                    ((vt-float-nan-p b) b)
-                    (t (max a b))))
-            t1 t2 :out out :dtype dtype)))
-
-(defun vt-minimum (t1 t2 &key out dtype)
-  "逐元素取两数组中较小者。NaN 会传播。"
-  (with-float-safe
-    (vt-map (lambda (a b)
-              (cond ((vt-float-nan-p a) a)
-                    ((vt-float-nan-p b) b)
-                    (t (min a b))))
-            t1 t2 :out out :dtype dtype)))
-
 (defun vt-get-axes-and-count (axis rank shape)
   "返回 (values real-axes count)。
    real-axes 为排序后的列表，count 为归约轴上的元素总乘积。"

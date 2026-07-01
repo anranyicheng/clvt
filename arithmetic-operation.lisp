@@ -329,14 +329,22 @@
 
 ;; ========== 10. 补充: 逐元素极值运算 ==========
 (defun vt-maximum (t1 t2 &key out dtype)
-  "逐元素取最大值. 支持广播. (区别于沿着轴求最大值的归约操作)"
-  (with-float-safe 
-    (vt-map #'max (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out)))
+  "逐元素取两数组中较大者。NaN 会传播。"
+  (with-float-safe
+    (vt-map (lambda (a b)
+              (cond ((vt-float-nan-p a) a)
+                    ((vt-float-nan-p b) b)
+                    (t (max a b))))
+            t1 t2 :out out :dtype dtype)))
 
 (defun vt-minimum (t1 t2 &key out dtype)
-  "逐元素取最小值. 支持广播."
-  (with-float-safe 
-    (vt-map #'min (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out)))
+  "逐元素取两数组中较小者。NaN 会传播。"
+  (with-float-safe
+    (vt-map (lambda (a b)
+              (cond ((vt-float-nan-p a) a)
+                    ((vt-float-nan-p b) b)
+                    (t (min a b))))
+            t1 t2 :out out :dtype dtype)))
 
 (defun vt-fmax (t1 t2 &key out dtype)
   "逐元素取最大值，忽略 NaN (NaN 仅在两个输入均为 NaN 时返回)."

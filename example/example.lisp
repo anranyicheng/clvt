@@ -4568,7 +4568,7 @@
   ;; vt-hypot
   (let* ((a (vt-from-sequence '(3.0) :dtype :float64))
          (b (vt-from-sequence '(4.0) :dtype :float64))
-         (h (vt-hypot a :t2 b)))
+         (h (vt-hypot a b)))
     (assert (lists-approx-equal (vt-to-list h) '(5.0) :epsilon 1e-6)))
 
   ;; vt-sinc: sinc(x) = sin(pi*x)/(pi*x), sinc(0)=1
