@@ -1,16 +1,17 @@
 (in-package :clvt)
 
 (defun vt-map (fn &rest args)
-  "高效映射函数. 支持标量、列表、张量混合输入，并自动进行多维广播.
-  
-  极致性能优化:
-  1. 编译期 case 展开，针对 1-6 个参数生成特化调用，彻底消灭 apply 和列表分配.
-  2. 双轨制: 连续内存走 1D Fast Path，非连续走 N-D Slow Path.
-  3. 寄存器优化: 同类型快速路径中声明临时变量类型，避免浮点装箱.
-  "
+   "高效映射函数. 支持标量、列表、张量混合输入，并自动进行多维广播.
+  极致性能与安全优化:
+  1. 编译期特化: 针对递增的 1-6 个参数在宏展开期生成专属调用，彻底消灭运行时 apply 和列表分配.
+  2. 双轨制内存: 
+     - Fast Path: 严格校验输入输出的连续性 (vt-contiguous-p)，连续内存直接走 1D 平坦遍历.
+     - Slow Path: 非连续内存 (如转置视图) 自动走 N-D 递归，精确依据 strides 进行多维跳跃寻址.
+  3. 零开销类型转换: 引入编译期局部宏，在展开期静态推断输出类型，生成无分支的 coerce/truncate 代码.
+     既保证了向类型化数组写入时的绝对类型安全 (杜绝内存损坏)，又消除了运行时类型检查的开销.
+  4. 寄存器优化: 同类型快速路径中提取数组指针并声明临时变量类型，最大化利用 CPU 寄存器，避免浮点装箱."
   (declare (function fn) (optimize (safety 0)))
   (with-float-safe
-    ;; 1. 解析关键字参数
     (multiple-value-bind (tensors dtype out)
 	(parse-vt-op-args args)
       (when (null tensors)
@@ -19,17 +20,12 @@
              (n-tensors (length clean-tensors))
              (out-shape (reduce #'vt-broadcast-shapes
                                 (mapcar #'vt-shape clean-tensors))))	
-	;; 2. 确定输出张量及其类型 (严格校验，避免静默忽略)
         (let* ((final-dtype (cond
-                              ;; 如果同时指定了 out 和 dtype，且类型不一致，直接报错
                               ((and out dtype (not (eq (vt-dtype out) dtype)))
-                               (error "vt-map: :out 的类型 (~a) 与 :dtype (~a) 冲突，无法强制转换"
+                               (error "vt-map: :out 的类型 (~a) 与 :dtype (~a) 冲突"
                                       (vt-dtype out) dtype))
-                              ;; 优先级1: 如果有 out，使用 out 的类型
                               (out (vt-dtype out))
-                              ;; 优先级2: 如果有 dtype，使用 dtype
                               (dtype dtype)
-                              ;; 优先级3: 自动类型提升
                               (t (apply #'vt-promote-type
                                         (mapcar #'vt-dtype clean-tensors))))) 
                (res (or out (vt-zeros out-shape :dtype final-dtype))))
@@ -54,10 +50,10 @@
                  (size (vt-shape-to-size out-shape))
 		 (is-fast (and (vt-contiguous-p res)
 			       (every #'(lambda (ts)
-					  (or (equal (vt-shape ts) out-shape)
+					  (or (and (equal (vt-shape ts) out-shape)
+                                                   (vt-contiguous-p ts))
 					      (= (vt-size ts) 1)))
 				      clean-tensors)))
-
                  (all-same-type (every #'(lambda (ts)
                                            (eq (vt-dtype ts) final-dtype))
                                        clean-tensors)))
@@ -72,31 +68,34 @@
                   for i fixnum from 0
                   do (setf (aref cur-ptrs i) (vt-offset vt))) 
 
-            ;; 3. 核心类型派发宏：在编译期为每种类型生成专属循环
-            (macrolet
-		((gen-dispatch (lisp-type)
-                   ;; 预生成 1-6 个参数的特化调用代码，避免运行时 apply 和列表分配
-                   (let ((calls-same
-                           (loop for n from 1 to 6
-                                 collect
-				 `(,n (funcall
-				       fn
-                                       ,@(loop for k from 0 below n
-                                               collect
-					       `(aref (the (simple-array ,lisp-type (*))
-							   (aref ins-data ,k))
-						      (aref cur-ptrs ,k)))))))
-                         (calls-diff
-                           (loop for n from 1 to 6
-                                 collect
-				 `(,n (funcall
-				       fn
-                                       ,@(loop for k from 0 below n
-                                               collect `(aref (the simple-array (aref ins-data ,k))
-							      (aref cur-ptrs ,k))))))))
+            (macrolet ((cast-to-out (val lisp-type)
+                         `(if ,(subtypep lisp-type 'integer)
+                              (truncate ,val)
+                              (coerce ,val ',lisp-type))))
+              
+              (macrolet
+                  ((gen-dispatch (lisp-type)
+                     (let ((calls-same
+                             (loop for n from 1 to 6
+                                   collect
+				    `(,n (funcall
+					  fn
+					  ,@(loop for k from 0 below n
+						  collect
+						  `(aref (the (simple-array ,lisp-type (*))
+							      (aref ins-data ,k))
+							 (aref cur-ptrs ,k)))))))
+                           (calls-diff
+                             (loop for n from 1 to 6
+                                   collect
+				    `(,n (funcall
+					  fn
+					  ,@(loop for k from 0 below n
+						  collect `(aref (the simple-array (aref ins-data ,k))
+								 (aref cur-ptrs ,k))))))))
                      `(let ((out-data (the (simple-array ,lisp-type (*)) res-data)))
-			(with-float-safe
-			  (if is-fast
+                        (with-float-safe
+                          (if is-fast
                               ;; ================ FAST PATH ================
                               (let ((out-ptr (vt-offset res))
 				    (steps (let ((arr (make-array n-tensors :element-type 'fixnum)))
@@ -105,11 +104,9 @@
 						   do (setf (aref arr k)
 							    (if (equal (vt-shape ts) out-shape) 1 0))) 
 					     arr)))
-
                                 (declare (type fixnum out-ptr)
                                          (type (simple-array fixnum (*)) steps))
                                 (if all-same-type
-                                    ;; --- 输入输出类型完全一致：零装箱 ---
                                     (cond
                                       ((= n-tensors 1)
                                        (let ((d0 (the (simple-array ,lisp-type (*)) (aref ins-data 0)))
@@ -118,8 +115,8 @@
 						  (type fixnum p0))
                                          (loop for i fixnum from 0 below size do
 					   (let ((v (funcall fn (aref d0 p0))))
-                                             (declare (type ,lisp-type v))
-                                             (setf (aref out-data out-ptr) v))
+                                             ;; 使用宏替换
+                                             (setf (aref out-data out-ptr) (cast-to-out v ,lisp-type)))
 					   (incf out-ptr)
 					   (incf p0 (aref steps 0))))) 
                                       ((= n-tensors 2)
@@ -131,8 +128,7 @@
 						  (type fixnum p0 p1))
                                          (loop for i fixnum from 0 below size do
 					   (let ((v (funcall fn (aref d0 p0) (aref d1 p1))))
-                                             (declare (type ,lisp-type v))
-                                             (setf (aref out-data out-ptr) v))				
+                                             (setf (aref out-data out-ptr) (cast-to-out v ,lisp-type)))
 					   (incf out-ptr)
 					   (incf p0 (aref steps 0))
 					   (incf p1 (aref steps 1)))))
@@ -146,12 +142,10 @@
 								     (aref (the (simple-array ,lisp-type (*))
 										(aref ins-data k))
 									   (aref cur-ptrs k))))))))
-					   (declare (type ,lisp-type v))
-					   (setf (aref out-data out-ptr) v))
+					   (setf (aref out-data out-ptr) (cast-to-out v ,lisp-type)))
                                          (incf out-ptr)
                                          (loop for k fixnum from 0 below n-tensors do
 					   (incf (aref cur-ptrs k) (aref steps k))))))
-                                    ;; --- 输入输出类型不一致：通用数组读取 ---
                                     (cond
                                       ((= n-tensors 1)
                                        (let ((d0 (the simple-array (aref ins-data 0)))
@@ -160,10 +154,7 @@
 						  (type fixnum p0))
                                          (loop for i fixnum from 0 below size do
 					   (let ((v (funcall fn (aref d0 p0))))
-                                             (setf (aref out-data out-ptr)
-						   (if ,(subtypep lisp-type 'integer)
-						       (truncate v)
-						       (coerce v ',lisp-type))))
+                                             (setf (aref out-data out-ptr) (cast-to-out v ,lisp-type)))
 					   (incf out-ptr)
 					   (incf p0 (aref steps 0))))) 
                                       ((= n-tensors 2)
@@ -175,10 +166,7 @@
 						  (type fixnum p0 p1))
                                          (loop for i fixnum from 0 below size do
 					   (let ((v (funcall fn (aref d0 p0) (aref d1 p1))))
-                                             (setf (aref out-data out-ptr)
-						   (if ,(subtypep lisp-type 'integer)
-						       (truncate v)
-						       (coerce v ',lisp-type))))
+                                             (setf (aref out-data out-ptr) (cast-to-out v ,lisp-type)))
 					   (incf out-ptr)
 					   (incf p0 (aref steps 0))
 					   (incf p1 (aref steps 1))))) 
@@ -192,17 +180,14 @@
                                                                      collect
 								     (aref (the simple-array (aref ins-data k))
 									   (aref cur-ptrs k))))))))
-					   (setf (aref out-data out-ptr)
-                                                 (if ,(subtypep lisp-type 'integer)
-						     (truncate v)
-						     (coerce v ',lisp-type))))
+					   (setf (aref out-data out-ptr) (cast-to-out v ,lisp-type)))
                                          (incf out-ptr)
                                          (loop for k fixnum from 0 below n-tensors do
-					   (incf (aref cur-ptrs k) (aref steps k)))))))) 
+					   (incf (aref cur-ptrs k) (aref steps k))))))))
                               
                               ;; ================ SLOW PATH (N-D 递归) ================
                               (labels
-				  ((recurse (depth out-ptr)
+                                  ((recurse (depth out-ptr)
                                      (declare (type fixnum depth out-ptr))
                                      (if (= depth rank)
 					 (let ((raw-result
@@ -214,9 +199,7 @@
 								    (aref (the simple-array (aref ins-data k))
 									  (aref cur-ptrs k))))))))
                                            (setf (aref out-data out-ptr)
-						 (if ,(subtypep lisp-type 'integer)
-						     (truncate raw-result)
-						     (coerce raw-result ',lisp-type))))
+						 (cast-to-out raw-result ,lisp-type)))
 					 (let* ((dim (the fixnum (nth depth out-shape)))
 						(res-stride (the fixnum (nth depth res-strides))))
                                            (declare (type fixnum dim res-stride))
@@ -233,7 +216,6 @@
 								       (nth depth (aref ins-strides k))))))))))) 
                                 (recurse 0 (vt-offset res)))))))))
               
-              ;; 触发宏展开，生成 4 份特化代码
               (etypecase res-data
                 ((simple-array double-float (*))
                  (gen-dispatch double-float))
@@ -244,7 +226,8 @@
                 ((simple-array (signed-byte 32) (*))
                  (gen-dispatch (signed-byte 32))))) 
             
-            res))))))
+            res)))))))
+
 
 (defun vt-binary (fn t1 t2 &key out dtype)
   "二元张量操作基石. 
@@ -847,8 +830,7 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                          (vt-offset result))))))
       result)))
 
-
-(defun vt-argwhere (condition)
+(defun vt-argwhere (condition &key (dtype :int64))
   "查找非零元素的坐标。
 condition: 条件张量。
 返回: 形状为 (n, rank) 的二维张量，每一行是一个非零元素的完整坐标。
@@ -856,108 +838,113 @@ condition: 条件张量。
 
 注意 (对标 pytorch/numpy):
 如果输入是 0 维张量 (标量), rank 为 0。
-- 若标量非零: 返回形状为 (1, 0) 的张量 (表示找到 1 个结果, 但坐标维度为 0, data 长度为 0)。
-- 若标量为零: 返回形状为 (0, 0) 的张量。"
-  (declare (type vt condition))
-  (let* ((in-shape (vt-shape condition))
-         (rank (length in-shape))
-         (in-data (vt-data condition))
-         (in-offset (vt-offset condition))
-         (shape-vec (coerce in-shape 'simple-vector))
-         (strides-vec (coerce (vt-strides condition) 'simple-vector))
-         (result-indices (make-array 128  ;; 预分配
-				     :element-type 'fixnum
-                                     :fill-pointer t
-				     :adjustable t))
-         (coord-buffer (make-array rank :element-type 'fixnum)))
-    (declare (type simple-vector shape-vec strides-vec)
-             (type fixnum rank in-offset))
+- 若标量非零: 返回形状为 (1, 0) 的张量。
+- 若标量为零: 返回形状为 (0, 0) 的张量。
 
-    ;; 宏定义：处理 0 维张量时，通过推入占位符记录命中次数
-    (macrolet
-        ((gen-recurse (test-fn)
-           `(labels
-                ((recurse (depth current-ptr)
-                   (declare (type fixnum depth current-ptr))
-		   (with-float-safe
-                     (if (= depth rank)
-			 ;; 安全地调用传入的测试逻辑
-			 (when (funcall ,test-fn in-data current-ptr)
-                           (if (zerop rank)
-                               ;; 0维张量匹配时，推入占位符使 count 计算为 1
-                               (vector-push-extend 0 result-indices)
-                               (loop for c across coord-buffer do 
-				 (vector-push-extend c result-indices))))
-			 (let ((dim (svref shape-vec depth))
-                               (stride (svref strides-vec depth)))
-                           (declare (type fixnum dim stride))
-                           (loop for i fixnum from 0 below dim
-				 do (setf (aref coord-buffer depth) i)
-                                    (recurse (1+ depth)
-                                             (+ current-ptr (* i stride)))))))))
-              (recurse 0 in-offset))))
-      
-      ;; 冷路径：根据真实数组类型派发
-      (etypecase in-data
-        ((simple-array double-float (*))
-         (gen-recurse
-          (lambda (data ptr)
-            (declare (type (simple-array double-float (*)) data)
-                     (type fixnum ptr))
-            (/= (aref data ptr) 0.0d0))))
-        ((simple-array fixnum (*))
-         (gen-recurse
-          (lambda (data ptr)
-            (declare (type (simple-array fixnum (*)) data)
-                     (type fixnum ptr))
-            (/= (the fixnum (aref data ptr)) 0))))
-        ((simple-array single-float (*))
-         (gen-recurse
-          (lambda (data ptr)
-            (declare (type (simple-array single-float (*)) data)
-                     (type fixnum ptr))
-            (/= (aref data ptr) 0.0f0))))
-        ((simple-array (signed-byte 64) (*))
-         (gen-recurse
-          (lambda (data ptr)
-            (declare (type (simple-array (signed-byte 64) (*)) data)
-                     (type fixnum ptr))
-            (/= (the (signed-byte 64) (aref data ptr)) 0))))
-        ((simple-array (signed-byte 32) (*))
-         (gen-recurse
-          (lambda (data ptr)
-            (declare (type (simple-array (signed-byte 32) (*)) data)
-                     (type fixnum ptr))
-            (/= (the (signed-byte 32) (aref data ptr)) 0)))))
+:dtype 选项: 仅支持 :int32 或 :int64 (默认)。"
+  (declare (type vt condition)
+	   (type (member nil :int32 :int64) dtype))
+  (let ((final-dtype (or dtype :int64)))
+    ;; 严格校验：只允许整数类型
+    (unless (member final-dtype '(:int32 :int64))
+      (setf final-dtype :int64))
+    
+    (let* ((lisp-type (if (eq final-dtype :int32)
+                          '(signed-byte 32)
+                          '(signed-byte 64)))
+           (in-shape (vt-shape condition))
+           (rank (length in-shape))
+           (in-data (vt-data condition))
+           (in-offset (vt-offset condition))
+           (shape-vec (coerce in-shape 'simple-vector))
+           (strides-vec (coerce (vt-strides condition) 'simple-vector))
+           ;; 中间收集器，使用 64 位防止遍历时越界
+           (result-indices (make-array 128
+                                       :element-type '(signed-byte 64)
+                                       :fill-pointer 0
+                                       :adjustable t))
+           (coord-buffer (make-array rank 
+                                     :element-type '(signed-byte 64))))
+      (declare (type simple-vector shape-vec strides-vec)
+               (type fixnum rank in-offset))
 
-      ;; 结果封装逻辑
-      (let* ((total-indices (length result-indices))
-             ;; 当 rank=0 时，count 直接等于 total-indices (非零时为1，为零时为0)
-             (count (if (zerop rank)
-                        total-indices
-                        (floor total-indices rank))))
-        (cond 
-          ;; 情况 a：完全没有匹配
-          ((zerop count)
-           (vt-zeros (list 0 rank) :dtype :int64)) ; 标量返回 (0, 0)，多维返回 (0, rank)
-          ;; 情况 b：有匹配，且 rank > 0（常规情况）
-          ((> rank 0)
-           (let ((final-data (make-array total-indices :element-type 'fixnum)))
-             (loop for i from 0 below total-indices
-                   for idx across result-indices
-                   do (setf (aref final-data i) idx))
-             (%make-vt :data final-data 
-                       :shape (list count rank) 
-                       :strides (list rank 1) 
-                       :offset 0 
-                       :dtype :int64
-                       )))            
-          ;; 情况 c：有匹配，且 rank = 0（标量非零）
-          ;; 完美对标 pytorch: 返回 (1, 0) 形状，data 长度为 0 满足底层不变量
-          (t 
-           (%make-vt :data (make-array 0 :element-type 'fixnum) ; 空数据
-                     :shape (list count 0)                       ; 形状 (1, 0)
-                     :strides (list 0 1) 
-                     :offset 0 
-                     :dtype :int64
-                     )))))))
+      (macrolet
+          ((gen-recurse (test-fn)
+             `(labels
+                  ((recurse (depth current-ptr)
+                     (declare (type fixnum depth current-ptr))
+                     (with-float-safe
+                       (if (= depth rank)
+                           (when (funcall ,test-fn in-data current-ptr)
+                             (if (zerop rank)
+                                 (vector-push-extend 0 result-indices)
+                                 (loop for c across coord-buffer do
+                                   (vector-push-extend c result-indices))))
+                           (let ((dim (svref shape-vec depth))
+                                 (stride (svref strides-vec depth)))
+                             (declare (type fixnum dim stride))
+                             (loop for i fixnum from 0 below dim
+                                   do (setf (aref coord-buffer depth) i)
+                                      (recurse (1+ depth)
+                                               (+ current-ptr
+                                                  (* i stride)))))))))
+                (recurse 0 in-offset))))
+
+        (etypecase in-data
+          ((simple-array double-float (*))
+           (gen-recurse
+            (lambda (data ptr)
+              (declare (type (simple-array double-float (*)) data)
+                       (type fixnum ptr))
+              (/= (aref data ptr) 0.0d0))))
+          ((simple-array fixnum (*))
+           (gen-recurse
+            (lambda (data ptr)
+              (declare (type (simple-array fixnum (*)) data)
+                       (type fixnum ptr))
+              (/= (the fixnum (aref data ptr)) 0))))
+          ((simple-array single-float (*))
+           (gen-recurse
+            (lambda (data ptr)
+              (declare (type (simple-array single-float (*)) data)
+                       (type fixnum ptr))
+              (/= (aref data ptr) 0.0f0))))
+          ((simple-array (signed-byte 64) (*))
+           (gen-recurse
+            (lambda (data ptr)
+              (declare (type (simple-array (signed-byte 64) (*)) data)
+                       (type fixnum ptr))
+              (/= (the (signed-byte 64) (aref data ptr)) 0))))
+          ((simple-array (signed-byte 32) (*))
+           (gen-recurse
+            (lambda (data ptr)
+              (declare (type (simple-array (signed-byte 32) (*)) data)
+                       (type fixnum ptr))
+              (/= (the (signed-byte 32) (aref data ptr)) 0)))))
+
+        (let* ((total-indices (length result-indices))
+               (count (if (zerop rank)
+                          total-indices
+                          (floor total-indices rank))))
+          (cond
+            ((zerop count)
+             (vt-zeros (list 0 rank) :dtype final-dtype))
+            ((> rank 0)
+             ;; 严格按照用户指定的 lisp-type 创建最终底层数组
+             (let ((final-data (make-array total-indices
+                                            :element-type lisp-type)))
+               (loop for i from 0 below total-indices
+                     for idx across result-indices
+                     do (setf (aref final-data i) idx))
+               (%make-vt :data final-data
+                         :shape (list count rank)
+                         :strides (list rank 1)
+                         :offset 0
+                         :dtype final-dtype)))
+            (t
+             (%make-vt :data (make-array 0 
+                                          :element-type lisp-type)
+                       :shape (list count 0)
+                       :strides (list 0 1)
+                       :offset 0
+                       :dtype final-dtype))))))))

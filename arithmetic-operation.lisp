@@ -239,7 +239,6 @@
             vt :out out :dtype dtype)))
 
 ;; ============ 7. 比较运算 ============
-;; 修复: 传递未绑定的 type 变量以及错误关键字 :type，统一修改为 :dtype dtype
 (defun vt-= (t1 t2 &key dtype out)
   "逐元素相等比较. 支持广播.返回布尔张量(1.0或0.0)."
   (with-float-safe 

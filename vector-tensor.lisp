@@ -160,7 +160,10 @@
                  :strides nil
                  :offset 0
                  :dtype final-dtype
-                 )))))
+                 )))
+    (sequence
+     (let ((final-dtype (or dtype :float64)))
+       (vt-from-sequence obj :dtype final-dtype)))))
 
 (defun vt-flatten-sequence (seq)
   "深度优先遍历 seq 及其嵌套序列,返回所有原子元素的列表.

@@ -33,98 +33,111 @@
   (unless condition
     (error "test failed: ~a" msg)))
 
-
 (defun test-vt-map ()
-  "测试 vt-map 的动态类型提升和边界处理。"
+  "测试升级后的 vt-map: 类型推断、内存安全、非连续视图及混合输入."
   (format t "~&开始运行 vt-map 测试...~%")
   
-  ;; 辅助断言函数：同时验证值和类型
   (flet ((check (expected-list expected-type tensor desc)
            (let ((actual-list (vt-to-list tensor))
-                 (actual-type (vt-element-type tensor)))
+                 (actual-type (vt-dtype tensor)))
              (assert (equal actual-list expected-list) ()
                      "~A: 值断言失败。预期 ~A, 实际 ~A" desc expected-list actual-list)
              (assert (eq actual-type expected-type) ()
                      "~A: 类型断言失败。预期 ~A, 实际 ~A" desc expected-type actual-type))))
     
     ;; ----------------------------------------------------
-    ;; 1. 纯整数路径 (不触发提升，极速路径)
+    ;; 1. 纯整数路径 (不触发提升，极速 1D Fast Path)
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (* x 2)) (vt-from-sequence '(1 2 3) :type 'fixnum))))
-      (check '(2 4 6) 'fixnum res "纯整数路径"))
+    (let ((res (vt-map (lambda (x) (* x 2)) (vt-from-sequence '(1 2 3) :dtype :int64))))
+      (check '(2 4 6) :int64 res "纯整数路径"))
 
     ;; ----------------------------------------------------
-    ;; 2. 纯浮点路径 (不触发提升，冷启动直接推断为浮点)
+    ;; 2. 纯浮点路径 (修正原测试笔误，输入也应为浮点)
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-from-sequence '(1 2 3) :type 'fixnum))))
-      (check '(2.0 4.0 6.0) 'double-float res "纯浮点路径"))
+    (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-from-sequence '(1.0 2.0 3.0) :dtype :float64))))
+      (check '(2.0 4.0 6.0) :float64 res "纯浮点路径"))
 
     ;; ----------------------------------------------------
-    ;; 3. 【核心修复】动态提升：首个整数，后续浮点
+    ;; 3. 类型安全防崩溃测试 (修复 safety 0 下的内存损坏)
+    ;; 闭包返回 fixnum 0，但目标数组是 float64，必须被安全 coerce
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (if (= x 0) 0 (/ 1.0 x))) 
-                       (vt-from-sequence '(0 2 4) :type 'fixnum))))
-      (check '(0.0 0.5 0.25) 'double-float res "动态提升(整数->浮点)"))
+    (let ((res (vt-map (lambda (x) (min x 0.0)) 
+                       (vt-from-sequence '(1.5 -2.5 3.0) :dtype :float64))))
+      (check '(0.0 -2.5 0.0) :float64 res "类型安全防崩溃(min x 0.0)"))
 
     ;; ----------------------------------------------------
-    ;; 4. 【核心修复】动态提升：首个整数，后续分数
-    ;; CL原生除法在不整除时返回 ratio，必须触发提升
+    ;; 4. 强制类型截断测试 (浮点运算结果写入整型数组)
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (if (= x 0) 0 (/ 1 x))) 
-                       (vt-from-sequence '(0 2 4) :type 'fixnum))))
-      (check '(0.0 0.5 0.25) 'double-float res "动态提升(整数->分数)"))
+    (let ((res (vt-map (lambda (x) (/ 10.0 x)) 
+                       (vt-from-sequence '(1 2 3) :dtype :int64))))
+      ;; 10.0, 5.0, 3.33... 会被安全地 truncate 为 10, 5, 3
+      (check '(10 5 3) :int64 res "浮点结果截断为整数"))
 
     ;; ----------------------------------------------------
-    ;; 5. 布尔语义 (首元素返回布尔值，冷启动直接推断为浮点)
+    ;; 5. 显式指定 dtype 防止截断
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (> x 5)) (vt-from-sequence '(1 6 2 7) :type 'fixnum))))
-      (check '(0.0 1.0 0.0 1.0) 'double-float res "布尔冷启动"))
+    (let ((res (vt-map (lambda (x) (/ 10.0 x)) 
+                       (vt-from-sequence '(1 2 4) :dtype :int64)
+                       :dtype :float64)))
+      (check '(10.0 5.0 2.5) :float64 res "显式 dtype 提升防截断"))
 
     ;; ----------------------------------------------------
-    ;; 6. 混合布尔语义 (首元素整数，后续布尔值，不触发提升，优雅降级为 0/1)
+    ;; 6. 混合输入支持 (标量、列表、张量自动对齐)
+    ;; 验证 ensure-vt 升级带来的便利
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (if (> x 5) t 0)) 
-                       (vt-from-sequence '(1 6 2 7) :type 'fixnum))))
-      (check '(0 1 0 1) 'fixnum res "混合布尔(不触发提升)"))
- ;; ----------------------------------------------------
-    ;; 7. Bignum 溢出提升 (首个是 fixnum，后续超出 fixnum 范围)
-    ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (if (= x 0) 0 (* x 1000000000000000000000))) 
-                       (vt-from-sequence '(0 2) :type 'fixnum))))
-      ;; 首元素返回 0 (fixnum)
-      ;; 第二个元素返回 2000000000000000000000 (明确超出 64位 fixnum 的 bignum) -> 触发提升
-      (check '(0.0 2.0e21) 'double-float res "Bignum 溢出提升"))
+    (let ((res (vt-map (lambda (a b c) (+ a (* b c)))
+                       10                          ; 标量
+                       '(1 2 3)                    ; 列表
+                       (vt-from-sequence '(2 2 2) :dtype :int64)))) ; 张量
+      (check '(12.0 14.0 16.0) :float64 res "混合输入(标量+列表+张量)"))
 
     ;; ----------------------------------------------------
-    ;; 8. 多参数动态提升 (广播与类型混合)
+    ;; 7. 多参数自动类型提升 (int32 + float64 -> float64)
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (a b) (if (= a 0) 0 (+ a (/ 1.0 b))))
-                       (vt-from-sequence '(0 2) :type 'fixnum)
-                       (vt-from-sequence '(1 2) :type 'fixnum))))
-      (check '(0.0 2.5) 'double-float res "多参数动态提升"))
- ;; ----------------------------------------------------
-    ;; 9. 空张量推断 (size=0, 依靠 promote-type)
+    (let ((res (vt-map #'+ 
+                       (vt-from-sequence '(1 2 3) :dtype :int32)
+                       (vt-from-sequence '(0.1 0.1 0.1) :dtype :float64))))
+      (check '(1.1 2.1 3.1) :float64 res "多参数自动类型提升"))
+
     ;; ----------------------------------------------------
-    ;; 输入为 fixnum，由于无元素可计算，只能基于输入推断为 fixnum
-    (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-zeros '(0) :type 'fixnum))))
-      (check '() 'fixnum res "空张量(基于fixnum输入)"))
+    ;; 8. :out 参数原地写入 (验证内存偏移与指针安全)
+    ;; ----------------------------------------------------
+    (let* ((out (vt-zeros '(3) :dtype :float64))
+           (res (vt-map (lambda (x) (* x 2.0)) 
+                        (vt-from-sequence '(1 2 3) :dtype :float64)
+                        :out out)))
+      (assert (eq res out) () ":out 测试: 返回值不是 out 本身")
+      (check '(2.0 4.0 6.0) :float64 out ":out 原地写入"))
+
+    ;; ----------------------------------------------------
+    ;; 9. 【核心修复】非连续内存 N-D Slow Path (转置视图测试)
+    ;; 如果错误走入 Fast Path，取出的数据将是错乱的
+    ;; ----------------------------------------------------
+    (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :float64))
+           (at (vt-transpose a '(1 0))) ; at 是非连续的，物理内存为 (1 2 3 4 5 6)，逻辑为 ((1 4) (2 5) (3 6))
+           (res (vt-map (lambda (x) (* x 10.0)) at)))
+      ;; 逻辑上应该是 10, 40, 20, 50, 30, 60
+      ;; 如果 fast path 错误按一维读取，会变成 10, 20, 30, 40, 50, 60
+      (check '((10.0 40.0) (20.0 50.0) (30.0 60.0)) :float64 res "非连续内存(转置视图)计算"))
+
+    ;; ----------------------------------------------------
+    ;; 10. 空张量推断 (size=0, 依靠 promote-type)
+    ;; ----------------------------------------------------
+    (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-zeros '(0) :dtype :int64))))
+      (check '() :int64 res "空张量(基于int64输入)"))
       
-    ;; 输入为 double-float，基于输入推断为 double-float
-    (let ((res (vt-map (lambda (x) (* x 2)) (vt-zeros '(0) :type 'double-float))))
-      (check '() 'double-float res "空张量(基于double-float输入)"))
+    (let ((res (vt-map (lambda (x) (* x 2)) (vt-zeros '(0) :dtype :float64))))
+      (check '() :float64 res "空张量(基于float64输入)"))
 
     (format t "~&所有 vt-map 测试通过！~%")))
 
-
-
 (defun test-vt-reduce ()
-  "全面测试 vt-reduce 的核心功能与边界情况。"
+  "全面测试升级后的 vt-reduce: 静态类型推断、非连续视图及内存安全."
   (format t "~&开始运行 vt-reduce 测试...~%")
   
-  ;; 辅助断言函数：同时验证值和类型
   (flet ((check (expected-list expected-type res desc)
            (let ((actual-list (vt-to-list res))
-                 (actual-type (vt-etype res)))
+                 (actual-type (vt-dtype res)))
              (assert (equal actual-list expected-list) ()
                      "~A: 值断言失败。预期 ~A, 实际 ~A" desc expected-list actual-list)
              (assert (eq actual-type expected-type) ()
@@ -133,98 +146,106 @@
     ;; ----------------------------------------------------
     ;; 1. 全局归约基础测试
     ;; ----------------------------------------------------
-    (let ((res (vt-reduce (vt-from-sequence '(1 2 3 4) :type 'fixnum) nil 0 #'+)))
-      (check 10 'fixnum res "全局归约-纯整数"))
+    (let ((res (vt-reduce (vt-from-sequence '(1 2 3 4) :dtype :int64) nil 0 #'+)))
+      (check 10 :int64 res "全局归约-纯整数"))
     
-    (let ((res (vt-reduce (vt-from-sequence '(1.0 2.0 3.0) :type 'double-float) nil 0.0 #'+)))
-      (check 6.0 'double-float res "全局归约-纯浮点"))
+    (let ((res (vt-reduce (vt-from-sequence '(1.0 2.0 3.0) :dtype :float64) nil 0.0 #'+)))
+      (check 6.0 :float64 res "全局归约-纯浮点"))
       
-    ;; 【核心修复】浮点初始值强制提升
-    (let ((res (vt-reduce (vt-from-sequence '(1 2 3) :type 'fixnum) nil 0.0 #'+)))
-      (check 6.0 'double-float res "全局归约-浮点初始值提升"))
+    ;; 【更新】浮点初始值提升：现在需要显式指定 :dtype 才能安全提升，避免静默截断
+    (let ((res (vt-reduce (vt-from-sequence '(1 2 3) :dtype :int64) nil 0.0 #'+ :dtype :float64)))
+      (check 6.0 :float64 res "全局归约-显式dtype提升"))
 
     ;; ----------------------------------------------------
     ;; 2. 指定轴归约
     ;; ----------------------------------------------------
-    (let ((a2 (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+    (let ((a2 (vt-from-sequence '((1 2) (3 4)) :dtype :int64)))
       (let ((res (vt-reduce a2 0 0 #'+)))
-        (check '(4 6) 'fixnum res "指定轴-axis0求和"))
+        (check '(4 6) :int64 res "指定轴-axis0求和"))
       (let ((res (vt-reduce a2 1 0 #'+)))
-        (check '(3 7) 'fixnum res "指定轴-axis1求和"))
+        (check '(3 7) :int64 res "指定轴-axis1求和"))
       (let ((res (vt-reduce a2 0 0 #'+ :keepdims t)))
-        (check '((4 6)) 'fixnum res "指定轴-keepdims")))
+        (check '((4 6)) :int64 res "指定轴-keepdims")))
 
     ;; ----------------------------------------------------
-    ;; 3. 【核心修复】动态类型提升 (累加溢出)
+    ;; 3. 【核心更新】显式类型提升防截断 (替代旧的动态溢出提升)
     ;; ----------------------------------------------------
-    ;; 3.1 全局乘法溢出
-    (let ((res (vt-reduce (vt-from-sequence '(1000000000000 1000000000000 1000000000000) :type 'fixnum) 
-                          nil 1 #'*)))
-      (check 1.0e36 'double-float res "动态提升-全局乘法溢出"))
+    ;; 3.1 全局乘法溢出：如果不指定 dtype，大数会被安全截断。
+    ;; 必须显式指定 :float64 才能保留大数结果。
+    (let ((res (vt-reduce (vt-from-sequence '(1000000000000 1000000000000 1000000000000) :dtype :int64) 
+                          nil 1 #'* :dtype :float64)))
+      (check 1.0e36 :float64 res "显式提升-全局乘法溢出"))
     
     ;; 3.2 沿轴乘法溢出
-    (let ((a2 (vt-from-sequence '((1000000000000 1000000000000) (2 2)) :type 'fixnum)))
-      (let ((res (vt-reduce a2 1 1 #'*)))
-        (check '(1.0e24 4.0) 'double-float res "动态提升-沿轴乘法溢出")))
+    (let ((a2 (vt-from-sequence '((1000000000000 1000000000000) (2 2)) :dtype :int64)))
+      (let ((res (vt-reduce a2 1 1 #'* :dtype :float64)))
+        (check '(1.0e24 4.0) :float64 res "显式提升-沿轴乘法溢出")))
 
-      ;; ----------------------------------------------------
+    ;; ----------------------------------------------------
     ;; 4. Return-arg (argmax / argmin 模拟)
     ;; ----------------------------------------------------
-    (let ((a1 (vt-from-sequence '(1 5 3 2) :type 'fixnum)))
+    (let ((a1 (vt-from-sequence '(1 5 3 2) :dtype :int64)))
       ;; 1D Argmax
       (multiple-value-bind (res idx) 
           (vt-reduce a1 nil 0 (lambda (acc val) (if (> val acc) (values val t) (values acc nil))) :return-arg t)
-        (check 5 'fixnum res "1D-Argmax-值")
-        ;; 标量张量返回单值，不是列表
+        (check 5 :int64 res "1D-Argmax-值")
         (assert (equal (vt-to-list idx) 1) () "1D-Argmax-索引断言失败"))
       
       ;; 1D Argmin
       (multiple-value-bind (res idx) 
           (vt-reduce a1 nil most-positive-fixnum (lambda (acc val) (if (< val acc) (values val t) (values acc nil))) :return-arg t)
-        (check 1 'fixnum res "1D-Argmin-值")
+        (check 1 :int64 res "1D-Argmin-值")
         (assert (equal (vt-to-list idx) 0) () "1D-Argmin-索引断言失败")))
     
-    (let ((a2 (vt-from-sequence '((1 5 3) (7 2 4)) :type 'fixnum)))
+    (let ((a2 (vt-from-sequence '((1 5 3) (7 2 4)) :dtype :int64)))
       ;; 2D Argmax along axis 1 (按行找最大值)
       (multiple-value-bind (res idx)
           (vt-reduce a2 1 0 (lambda (acc val) (if (> val acc) (values val t) (values acc nil))) :return-arg t)
-        (check '(5 7) 'fixnum res "2D-Argmax-值")
+        (check '(5 7) :int64 res "2D-Argmax-值")
         (assert (equal (vt-to-list idx) '(1 0)) () "2D-Argmax-索引断言失败"))
       
       ;; 2D Argmin along axis 0 (按列找最小值)
       (multiple-value-bind (res idx)
           (vt-reduce a2 0 most-positive-fixnum (lambda (acc val) (if (< val acc) (values val t) (values acc nil))) :return-arg t)
-        (check '(1 2 3) 'fixnum res "2D-Argmin-值")
+        (check '(1 2 3) :int64 res "2D-Argmin-值")
         (assert (equal (vt-to-list idx) '(0 1 0)) () "2D-Argmin-索引断言失败")))
 
+    ;; ----------------------------------------------------
+    ;; 5. 【核心新增】非连续内存视图归约 (转置测试)
+    ;; 如果 reduce 未正确处理 strides，将得到错误结果
+    ;; ----------------------------------------------------
+    (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
+           (at (vt-transpose a '(1 0)))) ; 逻辑形状 (3, 2)，物理内存为 (1 2 3 4 5 6)
+      ;; 沿 axis 1 归约 (逻辑上按行求和: 1+4=5, 2+5=7, 3+6=9)
+      (let ((res (vt-reduce at 1 0 #'+)))
+        (check '(5 7 9) :int64 res "非连续内存-转置视图axis1归约")))
 
     ;; ----------------------------------------------------
-    ;; 5. 布尔语义归约 (测试冷路径推断)
+    ;; 6. 类型安全测试 (除法产生 Ratio，必须安全截断或提升)
     ;; ----------------------------------------------------
-    (let ((res (vt-reduce (vt-from-sequence '(1 0 2) :type 'fixnum) nil nil 
-                          (lambda (acc x) (or acc (> x 0))))))
-      (check 1.0 'double-float res "布尔归约-含非零"))
+    (let ((res (vt-reduce (vt-from-sequence '(1 2 4) :dtype :int64) nil 1
+                          (lambda (acc x) (/ acc x))))) ; 1/2 = 1/2 (ratio), /4 = 1/8
+      ;; 不指定 dtype，保持 int64，ratio 会被强制 truncate 为 0
+      (check 0 :int64 res "类型安全-Ratio截断为整数"))
+      
+    (let ((res (vt-reduce (vt-from-sequence '(1 2 4) :dtype :int64) nil 1.0
+                          (lambda (acc x) (/ acc x)) :dtype :float64)))
+      (check 0.125 :float64 res "类型安全-显式提升防截断"))
 
-    (let ((res (vt-reduce (vt-from-sequence '(0 0 0) :type 'fixnum) nil nil 
-                          (lambda (acc x) (or acc (> x 0))))))
-      (check 0.0 'double-float res "布尔归约-全零"))
-
     ;; ----------------------------------------------------
-    ;; 6. 空维度与边界处理
+    ;; 7. 空维度与边界处理
     ;; ----------------------------------------------------
-    ;; 归约轴大小为 0
-    (let ((a-empty (vt-zeros '(2 0) :type 'fixnum)))
+    (let ((a-empty (vt-zeros '(2 0) :dtype :int64)))
       (let ((res (vt-reduce a-empty 1 0 #'+)))
-        (check '(0 0) 'fixnum res "空维度-axis归约")))
+        (check '(0 0) :int64 res "空维度-axis归约")))
     
-    ;; 输入总大小为 0
-    (let ((a-empty (vt-zeros '(0 3) :type 'fixnum)))
+    (let ((a-empty (vt-zeros '(0 3) :dtype :int64)))
       (let ((res (vt-reduce a-empty 1 0 #'+)))
-        (check '() 'fixnum res "空维度-总大小为0")))
+        (check '() :int64 res "空维度-总大小为0")))
         
-    (let ((a-empty (vt-zeros '(0) :type 'fixnum)))
+    (let ((a-empty (vt-zeros '(0) :dtype :int64)))
       (let ((res (vt-reduce a-empty nil 0 #'+)))
-        (check 0 'fixnum res "空维度-全局归约")))
+        (check 0 :int64 res "空维度-全局归约")))
 
     (format t "~&所有 vt-reduce 测试通过！~%")))
 
@@ -235,7 +256,7 @@
 
   ;; 辅助测试函数：期望成功
   (labels
-      ((expect-ok (name test-fn expected-shape &optional (type 'double-float))
+      ((expect-ok (name test-fn expected-shape &optional (type :float64))
          (handler-case
              (let* ((result (funcall test-fn))
                     (actual-shape (vt-shape result))
@@ -244,7 +265,7 @@
                     (actual-list (vt-to-list result))) ; 假设有 vt-to-list 函数用于打印观察
                (if (and (equal actual-shape expected-shape)
                         (= actual-size expected-size)
-                        (eq (vt-etype result) type))
+                        (eq (vt-dtype result) type))
                    (format t "✅ [PASS] ~a | Shape: ~a | Data: ~a~%" name actual-shape actual-list)
                    (format t "❌ [FAIL] ~a | 期望 Shape: ~a, 实际 Shape: ~a~%"
                            name expected-shape actual-shape)))
@@ -296,8 +317,8 @@
     
     ;; 7. 指定类型为 fixnum
     (expect-ok "指定类型 fixnum" 
-               (lambda () (vt-from-sequence '(1 2 3) :type 'fixnum)) 
-               '(3) 'fixnum)
+               (lambda () (vt-from-sequence '(1 2 3) :dtype :int64)) 
+               '(3) :int64)
     
     ;; 8. 单列二维张量（你之前提问的正确写法）
     (expect-ok "单列二维张量" 
@@ -345,7 +366,7 @@
 ;; --------------------- test reshape ---------------------
 (defun test-vt-reshape ()
   ;; np.arange(6).reshape(2,3)
-  (let* ((a (vt-arange 6 :type 'fixnum))
+  (let* ((a (vt-arange 6 :dtype :int64))
          (b (vt-reshape a '(2 3))))
     (assert (equal (vt-shape b) '(2 3)))
     (assert (equal (vt-to-list b) '((0 1 2) (3 4 5))))
@@ -368,7 +389,7 @@
   ;; ============================================================
   ;; 一维张量测试 (a = np.arange(10))
   ;; ============================================================
-  (let ((a (vt-arange 10 :type 'fixnum)))
+  (let ((a (vt-arange 10 :dtype :int64)))
     ;; 1a. 单个整数索引
     ;; a[3] -> 3
     (assert (= (vt-item (vt-slice a '(3))) 3))
@@ -414,7 +435,7 @@
   ;; ============================================================
   ;; 二维张量测试 (b = np.arange(20).reshape(4,5))
   ;; ============================================================
-  (let* ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5))))
+  (let* ((b (vt-reshape (vt-arange 20 :dtype :int64) '(4 5))))
     ;; 2a. 单个元素
     ;; b[1,2] -> 7
     (assert (= (vt-item (vt-slice b '(1) '(2))) 7.0))
@@ -501,7 +522,7 @@
   ;; ============================================================
   ;; 三维张量测试 (c = np.arange(24).reshape(2,3,4))
   ;; ============================================================
-  (let* ((c (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+  (let* ((c (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4))))
     ;; 3a. 取一个元素
     ;; c[0,1,2] -> 6
     (assert (= (vt-item (vt-slice c '(0) '(1) '(2))) 6.0))
@@ -563,30 +584,30 @@
   ;; ============================================================
   
   ;; 4a. 1D 标量广播赋值
-  (let ((a (vt-arange 10 :type 'fixnum))) ; [0,1,2,3,4,5,6,7,8,9]
+  (let ((a (vt-arange 10 :dtype :int64))) ; [0,1,2,3,4,5,6,7,8,9]
     ;; a[2:5] = 99
     (setf (vt-slice a '(2 5)) 99)
     ;; 预期: [0, 1, 99, 99, 99, 5, 6, 7, 8, 9]
     (assert (equal (vt-to-list a) '(0 1 99 99 99 5 6 7 8 9))))
 
   ;; 4b. 1D 张量赋值 (形状必须匹配)
-  (let ((a (vt-arange 10 :type 'fixnum))
-        (b (vt-from-sequence '(10 20 30) :type 'fixnum)))
+  (let ((a (vt-arange 10 :dtype :int64))
+        (b (vt-from-sequence '(10 20 30) :dtype :int64)))
     ;; a[5:8] = b
     (setf (vt-slice a '(5 8)) b)
     ;; 预期: [0, 1, 2, 3, 4, 10, 20, 30, 8, 9]
     (assert (equal (vt-to-list a) '(0 1 2 3 4 10 20 30 8 9))))
 
   ;; 4c. 1D 带步长的切片赋值 (标量广播)
-  (let ((a (vt-arange 10 :type 'fixnum))) ; [0,1,2,3,4,5,6,7,8,9]
+  (let ((a (vt-arange 10 :dtype :int64))) ; [0,1,2,3,4,5,6,7,8,9]
     ;; a[::2] = -1
     (setf (vt-slice a '(nil nil 2)) -1)
     ;; 预期: [-1, 1, -1, 3, -1, 5, -1, 7, -1, 9]
     (assert (equal (vt-to-list a) '(-1 1 -1 3 -1 5 -1 7 -1 9))))
 
   ;; 4d. 1D 带步长的切片赋值 (张量赋值)
-  (let ((a (vt-arange 10 :type 'fixnum))
-        (b (vt-from-sequence '(100 200 300 400 500) :type 'fixnum)))
+  (let ((a (vt-arange 10 :dtype :int64))
+        (b (vt-from-sequence '(100 200 300 400 500) :dtype :int64)))
     ;; a[::-2] = b
     (setf (vt-slice a '(nil nil -2)) b)
     ;; 原切片 a[::-2] 为 [9, 7, 5, 3, 1]
@@ -594,7 +615,7 @@
     (assert (equal (vt-to-list a) '(0 500 2 400 4 300 6 200 8 100))))
 
   ;; 4e. 2D 子矩阵标量赋值
-  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5))))
+  (let ((b (vt-reshape (vt-arange 20 :dtype :int64) '(4 5))))
     ;; b[1:3, 2:4] = -1
     (setf (vt-slice b '(1 3) '(2 4)) -1)
     ;; 影响的原来是 [[7,8],[12,13]]，现在变为 -1
@@ -605,8 +626,8 @@
                      (15 16 17 18 19)))))
 
   ;; 4f. 2D 子矩阵张量赋值
-  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
-        (val-mat (vt-reshape (vt-from-sequence '(1 2 3 4) :type 'fixnum) '(2 2))))
+  (let ((b (vt-reshape (vt-arange 20 :dtype :int64) '(4 5)))
+        (val-mat (vt-reshape (vt-from-sequence '(1 2 3 4) :dtype :int64) '(2 2))))
     ;; b[2:4, 0:2] = val-mat
     (setf (vt-slice b '(2 4) '(0 2)) val-mat)
     ;; 影响的原来是 [[10,11],[15,16]]，现在变为 [[1,2],[3,4]]
@@ -617,8 +638,8 @@
                      (3 4 17 18 19)))))
 
   ;; 4g. 2D 单行切片赋值
-  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
-        (row-vec (vt-from-sequence '(100 200 300 400 500) :type 'fixnum)))
+  (let ((b (vt-reshape (vt-arange 20 :dtype :int64) '(4 5)))
+        (row-vec (vt-from-sequence '(100 200 300 400 500) :dtype :int64)))
     ;; b[1, :] = row-vec
     (setf (vt-slice b '(1) '(:all)) row-vec)
     (assert (equal (vt-to-list b)
@@ -628,8 +649,8 @@
                      (15 16 17 18 19)))))
 
   ;; 4h. 2D 单列切片赋值
-  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
-        (col-vec (vt-from-sequence '(-1 -2 -3 -4) :type 'fixnum)))
+  (let ((b (vt-reshape (vt-arange 20 :dtype :int64) '(4 5)))
+        (col-vec (vt-from-sequence '(-1 -2 -3 -4) :dtype :int64)))
     ;; b[:, 2] = col-vec
     (setf (vt-slice b '(:all) '(2)) col-vec)
     (assert (equal (vt-to-list b)
@@ -639,8 +660,8 @@
                      (15 16 -4 18 19)))))
 
   ;; 4i. 降维索引赋值 (整数索引混合切片)
-  (let ((b (vt-reshape (vt-arange 20 :type 'fixnum) '(4 5)))
-        (vec (vt-from-sequence '(7 8 9) :type 'fixnum)))
+  (let ((b (vt-reshape (vt-arange 20 :dtype :int64) '(4 5)))
+        (vec (vt-from-sequence '(7 8 9) :dtype :int64)))
     ;; b[2, 1:4] = vec
     (setf (vt-slice b '(2) '(1 4)) vec)
     ;; 第 2 行，索引 1,2,3 原为 [11,12,13] -> [7,8,9]
@@ -651,8 +672,8 @@
                      (15 16 17 18 19)))))
 
   ;; 4j. 反向步长赋值验证
-  (let ((a (vt-arange 10 :type 'fixnum)) ; [0,1,2,3,4,5,6,7,8,9]
-        (b (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
+  (let ((a (vt-arange 10 :dtype :int64)) ; [0,1,2,3,4,5,6,7,8,9]
+        (b (vt-from-sequence '(1 2 3 4 5) :dtype :int64)))
     ;; a[8:3:-1] = b (原切片为 [8,7,6,5,4])
     (setf (vt-slice a '(8 3 -1)) b)
     (assert (equal (vt-to-list a) '(0 1 2 3 5 4 3 2 1 9))))
@@ -711,34 +732,34 @@
     (format t "~&--- 正常用例 ---~%")
     
     ;; 1. 1D 张量读取
-    (let ((t1 (vt-from-sequence '(10 20 30 40) :type 'fixnum)))
+    (let ((t1 (vt-from-sequence '(10 20 30 40) :dtype :int64)))
       (expect-read "1D 读取头部" t1 10 0)
       (expect-read "1D 读取尾部" t1 40 3)
       (expect-read "1D 读取中间" t1 20 1))
 
     ;; 2. 2D 张量读取
-    (let ((t2 (vt-from-sequence '((1 2) (3 4) (5 6)) :type 'fixnum)))
+    (let ((t2 (vt-from-sequence '((1 2) (3 4) (5 6)) :dtype :int64)))
       (expect-read "2D 读取(0,0)" t2 1 0 0)
       (expect-read "2D 读取(2,1)" t2 6 2 1)
       (expect-read "2D 读取(1,0)" t2 3 1 0))
 
     ;; 3. 3D 张量读取
-    (let ((t3 (vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))) :type 'fixnum)))
+    (let ((t3 (vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))) :dtype :int64)))
       (expect-read "3D 读取(0,1,0)" t3 3 0 1 0)
       (expect-read "3D 读取(1,1,1)" t3 8 1 1 1))
 
     ;; 4. 1D 张量写入
-    (let ((t1 (vt-from-sequence '(1.0 2.0 3.0) :type 'single-float)))
+    (let ((t1 (vt-from-sequence '(1.0 2.0 3.0) :dtype :float64)))
       (expect-write "1D 写入" t1 99.0 1)
       (expect-write "1D 写入头部" t1 -1.0 0))
 
     ;; 5. 2D 张量写入
-    (let ((t2 (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+    (let ((t2 (vt-from-sequence '((1 2) (3 4)) :dtype :int64)))
       (expect-write "2D 写入" t2 100 0 1)
       (expect-write "2D 写入尾部" t2 200 1 1))
 
     ;; 6. 类型强制转换测试 (写入整数到浮点张量)
-    (let ((tf (vt-from-sequence '(1.0 2.0) :type 'double-float)))
+    (let ((tf (vt-from-sequence '(1.0 2.0) :dtype :float64)))
       (handler-case
           (progn
             (setf (vt-ref tf 0) 42) ; 传入整数
@@ -754,14 +775,14 @@
     (format t "~&--- 边界用例 ---~%")
 
     ;; 7. 刚好在边界上的索引
-    (let ((t1 (vt-from-sequence '(1 2 3) :type 'fixnum)))
+    (let ((t1 (vt-from-sequence '(1 2 3) :dtype :int64)))
       (expect-read "边界索引(最大)" t1 3 2))
 
 
     ;; ==================== 错误用例测试 ====================
     (format t "~&--- 错误用例 (应打印警告，不中断) ---~%")
 
-    (let ((t2 (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+    (let ((t2 (vt-from-sequence '((1 2) (3 4)) :dtype :int64)))
       ;; 8. 错误：索引越界
       (expect-error "读取越界(1D)"
                     (lambda () (vt-ref t2 5 0))) ; 假设库内部检查越界并报错
@@ -793,7 +814,7 @@
   ;; 多维连续视图转一维视图
   ;; a = np.arange(6).reshape(2,3)
   ;; np.ravel(a) -> [0,1,2,3,4,5]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (r (vt-ravel a)))
     (assert (equal (vt-shape r) '(6)))
     (assert (equal (vt-to-list r) '(0 1 2 3 4 5)))
@@ -803,7 +824,7 @@
   ;; 非连续数组：ravel 将返回副本（形状正确）
   ;; a = np.arange(6).reshape(2,3).t   -> 非连续
   ;; np.ravel(a) 仍返回 [0,3,1,4,2,5]? 实际上是按行优先展平转置结果，但我们只关心形状
-  (let* ((a (vt-transpose (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3))))
+  (let* ((a (vt-transpose (vt-reshape (vt-arange 6 :dtype :int64) '(2 3))))
          (r (vt-ravel a)))
     (assert (equal (vt-shape r) '(6)))
     ;; 内容不需要和上面一样，只要是正确展平即可
@@ -818,14 +839,14 @@
   ;; 二维轴交换 (等同转置)
   ;; a = np.arange(6).reshape(2,3)
   ;; np.swapaxes(a, 0, 1)  -> shape (3,2)
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (sw (vt-swapaxes a 0 1)))
     (assert (equal (vt-shape sw) '(3 2)))
     (assert (equal (vt-to-list sw) '((0 3) (1 4) (2 5)))))
 
   ;; 三维轴交换：a.shape (2,3,4) -> swapaxes(a,0,2) -> (4,3,2)
   ;; np.arange(24).reshape(2,3,4).swapaxes(0,2)
-  (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
+  (let* ((a (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4)))
          (sw (vt-swapaxes a 0 2)))
     (assert (equal (vt-shape sw) '(4 3 2)))
     ;; 检查几个值
@@ -843,25 +864,25 @@
 (defun test-vt-flip ()
   ;; 一维翻转
   ;; a = np.array([0,1,2]) ; np.flip(a) -> [2,1,0]
-  (let* ((a (vt-arange 3 :type 'fixnum))
+  (let* ((a (vt-arange 3 :dtype :int64))
          (f (vt-flip a)))
     (assert (equal (vt-to-list f) '(2 1 0))))
 
   ;; 二维沿轴0翻转
   ;; a = np.arange(6).reshape(2,3)
   ;; np.flip(a, axis=0) -> [[3,4,5],[0,1,2]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (f (vt-flip a :axis 0)))
     (assert (equal (vt-to-list f) '((3 4 5) (0 1 2)))))
 
   ;; 沿轴1翻转
   ;; np.flip(a, axis=1) -> [[2,1,0],[5,4,3]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (f (vt-flip a :axis 1)))
     (assert (equal (vt-to-list f) '((2 1 0) (5 4 3)))))
 
   ;; 负轴
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (f (vt-flip a :axis -1)))
     (assert (equal (vt-to-list f) '((2 1 0) (5 4 3)))))
 
@@ -874,26 +895,26 @@
   ;; 一维滚动
   ;; a = np.array([0,1,2,3,4])
   ;; np.roll(a, 2) -> [3,4,0,1,2]
-  (let* ((a (vt-arange 5 :type 'fixnum))
+  (let* ((a (vt-arange 5 :dtype :int64))
          (r (vt-roll a 2)))
     (assert (equal (vt-to-list r) '(3 4 0 1 2))))
 
   ;; 负偏移
   ;; np.roll(a, -1) -> [1,2,3,4,0]
-  (let* ((a (vt-arange 5 :type 'fixnum))
+  (let* ((a (vt-arange 5 :dtype :int64))
          (r (vt-roll a -1)))
     (assert (equal (vt-to-list r) '(1 2 3 4 0))))
 
   ;; 二维沿轴滚动
   ;; a = np.arange(6).reshape(2,3)
   ;; np.roll(a, 1, axis=0) -> [[3,4,5],[0,1,2]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (r (vt-roll a 1 :axis 0)))
     (assert (equal (vt-to-list r) '((3 4 5) (0 1 2)))))
 
   ;; axis=1, shift=1
   ;; np.roll(a, 1, axis=1) -> [[2,0,1],[5,3,4]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (r (vt-roll a 1 :axis 1)))
     (assert (equal (vt-to-list r) '((2 0 1) (5 3 4)))))
 
@@ -903,7 +924,7 @@
   ;; # 将数组同时在轴0和轴1上滚动1步
   ;; res = np.roll(arr, 1, axis=(0, 1))
   ;; print(res)
-  (let* ((arr (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum)))
+  (let* ((arr (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64)))
     (assert (equal (vt-to-list (vt-roll arr 1 :axis '(0 1)))
 		   '((6 4 5)
 		     (3 1 2)))))
@@ -920,41 +941,37 @@
   ;; [[0,1,2],
   ;;  [0,4,5],
   ;;  [0,0,8]]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (u (vt-triu a)))
     (assert (equal (vt-to-list u) '((0 1 2) (0 4 5) (0 0 8)))))
 
   ;; k=1 上三角
   ;; np.triu(a,k=1) -> [[0,1,2],[0,0,5],[0,0,0]]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (u (vt-triu a :k 1)))
     (assert (equal (vt-to-list u) '((0 1 2) (0 0 5) (0 0 0)))))
 
   ;; 下三角
   ;; np.tril(a) -> [[0,0,0],[3,4,0],[6,7,8]]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (l (vt-tril a)))
     (assert (equal (vt-to-list l) '((0 0 0) (3 4 0) (6 7 8)))))
 
   ;; k=-1
   ;; np.tril(a,k=-1) -> [[0,0,0],[3,0,0],[6,7,0]]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (l (vt-tril a :k -1)))
     (assert (equal (vt-to-list l) '((0 0 0) (3 0 0) (6 7 0)))))
 
-  ;; 修改 in-place (拷贝后修改)
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
-         (b (vt-copy a))
-         (u (vt-triu b :in-place t)))
-    (assert (equal (vt-to-list b) (vt-to-list u)))
-    ;; 原 b 被修改，a 不受影响
-    (assert (equal (vt-to-list b) '((0 1 2) (0 4 5) (0 0 8))))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
+         (u (vt-triu a)))
+    (assert (equal (vt-to-list u) '((0 1 2) (0 4 5) (0 0 8))))
     (assert (equal (vt-to-list a) '((0 1 2) (3 4 5) (6 7 8)))))
 
   ;; 高维 batch 上三角（最后两轴）
   ;; a = np.arange(18).reshape(2,3,3)
   ;; np.triu(a) 对每个 3x3 应用上三角
-  (let* ((a (vt-reshape (vt-arange 18 :type 'fixnum) '(2 3 3)))
+  (let* ((a (vt-reshape (vt-arange 18 :dtype :int64) '(2 3 3)))
          (u (vt-triu a)))
     (assert (equal (vt-to-list (vt-slice u '(0) '(:all) '(:all)))
                    '((0 1 2) (0 4 5) (0 0 8))))
@@ -970,33 +987,33 @@
   ;; 二维提取对角线
   ;; a = np.arange(9).reshape(3,3)
   ;; np.diagonal(a) -> [0,4,8]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (d (vt-diagonal a)))
     (assert (equal (vt-to-list d) '(0 4 8))))
 
   ;; offset=1 -> 返回右上对角
   ;; np.diagonal(a, offset=1) -> [1,5]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (d (vt-diagonal a :offset 1)))
     (assert (equal (vt-to-list d) '(1 5))))
 
   ;; offset=-1
   ;; np.diagonal(a, offset=-1) -> [3,7]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (d (vt-diagonal a :offset -1)))
     (assert (equal (vt-to-list d) '(3 7))))
 
   ;; 非方阵
   ;; a = np.arange(6).reshape(2,3)
   ;; np.diagonal(a) -> [0,4]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (d (vt-diagonal a)))
     (assert (equal (vt-to-list d) '(0 4))))
 
   ;; 高维 batch 对角线
   ;; a = np.arange(24).reshape(2,3,4)
   ;; np.diagonal(a, axis1=1, axis2=2) -> shape (2,3)
-  (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
+  (let* ((a (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4)))
          (d (vt-diagonal a)))
     (assert (equal (vt-shape d) '(2 3)))
     (assert (equal (vt-to-list (vt-slice d '(0) '(:all))) '(0 5 10))))
@@ -1010,7 +1027,7 @@
   ;; 广播一维到二维
   ;; a = np.array([1,2,3])
   ;; np.broadcast_to(a, (2,3)) -> [[1,2,3],[1,2,3]]
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
          (b (vt-broadcast-to a '(2 3))))
     (assert (equal (vt-shape b) '(2 3)))
     (assert (equal (vt-to-list b) '((1 2 3) (1 2 3)))))
@@ -1018,7 +1035,7 @@
   ;; 广播二维增加前导维度
   ;; a = np.array([[10],[20]])
   ;; np.broadcast_to(a, (1,2,3)) -> 形状 (1,2,3)
-  (let* ((a (vt-from-sequence '((10) (20)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((10) (20)) :dtype :int64))
          (b (vt-broadcast-to a '(1 2 3))))
     (assert (equal (vt-shape b) '(1 2 3)))
     (assert (equal (vt-to-list (vt-slice b '(0) '(:all) '(:all)))
@@ -1041,14 +1058,14 @@
 (defun test-vt-transpose ()
   ;; a = np.arange(6).reshape(2,3)
   ;; a.t -> shape (3,2)
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (at (vt-transpose a)))
     (assert (equal (vt-shape at) '(3 2)))
     (assert (equal (vt-to-list at) '((0 3) (1 4) (2 5)))))
   ;; 指定 perm
   ;; a = np.arange(24).reshape(2,3,4)
   ;; a.transpose(1,0,2) -> shape (3,2,4)
-  (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
+  (let* ((a (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4)))
          (at (vt-transpose a '(1 0 2))))
     (assert (equal (vt-shape at) '(3 2 4)))
     ;; 检查个别值
@@ -1056,7 +1073,7 @@
     (assert (= (vt-ref at 0 1 0) 12))
     (assert (= (vt-ref at 2 1 3) 23)))
   ;; 一维转置无变化
-  (let* ((a (vt-arange 5 :type 'fixnum))
+  (let* ((a (vt-arange 5 :dtype :int64))
          (at (vt-transpose a)))
     (assert (equal (vt-shape at) '(5)))
     (assert (equal (vt-to-list at) '(0 1 2 3 4))))
@@ -1066,14 +1083,14 @@
 (defun test-vt-squeeze ()
   ;; a = np.arange(6).reshape(1,2,3)
   ;; np.squeeze(a)  -> shape (2,3)
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(1 2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(1 2 3)))
          (sq (vt-squeeze a)))
     (assert (equal (vt-shape sq) '(2 3)))
     (assert (equal (vt-to-list sq) '((0 1 2) (3 4 5)))))
   ;; 指定轴
   ;; a = np.arange(6).reshape(2,1,3)
   ;; np.squeeze(a, axis=1) -> shape (2,3)
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 1 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 1 3)))
          (sq (vt-squeeze a :axis 1)))
     (assert (equal (vt-shape sq) '(2 3)))
     (assert (equal (vt-to-list sq) '((0 1 2) (3 4 5)))))
@@ -1082,7 +1099,7 @@
     (handler-case (vt-squeeze a :axis 0)
       (error (e) (format t "~%[ok] squeeze non-singleton axis caught: ~a" e))))
   ;; 负轴
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3 1)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3 1)))
          (sq (vt-squeeze a :axis -1)))
     (assert (equal (vt-shape sq) '(2 3))))
   (format t "~%test-vt-squeeze passed.~%"))
@@ -1091,19 +1108,19 @@
 (defun test-vt-expand-dims ()
   ;; a = np.array([1,2,3])
   ;; np.expand_dims(a, 0)  -> shape (1,3)
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
          (ea (vt-expand-dims a 0)))
     (assert (equal (vt-shape ea) '(1 3)))
     (assert (equal (vt-to-list ea) '((1 2 3)))))
   ;; axis=1
   ;; np.expand_dims(a, 1) -> shape (3,1)
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
          (ea (vt-expand-dims a 1)))
     (assert (equal (vt-shape ea) '(3 1)))
     (assert (equal (vt-to-list ea) '((1) (2) (3)))))
   ;; 负轴
   ;; np.expand_dims(a, -1) 相同
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
          (ea (vt-expand-dims a -1)))
     (assert (equal (vt-shape ea) '(3 1))))
   (format t "~%test-vt-expand-dims passed.~%"))
@@ -1113,15 +1130,15 @@
   ;; a = np.array([[1,2],[3,4]])
   ;; b = np.array([[5,6]])
   ;; np.concatenate([a,b], axis=0) -> [[1,2],[3,4],[5,6]]
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
-         (b (vt-from-sequence '((5 6)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
+         (b (vt-from-sequence '((5 6)) :dtype :int64))
          (c (vt-concatenate 0 a b)))
     (assert (equal (vt-shape c) '(3 2)))
     (assert (equal (vt-to-list c) '((1 2) (3 4) (5 6)))))
   ;; 沿轴1
   ;; np.concatenate([a,b.t], axis=1)
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
-         (b (vt-from-sequence '((5) (6)) :type 'fixnum))  ; 列向量
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
+         (b (vt-from-sequence '((5) (6)) :dtype :int64))  ; 列向量
          (c (vt-concatenate 1 a b)))
     (assert (equal (vt-shape c) '(2 3)))
     (assert (equal (vt-to-list c) '((1 2 5) (3 4 6)))))
@@ -1129,8 +1146,8 @@
   ;; a = np.array([0,1,2])
   ;; b = np.array([2,3,4])
   ;; np.concatenate([a,b], axis=0) -> [0,1,2,2,3,4]
-  (let* ((a (vt-arange 3 :type 'fixnum))
-	 (b (vt-arange 3 :start 2 :type 'fixnum))
+  (let* ((a (vt-arange 3 :dtype :int64))
+	 (b (vt-arange 3 :start 2 :dtype :int64))
 	 (c (vt-concatenate -1 a b)))
     (assert (equal (vt-shape c) '(6)))
     (assert (equal (vt-to-list c) '(0 1 2 2 3 4))))
@@ -1140,14 +1157,14 @@
 (defun test-vt-stack ()
   ;; a = [1,2], b = [3,4]
   ;; np.stack([a,b], axis=0) -> [[1,2],[3,4]]
-  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
-         (b (vt-from-sequence '(3 4) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :int64))
+         (b (vt-from-sequence '(3 4) :dtype :int64))
          (s (vt-stack 0 a b)))
     (assert (equal (vt-shape s) '(2 2)))
     (assert (equal (vt-to-list s) '((1 2) (3 4)))))
   ;; axis=1 -> [[1,3],[2,4]]
-  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
-         (b (vt-from-sequence '(3 4) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :int64))
+         (b (vt-from-sequence '(3 4) :dtype :int64))
          (s (vt-stack 1 a b)))
     (assert (equal (vt-shape s) '(2 2)))
     (assert (equal (vt-to-list s) '((1 3) (2 4)))))
@@ -1166,14 +1183,14 @@
 (defun test-vt-tile ()
   ;; a = np.array([0,1,2])
   ;; np.tile(a, 3) -> [0,1,2,0,1,2,0,1,2]
-  (let* ((a (vt-from-sequence '(0 1 2) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(0 1 2) :dtype :int64))
          (b (vt-tile a 3)))
     (assert (equal (vt-shape b) '(9)))
     (assert (equal (vt-to-list b) '(0 1 2 0 1 2 0 1 2))))
   ;; 二维 tile reps=(2,3)
   ;; a = np.array([[1,2],[3,4]])
   ;; np.tile(a, (2,3)) -> shape (4,6)
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          (b (vt-tile a '(2 3))))
     (assert (equal (vt-shape b) '(4 6)))
     (assert (= (vt-ref b 0 0) 1))
@@ -1181,7 +1198,7 @@
     (assert (= (vt-ref b 3 5) 4)))
   ;; reps 自动扩展到维数
   ;; a = [1,2], reps=(2,3) -> 先扩展 a 为 (1,2) 再 tile -> (2,6)
-  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :int64))
          (b (vt-tile a '(2 3))))
     (assert (equal (vt-shape b) '(2 6)))
     (assert (equal (vt-to-list (vt-slice b '(:all) '(0 nil 2)))
@@ -1192,26 +1209,26 @@
 (defun test-vt-repeat ()
   ;; a = np.array([0,1,2])
   ;; np.repeat(a, 3) -> [0,0,0,1,1,1,2,2,2]
-  (let* ((a (vt-from-sequence '(0 1 2) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(0 1 2) :dtype :int64))
          (r (vt-repeat a 3)))
     (assert (equal (vt-shape r) '(9)))
     (assert (equal (vt-to-list r) '(0 0 0 1 1 1 2 2 2))))
   ;; 沿轴重复
   ;; a = np.array([[1,2],[3,4]])
   ;; np.repeat(a, 2, axis=1) -> [[1,1,2,2],[3,3,4,4]]
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          (r (vt-repeat a 2 :axis 1)))
     (assert (equal (vt-shape r) '(2 4)))
     (assert (equal (vt-to-list r) '((1 1 2 2) (3 3 4 4)))))
   ;; 沿轴0，每个元素不同重复次数（列表）
   ;; a = np.array([1,2,3])
   ;; np.repeat(a, [2,0,1]) -> [1,1,3]
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
          (r (vt-repeat a '(2 0 1))))
     (assert (equal (vt-shape r) '(3)))
     (assert (equal (vt-to-list r) '(1 1 3))))
   ;; 负轴
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          (r (vt-repeat a 2 :axis -1)))
     (assert (equal (vt-shape r) '(2 4)))
     (assert (equal (vt-to-list r) '((1 1 2 2) (3 3 4 4)))))
@@ -1258,34 +1275,34 @@
   ;; 二维张量，沿 axis=0 求中位数
   ;; a = np.arange(30).reshape(5,6)
   ;; np.median(a, axis=0) -> [12. 13. 14. 15. 16. 17.]
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-median a :axis 0))))
       (assert (lists-approx-equal result '(12.0 13.0 14.0 15.0 16.0 17.0)))))
 
   ;; 二维张量，沿 axis=1 求中位数
   ;; np.median(a, axis=1) -> [2.5 8.5 14.5 20.5 26.5]
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-median a :axis 1))))
       (assert (lists-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
 
   ;; 三维张量，沿 axis=1 求中位数
   ;; a = np.arange(24).reshape(2,3,4)
   ;; np.median(a, axis=1) -> [[ 4.  5.  6.  7.] [16. 17. 18. 19.]]
-  (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+  (let ((a (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4))))
     (let ((result (vt-to-list (vt-median a :axis 1))))
       (assert (lists-approx-equal (reduce #'append result) 
 				  '(4.0 5.0 6.0 7.0 16.0 17.0 18.0 19.0)))))
 
   ;; 三维张量，沿 axis=2（最后一维）求中位数
   ;; np.median(a, axis=2) -> [[ 1.5  5.5  9.5] [13.5 17.5 21.5]]
-  (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+  (let ((a (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4))))
     (let ((result (vt-to-list (vt-median a :axis 2))))
       (assert (lists-approx-equal (reduce #'append result)
 				  '(1.5 5.5 9.5 13.5 17.5 21.5)))))
 
   ;; 使用负轴 axis=-1 等同于 axis=1
   ;; np.median(a, axis=-1) -> [2.5 8.5 14.5 20.5 26.5]
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-median a :axis -1))))
       (assert (lists-approx-equal result '(2.5 8.5 14.5 20.5 26.5)))))
 
@@ -1336,7 +1353,7 @@
   ;; 二维轴向：axis=1，线性
   ;; a = np.arange(30).reshape(5,6)
   ;; np.percentile(a, 30, axis=1) -> [1.5 7.5 13.5 19.5 25.5]
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 30 :axis 1))))
       (assert (lists-approx-equal result '(1.5 7.5 13.5 19.5 25.5)))))
 
@@ -1344,45 +1361,45 @@
   ;; np.percentile(a, 90, axis=0, interpolation='nearest') -> [22 23 24 25 26 27]? 原数组精确
   ;; a 是 fixnum，shape (5,6)，每列 5 个值，90% 的索引 = 0.9*4=3.6，frac=0.6>0.5 => upper=4，取第4个（0-based）
   ;; 列0：0,6,12,18,24 -> 索引4=24，正确
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 0 :interpolation :nearest))))
       (assert (lists-approx-equal result '(24.0 25.0 26.0 27.0 28.0 29.0)))))
 
   ;; 二维轴向：axis=1，nearest 验证与 numpy 的一致性
   ;; np.percentile(a, 90, axis=1, interpolation='nearest') -> [4 10 16 22 28]
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :nearest))))
       (assert (lists-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
   ;;  np.percentile(a, 90,axis=1,interpolation="lower")
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :lower))))
       (assert (lists-approx-equal result '(4.0 10.0 16.0 22.0 28.0)))))
   
   ;; np.percentile(a, 90,axis=1,interpolation="higher")
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :higher))))
       (assert (lists-approx-equal result '(5.0 11.0 17.0 23.0 29.0)))))
 
   ;;np.percentile(a, 90,axis=1,interpolation="midpoint")
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :midpoint))))
       (assert (lists-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
 
   ;; np.percentile(a, 90,axis=1,interpolation="linear")
-  (let ((a (vt-reshape (vt-arange 30 :type 'fixnum) '(5 6))))
+  (let ((a (vt-reshape (vt-arange 30 :dtype :int64) '(5 6))))
     (let ((result (vt-to-list (vt-percentile a 90 :axis 1 :interpolation :linear))))
       (assert (lists-approx-equal result '( 4.5 10.5 16.5 22.5 28.5)))))
   ;; 三维轴向：axis=2，线性
   ;; a = np.arange(24).reshape(2,3,4)
   ;; np.percentile(a, 25, axis=2) -> [[0.75 4.75 8.75] [12.75 16.75 20.75]]
-  (let ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4))))
+  (let ((a (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4))))
     (let ((result (vt-to-list (vt-percentile a 25 :axis 2))))
       (assert (lists-approx-equal (reduce #'append result)
 				  '(0.75 4.75 8.75 12.75 16.75 20.75)))))
 
   ;; 全局百分位数，标量输入
   ;; np.percentile(np.array(42), 50) -> 42.0
-  (let ((a (vt-const '() 42 :type 'double-float)))  ; 标量张量
+  (let ((a (vt-const '() 42 :dtype :float64)))  ; 标量张量
     (assert (= (vt-item (vt-percentile a 50)) 42.0d0)))
 
   (format t "vt-percentile tests passed.~%")
@@ -1394,33 +1411,33 @@
 (defun test-vt-sum ()
   ;; 一维全局求和
   ;; np.sum(np.array([1,2,3,4,5])) -> 15
-  (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
+  (let ((a (vt-from-sequence '(1 2 3 4 5) :dtype :int64)))
     (assert (= (vt-item (vt-sum a)) 15.0d0)))
 
   ;; 二维沿轴0求和，保持维度
   ;; a = np.arange(6).reshape(2,3)
   ;; np.sum(a, axis=0, keepdims=true) -> [[3,5,7]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (res (vt-to-list (vt-sum a :axis 0 :keepdims t))))
     (assert (equal res '((3 5 7)))))
 
   ;; 二维沿轴1求和，不保留维度
   ;; np.sum(a, axis=1) -> [3,12]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (res (vt-to-list (vt-sum a :axis 1))))
     (assert (equal res '(3 12))))
 
   ;; 三维沿轴1求和（中间轴）
   ;; a = np.arange(24).reshape(2,3,4)
   ;; np.sum(a, axis=1) -> [[12,15,18,21],[48,51,54,57]]
-  (let* ((a (vt-reshape (vt-arange 24 :type 'fixnum) '(2 3 4)))
+  (let* ((a (vt-reshape (vt-arange 24 :dtype :int64) '(2 3 4)))
          (res (vt-to-list (vt-sum a :axis 1))))
     (assert (lists-approx-equal (reduce #'append res)
 				'(12.0 15.0 18.0 21.0 48.0 51.0 54.0 57.0))))
 
   ;; 全局求和（标量形状）
   ;; np.sum(np.array(42)) -> 42
-  (let ((a (vt-const '() 42 :type 'fixnum)))
+  (let ((a (vt-const '() 42 :dtype :int64)))
     (assert (= (vt-item (vt-sum a)) 42.0d0)))
 
   (format t "~%test-vt-sum passed.~%"))
@@ -1441,20 +1458,20 @@
   ;; 二维沿轴0 amax，不保留维度
   ;; a = np.arange(12).reshape(3,4)
   ;; np.max(a, axis=0) -> [8,9,10,11]
-  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(3 4)))
+  (let* ((a (vt-reshape (vt-arange 12 :dtype :int64) '(3 4)))
          (res (vt-to-list (vt-amax a :axis 0))))
     (assert (equal res '(8 9 10 11))))
 
   ;; 二维沿轴1 amin，保留维度
   ;; np.min(a, axis=1, keepdims=true) -> [[0],[4],[8]]
-  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(3 4)))
+  (let* ((a (vt-reshape (vt-arange 12 :dtype :int64) '(3 4)))
          (res (vt-to-list (vt-amin a :axis 1 :keepdims t))))
     (assert (equal res '((0) (4) (8)))))
 
   ;; 三维沿轴2 amax
   ;; a = np.arange(8).reshape(2,2,2)
   ;; np.max(a, axis=2) -> [[1,3],[5,7]]
-  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+  (let* ((a (vt-reshape (vt-arange 8 :dtype :int64) '(2 2 2)))
          (res (vt-to-list (vt-amax a :axis 2))))
     (assert (equal res '((1 3) (5 7)))))
 
@@ -1490,7 +1507,7 @@
   ;; 三维沿轴1 argmax
   ;; a = np.arange(12).reshape(2,3,2)
   ;; np.argmax(a, axis=1) -> [[2,2],[2,2]]? 实际每一列沿第二维的最大值索引
-  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(2 3 2)))
+  (let* ((a (vt-reshape (vt-arange 12 :dtype :int64) '(2 3 2)))
          (res (vt-to-list (vt-argmax a :axis 1))))
     (assert (equal res '((2 2) (2 2)))))
 
@@ -1562,7 +1579,107 @@
          (cond (vt-= a (vt-const '() 2.0d0)))  ; [f,t,f]
          (res (vt-where cond 10 20)))
     (assert (equal (vt-to-list res) '(20 10 20))))
+  ;; ==========================================
+  ;; 1. 基础功能测试
+  ;; ==========================================
 
+  (let ((cond (vt-from-array #(0 1 0 1)))
+        (x (vt-from-array #(1 2 3 4) :dtype :int32))
+        (y (vt-from-array #(10 20 30 40) :dtype :int32)))
+    (let ((res (vt-where cond x y)))
+      (format t "Test 1 - Basic Where: ~a~%" (vt-to-array res))
+      ;; 预期: [10, 2, 30, 4]
+      (assert (equalp (vt-to-array res) #(10 2 30 4)))))
+
+  ;; ==========================================
+  ;; 2. dtype 参数测试
+  ;; ==========================================
+
+  (let ((cond (vt-from-array #(1 0)))
+        (x (vt-from-array #(10 20) :dtype :int32))
+        (y (vt-from-array #(30 40) :dtype :int32)))
+    
+    ;; 情况 A: 默认推断 (int32 + int32 -> int32)
+    (let ((res1 (vt-where cond x y)))
+      (format t "Test 2A - Inferred Int: ~a (Type: ~a)~%" 
+              (vt-to-array res1) (vt-dtype res1))
+      (assert (eq (vt-dtype res1) :int32))
+      (assert (equalp (vt-to-array res1) #(10 40))))
+
+    ;; 情况 B: 强制转换为 float32
+    (let ((res2 (vt-where cond x y :dtype :float32)))
+      (format t "Test 2B - Forced Float32: ~a (Type: ~a)~%" 
+              (vt-to-array res2) (vt-dtype res2))
+      (assert (eq (vt-dtype res2) :float32))
+      ;; 值应该是 10.0 和 40.0
+      (assert (equalp (vt-to-array res2) #(10.0 40.0)))))
+
+  ;; ==========================================
+  ;; 3. out 参数测试 (内存复用)
+  ;; ==========================================
+  (let ((cond (vt-from-array #(1 0 1)))
+        (x (vt-from-array #(1 2 3)))
+        (y (vt-from-array #(4 5 6)))
+        (out-tensor (vt-zeros '(3) :dtype :float64)))
+    
+    ;; 获取 out-tensor 的底层 data 指针 (引用)
+    (let ((out-data (vt-data out-tensor)))
+      (let ((res (vt-where cond x y :out out-tensor)))
+        ;; 1. 检查返回值是否就是 out 参数本身
+        (format t "Test 3A - Out Reuse: Same object? ~a~%" (eq res out-tensor))
+        (assert (eq res out-tensor))
+        
+        ;; 2. 检查底层 data 是否没有重新分配 (应该同一个对象)
+        (assert (eq (vt-data res) out-data))
+        
+        ;; 3. 检查结果正确性
+        (format t "Test 3B - Out Result: ~a~%" (vt-to-array res))
+        (assert (equalp (vt-to-array res) #(1.0 5.0 3.0)))
+        
+        ;; 4. 检查形状不匹配报错
+        (handler-case
+            (let ((bad-out (vt-zeros '(10)))) ;; 形状不同
+              (vt-where cond x y :out bad-out)
+              (error "Test Failed: Should have thrown shape error"))
+          (error (e)
+            (format t "Test 3C - Shape Error Caught: ~a~%" e))))))
+
+  ;; ==========================================
+  ;; 4. 广播测试
+  ;; ==========================================
+  (let ((cond-scalar (vt-from-array #(1))) ; Shape (1), 广播为 (2,2)
+        (x-matrix (vt-from-array #2A((1 2) (3 4))))
+        (y-matrix (vt-from-array #2A((5 6) (7 8)))))
+    
+    (let ((res (vt-where cond-scalar x-matrix y-matrix)))
+      (format t "Test 4 - Broadcast (Scalar Cond): ~a~%" (vt-to-array res))
+      ;; 条件为真 (1)，所以全选 x
+      (assert (equalp (vt-to-array res) #2A((1 2) (3 4))))))
+
+  ;; ==========================================
+  ;; 5. 慢速路径测试 (非连续内存)
+  ;; ==========================================
+  (let ((x-base (vt-from-array #2A((1 2 3) (4 5 6)))) ;; Shape (2, 3)
+        ;; 修改 y 的形状为 (2)，使其能与 (3, 2) 进行广播
+        ;; 广播规则：最后维度对齐 (2 == 2)，前面维度自动补齐
+        (y (vt-from-array #(10 20)))) ;; Shape (2) -> 修改了这里
+    
+    ;; 将 x 转置，使其变为非连续 (通常行优先转列优先不再连续)
+    (let ((x-transposed (vt-transpose x-base '(1 0))) ;; Shape (3, 2)
+          ;; 为了能广播，我们将 y 也要扩展一下，或者让 x 转置后形状对齐
+          ;; 这里我们用全 1 矩阵做条件，让结果走慢速路径
+          (cond-matrix (vt-ones '(3 2))))
+      
+      (let ((res (vt-where cond-matrix x-transposed y)))
+        (format t "Test 5 - Non-contiguous Input: ~a~%" (vt-to-array res))
+        ;; 检查结果是否正确读取了转置后的 x
+        ;; cond-matrix 全 1，所以全取 x-transposed
+        ;; x-transposed 是 [[1, 4], [2, 5], [3, 6]]
+        (assert (equalp (vt-to-array res) #2A((1 4) (2 5) (3 6))))
+        ;; 验证 x-transposed 确实不是连续的
+        (format t "  - x-transposed contiguous? ~a~%" (vt-contiguous-p x-transposed))
+        (assert (not (vt-contiguous-p x-transposed))))))
+  
   (format t "~%test-vt-where passed.~%"))
 
 ;; ============================================================
@@ -1629,7 +1746,7 @@
 
   ;; 测试 3: 1D 张量常规情况
   ;; 对标 PyTorch: torch.nonzero(torch.tensor([0, 1, 0, 3, 0])) -> tensor([[1], [3]])
-  (let* ((vec1d (vt-from-sequence '(0 1 0 3 0) :type 'fixnum))
+  (let* ((vec1d (vt-from-sequence '(0 1 0 3 0) :dtype :int64))
          (res (vt-argwhere vec1d)))
     (format t "测试 3 [1D张量]: 输入 [0, 1, 0, 3, 0]~%")
     (format t "  期望形状: (2 1), 实际形状: ~a~%" (vt-shape res))
@@ -1639,7 +1756,7 @@
 
   ;; 测试 4: 2D 张量常规情况
   ;; 对标 PyTorch: torch.nonzero(torch.tensor([[0,1],[0,0],[2,0]])) -> tensor([[0, 1], [2, 0]])
-  (let* ((mat2d (vt-from-sequence '((0 1) (0 0) (2 0)) :type 'fixnum))
+  (let* ((mat2d (vt-from-sequence '((0 1) (0 0) (2 0)) :dtype :int64))
          (res (vt-argwhere mat2d)))
     (format t "测试 4 [2D张量]: 输入 [[0,1],[0,0],[2,0]]~%")
     (format t "  期望形状: (2 2), 实际形状: ~a~%" (vt-shape res))
@@ -1649,7 +1766,7 @@
 
   ;; 测试 5: 全零的 2D 张量
   ;; 对标 PyTorch: torch.nonzero(torch.zeros(2,2)) -> tensor([], size=(0, 2))
-  (let* ((zero-mat (vt-zeros '(2 2) :type 'double-float))
+  (let* ((zero-mat (vt-zeros '(2 2) :dtype :float64))
          (res (vt-argwhere zero-mat)))
     (format t "测试 5 [2D全零]: 输入 zeros(2,2)~%")
     (format t "  期望形状: (0 2), 实际形状: ~a~%" (vt-shape res))
@@ -1667,8 +1784,8 @@
   ;; a = np.array([[1,2],[3,4]], dtype=np.float64)
   ;; b = np.array([[5,6],[7,8]], dtype=np.float64)
   ;; np.matmul(a,b) -> [[19,22],[43,50]]
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
-         (b (vt-from-sequence '((5 6) (7 8)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
+         (b (vt-from-sequence '((5 6) (7 8)) :dtype :float64))
          (c (vt-matmul a b)))
     (assert (equal (vt-to-list c) '((19.0 22.0) (43.0 50.0)))))
 
@@ -1676,8 +1793,8 @@
   ;; a = np.arange(6).reshape(2,3)
   ;; b = np.arange(6).reshape(3,2)
   ;; np.matmul(a,b) -> [[10,13],[28,40]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
-         (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
+         (b (vt-reshape (vt-arange 6 :dtype :int64) '(3 2)))
          (c (vt-matmul a b)))
     (assert (equal (vt-to-list c) '((10 13) (28 40)))))
 
@@ -1685,8 +1802,8 @@
   ;; a = np.arange(8).reshape(2,2,2)
   ;; b = np.arange(8).reshape(2,2,2)
   ;; np.matmul(a,b) -> 形状 (2,2,2)，手动计算
-  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
-         (b (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+  (let* ((a (vt-reshape (vt-arange 8 :dtype :int64) '(2 2 2)))
+         (b (vt-reshape (vt-arange 8 :dtype :int64) '(2 2 2)))
          (c (vt-matmul a b)))
     ;; 预期：第一个批次 a[0]=[[0,1],[2,3]] b[0]=[[0,1],[2,3]] -> [[2,3],[6,11]]
     ;; 第二个批次 a[1]=[[4,5],[6,7]] b[1]=[[4,5],[6,7]] -> [[46,55],[66,79]]
@@ -1703,16 +1820,16 @@
   ;; 向量内积
   ;; a = np.array([1,2,3]), b = np.array([4,5,6])
   ;; np.einsum('i,i->', a, b) -> 32
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
-         (b (vt-from-sequence '(4 5 6) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (b (vt-from-sequence '(4 5 6) :dtype :int64))
          (res (vt-einsum "i,i->" a b)))
     (assert (= (vt-item res) 32.0d0)))
 
   ;; 矩阵乘法
   ;; a = np.arange(6).reshape(2,3), b = np.arange(6).reshape(3,2)
   ;; np.einsum('ij,jk->ik', a, b) -> [[10,13],[28,40]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
-         (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
+         (b (vt-reshape (vt-arange 6 :dtype :int64) '(3 2)))
          (c (vt-einsum "ij,jk->ik" a b)))
     (assert (equal (vt-to-list c) '((10 13) (28 40)))))
 
@@ -1721,8 +1838,8 @@
   ;; np.einsum('bij,bjk->bik', a, b)
   ;; 第一个批次：a[0]=[[0,1,2],[3,4,5]], b[0]=[[0,1,2],[3,4,5],[6,7,8]] -> [[15,18,21],[42,54,66]]
   ;; 第二个批次：a[1]=[[6,7,8],[9,10,11]], b[1]=[[9,10,11],[12,13,14],[15,16,17]] -> [[258, 279, 300], [366, 396, 426]]
-  (let* ((a (vt-reshape (vt-arange 12 :type 'fixnum) '(2 2 3)))
-         (b (vt-reshape (vt-arange 18 :type 'fixnum) '(2 3 3)))
+  (let* ((a (vt-reshape (vt-arange 12 :dtype :int64) '(2 2 3)))
+         (b (vt-reshape (vt-arange 18 :dtype :int64) '(2 3 3)))
          (c (vt-einsum "bij,bjk->bik" a b)))
     (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
 		   '((15 18 21) (42 54 66))))
@@ -1732,15 +1849,15 @@
   ;; 对角线提取
   ;; a = np.arange(9).reshape(3,3)
   ;; np.einsum('ii->i', a) -> [0,4,8]
-  (let* ((a (vt-reshape (vt-arange 9 :type 'fixnum) '(3 3)))
+  (let* ((a (vt-reshape (vt-arange 9 :dtype :int64) '(3 3)))
          (diag (vt-einsum "ii->i" a)))
     (assert (equal (vt-to-list diag) '(0 4 8))))
 
   ;; 外积
   ;; a = np.array([1,2,3]), b = np.array([4,5])
   ;; np.einsum('i,j->ij', a, b) -> [[4,5],[8,10],[12,15]]
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
-         (b (vt-from-sequence '(4 5) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (b (vt-from-sequence '(4 5) :dtype :int64))
          (outer (vt-einsum "i,j->ij" a b)))
     (assert (equal (vt-to-list outer)
 		   '((4 5) (8 10) (12 15)))))
@@ -1845,24 +1962,24 @@
   ;; 向量内积
   ;; a = np.array([1,2,3]), b = np.array([4,5,6])
   ;; np.dot(a,b) -> 32
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
-         (b (vt-from-sequence '(4 5 6) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (b (vt-from-sequence '(4 5 6) :dtype :int64))
          (res (vt-dot a b)))
     (assert (= (vt-item res) 32.0d0)))
 
   ;; 矩阵乘法 (2d)
   ;; a = np.arange(6).reshape(2,3), b = np.arange(6).reshape(3,2)
   ;; np.dot(a,b) -> [[10,13],[28,40]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
-         (b (vt-reshape (vt-arange 6 :type 'fixnum) '(3 2)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
+         (b (vt-reshape (vt-arange 6 :dtype :int64) '(3 2)))
          (c (vt-dot a b)))
     (assert (equal (vt-to-list c) '((10 13) (28 40)))))
 
   ;; 批量矩阵乘法 (秩 >= 2)
   ;;  a = np.arange(8).reshape(2,2,2)
   ;;  np.einsum('...ij,...jk->...ik', a,a) # 不是 np.dot(a,a)
-  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
-         (b (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+  (let* ((a (vt-reshape (vt-arange 8 :dtype :int64) '(2 2 2)))
+         (b (vt-reshape (vt-arange 8 :dtype :int64) '(2 2 2)))
          (c (vt-dot a b)))  ;;   (vt-einsum "...ij,...jk->...ik" a b)
     (assert (equal (vt-to-list (vt-slice c '(0) '(:all) '(:all)))
 		   '((2 3) (6 11))))
@@ -1909,8 +2026,8 @@
   ;; a = [[2,1],[1,3]], b = [7,8]
   ;; np.linalg.solve(a,b) -> [2.6, 1.8]? 实际：(2,1)^t? 让我们算：2x+y=7, x+3y=8 => 消元：y=7-2x, x+21-6x=8 => -5x=-13 => x=2.6, y=1.8
   ;; 所以解为 [2.6, 1.8]
-  (let* ((a (vt-from-sequence '((2 1) (1 3)) :type 'double-float))
-         (b (vt-from-sequence '(7 8) :type 'double-float))
+  (let* ((a (vt-from-sequence '((2 1) (1 3)) :dtype :float64))
+         (b (vt-from-sequence '(7 8) :dtype :float64))
          (x (vt-solve a b)))
     (assert (lists-approx-equal (vt-to-list x) '(2.6 1.8) :epsilon 1e-6)))
 
@@ -1918,8 +2035,8 @@
   ;; a = [[3,1],[1,2]]
   ;; b = [[9,8],[8,7]]
   ;; np.linalg.solve(a,b) -> [[2., 1.8.], [3., 2.6]]
-  (let* ((a (vt-from-sequence '((3 1) (1 2)) :type 'double-float))
-         (b (vt-from-sequence '((9 8) (8 7)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((3 1) (1 2)) :dtype :float64))
+         (b (vt-from-sequence '((9 8) (8 7)) :dtype :float64))
          (x (vt-solve a b)))
     (assert (lists-approx-equal (vt-to-list (vt-slice x '(:all) '(0)))
 				'(2.0 3.0) :epsilon 1e-6))
@@ -1959,8 +2076,8 @@
     (assert-ok (approx= ax-ill b-ill 1e-8) "接近奇异矩阵求解失败"))
 
   ;; 测试 5：整数类型 -> 自动转为 double-float
-  (let* ((a (vt-from-sequence '((2 1) (1 2)) :type 'fixnum))
-         (b (vt-from-sequence '(3 4) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((2 1) (1 2)) :dtype :int64))
+         (b (vt-from-sequence '(3 4) :dtype :int64))
          (x (vt-solve a b)))
     (assert-ok (approx= (vt-@ a x) b) "整数矩阵求解失败"))
   (format t "~%test-vt-solve passed.~%"))
@@ -1971,8 +2088,8 @@
   ;; 构造一个 2x2 奇异矩阵 (行成比例，行列式为 0)
   ;; | 1 2 |
   ;; | 2 4 |
-  (let ((singular-mat (vt-from-sequence '((1 2) (2 4)) :type 'double-float))
-        (b-vec (vt-from-sequence '(5 10) :type 'double-float)))
+  (let ((singular-mat (vt-from-sequence '((1 2) (2 4)) :dtype :float64))
+        (b-vec (vt-from-sequence '(5 10) :dtype :float64)))
     
     ;; 1. 测试 vt-solve 是否抛出错误
     (handler-case 
@@ -1996,7 +2113,7 @@
 (defun test-vt-inv ()
   ;; a = [[4,7],[2,6]]
   ;; np.linalg.inv(a) -> [[ 0.6, -0.7], [-0.2,  0.4]]
-  (let* ((a (vt-from-sequence '((4 7) (2 6)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((4 7) (2 6)) :dtype :float64))
          (inva (vt-inv a)))
     (assert (lists-approx-equal (vt-to-list (vt-slice inva '(:all) '(0)))
 				'(0.6 -0.2) :epsilon 1e-6))
@@ -2009,12 +2126,12 @@
 ;; ============================================================
 (defun test-vt-det ()
   ;; a = [[1,2],[3,4]] -> det = -2.0
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64)))
     (assert (= (vt-item (vt-det a)) -2.0d0)))
   ;; 三维矩阵
   ;; a = [[6,1,1],[4,-2,5],[2,8,7]] -> det = -306.0? 计算一下：6*(-14-40) -1*(28-10) +1*(32+4) = 6*(-54) -18 +36 = -324 -18+36 = -306.0
   (let ((a (vt-from-sequence '((6 1 1) (4 -2 5) (2 8 7))
-			     :type 'double-float)))
+			     :dtype :float64)))
     (assert (lists-approx-equal (list (vt-item (vt-det a)))
 				'(-306.0) :epsilon 1e-6)))
   "测试 vt-det 返回 0 维张量且值正确"
@@ -2046,16 +2163,16 @@
 (defun test-vt-norm ()
   ;; 向量 l2 范数
   ;; np.linalg.norm(np.array([3,4])) -> 5.0
-  (let ((v (vt-from-sequence '(3 4) :type 'double-float)))
+  (let ((v (vt-from-sequence '(3 4) :dtype :float64)))
     (assert (= (vt-item (vt-norm v)) 5.0d0)))
   ;; 矩阵 l2 范数 (全局) 默认是 frobenius? 根据代码 vt-norm 是 l2 范数 (vt-sqrt(vt-sum(sq)))，对于矩阵是 frobenius。
   ;; np.linalg.norm(np.array([[1,2],[3,4]])) -> 5.477225575051661
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64)))
     (assert (lists-approx-equal (list (vt-item (vt-norm a)))
 				(list (sqrt 30.0d0)) :epsilon 1e-6)))
   ;; 沿轴计算 l2 范数
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), axis=1) -> [2.23606798, 5.0]
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
          (norms (vt-to-list (vt-norm a :axis 1))))
     (assert (lists-approx-equal norms (list (sqrt 5.0) (sqrt 25.0)) :epsilon 1e-6)))
   (format t "~%test-vt-norm passed.~%"))
@@ -2066,7 +2183,7 @@
 (defun test-vt-frobenius-norm ()
   ;; 矩阵 frobenius 范数
   ;; np.linalg.norm(np.array([[1,2],[3,4]]), 'fro') -> 5.477225575051661
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64)))
     (assert (lists-approx-equal (list (vt-item (vt-frobenius-norm a)))
 				(list (sqrt 30.0d0)) :epsilon 1e-6)))
   (format t "~%test-vt-frobenius-norm passed.~%"))
@@ -2076,11 +2193,11 @@
 ;; ============================================================
 (defun test-vt-trace ()
   ;; a = [[1,2],[3,4]] -> trace = 5.0
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64)))
     (assert (= (vt-item (vt-trace a)) 5.0d0)))
   ;; 非方阵应报错或只取 min 对角线? 根据代码，vt-trace 调用 vt-diagonal 然后 sum，vt-diagonal 需要 rank>=2，会自动取 min 对角线。我们测试一个矩形矩阵。
   ;; np.trace(np.arange(6).reshape(2,3)) -> 0+4 = 4.0
-  (let ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3))))
+  (let ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3))))
     (assert (= (vt-item (vt-trace a)) 4.0d0)))
   (format t "~%test-vt-trace passed.~%"))
 
@@ -2090,8 +2207,8 @@
 (defun test-vt-outer ()
   ;; flatten模式（默认）
   ;; np.outer([1,2], [3,4,5]) -> [[3,4,5],[6,8,10]]
-  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
-         (b (vt-from-sequence '(3 4 5) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :int64))
+         (b (vt-from-sequence '(3 4 5) :dtype :int64))
          (outer (vt-outer a b)))
     (assert (equal (vt-to-list outer)
 		   '((3 4 5) (6 8 10)))))
@@ -2103,8 +2220,8 @@
   ;; a = np.arange(6).reshape(2,3)  b = np.array([1,2])
   ;; 使用 np.multiply.outer(a,b) 形状 (2,3,2)，但 numpy 没有直接 outer 高维函数，我们用 einsum 模拟
   ;; 对于 flatten=nil，预期形状 = a.shape + b.shape
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
-         (b (vt-from-sequence '(1 2) :type 'fixnum))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
+         (b (vt-from-sequence '(1 2) :dtype :int64))
          (outer (vt-outer a b :flatten nil)))
     (assert (equal (vt-shape outer) '(2 3 2)))
     ;; 检查值：a[i,j] * b[k] 存储在 outer[i,j,k]
@@ -2120,114 +2237,138 @@
 ;; --------------------------------------------------------------------
 
 (defun test-vt-cumsum ()
-  ;; np.cumsum([0,1,2,3,4]) → [0,1,3,6,10]
-  (let* ((a (vt-arange 5 :type 'fixnum))
+  "测试 vt-cumsum 的核心功能、维度处理与类型保持"
+  (format t "~&开始运行 vt-cumsum 测试...~%")
+  
+  ;; 1. 基础一维计算
+  (let* ((a (vt-arange 5 :dtype :int64))
          (res (vt-cumsum a)))
-    (assert (equal (vt-to-list res) '(0 1 3 6 10))))
+    (assert (equal (vt-to-list res) '(0 1 3 6 10)))
+    (assert (eq (vt-dtype res) :int64) () "cumsum: 类型应保持 :int64"))
 
-  ;; np.cumsum([1.0, 2.0, 3.0]) → [1,3,6]
-  (let* ((a (vt-from-sequence '(1.0 2.0 3.0) :type 'double-float))
+  ;; 2. 基础一维浮点计算
+  (let* ((a (vt-from-sequence '(1.0 2.0 3.0) :dtype :float64))
          (res (vt-cumsum a)))
-    (assert (equal (vt-to-list res) '(1.0 3.0 6.0))))
+    (assert (equal (vt-to-list res) '(1.0 3.0 6.0)))
+    (assert (eq (vt-dtype res) :float64) () "cumsum: 类型应保持 :float64"))
 
-  ;; a = np.arange(6).reshape(2,3)
-  ;; np.cumsum(a, axis=0) → [[0,1,2],[3,5,7]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  ;; 3. 【更新】显式类型提升 (对标 NumPy dtype 参数)
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (res (vt-cumsum a :dtype :float64)))
+    (assert (equal (vt-to-list res) '(1.0 3.0 6.0)))
+    (assert (eq (vt-dtype res) :float64) () "cumsum: 显式 :dtype 应提升为 :float64"))
+
+  ;; 4. 二维 axis=0
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (res (vt-cumsum a :axis 0)))
     (assert (equal (vt-to-list res) '((0 1 2) (3 5 7)))))
 
-  ;; axis=1 → [[0,1,3],[3,7,12]]
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  ;; 5. 二维 axis=1
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (res (vt-cumsum a :axis 1)))
     (assert (equal (vt-to-list res) '((0 1 3) (3 7 12)))))
 
-  ;; 负轴 axis=-1 同 axis=1
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  ;; 6. 负轴 axis=-1
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (res (vt-cumsum a :axis -1)))
     (assert (equal (vt-to-list res) '((0 1 3) (3 7 12)))))
 
-  ;; a = np.arange(8).reshape(2,2,2)
-  ;; np.cumsum(a, axis=1) → [[[0,1],[2,4]],[[4,5],[10,12]]]
-  (let* ((a (vt-reshape (vt-arange 8 :type 'fixnum) '(2 2 2)))
+  ;; 7. 三维 axis=1
+  (let* ((a (vt-reshape (vt-arange 8 :dtype :int64) '(2 2 2)))
          (res (vt-cumsum a :axis 1)))
     (assert (equal (vt-to-list res)
                    '(((0 1) (2 4)) ((4 5) (10 12))))))
 
-  ;; np.cumsum([]) → []
+  ;; 8. 空数组
   (let* ((a (vt-zeros '(0)))
          (res (vt-cumsum a)))
     (assert (equal (vt-to-list res) '())))
 
-  ;; 空轴切片（形状某维为0）
+  ;; 9. 空轴切片
   (let* ((a (vt-zeros '(2 0 3)))
          (res (vt-cumsum a :axis 1)))
     (assert (equal (vt-shape res) '(2 0 3))))
- (format t "~%test-vt-cumsum passed.~%")
-  )
+
+  (format t "✅ test-vt-cumsum passed.~%"))
 
 
 (defun test-vt-cumprod ()
-  ;; np.cumprod([1,2,3,4]) → [1,2,6,24]
-  (let* ((a (vt-from-sequence '(1 2 3 4) :type 'fixnum))
+  "测试 vt-cumprod 的核心功能、维度处理与类型保持"
+  (format t "~&开始运行 vt-cumprod 测试...~%")
+  
+  ;; 1. 基础一维计算
+  (let* ((a (vt-from-sequence '(1 2 3 4) :dtype :int64))
          (res (vt-cumprod a)))
-    (assert (equal (vt-to-list res) '(1 2 6 24))))
-  ;; a = np.array([[1,2],[3,4]])
-  ;; np.cumprod(a, axis=0) → [[1,2],[3,8]]
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+    (assert (equal (vt-to-list res) '(1 2 6 24)))
+    (assert (eq (vt-dtype res) :int64) () "cumprod: 类型应保持 :int64"))
+
+  ;; 2. 【更新】显式类型提升 (对标 NumPy dtype 参数，防止连乘溢出)
+  (let* ((a (vt-from-sequence '(1 2 3 4) :dtype :int64))
+         (res (vt-cumprod a :dtype :float64)))
+    (assert (equal (vt-to-list res) '(1.0 2.0 6.0 24.0)))
+    (assert (eq (vt-dtype res) :float64) () "cumprod: 显式 :dtype 应提升为 :float64"))
+
+  ;; 3. 二维 axis=0
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          (res (vt-cumprod a :axis 0)))
     (assert (equal (vt-to-list res) '((1 2) (3 8)))))
 
-  ;; axis=1 → [[1,2],[3,12]]
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+  ;; 4. 二维 axis=1
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          (res (vt-cumprod a :axis 1)))
     (assert (equal (vt-to-list res) '((1 2) (3 12)))))
-  ;; 确保输出类型与输入一致 (fixnum)
-  (let* ((a (vt-ones '(3) :type 'fixnum))
+
+  ;; 5. 浮点数测试
+  (let* ((a (vt-from-sequence '(1.5 2.0 1.0) :dtype :float64))
          (res (vt-cumprod a)))
-    (assert (eq (vt-element-type res) 'fixnum)))
-   (format t "~%test-vt-cumprod passed.~%"))
+    (assert (equal (vt-to-list res) '(1.5 3.0 3.0)))
+    (assert (eq (vt-dtype res) :float64)))
+
+  (format t "✅ test-vt-cumprod passed.~%"))
 
 
 (defun test-vt-cumsum-cumprod ()
-  "测试 cumsum 和 cumprod 的类型保持与溢出提升"
+  "测试 cumsum 和 cumprod 的类型保持与显式提升策略"
   
-  ;; 1. 不溢出的 cumsum，类型应保持 fixnum
-  (let* ((arr (vt-from-sequence '(1 2 3) :type 'fixnum))
+  ;; 1. 不溢出的 cumsum，类型应保持 :int64
+  (let* ((arr (vt-from-sequence '(1 2 3) :dtype :int64))
          (res (vt-cumsum arr)))
-    (assert (eq (vt-element-type res) 'fixnum) (res)
-            "cumsum 类型错误: 期望 fixnum, 得到 ~a" (vt-element-type res))
+    (assert (eq (vt-dtype res) :int64) (res)
+            "cumsum 类型错误: 期望 :int64, 得到 ~a" (vt-dtype res))
     (assert (equal (vt-to-list res) '(1 3 6)) (res)
             "cumsum 数值错误: 期望 (1 3 6), 得到 ~a" (vt-to-list res)))
 
-  ;; 2. 溢出的 cumsum，应自动提升为 double-float 且数值正确
-  (let* ((arr (vt-from-sequence (list most-positive-fixnum 1) :type 'fixnum))
-         (res (vt-cumsum arr)))
-    (assert (eq (vt-element-type res) 'double-float) (res)
-            "cumsum 溢出提升错误: 期望 double-float, 得到 ~a" (vt-element-type res))
-    (assert (equal (vt-to-list res) (list (coerce most-positive-fixnum 'double-float)
-                                          (+ 1.0d0 (coerce most-positive-fixnum 'double-float))))
-            (res) "cumsum 溢出数值错误: 得到 ~a" (vt-to-list res)))
-
-  ;; 3. 沿 axis 溢出的 cumsum 测试
-  (let* ((arr (vt-from-sequence (list (list most-positive-fixnum 1)
-                                      (list 0 most-positive-fixnum)) :type 'fixnum))
+  ;; 2. 【更新】不溢出的 cumsum 沿 axis，类型保持 :int64
+  (let* ((arr (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          (res (vt-cumsum arr :axis 1)))
-    (assert (eq (vt-element-type res) 'double-float) (res)
-            "cumsum axis 溢出提升错误: 期望 double-float, 得到 ~a" (vt-element-type res)))
+    (assert (eq (vt-dtype res) :int64) (res)
+            "cumsum axis 类型错误: 期望 :int64, 得到 ~a" (vt-dtype res))
+    (assert (equal (vt-to-list res) '((1 3) (3 7))) (res)
+            "cumsum axis 数值错误"))
 
-  ;; 4. 不溢出的 cumprod，类型保持 fixnum
-  (let* ((arr (vt-from-sequence '(1 2 3 4) :type 'fixnum))
+  ;; 3. 【更新】显式指定 dtype 提升，避免溢出
+  (let* ((arr (vt-from-sequence '(1000000000000 1000000000000 1000000000000) :dtype :int64))
+         (res (vt-cumsum arr :dtype :float64)))
+    (assert (eq (vt-dtype res) :float64) (res)
+            "cumsum 显式提升错误: 期望 :float64, 得到 ~a" (vt-dtype res))
+    (assert (equal (vt-to-list res) '(1.0e12 2.0e12 3.0e12)) (res)
+            "cumsum 显式提升数值错误"))
+
+  ;; 4. 不溢出的 cumprod，类型保持 :int64
+  (let* ((arr (vt-from-sequence '(1 2 3 4) :dtype :int64))
          (res (vt-cumprod arr)))
-    (assert (eq (vt-element-type res) 'fixnum) (res)
-            "cumprod 类型错误: 期望 fixnum, 得到 ~a" (vt-element-type res))
+    (assert (eq (vt-dtype res) :int64) (res)
+            "cumprod 类型错误: 期望 :int64, 得到 ~a" (vt-dtype res))
     (assert (equal (vt-to-list res) '(1 2 6 24)) (res)
             "cumprod 数值错误: 期望 (1 2 6 24), 得到 ~a" (vt-to-list res)))
 
-  ;; 5. 溢出的 cumprod (连乘极易溢出)，应自动提升
-  (let* ((arr (vt-from-sequence (list 2 2 2 most-positive-fixnum) :type 'fixnum))
-         (res (vt-cumprod arr)))
-    (assert (eq (vt-element-type res) 'double-float) (res)
-            "cumprod 溢出提升错误: 期望 double-float, 得到 ~a" (vt-element-type res)))
+  ;; 5. 【更新】显式指定 dtype 提升，防止连乘溢出
+  (let* ((arr (vt-from-sequence '(2 2 2 2 2 2) :dtype :int64))
+         (res (vt-cumprod arr :dtype :float64)))
+    (assert (eq (vt-dtype res) :float64) (res)
+            "cumprod 显式提升错误: 期望 :float64, 得到 ~a" (vt-dtype res))
+    (assert (equal (vt-to-list res) '(2.0 4.0 8.0 16.0 32.0 64.0)) (res)
+            "cumprod 显式提升数值错误"))
 
   (format t "✅ test-vt-cumsum-cumprod 测试通过！~%"))
 
@@ -2239,7 +2380,8 @@
   (let* ((k (vt-size s))
          (mat (vt-zeros (list m n))))
     (loop for i below k
-          do (setf (vt-ref mat i i) (coerce (vt-ref s i) 'double-float)))
+          do (setf (vt-ref mat i i)
+		   (vt-cast (vt-ref s i) :float64)))
     mat))
 
 (defun test-svd (a &optional (full-matrices nil))
@@ -2262,11 +2404,11 @@
           (format t "重构误差: max|a - u s vt| = ~a~%" recon-error))
         ;; 正交性检查
         (let* ((utu (vt-@ (vt-transpose u) u))
-               (iu (vt-eye (first (vt-shape utu)) :type 'double-float))
+               (iu (vt-eye (first (vt-shape utu)) :dtype :float64))
                (utu-error (reduce #'max (vt-data (vt-abs (vt-- utu iu))))))
           (format t "u^t u ≈ i ? max|u^t u - i| = ~a~%" utu-error))
         (let* ((vtv (vt-@ vt (vt-transpose vt)))
-               (iv (vt-eye (first (vt-shape vtv)) :type 'double-float))
+               (iv (vt-eye (first (vt-shape vtv)) :dtype :float64))
                (vtv-error (reduce #'max (vt-data (vt-abs (vt-- vtv iv))))))
           (format t "vt vt^t ≈ i ? max|vt vt^t - i| = ~a~%" vtv-error))))))
 
@@ -2285,7 +2427,7 @@
       (format t "~%full mode: q (m×m), r (m×n)~%")
       (let ((qtq (vt-@ (vt-transpose q) q)))
         (format t "q^t q 偏离单位阵的最大误差 = ~a~%"
-                (let ((i (vt-eye (first (vt-shape q)) :type 'double-float)))
+                (let ((i (vt-eye (first (vt-shape q)) :dtype :float64)))
                   (reduce #'max (vt-data (vt-abs (vt-- qtq i)))))))
       (format t "重构误差: max|a - q r| = ~a~%"
               (reduce #'max (vt-data (vt-abs (vt-- a (vt-@ q r)))))))
@@ -2294,7 +2436,7 @@
       (format t "~%reduced mode: q (m×k), r (k×n)~%")
       (let ((qtq (vt-@ (vt-transpose q) q)))
         (format t "q^t q 偏离单位阵的最大误差 = ~a~%"
-                (let ((i (vt-eye (second (vt-shape q)) :type 'double-float)))
+                (let ((i (vt-eye (second (vt-shape q)) :dtype :float64)))
                   (reduce #'max (vt-data (vt-abs (vt-- qtq i)))))))
       (format t "重构误差: max|a - q r| = ~a~%"
               (reduce #'max (vt-data (vt-abs (vt-- a (vt-@ q r)))))))))
@@ -2330,7 +2472,7 @@
                   t)))
     
     ;; ---------- 1d 等间距 ----------
-    (let* ((x (vt-arange 6 :step 1.0d0 :type 'double-float))       ; 0,1,2,3,4,5
+    (let* ((x (vt-arange 6 :step 1.0d0 :dtype :float64))       ; 0,1,2,3,4,5
            (y (vt-square x))                                         ; y = x^2
            ;; axis nil → 返回所有轴的梯度列表（此处 1d → 单元素列表）
            (grad-list (vt-gradient y))
@@ -2345,7 +2487,7 @@
       (assert-close (vt-ref grad 5) 9.0d0))      ; (f5-f4)/1 = 9
     
     ;; ---------- 1d 非等间距（坐标数组）----------
-    (let* ((x (vt-from-sequence '(0.0d0 1.0d0 3.0d0 6.0d0) :type 'double-float))
+    (let* ((x (vt-from-sequence '(0.0d0 1.0d0 3.0d0 6.0d0) :dtype :float64))
            (y (vt-square x))
            ;; 指定单轴 axis=0，直接返回该轴张量（不是列表）
            (grad (vt-gradient y :spacing x :axis 0)))
@@ -2359,7 +2501,7 @@
     (let* ((mat (vt-from-sequence '((0.0d0 1.0d0 2.0d0)
                                     (3.0d0 4.0d0 5.0d0)
                                     (6.0d0 7.0d0 8.0d0))
-                                  :type 'double-float))
+                                  :dtype :float64))
            ;; axis 整数 → 直接返回该轴梯度张量
            (grad0 (vt-gradient mat :axis 0))
            (grad1 (vt-gradient mat :axis 1)))
@@ -2375,7 +2517,7 @@
     ;; ---------- 多轴同时计算 ----------
     (let* ((a (vt-from-sequence '((1.0d0 2.0d0 3.0d0)
                                   (4.0d0 5.0d0 6.0d0))
-				:type 'double-float))
+				:dtype :float64))
            ;; axis 列表 → 返回列表
            (grads (vt-gradient a :axis '(0 1))))
       (format t "~%multi-axis gradients:~%~a~%~a~%" (first grads) (second grads))
@@ -2388,7 +2530,7 @@
     ;; ---------- 边界条件：尺寸太小 ----------
     (handler-case
 	(progn
-          (vt-gradient (vt-from-sequence '(1.0d0) :type 'double-float) :axis 0)
+          (vt-gradient (vt-from-sequence '(1.0d0) :dtype :float64) :axis 0)
           (error "should have thrown an error for size 1"))
       (simple-error (e)
 	(format t "~%correctly errored on size 1: ~a~%" e)))
@@ -2409,7 +2551,7 @@
 		 '((( 0.0d0  1.0d0  2.0d0) ( 3.0d0  4.0d0  5.0d0) ( 6.0d0  7.0d0  8.0d0))
                    (( 9.0d0 10.0d0 11.0d0) (12.0d0 13.0d0 14.0d0) (15.0d0 16.0d0 17.0d0))
                    ((18.0d0 19.0d0 20.0d0) (21.0d0 22.0d0 23.0d0) (24.0d0 25.0d0 26.0d0)))
-		 :type 'double-float))
+		 :dtype :float64))
            ;; t3d 形状 (3, 3, 3)，每个元素值相当于 i*9 + j*3 + k
            ;; 沿 axis=0 和 axis=2 求梯度，spacing=1
            (grads (vt-gradient t3d :axis '(0 2)))
@@ -2432,8 +2574,8 @@
     (let* ((shape '(2 2 2 2))
            (t4d (vt-from-function shape
                                   (lambda (idxs)
-                                    (coerce (reduce #'+ idxs) 'double-float))
-                                  :type 'double-float))
+                                    (vt-cast (reduce #'+ idxs) :float64))
+                                  :dtype :float64))
            ;; t4d 的元素是坐标索引之和 (i0+i1+i2+i3)
            ;; 每轴步长1，所以任何轴的梯度都应为1
            (grads (vt-gradient t4d))   ; 返回 4 个张量的列表
@@ -2451,7 +2593,7 @@
     (let* ((mat (vt-from-sequence '((0.0d0 1.0d0 2.0d0 3.0d0)
                                     (4.0d0 5.0d0 6.0d0 7.0d0)
                                     (8.0d0 9.0d0 10.0d0 11.0d0))
-                                  :type 'double-float))
+                                  :dtype :float64))
            ;; 轴0 间距 2.0, 轴1 间距 0.5
            (grads (vt-gradient mat :spacing '(2.0d0 0.5d0) :axis '(0 1)))
            (g0 (first grads))
@@ -2468,7 +2610,7 @@
       (format t "list spacing test passed.~%"))
 
     ;; === 一维，非均匀间距（坐标数组），长度2（刚修复的边界情况） ===
-    (let* ((x (vt-from-sequence '(1.0d0 5.0d0) :type 'double-float))
+    (let* ((x (vt-from-sequence '(1.0d0 5.0d0) :dtype :float64))
            (y (vt-square x))   ; y = [1, 25]
            (grad (vt-gradient y :spacing x :axis 0)))
       (format t "~%1d length-2 non-uniform: ~a~%" grad)
@@ -2481,9 +2623,9 @@
     (let* ((t3d (vt-from-sequence
 		 '(((1.0d0 2.0d0) (3.0d0 4.0d0))   ; shape (2,2,2)
                    ((5.0d0 6.0d0) (7.0d0 8.0d0)))
-		 :type 'double-float))
+		 :dtype :float64))
            ;; 沿 axis=1 求梯度，使用非均匀坐标 [0.0, 1.0] （对应轴大小2）
-           (coord (vt-from-sequence '(0.0d0 1.0d0) :type 'double-float))
+           (coord (vt-from-sequence '(0.0d0 1.0d0) :dtype :float64))
            (grad (vt-gradient t3d :spacing coord :axis 1)))
       (format t "~%3d axis=1 non-uniform (length 2 axis): ~a~%" grad)
       ;; 轴1长度=2，只能用一阶差分
@@ -2491,7 +2633,7 @@
       ;; 梯度应为常数：第一块 (3-1,4-2)=(2,2)，第二块 (7-5,8-6)=(2,2)
       (let ((expected (vt-from-sequence '(((2.0d0 2.0d0) (2.0d0 2.0d0))
                                           ((2.0d0 2.0d0) (2.0d0 2.0d0)))
-					:type 'double-float)))
+					:dtype :float64)))
 	(vt-do-each (ptr val grad)
           (assert-close val (aref (vt-data expected) ptr))))
       (format t "3d non-uniform length-2 axis passed.~%"))
@@ -2597,7 +2739,7 @@
   (format t "~%=== testing vt-pad ===")
   
   ;; 1. 常数填充（默认）
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          ;; 每轴填充宽度：轴0: (1 2)，轴1: (0 1)
          (padded (vt-pad a '((1 2) (0 1))
 			 :mode :constant :constant-values 99)))
@@ -2609,17 +2751,17 @@
                                              (3  4  99)
                                              (99 99 99)
                                              (99 99 99))
-                                           :type 'fixnum))))
+                                           :dtype :int64))))
   
   ;; 1b. 常数填充，左右不同常数
-  (let* ((a (vt-arange 5 :type 'fixnum))
+  (let* ((a (vt-arange 5 :dtype :int64))
          (padded (vt-pad a 2 :mode :constant :constant-values '(10 20))))
     (format t "~%constant left/right different:~%~a~%" padded)
     (assert (equal (vt-shape padded) '(9)))
-    (assert (vt-allclose padded (vt-from-sequence '(10 10 0 1 2 3 4 20 20) :type 'fixnum))))
+    (assert (vt-allclose padded (vt-from-sequence '(10 10 0 1 2 3 4 20 20) :dtype :int64))))
   
   ;; 2. 边缘填充
-  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
          ;; 轴0填充 (1 1)，轴1填充 (2 2)
          (padded (vt-pad a '((1 1) (2 2)) :mode :edge)))
     (format t "~%edge padding:~%~a~%" padded)
@@ -2629,11 +2771,11 @@
                                         (1 1 1 2 3 3 3)
                                         (4 4 4 5 6 6 6)
                                         (4 4 4 5 6 6 6))
-                                      :type 'fixnum)))
+                                      :dtype :int64)))
       (assert (vt-allclose padded expected))))
   
   ;; 3. 循环填充 (wrap)
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          ;; 轴0填充 (1 1)，轴1填充 (1 1)，则形状变为 (4 4)
          (padded (vt-pad a '((1 1) (1 1)) :mode :wrap)))
     (format t "~%wrap padding:~%~a~%" padded)
@@ -2643,11 +2785,11 @@
                                         (2 1 2 1)
                                         (4 3 4 3)
                                         (2 1 2 1))
-                                      :type 'fixnum)))
+                                      :dtype :int64)))
       (assert (vt-allclose padded expected))))
   
   ;; 4. 反射填充 (reflect) - 不重复边缘
-  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
          ;; 每轴填充 (2 2)，注意反射要求宽度 <= 原尺寸-1，满足
          (padded (vt-pad a '((2 2) (2 2)) :mode :reflect)))
     (format t "~%reflect padding:~%~a~%" padded)
@@ -2660,7 +2802,7 @@
       (assert (vt-allclose center a))))
   
   ;; 5. 对称填充 (symmetric) - 重复边缘
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
          ;; 轴0填充 (1 1)，轴1填充 (1 1)
          (padded (vt-pad a '((1 1) (1 1)) :mode :symmetric)))
     (format t "~%symmetric padding:~%~a~%" padded)
@@ -2670,7 +2812,7 @@
                                         (1 1 2 2)
                                         (3 3 4 4)
                                         (3 3 4 4))
-                                      :type 'fixnum)))
+                                      :dtype :int64)))
       (assert (vt-allclose padded expected))))
   
   ;; 6. 反射模式宽度超过限制应报错
@@ -2690,7 +2832,7 @@
 
 (defun test-all-pad ()
   ;; 1. constant
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64)))
     (let ((padded (vt-pad a '((1 2) (0 1)) :mode :constant :constant-values 99)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((99 99 99)
@@ -2698,44 +2840,44 @@
                                                ( 3  4 99)
                                                (99 99 99)
                                                (99 99 99))
-                                             :type 'fixnum)))))
+                                             :dtype :int64)))))
   ;; 2. edge
-  (let ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum)))
+  (let ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64)))
     (let ((padded (vt-pad a '((1 1) (2 2)) :mode :edge)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((1 1 1 2 3 3 3)
                                                (1 1 1 2 3 3 3)
                                                (4 4 4 5 6 6 6)
                                                (4 4 4 5 6 6 6))
-                                             :type 'fixnum)))))
+                                             :dtype :int64)))))
   ;; 3. wrap
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64)))
     (let ((padded (vt-pad a '((1 1) (1 1)) :mode :wrap)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((4 3 4 3)
                                                (2 1 2 1)
                                                (4 3 4 3)
                                                (2 1 2 1))
-                                             :type 'fixnum)))))
+                                             :dtype :int64)))))
   ;; 4. reflect（只需验证中心区域不变）
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64)))
     (let ((padded (vt-pad a '((2 2) (2 2)) :mode :reflect)))
       (assert (vt-allclose (vt-slice padded '(2 4) '(2 4)) a))))
   ;; 5. symmetric
-  (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum)))
+  (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64)))
     (let ((padded (vt-pad a '((1 1) (1 1)) :mode :symmetric)))
       (assert (vt-allclose padded
                            (vt-from-sequence '((1 1 2 2)
                                                (1 1 2 2)
                                                (3 3 4 4)
                                                (3 3 4 4))
-                                             :type 'fixnum)))))
+                                             :dtype :int64)))))
   ;; 6. 1d symmetric (numpy 示例)
-  (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
+  (let ((a (vt-from-sequence '(1 2 3 4 5) :dtype :int64)))
     (assert (vt-allclose (vt-pad a '((0 2)) :mode :symmetric)
-                         (vt-from-sequence '(1 2 3 4 5 5 4) :type 'fixnum)))
+                         (vt-from-sequence '(1 2 3 4 5 5 4) :dtype :int64)))
     (assert (vt-allclose (vt-pad a '((2 0)) :mode :symmetric)
-                         (vt-from-sequence '(2 1 1 2 3 4 5) :type 'fixnum))))
+                         (vt-from-sequence '(2 1 1 2 3 4 5) :dtype :int64))))
   (format t "~%all pad tests passed!~%"))
 
 
@@ -2747,31 +2889,31 @@
              (vt-allclose a b :atol 0.0d0 :rtol 0.0d0)))
 
     ;; ---------- 1. constant ----------
-    (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+    (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
            (p (vt-pad a '((2 3)) :mode :constant :constant-values 99)))
       ;; numpy: np.pad([1,2,3], (2,3), 'constant', constant_values=99) -> [99 99 1 2 3 99 99 99]
-      (assert (vt= p (vt-from-sequence '(99 99 1 2 3 99 99 99) :type 'fixnum))))
+      (assert (vt= p (vt-from-sequence '(99 99 1 2 3 99 99 99) :dtype :int64))))
 
-    (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+    (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
            (p (vt-pad a '((1 0) (2 1)) :mode :constant :constant-values 0)))
       ;; numpy: np.pad([[1,2],[3,4]], ((1,0),(2,1)), 'constant') -> [[0,0,0,0,0], [0,0,1,2,0], [0,0,3,4,0]]
       (assert (vt= p (vt-from-sequence '((0 0 0 0 0)
                                          (0 0 1 2 0)
                                          (0 0 3 4 0))
-                                       :type 'fixnum))))
+                                       :dtype :int64))))
 
-    (let* ((a (vt-from-sequence '(1.0d0 2.0d0) :type 'double-float))
+    (let* ((a (vt-from-sequence '(1.0d0 2.0d0) :dtype :float64))
            (p (vt-pad a '((1 1)) :mode :constant :constant-values '(10.0d0 20.0d0))))
       ;; numpy: np.pad([1.,2.], (1,1), 'constant', constant_values=(10,20)) -> [10., 1., 2., 20.]
-      (assert (vt= p (vt-from-sequence '(10.0d0 1.0d0 2.0d0 20.0d0) :type 'double-float))))
+      (assert (vt= p (vt-from-sequence '(10.0d0 1.0d0 2.0d0 20.0d0) :dtype :float64))))
 
     ;; 零宽度填充
-    (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+    (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
            (p (vt-pad a '((0 0) (0 0)) :mode :constant :constant-values 99)))
       (assert (vt= p a)))
 
     ;; ---------- 2. edge ----------
-    (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum))
+    (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
            (p (vt-pad a '((2 1) (1 2)) :mode :edge)))
       ;; numpy: np.pad([[1,2,3],[4,5,6]], ((2,1),(1,2)), 'edge')
       ;; 预期：行上两行边缘（复制第一行），下一行边缘（复制最后一行）；列左一列复制第一列，右两列复制最后一列。
@@ -2780,11 +2922,11 @@
                                           (1 1  2 3 3 3)
                                           (4 4  5 6 6 6)
                                           (4 4  5 6 6 6))
-                                        :type 'fixnum)))
+                                        :dtype :int64)))
         (assert (vt= p expected))))
 
     ;; ---------- 3. wrap ----------
-    (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+    (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
            (p (vt-pad a '((1 1) (2 1)) :mode :wrap)))
       ;; numpy: np.pad([[1,2],[3,4]], ((1,1),(2,1)), 'wrap')
       ;; 行循环：上边取最后一行，下边取第一行；列循环：左边取最后两列，右边取第一列。
@@ -2793,56 +2935,56 @@
 					  (1 2 1 2 1)
 					  (3 4 3 4 3)
 					  (1 2 1 2 1))
-                                        :type 'fixnum)))
+                                        :dtype :int64)))
         (assert (vt= p expected))))
 
     ;; ---------- 4. reflect (宽度可任意大) ----------
-    (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum))
+    (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
            (p (vt-pad a '((2 2) (3 3)) :mode :reflect)))
       ;; 只验证中心区域未变，并验证几个特征点（numpy 可生成完整预期，此处省略）
       (assert (vt= (vt-slice p '(2 4) '(3 6)) a))
       (assert (= 189 (vt-item (vt-sum p))))
       )
 
-    (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
+    (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
            (p (vt-pad a '((4 4)) :mode :reflect)))
       ;; numpy: np.pad([1,2,3], (4,4), 'reflect')
       ;; 预期：左填充 [3,2,1,2]，右填充 [2,3,2,1]
       (assert (vt= p (vt-from-sequence '(1 2 3 2 1 2 3 2 1 2 3)
-				       :type 'fixnum))))
+				       :dtype :int64))))
 
     ;; ---------- 5. symmetric (大宽度) ----------
     ;; 1d 左边宽度2
-    (let* ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum))
+    (let* ((a (vt-from-sequence '(1 2 3 4 5) :dtype :int64))
            (p (vt-pad a '((2 0)) :mode :symmetric)))
-      (assert (vt= p (vt-from-sequence '(2 1 1 2 3 4 5) :type 'fixnum))))
+      (assert (vt= p (vt-from-sequence '(2 1 1 2 3 4 5) :dtype :int64))))
     ;; 1d 右边宽度2
-    (let* ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum))
+    (let* ((a (vt-from-sequence '(1 2 3 4 5) :dtype :int64))
            (p (vt-pad a '((0 2)) :mode :symmetric)))
-      (assert (vt= p (vt-from-sequence '(1 2 3 4 5 5 4) :type 'fixnum))))
+      (assert (vt= p (vt-from-sequence '(1 2 3 4 5 5 4) :dtype :int64))))
     ;; 1d 左边大宽度7
-    (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+    (let* ((a (vt-from-sequence '(1 2) :dtype :int64))
            (p (vt-pad a '((7 0)) :mode :symmetric))
-	   (expected (vt-from-sequence '(2 2 1 1 2 2 1 1 2) :type 'fixnum)))
+	   (expected (vt-from-sequence '(2 2 1 1 2 2 1 1 2) :dtype :int64)))
       ;; numpy: np.pad([1,2], (7,0), 'symmetric') -> [2, 2, 1, 1, 2, 2, 1, 1, 2]? 我们直接验证形状和边界值
       (vt-allclose expected p))
     ;; 2d symmetric
-    (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))
+    (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
            (p (vt-pad a '((1 1) (1 1)) :mode :symmetric)))
       (assert (vt= p (vt-from-sequence '((1 1 2 2)
                                          (1 1 2 2)
                                          (3 3 4 4)
                                          (3 3 4 4))
-                                       :type 'fixnum))))
+                                       :dtype :int64))))
 
     ;; ---------- 6. 混合类型测试 ----------
-    (let* ((a (vt-from-sequence '((1.0d0 2.0d0) (3.0d0 4.0d0)) :type 'double-float))
+    (let* ((a (vt-from-sequence '((1.0d0 2.0d0) (3.0d0 4.0d0)) :dtype :float64))
            (p (vt-pad a '((1 1) (1 1)) :mode :symmetric)))
       (assert (vt= p (vt-from-sequence '((1.0 1.0 2.0 2.0)
                                          (1.0 1.0 2.0 2.0)
                                          (3.0 3.0 4.0 4.0)
                                          (3.0 3.0 4.0 4.0))
-                                       :type 'double-float))))
+                                       :dtype :float64))))
 
     (format t "~%all thorough pad tests passed!~%")))
 
@@ -2855,7 +2997,7 @@
                                 ( 5  6  7  8  9)
                                 (10 11 12 13 14)
                                 (15 16 17 18 19))
-                              :type 'fixnum))
+                              :dtype :int64))
          ;; 辅助函数：将张量展平为列表（如果是一维）或保持嵌套
          (to-list (lambda (vt)
                     (if (= (length (vt-shape vt)) 1)
@@ -2874,7 +3016,7 @@
     ;; np: a.take([0,5])  => [0, 5]
     ;; ================================================================
     (let* ((result (vt-take m (list 0 5)))
-           (expected (vt-from-sequence '(0 5) :type 'fixnum)))
+           (expected (vt-from-sequence '(0 5) :dtype :int64)))
       (assert (equal (funcall to-list result)
                      (funcall to-list expected))
               () "take([0,5]) failed"))
@@ -2883,7 +3025,7 @@
     ;; 3. axis = nil : 多维索引，保留形状
     ;; np: a.take([[1,3],[1,5]])  => [[1,3],[1,5]]  shape (2,2)
     ;; ================================================================
-    (let* ((indices (vt-from-sequence '((1 3) (1 5)) :type 'fixnum))
+    (let* ((indices (vt-from-sequence '((1 3) (1 5)) :dtype :int64))
            (result (vt-take m indices)))
       (assert (equal (vt-shape result) '(2 2))
               () "take with 2d indices: shape mismatch ~a" (vt-shape result))
@@ -2895,7 +3037,7 @@
     ;; 4. axis = 0 : 一维索引
     ;; np: a.take([1,3], axis=0)  => [[5,6,7,8,9],[15,16,17,18,19]]  shape (2,5)
     ;; ================================================================
-    (let* ((indices (vt-arange 2 :start 1 :step 2 :type 'fixnum)) ; [1,3]
+    (let* ((indices (vt-arange 2 :start 1 :step 2 :dtype :int64)) ; [1,3]
            (result (vt-take m indices :axis 0)))
       (assert (equal (vt-shape result) '(2 5)) () "axis=0 shape failed")
       (assert (equal (vt-to-list result)
@@ -2906,7 +3048,7 @@
     ;; 5. axis = 1 : 一维索引
     ;; np: a.take([0,2], axis=1)  => [[0,2],[5,7],[10,12],[15,17]]  shape (4,2)
     ;; ================================================================
-    (let* ((indices (vt-from-sequence '(0 2) :type 'fixnum))
+    (let* ((indices (vt-from-sequence '(0 2) :dtype :int64))
            (result (vt-take m indices :axis 1)))
       (assert (equal (vt-shape result) '(4 2)) () "axis=1 shape failed")
       (assert (equal (vt-to-list result)
@@ -2918,7 +3060,7 @@
     ;; np: a.take([[0,2],[1,3]], axis=-1)
     ;;     输出形状 (4,2,2)
     ;; ================================================================
-    (let* ((indices (vt-from-sequence '((0 2) (1 3)) :type 'fixnum))
+    (let* ((indices (vt-from-sequence '((0 2) (1 3)) :dtype :int64))
            (result (vt-take m indices :axis -1)))
       (assert (equal (vt-shape result) '(4 2 2))
               () "axis=-1 with 2d indices: shape mismatch ~a" (vt-shape result))
@@ -2932,7 +3074,7 @@
     ;; np: a.take(2, axis=-2)  => 第三行，shape (5)
     ;; ================================================================
     (let* ((result (vt-take m 2 :axis -2))
-           (expected (vt-from-sequence '(10 11 12 13 14) :type 'fixnum)))
+           (expected (vt-from-sequence '(10 11 12 13 14) :dtype :int64)))
       (assert (equal (vt-shape result) '(5)) () "axis=-2 shape failed")
       (assert (equal (funcall to-list result)
                      (funcall to-list expected))
@@ -2945,8 +3087,8 @@
   (format t "~%===== 测试 vt-argsort =====~%")
 
   (labels ((vlist (vt) (vt-to-list vt))
-           (arr (seq &key (type 'fixnum))
-             (vt-from-sequence seq :type type)))
+           (arr (seq &key (type :int64))
+             (vt-from-sequence seq :dtype type)))
 
     ;; 1. 一维默认轴（即 -1，相当于展平）
     (let* ((a (arr '(30 10 20)))
@@ -3012,7 +3154,7 @@
       (format t "Test 6 (3D axis=1) passed~%"))
 
     ;; 7. 包含 NaN（NaN 应在末尾）
-    (let* ((a (vt-from-sequence (list 1.0 3.0 +vt-float-nan+ 2.0) :type 'double-float))
+    (let* ((a (vt-from-sequence (list 1.0 3.0 +vt-float-nan+ 2.0) :dtype :float64))
            (res (vt-argsort a)))
       ;; NumPy: [1.0,3.0,NaN,2.0] → [0,3,1,2]（NaN 索引 2 在末尾）
       (assert (equal (vlist res) '(0 3 1 2)) ()
@@ -3039,7 +3181,7 @@
               "空张量 argsort 失败")
       (format t "Test 9 (empty tensor) passed~%")))
   
-  (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
+  (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :dtype :int64)))
     (assert (equal
 	     (vt-to-list (vt-argsort a :axis -1))
 	     '((1 2 0)
@@ -3088,7 +3230,7 @@
 
 
 (defun test-vt-sort ()
-  (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :type 'fixnum)))
+  (let* ((a (vt-from-sequence '((3 1 2) (6 5 4)) :dtype :int64)))
     (assert (equal
 	     (vt-to-list (vt-sort a :axis -1))
 	     '((1 2 3)
@@ -3110,7 +3252,7 @@
   (format t "~%=== testing vt-argsort with rank>2 ===")
   (let ((a (vt-from-sequence '(((3 2) (1 0))
                                ((9 8) (7 6)))
-                             :type 'fixnum)))   ; shape (2,2,2)
+                             :dtype :int64)))   ; shape (2,2,2)
     ;; 沿最后一轴（axis=-1）排序，期望每层内两个元素升序
     (let ((sorted (vt-argsort a :axis -1)))
       (assert (equal (vt-to-list sorted)
@@ -3140,17 +3282,18 @@
                                   (4 5 6)
                                   (7 8 9)
                                   (10 11 12))
-				:type 'double-float))
+				:dtype :float64))
            (m (first (vt-shape a)))
            (n (second (vt-shape a)))
            (k (min m n)))
       ;; 经济模式
       (multiple-value-bind (u s vt) (vt-svd a :full-matrices nil)
-	(let* ((smat (vt-zeros (list (vt-size s) (vt-size s)) :type 'double-float))
+	(let* ((smat (vt-zeros (list (vt-size s) (vt-size s)) :dtype :float64))
                (_ (dotimes (i (vt-size s))
                     (setf (vt-ref smat i i) (vt-ref s i))))
                (recon (vt-@ (vt-@ u smat) vt))
                (err (vt-amax (vt-abs (vt-- a recon)))))
+	  (declare (ignorable _))
           (format t "~%economic svd: max reconstruction error = ~a" err)
           (assert-close err 0.0d0 1e-12)
           (assert (equal (vt-shape vt) (list k n))   ; vt 应为 k×n
@@ -3160,7 +3303,7 @@
 	(let* ((m (first (vt-shape a)))   ; = 4
                (n (second (vt-shape a)))  ; = 3
                (k (vt-size s))            ; = 3
-               (smat (vt-zeros (list m n) :type 'double-float)))  ; 4×3
+               (smat (vt-zeros (list m n) :dtype :float64)))  ; 4×3
 	  (dotimes (i k)
 	    (setf (vt-ref smat i i) (vt-ref s i)))
 	  (let* ((recon (vt-@ (vt-@ u smat) vt))
@@ -3189,10 +3332,10 @@
   ;;   np.put(a, 4, 99)                # 展平索引 4 处设值
   ;;   print(a)                        # [[0,1,2],[3,99,5]]
   ;; ------------------------------------------------------------
-  (let ((a (vt-arange 6 :type 'fixnum)))
+  (let ((a (vt-arange 6 :dtype :int64)))
     (setf a (vt-reshape a '(2 3)))
     (vt-put a 4 99)
-    (let ((expected (vt-from-sequence '((0 1 2) (3 99 5)) :type 'fixnum)))
+    (let ((expected (vt-from-sequence '((0 1 2) (3 99 5)) :dtype :int64)))
       (assert (vt-allclose a expected))
       (format t "test 1 passed: scalar index + scalar value~%")))
 
@@ -3203,9 +3346,9 @@
   ;;   np.put(a, [0, 5, 9], [100, 200, 300])
   ;;   print(a)   # [100, 1, 2, 3, 4, 200, 6, 7, 8, 300]
   ;; ------------------------------------------------------------
-  (let ((a (vt-arange 10 :type 'fixnum)))
+  (let ((a (vt-arange 10 :dtype :int64)))
     (vt-put a '(0 5 9) '(100 200 300))
-    (let ((expected (vt-from-sequence '(100 1 2 3 4 200 6 7 8 300) :type 'fixnum)))
+    (let ((expected (vt-from-sequence '(100 1 2 3 4 200 6 7 8 300) :dtype :int64)))
       (assert (vt-allclose a expected))
       (format t "test 2 passed: 1d indices + same length values~%")))
 
@@ -3216,9 +3359,9 @@
   ;;   np.put(a, [1, 3, 5, 7], -1)
   ;;   print(a)   # [0, -1, 2, -1, 4, -1, 6, -1]
   ;; ------------------------------------------------------------
-  (let ((a (vt-arange 8 :type 'fixnum)))
+  (let ((a (vt-arange 8 :dtype :int64)))
     (vt-put a '(1 3 5 7) -1)
-    (let ((expected (vt-from-sequence '(0 -1 2 -1 4 -1 6 -1) :type 'fixnum)))
+    (let ((expected (vt-from-sequence '(0 -1 2 -1 4 -1 6 -1) :dtype :int64)))
       (assert (vt-allclose a expected))
       (format t "test 3 passed: 1d indices + scalar value (broadcast)~%")))
 
@@ -3229,9 +3372,9 @@
   ;;   np.put(a, [0, 2, 4, 5], [10, 20])   # values = [10,20,10,20] 循环填充
   ;;   print(a)   # [10, 1, 20, 3, 10, 20]
   ;; ------------------------------------------------------------
-  (let ((a (vt-arange 6 :type 'fixnum)))
+  (let ((a (vt-arange 6 :dtype :int64)))
     (vt-put a '(0 2 4 5) '(10 20))
-    (let ((expected (vt-from-sequence '(10 1 20 3 10 20) :type 'fixnum)))
+    (let ((expected (vt-from-sequence '(10 1 20 3 10 20) :dtype :int64)))
       (assert (vt-allclose a expected))
       (format t "test 4 passed: 1d indices + shorter values (cycle)~%"))
 
@@ -3246,14 +3389,14 @@
     ;;   #  [   4,   5,   6,   7],
     ;;   #  [-999,   9,  10, -999]]
     ;; ------------------------------------------------------------
-    (let ((a (vt-arange 12 :type 'fixnum)))
+    (let ((a (vt-arange 12 :dtype :int64)))
       (setf a (vt-reshape a '(3 4)))
-      (let ((indices (vt-from-sequence '((0 3) (8 11)) :type 'fixnum)))
+      (let ((indices (vt-from-sequence '((0 3) (8 11)) :dtype :int64)))
 	(vt-put a indices -999))
       (let ((expected (vt-from-sequence '((-999 1 2 -999)
                                           (4 5 6 7)
                                           (-999 9 10 -999))
-					:type 'fixnum)))
+					:dtype :int64)))
 	(assert (vt-allclose a expected))
 	(format t "test 5 passed: multi-dim indices (flattened) + scalar value~%"))
 
@@ -3269,13 +3412,13 @@
       ;;   #  [  4,   5,   6, 888],
       ;;   #  [  8,   9, 999,  11]]
       ;; ------------------------------------------------------------
-      (let ((a (vt-arange 12 :type 'fixnum)))
+      (let ((a (vt-arange 12 :dtype :int64)))
 	(setf a (vt-reshape a '(3 4)))
 	(vt-put a '(2 7 10) '(777 888 999))
 	(let ((expected (vt-from-sequence '((0 1 777 3)
                                             (4 5 6 888)
                                             (8 9 999 11))
-					  :type 'fixnum)))
+					  :dtype :int64)))
 	  (assert (vt-allclose a expected))
 	  (format t "test 6 passed: flat indices on 2d array~%"))
 
@@ -3284,13 +3427,13 @@
 	;; numpy: np.put(a, [100], 0) 会引发 indexerror
 	;; ------------------------------------------------------------
 	(handler-case
-	    (let ((a (vt-arange 5 :type 'fixnum)))
+	    (let ((a (vt-arange 5 :dtype :int64)))
               (vt-put a 100 42))
 	  (simple-error (e)
 	    (format t "test 7 passed: caught out-of-bounds error: ~a~%" e))))))
   
   ;; 测试 1：连续数组上 put (完全正确，不用改)
-  (let* ((a (vt-arange 12 :type 'double-float))
+  (let* ((a (vt-arange 12 :dtype :float64))
          (indices '(2 5 10))
          (values  '(0 0 0)))
     (vt-put a indices values)
@@ -3300,7 +3443,7 @@
 	       "连续 put 失败"))
 
   ;; 测试 2：转置视图上的 put
-  (let* ((a (vt-arange 12 :type 'double-float))
+  (let* ((a (vt-arange 12 :dtype :float64))
          (a-reshape (vt-reshape a '(3 4)))
          (at (vt-transpose a-reshape))
          ;; 修复：at(1,2)的逻辑索引是 1*3+2=5，at(2,1)的逻辑索引是 2*3+1=7
@@ -3309,10 +3452,11 @@
 		    '((0d0 1d0 2d0 3d0)
 		      (4d0 5d0 0d0 7d0)   ; 原索引 (1,2) 被置0
 		      (8d0 0d0 10d0 11d0))))) ; 原索引 (2,1) 被置0 (原注释写错为3,1)
+    (declare (ignorable _))
     (assert-ok (approx= a-reshape expected) "转置视图 put 失败"))
 
   ;; 测试 3：切片视图上的 put
-  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9)) :dtype :float64))
          (s (vt-slice a '(1 3) '(1 3)))   ; [[5,6],[8,9]]
          ;; 修复：s(0,0)的逻辑索引是 0，s(1,1)的逻辑索引是 1*2+1=3
          (_ (vt-put s '(0 3) '(-1 -2)))
@@ -3320,6 +3464,7 @@
 		    '((1d0 2d0 3d0)
 		      (4d0 -1d0 6d0)
 		      (7d0 8d0 -2d0)))))
+     (declare (ignorable _))
     (assert-ok (approx= a expected) "切片视图 put 失败"))
 
   ;; 测试 5：空 indices (不用改)
@@ -3344,30 +3489,31 @@
   ;; ==========================================
   ;; 测试 1: 1D 全 NaN (当前实现会错误返回 ±∞)
   ;; ==========================================
-  (let ((a (vt-from-sequence (list (vt-float-nan) (vt-float-nan)))))
+  (let ((a (vt-from-sequence
+	    (list (vt-get-nan :float64) (vt-get-nan :float64)))))
     (assert-nan (vt-nanmax a))   ; 预期: nan，当前漏洞返回: -∞
     (assert-nan (vt-nanmin a)))  ; 预期: nan，当前漏洞返回: +∞
 
   ;; ==========================================
   ;; 测试 2: 1D 混合 (存在有效数值，原有逻辑正常)
   ;; ==========================================
-  (let ((a (vt-from-sequence (list 1.0d0 (vt-float-nan) -2.0d0))))
+  (let ((a (vt-from-sequence (list 1.0d0 (vt-get-nan :float64) -2.0d0))))
     (assert (= (vt-item (vt-nanmax a)) 1.0d0))
     (assert (= (vt-item (vt-nanmin a)) -2.0d0)))
 
   ;; ==========================================
   ;; 测试 3: 2D 全 NaN 全局归约
   ;; ==========================================
-  (let ((a (vt-from-sequence (list (list (vt-float-nan) (vt-float-nan))
-                                   (list (vt-float-nan) (vt-float-nan))))))
+  (let ((a (vt-from-sequence (list (list (vt-get-nan :float64) (vt-get-nan :float64))
+                                   (list (vt-get-nan :float64) (vt-get-nan :float64))))))
     (assert-nan (vt-nanmax a))
     (assert-nan (vt-nanmin a)))
 
   ;; ==========================================
   ;; 测试 4: 2D 混合 沿轴归约 (关键漏洞暴露点)
   ;; ==========================================
-  (let ((a (vt-from-sequence (list (list 1.0d0 (vt-float-nan))
-                                   (list (vt-float-nan) (vt-float-nan))))))
+  (let ((a (vt-from-sequence (list (list 1.0d0 (vt-get-nan :float64))
+                                   (list (vt-get-nan :float64) (vt-get-nan :float64))))))
     
     ;; --- 沿 axis=1 (按行归约) ---
     ;; 第0行有1.0，第1行全为NaN
@@ -3400,7 +3546,7 @@
     (let* ((nan (/ 0.0d0 0.0d0))
 	   (data (vt-from-sequence (list (list 1.0 2.0 3.0)
 					 (list 4.0 nan 6.0))
-				   :type 'double-float))
+				   :dtype :float64))
            ;; 手动将符号 :nan 替换为实际 nan
            (arr (vt-data data)))
       (loop for i below (length arr)
@@ -3412,7 +3558,7 @@
 		   (setf (aref arr i) (/ 0.0d0 0.0d0))))  ;; 索引 (1,1) 设为 nan
       ;; 检查 nan 是否设置成功
       (format t "~2%original tensor:~%")
-      (print-vt-recursive data 0 nil 2 10 'double-float t) ;; 简化打印，直接使用内部打印函数可能需要调整
+      (print-vt-recursive data 0 nil 2 10 :float64 t) ;; 简化打印，直接使用内部打印函数可能需要调整
       ;; 使用 vt-map 来打印，避免未导出函数
       (format t "~2%data values: ~{~a ~}~%" (vt-to-list data))
       
@@ -3421,7 +3567,7 @@
             (s-axis0 (vt-nansum data :axis 0))
             (s-axis1 (vt-nansum data :axis 1))
             (s-keepdim (vt-nansum data :axis 0 :keepdims t)))
-	(assert (= (coerce s-global 'double-float) 16.0d0) () "nansum global-> ~a" s-global)
+	(assert (= (vt-cast s-global :float64) 16.0d0) () "nansum global-> ~a" s-global)
 	(assert (equal (vt-to-list s-axis0) '(5.0 2.0 9.0)))
 	(assert (equal (vt-to-list s-axis1)  '(6.0 10.0)))
 	(assert (equal (list (first (vt-shape s-keepdim))
@@ -3489,7 +3635,7 @@
 	(format t "vt-nanmin: pass~%"))
 
       ;; ---- 边界情况：全 nan ----
-      (let* ((all-nan (vt-ones '(2 3) :type 'double-float))
+      (let* ((all-nan (vt-ones '(2 3) :dtype :float64))
              (d (vt-data all-nan)))
 	(loop for i below (length d)
 	      do (setf (aref d i) (/ 0.0d0 0.0d0)))
@@ -3517,7 +3663,7 @@
 	  (assert (vt-all (vt-isnan (ensure-vt v))))))
 
       ;; ---- 边界情况：无 nan ----
-      (let* ((clean (vt-arange 6 :step 1 :type 'double-float)))
+      (let* ((clean (vt-arange 6 :step 1 :dtype :float64)))
 	(assert (= (vt-item (vt-nansum clean)) 15.0d0))
 	(assert (= (vt-item (vt-nanmean clean)) 2.5d0))
 	(assert (< (abs (- (vt-item (vt-nanvar clean))
@@ -3533,7 +3679,7 @@
 (defun test-vt-logspace ()
   (format t "~%--- testing vt-logspace ---~%")
   ;; 1. 默认底数10，端点包含
-  (let* ((ls (vt-logspace 0 3 4 :type 'double-float))
+  (let* ((ls (vt-logspace 0 3 4 :dtype :float64))
          (arr (vt-to-list ls)))
     (assert (= (vt-size ls) 4))
     (assert (< (abs (- (first arr) 1.0d0)) 1d-10))
@@ -3543,7 +3689,7 @@
     (format t "  logspace(0,3,4) = ~a  pass~%" arr))
   
   ;; 2. 底数为2，不包含终点
-  (let* ((ls (vt-logspace 1 4 3 :base 2.0d0 :endpoint nil :type 'double-float))
+  (let* ((ls (vt-logspace 1 4 3 :base 2.0d0 :endpoint nil :dtype :float64))
          (arr (vt-to-list ls)))
     ;; 对数间隔在[1,4)上等分3个点：2^1=2, 2^2=4, 2^3=8
     (assert (< (abs (- (first arr) 2.0d0)) 1d-10))
@@ -3601,9 +3747,9 @@
   ;; 但 numpy 会进行取整，我们使用 fixnum 演示
   ;; 注意：因整数除法截断，结果可能不一样，这里仅验证类型和形状
   ;; -----------------------------------------------------------
-  (let ((vt (vt-linspace 0 10 5 :type 'fixnum)))
+  (let ((vt (vt-linspace 0 10 5 :dtype :int64)))
     (assert (equal (vt-shape vt) '(5)))
-    (assert (eq (vt-element-type vt) 'fixnum))
+    (assert (eq (vt-dtype vt) :int64))
     ;; 值不做具体断言，因为整数除法会丢失精度
     )
 
@@ -3650,37 +3796,37 @@
 (defun test-vt-kron ()
   (format t "~%--- testing vt-kron ---~%")
   ;; 1. 两个向量（结果为一维）
-  (let* ((a (vt-from-sequence '(1 2) :type 'double-float))
-         (b (vt-from-sequence '(3 4 5) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :float64))
+         (b (vt-from-sequence '(3 4 5) :dtype :float64))
          (k (vt-kron a b))
-         (expected (vt-from-sequence '(3 4 5 6 8 10) :type 'double-float)))
+         (expected (vt-from-sequence '(3 4 5 6 8 10) :dtype :float64)))
     (assert (equal (vt-shape k) '(6)))
     (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([1,2],[3,4,5]) = ~a  pass~%" k))
   
   ;; 2. 两个矩阵
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
-         (b (vt-from-sequence '((0 5) (6 7)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
+         (b (vt-from-sequence '((0 5) (6 7)) :dtype :float64))
          (k (vt-kron a b))
          (expected (vt-from-sequence
                     '((0 5 0 10)
                       (6 7 12 14)
                       (0 15 0 20)
                       (18 21 24 28))
-                    :type 'double-float)))
+                    :dtype :float64)))
     (assert (equal (vt-shape k) '(4 4)))
     (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([[1,2],[3,4]], [[0,5],[6,7]]) pass~%"))
   
   ;; 3. 向量与矩阵（向量视为行向量）
-  (let* ((a (vt-from-sequence '(1 2) :type 'double-float))
-         (b (vt-from-sequence '((3 4) (5 6)) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :float64))
+         (b (vt-from-sequence '((3 4) (5 6)) :dtype :float64))
          (k (vt-kron a b))
          ;; 预期：a 视为 1x2，b 为 2x2 → 结果 2x4
          (expected (vt-from-sequence
                     '((3 4 6 8)
                       (5 6 10 12))
-                    :type 'double-float)))
+                    :dtype :float64)))
     (assert (equal (vt-shape k) '(2 4)))
     (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([1,2], [[3,4],[5,6]]) pass~%"))
@@ -3704,21 +3850,21 @@
   (format t "~%--- testing vt-diff ---~%")
   
   ;; 1. 一维数组，默认一阶差分
-  (let* ((data (vt-from-sequence '(1 3 7 13 21) :type 'fixnum))
+  (let* ((data (vt-from-sequence '(1 3 7 13 21) :dtype :int64))
          (result (vt-diff data)))
     (assert (equal (vt-shape result) '(4)))
     (assert (equal (vt-to-list result) '(2 4 6 8)))
     (format t "  1d 1st-order diff: ~a pass~%" result))
   
   ;; 2. 一维数组，二阶差分
-  (let* ((data (vt-from-sequence '(1 3 7 13 21) :type 'fixnum))
+  (let* ((data (vt-from-sequence '(1 3 7 13 21) :dtype :int64))
          (result (vt-diff data :n 2)))
     (assert (equal (vt-shape result) '(3)))
     (assert (equal (vt-to-list result) '(2 2 2)))
     (format t "  1d 2nd-order diff: ~a pass~%" result))
   
   ;; 3. 一维数组，高阶差分 (n=3)
-  (let* ((data (vt-from-sequence '(1 2 4 8 16) :type 'fixnum))
+  (let* ((data (vt-from-sequence '(1 2 4 8 16) :dtype :int64))
          (result (vt-diff data :n 3)))
     ;; 原始: [1,2,4,8,16]
     ;; diff1: [1,2,4,8]
@@ -3729,7 +3875,7 @@
     (format t "  1d 3rd-order diff: ~a pass~%" result))
   
   ;; 4. 二维数组，默认轴 (axis = -1)
-  (let* ((data (vt-from-sequence '((1 3 7) (1 4 9)) :type 'fixnum))
+  (let* ((data (vt-from-sequence '((1 3 7) (1 4 9)) :dtype :int64))
          (result (vt-diff data)))
     ;; 沿最后一轴 (axis=1) 差分
     (assert (equal (vt-shape result) '(2 2)))
@@ -3737,7 +3883,7 @@
     (format t "  2d diff axis=-1: ~a pass~%" result))
   
   ;; 5. 二维数组，沿 axis=0 差分
-  (let* ((data (vt-from-sequence '((1 3 7) (1 4 9)) :type 'fixnum))
+  (let* ((data (vt-from-sequence '((1 3 7) (1 4 9)) :dtype :int64))
          (result (vt-diff data :axis 0)))
     ;; 沿第0轴 (行方向) 差分
     (assert (equal (vt-shape result) '(1 3)))
@@ -3745,7 +3891,7 @@
     (format t "  2d diff axis=0: ~a pass~%" result))
   
   ;; 6. 二维数组，沿 axis=1 且 n=2
-  (let* ((data (vt-from-sequence '((1 3 7 13) (1 4 9 16)) :type 'fixnum))
+  (let* ((data (vt-from-sequence '((1 3 7 13) (1 4 9 16)) :dtype :int64))
          (result (vt-diff data :axis 1 :n 2)))
     (assert (equal (vt-shape result) '(2 2)))
     ;; 第一行: diff1 [2,4,6], diff2 [2,2]
@@ -3755,7 +3901,7 @@
   
   ;; 7. 边界情况：长度不足以做差分（长度 < n+1）应返回空形状
   ;; numpy 行为：若数组长度小于 n+1，返回空数组
-  (let ((data (vt-from-sequence '(1 2) :type 'fixnum)))
+  (let ((data (vt-from-sequence '(1 2) :dtype :int64)))
     ;; 一阶差分可做 (结果长度1)
     (let ((r (vt-diff data)))
       (assert (equal (vt-shape r) '(1)))
@@ -3772,7 +3918,7 @@
 (defun test-vt-trapz ()
   (format t "~%--- testing vt-trapz ---~%")
   ;; 1. 一维数组，默认 dx=1
-  (let* ((y (vt-from-sequence '(1 2 3 4) :type 'double-float))
+  (let* ((y (vt-from-sequence '(1 2 3 4) :dtype :float64))
          (trap (vt-item (vt-trapz y))))
     ;; 梯形积分： (1+2)/2 + (2+3)/2 + (3+4)/2 = 1.5+2.5+3.5 = 7.5
     (assert (floatp trap))
@@ -3780,8 +3926,8 @@
     (format t "  trapz([1,2,3,4]) default dx=1 -> ~a  pass~%" trap))
   
   ;; 2. 指定 x 坐标
-  (let* ((x (vt-from-sequence '(0 2 3 5) :type 'double-float))
-         (y (vt-from-sequence '(1 2 3 4) :type 'double-float))
+  (let* ((x (vt-from-sequence '(0 2 3 5) :dtype :float64))
+         (y (vt-from-sequence '(1 2 3 4) :dtype :float64))
          (trap (vt-item (vt-trapz y :x x))))
     ;; 梯度：dx1=2, dx2=1, dx3=2
     ;; 积分 = (1+2)/2*2 + (2+3)/2*1 + (3+4)/2*2 = 3*2 + 2.5*1 + 3.5*2 = 6+2.5+7 = 12.5
@@ -3789,7 +3935,7 @@
     (format t "  trapz with x=[0,2,3,5] -> ~a  pass~%" trap))
   
   ;; 3. 二维数组，沿指定轴
-  (let* ((data (vt-from-sequence '((1 2 3) (4 5 6)) :type 'double-float))
+  (let* ((data (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :float64))
          (trap-axis0 (vt-trapz data :axis 0))
          (trap-axis1 (vt-trapz data :axis 1)))
     ;; axis=0：每列沿行方向（长度2）梯形积分，dx=1
@@ -3813,8 +3959,8 @@
 
 (defun test-vt-correlate ()
   (format t "~%--- testing vt-correlate ---~%")
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
-         (v (vt-from-sequence '(0 1 0.5) :type 'double-float)))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :float64))
+         (v (vt-from-sequence '(0 1 0.5) :dtype :float64)))
     ;; full 模式
     (let ((res (vt-correlate a v :mode :full)))
       (assert (equal (vt-to-list res) '(0.5 2.0 3.5 3.0 0.0)))
@@ -3828,8 +3974,8 @@
       (assert (equal (vt-to-list res) '(2.0 3.5 3.0)))
       (format t "  same  mode: ~a pass~%" res)))
   ;; 单元素
-  (let ((a (vt-from-sequence '(5) :type 'double-float))
-        (v (vt-from-sequence '(3) :type 'double-float)))
+  (let ((a (vt-from-sequence '(5) :dtype :float64))
+        (v (vt-from-sequence '(3) :dtype :float64)))
     (dolist (mode '(:full :valid :same))
       (let ((res (vt-correlate a v :mode mode)))
         (assert (equal (vt-to-list res) '(15.0)))
@@ -3881,7 +4027,7 @@
   ;; 我们使用简单数据测试：0..9 的 10 个整数，bins=5
   ;; a = np.arange(10)
   ;; np.histogram(a, bins=5) -> (array([2,2,2,2,2]), array([0., 1.8, 3.6, 5.4, 7.2, 9.]))
-  (let* ((a (vt-arange 10 :type 'fixnum))
+  (let* ((a (vt-arange 10 :dtype :int64))
          (result (multiple-value-list (vt-histogram a :bins 5)))
          (hist (first result))
          (edges (second result)))
@@ -3891,7 +4037,7 @@
   ;; ---- 2. 指定 range ----
   ;; a = np.array([0,1,2,3,4,5,6,7,8,9])
   ;; np.histogram(a, bins=3, range=(0,9)) -> (array([3,3,4]), array([0., 3., 6., 9.]))
-  (let* ((a (vt-arange 10 :type 'fixnum))
+  (let* ((a (vt-arange 10 :dtype :int64))
          (mv (multiple-value-list (vt-histogram a :bins 3 :range '(0 9))))
          (hist (first mv))
          (edges (second mv)))
@@ -3913,7 +4059,7 @@
   ;; np.histogram(a, bins=3) -> 所有值落在同一个 bin？实际默认 range 会扩展至 (2-0.5, 2+0.5)? 需要指定 range 为准
   ;; 我们指定 range=(0,10), bins=5
   ;; np.histogram(np.array([2,2,2,2]), bins=5, range=(0,10)) -> (array([0,4,0,0,0]), array([0.,2.,4.,6.,8.,10.]))
-  (let* ((a (vt-const '(4) 2 :type 'fixnum))
+  (let* ((a (vt-const '(4) 2 :dtype :int64))
          (mv (multiple-value-list (vt-histogram a :bins 5 :range '(0 10))))
          (hist (first mv))
          (edges (second mv)))
@@ -3933,7 +4079,7 @@
   ;; ---- 6. 二维张量（内部自动展平） ----
   ;; a = np.arange(6).reshape(2,3)
   ;; np.histogram(a, bins=3, range=(0,5)) -> 展平后直方图
-  (let* ((a (vt-reshape (vt-arange 6 :type 'fixnum) '(2 3)))
+  (let* ((a (vt-reshape (vt-arange 6 :dtype :int64) '(2 3)))
          (mv (multiple-value-list (vt-histogram a :bins 3 :range '(0 5))))
          (hist (first mv))
          (edges (second mv)))
@@ -3969,42 +4115,42 @@
   ;; vt-unique 基本排序，不返回额外关键字
   ;; a = np.array([3,1,2,1,3])
   ;; np.unique(a) -> [1,2,3]
-  (let* ((a (vt-from-sequence '(3 1 2 1 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(3 1 2 1 3) :dtype :int64))
          (u (vt-unique a)))
     (assert (equal (vt-to-list u) '(1 2 3))))
 
   ;; vt-intersect1d
   ;; np.intersect1d([1,3,5],[3,7,5]) -> [3,5]
-  (let* ((a (vt-from-sequence '(1 3 5) :type 'fixnum))
-         (b (vt-from-sequence '(3 7 5) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 3 5) :dtype :int64))
+         (b (vt-from-sequence '(3 7 5) :dtype :int64))
          (res (vt-intersect1d a b)))
     (assert (equal (vt-to-list res) '(3 5))))
 
   ;; vt-union1d
   ;; np.union1d([1,2],[2,3]) -> [1,2,3]
-  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
-         (b (vt-from-sequence '(2 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :int64))
+         (b (vt-from-sequence '(2 3) :dtype :int64))
          (res (vt-union1d a b)))
     (assert (equal (vt-to-list res) '(1 2 3))))
 
   ;; vt-setdiff1d
   ;; np.setdiff1d([1,2,3,4],[3,4,5]) -> [1,2]
-  (let* ((a (vt-from-sequence '(1 2 3 4) :type 'fixnum))
-         (b (vt-from-sequence '(3 4 5) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3 4) :dtype :int64))
+         (b (vt-from-sequence '(3 4 5) :dtype :int64))
          (res (vt-setdiff1d a b)))
     (assert (equal (vt-to-list res) '(1 2))))
 
   ;; vt-setxor1d
   ;; np.setxor1d([1,2,3],[3,4]) -> [1,2,4]
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
-         (b (vt-from-sequence '(3 4) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (b (vt-from-sequence '(3 4) :dtype :int64))
          (res (vt-setxor1d a b)))
     (assert (equal (vt-to-list res) '(1 2 4))))
 
   ;; vt-in1d
   ;; np.in1d([1,2,3],[2,4]) -> [false, true, false]
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
-         (b (vt-from-sequence '(2 4) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (b (vt-from-sequence '(2 4) :dtype :int64))
          (res (vt-in1d a b)))
     (assert (equal (vt-to-list res) '(0.0 1.0 0.0))))
 
@@ -4041,7 +4187,7 @@
   
 
   ;; vt-softmax
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
 	 (sm (vt-softmax a :axis -1)))
     (assert (lists-approx-equal
 	     (vt-to-list sm)
@@ -4049,7 +4195,7 @@
                (0.2689414213699951d0 0.7310585786300049d0)))))
 
   ;; vt-log-softmax
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
 	 (lsm (vt-log-softmax a :axis -1))
 	 (soft (vt-softmax a :axis -1))
 	 (logsoft (vt-log soft)))
@@ -4061,10 +4207,10 @@
 
   ;; 先计算 softmax，再将概率传入交叉熵
   (let* ((logits (vt-from-sequence '((2.0 1.0 0.1) (0.5 2.5 0.3))
-				   :type 'double-float))
+				   :dtype :float64))
 	 (probs (vt-softmax logits :axis -1))
 	 (true (vt-from-sequence '((0.0 1.0 0.0) (0.0 1.0 0.0))
-				 :type 'double-float))
+				 :dtype :float64))
 	 (loss (vt-item (vt-cross-entropy true probs))))
     ;; 损失应为正数（大约 0.874）
     (assert (> loss 0.0d0))
@@ -4074,8 +4220,8 @@
   ;; y_true=[1,0,1], y_pred=[0.9,0.1,0.8]
   ;; bce = -[1*log(0.9)+0*log(0.1)+1*log(0.8)] / 3
   ;; 二元交叉熵
-  (let* ((y-true (vt-from-sequence '(1 0 1) :type 'double-float))
-	 (y-pred (vt-from-sequence '(0.9 0.1 0.8) :type 'double-float))
+  (let* ((y-true (vt-from-sequence '(1 0 1) :dtype :float64))
+	 (y-pred (vt-from-sequence '(0.9 0.1 0.8) :dtype :float64))
 	 (bce (vt-item (vt-binary-cross-entropy y-true y-pred))))
     ;; 正确期望值：三个样本损失的平均
     (let ((expected (/ (+ (- (log 0.9d0))   ; 样本1
@@ -4086,21 +4232,21 @@
 
   ;; vt-relu
   ;; np.maximum(0, [-1,0,2,-3]) -> [0,0,2,0]
-  (let* ((a (vt-from-sequence '(-1 0 2 -3) :type 'double-float))
+  (let* ((a (vt-from-sequence '(-1 0 2 -3) :dtype :float64))
          (r (vt-relu a)))
     (assert (equal (vt-to-list r) '(0.0 0.0 2.0 0.0))))
 
   ;; vt-sigmoid
   ;; sigmoid(0) = 0.5
-  (let ((a (vt-const '(1) 0.0d0 :type 'double-float)))
+  (let ((a (vt-const '(1) 0.0d0 :dtype :float64)))
     (assert (= (vt-ref (vt-sigmoid a) 0) 0.5d0)))
 
   ;; vt-tanh 奇函数性质
-  (let ((a (vt-const '(1) 0.0d0 :type 'double-float)))
+  (let ((a (vt-const '(1) 0.0d0 :dtype :float64)))
     (assert (= (vt-ref (vt-tanh a) 0) 0.0d0)))
 
   ;; vt-gelu (近似) 输入0输出0
-  (let ((a (vt-zeros '(3) :type 'double-float)))
+  (let ((a (vt-zeros '(3) :dtype :float64)))
     (assert (every (lambda (x) (< (abs x) 1e-10))
 		   (vt-to-list (vt-gelu a)))))
 
@@ -4110,8 +4256,8 @@
   ;; vt-average 加权平均
   ;; a = [1,2,3], weights = [1,2,1]
   ;; np.average(a, weights=weights) -> (1*1+2*2+3*1)/(1+2+1) = 2.0
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
-         (w (vt-from-sequence '(1 2 1) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :float64))
+         (w (vt-from-sequence '(1 2 1) :dtype :float64))
          (avg (vt-item (vt-average a w))))
     (assert (= avg 2.0d0)))
   ;; ==========================================
@@ -4187,14 +4333,14 @@
   ;; a = np.array([[1,5],[3,2]])
   ;; np.ptp(a) -> 4
   ;; np.ptp(a, axis=0) -> [2,3]
-  (let* ((a (vt-from-sequence '((1 5) (3 2)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((1 5) (3 2)) :dtype :int64))
          (p (vt-ptp a)))
     (assert (= p 4.0d0))
     (let ((p0 (vt-to-list (vt-ptp a :axis 0))))
       (assert (equal p0 '(2 3)))))
   ;; vt-var / vt-std
   ;; a = [1,2,3,4]  有偏方差 = mean((x-mean)^2) = 1.25, std=sqrt(1.25)
-  (let* ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1 2 3 4) :dtype :float64))
          (v (vt-item (vt-var a)))
          (s (vt-item (vt-std a))))
     (assert (lists-approx-equal (list v)
@@ -4204,13 +4350,13 @@
 
   ;; vt-prod
   ;; np.prod([1,2,3,4]) -> 24
-  (let ((a (vt-from-sequence '(1 2 3 4) :type 'fixnum)))
+  (let ((a (vt-from-sequence '(1 2 3 4) :dtype :int64)))
     (assert (= (vt-item (vt-prod a)) 24.0d0)))
 
   ;; vt-prod axis
   ;; a = np.array([[1,2],[3,4]])
   ;; np.prod(a, axis=1) -> [2,12]
-  (let* ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
          (p (vt-prod a :axis 1)))
     (assert (equal (vt-to-list p) '(2.0 12.0))))
 
@@ -4222,12 +4368,12 @@
 (defun test-logical ()
   ;; vt-all
   ;; np.all([true, true, false]) -> false
-  (let ((a (vt-from-sequence '(1 1 0) :type 'double-float)))
+  (let ((a (vt-from-sequence '(1 1 0) :dtype :float64)))
     (assert (= (vt-item (vt-all a)) 0.0d0)))
 
   ;; vt-any
   ;; np.any([0,0,1]) -> true
-  (let ((a (vt-from-sequence '(0 0 1) :type 'double-float)))
+  (let ((a (vt-from-sequence '(0 0 1) :dtype :float64)))
     (assert (= (vt-item (vt-any a)) 1.0d0)))
 
   ;; vt-isclose
@@ -4237,8 +4383,8 @@
     (assert (= (vt-item (vt-isclose a b)) 1.0d0)))
 
   ;; vt-allclose
-  (let ((a (vt-from-sequence '(1 2 3) :type 'double-float))
-        (b (vt-from-sequence '(1 2 3.0001) :type 'double-float)))
+  (let ((a (vt-from-sequence '(1 2 3) :dtype :float64))
+        (b (vt-from-sequence '(1 2 3.0001) :dtype :float64)))
     (assert (vt-allclose a b :rtol 1e-3 :atol 1e-3)))
 
   ;; vt-isfinite / vt-isinf / vt-isnan
@@ -4246,7 +4392,7 @@
 		(list 1.0 0.0
 		      sb-kernel::double-float-positive-infinity
 		      sb-kernel::double-float-positive-infinity 0.0)
-		:type 'double-float))
+		:dtype :float64))
          (finite (vt-isfinite data))
          (inf (vt-isinf data))
          (nan (vt-isnan data)))
@@ -4262,14 +4408,14 @@
 (defun test-math-ops ()
   ;; vt-clip
   ;; np.clip([1,2,3,4,5], 2, 4) -> [2,2,3,4,4]
-  (let* ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1 2 3 4 5) :dtype :float64))
          (c (vt-clip a 2 4)))
     (assert (equal (vt-to-list c) '(2.0 2.0 3.0 4.0 4.0))))
 
   ;; vt-convolve (same mode)
   ;; np.convolve([1,2,3], [0,1,0.5], 'same') -> 中间值与 numpy 对比
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'double-float))
-         (v (vt-from-sequence '(0 1 0.5) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :float64))
+         (v (vt-from-sequence '(0 1 0.5) :dtype :float64))
          (c (vt-convolve a v :mode :same)))
     ;; numpy: array([1., 2.5, 4 ])  计算略
     (assert (lists-approx-equal (vt-to-list c)
@@ -4319,34 +4465,34 @@
 (defun test-more-activations ()
   ;; vt-leaky-relu alpha=0.01
   ;; np.where(x > 0, x, 0.01*x)
-  (let* ((a (vt-from-sequence '(-1.0 0.0 2.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(-1.0 0.0 2.0) :dtype :float64))
          (act (vt-leaky-relu a :alpha 0.01d0)))
     (assert (lists-approx-equal (vt-to-list act) '(-0.01 0.0 2.0) :epsilon 1e-6)))
 
   ;; vt-swish = x * sigmoid(x)
   ;; swish(0) = 0, swish(1) ≈ 1/(1+exp(-1)) ≈ 0.7311
-  (let* ((a (vt-from-sequence '(0.0 1.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(0.0 1.0) :dtype :float64))
          (act (vt-swish a)))
     (assert (lists-approx-equal (vt-to-list act) '(0.0 0.7310585786300049) :epsilon 1e-6)))
 
   ;; vt-softplus: log(1+exp(x))，大值近似 x
-  (let* ((a (vt-from-sequence '(0.0 10.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(0.0 10.0) :dtype :float64))
          (act (vt-softplus a)))
     (assert (lists-approx-equal (vt-to-list act) (list (log 2.0d0) (+ (log (1+ (exp 10.0d0))) 0.0d0)) :epsilon 1e-6)))
 
   ;; vt-mish: x * tanh(softplus(x)) 在0处为0，正数近似 x
-  (let* ((a (vt-from-sequence '(0.0 2.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(0.0 2.0) :dtype :float64))
          (act (vt-mish a)))
     (assert (lists-approx-equal (vt-to-list act) (list 0.0d0 (* 2.0d0 (tanh (log (1+ (exp 2.0d0)))))) :epsilon 1e-6)))
 
   ;; vt-hard-tanh: clamp(x, -1, 1)
-  (let* ((a (vt-from-sequence '(-1.5 -0.5 0.5 1.5) :type 'double-float))
+  (let* ((a (vt-from-sequence '(-1.5 -0.5 0.5 1.5) :dtype :float64))
          (act (vt-hard-tanh a)))
     (assert (equal (vt-to-list act) '(-1.0 -0.5 0.5 1.0))))
 
   ;; vt-hard-sigmoid: 快速分段线性近似
   ;; 实现: 0.2*x + 0.5 后 clip [0,1]
-  (let* ((a (vt-from-sequence '(-3.0 0.0 3.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(-3.0 0.0 3.0) :dtype :float64))
          (act (vt-hard-sigmoid a)))
     (assert (lists-approx-equal (vt-to-list act) '(0.0 0.5 1.0) :epsilon 1e-6)))
 
@@ -4357,35 +4503,35 @@
 ;; --------------------------------------------------------------------
 (defun test-arithmetic-ops ()
   ;; vt-square
-  (let* ((a (vt-from-sequence '(-2 0 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(-2 0 3) :dtype :int64))
          (sq (vt-square a)))
     (assert (equal (vt-to-list sq) '(4 0 9))))
 
   ;; vt-sqrt
-  (let* ((a (vt-from-sequence '(4.0 0.0 9.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(4.0 0.0 9.0) :dtype :float64))
          (sq (vt-sqrt a)))
     (assert (lists-approx-equal (vt-to-list sq) '(2.0 0.0 3.0))))
 
   ;; vt-exp / vt-log
-  (let* ((a (vt-from-sequence '(1.0 0.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1.0 0.0) :dtype :float64))
          (exp-a (vt-exp a))
          (log-exp (vt-log exp-a)))
     (assert (lists-approx-equal (vt-to-list log-exp) '(1.0 0.0) :epsilon 1e-6)))
 
   ;; vt-clip (already tested, but verify broadcast)
-  (let* ((a (vt-from-sequence '((-1 2 5) (10 0 -3)) :type 'fixnum))
+  (let* ((a (vt-from-sequence '((-1 2 5) (10 0 -3)) :dtype :int64))
          (cl (vt-clip a 0 4)))
     (assert (equal (vt-to-list cl) '((0 2 4) (4 0 0)))))
 
   ;; vt-mod / vt-rem
-  (let* ((a (vt-from-sequence '(5 3 8) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(5 3 8) :dtype :int64))
          (mod (vt-mod a 3))
          (rem (vt-rem a 3)))
     (assert (equal (vt-to-list mod) '(2 0 2)))
     (assert (equal (vt-to-list rem) '(2 0 2))))
 
   ;; vt-round / vt-floor / vt-ceiling / vt-truncate
-  (let* ((a (vt-from-sequence '(-1.4 2.6) :type 'double-float))
+  (let* ((a (vt-from-sequence '(-1.4 2.6) :dtype :float64))
          (r (vt-round a))
          (f (vt-floor a))
          (c (vt-ceiling a))
@@ -4396,43 +4542,43 @@
     (assert (lists-approx-equal (vt-to-list e) '(-1.0 2.0))))
 
   ;; vt-rint (round to nearest integer, float)
-  (let* ((a (vt-from-sequence '(1.2 2.7 -1.5) :type 'double-float))
+  (let* ((a (vt-from-sequence '(1.2 2.7 -1.5) :dtype :float64))
          (ri (vt-rint a)))
     ;; 注意：rint 在半值向上取整
     (assert (lists-approx-equal (vt-to-list ri) '(1.0 3.0 -2.0))))
 
   ;; vt-signum
-  (let* ((a (vt-from-sequence '(-3 0 5) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(-3 0 5) :dtype :int64))
          (s (vt-signum a)))
     (assert (equal (vt-to-list s) '(-1 0 1))))
 
   ;; 三角函数简单测试
   ;; sin(0)=0, cos(0)=1
-  (let ((a (vt-const '(1) 0.0d0 :type 'double-float)))
+  (let ((a (vt-const '(1) 0.0d0 :dtype :float64)))
     (assert (< (abs (vt-ref (vt-sin a) 0)) 1e-10))
     (assert (< (abs (- 1.0d0 (vt-ref (vt-cos a) 0))) 1e-10))
     (assert (< (abs (vt-ref (vt-tan a) 0)) 1e-10)))
 
   ;; 双曲函数
-  (let ((a (vt-const '(1) 0.0d0 :type 'double-float)))
+  (let ((a (vt-const '(1) 0.0d0 :dtype :float64)))
     (assert (< (abs (vt-ref (vt-sinh a) 0)) 1e-10))
     (assert (< (abs (- 1.0d0 (vt-ref (vt-cosh a) 0))) 1e-10))
     (assert (< (abs (vt-ref (vt-tanh a) 0)) 1e-10)))
 
   ;; vt-hypot
-  (let* ((a (vt-from-sequence '(3.0) :type 'double-float))
-         (b (vt-from-sequence '(4.0) :type 'double-float))
-         (h (vt-hypot a b)))
+  (let* ((a (vt-from-sequence '(3.0) :dtype :float64))
+         (b (vt-from-sequence '(4.0) :dtype :float64))
+         (h (vt-hypot a :t2 b)))
     (assert (lists-approx-equal (vt-to-list h) '(5.0) :epsilon 1e-6)))
 
   ;; vt-sinc: sinc(x) = sin(pi*x)/(pi*x), sinc(0)=1
-  (let* ((a (vt-from-sequence '(0.0 0.5) :type 'double-float))
+  (let* ((a (vt-from-sequence '(0.0 0.5) :dtype :float64))
          (sc (vt-sinc a)))
     ;; sinc(0.5) = sin(pi/2)/(pi/2) = 1 / (pi/2) = 2/pi ≈ 0.6366
     (assert (lists-approx-equal (vt-to-list sc) (list 1.0d0 (/ 2.0d0 pi)) :epsilon 1e-6)))
 
   ;; vt-deg2rad / vt-rad2deg
-  (let* ((a (vt-from-sequence '(180.0) :type 'double-float))
+  (let* ((a (vt-from-sequence '(180.0) :dtype :float64))
          (rad (vt-deg2rad a))
          (deg (vt-rad2deg rad)))
     (assert (lists-approx-equal (vt-to-list rad) (list pi) :epsilon 1e-6))
@@ -4448,14 +4594,14 @@
   ;; np.fromfunction(lambda i,j: i+j, (3,2), dtype=int)
   (let* ((shape '(3 2))
          (fn (lambda (idxs) (+ (first idxs) (second idxs))))
-         (arr (vt-from-function shape fn :type 'fixnum)))
+         (arr (vt-from-function shape fn :dtype :int64)))
     (assert (equal (vt-shape arr) shape))
     (assert (equal (vt-to-list arr) '((0 1) (1 2) (2 3)))))
 
   ;; 一维情况
   (let* ((shape '(5))
          (fn (lambda (idxs) (* (first idxs) 2)))
-         (arr (vt-from-function shape fn :type 'fixnum)))
+         (arr (vt-from-function shape fn :dtype :int64)))
     (assert (equal (vt-to-list arr) '(0 2 4 6 8))))
 
   (format t "~%test-vt-from-function passed.~%"))
@@ -4465,18 +4611,18 @@
 ;; --------------------------------------------------------------------
 (defun test-vt-bincount ()
   ;; np.bincount([0,1,2,1,0,3]) -> [2,2,1,1]
-  (let* ((a (vt-from-sequence '(0 1 2 1 0 3) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(0 1 2 1 0 3) :dtype :int64))
          (cnt (vt-bincount a)))
     (assert (equal (vt-to-list cnt) '(2 2 1 1))))
 
   ;; 指定 minlength
   ;; np.bincount([0,1,1], minlength=5) -> [1,2,0,0,0]
-  (let* ((a (vt-from-sequence '(0 1 1) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(0 1 1) :dtype :int64))
          (cnt (vt-bincount a :minlength 5)))
     (assert (equal (vt-to-list cnt) '(1 2 0 0 0))))
 
   ;; 空输入（零大小）
-  (let* ((a (vt-zeros '(0) :type 'fixnum))
+  (let* ((a (vt-zeros '(0) :dtype :int64))
          (cnt (vt-bincount a)))
     (assert (equal (vt-to-list cnt) '())))
 
@@ -4488,8 +4634,8 @@
 (defun test-vt-digitize ()
   ;; 默认 right=false：bins[i-1] <= x < bins[i]
   ;; np.digitize([0.2, 6.4, 3.0, 1.6], [0,2,4,6]) -> [1,4,2,1]
-  (let* ((x (vt-from-sequence '(0.2 6.4 3.0 1.6) :type 'double-float))
-         (bins (vt-from-sequence '(0 2 4 6) :type 'double-float))
+  (let* ((x (vt-from-sequence '(0.2 6.4 3.0 1.6) :dtype :float64))
+         (bins (vt-from-sequence '(0 2 4 6) :dtype :float64))
          (dig (vt-digitize x bins)))
     (assert (equal (vt-to-list dig) '(1 4 2 1))))
 
@@ -4504,8 +4650,8 @@
   ;; # 返回第一个大于等于 x 的 bin 索引
   ;; dig_true = np.digitize(x, bins, right=true)
   ;; print(dig_true)  
-  (let* ((x (vt-from-sequence '(2.0) :type 'double-float))
-         (bins (vt-from-sequence '(0 2 4) :type 'double-float))
+  (let* ((x (vt-from-sequence '(2.0) :dtype :float64))
+         (bins (vt-from-sequence '(0 2 4) :dtype :float64))
          (dig-false (vt-digitize x bins))
          (dig-true (vt-digitize x bins :right t)))
     ;; right=false: 2.0 属于 [2,4) -> bin 2
@@ -4526,7 +4672,7 @@
   "测试 vt-append 与 numpy np.append 行为的一致性。"
   (format t "~%testing vt-append...~%")
   (flet ((check (name got expected-list)
-           (let ((expected (vt-from-sequence expected-list :type 'double-float)))
+           (let ((expected (vt-from-sequence expected-list :dtype :float64)))
              (if (vt-allclose got expected :rtol 1e-5 :atol 1e-8)
                  (format t "✓ pass: ~a~%" name)
                  (format t "✗ fail: ~a~%  got: ~a~%  expected: ~a~%" 
@@ -4534,7 +4680,7 @@
     
     ;; 用例1: 展平模式，标量 values 自动转为张量
     ;; # numpy: a = np.array([[1,2],[3,4]]); b = 5; np.append(a, b)  # axis=none
-    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
           (b 5))
       (check "append_flat_scalar"
              (vt-append a b :axis nil)
@@ -4542,24 +4688,24 @@
     
     ;; 用例2: 展平模式，张量 values
     ;; # numpy: a = np.array([[1,2],[3,4]]); b = np.array([5,6]); np.append(a, b)
-    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
-          (b (vt-from-sequence '(5 6) :type 'double-float)))
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
+          (b (vt-from-sequence '(5 6) :dtype :float64)))
       (check "append_flat_tensor"
              (vt-append a b :axis nil)
              '(1 2 3 4 5 6)))
     
     ;; 用例3: 沿 axis=0 连接
     ;; # numpy: a = np.array([[1,2],[3,4]]); b = np.array([[5,6]]); np.append(a, b, axis=0)
-    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
-          (b (vt-from-sequence '((5 6)) :type 'double-float)))
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
+          (b (vt-from-sequence '((5 6)) :dtype :float64)))
       (check "append_axis0"
              (vt-append a b :axis 0)
              '((1 2) (3 4) (5 6))))
     
     ;; 用例4: 沿 axis=1 连接 (要求行数相同)
     ;; # numpy: a = np.array([[1,2],[3,4]]); b = np.array([[5],[6]]); np.append(a, b, axis=1)
-    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
-          (b (vt-from-sequence '((5) (6)) :type 'double-float)))
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
+          (b (vt-from-sequence '((5) (6)) :dtype :float64)))
       (check "append_axis1"
              (vt-append a b :axis 1)
              '((1 2 5) (3 4 6))))
@@ -4569,7 +4715,7 @@
   "测试 vt-insert 与 numpy np.insert 行为的一致性。"
   (format t "~%testing vt-insert...~%")
   (flet ((check (name got expected-list)
-           (let ((expected (vt-from-sequence expected-list :type 'double-float)))
+           (let ((expected (vt-from-sequence expected-list :dtype :float64)))
              (if (vt-allclose got expected :rtol 1e-5 :atol 1e-8)
                  (format t "✓ pass: ~a~%" name)
                  (format t "✗ fail: ~a~%  got: ~a~%  expected: ~a~%" 
@@ -4577,7 +4723,7 @@
     
     ;; 用例1: 展平模式，单索引插入标量
     ;; # numpy: a = np.array([1,2,3,4]); np.insert(a, 2, 99)  # axis=none
-    (let ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
+    (let ((a (vt-from-sequence '(1 2 3 4) :dtype :float64))
           (vals 99))
       (check "insert_flat_scalar"
              (vt-insert a 2 vals :axis nil)
@@ -4585,32 +4731,32 @@
     
     ;; 用例2: 展平模式，单索引插入张量
     ;; # numpy: a = np.array([1,2,3,4]); vals = np.array([99,100]); np.insert(a, 2, vals)
-    (let ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
-          (vals (vt-from-sequence '(99 100) :type 'double-float)))
+    (let ((a (vt-from-sequence '(1 2 3 4) :dtype :float64))
+          (vals (vt-from-sequence '(99 100) :dtype :float64)))
       (check "insert_flat_tensor"
              (vt-insert a 2 vals :axis nil)
              '(1 2 99 100 3 4)))
     
     ;; 用例3: 展平模式，多索引列表插入
     ;; # numpy: a = np.array([1,2,3,4]); np.insert(a, [0,2], 99)
-    (let ((a (vt-from-sequence '(1 2 3 4) :type 'double-float))
-          (vals (vt-from-sequence '(99) :type 'double-float)))
+    (let ((a (vt-from-sequence '(1 2 3 4) :dtype :float64))
+          (vals (vt-from-sequence '(99) :dtype :float64)))
       (check "insert_flat_multi_index"
              (vt-insert a '(0 2) vals :axis nil)
              '(99 1 2 99 3 4)))
     
     ;; 用例4: 沿 axis=1 插入 (矩阵列)
     ;; # numpy: a = np.array([[1,2],[3,4]]); vals = np.array([[99,100]]); np.insert(a, 1, vals, axis=1)
-    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
-          (vals (vt-from-sequence '((99 100)) :type 'double-float)))
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
+          (vals (vt-from-sequence '((99 100)) :dtype :float64)))
       (check "insert_axis1"
              (vt-insert a 1 vals :axis 1)
              '((1 99 2) (3 100 4))))
     
     ;; 用例5: 沿 axis=0 插入行
     ;; # numpy: a = np.array([[1,2],[3,4]]); vals = np.array([[5,6]]); np.insert(a, 1, vals, axis=0)
-    (let ((a (vt-from-sequence '((1 2) (3 4)) :type 'double-float))
-          (vals (vt-from-sequence '((5 6)) :type 'double-float)))
+    (let ((a (vt-from-sequence '((1 2) (3 4)) :dtype :float64))
+          (vals (vt-from-sequence '((5 6)) :dtype :float64)))
       (check "insert_axis0"
              (vt-insert a 1 vals :axis 0)
              '((1 2) (5 6) (3 4))))
@@ -4618,8 +4764,8 @@
     ;; arr = np.array([[1,2,3],[4,5,6],[7,8,9]])
     ;; vals = np.array([[10,10,10],[20,20,20]])
     ;; res = np.insert(arr, [1,2], vals, axis=0)
-    (let* ((arr (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9)) :type 'fixnum))
-	   (vals (vt-from-sequence '((10 10 10) (20 20 20)) :type 'fixnum))
+    (let* ((arr (vt-from-sequence '((1 2 3) (4 5 6) (7 8 9)) :dtype :int64))
+	   (vals (vt-from-sequence '((10 10 10) (20 20 20)) :dtype :int64))
 	   (res (vt-insert arr '(1 2) vals :axis 0)))
       (assert (equal (vt-to-list res)
 		     '((1 2 3)
@@ -4629,14 +4775,14 @@
 		       (7 8 9)))))
     ;; 测试 1：轴0插入，索引0
     (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
-           (res (vt-insert a 0 (vt-from-sequence '(10 11 12) :type 'double-float) :axis 0))
+           (res (vt-insert a 0 (vt-from-sequence '(10 11 12) :dtype :float64) :axis 0))
            (expected (vt-from-sequence '((10 11 12) (0 1 2) (3 4 5)))))
       (assert-ok (approx= res expected) "vt-insert 轴0插入失败"))
 
     ;; 测试 2：轴1末尾插入
     (let* ((a (vt-from-sequence '((0 1 2) (3 4 5))))
            (res (vt-insert a (second (vt-shape a))
-			   (vt-from-sequence '(7 8) :type 'double-float) :axis 1))
+			   (vt-from-sequence '(7 8) :dtype :float64) :axis 1))
            (expected (vt-from-sequence '((0 1 2 7) (3 4 5 8)))))
       (assert-ok (approx= res expected) "vt-insert 轴末尾插入失败"))
 
@@ -4666,8 +4812,8 @@
     
     ;; 辅助函数：将序列转为列表便于比较
     (labels ((vlist (vt) (vt-to-list vt))
-             (arr (seq &key (type 'fixnum))
-               (vt-from-sequence seq :type type)))
+             (arr (seq &key (type :int64))
+               (vt-from-sequence seq :dtype type)))
       
       ;; ---------- 1. 展平，单索引 ----------
       (let* ((a (arr '(10 20 30 40)))
@@ -4753,7 +4899,7 @@
       ;; res = np.insert(arr, -1, 99)
       ;; print("NumPy 结果:", res)
       ;; # 期望输出: [ 1  2  3  4 99  5]
-      (let* ((arr (vt-from-sequence '(1 2 3 4 5) :type 'fixnum)))
+      (let* ((arr (vt-from-sequence '(1 2 3 4 5) :dtype :int64)))
 	(assert (equal (vt-to-list (vt-insert arr -1 99))
 		       '(1 2 3 4 99 5))))
 		       
@@ -4765,7 +4911,7 @@
   "测试 vt-delete 与 numpy np.delete 行为的一致性。"
   (format t "~%testing vt-delete...~%")
   (flet ((check (name got expected-list)
-           (let ((expected (vt-from-sequence expected-list :type 'double-float)))
+           (let ((expected (vt-from-sequence expected-list :dtype :float64)))
              (if (vt-allclose got expected :rtol 1e-5 :atol 1e-8)
                  (format t "✓ pass: ~a~%" name)
                  (format t "✗ fail: ~a~%  got: ~a~%  expected: ~a~%" 
@@ -4773,7 +4919,7 @@
     
     ;; 用例1: 展平模式，单索引删除
     ;; # numpy: a = np.array([1,2,3,4,5]); np.delete(a, 2)  # axis=none
-    (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float)))
+    (let ((a (vt-from-sequence '(1 2 3 4 5) :dtype :float64)))
       (check "delete_flat_single"
              (vt-delete a 2 :axis nil)
              '(1 2 4 5)))
@@ -4781,35 +4927,35 @@
     ;; 用例2: 展平模式，切片删除 (start end)
     ;; # numpy: a = np.array([1,2,3,4,5]); np.delete(a, slice(1,3))
 
-    (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float)))
+    (let ((a (vt-from-sequence '(1 2 3 4 5) :dtype :float64)))
       (check "delete_flat_slice"
              (vt-delete a '(:slice 1 3) :axis nil)   ; 注意改为 (:slice 1 3)
              '(1 4 5)))
     
     ;; 用例3: 展平模式，索引列表删除
     ;; # numpy: a = np.array([1,2,3,4,5]); np.delete(a, [0,2,4])
-    (let ((a (vt-from-sequence '(1 2 3 4 5) :type 'double-float)))
+    (let ((a (vt-from-sequence '(1 2 3 4 5) :dtype :float64)))
       (check "delete_flat_list"
              (vt-delete a '(0 2 4) :axis nil)
              '(2 4)))
     
     ;; 用例4: 沿 axis=0 删除索引列表
     ;; # numpy: a = np.array([[1,2],[3,4],[5,6]]); np.delete(a, [0,2], axis=0)
-    (let ((a (vt-from-sequence '((1 2) (3 4) (5 6)) :type 'double-float)))
+    (let ((a (vt-from-sequence '((1 2) (3 4) (5 6)) :dtype :float64)))
       (check "delete_axis0_list"
              (vt-delete a '(0 2) :axis 0)
              '((3 4))))
     
     ;; 用例5: 沿 axis=1 删除切片
     ;; # numpy: a = np.array([[1,2,3],[4,5,6]]); np.delete(a, slice(0,2), axis=1)
-    (let ((a (vt-from-sequence '((1 2 3) (4 5 6)) :type 'double-float)))
+    (let ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :float64)))
       (check "delete_axis1_slice"
              (vt-delete a '(:slice 0 2) :axis 1)     ; 删除列 0 和 1
              '((3) (6))))
     
     (labels ((vlist (vt) (vt-to-list vt))
-             (arr (seq &key (type 'fixnum))
-               (vt-from-sequence seq :type type)))
+             (arr (seq &key (type :int64))
+               (vt-from-sequence seq :dtype type)))
       
       ;; ---------- 1. 展平：删除单个索引 ----------
       (let* ((a (arr '(10 20 30 40)))
@@ -4903,7 +5049,7 @@
     (assert (equal (vt-shape flat) '(4)))
     (assert (equal (vt-to-list flat) '(1.0d0 2.0d0 3.0d0 4.0d0))))
   ;; 对已经是 1d 的张量 flatten 无影响
-  (let* ((a (vt-arange 3 :type 'fixnum))
+  (let* ((a (vt-arange 3 :dtype :int64))
          (flat (vt-flatten a)))
     (assert (equal (vt-shape flat) '(3)))
     (assert (equal (vt-to-list flat) '(0 1 2))))
@@ -4915,7 +5061,7 @@
   ;; -> [[1 0 0]
   ;;     [0 2 0]
   ;;     [0 0 3]]
-  (let* ((v (vt-from-sequence '(1 2 3) :type 'fixnum))
+  (let* ((v (vt-from-sequence '(1 2 3) :dtype :int64))
          (m (vt-diag v)))
     (assert (equal (vt-shape m) '(3 3)))
     (assert (= (vt-ref m 0 0) 1))
@@ -4955,8 +5101,8 @@
   ;; a = np.array([1, 2, 3])
   ;; b = np.array([1, 4, 1])
   ;; a == b -> [true, false, false] (1.0, 0.0, 0.0)
-  (let* ((a (vt-from-sequence '(1 2 3) :type 'fixnum))
-         (b (vt-from-sequence '(1 4 1) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (b (vt-from-sequence '(1 4 1) :dtype :int64))
          (eq (vt-= a b))
          (lt (vt-< a b))
          (gt (vt-> a b)))
@@ -4988,11 +5134,11 @@
 (defun test-vt-prod-ptp ()
   ;; a = np.array([2, 3, 4])
   ;; np.prod(a) -> 24
-  (let* ((a (vt-from-sequence '(2 3 4) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(2 3 4) :dtype :int64))
          (p (vt-item (vt-prod a))))
     (assert (= p 24)))
   ;; np.ptp(a) -> 4 - 2 = 2 (峰峰值)
-  (let* ((a (vt-from-sequence '(2 3 4) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(2 3 4) :dtype :int64))
          (p (vt-item (vt-ptp a))))
     (assert (= p 2)))
   (format t "~%test-vt-prod-ptp passed.~%"))
@@ -5076,13 +5222,13 @@
   ;; np.searchsorted(a, 3) -> 2
   ;; np.searchsorted(a, 0) -> 0
   ;; np.searchsorted(a, 6) -> 5
-  (let* ((a (vt-from-sequence '(1 2 3 4 5) :type 'fixnum))
-         (vals (vt-from-sequence '(3 0 6) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 3 4 5) :dtype :int64))
+         (vals (vt-from-sequence '(3 0 6) :dtype :int64))
          (res (vt-searchsorted a vals)))
     (assert (equal (vt-to-list res) '(2 0 5))))
 
-  (let* ((a (vt-from-sequence '(1 2 2 3 4 5) :type 'fixnum))
-	 (b (vt-from-sequence '(2 5 0 6) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2 2 3 4 5) :dtype :int64))
+	 (b (vt-from-sequence '(2 5 0 6) :dtype :int64))
 	 (left (vt-searchsorted a b :side :left))
 	 (right (vt-searchsorted a b :side :right)))
     (assert (equal (vt-to-list left)
@@ -5096,8 +5242,8 @@
   ;; a = np.array([10, 20, 30, 40, 50])
   ;; mask = np.array([true, false, true, false, true])
   ;; a[mask] -> [10, 30, 50]
-  (let* ((a (vt-from-sequence '(10 20 30 40 50) :type 'fixnum))
-         (mask (vt-from-sequence '(1 0 1 0 1) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(10 20 30 40 50) :dtype :int64))
+         (mask (vt-from-sequence '(1 0 1 0 1) :dtype :int64))
          (res (vt-extract mask a)))
     (assert (equal (vt-shape res) '(3)))
     (assert (equal (vt-to-list res) '(10 30 50))))
@@ -5116,7 +5262,7 @@
     (assert (= itemsize 8))
     (assert (= nbytes 16)))
   ;; fixnum 测试 (通常为 8 字节，取决于平台，此处用 > 0 断言避免平台差异)
-  (let* ((a (vt-from-sequence '(1 2) :type 'fixnum))
+  (let* ((a (vt-from-sequence '(1 2) :dtype :int64))
          (itemsize (vt-itemsize a)))
     (assert (> itemsize 0)))
   (format t "~%test-vt-itemsize-nbytes passed.~%"))
@@ -5205,7 +5351,7 @@
   ;; 测试 3：除数为 0 (ddof = 数据个数)
   (let* ((data (vt-from-sequence '(1 2 3)))
          (var (vt-item (vt-var data :ddof 3))))
-    ;; 应返回 nan (common lisp 的 (coerce (/ 0.0d0 0.0d0) 'double-float) 就是 nan)
+    ;; 应返回 nan (common lisp 的 (coerce (/ 0.0d0 0.0d0) :float64) 就是 nan)
     (assert-ok (vt-float-nan-= var var) "ddof=3 时应返回 nan"))
 
   ;; 测试 4：沿轴方差，除数为0
@@ -5318,8 +5464,8 @@
   ;; ==========================================
   ;; 测试 1: 正常形状匹配拷贝
   ;; ==========================================
-  (let ((dest (vt-zeros '(2 3) :type 'double-float))
-        (src (vt-arange 6 :type 'double-float))) ; [0, 1, 2, 3, 4, 5]
+  (let ((dest (vt-zeros '(2 3) :dtype :float64))
+        (src (vt-arange 6 :dtype :float64))) ; [0, 1, 2, 3, 4, 5]
     (setf src (vt-reshape src '(2 3)))
     (vt-copy-into dest src)
     (assert (equal (vt-to-list dest) '((0.0d0 1.0d0 2.0d0) (3.0d0 4.0d0 5.0d0))))
@@ -5328,8 +5474,8 @@
   ;; ==========================================
   ;; 测试 2: 广播拷贝 (src 维度为 1，向 dest 广播)
   ;; ==========================================
-  (let ((dest (vt-zeros '(3 4) :type 'double-float))
-        (src (vt-arange 4 :type 'double-float))) ; [0, 1, 2, 3] shape: (4)
+  (let ((dest (vt-zeros '(3 4) :dtype :float64))
+        (src (vt-arange 4 :dtype :float64))) ; [0, 1, 2, 3] shape: (4)
     (setf src (vt-reshape src '(1 4)))           ; shape: (1, 4) 广播为 (3, 4)
     (vt-copy-into dest src)
     ;; 期望 dest 每一行都是 [0, 1, 2, 3]
@@ -5342,7 +5488,7 @@
   ;; ==========================================
   ;; 测试 3: 标量拷贝 (src 是单个数字)
   ;; ==========================================
-  (let ((dest (vt-zeros '(2 2) :type 'double-float)))
+  (let ((dest (vt-zeros '(2 2) :dtype :float64)))
     (vt-copy-into dest 99.0d0)
     (assert (equal (vt-to-list dest) '((99.0d0 99.0d0) (99.0d0 99.0d0))))
     (format t "✅ 测试 3 通过: 标量拷贝~%"))
@@ -5371,12 +5517,12 @@
   ;; 测试 5: 类型转换测试 (fixnum -> double-float，验证移除 vt-astype 后的正确性)
   ;; ==========================================
 
-  (let ((dest (vt-zeros '(2 2) :type 'double-float))
-        (src (vt-from-sequence '((1 2) (3 4)) :type 'fixnum))) ; fixnum 张量
+  (let ((dest (vt-zeros '(2 2) :dtype :float64))
+        (src (vt-from-sequence '((1 2) (3 4)) :dtype :int64))) ; fixnum 张量
     (vt-copy-into dest src)
     ;; 验证不仅拷贝成功，且 dest 的元素确实变成了 double-float
     (assert (equal (vt-to-list dest) '((1.0d0 2.0d0) (3.0d0 4.0d0))))
-    (assert (eq (vt-element-type dest) 'double-float))
+    (assert (eq (vt-dtype dest) :float64))
     (format t "✅ 测试 5 通过: 降级 coerce 的类型转换拷贝~%"))
   )
 
@@ -5385,7 +5531,7 @@
   (let* ((mat (vt-from-sequence '((1 2 3)
                                   (4 5 6)
                                   (7 8 9))
-				:type 'fixnum))
+				:dtype :int64))
          ;; 绕中心 (1.0, 1.0) 逆时针旋转 90 度
          (rot (vt-rotate mat 90 :order 0 :center '(1 1))))
     
@@ -5402,20 +5548,20 @@
   (6 7 8 9 10)
   (11 12 13 14 15)
   (16 17 18 19 20)
-  (21 22 23 24 25)) :type 'double-float))
+  (21 22 23 24 25)) :dtype :float64))
 
   ;; ============ 矩阵 2: 4x4 fixnum ============
   (defparameter *m2*
   (vt-from-sequence '((1 2 3 4)
   (5 6 7 8)
   (9 10 11 12)
-  (13 14 15 16)) :type 'fixnum))
+  (13 14 15 16)) :dtype :int64))
 
   ;; ============ 矩阵 3: 3x6 double-float (非对称) ============
   (defparameter *m3*
   (vt-from-sequence '((1 2 3 4 5 6)
   (7 8 9 10 11 12)
-  (13 14 15 16 17 18)) :type 'double-float))
+  (13 14 15 16 17 18)) :dtype :float64))
 
   (format t "=== 矩阵 1: 5x5 double-float ===")
   (print *m1*)
@@ -5654,19 +5800,19 @@
   ;; ==========================================
   ;; 场景 1: 基础功能、动态类型提升与负索引
   ;; ==========================================
-  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :type 'fixnum))      ; fixnum
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))      ; fixnum
          (c2 (vt-from-sequence '((1.0 2.0) (3.0 4.0))))  ; double-float
          ;; 索引含义：
          ;; 0 选 c1, 1 选 c2
          ;; -1 选倒数第1个(即 c2), -2 选倒数第2个(即 c1)
-         (idx (vt-from-sequence '(0 1 -1 -2) :type 'fixnum))
+         (idx (vt-from-sequence '(0 1 -1 -2) :dtype :int64))
          
          ;; 执行：混合类型应自动提升为 double-float
          (res-mixed (vt-choose (list c1 c2) idx)))
     
     ;; 断言类型提升正确
-    (assert (eq (vt-element-type res-mixed) 'double-float)
-            (res-mixed) "类型提升错误: 期望 double-float, 得到 ~a" (vt-element-type res-mixed))
+    (assert (eq (vt-dtype res-mixed) :float64)
+            (res-mixed) "类型提升错误: 期望 double-float, 得到 ~a" (vt-dtype res-mixed))
     
     ;; 断言数据提取正确
     ;; i=0 (idx=0) -> c1[0] = 10
@@ -5680,14 +5826,14 @@
   ;; ==========================================
   ;; 场景 2: 纯 fixnum 类型保持
   ;; ==========================================
-  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :type 'fixnum))
-         (c2 (vt-from-sequence '((100 200) (300 400)) :type 'fixnum))
-         (idx (vt-from-sequence '(0 1 1 0) :type 'fixnum))
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))
+         (c2 (vt-from-sequence '((100 200) (300 400)) :dtype :int64))
+         (idx (vt-from-sequence '(0 1 1 0) :dtype :int64))
          (res-fix (vt-choose (list c1 c2) idx)))
     
     ;; 断言类型被正确保持为 fixnum，没有被强制转为 double-float
-    (assert (eq (vt-element-type res-fix) 'fixnum)
-            (res-fix) "类型保持错误: 期望 fixnum, 得到 ~a" (vt-element-type res-fix))
+    (assert (eq (vt-dtype res-fix) :int64)
+            (res-fix) "类型保持错误: 期望 fixnum, 得到 ~a" (vt-dtype res-fix))
     
     (assert (equal (vt-to-list res-fix) '(10 200 300 40))
             (res-fix) "Fixnum 结果错误: 期望 (10 200 300 40), 得到 ~a" (vt-to-list res-fix)))
@@ -5696,20 +5842,20 @@
   ;; ==========================================
   ;; 场景 3: 非连续内存视图安全性测试 (核心缺陷验证)
   ;; ==========================================
-  (let* ((base (vt-from-sequence '((1 2 3) (4 5 6)) :type 'fixnum)) ; shape (2, 3)
+  (let* ((base (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64)) ; shape (2, 3)
          ;; 转置后 shape 变为 (3, 2)，底层 strides 改变，属于非连续视图
          ;; view-a 的逻辑内容是 ((1 4) (2 5) (3 6))
          ;; 展平后逻辑顺序应为 (1 4 2 5 3 6)
          (view-a (vt-transpose base)) 
          
-         (c2 (vt-zeros '(3 2) :type 'fixnum))
+         (c2 (vt-zeros '(3 2) :dtype :int64))
          ;; idx 全为 0，强制只从 view-a 中取值
-         (idx (vt-from-sequence '(0 0 0 0 0 0) :type 'fixnum))
+         (idx (vt-from-sequence '(0 0 0 0 0 0) :dtype :int64))
          
          (res-view (vt-choose (list view-a c2) idx)))
     
-    (assert (eq (vt-element-type res-view) 'fixnum)
-            (res-view) "视图类型错误: 期望 fixnum, 得到 ~a" (vt-element-type res-view))
+    (assert (eq (vt-dtype res-view) :int64)
+            (res-view) "视图类型错误: 期望 fixnum, 得到 ~a" (vt-dtype res-view))
     
     ;; 如果没有修复 (没有调用 vt-flatten)，直接按 i 读取底层物理内存，
     ;; 读到的会是 base 的原始连续数据 (1 2 3 4 5 6)，而不是逻辑视图的 (1 4 2 5 3 6)

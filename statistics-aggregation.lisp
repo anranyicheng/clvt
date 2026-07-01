@@ -134,6 +134,85 @@
                                  (values acc nil)))))
                   :out out :return-arg t)))))
 
+(defun vt-average (tensor weights &key axis keepdims dtype out)
+  "计算加权平均值.
+  严格对标 NumPy np.average，并扩展支持 :dtype 和 :out 参数。
+  
+  - axis 为整数时: weights 必须为 1D 且长度等于 a.shape[axis]，沿 axis 广播
+  - axis 为 nil 时: weights 必须与 tensor 形状完全一致
+  - 权重和为零或 NaN 时：返回 NaN 或抛出错误。
+  - 类型提升: 整数输入将被提升为浮点数输出 (默认 float64)。
+  - 内部利用 vt-map 的自动类型推断能力，消除冗余逻辑。"
+  (declare (type vt tensor weights))
+  (with-float-safe
+    (let ((a-shape (vt-shape tensor))
+          (w-shape (vt-shape weights))
+          (effective-weights weights))
+
+      ;; 1. 形状校验与权重广播准备
+      (cond
+        (axis
+         (let* ((rank (length a-shape))
+                (ax (vt-normalize-axis axis rank))
+                (ax-size (nth ax a-shape)))
+           (unless (and (= (length w-shape) 1) (= (first w-shape) ax-size))
+             (error "ValueError: 1D weights expected when axis is specified.~@
+                     weights shape ~a does not match a.shape[~a] = ~a"
+                    w-shape ax ax-size))
+           (let ((expanded-shape (loop for i below rank collect (if (= i ax) ax-size 1))))
+             (setf effective-weights (vt-reshape weights expanded-shape)))))
+        (t
+         (unless (equal w-shape a-shape)
+           (error "ValueError: weights must have the same shape as a when axis is None.~@
+                     weights shape ~a vs a shape ~a" w-shape a-shape))))
+
+      ;; 2. 计算加权和与权重和
+      (let* ((prod (vt-map #'* tensor effective-weights))
+             (weighted-sum (vt-sum prod :axis axis :keepdims keepdims))
+             (sum-weights (vt-item (vt-sum weights)))
+             (in-dtype (vt-dtype weighted-sum))
+             (need-promote (member in-dtype '(:int32 :int64 :int16 :int8 :uint8 :uint16)))
+             (promote-dtype (if need-promote :float64 in-dtype))
+             (exec-dtype (cond (out (vt-dtype out))
+                               (dtype dtype)
+                               (t promote-dtype)))
+             (is-float32 (eq exec-dtype :float32))
+             (nan-val (if is-float32 +vt-sfloat-nan+ +vt-dfloat-nan+))
+             (scalar-divisor (coerce sum-weights (if is-float32 'single-float 'double-float)))
+             
+             (map-dtype (cond (out nil)
+                              (dtype dtype)
+                              (need-promote promote-dtype)
+                              (t nil))))
+
+        ;; 校验 out 形状
+        (when out
+          (unless (equal (vt-shape out) (vt-shape weighted-sum))
+            (error "vt-average: :out 张量形状 ~a 与期望结果形状 ~a 不匹配"
+                   (vt-shape out) (vt-shape weighted-sum))))
+
+        ;; 3. 边缘情况与正常计算
+        (cond
+          ((vt-float-nan-p sum-weights)
+           (if out
+               (progn
+                 (vt-map (lambda (x)
+			   (declare (ignorable x))
+			   nan-val)
+			 weighted-sum :out out :dtype dtype)
+                 out)
+               (vt-full (vt-shape weighted-sum) nan-val :dtype exec-dtype)))
+          
+          ((zerop sum-weights)
+           (error "ZeroDivisionError: Weights sum to zero, can't be normalized"))
+          
+          (t
+           ;; 完全信任 vt-map 的自动推断和 out 处理能力
+           (vt-map (lambda (s) (/ s scalar-divisor))
+                   weighted-sum
+                   :dtype map-dtype
+                   :out out)))))))
+
 (defun vt-mean (tensor &key axis keepdims dtype out)
   "计算平均值. 支持多轴归约。
    优化: 透传 dtype 和 out，底层自动处理类型校验与原地写入。"

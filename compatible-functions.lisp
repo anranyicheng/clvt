@@ -46,11 +46,8 @@
                  :dtype dtype)))
     (let* ((div (if endpoint (1- num) num))
            (step (/ (- end start) div))
-           (lisp-type (vt-dtype->lisp-type dtype))
            (elements (loop for i fixnum from 0 below num
-                           collect (coerce (+ start (* i step)) lisp-type))))
-      (when (or (eq dtype :int32) (eq dtype :int64))
-        (setf elements (mapcar #'truncate elements)))
+                           collect (vt-cast (+ start (* i step)) dtype))))
       (vt-from-sequence elements :dtype dtype))))
 
 (defun vt-logspace
@@ -738,16 +735,15 @@
                     (setf rem r)
                     idx))))
 
-(defun vt-cumsum (tensor &key axis dtype out)
-  "累积和。遵循 NumPy 规范。
-   支持 out 参数原地写入，严格校验类型冲突。"
+(defun vt-cumulative (tensor op init-val &key axis dtype out)
+  "累积操作的核心通用实现 (供 vt-cumsum 和 vt-cumprod 调用)"
   (with-float-safe
     (let* ((shape (vt-shape tensor))
            (rank (length shape))
            (final-dtype (cond
                           ((and out dtype (not (eq (vt-dtype out) dtype)))
-                           (error "vt-cumsum: :out 的类型 (~a) 与 :dtype (~a) 冲突"
-				  (vt-dtype out) dtype))
+                           (error "类型冲突: :out (~a) vs :dtype (~a)"
+                                  (vt-dtype out) dtype))
                           (dtype dtype)
                           (out (vt-dtype out))
                           (t (vt-dtype tensor))))
@@ -757,85 +753,71 @@
            (out-data (vt-data result))
            (in-strides (vt-strides tensor))
            (in-offset (vt-offset tensor))
-           (out-strides (vt-strides result)))
+           (out-strides (vt-strides result))
+           (out-offset (vt-offset result)))
+      
       (if axis
+          ;; === 分支 1: 沿指定轴 ===
           (let* ((ax (vt-normalize-axis axis rank))
-                 (ax-dim (nth ax shape)))
-            (labels ((recurse (depth in-ptr out-ptr)
-                       (if (= depth ax)
-                           (let ((in-stride (nth ax in-strides))
-                                 (out-stride (nth ax out-strides))
-                                 (cum (coerce 0 lisp-type)))
-                             (loop for i fixnum from 0 below ax-dim do
-                               (setf cum (+ cum (aref in-data (+ in-ptr (* i in-stride)))))
-                               (setf (aref out-data (+ out-ptr (* i out-stride)))
-				     (vt-cast cum final-dtype))))
-                           (let ((dim (nth depth shape))
-                                 (in-stride (nth depth in-strides))
-                                 (out-stride (nth depth out-strides)))
-                             (loop for i fixnum from 0 below dim do
-                               (recurse (1+ depth)
-					(+ in-ptr (* i in-stride))
-					(+ out-ptr (* i out-stride))))))))
-              (recurse 0 in-offset 0)))
+                 (ax-dim (nth ax shape))
+                 ;; 使用一维数组作为多维迭代器，记录非 ax 维度的当前坐标
+                 (indices (make-array rank :element-type 'fixnum :initial-element 0)))
+            
+            (labels ((advance ()
+                       "推进迭代器，跳过 ax 维度。返回 nil 表示遍历结束。"
+                       (loop for d from (1- rank) downto 0
+                             when (/= d ax)
+                             do (incf (aref indices d))
+                                (if (< (aref indices d) (nth d shape))
+                                    (return-from advance t)
+                                    (setf (aref indices d) 0)))
+                       nil))
+              
+              (loop
+                ;; 1. 根据当前迭代器状态，计算起始物理偏移量 (考虑 offset)
+                (let ((in-ptr in-offset)
+                      (out-ptr out-offset))
+                  (loop for d from 0 below rank do
+                    (incf in-ptr (* (aref indices d) (nth d in-strides)))
+                    (incf out-ptr (* (aref indices d) (nth d out-strides))))
+                  
+                  ;; 2. 沿着 ax 维度执行累积操作
+                  (let ((in-stride (nth ax in-strides))
+                        (out-stride (nth ax out-strides))
+                        (cum (coerce init-val lisp-type)))
+                    (loop for i fixnum from 0 below ax-dim do
+                      (setf cum (funcall op cum (aref in-data (+ in-ptr
+								 (* i in-stride)))))
+                      (setf (aref out-data (+ out-ptr (* i out-stride)))
+                            (vt-cast cum final-dtype)))))
+                
+                ;; 3. 推进到下一个非 ax 坐标，若结束则跳出
+                (unless (advance)
+                  (return)))))
+          
+          ;; === 分支 2: 全局展平 (axis=nil) ===
           (let* ((flat (vt-ravel tensor))
                  (flat-in (vt-data flat))
+                 (flat-offset (vt-offset flat))
                  (size (vt-size flat))
-                 (cum (coerce 0 lisp-type)))
+                 (cum (coerce init-val lisp-type)))
             (loop for i fixnum from 0 below size do
-              (setf cum (+ cum (aref flat-in i)))
-              (setf (aref out-data i) (vt-cast cum final-dtype)))))
+              (setf cum (funcall op cum (aref flat-in (+ flat-offset i))))
+              (setf (aref out-data (+ out-offset i)) (vt-cast cum final-dtype)))))
+      
       result)))
+
+
+(defun vt-cumsum (tensor &key axis dtype out)
+  "累积和。遵循 NumPy 规范。
+   支持 out 参数原地写入，严格校验类型冲突。"
+  (vt-cumulative tensor #'+ 0 :axis axis :dtype dtype :out out))
+
 
 (defun vt-cumprod (tensor &key axis dtype out)
   "累积积。遵循 NumPy 规范。
    支持 out 参数原地写入，严格校验类型冲突。"
-  (with-float-safe
-    (let* ((shape (vt-shape tensor))
-           (rank (length shape))
-           (final-dtype (cond
-                          ((and out dtype (not (eq (vt-dtype out) dtype)))
-                           (error "vt-cumprod: :out 的类型 (~a) 与 :dtype (~a) 冲突"
-				  (vt-dtype out) dtype))
-                          (dtype dtype)
-                          (out (vt-dtype out))
-                          (t (vt-dtype tensor))))
-           (lisp-type (vt-dtype->lisp-type final-dtype))
-           (result (or out (vt-zeros shape :dtype final-dtype)))
-           (in-data (vt-data tensor))
-           (out-data (vt-data result))
-           (in-strides (vt-strides tensor))
-           (in-offset (vt-offset tensor))
-           (out-strides (vt-strides result)))
-      (if axis
-          (let* ((ax (vt-normalize-axis axis rank))
-                 (ax-dim (nth ax shape)))
-            (labels ((recurse (depth in-ptr out-ptr)
-                       (if (= depth ax)
-                           (let ((in-stride (nth ax in-strides))
-                                 (out-stride (nth ax out-strides))
-                                 (cum (coerce 1 lisp-type)))
-                             (loop for i fixnum from 0 below ax-dim do
-                               (setf cum (* cum (aref in-data (+ in-ptr (* i in-stride)))))
-                               (setf (aref out-data (+ out-ptr (* i out-stride)))
-				     (vt-cast cum final-dtype))))
-                           (let ((dim (nth depth shape))
-                                 (in-stride (nth depth in-strides))
-                                 (out-stride (nth depth out-strides)))
-                             (loop for i fixnum from 0 below dim do
-                               (recurse (1+ depth)
-					(+ in-ptr (* i in-stride))
-					(+ out-ptr (* i out-stride))))))))
-              (recurse 0 in-offset 0)))
-          (let* ((flat (vt-ravel tensor))
-                 (flat-in (vt-data flat))
-                 (size (vt-size flat))
-                 (cum (coerce 1 lisp-type)))
-            (loop for i fixnum from 0 below size do
-              (setf cum (* cum (aref flat-in i)))
-              (setf (aref out-data i) (vt-cast cum final-dtype)))))
-      result)))
-
+  (vt-cumulative tensor #'* 1 :axis axis :dtype dtype :out out))
 
 (defun vt-median (tensor &key axis)
   "中位数。对标 NumPy：包含 NaN 则返回 NaN，输出固定为 :float64。
@@ -1046,10 +1028,8 @@
                                     (* total bin-width)))))))
 
           ;; 返回
-          (values (vt-from-sequence
-		   (vt-cast hist 'list) :dtype :float64)
-                  (vt-from-sequence
-		   (vt-cast bin-edges 'list) :dtype :float64)))))))
+          (values (vt-from-sequence hist :dtype :float64)
+                  (vt-from-sequence bin-edges :dtype :float64)))))))
 
 
 ;;; 逻辑运算扩展
@@ -1342,7 +1322,8 @@
     (let* ((flat (vt-flatten tensor))
 	   (n (vt-size flat))
 	   (src-data (vt-data flat))
-	   (elem-type (vt-dtype flat))
+	   (dtype (vt-dtype flat))
+	   (elem-type (vt-element-type flat))
 	   ;; 初始化索引向量 0..n-1
 	   (sorted-idx (make-array n :element-type 'fixnum
 				     :initial-contents
@@ -1396,11 +1377,9 @@
 			      (incf pos)))
 		 (vector-push-extend (- pos start) cnts))
 	;; 转换为 vt
-	(let ((uniq-vt (vt-from-sequence (coerce unique-vals 'list)
-					 :dtype elem-type))
+	(let ((uniq-vt (vt-from-sequence unique-vals :dtype dtype))
               (idx-vt  (when return-index
-			 (vt-from-sequence (coerce first-idx 'list)
-					   :dtype 'fixnum)))
+			 (vt-from-sequence first-idx :dtype :int64)))
               (inv-vt  (when return-inverse
 			 (let ((v (make-array n :element-type 'fixnum)))
                            (dotimes (i n) (setf (aref v i)
@@ -1411,8 +1390,7 @@
 				     :offset 0
 				     :dtype :int64))))
               (cnt-vt  (when return-counts
-			 (vt-from-sequence (coerce cnts 'list)
-					   :dtype :int64))))
+			 (vt-from-sequence cnts :dtype :int64))))
           (if (or return-index return-inverse return-counts)
               (values uniq-vt
                       (when return-index idx-vt)
@@ -1588,7 +1566,7 @@
   (with-float-safe
     (let ((t2-set (coerce (vt-data (vt-unique t2)) 'list)))
       (vt-map (lambda (x) (if (member x t2-set) 1.0d0 0.0d0))
-	      t1))))
+	      t1 :dtype :float64))))
 
 
 ;;; 其他数学运算
@@ -1596,7 +1574,7 @@
   "将数值限制在指定范围内"
   (with-float-safe
     (vt-map (lambda (x) (max min-val (min max-val x)))
-	    tensor :dtype dtype out)))
+	    tensor :dtype dtype :out out)))
 
 (defun vt-gradient (tensor &key (spacing 1.0d0) axis)
   "计算张量的梯度（沿指定轴的二阶中心差分）。
@@ -1850,7 +1828,7 @@
            (strides (vt-strides tensor))
            (offset (vt-offset tensor))
            (data (vt-data tensor))
-           (elem-type (vt-dtype tensor)))
+           (dtype (vt-dtype tensor)))
       
       (loop for raw-idx in idx-list
             for val-idx from 0 
@@ -1876,7 +1854,7 @@
                               (setf remaining q)))
                    ;; 写入底层物理内存
                    (setf (aref data phys-offset)
-			 (coerce val elem-type)))))
+			 (vt-cast val dtype)))))
       tensor)))
 
 (defun vt-choose (choices indices)
@@ -1890,7 +1868,9 @@
            (result-type
 	     (apply #'vt-promote-type
 		    (mapcar #'vt-dtype flat-choices)))
-           (result-data (make-array idx-size :element-type result-type)))
+           (result-data (make-array idx-size
+				    :element-type
+				    (vt-dtype->lisp-type result-type))))
       (loop for i from 0 below idx-size
             for raw-idx = (truncate (aref idx-data i))
             for idx = (if (minusp raw-idx)
@@ -2122,8 +2102,8 @@
            (pad-before-arr
 	     (make-array rank :element-type 'fixnum
 			      :initial-contents (mapcar #'first pad)))
-           (c-left-conv (coerce c-left out-dtype))
-           (c-right-conv (coerce c-right out-dtype)))
+           (c-left-conv (vt-cast c-left out-dtype))
+           (c-right-conv (vt-cast c-right out-dtype)))
       (loop for out-ptr fixnum from 0 below out-size do
         (let ((rem out-ptr)
               (in-ptr in-offset)
