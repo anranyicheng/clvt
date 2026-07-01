@@ -239,37 +239,37 @@
             vt :out out :dtype dtype)))
 
 ;; ============ 7. 比较运算 ============
-(defun vt-= (t1 t2 &key dtype out)
+(defun vt-= (t1 t2 &key (dtype :float64) out)
   "逐元素相等比较. 支持广播.返回布尔张量(1.0或0.0)."
   (with-float-safe 
     (vt-map (lambda (a b) (if (= a b) 1.0d0 0.0d0)) 
             (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out)))
 
-(defun vt-/= (t1 t2 &key dtype out)
+(defun vt-/= (t1 t2 &key (dtype :float64) out)
   "逐元素不相等比较. 支持广播.返回布尔张量(1.0或0.0)."
   (with-float-safe 
     (vt-map (lambda (a b) (if (/= a b) 1.0d0 0.0d0)) 
             (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out)))
 
-(defun vt-< (t1 t2 &key dtype out)
+(defun vt-< (t1 t2 &key (dtype :float64) out)
   "逐元素小于比较. 支持广播.返回布尔张量(1.0或0.0)."
   (with-float-safe 
     (vt-map (lambda (a b) (if (< a b) 1.0d0 0.0d0)) 
             (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out)))
 
-(defun vt-<= (t1 t2 &key dtype out)
+(defun vt-<= (t1 t2 &key (dtype :float64) out)
   "逐元素小于等于比较. 支持广播.返回布尔张量(1.0或0.0)."
   (with-float-safe 
     (vt-map (lambda (a b) (if (<= a b) 1.0d0 0.0d0)) 
             (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out)))
 
-(defun vt-> (t1 t2 &key dtype out)
+(defun vt-> (t1 t2 &key (dtype :float64) out)
   "逐元素大于比较. 支持广播.返回布尔张量(1.0或0.0)."
   (with-float-safe 
     (vt-map (lambda (a b) (if (> a b) 1.0d0 0.0d0)) 
             (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out)))
 
-(defun vt->= (t1 t2 &key dtype out)
+(defun vt->= (t1 t2 &key (dtype :float64) out)
   "逐元素大于等于比较. 支持广播.返回布尔张量(1.0或0.0)."
   (with-float-safe 
     (vt-map (lambda (a b) (if (>= a b) 1.0d0 0.0d0)) 
