@@ -7,13 +7,9 @@
   "逐元素加法. 支持标量、列表、张量混合. 多参数时单次遍历."
   (with-float-safe (apply #'vt-map #'+ args)))
 
-(defun vt-add (&rest args) (apply #'vt-+ args))
-
 (defun vt-* (&rest args)
   "逐元素乘法. 支持标量、列表、张量混合. 多参数时单次遍历."
   (with-float-safe (apply #'vt-map #'* args)))
-
-(defun vt-mul (&rest args) (apply #'vt-* args))
 
 (defun vt-- (vt &rest args)
   "逐元素减法. 单参数取反. 多参数: a - b - c ..."
@@ -23,8 +19,6 @@
           (vt-map #'- first-vt)
           (apply #'vt-map #'- first-vt args)))))
 
-(defun vt-sub (vt &rest args) (apply #'vt-- vt args))
-
 (defun vt-/ (vt &rest args)
   "逐元素除法. 单参数取倒数. 多参数: a / b / c ... (单趟遍历优化)"
   (with-float-safe 
@@ -33,7 +27,21 @@
           (vt-map (lambda (v) (/ 1.0d0 v)) first-vt)
           (apply #'vt-map #'/ first-vt args)))))
 
-(defun vt-div (vt &rest args) (apply #'vt-/ vt args))
+(defun vt-add (a b &key dtype out)
+  "逐元素加法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
+  (vt-binary-fast-map #'+ a b :dtype dtype :out out))
+
+(defun vt-sub (a b &key dtype out)
+  "逐元素减法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
+  (vt-binary-fast-map #'- a b :dtype dtype :out out))
+
+(defun vt-mul (a b &key dtype out)
+  "逐元素乘法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
+  (vt-binary-fast-map #'* a b :dtype dtype :out out))
+
+(defun vt-div (a b &key dtype out)
+  "逐元素除法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
+  (vt-binary-fast-map #'/ a b :dtype dtype :out out))
 
 (defun vt-scale (a b &key out dtype)
   "将张量乘以标量."

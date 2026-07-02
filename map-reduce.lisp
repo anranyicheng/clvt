@@ -28,8 +28,7 @@
                               (dtype dtype)
                               (t (apply #'vt-promote-type
                                         (mapcar #'vt-dtype clean-tensors))))) 
-               (res (or out (vt-zeros out-shape :dtype final-dtype))))
-          
+               (res (or out (vt-zeros out-shape :dtype final-dtype))))          
           (when out
             (unless (equal (vt-shape res) out-shape)
               (error "vt-map: :out 张量形状 ~a 与广播结果 ~a 不匹配"
@@ -57,22 +56,18 @@
                  (all-same-type (every #'(lambda (ts)
                                            (eq (vt-dtype ts) final-dtype))
                                        clean-tensors)))
-            
             (declare (type simple-vector ins-data ins-strides)
                      (type (simple-array fixnum (*)) cur-ptrs)
                      (type list out-shape res-strides)
                      (type fixnum rank n-tensors size)
                      (boolean is-fast all-same-type))
-
             (loop for vt in clean-tensors
                   for i fixnum from 0
-                  do (setf (aref cur-ptrs i) (vt-offset vt))) 
-
+                  do (setf (aref cur-ptrs i) (vt-offset vt)))
             (macrolet ((cast-to-out (val lisp-type)
                          `(if ,(subtypep lisp-type 'integer)
                               (truncate ,val)
-                              (coerce ,val ',lisp-type))))
-              
+                              (coerce ,val ',lisp-type))))              
               (macrolet
                   ((gen-dispatch (lisp-type)
                      (let ((calls-same
@@ -184,7 +179,6 @@
                                          (incf out-ptr)
                                          (loop for k fixnum from 0 below n-tensors do
 					   (incf (aref cur-ptrs k) (aref steps k))))))))
-                              
                               ;; ================ SLOW PATH (N-D 递归) ================
                               (labels
                                   ((recurse (depth out-ptr)
@@ -215,7 +209,6 @@
                                                                   (the fixnum
 								       (nth depth (aref ins-strides k))))))))))) 
                                 (recurse 0 (vt-offset res)))))))))
-              
               (etypecase res-data
                 ((simple-array double-float (*))
                  (gen-dispatch double-float))
@@ -225,9 +218,7 @@
                  (gen-dispatch (signed-byte 64)))
                 ((simple-array (signed-byte 32) (*))
                  (gen-dispatch (signed-byte 32))))) 
-            
             res)))))))
-
 
 (defun vt-binary (fn t1 t2 &key out dtype)
   "二元张量操作基石. 
@@ -240,7 +231,6 @@
            (clean-t2 (ensure-vt t2))
            (out-shape
 	     (vt-broadcast-shapes (vt-shape clean-t1) (vt-shape clean-t2))))
-      
       ;; 1. 确定输出张量及其类型 (严格校验)
       (let* ((final-dtype (cond
                             ((and out dtype (not (eq (vt-dtype out) dtype)))
@@ -250,12 +240,10 @@
                             (dtype dtype)
                             (t (vt-promote-type (vt-dtype clean-t1) (vt-dtype clean-t2))))) 
              (res (or out (vt-zeros out-shape :dtype final-dtype))))
-        
         (when out
           (unless (equal (vt-shape res) out-shape)
             (error "vt-binary: :out 张量形状 ~a 与广播结果 ~a 不匹配"
                    (vt-shape res) out-shape)))
-
         (let* ((res-data (vt-data res))
                (res-strides (vt-strides res))
                (d0 (vt-data clean-t1))
@@ -273,14 +261,11 @@
 				 (= (vt-size clean-t1) 1))
 			     (or (equal (vt-shape clean-t2) out-shape)
 				 (= (vt-size clean-t2) 1))))
-
                (all-same-type (and (eq (vt-dtype clean-t1) final-dtype)
                                    (eq (vt-dtype clean-t2) final-dtype))))
-          
           (declare (type list out-shape res-strides strides-0 strides-1)
                    (type fixnum p0 p1 rank size)
                    (boolean is-fast all-same-type))
-
           ;; 2. 核心类型派发宏：二元特化版
           (macrolet
 	      ((gen-dispatch (lisp-type)
@@ -315,7 +300,6 @@
                                     (incf out-ptr)
                                     (incf p0 step0)
                                     (incf p1 step1)))))
-			  
 			  ;; ================ SLOW PATH (N-D 递归) ================
 			  (labels
 			      ((recurse (depth out-ptr)
@@ -338,7 +322,6 @@
 				       (decf p0 (the fixnum (* dim str0)))
 				       (decf p1 (the fixnum (* dim str1)))))))
                             (recurse 0 (vt-offset res))))))))
-            
             ;; 触发宏展开，生成 4 份特化代码
             (etypecase res-data
               ((simple-array double-float (*))
@@ -348,8 +331,7 @@
               ((simple-array (signed-byte 64) (*))
                (gen-dispatch (signed-byte 64)))
               ((simple-array (signed-byte 32) (*))
-               (gen-dispatch (signed-byte 32))))))
-        
+               (gen-dispatch (signed-byte 32))))))        
         res))))
 
 (declaim (inline get-reduction-identity))
@@ -388,7 +370,6 @@
          ;; 兜底: 未知整数类型退回 fixnum 极值
          ((subtypep element-type 'integer) most-positive-fixnum)
          (t 0))))))
-
 
 (defun vt-reduce (tensor axis init-val reducer-fn &key out dtype keepdims return-arg)
   "通用归约核心. 支持多维指定轴(可多轴)归约与全局归约.
@@ -446,8 +427,7 @@
         (let ((empty-dtype (or dtype (and out (vt-dtype out)) (vt-dtype tensor))))
           (return-from vt-reduce
             (values (make-vt out-shape 0 :dtype empty-dtype)
-                    (when return-arg (make-vt out-shape 0 :dtype :int32))))))
-      
+                    (when return-arg (make-vt out-shape 0 :dtype :int32))))))      
       ;; 1. 确定输出类型 (对标 NumPy 严格校验)
       (let* ((final-dtype (cond
                             ((and out dtype (not (eq (vt-dtype out) dtype)))
@@ -506,8 +486,7 @@
                                        (loop for i fixnum from 0 below dim do
                                          (init-view (1+ depth) out-ptr)
                                          (incf out-ptr stride))))))
-                        (init-view 0 res-offset)))
-                    
+                        (init-view 0 res-offset)))                    
                     (labels
 			((recurse (depth in-ptr out-ptr out-idx-ptr current-arg-val)
                            (declare (type fixnum depth in-ptr out-ptr out-idx-ptr current-arg-val))
@@ -548,14 +527,12 @@
 	     (gen-reduce (signed-byte 32)))))
 	(values res res-idx)))))
 
-
 ;; 底层统一迭代器宏
 (defmacro vt-foreach ((out-spec &rest in-specs) &body body)
   "高效的多张量遍历基石宏。
 Fast-Path: 连续内存极速线性循环。
 Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)。
 支持从 body 中自动提取 declare 语句并置于合法作用域。"
-
   (let* ((out-tens (first out-spec))
          (p-out (second out-spec))
          (in-tens (mapcar #'first in-specs))
@@ -611,7 +588,6 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                             ,@(loop for v in in-vars
                                     for s in in-stride-vars
                                     collect `(incf ,v ,s)))))
-
                ;; Slow-Path: 通用 N 维非连续遍历
                (let* ((,dims-vec (coerce (vt-shape ,out-tens) 'simple-vector))
                       (,rank (length ,dims-vec))
@@ -643,10 +619,135 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                                             for vec in in-strs-vecs
                                             collect
 					    `(incf ,v
-                                                   (svref ,vec depth))))))))
+                                                   (svref ,vec depth))))
+			       (decf ,p-out (* dim (svref ,out-strs-vec depth)))
+                              ,@(loop for v in in-vars
+                                      for vec in in-strs-vecs
+                                      collect
+                                      `(decf ,v (* dim (svref ,vec depth))))))))
                    (recurse 0)))))))))
 
-
+(defmacro vt-binary-fast-map (fn &rest args)
+  "专为二元运算极致优化的逐元素映射宏。
+   使用 array-element-type 实现精确的运行时类型分派。"
+   (multiple-value-bind (tensors explicit-dtype explicit-out)
+	(parse-vt-op-args args)    
+    (when (null tensors) (error "vt-binary-fast-map 至少需要一个输入张量"))
+    (let* ((n (length tensors))
+           (fn-var (gensym "FN"))
+           (inline-fn (if (and (consp fn)
+			       (eq (car fn) 'function)
+			       (symbolp (cadr fn)))
+                          (cadr fn)
+                          nil))
+           (tens-vars
+	     (loop for i below n collect (gensym (format nil "TENS-~d" i))))
+           (data-vars
+	     (loop for i below n collect (gensym (format nil "DATA-~d" i))))
+           (ptr-vars
+	     (loop for i below n collect (gensym (format nil "P-~d" i))))
+           (views-vars
+	     (loop for i below n collect (gensym (format nil "VIEW-~d" i))))
+           (in-etype-vars
+	     (loop for i below n collect (gensym (format nil "IN-ETYPE-~d" i))))
+           (out-tens (gensym "OUT-TENS"))
+           (out-ptr (gensym "OUT-PTR"))
+           (out-data (gensym "OUT-DATA"))
+           (out-type (gensym "OUT-TYPE"))
+           (out-etype (gensym "OUT-ETYPE"))
+           (out-shape (gensym "OUT-SHAPE"))
+           (out-dtype (gensym "OUT-DTYPE"))
+           (call-form (if inline-fn
+                          `(,inline-fn ,@(loop for dv in data-vars
+					       for pv in ptr-vars
+					       collect `(aref ,dv ,pv)))
+                          `(funcall ,fn-var ,@(loop for dv in data-vars
+                                                    for pv in ptr-vars
+                                                    collect `(aref ,dv ,pv)))))
+           ;; 已知类型表: (lisp-type array-type cast-op)
+           (known-types
+	     '((double-float (simple-array double-float (*)) coerce)
+	       (single-float (simple-array single-float (*)) coerce)
+	       ((signed-byte 64) (simple-array (signed-byte 64) (*)) truncate)
+	       ((signed-byte 32) (simple-array (signed-byte 32) (*)) truncate))))      
+      `(let* (,@(loop for tv in tens-vars
+		      for form in tensors
+		      collect `(,tv (ensure-vt ,form)))
+	      (,out-shape ,(reduce (lambda (acc tv)
+                                     `(vt-broadcast-shapes ,acc (vt-shape ,tv)))
+                                   (rest tens-vars)
+                                   :initial-value `(vt-shape ,(first tens-vars))))
+	      (,out-dtype (or ,explicit-dtype
+			      (vt-promote-type
+			       ,@(loop for tv in tens-vars
+				       collect `(vt-dtype ,tv)))))
+	      (,out-tens (or ,explicit-out
+                             (vt-zeros ,out-shape :dtype ,out-dtype)))
+	      (,out-data (vt-data ,out-tens))
+	      (,out-type (vt-dtype->lisp-type (vt-dtype ,out-tens)))
+	      (,out-etype (array-element-type ,out-data))
+	      ,@(unless inline-fn `((,fn-var ,fn)))
+	      ,@(loop for dv in data-vars
+		      for tv in tens-vars
+		      collect `(,dv (vt-data ,tv)))
+	      ,@(loop for etv in in-etype-vars
+		      for dv in data-vars
+		      collect `(,etv (array-element-type ,dv)))
+	      ,@(loop for vv in views-vars
+		      for tv in tens-vars
+		      collect `(,vv (if (or (equal (vt-shape ,tv) ,out-shape)
+                                            (= (vt-size ,tv) 1))
+                                        ,tv
+                                        (vt-broadcast-to ,tv ,out-shape)))))         
+         ;; 严格校验 out 形状与 dtype 冲突，与库其他部分保持一致
+         (when (and ,explicit-out ,explicit-dtype
+                    (not (eq (vt-dtype ,out-tens) ,explicit-dtype)))
+           (error "vt-binary-fast-map: :out 的类型 (~a) 与 :dtype (~a) 冲突"
+                  (vt-dtype ,out-tens) ,explicit-dtype))
+         (when ,explicit-out
+           (unless (equal (vt-shape ,out-tens) ,out-shape)
+             (error "vt-binary-fast-map: :out 张量形状 ~a 与广播结果 ~a 不匹配"
+                    (vt-shape ,out-tens) ,out-shape)))
+         (cond
+           ,@(loop for (out-lt out-at cast-op) in known-types
+                   for cast-form = (if (eq cast-op 'coerce)
+				       `(coerce ,call-form ',out-lt)
+				       `(truncate ,call-form))
+                   collect
+		   `((equal ,out-etype ',out-lt)
+                     (cond
+		       ,@(loop for (in-lt in-at) in known-types
+			       collect
+			       `((and ,@(loop for etv in in-etype-vars
+					      collect `(equal ,etv ',in-lt)))
+                                 (vt-foreach ((,out-tens ,out-ptr)
+					      ,@(loop for vv in views-vars
+						      for pv in ptr-vars
+						      collect `(,vv ,pv)))
+                                   (declare (type ,out-at ,out-data)
+                                            (type ,in-at ,@data-vars))
+                                   (setf (aref ,out-data ,out-ptr) ,cast-form))))
+		       (t
+                        (vt-foreach ((,out-tens ,out-ptr)
+                                     ,@(loop for vv in views-vars
+                                             for pv in ptr-vars
+                                             collect `(,vv ,pv)))
+                          (declare (type ,out-at ,out-data))
+                          (setf (aref ,out-data ,out-ptr) ,cast-form))))))
+           (t
+            (if (subtypep ,out-type 'integer)
+                (vt-foreach ((,out-tens ,out-ptr)
+                             ,@(loop for vv in views-vars
+                                     for pv in ptr-vars
+                                     collect `(,vv ,pv)))
+                  (setf (aref ,out-data ,out-ptr) (truncate ,call-form)))
+                (vt-foreach ((,out-tens ,out-ptr)
+                             ,@(loop for vv in views-vars
+                                     for pv in ptr-vars
+                                     collect `(,vv ,pv)))
+                  (setf (aref ,out-data ,out-ptr)
+			(coerce ,call-form ,out-type))))))
+         ,out-tens))))
 
 ;;; --- 高效迭代逻辑  ---
 (defmacro vt-do-each ((ptr-var val-var vt) &body body)
@@ -688,7 +789,6 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
 (defun vt-where (condition x y &key out dtype)
   "三元条件选择，对标 pytorch 的 torch.where 和 numpy 的 np.where(cond, x, y)。
    根据 condition 的真假，从 x 或 y 中选择元素。支持自动广播。
-   
    Parameters:
    - condition: 条件张量。
    - x, y: 选择源张量。
@@ -703,8 +803,7 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                           (vt-shape condition)
                           (vt-broadcast-shapes (vt-shape x) (vt-shape y))))
            ;; 推断 x 和 y 的自然提升类型
-           (promoted-dtype (vt-promote-type (vt-dtype x) (vt-dtype y)))
-           
+           (promoted-dtype (vt-promote-type (vt-dtype x) (vt-dtype y)))           
            ;; 1. 确定 final-dtype (优先级: out > 显式 dtype > 自动推断)
            (final-dtype (cond 
                           ;; 如果同时提供 out 和 dtype，必须一致
@@ -718,10 +817,8 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                           ;; 如果有 dtype，以显式 dtype 为准
                           (dtype dtype)
                           ;; 否则自动推断
-                          (t promoted-dtype)))
-           
+                          (t promoted-dtype)))           
            (lisp-type (vt-dtype->lisp-type final-dtype))
-           
            ;; 2. 确定输出张量 result
            (result (if out
                        (progn
@@ -731,10 +828,8 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                                   (vt-shape out) target-shape))
                          out)
                        ;; 如果没有 out，创建新张量
-                       (vt-zeros target-shape :dtype final-dtype)))
-           
-           (size (vt-shape-to-size target-shape))
-           
+                       (vt-zeros target-shape :dtype final-dtype)))           
+           (size (vt-shape-to-size target-shape))           
            ;; 3. 快速路径判断
            ;; 只有当所有相关张量均为连续内存，且形状符合广播规则时才走快速路径
            ;; 注意：result (out) 也必须是连续的才能走快速路径 (步长必须为1)
@@ -752,12 +847,10 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                          (or (equal (vt-shape y)
 				    target-shape)
 			     (= (vt-size y) 1)))))
-      
       (let ((c-data (vt-data condition))
             (x-data (vt-data x))
             (y-data (vt-data y))
             (r-data (vt-data result))) ; 可能是 out 的 data，也可能是新分配的 data
-        
         (if is-fast
             ;; === 极速路径: 连续内存极速线性循环 ===
             (let ((c-ptr (vt-offset condition))
@@ -779,8 +872,7 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                 (incf c-ptr c-step)
                 (incf x-ptr x-step)
                 (incf y-ptr y-step)
-                (incf r-ptr)))
-            
+                (incf r-ptr)))            
             ;; === 慢速路径: 通用 N 维非连续/广播遍历 ===
             (let* ((rank (length target-shape))
                    (dims-vec (coerce target-shape 'simple-vector))
@@ -799,8 +891,7 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                    ;; 获取 result (out) 的实际步长，支持非连续输出
                    (r-strs-vec (coerce (vt-strides result) 'simple-vector)))
               (declare (type fixnum rank)
-                       (type simple-vector dims-vec c-strs-vec x-strs-vec y-strs-vec r-strs-vec))
-              
+                       (type simple-vector dims-vec c-strs-vec x-strs-vec y-strs-vec r-strs-vec))              
               (labels ((recurse (depth c-ptr x-ptr y-ptr r-ptr)
                          (declare (type fixnum depth c-ptr x-ptr y-ptr r-ptr)
                                   (optimize (safety 0)))
@@ -837,20 +928,17 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
 condition: 条件张量。
 返回: 形状为 (n, rank) 的二维张量，每一行是一个非零元素的完整坐标。
 示例: (vt-argwhere tensor) -> [[0, 1], [2, 3], ...]
-
 注意 (对标 pytorch/numpy):
 如果输入是 0 维张量 (标量), rank 为 0。
 - 若标量非零: 返回形状为 (1, 0) 的张量。
 - 若标量为零: 返回形状为 (0, 0) 的张量。
-
 :dtype 选项: 仅支持 :int32 或 :int64 (默认)。"
   (declare (type vt condition)
 	   (type (member nil :int32 :int64) dtype))
   (let ((final-dtype (or dtype :int64)))
     ;; 严格校验：只允许整数类型
     (unless (member final-dtype '(:int32 :int64))
-      (setf final-dtype :int64))
-    
+      (setf final-dtype :int64))    
     (let* ((lisp-type (if (eq final-dtype :int32)
                           '(signed-byte 32)
                           '(signed-byte 64)))
@@ -869,7 +957,6 @@ condition: 条件张量。
                                      :element-type '(signed-byte 64))))
       (declare (type simple-vector shape-vec strides-vec)
                (type fixnum rank in-offset))
-
       (macrolet
           ((gen-recurse (test-fn)
              `(labels
@@ -891,7 +978,6 @@ condition: 条件张量。
                                                (+ current-ptr
                                                   (* i stride)))))))))
                 (recurse 0 in-offset))))
-
         (etypecase in-data
           ((simple-array double-float (*))
            (gen-recurse
