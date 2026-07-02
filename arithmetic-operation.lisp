@@ -111,7 +111,7 @@
   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
 				    :float32 :float64)))
          ;; 预先绑定正确类型的 NaN，消灭循环内的 if 判断
-         (nan-val (vt-get-nan dtype)))
+         (nan-val (vt-get-nan infer-dtype)))
     (vt-map (lambda (x) (if (minusp x) nan-val (sqrt x))) 
             vt :out out :dtype infer-dtype)))
 
@@ -120,7 +120,7 @@
   (with-float-safe 
     (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
 				      :float32 :float64)))
-           (nan-val (vt-get-nan dtype)))
+           (nan-val (vt-get-nan infer-dtype)))
       (if base
           (vt-map (lambda (val) (if (<= val 0) nan-val (log val base))) 
                   vt :out out :dtype infer-dtype)

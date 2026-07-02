@@ -87,11 +87,10 @@
     (vt-sum (vt-abs vt) :axis axis :keepdims keepdims
             :dtype dtype :out out)))
 
-(defun vt-frobenius-norm (matrix &key dtype out)
+(defun vt-frobenius-norm (matrix &key axis keepdims dtype out)
   "frobenius 范数 (专用于矩阵)"
   (with-float-safe
-    (vt-norm matrix :dtype dtype :out out)))
-
+    (vt-norm matrix :axis axis :keepdims keepdims :dtype dtype :out out)))
 
 ;;; 方程求解与矩阵分析
 
