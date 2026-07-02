@@ -29,19 +29,19 @@
 
 (defun vt-add (a b &key dtype out)
   "逐元素加法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
-  (vt-binary-fast-map #'+ a b :dtype dtype :out out))
+  (vt-fast-map #'+ a b :dtype dtype :out out))
 
 (defun vt-sub (a b &key dtype out)
   "逐元素减法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
-  (vt-binary-fast-map #'- a b :dtype dtype :out out))
+  (vt-fast-map #'- a b :dtype dtype :out out))
 
 (defun vt-mul (a b &key dtype out)
   "逐元素乘法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
-  (vt-binary-fast-map #'* a b :dtype dtype :out out))
+  (vt-fast-map #'* a b :dtype dtype :out out))
 
 (defun vt-div (a b &key dtype out)
   "逐元素除法. 支持标量、列表、张量混合. 只用于两项数据，快速运算"
-  (vt-binary-fast-map #'/ a b :dtype dtype :out out))
+  (vt-fast-map #'/ a b :dtype dtype :out out))
 
 (defun vt-scale (a b &key out dtype)
   "将张量乘以标量."

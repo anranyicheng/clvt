@@ -627,12 +627,13 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
                                       `(decf ,v (* dim (svref ,vec depth))))))))
                    (recurse 0)))))))))
 
-(defmacro vt-binary-fast-map (fn &rest args)
-  "专为二元运算极致优化的逐元素映射宏。
-   使用 array-element-type 实现精确的运行时类型分派。"
+(defmacro vt-fast-map (fn &rest args)
+  "运算极致优化的逐元素映射宏, 谨慎使用，否则宏展开占据大量内存。
+   使用 array-element-type 实现精确的运行时类型分派,
+   底层调用 vt-foreach 宏"
    (multiple-value-bind (tensors explicit-dtype explicit-out)
 	(parse-vt-op-args args)    
-    (when (null tensors) (error "vt-binary-fast-map 至少需要一个输入张量"))
+    (when (null tensors) (error "vt-fast-map 至少需要一个输入张量"))
     (let* ((n (length tensors))
            (fn-var (gensym "FN"))
            (inline-fn (if (and (consp fn)
@@ -702,11 +703,11 @@ Slow-Path: 通用 N 维非连续遍历 (编译期展开，零分配指针推进)
          ;; 严格校验 out 形状与 dtype 冲突，与库其他部分保持一致
          (when (and ,explicit-out ,explicit-dtype
                     (not (eq (vt-dtype ,out-tens) ,explicit-dtype)))
-           (error "vt-binary-fast-map: :out 的类型 (~a) 与 :dtype (~a) 冲突"
+           (error "vt-fast-map: :out 的类型 (~a) 与 :dtype (~a) 冲突"
                   (vt-dtype ,out-tens) ,explicit-dtype))
          (when ,explicit-out
            (unless (equal (vt-shape ,out-tens) ,out-shape)
-             (error "vt-binary-fast-map: :out 张量形状 ~a 与广播结果 ~a 不匹配"
+             (error "vt-fast-map: :out 张量形状 ~a 与广播结果 ~a 不匹配"
                     (vt-shape ,out-tens) ,out-shape)))
          (cond
            ,@(loop for (out-lt out-at cast-op) in known-types
