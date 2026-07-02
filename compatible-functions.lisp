@@ -28,7 +28,7 @@
 
 ;;;  数组创建扩展
 (defun vt-linspace (start end num &key (endpoint t) (dtype :float64))
-   "创建线性间隔数组，与 numpy linspace 完全兼容。
+  "创建线性间隔数组，与 numpy linspace 完全兼容。
    start     : 起始值
    end       : 结束值
    num       : 元素个数（>0 整数）
@@ -761,16 +761,17 @@
           (let* ((ax (vt-normalize-axis axis rank))
                  (ax-dim (nth ax shape))
                  ;; 使用一维数组作为多维迭代器，记录非 ax 维度的当前坐标
-                 (indices (make-array rank :element-type '(signed-byte 64) :initial-element 0)))
+                 (indices (make-array rank :element-type '(signed-byte 64)
+					   :initial-element 0)))
             
             (labels ((advance ()
                        "推进迭代器，跳过 ax 维度。返回 nil 表示遍历结束。"
                        (loop for d from (1- rank) downto 0
                              when (/= d ax)
-                             do (incf (aref indices d))
-                                (if (< (aref indices d) (nth d shape))
-                                    (return-from advance t)
-                                    (setf (aref indices d) 0)))
+                               do (incf (aref indices d))
+                                  (if (< (aref indices d) (nth d shape))
+                                      (return-from advance t)
+                                      (setf (aref indices d) 0)))
                        nil))
               
               (loop
@@ -829,7 +830,8 @@
                (out-shape (loop for d in shape
 				for i from 0
 				unless (= i ax) collect d))
-               (result (vt-zeros out-shape :dtype :float64))
+	       (dtype :float64)
+               (result (vt-zeros out-shape :dtype dtype))
                (out-strides (vt-strides result)))
           (vt-do-each (ptr val result) (declare (ignore val))
             (let ((out-idx (vt-unravel-index ptr out-shape out-strides)))
@@ -840,36 +842,39 @@
                      (fiber (apply #'vt-slice tensor specs))
                      (fiber-size (vt-size fiber)))
                 (if (zerop fiber-size)
-                    (setf (aref (vt-data result) ptr) (vt-get-nan :float64))
+                    (setf (aref (vt-data result) ptr) (vt-get-nan dtype))
                     (let ((vals (loop for i below fiber-size
 				      collect (vt-ref fiber i))))
                       (if (some #'vt-float-nan-p vals)
-                          (setf (aref (vt-data result) ptr) (vt-get-nan :float64))
+                          (setf (aref (vt-data result) ptr) (vt-get-nan dtype))
                           (let ((sorted-vals (vt-numpy-sort vals #'<)))
                             (setf (aref (vt-data result) ptr)
                                   (if (oddp fiber-size)
-                                      (coerce (nth (floor fiber-size 2) sorted-vals)
-					      'double-float)
-                                      (/ (+ (coerce (nth (1- (floor fiber-size 2)) sorted-vals)
-						    'double-float)
-                                            (coerce (nth (floor fiber-size 2) sorted-vals)
-						    'double-float))
+                                      (vt-cast (nth (floor fiber-size 2) sorted-vals)
+					       dtype)
+                                      (/ (+ (vt-cast (nth (1- (floor fiber-size 2)) sorted-vals)
+						     dtype)
+                                            (vt-cast (nth (floor fiber-size 2) sorted-vals)
+						     dtype))
 					 2.0d0))))))))))
           result)
-        (let* ((flat (vt-flatten tensor)) (size (vt-size flat)))
+        (let* ((flat (vt-flatten tensor))
+	       (size (vt-size flat))
+	       (dtype :float64))
           (if (zerop size)
-              (make-vt nil (vt-get-nan :float64) :dtype :float64)
+              (make-vt nil (vt-get-nan dtype) :dtype dtype)
               (let ((vals (loop for i below size collect (aref (vt-data flat) i))))
                 (if (some #'vt-float-nan-p vals)
-                    (make-vt nil (vt-get-nan :float64) :dtype :float64)
+                    (make-vt nil (vt-get-nan dtype) :dtype dtype)
                     (let ((sorted-vals (vt-numpy-sort vals #'<)))
                       (if (oddp size)
-                          (make-vt nil (coerce (nth (floor size 2) sorted-vals) 'double-float)
-				   :dtype :float64)
-                          (make-vt nil (/ (+ (coerce (nth (1- (floor size 2)) sorted-vals) 'double-float)
-                                             (coerce (nth (floor size 2) sorted-vals) 'double-float))
+                          (make-vt nil (vt-cast (nth (floor size 2) sorted-vals) dtype)
+				   :dtype dtype)
+                          (make-vt nil (/ (+ (vt-cast
+					      (nth (1- (floor size 2)) sorted-vals) dtype)
+                                             (vt-cast (nth (floor size 2) sorted-vals) dtype))
 					  2.0d0)
-                                   :dtype :float64))))))))))
+                                   :dtype dtype))))))))))
 
 (defun percent-from-sorted (sorted q interpolation)
   "从已排序列表 sorted 中，按分数 q (0..1) 和插值方法 interpolation 计算百分位值。
@@ -905,47 +910,56 @@
    percentile : 0~100 的百分位数值。
    axis : 归约轴，支持负数 (nil 表示全局)。
    interpolation : :linear, :lower, :higher, :midpoint,
-                   :nearest (默认 :linear)。"
+                   :nearest (默认 :linear)。
+   优化: 严格对齐 NumPy 行为，包含 NaN 则返回 NaN。"
   (with-float-safe
     (let ((q (/ percentile 100.0d0)))
       (if axis
+          ;; ========== 沿轴计算 ==========
           (let* ((shape (vt-shape tensor))
                  (rank (length shape))
                  (ax (vt-normalize-axis axis rank))
                  (out-shape (loop for d in shape
-				  for i from 0
-				  unless (= i ax) collect d))
-                 (result (vt-zeros out-shape :dtype :float64))
+                                  for i from 0
+                                  unless (= i ax) collect d))
+                 (dtype :float64)
+                 (result (vt-zeros out-shape :dtype dtype))
                  (out-strides (vt-strides result)))
             (vt-do-each (ptr val result)
               (declare (ignore val))
               (let ((out-idx (vt-unravel-index ptr out-shape out-strides)))
                 (let* ((specs (loop for i from 0 below rank
-				    if (= i ax) collect '(:all)
-				      else collect (list (pop out-idx))))
+                                    if (= i ax) collect '(:all)
+                                      else collect (list (pop out-idx))))
                        (fiber (apply #'vt-slice tensor specs))
                        (fiber-size (vt-size fiber)))
                   (if (zerop fiber-size)
-                      ;; 拦截空轴，防止传入空列表给 percent-from-sorted 导致崩溃
-                      (setf (aref (vt-data result) ptr) +vt-dfloat-nan+)
-                      (let ((vals (vt-numpy-sort
-				   (loop for i below fiber-size
-					 collect (vt-ref fiber i)) #'<)))
-                        (setf (aref (vt-data result) ptr)
-			      (percent-from-sorted vals q interpolation)))))))
+                      ;; 拦截空轴，防止传入空列表导致崩溃
+                      (setf (aref (vt-data result) ptr) (vt-get-nan dtype))
+                      (let ((raw-vals (loop for i below fiber-size
+                                            collect (vt-ref fiber i))))
+                        (if (some #'vt-float-nan-p raw-vals)
+                            (setf (aref (vt-data result) ptr) (vt-get-nan dtype))
+                            ;; 无 NaN，正常排序并计算
+                            (let ((vals (vt-numpy-sort raw-vals #'<)))
+                              (setf (aref (vt-data result) ptr)
+                                    (percent-from-sorted vals q interpolation)))))))))
             result)
-          ;; 全局百分位
+          ;; ========== 全局百分位 ==========
           (let* ((flat (vt-flatten tensor))
-                 (size (vt-size flat)))
+                 (size (vt-size flat))
+                 (dtype :float64))
             (if (zerop size)
-                ;; 拦截全局空张量
-                (make-vt nil +vt-dfloat-nan+ :dtype :float64)
-                (let ((vals (vt-numpy-sort
-			     (loop for i below size
-				   collect (aref (vt-data flat) i))
-			     #'<)))
-                  (make-vt nil (percent-from-sorted vals q interpolation)
-			   :dtype :float64))))))))
+                (make-vt nil (vt-get-nan dtype) :dtype dtype)
+                (let ((raw-vals (loop for i below size
+                                      collect (aref (vt-data flat) i))))
+                  (if (some #'vt-float-nan-p raw-vals)
+                      (make-vt nil (vt-get-nan dtype) :dtype dtype)
+                      ;; 无 NaN，正常排序并计算
+                      (let ((vals (vt-numpy-sort raw-vals #'<)))
+                        (make-vt nil (percent-from-sorted vals q interpolation)
+                                 :dtype dtype))))))))))
+
 
 (defun vt-quantile (tensor q &key axis (interpolation :linear))
   "计算分位数.
