@@ -409,10 +409,17 @@
 	     (if return-arg
 		 (if is-global-reduction
 		     (vt-compute-strides in-shape)
-		     (loop for i from 0 below rank
-			   if (member i real-axes) collect 1
-			     else collect 0))
+		     (let* ((reduced-shape (mapcar (lambda (a) (nth a in-shape))
+						   real-axes))
+			    (reduced-strides (vt-compute-strides reduced-shape))
+			    (k -1))
+		       (loop for i from 0 below rank
+			     if (member i real-axes)
+			       collect (progn (incf k)
+					      (nth k reduced-strides))
+			     else collect 0)))
 		 (make-list rank :initial-element 0)))
+
            (axis-size
              (if real-axes
                  (the fixnum (reduce #'* (mapcar (lambda (a)

@@ -694,61 +694,62 @@
       (error "vt-diagonal requires rank >= 2"))
     (let* ((rows (nth (- rank 2) in-shape))
            (cols (nth (- rank 1) in-shape))
-           (diag-len (max 0 (- (min rows cols) (abs offset))))
-           (dtype (vt-dtype tensor))
-           (out-shape (append (subseq in-shape 0 (- rank 2))
-                              (list diag-len)))
-           (res (vt-zeros out-shape :dtype dtype))
-           (res-data (vt-data res))
-           (in-data (vt-data tensor))
-           (in-strs (coerce (vt-strides tensor) 'simple-vector))
-           (out-strs (coerce (vt-strides res) 'simple-vector))
-           (in-shp-vec (coerce in-shape 'simple-vector))
-           ;; 预计算起点偏移量
            (r-init (if (> offset 0) 0 (- offset)))
-           (c-init (if (> offset 0) offset 0)))
-      (declare (type simple-vector in-strs out-strs in-shp-vec)
-               (type fixnum r-init c-init))
-      (labels
-          ((recurse (depth in-ptr out-ptr)
-             (declare (type fixnum depth in-ptr out-ptr))
-             (if (= depth (- rank 2))
-                 ;; === 底层: 提取对角线 ===
-                 (let ((str-r (svref in-strs depth))
-                       (str-c (svref in-strs (1+ depth))))
-                   (declare (type fixnum str-r str-c))
-                   (loop for i fixnum from 0 below diag-len
-                         for src-off fixnum = (+ in-ptr
-                                                 (* (+ r-init i) str-r)
-                                                 (* (+ c-init i) str-c))
-                         do (setf (aref res-data out-ptr)
-                                  (aref in-data src-off))
-                            (incf out-ptr)))
-                 ;; === 高维递归 ===
-                 (let ((dim (svref in-shp-vec depth))
-                       (in-str (svref in-strs depth))
-                       (out-str (svref out-strs depth)))
-                   (declare (type fixnum dim in-str out-str))
-                   (loop for i fixnum from 0 below dim do
-                     (recurse (1+ depth) in-ptr out-ptr)
-                     (incf in-ptr in-str)
-                     (incf out-ptr out-str))))))
-        (recurse 0 (vt-offset tensor) 0))
-      res)))
-
+           (c-init (if (> offset 0) offset 0))
+           (diag-len (max 0 (min (- rows r-init) (- cols c-init)))))
+      (declare (type fixnum r-init c-init diag-len))
+      (let* ((dtype (vt-dtype tensor))
+             (out-shape (append (subseq in-shape 0 (- rank 2))
+				(list diag-len)))
+             (res (vt-zeros out-shape :dtype dtype))
+             (res-data (vt-data res))
+             (in-data (vt-data tensor))
+             (in-strs (coerce (vt-strides tensor) 'simple-vector))
+             (out-strs (coerce (vt-strides res) 'simple-vector))
+             (in-shp-vec (coerce in-shape 'simple-vector)))
+        (declare (type simple-vector in-strs out-strs in-shp-vec))
+        (labels ((recurse (depth in-ptr out-ptr)
+                   (declare (type fixnum depth in-ptr out-ptr))
+                   (if (= depth (- rank 2))
+                       ;; === 底层: 提取对角线 ===
+                       (let ((str-r (svref in-strs depth))
+                             (str-c (svref in-strs (1+ depth))))
+                         (declare (type fixnum str-r str-c))
+                         (loop for i fixnum from 0 below diag-len
+                               for src-off fixnum = (+ in-ptr
+						       (* (+ r-init i) str-r)
+						       (* (+ c-init i) str-c))
+                               do (setf (aref res-data out-ptr)
+					(aref in-data src-off))
+                                  (incf out-ptr)))
+                       ;; === 高维递归 ===
+                       (let ((dim (svref in-shp-vec depth))
+                             (in-str (svref in-strs depth))
+                             (out-str (svref out-strs depth)))
+                         (declare (type fixnum dim in-str out-str))
+                         (loop for i fixnum from 0 below dim
+                               do (recurse (1+ depth) in-ptr out-ptr)
+                                  (incf in-ptr in-str)
+                                  (incf out-ptr out-str))))))
+          (recurse 0 (vt-offset tensor) 0))
+        res))))
 
 ;; 1. 选用正确的步长计算函数
 (defun vt-compute-strides (shape)
   "根据形状计算连续内存步长.
    shape 为 nil (标量) -> 返回 nil.
-   shape 为 (10) -> 返回 (1)."
-  (if (null shape)
-      nil
-      (loop with stride = 1
-            for dim in (reverse shape)
-            collect stride into strides
-            do (setf stride (* stride dim))
-            finally (return (reverse strides)))))
+   shape 为 (10) -> 返回 (1).
+   极致优化: 单次分配。"
+  (declare (list shape) (optimize (speed 3) (safety 0)))
+  (if (null shape) nil
+      (let ((result nil)
+            (stride 1))
+        (declare (type fixnum stride))
+        (do ((tail (reverse shape) (cdr tail)))
+            ((null tail) result)
+          (push stride result)
+          (setf stride (the fixnum
+			    (* stride (the fixnum (car tail)))))))))
 
 (defun vt-contiguous-p (vt)
   "检查张量是否在内存中连续 只有连续的张量才能安全地重塑为任意形状.
@@ -1352,111 +1353,127 @@
 
 (declaim (inline vt-broadcast-shapes))
 (defun vt-broadcast-shapes (shape1 shape2)
-  "计算广播结果形状，严格对标 numpy 规范（完美支持 0 尺寸维度）。"
-  (declare (list shape1 shape2) (optimize (speed 3)))
-  (let ((len1 (length shape1))
-        (len2 (length shape2))
-        (result '()))
-    (declare (fixnum len1 len2))
-    (loop for i fixnum from 1 to (max len1 len2)
-          for dim1 fixnum = (if (<= i len1) (nth (- len1 i) shape1) 1)
-          for dim2 fixnum = (if (<= i len2) (nth (- len2 i) shape2) 1)
-          do (cond ((= dim1 dim2) (push dim1 result)) ;; 规则1: 相等则取其一 (0=0 -> 0)
-                   ((= dim1 1) (push dim2 result))    ;; 规则2: dim1为1，取dim2 (1,0->0; 1,3->3)
-                   ((= dim2 1) (push dim1 result))    ;; 规则2: dim2为1，取dim1 (0,1->0; 3,1->3)
-                   (t (error "形状 ~a 和 ~a 无法进行广播，维度 ~a 和 ~a 不兼容" 
-                             shape1 shape2 dim1 dim2)))) ;; 规则3: 其他报错 (0,3报错)
-    (the list result)))
+  "计算广播结果形状，严格对标 numpy 规范。
+   极致优化: 预分配结果，零动态 cons，O(N) 复杂度。"
+  (declare (list shape1 shape2) (optimize (speed 3) (safety 0)))
+  (let* ((len1 (length shape1))
+         (len2 (length shape2))
+         (max-len (max len1 len2))
+         (result (make-list max-len)))
+    (declare (type fixnum len1 len2 max-len))
+    (do ((i 0 (1+ i))
+         (s1 (nthcdr (the fixnum (- max-len len1)) shape1) (cdr s1))
+         (s2 (nthcdr (the fixnum (- max-len len2)) shape2) (cdr s2))
+         (r result (cdr r)))
+        ((= i max-len) result)
+      (declare (type fixnum i))
+      (let ((dim1 (if s1 (the fixnum (car s1)) 1))
+            (dim2 (if s2 (the fixnum (car s2)) 1)))
+        (declare (type fixnum dim1 dim2))
+        (cond ((= dim1 dim2) (setf (car r) dim1))
+              ((= dim1 1)    (setf (car r) dim2))
+              ((= dim2 1)    (setf (car r) dim1))
+              (t (error "形状 ~a 和 ~a 无法进行广播，维度 ~a 和 ~a 不兼容"
+			shape1 shape2 dim1 dim2)))))))
 
 (declaim (inline vt-broadcast-strides))
 (defun vt-broadcast-strides (orig-shape target-shape orig-strides)
-  "计算广播后的步长. 添加形状兼容性校验，避免静默越界。"
+  "计算广播后的步长. 极致优化: O(N) 指针推进消灭 nth，预分配零动态 cons。"
   (declare (list orig-shape target-shape orig-strides))
-  (declare (optimize (speed 3) (safety 1))) ; 开启基础安全检查
-  (let ((rank-diff (- (length target-shape) (length orig-shape))))
-    (declare (fixnum rank-diff))
+  (declare (optimize (speed 3) (safety 0)))
+  (let* ((target-len (length target-shape))
+         (orig-len (length orig-shape))
+         (rank-diff (- target-len orig-len))
+         (result (make-list target-len)))
+    (declare (type fixnum target-len orig-len rank-diff))
     (when (minusp rank-diff)
-      (error "vt-broadcast-strides: orig-shape ~a rank > target-shape ~a rank" 
-             orig-shape target-shape))
+      (error "vt-broadcast-strides: orig-shape ~a rank > target-shape ~a rank" orig-shape target-shape))
     
-    ;; 预分配固定数组，避免 cons 分配 (可进一步优化为 simple-vector)
-    (let ((result (make-list (length target-shape))))
-      (loop
-	for i fixnum from 0 below (length target-shape)
-        for tail-ptr = (nthcdr i result)
-        do (setf (car tail-ptr)
-                 (cond
-                   ((< i rank-diff) 0)
-                   (t (let* ((orig-idx
-			       (the fixnum (- i rank-diff)))
-                             (orig-dim
-			       (the fixnum (nth orig-idx orig-shape)))
-                             (target-dim
-			       (the fixnum (nth i target-shape))))
-                        (unless (or (= orig-dim target-dim)
-				    (= orig-dim 1))
-                          (error "vt-broadcast-strides: shape mismatch! orig-dim ~a vs target-dim ~a at axis ~a"
-                                 orig-dim target-dim i))
-                        (if (= orig-dim 1)
-			    0
-			    (nth orig-idx orig-strides)))))))
-      result)))
+    (let ((t-tail result)
+          (t-shp target-shape))
+      ;; 1. 填充左侧被广播的维度
+      (dotimes (i rank-diff)
+        (declare (type fixnum i))
+        (setf (car t-tail) 0)
+        (setf t-tail (cdr t-tail))
+        (setf t-shp (cdr t-shp)))
+      
+      ;; 2. 对齐阶段
+      (do ((o-shp orig-shape (cdr o-shp))
+           (o-str orig-strides (cdr o-str))
+           (i rank-diff (1+ i)))
+          ((null o-shp) result)
+        (declare (type fixnum i))
+        (let ((t-dim (the fixnum (car t-shp)))
+              (o-dim (the fixnum (car o-shp))))
+          (declare (type fixnum t-dim o-dim))
+          (unless (or (= o-dim t-dim) (= o-dim 1))
+            (error "vt-broadcast-strides: shape mismatch! orig-dim ~a vs target-dim ~a at axis ~a" o-dim t-dim i))
+          (setf (car t-tail)
+                (if (= o-dim 1)
+                    0
+                    (the fixnum (car o-str))))
+          (setf t-tail (cdr t-tail))
+          (setf t-shp (cdr t-shp)))))))
 
-
-;; 核心宏:高性能广播迭代 
+;; 核心宏:高性能广播迭代
 (defmacro with-broadcasting-ptrs ((t1 t2 result-vt) &body body)
-  "高性能广播宏. 指针随着循环正确递增."
-  (with-float-safe
-    (let ((idx-var (gensym "idx"))
+  "高性能广播宏. 指针随着循环正确递增. 极致优化版。"
+  (with-float-safe 
+    (let* ((idx-var (gensym "idx"))
           (rank-var (gensym "rank"))
           (res-shape (gensym "res-shape"))
-          ;; 指针变量
-          (p1 (gensym "p1"))
-          (p2 (gensym "p2"))
-          (pr (gensym "pr"))
-          ;; 步长变量
-          (s1 (gensym "s1"))
-          (s2 (gensym "s2"))
-          (sr (gensym "sr"))
+           (p1 (gensym "p1"))
+	   (p2 (gensym "p2"))
+	   (pr (gensym "pr"))
+           (s1 (gensym "s1"))
+	   (s2 (gensym "s2"))
+	   (sr (gensym "sr"))
           (dim (gensym "dim"))
-          (data1 (gensym "data1"))
-          (data2 (gensym "data2"))
-          (data-res (gensym "data-res")))
+           (data1 (gensym "data1"))
+	   (data2 (gensym "data2"))
+	   (data-res (gensym "data-res"))
+          (res-shp-vec (gensym "RES-SHP-VEC"))
+          (str1-vec (gensym "STR1-VEC"))
+          (str2-vec (gensym "STR2-VEC"))
+          (strr-vec (gensym "STRR-VEC")))
       `(let* ((,res-shape (vt-shape ,result-vt))
               (,rank-var (length ,res-shape))
               (,data1 (vt-data ,t1))
               (,data2 (vt-data ,t2))
               (,data-res (vt-data ,result-vt))
-              ;; 预计算广播后的步长
-              (strides1-list (vt-broadcast-strides
-			      (vt-shape ,t1) ,res-shape (vt-strides ,t1)))
-              (strides2-list (vt-broadcast-strides
-			      (vt-shape ,t2) ,res-shape (vt-strides ,t2)))
-              (strides-res-list (vt-strides ,result-vt)))
-	 
-	 (labels ((recurse (depth ,p1 ,p2 ,pr)
+              (,res-shp-vec (coerce ,res-shape 'simple-vector))
+              (,str1-vec
+		(coerce (vt-broadcast-strides
+			 (vt-shape ,t1) ,res-shape (vt-strides ,t1))
+			'simple-vector))
+              (,str2-vec
+		(coerce (vt-broadcast-strides
+			 (vt-shape ,t2) ,res-shape (vt-strides ,t2))
+			'simple-vector))
+              (,strr-vec (coerce (vt-strides ,result-vt) 'simple-vector)))
+         (declare (type simple-vector ,res-shp-vec ,str1-vec ,str2-vec ,strr-vec))
+         (labels ((recurse (depth ,p1 ,p2 ,pr)
+                    (declare (type fixnum depth ,p1 ,p2 ,pr))
                     (if (= depth ,rank-var)
-			;; 最内层:直接访问内存
-			(let ((val1 (aref ,data1 ,p1))
+                        ;; 最内层:直接访问内存
+                        (let ((val1 (aref ,data1 ,p1))
                               (val2 (aref ,data2 ,p2)))
-                          (setf (aref ,data-res ,pr) (progn ,@body)))                      
-			;; 外层:循环并移动指针
-			(let* ((,dim (nth depth ,res-shape))
-                               (,s1 (nth depth strides1-list))
-                               (,s2 (nth depth strides2-list))
-                               (,sr (nth depth strides-res-list)))                        
-                          ;; === 使用局部变量迭代指针 ===
-                          (let ((cur-p1 ,p1)
-				(cur-p2 ,p2)
-				(cur-pr ,pr))
-                            (loop for ,idx-var from 0 below ,dim do
+                          (setf (aref ,data-res ,pr) (progn ,@body)))
+                        ;; 外层:循环并移动指针
+                        (let* ((,dim (the fixnum (svref ,res-shp-vec depth)))
+                               (,s1 (the fixnum (svref ,str1-vec depth)))
+                               (,s2 (the fixnum (svref ,str2-vec depth)))
+                               (,sr (the fixnum (svref ,strr-vec depth))))
+                          (declare (type fixnum ,dim ,s1 ,s2 ,sr))
+                          (let ((cur-p1 ,p1) (cur-p2 ,p2) (cur-pr ,pr))
+                            (declare (type fixnum cur-p1 cur-p2 cur-pr))
+                            (loop for ,idx-var fixnum from 0 below ,dim do
                               (recurse (1+ depth) cur-p1 cur-p2 cur-pr)
-                              ;; 手动递增指针
+                              ;; 手动递增指针，使用局部变量避免寄存器溢出
                               (incf cur-p1 ,s1)
                               (incf cur-p2 ,s2)
-                              (incf cur-pr ,sr)))))))         
-           ;; 初始调用,加上各自的 offset
-           (recurse 0
-                    (vt-offset ,t1)
-                    (vt-offset ,t2)
-                    (vt-offset ,result-vt)))))))
+                              (incf cur-pr ,sr)))))))
+           (recurse 0 (the fixnum (vt-offset ,t1)) 
+                      (the fixnum (vt-offset ,t2)) 
+                      (the fixnum (vt-offset ,result-vt))))))))
