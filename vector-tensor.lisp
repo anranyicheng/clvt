@@ -440,12 +440,22 @@
 
 
 
-(defun vt-arange (n &key (start 0) (step 1) (dtype :float64))
-  "创建一个包含范围值的一维张量."
-  (declare (fixnum n))
-  (let* ((data (make-array n :element-type (vt-dtype->lisp-type dtype)))
-         (shape (list n)))
-    (loop for i fixnum below n
+(defun vt-arange (totla-num &key (start 0) (step 1) (dtype :float64))
+  "创建一个包含等差数列的一维张量，此函数的语义与 NumPy 的 np.arange 存在根本性差异。
+totla-num : fixnum
+    要生成的元素总个数。
+start : number (默认 0)
+    等差数列的起始值。
+step : number (默认 1)
+    等差数列相邻两个元素之间的差值 (步长)。
+dtype : symbol (默认 :float64)
+    张量的元素数据类型 (如 :float32, :float64, :int32, :int64 等)。
+"
+  (declare (fixnum totla-num))
+  (let* ((data (make-array totla-num
+			   :element-type (vt-dtype->lisp-type dtype)))
+         (shape (list totla-num)))
+    (loop for i fixnum below totla-num
           do (setf (aref data i)
 		   (vt-cast (+ start (* i step)) dtype)))
     (%make-vt :data data
