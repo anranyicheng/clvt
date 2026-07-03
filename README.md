@@ -318,7 +318,6 @@ vt-minimum
 
 ;; 线性代数
 vt-matmul
-vt-matmul-df
 vt-@
 vt-einsum
 vt-dot
@@ -393,7 +392,6 @@ vt-do-each
 vt-reduce
 vt-copy-into
 vt-copy
-vt-get-contiguous-df-data
 
 ;; 通用辅助与宏
 vt-normalize-axis
