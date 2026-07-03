@@ -479,16 +479,43 @@
         (apply #'vt-concatenate 1 vts))))
 
 (defun vt-dstack (&rest vts)
-  "深度堆叠(沿轴2)"
-  (apply #'vt-concatenate 2 vts))
+  "深度堆叠(沿轴2)。对标 numpy.dstack:
+   - 1D (N,) -> 重塑为 (N, 1, 1)
+   - 2D (M, N) -> 重塑为 (M, N, 1)
+   - 3D+ -> 保持不变
+   最后沿 axis=2 进行 concatenate。"
+  (when (null vts)
+    (error "vt-dstack 至少需要一个张量"))
+  (let ((expanded-vts
+          (mapcar (lambda (vt)
+                    (let ((rank (length (vt-shape vt))))
+                      (cond
+                        ;; 1D -> (N, 1, 1)
+                        ((= rank 1)
+                         (vt-reshape vt (append (vt-shape vt) '(1 1))))
+                        ;; 2D -> (M, N, 1)
+                        ((= rank 2)
+                         (vt-reshape vt (append (vt-shape vt) '(1))))
+                        ;; 3D 及以上保持不变
+                        (t vt))))
+                  vts)))
+    ;; 沿第 3 维 (axis=2) 拼接
+    (apply #'vt-concatenate 2 expanded-vts)))
+
+(defun vt-hsplit (vt indices-or-sections)
+  "水平分割(对标 numpy.hsplit)。
+   - 1D 张量：沿 axis=0 分割 (因为只有一维)
+   - 2D 及以上张量：沿 axis=1 分割"
+  (let ((rank (length (vt-shape vt))))
+    (if (<= rank 1)
+        ;; 1D 情况：沿唯一的轴 0 分割
+        (vt-split vt indices-or-sections :axis 0)
+        ;; 2D 及以上情况：沿轴 1 分割
+        (vt-split vt indices-or-sections :axis 1))))
 
 (defun vt-vsplit (vt indices-or-sections)
   "垂直分割(沿轴0)"
   (vt-split vt indices-or-sections :axis 0))
-
-(defun vt-hsplit (vt indices-or-sections)
-  "水平分割(沿轴1)"
-  (vt-split vt indices-or-sections :axis 1))
 
 (defun vt-dsplit (vt indices-or-sections)
   "深度分割(沿轴2)"
@@ -2330,12 +2357,3 @@
 		(if (zerop x) 1.0d0 (/ (sin x) x)))
               x-pi :out out))))
 
-(defun vt-deg2rad (tensor &key out)
-  "角度转弧度。"
-  (with-float-safe
-    (vt-scale tensor (/ pi 180.0d0) :out out)))
-
-(defun vt-rad2deg (tensor &key out)
-  "弧度转角度。"
-  (with-float-safe
-    (vt-scale tensor (/ 180.0d0 pi) :out out)))

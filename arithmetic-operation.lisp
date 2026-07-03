@@ -123,16 +123,40 @@
             vt :out out :dtype infer-dtype)))
 
 (defun vt-log (vt &key base out dtype)
-  "对数运算. 非正数返回对应类型的 nan."
+  "对数运算. 严格对齐 NumPy: log(0)=-inf, log(<0)=nan. 支持任意底数."
   (with-float-safe 
     (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
-				      :float32 :float64)))
-           (nan-val (vt-get-nan infer-dtype)))
-      (if base
-          (vt-map (lambda (val) (if (<= val 0) nan-val (log val base))) 
-                  vt :out out :dtype infer-dtype)
-          (vt-map (lambda (val) (if (<= val 0) nan-val (log val))) 
-                  vt :out out :dtype infer-dtype)))))
+                                      :float32 :float64)))
+           (nan-val (vt-get-nan infer-dtype))
+           (neg-inf-val (vt-get-neg-inf infer-dtype))
+           (pos-inf-val (vt-get-pos-inf infer-dtype)))
+      (cond
+        ;; 1. 非法底数 (base <= 0 或 base = 1): 数学上无意义，统一返回 nan
+        ((and base (or (<= base 0) (= base 1)))
+         (vt-map (lambda (val) 
+                   (declare (ignore val)) 
+                   nan-val) 
+                 vt :out out :dtype infer-dtype))        
+        ;; 2. 自然对数 (base = nil)
+        ((null base)
+         (vt-map (lambda (val)
+                   (cond
+                     ((minusp val) nan-val)      ; log(<0) = nan
+                     ((zerop val) neg-inf-val)   ; log(0) = -inf
+                     (t (log val))))
+                 vt :out out :dtype infer-dtype))        
+        ;; 3. 带合法底数的对数 (base > 0 且 base /= 1)
+        (t
+         ;; 预计算 log(0) 在该底数下的极限值:
+         ;; 若 base > 1, log_base(0) = -inf
+         ;; 若 0 < base < 1, log_base(0) = +inf
+         (let ((zero-result (if (plusp (log base)) neg-inf-val pos-inf-val)))
+           (vt-map (lambda (val)
+                     (cond
+                       ((minusp val) nan-val)         ; 真数负 = nan
+                       ((zerop val) zero-result)      ; 真数为 0 的极限
+                       (t (log val base))))
+                   vt :out out :dtype infer-dtype)))))))
 
 (defun vt-log10 (vt &key out dtype)
   "以 10 为底的对数."
@@ -316,7 +340,7 @@
             vt :out out :dtype infer-dtype)))
 
 ;; ========== 9. 补充: 角度与弧度转换 ==========
-(defun vt-degrees (vt &key out dtype)
+(defun vt-rad2deg (vt &key out dtype)
   "弧度转角度."
   (let* ((factor (float (/ 180.0 pi) 1.0d0))
 	 (infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
@@ -326,7 +350,7 @@
 	    :out out 
 	    :dtype infer-dtype)))
 
-(defun vt-radians (vt &key out dtype)
+(defun vt-deg2rad (vt &key out dtype)
   "角度转弧度."
   (let* ((factor (float (/ pi 180.0) 1.0d0))
 	 (infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)

@@ -125,7 +125,7 @@
     ;; ----------------------------------------------------
     (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-zeros '(0) :dtype :int64))))
       (check '() :int64 res "空张量(基于int64输入)"))
-      
+    
     (let ((res (vt-map (lambda (x) (* x 2)) (vt-zeros '(0) :dtype :float64))))
       (check '() :float64 res "空张量(基于float64输入)"))
 
@@ -151,7 +151,7 @@
     
     (let ((res (vt-reduce (vt-from-sequence '(1.0 2.0 3.0) :dtype :float64) nil 0.0 #'+)))
       (check 6.0 :float64 res "全局归约-纯浮点"))
-      
+    
     ;; 【更新】浮点初始值提升：现在需要显式指定 :dtype 才能安全提升，避免静默截断
     (let ((res (vt-reduce (vt-from-sequence '(1 2 3) :dtype :int64) nil 0.0 #'+ :dtype :float64)))
       (check 6.0 :float64 res "全局归约-显式dtype提升"))
@@ -227,7 +227,7 @@
                           (lambda (acc x) (/ acc x))))) ; 1/2 = 1/2 (ratio), /4 = 1/8
       ;; 不指定 dtype，保持 int64，ratio 会被强制 truncate 为 0
       (check 0 :int64 res "类型安全-Ratio截断为整数"))
-      
+    
     (let ((res (vt-reduce (vt-from-sequence '(1 2 4) :dtype :int64) nil 1.0
                           (lambda (acc x) (/ acc x)) :dtype :float64)))
       (check 0.125 :float64 res "类型安全-显式提升防截断"))
@@ -242,7 +242,7 @@
     (let ((a-empty (vt-zeros '(0 3) :dtype :int64)))
       (let ((res (vt-reduce a-empty 1 0 #'+)))
         (check '() :int64 res "空维度-总大小为0")))
-        
+    
     (let ((a-empty (vt-zeros '(0) :dtype :int64)))
       (let ((res (vt-reduce a-empty nil 0 #'+)))
         (check 0 :int64 res "空维度-全局归约")))
@@ -272,15 +272,15 @@
            (error (e)
              (format t "❌ [FAIL] ~a | 捕获到意外错误: ~a~%" name e))))
 
-             ;; 辅助测试函数：期望失败（抛出错误）
-             (expect-error (name test-fn)
-               (handler-case
-                   (progn
-                     (funcall test-fn)
-                     (format t "❌ [FAIL] ~a | 期望抛出错误，但成功执行了!~%" name))
-                 (error (e)
-                   ;; 捕获到错误，打印警告而不是中断测试
-                   (format t "⚠️  [WARN] ~a | 成功捕获预期错误: ~a~%" name e)))))
+       ;; 辅助测试函数：期望失败（抛出错误）
+       (expect-error (name test-fn)
+         (handler-case
+             (progn
+               (funcall test-fn)
+               (format t "❌ [FAIL] ~a | 期望抛出错误，但成功执行了!~%" name))
+           (error (e)
+             ;; 捕获到错误，打印警告而不是中断测试
+             (format t "⚠️  [WARN] ~a | 成功捕获预期错误: ~a~%" name e)))))
 
     ;; ==================== 正常用例测试 ====================
     (format t "~&--- 正常用例 ---~%")
@@ -3464,7 +3464,7 @@
 		    '((1d0 2d0 3d0)
 		      (4d0 -1d0 6d0)
 		      (7d0 8d0 -2d0)))))
-     (declare (ignorable _))
+    (declare (ignorable _))
     (assert-ok (approx= a expected) "切片视图 put 失败"))
 
   ;; 测试 5：空 indices (不用改)
@@ -4161,17 +4161,17 @@
 				    +vt-float-pos-inf+))))
     (assert (equal (vt-to-list (vt-intersect1d a a))
 		   (list
-		     sb-kernel::double-float-negative-infinity
-		     1.0 3.0 4.0
-		     sb-kernel::double-float-positive-infinity
-		     +vt-float-nan+)))
+		    sb-kernel::double-float-negative-infinity
+		    1.0 3.0 4.0
+		    sb-kernel::double-float-positive-infinity
+		    +vt-float-nan+)))
     (assert (equal (vt-to-list (vt-setdiff1d a a))
 		   nil))
     (assert (equal (vt-to-list (vt-setxor1d a a))
 		   nil))
     (assert (equal (vt-to-list (vt-in1d a a))
 		   '(1.0 1.0 1.0 1.0 1.0 1.0))))
-    
+  
 
   (format t "~%test-set-ops passed.~%"))
 
@@ -4902,7 +4902,7 @@
       (let* ((arr (vt-from-sequence '(1 2 3 4 5) :dtype :int64)))
 	(assert (equal (vt-to-list (vt-insert arr -1 99))
 		       '(1 2 3 4 99 5))))
-		       
+      
       
       (format t "===== 所有 vt-insert 测试通过 =====~%~%")))
   t)
@@ -5718,7 +5718,7 @@
   test_scipy(m3, "m3", -135, True, 1, 'nearest', 0.0)
   test_scipy(m3, "m3", 200, True, 1, 'constant', -1.0)
   |#
-    (print "test vt-rotate passed"))
+  (print "test vt-rotate passed"))
 
 (defun test-vt-matrix-rank ()
   "测试 vt-matrix-rank 函数的三种典型情况"
@@ -5774,24 +5774,24 @@
             (results-neg)
             "负索引切分第一块错误: 期望 (0.0 1.0 2.0), 得到 ~a" 
             (vt-to-list (first results-neg)))
-            
+    
     ;; 3. 断言负索引切分的第二块内容等于 [3, 4]
     (assert (equal (vt-to-list (second results-neg)) '(3.0 4.0))
             (results-neg)
             "负索引切分第二块错误: 期望 (3.0 4.0), 得到 ~a" 
             (vt-to-list (second results-neg)))
-            
+    
     ;; 4. 断言正索引切分的结果与负索引完全一致
     (assert (equal (vt-to-list (first results-pos)) '(0.0 1.0 2.0))
             (results-pos)
             "正索引切分第一块错误: 期望 (0.0 1.0 2.0), 得到 ~a" 
             (vt-to-list (first results-pos)))
-            
+    
     (assert (equal (vt-to-list (second results-pos)) '(3.0 4.0))
             (results-pos)
             "正索引切分第二块错误: 期望 (3.0 4.0), 得到 ~a" 
             (vt-to-list (second results-pos)))
-            
+    
     (format t "✅ test-vt-split 测试通过！~%")))
 
 (defun test-vt-choose ()
@@ -5863,6 +5863,166 @@
             (res-view) "非连续视图读取错误: 期望 (1 4 2 5 3 6), 得到 ~a" (vt-to-list res-view)))
 
   (format t "✅ test-vt-choose 所有测试通过！~%"))
+
+
+;;; =========================================
+;;; vt-dstack 测试
+;;; =========================================
+(defun test-vt-dstack ()
+  "测试 vt-dstack 的堆叠行为，覆盖 1D, 2D, 3D 输入"
+  (format t "~&开始测试 vt-dstack...~%")
+  
+  ;; 测试 1: 1D 张量堆叠 (应重塑为 (N, 1, 1) 后沿 axis=2 拼接)
+  (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
+         (b (vt-from-sequence '(4 5 6) :dtype :int64))
+         (res (vt-dstack a b))
+         (expected '(((1 4)) ((2 5)) ((3 6)))))
+    (assert (equal (vt-to-list res) expected))
+    (format t "  [1D->3D] 形状 ~a, 输出: ~a~%" (vt-shape res) (vt-to-list res)))
+
+  ;; 测试 2: 2D 张量堆叠 (应重塑为 (M, N, 1) 后沿 axis=2 拼接)
+  (let* ((a (vt-from-sequence '((1 2) (3 4)) :dtype :int64))
+         (b (vt-from-sequence '((5 6) (7 8)) :dtype :int64))
+         (c (vt-from-sequence '((9 10) (11 12)) :dtype :int64))
+         (res (vt-dstack a b c))
+         (expected '(((1 5 9) (2 6 10)) ((3 7 11) (4 8 12)))))
+    (assert (equal (vt-to-list res) expected))
+    (format t "  [2D->3D] 形状 ~a, 输出: ~a~%" (vt-shape res) (vt-to-list res)))
+
+  ;; 测试 3: 3D 张量堆叠 (直接沿 axis=2 拼接)
+  (let* ((a (vt-from-sequence '(((1 2) (3 4)) ((5 6) (7 8))) :dtype :int64))  ; shape (2, 2, 2)
+         (b (vt-from-sequence '(((9 10) (11 12)) ((13 14) (15 16))) :dtype :int64)) ; shape (2, 2, 2)
+         (res (vt-dstack a b))
+         (expected '(((1 2 9 10) (3 4 11 12)) ((5 6 13 14) (7 8 15 16)))))
+    (assert (equal (vt-to-list res) expected))
+    (format t "  [3D->3D] 形状 ~a, 输出: ~a~%" (vt-shape res) (vt-to-list res)))
+  
+  (format t "vt-dstack 测试完成.~%"))
+
+;;; =========================================
+;;; vt-hsplit 测试
+;;; =========================================
+(defun test-vt-hsplit ()
+  "测试 vt-hsplit 的分割行为，覆盖 1D, 2D, 3D 输入"
+  (format t "~&开始测试 vt-hsplit...~%")
+  
+  ;; 测试 1: 1D 张量分割 (应沿 axis=0 分割)
+  (let* ((a (vt-from-sequence '(1 2 3 4 5 6) :dtype :int64))
+         (res-list (vt-hsplit a 2)) ; 分成 2 份
+         (expected '((1 2 3) (4 5 6))))
+    (assert (equal (mapcar #'vt-to-list res-list) expected))
+    (format t "  [1D 均分] 输出: ~a~%" (mapcar #'vt-to-list res-list)))
+
+  ;; 测试 2: 1D 张量按索引分割
+  (let* ((a (vt-from-sequence '(1 2 3 4 5 6) :dtype :int64))
+         (res-list (vt-hsplit a '(2 5))) ; 在索引 2 和 5 处切分
+         (expected '((1 2) (3 4 5) (6))))
+    (assert (equal (mapcar #'vt-to-list res-list) expected))
+    (format t "  [1D 索引] 输出: ~a~%" (mapcar #'vt-to-list res-list)))
+
+  ;; 测试 3: 2D 张量分割 (应沿 axis=1 分割)
+  (let* ((a (vt-from-sequence '((1 2 3 4) (5 6 7 8) (9 10 11 12)) :dtype :int64)) ; shape (3, 4)
+         (res-list (vt-hsplit a 2)) ; 分成 2 份
+         (expected '(((1 2) (5 6) (9 10)) ((3 4) (7 8) (11 12)))))
+    (assert (equal (mapcar #'vt-to-list res-list) expected))
+    (format t "  [2D 均分] 输出: ~a~%" (mapcar #'vt-to-list res-list)))
+
+  ;; 测试 4: 3D 张量分割 (应沿 axis=1 分割)
+  (let* ((a (vt-arange 12 :dtype :int64))
+         (a3d (vt-reshape a '(2 3 2))) ; shape (2, 3, 2)
+         ;; a3d 结构:
+         ;; [[[0, 1], [2, 3], [4, 5]], 
+         ;;  [[6, 7], [8, 9], [10, 11]]]
+         (res-list (vt-hsplit a3d '(1))) ; 在 axis=1 的索引 1 处切分
+         (expected '(
+                     (((0 1)) ((6 7)))         ; 切片 [:, 0:1, :]
+                     (((2 3) (4 5)) ((8 9) (10 11))) ; 切片 [:, 1:, :]
+                     )))
+    (assert (equal (mapcar #'vt-to-list res-list) expected))
+    (format t "  [3D 索引] 输出: ~a~%" (mapcar #'vt-to-list res-list)))
+  
+  (format t "vt-hsplit 测试完成.~%"))
+
+(defun test-vt-log ()
+  "测试 vt-log 的对数运算，覆盖自然对数、任意底数、0/负数边界、非法底数及 float32 类型。"
+  (format t "~&开始测试 vt-log...~%")
+
+  ;; 1. 自然对数正常值
+  (let* ((a (vt-from-sequence '(1.0d0 2.718281828459045d0 100.0d0)))
+         (res (vt-to-list (vt-log a))))
+    (assert (equal res '(0.0d0 1.0d0 4.605170185988092d0)))
+    (format t "  [自然对数] 正常值: ~a~%" res))
+
+  ;; 2. 自然对数的 nan 和 -inf 边界
+  (let* ((a (vt-from-sequence '(-1.0d0 0.0d0 10.0d0)))
+         (res (vt-to-list (vt-log a)))
+         (neg-inf-f64 (vt-get-neg-inf :float64)))
+    (assert (equal (list (vt-float-nan-p (nth 0 res))         ; log(-1) -> nan
+                         (equal (nth 1 res) neg-inf-f64)      ; log(0) -> -inf
+                         (equal (nth 2 res) (log 10.0d0)))    ; log(10) 正常
+                   '(t t t)))
+    (format t "  [自然对数] 0与负数边界: ~a~%" res))
+
+  ;; 3. 带合法底数 (base > 1) 的对数
+  (let* ((a (vt-from-sequence '(8.0d0 4.0d0 2.0d0)))
+         (res (vt-to-list (vt-log a :base 2))))
+    (assert (equal res '(3.0d0 2.0d0 1.0d0)))
+    (format t "  [底数>1] 正常值 (base=2): ~a~%" res))
+
+  ;; 4. 带合法底数 (base > 1) 的 nan 和 -inf 边界
+  (let* ((a (vt-from-sequence '(0.0d0 -2.0d0 8.0d0)))
+         (res (vt-to-list (vt-log a :base 2)))
+         (neg-inf-f64 (vt-get-neg-inf :float64)))
+    (assert (equal (list (equal (nth 0 res) neg-inf-f64)      ; log_2(0) -> -inf
+                         (vt-float-nan-p (nth 1 res))         ; log_2(-2) -> nan
+                         (equal (nth 2 res) 3.0d0))           ; log_2(8) 正常
+                   '(t t t)))
+    (format t "  [底数>1] 0与负数边界 (base=2): ~a~%" res))
+
+  ;; 5. 带合法底数 (0 < base < 1) 的对数
+  (let* ((a (vt-from-sequence '(4.0d0 2.0d0)))
+         (res (vt-to-list (vt-log a :base 0.5))))
+    (assert (equal res '(-2.0d0 -1.0d0)))
+    (format t "  [底数<1] 正常值 (base=0.5): ~a~%" res))
+
+  ;; 6. 带合法底数 (0 < base < 1) 的 +inf 边界 (极限趋向 +inf)
+  (let* ((a (vt-from-sequence '(0.0d0 4.0d0)))
+         (res (vt-to-list (vt-log a :base 0.5)))
+         (pos-inf-f64 (vt-get-pos-inf :float64)))
+    (assert (equal (list (equal (nth 0 res) pos-inf-f64)      ; log_0.5(0) -> +inf
+                         (equal (nth 1 res) -2.0d0))          ; log_0.5(4) 正常
+                   '(t t)))
+    (format t "  [底数<1] 0边界 (base=0.5): ~a~%" res))
+
+  ;; 7. 非法底数 (base = 1) 统一返回 nan
+  (let* ((a (vt-from-sequence '(1.0d0 2.0d0)))
+         (res (vt-to-list (vt-log a :base 1))))
+    (assert (equal (list (vt-float-nan-p (nth 0 res))
+                         (vt-float-nan-p (nth 1 res)))
+                   '(t t)))
+    (format t "  [非法底数] base=1: ~a~%" res))
+
+  ;; 8. 非法底数 (base <= 0) 统一返回 nan
+  (let* ((a (vt-from-sequence '(1.0d0 2.0d0)))
+         (res (vt-to-list (vt-log a :base -2))))
+    (assert (equal (list (vt-float-nan-p (nth 0 res))
+                         (vt-float-nan-p (nth 1 res)))
+                   '(t t)))
+    (format t "  [非法底数] base=-2: ~a~%" res))
+
+  ;; 9. Float32 类型支持验证
+  (let* ((a (vt-from-sequence '(1.0f0 0.0f0 -1.0f0) :dtype :float32))
+         (res (vt-to-list (vt-log a)))
+         (neg-inf-f32 (vt-get-neg-inf :float32)))
+    (assert (equal (list (equal (nth 0 res) 0.0f0)             ; log(1) -> 0.0f0
+                         (equal (nth 1 res) neg-inf-f32)       ; log(0) -> -inf
+                         (vt-float-nan-p (nth 2 res))          ; log(-1) -> nan
+                         (typep (nth 0 res) 'single-float))    ; 验证未类型提升
+                   '(t t t t)))
+    (format t "  [Float32] 类型保持与边界: ~a~%" res))
+
+  (format t "vt-log 测试完成.~%"))
+
 
 
 
@@ -5976,6 +6136,9 @@
   (test-vt-matrix-rank)
   (test-vt-split)
   (test-vt-choose)
+  (test-vt-dstack)
+  (test-vt-hsplit)
+  (test-vt-log)
   (format t "~&~%all test passed")
   )
 
