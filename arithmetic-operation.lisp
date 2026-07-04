@@ -112,7 +112,6 @@
   "计算逐元素平方"
   (vt-pow vt 2 :out out :dtype dtype))
 
-
 (defun vt-sqrt (vt &key out dtype)
   "计算逐元素平方根. 负数返回对应类型的 NaN."
   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
@@ -140,22 +139,18 @@
         ;; 2. 自然对数 (base = nil)
         ((null base)
          (vt-map (lambda (val)
-                   (cond
-                     ((minusp val) nan-val)      ; log(<0) = nan
-                     ((zerop val) neg-inf-val)   ; log(0) = -inf
-                     (t (log val))))
+                   (if (> val 0)
+                       (log val)
+                       (if (zerop val) neg-inf-val nan-val)))
                  vt :out out :dtype infer-dtype))        
         ;; 3. 带合法底数的对数 (base > 0 且 base /= 1)
         (t
-         ;; 预计算 log(0) 在该底数下的极限值:
-         ;; 若 base > 1, log_base(0) = -inf
-         ;; 若 0 < base < 1, log_base(0) = +inf
-         (let ((zero-result (if (plusp (log base)) neg-inf-val pos-inf-val)))
+         (let ((zero-result (if (plusp (log base))
+				neg-inf-val pos-inf-val)))
            (vt-map (lambda (val)
-                     (cond
-                       ((minusp val) nan-val)         ; 真数负 = nan
-                       ((zerop val) zero-result)      ; 真数为 0 的极限
-                       (t (log val base))))
+                     (if (> val 0)
+                         (log val base)
+                         (if (zerop val) zero-result nan-val)))
                    vt :out out :dtype infer-dtype)))))))
 
 (defun vt-log10 (vt &key out dtype)
