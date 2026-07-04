@@ -103,53 +103,61 @@
 
 ;;; 部分选主元 lu 分解 (返回 p, l, u，使 p*a = l*u)
 (defun vt-lu (matrix)
-  "lu 分解。返回 (p, l, u)，其中 p 为置换矩阵(由行交换向量表示)"
+  "lu 分解。返回，其中 p 为置换矩阵(由行交换向量表示)。支持非方阵。"
   (with-float-safe
-    (let* ((a (ensure-contiguous-2d-vt
-	       (vt-astype matrix :float64)))
-           (n (first (vt-shape a)))
+    (let* ((a (ensure-contiguous-2d-vt (vt-astype matrix :float64)))
+           (m (first (vt-shape a)))   ;; 行数
+           (n (second (vt-shape a)))  ;; 列数
+           (k-max (min m n))          ;; 最大消元步数
            (data (vt-data a))
            (s0 (first (vt-strides a))) ; 行步长
            (s1 (second (vt-strides a))) ; 列步长
            (off (vt-offset a))
-           (piv (loop for i from 0 below n collect i))
+           ;; 置换向量长度应等于行数
+           (piv (loop for i from 0 below m collect i))
            (sign 1))
       (declare (type (simple-array double-float (*)) data)
-               (type fixnum n s0 s1 off))
-      (loop for k from 0 below n
+               (type fixnum m n k-max s0 s1 off))
+      (loop for k from 0 below k-max
             for max-row = k
             for max-val = (abs (aref data (+ off (* k s0) (* k s1))))
-            do (loop for i from (1+ k) below n
+            do (loop for i from (1+ k) below m ;; 在当前列的下方行中寻找主元
                      for val = (abs (aref data (+ off (* i s0) (* k s1))))
                      when (> val max-val)
-                       do (setf max-val val max-row i))
-	       (unless (zerop max-val)
-		 ;; 交换行
-		 (unless (= max-row k)
+                     do (setf max-val val max-row i))
+               (unless (zerop max-val)
+                 ;; 交换行
+                 (unless (= max-row k)
                    (rotatef (nth k piv) (nth max-row piv))
                    (setf sign (- sign))
-                   (loop for j from 0 below n
-			 for ptr1 = (+ off (* k s0) (* j s1))
-			 for ptr2 = (+ off (* max-row s0) (* j s1))
-			 do (rotatef (aref data ptr1) (aref data ptr2))))
-		 ;; 消元
-		 (let ((pivot (aref data (+ off (* k s0) (* k s1)))))
-                   (loop for i from (1+ k) below n
-			 for ptr-ik = (+ off (* i s0) (* k s1))
-			 for multiplier = (/ (aref data ptr-ik) pivot)
-			 do (setf (aref data ptr-ik) multiplier)
-                            (loop for j from (1+ k) below n
+                   (loop for j from 0 below n ;; 交换整行 (列数维度)
+                         for ptr1 = (+ off (* k s0) (* j s1))
+                         for ptr2 = (+ off (* max-row s0) (* j s1))
+                         do (rotatef (aref data ptr1) (aref data ptr2))))
+                 ;; 消元
+                 (let ((pivot (aref data (+ off (* k s0) (* k s1)))))
+                   (loop for i from (1+ k) below m ;; 消去当前列下方的行
+                         for ptr-ik = (+ off (* i s0) (* k s1))
+                         for multiplier = (/ (aref data ptr-ik) pivot)
+                         do (setf (aref data ptr-ik) multiplier)
+                            (loop for j from (1+ k) below n ;; 遍历右侧列
                                   for ptr-ij = (+ off (* i s0) (* j s1))
                                   for ptr-kj = (+ off (* k s0) (* j s1))
                                   do (decf (aref data ptr-ij)
-					   (* multiplier (aref data ptr-kj))))))))
+                                           (* multiplier (aref data ptr-kj))))))))
       (values a piv sign))))
+
 
 (defun vt-det (matrix &key out)
   "基于 lu 分解计算行列式，返回 0 维张量"
   (with-float-safe
+    (let ((shape (vt-shape matrix)))
+      ;; 校验方阵
+      (unless (and (= (length shape) 2)
+                   (= (first shape) (second shape)))
+        (error "vt-det: 行列式仅支持方阵，收到形状 ~a" shape)))
     (multiple-value-bind (lu piv sign)
-	(vt-lu matrix)
+        (vt-lu matrix)
       (declare (ignore piv))
       (let* ((n (first (vt-shape lu)))
              (data (vt-data lu))
@@ -158,102 +166,103 @@
              (off (vt-offset lu))
              (det sign))
         (loop for i from 0 below n
-              for pivot = (aref data (+ off
-					(* i s0)
-					(* i s1)))
+              for pivot = (aref data (+ off (* i s0) (* i s1)))
               when (zerop pivot)
                 do (return-from vt-det
-                     (if out
-                         (vt-fill out 0.0d0)
-                         (make-vt nil 0.0d0 :dtype :float64)))
+                     (if out (vt-fill out 0.0d0)
+			 (make-vt nil 0.0d0 :dtype :float64)))
               do (setf det (* det pivot)))
-        (if out
-            (vt-fill out det)
-            (make-vt nil det :dtype :float64))))))
+        (if out (vt-fill out det) (make-vt nil det :dtype :float64))))))
+
 
 (defun vt-solve (a b &key out)
   "求解线性方程组 ax = b (支持多右端项)"
   (with-float-safe
-    (let* ((a (ensure-contiguous-2d-vt a))
-           (b-vt (ensure-vt b))
-           (n (first (vt-shape a)))
-           (b-shape (vt-shape b-vt))
-           (nrhs (if (> (length b-shape) 1) (second b-shape) 1))
-           (b-copy (if (= nrhs 1)
-                       (vt-reshape (vt-astype (vt-copy b-vt) :float64)
-				   (list n 1))
-                       (vt-astype (vt-copy b-vt) :float64)))
-           (orig-b (vt-copy b-copy)))
-      (multiple-value-bind (lu piv sign)
-          (vt-lu a)
-        (declare (ignore sign))
-        (let ((lu-data (vt-data lu))
-              (lu-s0 (first (vt-strides lu)))
-              (lu-s1 (second (vt-strides lu)))
-              (lu-off (vt-offset lu))
-              (b-data (vt-data b-copy))
-              (b-s0 (first (vt-strides b-copy)))
-              (b-s1 (second (vt-strides b-copy)))
-              (b-off (vt-offset b-copy))
-              (ob-data (vt-data orig-b))
-              (ob-s0 (first (vt-strides orig-b)))
-              (ob-s1 (second (vt-strides orig-b)))
-              (ob-off (vt-offset orig-b)))          
-          ;; 1. 应用行置换 pb
-          (loop for i from 0 below n do
-            (loop for j from 0 below nrhs do
-              (setf (aref b-data (+ b-off
-				    (* i b-s0)
-				    (* j b-s1)))
-                    (aref ob-data (+ ob-off
-				     (* (nth i piv) ob-s0)
-				     (* j ob-s1))))))          
-          ;; 2. 前代
-          (loop for k from 0 below n do
-            (loop for i from (1+ k) below n
-                  for mult = (aref lu-data (+ lu-off
-					      (* i lu-s0)
-					      (* k lu-s1)))
-                  do (loop for j from 0 below nrhs do
-                    (decf (aref b-data (+ b-off
-					  (* i b-s0)
-					  (* j b-s1)))
-                          (* mult (aref b-data (+ b-off
-						  (* k b-s0)
-						  (* j b-s1))))))))          
-          ;; 3. 回代
-          (loop for k from (1- n) downto 0 do
-            (let ((pivot (aref lu-data (+ lu-off
-					  (* k lu-s0)
-					  (* k lu-s1)))))
-	      (when (or (zerop pivot)
-			(< (abs pivot) 1.0d-12)) ; 阈值可根据需求调整，防止极小数除法引发数值不稳定
-		(error "LinAlgError: Singular matrix. Cannot solve or invert."))
+    (let* ((a-shape (vt-shape a)))
+      ;; 校验系数矩阵为方阵
+      (unless (and (= (length a-shape) 2)
+                   (= (first a-shape) (second a-shape)))
+        (error "vt-solve: 线性方程组求解要求系数矩阵为方阵，收到形状 ~a" a-shape))
+      (let* ((a (ensure-contiguous-2d-vt a))
+             (b-vt (ensure-vt b))
+             (n (first (vt-shape a)))
+             (b-shape (vt-shape b-vt))
+             (nrhs (if (> (length b-shape) 1) (second b-shape) 1))
+             (b-copy (if (= nrhs 1)
+			 (vt-reshape (vt-astype (vt-copy b-vt) :float64)
+				     (list n 1))
+			 (vt-astype (vt-copy b-vt) :float64)))
+             (orig-b (vt-copy b-copy)))
+	(multiple-value-bind (lu piv sign)
+            (vt-lu a)
+          (declare (ignore sign))
+          (let ((lu-data (vt-data lu))
+		(lu-s0 (first (vt-strides lu)))
+		(lu-s1 (second (vt-strides lu)))
+		(lu-off (vt-offset lu))
+		(b-data (vt-data b-copy))
+		(b-s0 (first (vt-strides b-copy)))
+		(b-s1 (second (vt-strides b-copy)))
+		(b-off (vt-offset b-copy))
+		(ob-data (vt-data orig-b))
+		(ob-s0 (first (vt-strides orig-b)))
+		(ob-s1 (second (vt-strides orig-b)))
+		(ob-off (vt-offset orig-b)))          
+            ;; 1. 应用行置换 pb
+            (loop for i from 0 below n do
               (loop for j from 0 below nrhs do
-                (setf (aref b-data (+ b-off
-				      (* k b-s0)
+		(setf (aref b-data (+ b-off
+				      (* i b-s0)
 				      (* j b-s1)))
-                      (/ (aref b-data (+ b-off
-					 (* k b-s0)
-					 (* j b-s1)))
-			 pivot)))
-              (loop for i from 0 below k
-                    for factor = (aref lu-data (+ lu-off
-						  (* i lu-s0)
-						  (* k lu-s1)))
+                      (aref ob-data (+ ob-off
+				       (* (nth i piv) ob-s0)
+				       (* j ob-s1))))))          
+            ;; 2. 前代
+            (loop for k from 0 below n do
+              (loop for i from (1+ k) below n
+                    for mult = (aref lu-data (+ lu-off
+						(* i lu-s0)
+						(* k lu-s1)))
                     do (loop for j from 0 below nrhs do
                       (decf (aref b-data (+ b-off
 					    (* i b-s0)
 					    (* j b-s1)))
-                            (* factor (aref b-data (+ b-off
-						      (* k b-s0)
-						      (* j b-s1)))))))))
-	  (let ((res (if (= nrhs 1)
-                         (vt-reshape b-copy (list n))
-                         b-copy)))
-            (if out
-                (vt-map #'identity res :out out)
-                res)))))))
+                            (* mult (aref b-data (+ b-off
+						    (* k b-s0)
+						    (* j b-s1))))))))          
+            ;; 3. 回代
+            (loop for k from (1- n) downto 0 do
+              (let ((pivot (aref lu-data (+ lu-off
+					    (* k lu-s0)
+					    (* k lu-s1)))))
+		(when (or (zerop pivot)
+			  (< (abs pivot) 1.0d-12)) ; 阈值可根据需求调整，防止极小数除法引发数值不稳定
+		  (error "LinAlgError: Singular matrix. Cannot solve or invert."))
+		(loop for j from 0 below nrhs do
+                  (setf (aref b-data (+ b-off
+					(* k b-s0)
+					(* j b-s1)))
+			(/ (aref b-data (+ b-off
+					   (* k b-s0)
+					   (* j b-s1)))
+			   pivot)))
+		(loop for i from 0 below k
+                      for factor = (aref lu-data (+ lu-off
+						    (* i lu-s0)
+						    (* k lu-s1)))
+                      do (loop for j from 0 below nrhs do
+			(decf (aref b-data (+ b-off
+					      (* i b-s0)
+					      (* j b-s1)))
+                              (* factor (aref b-data (+ b-off
+							(* k b-s0)
+							(* j b-s1)))))))))
+	    (let ((res (if (= nrhs 1)
+                           (vt-reshape b-copy (list n))
+                           b-copy)))
+              (if out
+                  (vt-map #'identity res :out out)
+                  res))))))))
 
 (defun vt-inv (matrix)
   "矩阵求逆。"
@@ -266,11 +275,11 @@
 ;;; 3. 矩阵分解
 
 (defun vt-qr (matrix &key (mode :reduced))
-  "矩阵 qr 分解。
+  "矩阵 qr 分解。 
    matrix : m×n 矩阵。
-   mode   :reduced 返回 q(m×k), r(k×n)，k = min(m,n)。
-          :full    返回 q(m×m), r(m×n)。
-   返回 (values q r)。"
+   mode :reduced 返回 q(m×k), r(k×n)，k = min(m,n)。
+         :full 返回 q(m×m), r(m×n)。
+   返回。"
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
     (let* ((row (first (vt-shape matrix)))
@@ -279,10 +288,10 @@
            (r (vt-astype matrix :float64))
            (vlist (make-array k :initial-element nil))
            (betas (make-array k :element-type 'double-float)))
+      
       ;; ---- 1. 正向分解，更新 r ----
       (loop for i from 0 below k
-            for x = (vt-slice r (list i row) (list i))
-	    ;; 第 i 列，i 行开始，形状 (m-i)
+            for x = (vt-slice r (list i row) (list i)) ;; 第 i 列，i 行开始，形状
             do (if (<= (vt-size x) 1)
                    (setf (aref betas i) 0.0d0)
                    (multiple-value-bind (v beta sigma)
@@ -292,34 +301,34 @@
                            (aref betas i) beta)
                      ;; 对子矩阵 r(i:m , i:n) 应用反射
                      (let ((subr (vt-slice r (list i row) (list i col))))
-                       (let* ((w (vt-einsum "i,ij->j" v subr))
-			      ;; 长度 (n-i)
-			      (wsize (vt-size w))
-			      (vcol (vt-reshape v (list (vt-size v) 1)))
-			      (wrow (vt-reshape w (list 1 wsize)))
-			      (update (vt-outer vcol wrow)))
-			 (setf (vt-slice r (list i row) (list i col))
+                       (let* ((w (vt-einsum "i,ij->j" v subr))  ;; 长度
+                              (wsize (vt-size w))
+                              (vcol (vt-reshape v (list (vt-size v) 1)))
+                              (wrow (vt-reshape w (list 1 wsize)))
+                              (update (vt-outer vcol wrow)))
+                         (setf (vt-slice r (list i row) (list i col))
                                (vt-- subr (vt-scale update beta))))))))
+      
       ;; ---- 2. 反向累积 q (必须从 k-1 到 0) ----
       (let* ((need-full (eq mode :full))
              (q (if need-full
-                    (vt-eye row :cols row  :dtype :float64)
-                    (vt-eye row :cols col :dtype :float64))))
-	(loop for i from (1- k) downto 0  ;; 反向循环
+                    (vt-eye row :cols row :dtype :float64)
+                    (vt-eye row :cols k :dtype :float64))))
+        
+        (loop for i from (1- k) downto 0 ;; 反向循环
               for beta = (aref betas i)
               for v = (aref vlist i)
               when (and v (> beta 0.0d0))
-		do (let ((qsub (vt-slice q (list i row) '(:all))))
+                do (let ((qsub (vt-slice q (list i row) '(:all))))
                      (let* ((w (vt-einsum "i,ij->j" v qsub))
-			    (wsize (vt-size w))
+                            (wsize (vt-size w))
                             (vcol (vt-reshape v (list (vt-size v) 1)))
                             (wrow (vt-reshape w (list 1 wsize)))
                             (update (vt-outer vcol wrow)))
                        (setf (vt-slice q (list i row) '(:all))
                              (vt-- qsub (vt-scale update beta))))))
-	(values q (if need-full
-                      r
-                      (vt-slice r (list 0 k) '(:all))))))))
+        
+        (values q (if need-full r (vt-slice r (list 0 k) '(:all))))))))
 
 (defun compute-householder (x)
   "给定向量 x，返回 v, beta, sigma 使得

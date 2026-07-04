@@ -767,13 +767,12 @@
   (with-float-safe
     (let* ((shape (vt-shape tensor))
            (rank (length shape))
-           (final-dtype (cond
-                          ((and out dtype (not (eq (vt-dtype out) dtype)))
-                           (error "类型冲突: :out (~a) vs :dtype (~a)"
-                                  (vt-dtype out) dtype))
-                          (dtype dtype)
-                          (out (vt-dtype out))
-                          (t (vt-dtype tensor))))
+           (final-dtype
+	     (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
+                    (error "类型冲突: :out (~a) vs :dtype (~a)" (vt-dtype out) dtype))
+                   (dtype dtype)
+                   (out (vt-dtype out))
+                   (t (vt-dtype tensor))))
            (lisp-type (vt-dtype->lisp-type final-dtype))
            (result (or out (vt-zeros shape :dtype final-dtype)))
            (in-data (vt-data tensor))
@@ -790,17 +789,15 @@
                  ;; 使用一维数组作为多维迭代器，记录非 ax 维度的当前坐标
                  (indices (make-array rank :element-type '(signed-byte 64)
 					   :initial-element 0)))
-            
             (labels ((advance ()
                        "推进迭代器，跳过 ax 维度。返回 nil 表示遍历结束。"
                        (loop for d from (1- rank) downto 0
-                             when (/= d ax)
-                               do (incf (aref indices d))
-                                  (if (< (aref indices d) (nth d shape))
-                                      (return-from advance t)
-                                      (setf (aref indices d) 0)))
+                             when (/= d ax) do
+                               (incf (aref indices d))
+                               (if (< (aref indices d) (nth d shape))
+                                   (return-from advance t)
+                                   (setf (aref indices d) 0)))
                        nil))
-              
               (loop
                 ;; 1. 根据当前迭代器状态，计算起始物理偏移量 (考虑 offset)
                 (let ((in-ptr in-offset)
@@ -808,7 +805,6 @@
                   (loop for d from 0 below rank do
                     (incf in-ptr (* (aref indices d) (nth d in-strides)))
                     (incf out-ptr (* (aref indices d) (nth d out-strides))))
-                  
                   ;; 2. 沿着 ax 维度执行累积操作
                   (let ((in-stride (nth ax in-strides))
                         (out-stride (nth ax out-strides))
@@ -817,30 +813,43 @@
                       (setf cum (funcall op cum (aref in-data (+ in-ptr
 								 (* i in-stride)))))
                       (setf (aref out-data (+ out-ptr (* i out-stride)))
-                            (vt-cast cum final-dtype)))))
-                
+			    (vt-cast cum final-dtype)))))
                 ;; 3. 推进到下一个非 ax 坐标，若结束则跳出
-                (unless (advance)
-                  (return)))))
+                (unless (advance) (return)))))
           
-          ;; === 分支 2: 全局展平 (axis=nil) ===
+          ;; === 分支 2: 全局展平 ===
           (let* ((flat (vt-ravel tensor))
                  (flat-in (vt-data flat))
                  (flat-offset (vt-offset flat))
-                 (size (vt-size flat))
-                 (cum (coerce init-val lisp-type)))
-            (loop for i fixnum from 0 below size do
-              (setf cum (funcall op cum (aref flat-in (+ flat-offset i))))
-              (setf (aref out-data (+ out-offset i)) (vt-cast cum final-dtype)))))
-      
+                 (cum (coerce init-val lisp-type))
+                 ;; 提取输出张量的形状和步长信息
+                 (out-shape-vec (coerce (vt-shape result) 'simple-vector))
+                 (out-strs-vec (coerce out-strides 'simple-vector))
+                 (out-rank (length out-shape-vec)))
+            (declare (type simple-vector out-shape-vec out-strs-vec)
+                     (type fixnum out-rank flat-offset))
+            (labels ((recurse (depth out-ptr flat-idx)
+                       (declare (type fixnum depth out-ptr flat-idx))
+                       (if (= depth out-rank)
+                           ;; 叶子节点：计算累积值并按物理偏移写入 out
+                           (progn
+                             (setf cum (funcall op cum (aref flat-in (+ flat-offset flat-idx))))
+                             (setf (aref out-data out-ptr) (vt-cast cum final-dtype))
+                             (1+ flat-idx))
+                           ;; 非叶子节点：按行主序递归遍历，推进 out 指针和 flat 索引
+                           (let ((dim (svref out-shape-vec depth))
+                                 (stride (svref out-strs-vec depth)))
+                             (declare (type fixnum dim stride))
+                             (loop for i fixnum from 0 below dim
+                                   for cur-out-ptr fixnum = out-ptr then (+ cur-out-ptr stride)
+                                   do (setf flat-idx (recurse (1+ depth) cur-out-ptr flat-idx)))))))
+              (recurse 0 out-offset 0))))
       result)))
-
 
 (defun vt-cumsum (tensor &key axis dtype out)
   "累积和。遵循 NumPy 规范。
    支持 out 参数原地写入，严格校验类型冲突。"
   (vt-cumulative tensor #'+ 0 :axis axis :dtype dtype :out out))
-
 
 (defun vt-cumprod (tensor &key axis dtype out)
   "累积积。遵循 NumPy 规范。
