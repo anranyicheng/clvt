@@ -433,7 +433,7 @@
       (when (or (zerop axis-size) (zerop (vt-size tensor)))
         (let ((empty-dtype (or dtype (and out (vt-dtype out)) (vt-dtype tensor))))
           (return-from vt-reduce
-            (values (make-vt out-shape 0 :dtype empty-dtype)
+            (values (make-vt out-shape (or init-val 0) :dtype empty-dtype)
                     (when return-arg (make-vt out-shape 0 :dtype :int32))))))      
       ;; 1. 确定输出类型 (对标 NumPy 严格校验)
       (let* ((final-dtype (cond

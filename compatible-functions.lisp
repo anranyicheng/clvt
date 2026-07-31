@@ -2223,8 +2223,8 @@
 (defun vt-correlate (a v &key (mode :full))
   "一维互相关（不翻转 v），与 numpy.correlate 完全一致。"
   (with-float-safe
-    (let* ((a-flat (vt-flatten a))
-           (v-flat (vt-flatten v))
+    (let* ((a-flat (vt-contiguous (vt-flatten a)))
+           (v-flat (vt-contiguous (vt-flatten v)))
            (n (vt-size a-flat))
            (m (vt-size v-flat))
            (a-data (vt-data a-flat))
@@ -2278,7 +2278,7 @@
 (defun vt-convolve (a v &key (mode :full))
   "一维卷积。"
   (with-float-safe
-    (vt-correlate a (vt-flip v) :mode mode)))
+    (vt-correlate (vt-contiguous a) (vt-contiguous (vt-flip v)) :mode mode)))
 
 (defun vt-trapz (y &key (x nil) (dx 1.0d0) (axis -1))
   "使用梯形法则沿指定轴积分，与 numpy.trapz 一致。"

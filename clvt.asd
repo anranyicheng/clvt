@@ -20,4 +20,5 @@
 	       (:file "rotate")
 	       (:file "activation")
 	       (:file "loss-probability")
-	       (:file "linalg")))
+	       (:file "linalg")
+	       (:file "linalg-extensions")))

@@ -1,11 +1,15 @@
 # clvt
 clvt (common lisp vector tensor) library.
-这是一个纯 common lisp 语言编写的张量库，是使用'智谱清言'AI(GLM5+)和'DeepSeek'(v4pro) AI共同编写，目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。虽然 lisp 社区拥有 magicl 和 numcl 这两个比较流行的库，但是 magicl 缺乏对高维张量的支持以及缺少一些重要的函数，numcl 注重类型推理并且一些函数接口和CL语言标准重合。clvt 这库的核心基础是 vt-einsum，vt-map, vt-reduce 三个函数, 其余操作大多数都是基于这三个核心函数组合完成，易于理解，同时这个库有完美的打印输出功能。目前这个库已经实现了许多张量的基础操作，未来将进一步完善，目标是尽可能实现 numpy 众多功能, 部分函数功能向pytorch看齐。这个库的函数都是以 vt- 开头，配合 slime 一起使用非常方便，易于查看已经实现了哪些函数。目前在sbcl上完成了大部分的测试。
+这是一个纯 common lisp 语言编写的张量库，是使用'智谱清言'AI(GLM5+)和'DeepSeek'(v4pro) AI共同编写，后续由 MiMo (Xiaomi AI) 进行了大量测试、bug 修复和功能扩展。目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。虽然 lisp 社区拥有 magicl 和 numcl 这两个比较流行的库，但是 magicl 缺乏对高维张量的支持以及缺少一些重要的函数，numcl 注重类型推理并且一些函数接口和CL语言标准重合。clvt 这库的核心基础是 vt-einsum，vt-map, vt-reduce 三个函数, 其余操作大多数都是基于这三个核心函数组合完成，易于理解，同时这个库有完美的打印输出功能。目前这个库已经实现了许多张量的基础操作，未来将进一步完善，目标是尽可能实现 numpy 众多功能, 部分函数功能向pytorch看齐。这个库的函数都是以 vt- 开头，配合 slime 一起使用非常方便，易于查看已经实现了哪些函数。目前在sbcl上完成了大部分的测试。
 
-This is a tensor library written entirely in Common Lisp, collaboratively developed by the AI 'Zhipu Qingyan' (GLM5+) and 'DeepSeek' (v4pro). The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community already has two relatively popular libraries, magicl and numcl, magicl lacks support for high-dimensional tensors and some important functions, while numcl emphasizes type inference and has some function interfaces that overlap with standard CL functions. The core foundation of the clvt library consists of three functions: vt-einsum, vt-map, and vt-reduce. Most other operations are built by combining these three core functions, making them easy to understand. Additionally, this library features excellent pretty-printing capabilities. Currently, the library has already implemented many basic tensor operations, and further improvements will be made in the future, aiming to implement as many NumPy features as possible, with some functions modeled after PyTorch. Functions in this library are all prefixed with vt-, which, when used with Slime, makes it very convenient to see which functions have been implemented. The majority of tests have been completed on SBCL.
+This is a tensor library written entirely in Common Lisp, collaboratively developed by the AI 'Zhipu Qingyan' (GLM5+) and 'DeepSeek' (v4pro), with extensive testing, bug fixes, and feature extensions contributed by MiMo (Xiaomi AI). The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community already has two relatively popular libraries, magicl and numcl, magicl lacks support for high-dimensional tensors and some important functions, while numcl emphasizes type inference and has some function interfaces that overlap with standard CL functions. The core foundation of the clvt library consists of three functions: vt-einsum, vt-map, and vt-reduce. Most other operations are built by combining these three core functions, making them easy to understand. Additionally, this library features excellent pretty-printing capabilities. Currently, the library has already implemented many basic tensor operations, and further improvements will be made in the future, aiming to implement as many NumPy features as possible, with some functions modeled after PyTorch. Functions in this library are all prefixed with vt-, which, when used with Slime, makes it very convenient to see which functions have been implemented. The majority of tests have been completed on SBCL.
+
+## MiMo (Xiaomi AI) 贡献
+
+由 MiMo (Xiaomi AI) 进行了系统性的测试、bug 修复和功能扩展，详见 [CHANGELOG.md](CHANGELOG.md)。
 
 clvt 举例:
-``` commmon lisp
+``` common lisp
 CLVT> (defparameter *m* (vt-arange 27 :start 0 :step 1 :dtype :int32))
 *M*
 CLVT> *m*
@@ -263,6 +267,11 @@ vt-sinc
 vt-deg2rad
 vt-rad2deg
 
+;; 反双曲函数 (新增)
+vt-asinh
+vt-acosh
+vt-atanh
+
 ;; 比较与逻辑
 vt-=
 vt-/=
@@ -287,6 +296,26 @@ vt-allclose
 vt-isfinite
 vt-isinf
 vt-isnan
+
+;; 补充算术与数学 (新增)
+vt-reciprocal
+vt-negative
+vt-lerp
+vt-cbrt
+
+;; 位运算 (新增)
+vt-bit-and
+vt-bit-ior
+vt-bit-xor
+vt-bit-not
+vt-left-shift
+vt-right-shift
+
+;; 逐元素极值 (新增)
+vt-maximum
+vt-minimum
+vt-fmax
+vt-fmin
 
 ;; 归约与统计
 vt-sum
@@ -316,6 +345,14 @@ vt-argsort
 vt-maximum
 vt-minimum
 
+;; nan 感知统计 (新增)
+vt-nansum
+vt-nanmean
+vt-nanstd
+vt-nanvar
+vt-nanmax
+vt-nanmin
+
 ;; 线性代数
 vt-matmul
 vt-@
@@ -337,6 +374,12 @@ vt-diagonal
 vt-qr
 vt-svd
 vt-matrix-rank
+
+;; 线性代数扩展 (新增)
+vt-cholesky
+vt-eig
+vt-pinv
+vt-lstsq
 
 ;; 激活函数
 vt-sigmoid
@@ -363,6 +406,17 @@ vt-union1d
 vt-setdiff1d
 vt-setxor1d
 vt-in1d
+
+;; 填充与插值 (新增)
+vt-fill
+vt-interp
+vt-kron
+vt-meshgrid
+
+;; 追加、插入、删除 (新增)
+vt-append
+vt-insert
+vt-delete
 
 ;; 随机数生成
 vt-random
@@ -408,6 +462,19 @@ with-float-safe
 (load "~/quicklisp/local-projects/clvt/example/example.lisp")
 (run-all-tests)
 ```
+
+自动化测试:
+```bash
+# 运行所有测试 (815 个测试用例)
+bash test/run-tests.sh
+
+# 运行指定测试套件
+bash test/run-tests.sh --suite run_all_tests
+bash test/run-tests.sh --suite nested-test
+
+# 列出所有测试套件
+bash test/run-tests.sh --list
+```
+
 ## License
 MIT
-

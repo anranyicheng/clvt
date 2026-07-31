@@ -291,7 +291,7 @@
       
       ;; ---- 1. 正向分解，更新 r ----
       (loop for i from 0 below k
-            for x = (vt-slice r (list i row) (list i)) ;; 第 i 列，i 行开始，形状
+            for x = (vt-slice r (list i row) (list i)) ;; 第 i 列，i 行开始
             do (if (<= (vt-size x) 1)
                    (setf (aref betas i) 0.0d0)
                    (multiple-value-bind (v beta sigma)
@@ -299,15 +299,32 @@
                      (declare (ignore sigma))
                      (setf (aref vlist i) v
                            (aref betas i) beta)
-                     ;; 对子矩阵 r(i:m , i:n) 应用反射
-                     (let ((subr (vt-slice r (list i row) (list i col))))
-                       (let* ((w (vt-einsum "i,ij->j" v subr))  ;; 长度
-                              (wsize (vt-size w))
-                              (vcol (vt-reshape v (list (vt-size v) 1)))
-                              (wrow (vt-reshape w (list 1 wsize)))
-                              (update (vt-outer vcol wrow)))
-                         (setf (vt-slice r (list i row) (list i col))
-                               (vt-- subr (vt-scale update beta))))))))
+                     ;; 对子矩阵 r(i:m, i:n) 应用反射: R = R - beta * v * (v^T R)
+                     ;; 直接用循环实现，避免 einsum 的 stride 问题
+                     (let* ((subr (vt-slice r (list i row) (list i col)))
+                            (m-sub (- row i))
+                            (n-sub (- col i))
+                            (r-data (vt-data r))
+                            (r-s0 (first (vt-strides r)))
+                            (r-s1 (second (vt-strides r)))
+                            (r-off (vt-offset r))
+                            (v-data (vt-data v))
+                            (v-stride (first (vt-strides v)))
+                            (v-off (vt-offset v)))
+                       ;; w[j] = sum_k v[k] * R[i+k, i+j]
+                       (let ((w (make-array n-sub :element-type 'double-float :initial-element 0.0d0)))
+                         (loop for j fixnum from 0 below n-sub do
+                           (let ((s 0.0d0))
+                             (loop for ii fixnum from 0 below m-sub do
+                               (incf s (* (aref v-data (+ v-off (* ii v-stride)))
+                                          (aref r-data (+ r-off (* (+ i ii) r-s0) (* (+ i j) r-s1))))))
+                             (setf (aref w j) s)))
+                         ;; R[i+ii, i+j] -= beta * v[ii] * w[j]
+                         (loop for ii fixnum from 0 below m-sub do
+                           (let ((vi (aref v-data (+ v-off (* ii v-stride)))))
+                             (loop for j fixnum from 0 below n-sub do
+                               (decf (aref r-data (+ r-off (* (+ i ii) r-s0) (* (+ i j) r-s1)))
+                                     (* beta vi (aref w j)))))))))))
       
       ;; ---- 2. 反向累积 q (必须从 k-1 到 0) ----
       (let* ((need-full (eq mode :full))
@@ -319,14 +336,31 @@
               for beta = (aref betas i)
               for v = (aref vlist i)
               when (and v (> beta 0.0d0))
-                do (let ((qsub (vt-slice q (list i row) '(:all))))
-                     (let* ((w (vt-einsum "i,ij->j" v qsub))
-                            (wsize (vt-size w))
-                            (vcol (vt-reshape v (list (vt-size v) 1)))
-                            (wrow (vt-reshape w (list 1 wsize)))
-                            (update (vt-outer vcol wrow)))
-                       (setf (vt-slice q (list i row) '(:all))
-                             (vt-- qsub (vt-scale update beta))))))
+                do ;; Q[i:m, :] = Q[i:m, :] - beta * v * (v^T Q[i:m, :])
+                   (let* ((qsub (vt-slice q (list i row) '(:all)))
+                          (m-sub (- row i))
+                          (nq (second (vt-shape q)))
+                          (q-data (vt-data q))
+                          (q-s0 (first (vt-strides q)))
+                          (q-s1 (second (vt-strides q)))
+                          (q-off (vt-offset q))
+                          (v-data (vt-data v))
+                          (v-stride (first (vt-strides v)))
+                          (v-off (vt-offset v)))
+                     ;; w[j] = sum_k v[k] * Q[i+k, j]
+                     (let ((w (make-array nq :element-type 'double-float :initial-element 0.0d0)))
+                       (loop for j fixnum from 0 below nq do
+                         (let ((s 0.0d0))
+                           (loop for ii fixnum from 0 below m-sub do
+                             (incf s (* (aref v-data (+ v-off (* ii v-stride)))
+                                        (aref q-data (+ q-off (* (+ i ii) q-s0) (* j q-s1))))))
+                           (setf (aref w j) s)))
+                       ;; Q[i+ii, j] -= beta * v[ii] * w[j]
+                       (loop for ii fixnum from 0 below m-sub do
+                         (let ((vi (aref v-data (+ v-off (* ii v-stride)))))
+                           (loop for j fixnum from 0 below nq do
+                             (decf (aref q-data (+ q-off (* (+ i ii) q-s0) (* j q-s1)))
+                                   (* beta vi (aref w j)))))))))
         
         (values q (if need-full r (vt-slice r (list 0 k) '(:all))))))))
 

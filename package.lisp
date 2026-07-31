@@ -215,6 +215,38 @@
    :vt-qr
    :vt-svd
    :vt-matrix-rank
+   :vt-cholesky
+   :vt-eig
+   :vt-pinv
+   :vt-lstsq
+
+   ;; 补充算术与数学
+   :vt-asinh
+   :vt-acosh
+   :vt-atanh
+   :vt-cbrt
+   :vt-reciprocal
+   :vt-negative
+   :vt-lerp
+   :vt-bit-and
+   :vt-bit-ior
+   :vt-bit-xor
+   :vt-bit-not
+   :vt-left-shift
+   :vt-right-shift
+   :vt-fmax
+   :vt-fmin
+
+   ;; 填充与插值
+   :vt-fill
+   :vt-interp
+   :vt-kron
+   :vt-meshgrid
+
+   ;; 追加、插入、删除
+   :vt-append
+   :vt-insert
+   :vt-delete
 
    ;; 激活函数
    :vt-sigmoid
