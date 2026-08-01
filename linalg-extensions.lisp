@@ -127,7 +127,7 @@
         (loop for i fixnum from 0 below s-size do
           (when (> (aref s-data i) cutoff)
             (setf (vt-ref s-pinv i) (/ 1.0d0 (aref s-data i)))))
-        (let* ((n (first (vt-shape vt-mat)))
+        (let* ((n (second (vt-shape vt-mat)))
                (k (vt-size s))
                (v-scaled (vt-zeros (list n k) :dtype :float64)))
           (loop for j fixnum from 0 below k do
@@ -157,7 +157,7 @@
                (cutoff (* rcond s-max))
                (rank (loop for i fixnum from 0 below k count (> (aref s-data i) cutoff)))
                (utb (vt-@ (vt-transpose u) b-mat))
-               (x (vt-zeros (list n nrhs) :dtype :float64)))
+               (x (vt-zeros (list k nrhs) :dtype :float64)))
           (loop for j fixnum from 0 below nrhs do
             (loop for i fixnum from 0 below rank do
               (setf (vt-ref x i j) (* (vt-ref utb i j) (/ 1.0d0 (aref s-data i))))))

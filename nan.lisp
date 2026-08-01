@@ -9,22 +9,22 @@
     "安全生成指定类型的 NaN."
     (with-float-safe
       (ecase float-type
-        (single-float (/ 0.0s0 0.0s0))
-        (double-float (/ 0.0d0 0.0d0)))))
+	(single-float (locally (declare (notinline /)) (/ 0.0s0 0.0s0)))
+	(double-float (locally (declare (notinline /)) (/ 0.0d0 0.0d0))))))
 
   (defun vt-make-float-pos-inf (float-type)
     "安全生成指定类型的正无穷大."
     (with-float-safe
       (ecase float-type
-        (single-float (/ 1.0s0 0.0s0))
-        (double-float (/ 1.0d0 0.0d0)))))
+        (single-float  (locally (declare (notinline /)) (/ 1.0s0 0.0s0)))
+        (double-float  (locally (declare (notinline /)) (/ 1.0d0 0.0d0))))))
 
   (defun vt-make-float-neg-inf (float-type)
     "安全生成指定类型的负无穷大."
     (with-float-safe
       (ecase float-type
-        (single-float (/ -1.0s0 0.0s0))
-        (double-float (/ -1.0d0 0.0d0)))))
+        (single-float (locally (declare (notinline /)) (/ -1.0s0 0.0s0)))
+        (double-float (locally (declare (notinline /)) (/ -1.0d0 0.0d0))))))
 
   ;; === 谓词函数 (兼容 SBCL 特性，并提供 ANSI 回退) ===
   (defun vt-float-nan-p (x)

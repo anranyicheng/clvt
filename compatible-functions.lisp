@@ -284,8 +284,6 @@
         (error "vt-rot90: axes must be different, but got ~d and ~d" ax0 ax1))
       ;; k 规范化到 0~3
       (let ((k (mod k 4)))
-        (when (minusp k)    ; 保证非负
-          (incf k 4))
         ;; 重复 k 次：先转置，再翻转第一个轴（与 numpy 一致）
         (loop with result = tensor
               repeat k

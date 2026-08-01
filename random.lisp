@@ -82,13 +82,19 @@
     (assert (>= range 0)
 	    (high low)
 	    "high: ~a less than low: ~a" high low)
-    (if size
-        (vt-astype (vt-map (lambda (x)
-                             (declare (ignore x))
-                             (+ low (random range rng)))
-                           (vt-zeros size :dtype dtype))
-                   dtype)
-	(make-vt nil (+ low (random range rng)) :dtype dtype))))
+    ;; When range is 0 (high == low), (random 0) would signal an error
+    ;; because CL's random requires a positive argument. Return constant low.
+    (if (zerop range)
+        (if size
+            (vt-full size low :dtype dtype)
+            (make-vt nil low :dtype dtype))
+        (if size
+            (vt-astype (vt-map (lambda (x)
+                                 (declare (ignore x))
+                                 (+ low (random range rng)))
+                               (vt-zeros size :dtype dtype))
+                       dtype)
+            (make-vt nil (+ low (random range rng)) :dtype dtype)))))
 
 (defun vt-random-integers (low high &key (size nil) (dtype :int64)
 				      (rng *vt-default-random-state*))
