@@ -1,0 +1,117 @@
+diff --git a/arithmetic-operation.lisp b/arithmetic-operation.lisp
+index 5464531..3a4b6ef 100644
+--- a/arithmetic-operation.lisp
++++ b/arithmetic-operation.lisp
+@@ -64,14 +64,26 @@
+     (vt-map #'tan vt :out out :dtype infer-dtype)))
+ 
+ (defun vt-asin (vt &key out dtype)
++  "反正弦. |x|>1 返回 NaN (与 numpy 对齐)."
+   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
+-				    :float32 :float64))))
+-    (vt-map #'asin vt :out out :dtype infer-dtype)))
++				    :float32 :float64)))
++         (nan-val (vt-get-nan infer-dtype)))
++    (vt-map (lambda (x)
++              (if (> (abs x) 1.0d0)
++                  nan-val
++                  (asin x)))
++            vt :out out :dtype infer-dtype)))
+ 
+ (defun vt-acos (vt &key out dtype)
++  "反余弦. |x|>1 返回 NaN (与 numpy 对齐)."
+   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
+-				    :float32 :float64))))
+-    (vt-map #'acos vt :out out :dtype infer-dtype)))
++				    :float32 :float64)))
++         (nan-val (vt-get-nan infer-dtype)))
++    (vt-map (lambda (x)
++              (if (> (abs x) 1.0d0)
++                  nan-val
++                  (acos x)))
++            vt :out out :dtype infer-dtype)))
+ 
+ (defun vt-atan (vt &key out dtype)
+   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
+@@ -100,9 +112,17 @@
+     (vt-map #'exp vt :out out :dtype infer-dtype)))
+ 
+ (defun vt-pow (vt power &key out dtype)
+-  "计算逐元素幂次方"
+-  (with-float-safe 
+-    (vt-map (lambda (x) (expt x power)) vt :out out :dtype dtype)))
++  "逐元素幂次方. 0^0=1, 负数^非整数=NaN (与 numpy 对齐)."
++  (with-float-safe
++    (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
++                                      :float32 :float64)))
++           (nan-val (vt-get-nan infer-dtype)))
++      (vt-map (lambda (x)
++                (cond
++                  ((and (zerop x) (zerop power)) 1.0d0)  ; 0^0 = 1
++                  ((and (minusp x) (not (integerp power))) nan-val)  ; 负数^非整数 = NaN
++                  (t (expt x power))))
++              vt :out out :dtype infer-dtype))))
+ 
+ (defun vt-expt (vt power-num &key out dtype)
+   "vt-pow 的别名. 逐元素幂运算."
+@@ -335,6 +355,14 @@
+             vt :out out :dtype infer-dtype)))
+ 
+ ;; ========== 9. 补充: 角度与弧度转换 ==========
++(defun vt-sinc (vt &key out dtype)
++  "sinc 函数: sin(x)/x, sinc(0)=1 (与 numpy 对齐)."
++  (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
++                                    :float32 :float64))))
++    (vt-map (lambda (x)
++              (if (zerop x) 1.0d0 (/ (sin x) x)))
++            vt :out out :dtype infer-dtype)))
++
+ (defun vt-rad2deg (vt &key out dtype)
+   "弧度转角度."
+   (let* ((factor (float (/ 180.0 pi) 1.0d0))
+diff --git a/test/robustness-test.lisp b/test/robustness-test.lisp
+index 307db49..18eb754 100644
+--- a/test/robustness-test.lisp
++++ b/test/robustness-test.lisp
+@@ -371,7 +371,40 @@
+   (let ((a (make-vt nil +vt-float-nan+ :dtype :float64))
+         (b (make-vt nil 1.0d0 :dtype :float64)))
+     (T! "nan == nan" 0.0d0 (vt-item (vt-= a (make-vt nil +vt-float-nan+ :dtype :float64))))
+-    (T! "nan < 1" 0.0d0 (vt-item (vt-< a b)))))
++    (T! "nan < 1" 0.0d0 (vt-item (vt-< a b))))
++
++  ;; 9.2 数学函数 NaN 返回 (SBCL 修复验证)
++  ;; asin/acos 超范围返回 NaN 而非复数
++  (let ((a (vt-from-sequence '(-2.0 -1.0 0.0 1.0 2.0))))
++    (let ((r (vt-asin a)))
++      (T! "asin(-2)=NaN" t (vt-float-nan-p (vt-ref r 0)))
++      (T! "asin(0)=0" 0.0d0 (vt-ref r 2) 1e-10)
++      (T! "asin(2)=NaN" t (vt-float-nan-p (vt-ref r 4))))
++    (let ((r (vt-acos a)))
++      (T! "acos(-2)=NaN" t (vt-float-nan-p (vt-ref r 0)))
++      (T! "acos(1)=0" 0.0d0 (vt-ref r 3) 1e-10)
++      (T! "acos(2)=NaN" t (vt-float-nan-p (vt-ref r 4)))))
++
++  ;; pow 0^0=1, 负数^非整数=NaN
++  (let ((r (vt-pow (vt-from-sequence '(0.0 -1.0 -2.0 4.0)) 0)))
++    (T! "pow(x,0)=1" t (every (lambda (x) (= x 1.0d0)) (vt-to-list r))))
++  (let ((r (vt-pow (vt-from-sequence '(-1.0 -2.0)) 0.5)))
++    (T! "pow(-x,0.5)=NaN" t (every (lambda (x) (vt-float-nan-p x)) (vt-to-list r))))
++
++  ;; sinc(0)=1
++  (T! "sinc(0)=1" 1.0d0 (vt-ref (vt-sinc (vt-from-sequence '(0.0))) 0))
++
++  ;; 9.3 Inf 算术
++  (let ((inf +vt-float-pos-inf+)
++        (neginf +vt-float-neg-inf+))
++    (with-float-safe
++      (T! "inf+inf=inf" t (vt-float-inf-p (+ inf inf)))
++      (T! "inf-inf=NaN" t (vt-float-nan-p (- inf inf)))
++      (T! "inf*0=NaN" t (vt-float-nan-p (* inf 0.0d0)))
++      (T! "1/0=inf" t (vt-float-inf-p (/ 1.0d0 0.0d0)))
++      (T! "0/0=NaN" t (vt-float-nan-p (/ 0.0d0 0.0d0)))
++      (T! "-inf < inf" t (< neginf inf))
++      (T! "inf > 1e300" t (> inf 1d300)))))
+ 
+ ;;; ============================================================
+ ;;; 10. 数值稳定性

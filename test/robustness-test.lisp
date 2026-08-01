@@ -371,7 +371,40 @@
   (let ((a (make-vt nil +vt-float-nan+ :dtype :float64))
         (b (make-vt nil 1.0d0 :dtype :float64)))
     (T! "nan == nan" 0.0d0 (vt-item (vt-= a (make-vt nil +vt-float-nan+ :dtype :float64))))
-    (T! "nan < 1" 0.0d0 (vt-item (vt-< a b)))))
+    (T! "nan < 1" 0.0d0 (vt-item (vt-< a b))))
+
+  ;; 9.2 数学函数 NaN 返回 (SBCL 修复验证)
+  ;; asin/acos 超范围返回 NaN 而非复数
+  (let ((a (vt-from-sequence '(-2.0 -1.0 0.0 1.0 2.0))))
+    (let ((r (vt-asin a)))
+      (T! "asin(-2)=NaN" t (vt-float-nan-p (vt-ref r 0)))
+      (T! "asin(0)=0" 0.0d0 (vt-ref r 2) 1e-10)
+      (T! "asin(2)=NaN" t (vt-float-nan-p (vt-ref r 4))))
+    (let ((r (vt-acos a)))
+      (T! "acos(-2)=NaN" t (vt-float-nan-p (vt-ref r 0)))
+      (T! "acos(1)=0" 0.0d0 (vt-ref r 3) 1e-10)
+      (T! "acos(2)=NaN" t (vt-float-nan-p (vt-ref r 4)))))
+
+  ;; pow 0^0=1, 负数^非整数=NaN
+  (let ((r (vt-pow (vt-from-sequence '(0.0 -1.0 -2.0 4.0)) 0)))
+    (T! "pow(x,0)=1" t (every (lambda (x) (= x 1.0d0)) (vt-to-list r))))
+  (let ((r (vt-pow (vt-from-sequence '(-1.0 -2.0)) 0.5)))
+    (T! "pow(-x,0.5)=NaN" t (every (lambda (x) (vt-float-nan-p x)) (vt-to-list r))))
+
+  ;; sinc(0)=1
+  (T! "sinc(0)=1" 1.0d0 (vt-ref (vt-sinc (vt-from-sequence '(0.0))) 0))
+
+  ;; 9.3 Inf 算术
+  (let ((inf +vt-float-pos-inf+)
+        (neginf +vt-float-neg-inf+))
+    (with-float-safe
+      (T! "inf+inf=inf" t (vt-float-inf-p (+ inf inf)))
+      (T! "inf-inf=NaN" t (vt-float-nan-p (- inf inf)))
+      (T! "inf*0=NaN" t (vt-float-nan-p (* inf 0.0d0)))
+      (T! "1/0=inf" t (vt-float-inf-p (/ 1.0d0 0.0d0)))
+      (T! "0/0=NaN" t (vt-float-nan-p (/ 0.0d0 0.0d0)))
+      (T! "-inf < inf" t (< neginf inf))
+      (T! "inf > 1e300" t (> inf 1d300)))))
 
 ;;; ============================================================
 ;;; 10. 数值稳定性

@@ -64,14 +64,26 @@
     (vt-map #'tan vt :out out :dtype infer-dtype)))
 
 (defun vt-asin (vt &key out dtype)
+  "反正弦. |x|>1 返回 NaN (与 numpy 对齐)."
   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
-				    :float32 :float64))))
-    (vt-map #'asin vt :out out :dtype infer-dtype)))
+				    :float32 :float64)))
+         (nan-val (vt-get-nan infer-dtype)))
+    (vt-map (lambda (x)
+              (if (> (abs x) 1.0d0)
+                  nan-val
+                  (asin x)))
+            vt :out out :dtype infer-dtype)))
 
 (defun vt-acos (vt &key out dtype)
+  "反余弦. |x|>1 返回 NaN (与 numpy 对齐)."
   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
-				    :float32 :float64))))
-    (vt-map #'acos vt :out out :dtype infer-dtype)))
+				    :float32 :float64)))
+         (nan-val (vt-get-nan infer-dtype)))
+    (vt-map (lambda (x)
+              (if (> (abs x) 1.0d0)
+                  nan-val
+                  (acos x)))
+            vt :out out :dtype infer-dtype)))
 
 (defun vt-atan (vt &key out dtype)
   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
@@ -100,9 +112,17 @@
     (vt-map #'exp vt :out out :dtype infer-dtype)))
 
 (defun vt-pow (vt power &key out dtype)
-  "计算逐元素幂次方"
-  (with-float-safe 
-    (vt-map (lambda (x) (expt x power)) vt :out out :dtype dtype)))
+  "逐元素幂次方. 0^0=1, 负数^非整数=NaN (与 numpy 对齐)."
+  (with-float-safe
+    (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
+                                      :float32 :float64)))
+           (nan-val (vt-get-nan infer-dtype)))
+      (vt-map (lambda (x)
+                (cond
+                  ((and (zerop x) (zerop power)) 1.0d0)  ; 0^0 = 1
+                  ((and (minusp x) (not (integerp power))) nan-val)  ; 负数^非整数 = NaN
+                  (t (expt x power))))
+              vt :out out :dtype infer-dtype))))
 
 (defun vt-expt (vt power-num &key out dtype)
   "vt-pow 的别名. 逐元素幂运算."
@@ -335,6 +355,14 @@
             vt :out out :dtype infer-dtype)))
 
 ;; ========== 9. 补充: 角度与弧度转换 ==========
+(defun vt-sinc (vt &key out dtype)
+  "sinc 函数: sin(x)/x, sinc(0)=1 (与 numpy 对齐)."
+  (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
+                                    :float32 :float64))))
+    (vt-map (lambda (x)
+              (if (zerop x) 1.0d0 (/ (sin x) x)))
+            vt :out out :dtype infer-dtype)))
+
 (defun vt-rad2deg (vt &key out dtype)
   "弧度转角度."
   (let* ((factor (float (/ 180.0 pi) 1.0d0))
