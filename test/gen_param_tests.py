@@ -151,10 +151,15 @@ add("squeeze_3d_ax0", np.squeeze(np.arange(12).reshape(1,3,4), axis=0))
 add("squeeze_3d_ax1", np.squeeze(np.arange(12).reshape(3,1,4), axis=1))
 
 # expand_dims: 3D at different positions
+# 注: 同时生成 expand_3d_axN (shape 元组,字符串形式) 和 expand_3d_axN_shape (列表形式)
+#     run_param_tests.lisp 引用的是带 _shape 后缀的键
 add("expand_3d_ax0", np.expand_dims(T234, 0).shape)
+add("expand_3d_ax0_shape", list(np.expand_dims(T234, 0).shape))
 add("expand_3d_ax1", np.expand_dims(T234, 1).shape)
 add("expand_3d_ax2", np.expand_dims(T234, 2).shape)
+add("expand_3d_ax2_shape", list(np.expand_dims(T234, 2).shape))
 add("expand_3d_ax3", np.expand_dims(T234, 3).shape)
+add("expand_3d_ax3_shape", list(np.expand_dims(T234, 3).shape))
 add("expand_3d_ax_neg1", np.expand_dims(T234, -1).shape)
 
 # concatenate: 3D
@@ -162,9 +167,11 @@ add("concat_3d_ax0", np.concatenate([T234, T234+100], axis=0))
 add("concat_3d_ax1", np.concatenate([T234, T234[:,:,:2]], axis=2))
 
 # stack: 3D
-add("stack_3d_ax0", np.stack([T234, T234+100], axis=0))
+# 注: run_param_tests.lisp 对 stack_3d_ax0/ax3 只比较 vt-shape,
+#     因此这里存储 shape 列表而非完整数组
+add("stack_3d_ax0", list(np.stack([T234, T234+100], axis=0).shape))
 add("stack_3d_ax1", np.stack([T234, T234+100], axis=1))
-add("stack_3d_ax3", np.stack([T234, T234+100], axis=3))
+add("stack_3d_ax3", list(np.stack([T234, T234+100], axis=3).shape))
 
 # flip: 3D per axis
 add("flip_3d_ax0", np.flip(T234, axis=0))
@@ -182,15 +189,20 @@ add("split_3d_ax0", [x.tolist() for x in np.split(T234, 2, axis=0)])
 add("split_3d_ax2", [x.tolist() for x in np.split(T234, 2, axis=2)])
 
 # tile: 3D
-add("tile_3d_121", np.tile(T222, (1,2,1)))
-add("tile_3d_212", np.tile(T222, (2,1,2)))
+# 注: run_param_tests.lisp 使用 t222i (int64) 作为输入,这里保持一致
+add("tile_3d_121", np.tile(T222i, (1,2,1)))
+add("tile_3d_212", np.tile(T222i, (2,1,2)))
 
 # repeat: 3D
 add("repeat_3d_ax0", np.repeat(T222i, 2, axis=0))
 add("repeat_3d_ax2", np.repeat(T222i, 2, axis=2))
 
 # diagonal: 3D (batch)
-add("diag_3d", np.diagonal(T234))  # shape (2, 4, 3) -> (2, 3) last two dims
+# 注: clvt 的 vt-diagonal 对 3D 输入提取最后两维的对角线 (PyTorch 风格),
+#     返回 shape = batch_dims + (min(rows,cols),)
+#     numpy 2.x 的 np.diagonal 对 3D 返回前两维对角线,行为不同。
+#     这里手动构造与 clvt 一致的期望值: T234 shape (2,3,4) -> (2, 3)
+add("diag_3d", np.array([np.diagonal(T234[i]) for i in range(T234.shape[0])]))
 
 # triu/tril: 3D (batch)
 add("triu_3d", np.triu(T234))
@@ -366,6 +378,28 @@ add("clip_3d_neg", np.clip(T234, -5.0, 5.0))
 # ============================================================
 for dt_name, dt in [("f32", np.float32), ("f64", np.float64), ("i32", np.int32), ("i64", np.int64)]:
     add(f"astype_{dt_name}", np.arange(6, dtype=dt).reshape(2,3))
+
+# ============================================================
+# 18. 补充: convolve / eig / diag_3d_pytorch
+#     这些测试用例在 run_param_tests.lisp 中被引用,需单独生成
+# ============================================================
+# convolve: 一维卷积 (与 numpy.convolve 对齐)
+_conv_a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+_conv_v = np.array([1.0, 0.0, -1.0])
+add("convolve_valid", np.convolve(_conv_a, _conv_v, mode='valid').tolist())
+add("convolve_full", np.convolve(_conv_a, _conv_v, mode='full').tolist())
+
+# eig: 3x3 对称矩阵特征值 (clvt vt-eig 返回降序排列)
+# 注: 矩阵必须与 run_param_tests.lisp 中的测试矩阵一致
+_eig_A = np.array([[4.0, 2.0, 1.0],
+                   [2.0, 5.0, 3.0],
+                   [1.0, 3.0, 6.0]])
+_eig_vals = np.linalg.eigvals(_eig_A)
+add("eig_3x3_vals", sorted(_eig_vals.real.tolist(), reverse=True))
+
+# diag_3d_pytorch: clvt vt-diagonal 对 3D 的行为 (PyTorch 风格,最后两维对角线)
+# T234 shape (2,3,4) -> 每个批次取 min(3,4)=3 的对角线 -> shape (2, 3)
+add("diag_3d_pytorch", np.array([np.diagonal(T234[i]) for i in range(T234.shape[0])]))
 
 # ============================================================
 # Output
