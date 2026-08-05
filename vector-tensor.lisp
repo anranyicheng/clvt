@@ -452,6 +452,8 @@ dtype : symbol (默认 :float64)
     张量的元素数据类型 (如 :float32, :float64, :int32, :int64 等)。
 "
   (declare (fixnum totla-num))
+  (when (and (numberp step) (zerop step))
+    (error "vt-arange: step 不能为 0（会生成退化序列）；如需常量填充请使用 vt-full/vt-const。"))
   (let* ((data (make-array totla-num
 			   :element-type (vt-dtype->lisp-type dtype)))
          (shape (list totla-num)))

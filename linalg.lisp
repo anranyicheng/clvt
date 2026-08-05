@@ -207,8 +207,22 @@
 		(ob-data (vt-data orig-b))
 		(ob-s0 (first (vt-strides orig-b)))
 		(ob-s1 (second (vt-strides orig-b)))
-		(ob-off (vt-offset orig-b)))          
-            ;; 1. 应用行置换 pb
+		(ob-off (vt-offset orig-b)))
+            ;; 计算相对奇异阈值：基于 LU 矩阵的最大绝对值元素，
+            ;; 避免绝对阈值 1e-12 对小范数矩阵误判为奇异、对大范数矩阵漏判。
+            ;; 阈值 = n * eps * max|lu_ij|，n 为矩阵阶数，
+            ;; eps = double-float-epsilon (≈2.22e-16)，n 倍补偿消元累积误差。
+            (let ((max-abs 0.0d0))
+              (declare (double-float max-abs))
+              (loop for i below (length lu-data) do
+                (let ((v (abs (aref lu-data i))))
+                  (when (> v max-abs)
+                    (setf max-abs v))))
+              (let ((singular-threshold
+                      (* (max 1 n) double-float-epsilon
+                         (max max-abs 1.0d0))))
+                (declare (double-float singular-threshold))
+          ;; 1. 应用行置换 pb
             (loop for i from 0 below n do
               (loop for j from 0 below nrhs do
 		(setf (aref b-data (+ b-off
@@ -236,7 +250,7 @@
 					    (* k lu-s0)
 					    (* k lu-s1)))))
 		(when (or (zerop pivot)
-			  (< (abs pivot) 1.0d-12)) ; 阈值可根据需求调整，防止极小数除法引发数值不稳定
+			  (< (abs pivot) singular-threshold))
 		  (error "LinAlgError: Singular matrix. Cannot solve or invert."))
 		(loop for j from 0 below nrhs do
                   (setf (aref b-data (+ b-off
@@ -262,7 +276,7 @@
                            b-copy)))
               (if out
                   (vt-map #'identity res :out out)
-                  res))))))))
+                  res))))))))))
 
 (defun vt-inv (matrix)
   "矩阵求逆。"

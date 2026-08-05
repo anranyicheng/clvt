@@ -243,7 +243,7 @@
   (with-float-safe 
     (vt-map #'atan vty vtx :out out :dtype dtype)))
 
-;; 修复: 使用输入值 x 作为浮点基准，防止将 float32 强制提升为 float64
+;; 使用输入值 x 作为浮点基准，防止将 float32 强制提升为 float64
 (defun vt-floor (vt &key (divisor 1) out dtype)
   "向下取整."
   (with-float-safe 
@@ -323,7 +323,7 @@
 
 
 ;; ========== 8. 补充: 双曲反函数 ==========
-;; 修复逻辑: acosh 输入 < 1 会产生复数，需安全返回 NaN
+;; acosh 输入 < 1 会产生复数，需安全返回 NaN
 (defun vt-asinh (vt &key out dtype)
   "反双曲正弦."
   (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
@@ -352,15 +352,6 @@
 		      +vt-sfloat-nan+
 		      +vt-dfloat-nan+)
                   (atanh x))) 
-            vt :out out :dtype infer-dtype)))
-
-;; ========== 9. 补充: 角度与弧度转换 ==========
-(defun vt-sinc (vt &key out dtype)
-  "sinc 函数: sin(x)/x, sinc(0)=1 (与 numpy 对齐)."
-  (let* ((infer-dtype (or dtype (if (eq (vt-dtype vt) :float32)
-                                    :float32 :float64))))
-    (vt-map (lambda (x)
-              (if (zerop x) 1.0d0 (/ (sin x) x)))
             vt :out out :dtype infer-dtype)))
 
 (defun vt-rad2deg (vt &key out dtype)

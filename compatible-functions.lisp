@@ -433,7 +433,10 @@
                                ;; 其他轴: 全部选中
                                (list '(:all))))))
               ;; 将源张量直接写入目标切片
-              (setf (apply #'vt-slice result slice-args) vt)
+              ;; 将源张量转换到结果 dtype 后写入目标切片，
+              ;; 避免 int32/float64 等混合 dtype 拼接时类型不匹配报错。
+              (setf (apply #'vt-slice result slice-args)
+                    (vt-astype vt result-type))
               (incf cur-offset axis-size)))
           result)))))
 
@@ -2356,11 +2359,14 @@
                                         (/ (- xi x-left) denom)))))))))))
       out-vt)))
 
-(defun vt-sinc (tensor &key out)
-  "计算 sinc(x) = sin(pi*x) / (pi*x)，对 x=0 返回 1。"
+(defun vt-sinc (tensor &key out dtype)
+  "计算 sinc(x) = sin(pi*x) / (pi*x)，对 x=0 返回 1。
+与 NumPy np.sinc 语义一致（归一化 sinc）。
+dtype : 指定输出 dtype（默认与输入一致，浮点输入保持浮点）。"
   (with-float-safe
-    (let* ((x-pi (vt-scale tensor pi)))
+    (let* ((infer-dtype (or dtype (vt-dtype tensor)))
+           (x-pi (vt-scale tensor pi)))
       (vt-map (lambda (x)
 		(if (zerop x) 1.0d0 (/ (sin x) x)))
-              x-pi :out out))))
+              x-pi :out out :dtype infer-dtype))))
 
