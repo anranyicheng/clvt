@@ -4504,7 +4504,7 @@
 (defun test-arithmetic-ops ()
   ;; vt-square
   (let* ((a (vt-from-sequence '(-2 0 3) :dtype :int64))
-         (sq (vt-square a)))
+         (sq (vt-square a :dtype :int64)))
     (assert (equal (vt-to-list sq) '(4 0 9))))
 
   ;; vt-sqrt
