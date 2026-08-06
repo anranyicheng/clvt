@@ -40,7 +40,7 @@
   (flet ((check (expected-list expected-type tensor desc)
            (let ((actual-list (vt-to-list tensor))
                  (actual-type (vt-dtype tensor)))
-             (assert (equal actual-list expected-list) ()
+             (assert (lists-approx-equal actual-list expected-list :epsilon 1e-10) ()
                      "~A: 值断言失败。预期 ~A, 实际 ~A" desc expected-list actual-list)
              (assert (eq actual-type expected-type) ()
                      "~A: 类型断言失败。预期 ~A, 实际 ~A" desc expected-type actual-type))))
@@ -54,16 +54,16 @@
     ;; ----------------------------------------------------
     ;; 2. 纯浮点路径 (修正原测试笔误，输入也应为浮点)
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (* x 2.0)) (vt-from-sequence '(1.0 2.0 3.0) :dtype :float64))))
-      (check '(2.0 4.0 6.0) :float64 res "纯浮点路径"))
+    (let ((res (vt-map (lambda (x) (* x 2.0d0)) (vt-from-sequence '(1.0 2.0 3.0) :dtype :float64))))
+      (check '(2.0d0 4.0d0 6.0d0) :float64 res "纯浮点路径"))
 
     ;; ----------------------------------------------------
     ;; 3. 类型安全防崩溃测试 (修复 safety 0 下的内存损坏)
     ;; 闭包返回 fixnum 0，但目标数组是 float64，必须被安全 coerce
     ;; ----------------------------------------------------
-    (let ((res (vt-map (lambda (x) (min x 0.0)) 
+    (let ((res (vt-map (lambda (x) (min x 0.0d0)) 
                        (vt-from-sequence '(1.5 -2.5 3.0) :dtype :float64))))
-      (check '(0.0 -2.5 0.0) :float64 res "类型安全防崩溃(min x 0.0)"))
+      (check '(0.0d0 -2.5d0 0.0d0) :float64 res "类型安全防崩溃(min x 0.0)"))
 
     ;; ----------------------------------------------------
     ;; 4. 强制类型截断测试 (浮点运算结果写入整型数组)
@@ -79,7 +79,7 @@
     (let ((res (vt-map (lambda (x) (/ 10.0 x)) 
                        (vt-from-sequence '(1 2 4) :dtype :int64)
                        :dtype :float64)))
-      (check '(10.0 5.0 2.5) :float64 res "显式 dtype 提升防截断"))
+      (check '(10.0d0 5.0d0 2.5d0) :float64 res "显式 dtype 提升防截断"))
 
     ;; ----------------------------------------------------
     ;; 6. 混合输入支持 (标量、列表、张量自动对齐)
@@ -89,7 +89,7 @@
                        10                          ; 标量
                        '(1 2 3)                    ; 列表
                        (vt-from-sequence '(2 2 2) :dtype :int64)))) ; 张量
-      (check '(12.0 14.0 16.0) :float64 res "混合输入(标量+列表+张量)"))
+      (check '(12.0d0 14.0d0 16.0d0) :float64 res "混合输入(标量+列表+张量)"))
 
     ;; ----------------------------------------------------
     ;; 7. 多参数自动类型提升 (int32 + float64 -> float64)
@@ -97,7 +97,7 @@
     (let ((res (vt-map #'+ 
                        (vt-from-sequence '(1 2 3) :dtype :int32)
                        (vt-from-sequence '(0.1 0.1 0.1) :dtype :float64))))
-      (check '(1.1 2.1 3.1) :float64 res "多参数自动类型提升"))
+      (check '(1.1d0 2.1d0 3.1d0) :float64 res "多参数自动类型提升"))
 
     ;; ----------------------------------------------------
     ;; 8. :out 参数原地写入 (验证内存偏移与指针安全)
@@ -107,7 +107,7 @@
                         (vt-from-sequence '(1 2 3) :dtype :float64)
                         :out out)))
       (assert (eq res out) () ":out 测试: 返回值不是 out 本身")
-      (check '(2.0 4.0 6.0) :float64 out ":out 原地写入"))
+      (check '(2.0d0 4.0d0 6.0d0) :float64 out ":out 原地写入"))
 
     ;; ----------------------------------------------------
     ;; 9. 【核心修复】非连续内存 N-D Slow Path (转置视图测试)
@@ -118,7 +118,7 @@
            (res (vt-map (lambda (x) (* x 10.0)) at)))
       ;; 逻辑上应该是 10, 40, 20, 50, 30, 60
       ;; 如果 fast path 错误按一维读取，会变成 10, 20, 30, 40, 50, 60
-      (check '((10.0 40.0) (20.0 50.0) (30.0 60.0)) :float64 res "非连续内存(转置视图)计算"))
+      (check '((10.0d0 40.0d0) (20.0d0 50.0d0) (30.0d0 60.0d0)) :float64 res "非连续内存(转置视图)计算"))
 
     ;; ----------------------------------------------------
     ;; 10. 空张量推断 (size=0, 依靠 promote-type)
@@ -6028,6 +6028,129 @@
 
 
 ;; ============================================================
+;; nan/random 扩展函数测试
+;; ============================================================
+
+(defun test-nan-extensions ()
+  "测试新增的 nan 谓词和统计函数。"
+  (format t "~%--- testing nan extensions ---~%")
+  (sb-vm::with-float-traps-masked (:invalid :divide-by-zero :overflow)
+    ;; vt-float-pos-inf-p / vt-float-neg-inf-p
+    (assert (vt-float-pos-inf-p +vt-float-pos-inf+))
+    (assert (vt-float-neg-inf-p +vt-float-neg-inf+))
+    (assert (not (vt-float-pos-inf-p +vt-float-neg-inf+)))
+    (assert (not (vt-float-neg-inf-p +vt-float-pos-inf+)))
+    (assert (not (vt-float-pos-inf-p +vt-float-nan+)))
+    (assert (not (vt-float-neg-inf-p +vt-float-nan+)))
+    (assert (not (vt-float-pos-inf-p 1.0d0)))
+    ;; single-float versions
+    (assert (vt-float-pos-inf-p +vt-sfloat-pos-inf+))
+    (assert (vt-float-neg-inf-p +vt-sfloat-neg-inf+))
+    (assert (vt-float-inf-p +vt-sfloat-pos-inf+))
+    (assert (vt-float-inf-p +vt-sfloat-neg-inf+))
+    (assert (not (vt-float-inf-p +vt-sfloat-nan+)))
+    (format t "vt-float-pos-inf-p/neg-inf-p: pass~%")
+
+    ;; vt-nanargmax / vt-nanargmin
+    (let* ((nan +vt-float-nan+)
+           (a (vt-from-sequence (list 1.0 nan 3.0 2.0) :dtype :float64)))
+      (assert (= (vt-item (vt-nanargmax a)) 2))
+      (assert (= (vt-item (vt-nanargmin a)) 0)))
+    (let* ((nan +vt-float-nan+)
+           (a (vt-from-sequence (list (list 1.0 nan 3.0) (list 2.0 5.0 nan)) :dtype :float64)))
+      (assert (equal (vt-to-list (vt-nanargmax a :axis 1)) '(2 1)))
+      (assert (equal (vt-to-list (vt-nanargmin a :axis 1)) '(0 0))))
+    (format t "vt-nanargmax/nanargmin: pass~%")
+
+    ;; vt-nanprod
+    (let* ((nan +vt-float-nan+)
+           (a (vt-from-sequence (list 2.0 nan 3.0 4.0) :dtype :float64)))
+      (assert (< (abs (- (vt-item (vt-nanprod a)) 24.0d0)) 1d-10)))
+    (let* ((nan +vt-float-nan+)
+           (a (vt-from-sequence (list nan nan) :dtype :float64)))
+      (assert (= (vt-item (vt-nanprod a)) 1.0d0)))
+    (format t "vt-nanprod: pass~%")
+
+    ;; vt-nanmedian
+    (let* ((nan +vt-float-nan+)
+           (a (vt-from-sequence (list 1.0 2.0 nan 3.0 4.0) :dtype :float64)))
+      (assert (< (abs (- (vt-item (vt-nanmedian a)) 2.5d0)) 1d-10)))
+    (let* ((nan +vt-float-nan+)
+           (a (vt-from-sequence (list nan nan) :dtype :float64)))
+      (assert (vt-float-nan-p (vt-item (vt-nanmedian a)))))
+    (let* ((nan +vt-float-nan+)
+           (a (vt-from-sequence (list (list 1.0 nan 3.0) (list 2.0 5.0 nan)) :dtype :float64)))
+      (assert (lists-approx-equal (vt-to-list (vt-nanmedian a :axis 1)) '(2.0 3.5) :epsilon 1e-10)))
+    (format t "vt-nanmedian: pass~%")
+
+    ;; vt-float-inf-= edge cases
+    (assert (vt-float-inf-= +vt-float-pos-inf+ +vt-float-pos-inf+))
+    (assert (not (vt-float-inf-= +vt-float-pos-inf+ +vt-float-neg-inf+)))
+    (assert (not (vt-float-inf-= +vt-float-nan+ +vt-float-pos-inf+)))
+    (format t "vt-float-inf-= edge cases: pass~%")
+
+    (format t "~%test-nan-extensions passed.~%")))
+
+(defun test-random-extensions ()
+  "测试新增的随机数函数。"
+  (format t "~%--- testing random extensions ---~%")
+
+  ;; vt-random-choice
+  (vt-random-seed 42)
+  (let ((a (vt-random-choice 5 :size '(20) :dtype :int64)))
+    (assert (equal (vt-shape a) '(20)))
+    (vt-do-each (ptr val a)
+      (declare (ignore ptr))
+      (assert (and (>= val 0) (< val 5)))))
+  (let* ((src (vt-from-sequence '(10 20 30 40 50) :dtype :int64))
+         (a (vt-random-choice src :size '(10))))
+    (assert (equal (vt-shape a) '(10)))
+    (vt-do-each (ptr val a)
+      (declare (ignore ptr))
+      (assert (member val '(10 20 30 40 50)))))
+  (format t "vt-random-choice: pass~%")
+
+  ;; vt-random-permutation
+  (vt-random-seed 42)
+  (let ((p (vt-random-permutation 10)))
+    (assert (equal (vt-shape p) '(10)))
+    (assert (equal (sort (copy-list (vt-to-list p)) #'<) '(0 1 2 3 4 5 6 7 8 9))))
+  (let ((p (vt-random-permutation 0)))
+    (assert (equal (vt-shape p) '(0))))
+  (let ((p (vt-random-permutation 1)))
+    (assert (equal (vt-to-list p) '(0))))
+  (format t "vt-random-permutation: pass~%")
+
+  ;; vt-random-shuffle
+  (vt-random-seed 42)
+  (let ((a (vt-from-sequence '(1 2 3 4 5 6 7 8 9 10) :dtype :int64)))
+    (vt-random-shuffle a)
+    (assert (equal (sort (copy-list (vt-to-list a)) #'<) '(1 2 3 4 5 6 7 8 9 10))))
+  (format t "vt-random-shuffle: pass~%")
+
+  ;; vt-random-multinomial
+  (vt-random-seed 42)
+  (let ((result (vt-random-multinomial 100 '(0.5 0.3 0.2))))
+    (assert (equal (vt-shape result) '(3)))
+    (assert (= (vt-item (vt-sum result)) 100)))
+  (format t "vt-random-multinomial: pass~%")
+
+  ;; vt-random-normal with dtype
+  (vt-random-seed 42)
+  (let ((a (vt-random-normal '(10) :dtype :float32)))
+    (assert (eq (vt-dtype a) :float32)))
+  (format t "vt-random-normal dtype: pass~%")
+
+  ;; Validation tests
+  (let ((caught nil))
+    (handler-case (vt-random-uniform '(3) :low 5.0d0 :high 3.0d0)
+      (error () (setf caught t)))
+    (assert caught))
+  (format t "vt-random-uniform validation: pass~%")
+
+  (format t "~%test-random-extensions passed.~%"))
+
+;; ============================================================
 ;; 运行所有测试
 ;; ============================================================
 
@@ -6108,6 +6231,8 @@
   (test-logical)
   (test-math-ops)
   (test-random)
+  (test-nan-extensions)
+  (test-random-extensions)
   (test-more-activations)
   (test-arithmetic-ops)
   (test-vt-from-function)

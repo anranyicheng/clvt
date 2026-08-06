@@ -281,6 +281,10 @@
    :vt-random-int
    :vt-random-integers
    :vt-random-seed
+   :vt-random-choice
+   :vt-random-permutation
+   :vt-random-shuffle
+   :vt-random-multinomial
 
    ;; nan的相关
    :vt-float-nan
@@ -295,6 +299,18 @@
    :+vt-float-nan+
    :+vt-float-pos-inf+
    :+vt-float-neg-inf+
+
+   ;; nan 感知统计
+   :vt-nansum
+   :vt-nanmean
+   :vt-nanstd
+   :vt-nanvar
+   :vt-nanmax
+   :vt-nanmin
+   :vt-nanargmax
+   :vt-nanargmin
+   :vt-nanprod
+   :vt-nanmedian
    
    ;; 核心迭代与映射
    :vt-map

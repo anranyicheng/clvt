@@ -37,8 +37,11 @@
     "判断是否为无穷大 (单双精度均可)."
     (and (floatp x)
          #+sbcl (sb-kernel::float-infinity-p x)
-         #-sbcl (with-float-safe (or (= x (/ 1.0d0 0.0d0)) 
-                                     (= x (/ -1.0d0 0.0d0))))))
+         #-sbcl (with-float-safe
+                  (let* ((zero (coerce 0 (type-of x)))
+                         (pos-inf (/ (coerce 1 (type-of x)) zero))
+                         (neg-inf (/ (coerce -1 (type-of x)) zero)))
+                    (or (= x pos-inf) (= x neg-inf))))))
 
   ;; === 比较函数 ===
   (defun vt-float-nan-= (a b)
@@ -46,8 +49,12 @@
     (and (vt-float-nan-p a) (vt-float-nan-p b)))
 
   (defun vt-float-inf-= (a b)
-    "两个 Inf 相等."
-    (with-float-safe (= a b)))
+    "两个 Inf 相等 (同符号). NaN 不等于任何值."
+    (and (not (vt-float-nan-p a))
+         (not (vt-float-nan-p b))
+         (vt-float-inf-p a)
+         (vt-float-inf-p b)
+         (with-float-safe (= a b))))
   
   (defun vt-float-nan-inf-= (a b)
     "统一比较: NaN 与 NaN 相等，Inf 与 Inf 相等，其余数值正常比较."
@@ -55,6 +62,21 @@
       ((and (vt-float-nan-p a) (vt-float-nan-p b)) t)
       ((or (vt-float-nan-p a) (vt-float-nan-p b)) nil)
       (t (with-float-safe (= a b)))))
+
+  ;; === 分类谓词 (正/负无穷分别判断) ===
+  (defun vt-float-pos-inf-p (x)
+    "判断是否为正无穷大."
+    (and (floatp x)
+         #+sbcl (and (sb-kernel::float-infinity-p x) (plusp x))
+         #-sbcl (with-float-safe (= x (/ (coerce 1 (type-of x))
+                                         (coerce 0 (type-of x)))))))
+
+  (defun vt-float-neg-inf-p (x)
+    "判断是否为负无穷大."
+    (and (floatp x)
+         #+sbcl (and (sb-kernel::float-infinity-p x) (minusp x))
+         #-sbcl (with-float-safe (= x (/ (coerce -1 (type-of x))
+                                         (coerce 0 (type-of x)))))))
   )
 ;; === 全局常量 (加载期初始化，零运行时开销，零编译警告) ===
 (defconstant +vt-dfloat-nan+

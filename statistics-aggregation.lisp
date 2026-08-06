@@ -406,3 +406,130 @@
 				:dtype infer-dtype :out out)))
           (vt-where (vt-all mask :axis axis :keepdims keepdims)
 		    nan-val result :dtype infer-dtype :out result)))))
+
+(defun vt-nanargmax (tensor &key axis out)
+  "返回最大值索引，忽略 NaN。对标 NumPy 的 np.nanargmax。"
+  (with-float-safe
+    (if (member (vt-dtype tensor) '(:int32 :int64))
+        (vt-argmax tensor :axis axis :out out)
+        (let* ((mask (vt-isnan tensor))
+               (neg-inf (vt-get-neg-inf (vt-dtype tensor)))
+               (clean (vt-where mask neg-inf tensor)))
+          (vt-argmax clean :axis axis :out out)))))
+
+(defun vt-nanargmin (tensor &key axis out)
+  "返回最小值索引，忽略 NaN。对标 NumPy 的 np.nanargmin。"
+  (with-float-safe
+    (if (member (vt-dtype tensor) '(:int32 :int64))
+        (vt-argmin tensor :axis axis :out out)
+        (let* ((mask (vt-isnan tensor))
+               (pos-inf (vt-get-pos-inf (vt-dtype tensor)))
+               (clean (vt-where mask pos-inf tensor)))
+          (vt-argmin clean :axis axis :out out)))))
+
+(defun vt-nanprod (tensor &key axis keepdims dtype out)
+  "忽略 NaN 的乘积。对标 NumPy 的 np.nanprod。"
+  (with-float-safe
+    (if (member (vt-dtype tensor) '(:int32 :int64))
+        (vt-prod tensor :axis axis :keepdims keepdims :dtype dtype :out out)
+        (let* ((mask (vt-isnan tensor))
+               (one-val (if (eq (vt-dtype tensor) :float32) 1.0s0 1.0d0))
+               (clean (vt-where mask one-val tensor)))
+          (vt-prod clean :axis axis :keepdims keepdims :dtype dtype :out out)))))
+
+(defun vt-nanmedian (tensor &key axis keepdims out)
+  "忽略 NaN 计算中位数。对标 NumPy 的 np.nanmedian。"
+  (with-float-safe
+    (if (member (vt-dtype tensor) '(:int32 :int64))
+        (vt-median tensor :axis axis :keepdims keepdims :out out)
+        (let* ((nan-val (vt-get-nan :float64))
+               (in-data (vt-data tensor))
+               (in-strides (vt-strides tensor))
+               (in-offset (vt-offset tensor))
+               (in-shape (vt-shape tensor))
+               (rank (length in-shape)))
+          (cond
+            ;; Global median
+            ((null axis)
+             (let ((vals '()))
+               (vt-do-each (ptr val tensor)
+                 (unless (vt-float-nan-p val)
+                   (push val vals)))
+               (setf vals (sort vals #'<))
+               (let ((result
+                       (cond
+                         ((null vals) nan-val)
+                         ((oddp (length vals)) (coerce (nth (floor (length vals) 2) vals) 'double-float))
+                         (t (coerce (/ (+ (nth (1- (/ (length vals) 2)) vals)
+                                          (nth (/ (length vals) 2) vals))
+                                       2.0d0) 'double-float)))))
+                 (if out
+                     (progn (vt-fill out result) out)
+                     (make-vt nil result :dtype :float64)))))
+            ;; Axis reduction: iterate over output, collect along axis
+            (t
+             (let* ((ax (vt-normalize-axis axis rank))
+                    (ax-size (nth ax in-shape))
+                    (ax-stride (nth ax in-strides))
+                    ;; Build output shape
+                    (out-shape (if keepdims
+                                   (loop for d in in-shape
+                                         for i from 0
+                                         collect (if (= i ax) 1 d))
+                                   (loop for d in in-shape
+                                         for i from 0
+                                         unless (= i ax) collect d)))
+                    (res (vt-zeros out-shape :dtype :float64))
+                    (res-data (vt-data res))
+                    (res-offset (vt-offset res))
+                    ;; Map: for each output dimension, which input dimension it corresponds to
+                    ;; and what stride to use
+                    (out-rank (length out-shape))
+                    (out-dims (coerce out-shape 'simple-vector))
+                    (out-strs (coerce (vt-strides res) 'simple-vector))
+                    ;; For each output dim, the corresponding input dim index
+                    (in-dim-map (let ((map (make-array out-rank :element-type 'fixnum))
+                                      (k 0))
+                                  (loop for i from 0 below rank do
+                                    (unless (= i ax)
+                                      (setf (aref map k) i)
+                                      (incf k)))
+                                  map))
+                    (in-dim-strs (coerce (loop for i below out-rank
+                                               collect (nth (aref in-dim-map i) in-strides))
+                                         'simple-vector)))
+               (declare (type simple-vector out-dims out-strs in-dim-strs)
+                        (type (simple-array fixnum (*)) in-dim-map))
+               ;; Recurse over output dimensions
+               (labels ((compute-med (depth in-ptr out-ptr)
+                          (declare (type fixnum depth in-ptr out-ptr))
+                          (if (= depth out-rank)
+                              ;; Leaf: collect non-NaN values along axis
+                              (let ((vals '()))
+                                (loop for i fixnum from 0 below ax-size
+                                      for ptr fixnum = in-ptr then (+ ptr ax-stride)
+                                      for v = (aref in-data ptr)
+                                      unless (vt-float-nan-p v)
+                                        do (push (coerce v 'double-float) vals))
+                                (setf vals (nreverse vals))
+                                (setf (aref res-data out-ptr)
+                                      (cond
+                                        ((null vals) nan-val)
+                                        ((oddp (length vals))
+                                         (nth (floor (length vals) 2) vals))
+                                        (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
+                                                 (nth (/ (length vals) 2) vals))
+                                              2.0d0)))))
+                              ;; Loop over this output dimension
+                              (let ((dim (the fixnum (svref out-dims depth)))
+                                    (out-str (the fixnum (svref out-strs depth)))
+                                    (in-str (the fixnum (svref in-dim-strs depth))))
+                                (declare (type fixnum dim out-str in-str))
+                                (loop for i fixnum from 0 below dim do
+                                  (compute-med (1+ depth) in-ptr out-ptr)
+                                  (incf in-ptr in-str)
+                                  (incf out-ptr out-str))))))
+                 (compute-med 0 in-offset res-offset))
+               (if out
+                   (progn (vt-copy-into out res) out)
+                   res))))))))

@@ -352,6 +352,10 @@ vt-nanstd
 vt-nanvar
 vt-nanmax
 vt-nanmin
+vt-nanargmax
+vt-nanargmin
+vt-nanprod
+vt-nanmedian
 
 ;; 线性代数
 vt-matmul
@@ -425,6 +429,10 @@ vt-random-normal
 vt-random-int
 vt-random-integers
 vt-random-seed
+vt-random-choice
+vt-random-permutation
+vt-random-shuffle
+vt-random-multinomial
 
 ;; nan的相关
 vt-float-nan
