@@ -243,7 +243,7 @@ vt-rem
 vt-round
 vt-floor
 vt-ceiling
-vt-trancate
+vt-truncate
 vt-rint
 vt-log
 vt-log2
@@ -463,6 +463,17 @@ vt-compute-strides
 vt-compute-logical-strides
 with-float-safe
 
+;; 扩展功能 (extensions.lisp)
+vt-count-nonzero    ;; 统计非零元素个数 (对标 numpy.count_nonzero)
+vt-count            ;; 统计等于指定值的元素个数
+vt-flatnonzero      ;; 展平后返回非零元素索引 (对标 numpy.flatnonzero)
+vt-moveaxis         ;; 移动轴到新位置 (对标 numpy.moveaxis)
+vt-inner            ;; 内积 (对标 numpy.inner)
+vt-tensordot        ;; 张量缩并 (对标 numpy.tensordot)
+vt-topk             ;; 获取前 k 个最大/最小值 (对标 torch.topk)
+vt-clip-tensor      ;; 支持张量作为边界的裁剪
+vt-set-print-options ;; 设置打印选项
+vt-get-print-options ;; 获取打印选项
 
 ```
 测试在 example/example.lisp 文件中。
@@ -473,7 +484,7 @@ with-float-safe
 
 自动化测试:
 ```bash
-# 运行所有测试 (815 个测试用例)
+# 运行所有测试 (834 个测试用例)
 bash test/run-tests.sh
 
 # 运行指定测试套件

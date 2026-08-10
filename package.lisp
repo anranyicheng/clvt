@@ -333,7 +333,19 @@
    :*vt-print-precision*
    :*vt-indent-step*
    :*vt-fun-list*
-   :*vt-einsum-parse-cache*))
+   :*vt-einsum-parse-cache*
+
+   ;; 扩展功能 (extensions.lisp)
+   :vt-count-nonzero
+   :vt-moveaxis
+   :vt-inner
+   :vt-tensordot
+   :vt-topk
+   :vt-set-print-options
+   :vt-get-print-options
+   :vt-flatnonzero
+   :vt-count
+   :vt-clip-tensor))
 
 (in-package :clvt)
 (defparameter *vt-fun-list* nil)

@@ -21,4 +21,5 @@
 	       (:file "activation")
 	       (:file "loss-probability")
 	       (:file "linalg")
-	       (:file "linalg-extensions")))
+	       (:file "linalg-extensions")
+	       (:file "extensions")))

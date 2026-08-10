@@ -4,6 +4,47 @@
 
 ---
 
+## 2026-08-10 — MiMo (Xiaomi AI) 项目审查与功能补充
+
+### 项目审查
+
+对整个 clvt 项目进行了全面审查，覆盖全部 15 个源文件（约 8000 行代码），识别出 NumPy/PyTorch 生态中常用但缺失的关键函数，并补充实现。
+
+### 新增功能 (extensions.lisp)
+
+| 函数 | 对标 | 说明 |
+|------|------|------|
+| `vt-count-nonzero` | `numpy.count_nonzero` | 统计非零元素个数，支持 axis/keepdims |
+| `vt-count` | — | 统计等于指定值的元素个数 |
+| `vt-flatnonzero` | `numpy.flatnonzero` | 展平后返回非零元素的一维索引 |
+| `vt-moveaxis` | `numpy.moveaxis` | 将轴从源位置移动到目标位置，返回零拷贝视图 |
+| `vt-inner` | `numpy.inner` | 内积，沿最后一个轴收缩 |
+| `vt-tensordot` | `numpy.tensordot` | 张量缩并，支持整数轴和显式轴对两种模式 |
+| `vt-topk` | `torch.topk` | 沿指定轴获取前 k 个最大/最小值及其索引 |
+| `vt-clip-tensor` | — | 支持张量作为上下边界的裁剪（`vt-clip` 的扩展版） |
+| `vt-set-print-options` | `numpy.set_print_options` | 设置打印阈值、精度、缩步长 |
+| `vt-get-print-options` | — | 获取当前打印选项 |
+
+### Bug 修复
+
+| Bug | 严重程度 | 修复方式 |
+|-----|----------|----------|
+| README.md 中 `vt-trancate` 拼写错误 | 🟢 轻微 | 修正为 `vt-truncate`，与实际导出名一致 |
+
+### 构建与环境
+
+- SBCL 安装：从 SourceForge 下载 SBCL 2.6.7 二进制包，安装到 `~/.local/`
+- Quicklisp：自动安装并配置 `~/quicklisp/local-projects/clvt` 软链接
+- Python3 + NumPy：确认系统自带可用
+
+### 测试
+
+- 新增 `test/test-extensions.lisp`，包含 **19 个测试用例**，覆盖全部新增函数
+- 原有 **815 个测试用例** 全部通过，无回归
+- 总计 **834 个测试用例**，全部通过 ✅
+
+---
+
 ## 2026-08-01 — MiMo (Xiaomi AI) 系统性测试与修复
 
 ### Bug 修复
