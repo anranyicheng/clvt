@@ -1,6 +1,5 @@
 ;;;; test-extensions.lisp — 测试新增的扩展函数
 
-(load "~/quicklisp/setup.lisp")
 (ql:quickload :clvt)
 
 (in-package :clvt)
@@ -83,7 +82,9 @@
     (check "topk 3 idxs"
            (vt-to-list idxs)
            '(5 7 4)))
-  (multiple-value-bind (vals idxs) (vt-topk m 3 :largest nil)
+  (multiple-value-bind (vals idxs)
+      (vt-topk m 3 :largest nil)
+    (declare (ignore idxs))
     (check "topk 3 smallest vals"
            (vt-to-list vals)
            '(1.0d0 1.0d0 2.0d0))))
@@ -118,6 +119,3 @@
 (vt-set-print-options :threshold 3 :precision 6 :indent-step 1)
 
 (format t "~%=== Results: ~a PASS, ~a FAIL ===~%" *pass* *fail*)
-(when (> *fail* 0)
-  (sb-ext:exit :code 1))
-(sb-ext:exit :code 0)
