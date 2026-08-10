@@ -255,7 +255,7 @@
           (vt-zeros '(0) :dtype dtype)))))
 
 ;;; ============================================================
-;;; 9. vt-argmax/argmin with keepdims support
+;;; 9. vt-count with keepdims support
 ;;; ============================================================
 
 (defun vt-count (tensor value &key axis keepdims (dtype :int64))
