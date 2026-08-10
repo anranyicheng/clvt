@@ -91,8 +91,10 @@
          (let* ((a-free (1- a-rank))
                 (b-free (1- b-rank))
                 ;; 使用 ASCII 字母分配标签
-                (a-labels (loop for i below a-free collect (code-char (+ #.(char-code #\a) i))))
-                (b-labels (loop for i below b-free collect (code-char (+ #.(char-code #\a) (+ a-free i)))))
+                (a-labels (loop for i below a-free
+				collect (code-char (+ #.(char-code #\a) i))))
+                (b-labels (loop for i below b-free
+				collect (code-char (+ #.(char-code #\a) (+ a-free i)))))
                 (contract-label #\z)
                 (a-sub (append a-labels (list contract-label)))
                 (b-sub (append b-labels (list contract-label)))
@@ -126,7 +128,8 @@
                 (a-free (- a-rank n))
                 (b-free (- b-rank n))
                 ;; 预分配所有标签
-                (all (loop for i below (+ a-free n b-free) collect (code-char (+ #.(char-code #\a) i))))
+                (all (loop for i below (+ a-free n b-free)
+			   collect (code-char (+ #.(char-code #\a) i))))
                 (a-free-labels (subseq all 0 a-free))
                 (contract-labels (subseq all a-free (+ a-free n)))
                 (b-free-labels (subseq all (+ a-free n)))
@@ -214,42 +217,19 @@
         ;; 取 k 个元素
         (let ((vals (if largest
                         ;; 最大值：取最后 k 个（升序的尾部），再翻转为降序
-                        (vt-flip (vt-narrow sorted-tensor ax (- ax-dim k) ax-dim) :axis ax)
+                        (vt-flip (vt-narrow sorted-tensor ax (- ax-dim k) ax-dim)
+				 :axis ax)
                         ;; 最小值：取前 k 个
                         (vt-narrow sorted-tensor ax 0 k)))
               (idxs (if largest
-                        (vt-flip (vt-narrow sorted-indices ax (- ax-dim k) ax-dim) :axis ax)
+                        (vt-flip (vt-narrow sorted-indices ax (- ax-dim k) ax-dim)
+				 :axis ax)
                         (vt-narrow sorted-indices ax 0 k))))
           ;; 如果不要排序
           (unless sorted
             ;; 随机打乱？这里简单返回不额外处理
             nil)
           (values vals idxs))))))
-
-;;; ============================================================
-;;; 6. vt-set-print-options — 设置打印选项
-;;; ============================================================
-
-(defun vt-set-print-options (&key threshold precision indent-step)
-  "设置 clvt 的张量打印选项。
-   threshold: 触发省略输出的元素阈值（默认 1000）。
-   precision: 浮点数打印精度（默认 4）。
-   indent-step: 缩进步长（默认 2）。"
-  (when threshold
-    (setf *vt-print-threshold* threshold))
-  (when precision
-    (setf *vt-print-precision* precision))
-  (when indent-step
-    (setf *vt-indent-step* indent-step))
-  (values))
-
-;;; ============================================================
-;;; 7. vt-get-print-options — 获取打印选项
-;;; ============================================================
-
-(defun vt-get-print-options ()
-  "返回当前打印选项的列表：(threshold precision indent-step)。"
-  (list *vt-print-threshold* *vt-print-precision* *vt-indent-step*))
 
 ;;; ============================================================
 ;;; 8. vt-flatnonzero — 展平后返回非零元素索引

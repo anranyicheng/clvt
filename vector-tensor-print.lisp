@@ -157,3 +157,21 @@
            ;; 传递 element-type 给递归函数
            (print-vt-recursive
 	    obj 0 nil 2 max-width element-type stream)))))))
+
+
+(defun vt-set-print-options (&key threshold precision indent-step)
+  "设置 clvt 的张量打印选项。
+   threshold: 触发省略输出的元素阈值（默认 1000）。
+   precision: 浮点数打印精度（默认 4）。
+   indent-step: 缩进步长（默认 2）。"
+  (when threshold
+    (setf *vt-print-threshold* threshold))
+  (when precision
+    (setf *vt-print-precision* precision))
+  (when indent-step
+    (setf *vt-indent-step* indent-step))
+  (values))
+
+(defun vt-get-print-options ()
+  "返回当前打印选项的列表：(threshold precision indent-step)。"
+  (list *vt-print-threshold* *vt-print-precision* *vt-indent-step*))
