@@ -101,3 +101,24 @@
 
 (defun vt-float-neg-inf (&optional (dtype :float64))
   (vt-get-neg-inf dtype))
+
+;;; ------------------------------------------------------------------
+;;; 快速 NaN / Inf 判定（内联，调用方需确保浮点陷阱已屏蔽）
+;;; 用于 vt-map / vt-reduce / vt-numpy-sort / vt-unique 等已 with-float-safe 的热路径。
+;;; ------------------------------------------------------------------
+
+(declaim (inline %nan-p %inf-p %pos-inf-p %neg-inf-p))
+
+(defun %nan-p (x)
+  "快速 NaN 判定：IEEE 754 中 NaN != NaN。调用方需屏蔽浮点陷阱。"
+  (and (floatp x) (not (= x x))))
+
+(defun %inf-p (x)
+  "快速 Inf 判定：|x| > most-positive-double-float（对 single/double 均成立）。"
+  (and (floatp x) (> (abs x) most-positive-double-float)))
+
+(defun %pos-inf-p (x)
+  (and (floatp x) (> x most-positive-double-float)))
+
+(defun %neg-inf-p (x)
+  (and (floatp x) (< x most-negative-double-float)))

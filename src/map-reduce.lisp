@@ -300,7 +300,7 @@
                                     (vt-dtype out) dtype))
                             (out (vt-dtype out))
                             (dtype dtype)
-                            ((and init-val (or (floatp init-val) (vt-float-inf-p init-val))) :float64)
+                            ((and init-val (or (floatp init-val) (%inf-p init-val))) :float64)
                             (t (vt-dtype tensor))))
              (res (or out (make-vt out-shape 0 :dtype final-dtype)))
              (res-data (vt-data res))

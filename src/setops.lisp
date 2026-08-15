@@ -13,7 +13,7 @@
       (setf sorted-idx (sort sorted-idx
                              (lambda (a b)
                                (let ((va (aref src-data a)) (vb (aref src-data b)))
-                                 (cond ((vt-float-nan-p va) nil) ((vt-float-nan-p vb) t)
+                                 (cond ((%nan-p va) nil) ((%nan-p vb) t)
                                        (t (< va vb)))))))
       (let ((unique-vals (make-array 0 :element-type elem-type :adjustable t :fill-pointer t))
             (first-idx (make-array 0 :element-type '(signed-byte 64) :adjustable t :fill-pointer t))
@@ -27,8 +27,8 @@
               for start = pos
               do (vector-push-extend val unique-vals)
                  (vector-push-extend idx0 first-idx)
-                 (if (vt-float-nan-p val)
-                     (loop while (and (< pos n) (vt-float-nan-p (aref src-data (aref sorted-idx pos))))
+                 (if (%nan-p val)
+                     (loop while (and (< pos n) (%nan-p (aref src-data (aref sorted-idx pos))))
                            for orig = (aref sorted-idx pos)
                            do (setf (aref inverse orig) uniq-num) (incf pos))
                      (loop while (and (< pos n) (= val (aref src-data (aref sorted-idx pos))))

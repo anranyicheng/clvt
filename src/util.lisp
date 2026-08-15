@@ -56,7 +56,7 @@
   (with-float-safe
     (let ((sequence (coerce sequence 'list)) non-nans nans)
       (dolist (x sequence)
-        (if (vt-float-nan-p x) (push x nans) (push x non-nans)))
+        (if (%nan-p x) (push x nans) (push x non-nans)))
       (setf non-nans (stable-sort (nreverse non-nans) predicate)
             nans (nreverse nans))
       (if (or (eq predicate #'<) (eq predicate '<))
