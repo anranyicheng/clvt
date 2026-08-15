@@ -486,6 +486,8 @@ vt-get-print-options ;; 获取打印选项
 ```
 测试在 example/example.lisp 文件中。
 ``` common lisp
+(ql:quickload :clvt)
+(in-package :clvt)
 (load "~/quicklisp/local-projects/clvt/example/example.lisp")
 (run-all-tests)
 ```
