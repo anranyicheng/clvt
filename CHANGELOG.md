@@ -26,6 +26,7 @@
 - `vt-map` 重写为按输出元素类型特化（`(the (simple-array double-float (*)) ...)`），消除浮点装箱
 - 恢复 `vt-fast-map` 编译期内联（`%inline1-loop` / `%inline2-loop` / `%cast-to`），`vt-+`/`vt-*`/`vt--`/`vt-/`、`vt-add`/`vt-sub`/`vt-mul`/`vt-div`/`vt-scale` 及一元数学函数（`vt-sin`/`vt-cos`/`vt-exp` 等）均内联算子，避免 `funcall` 装箱
 - 基准（100 万元素，暖机后）：`vt-+` ≈ 0.004s、`vt-add` ≈ 0.009s、`vt-sin` ≈ 0.027s，达到或超越重构前水平；内联路径装箱量从 ~56MB 降至 ~8MB（仅结果张量本身）
+- `vt-reduce` 内层递归循环按输入/输出元素类型特化（`macrolet` 生成 `(the (simple-array <type> (*)) ...)` 的 `recurse`，整数走 `truncate`、浮点走 `coerce`），消除 `vt-cast` 运行时 `ecase` 分派与通用 `aref` 的逐元素装箱；100 万元素下 `vt-sum` 提速约 1.5–1.75×、`vt-mean` 约 1.5–1.7×、`vt-amax` 约 1.3–1.5×
 
 ### 测试体系
 
