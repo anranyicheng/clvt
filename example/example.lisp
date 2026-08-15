@@ -2474,10 +2474,9 @@
     ;; ---------- 1d 等间距 ----------
     (let* ((x (vt-arange 6 :step 1.0d0 :dtype :float64))       ; 0,1,2,3,4,5
            (y (vt-square x))                                         ; y = x^2
-           ;; axis nil → 返回所有轴的梯度列表（此处 1d → 单元素列表）
-           (grad-list (vt-gradient y))
-           (grad (first grad-list)))     ; 取出唯一张量
-      (format t "~%1d uniform (single from list): ~a~%" grad)
+           ;; axis nil → 1d 返回单个张量（与 NumPy 一致）
+           (grad (vt-gradient y)))
+      (format t "~%1d uniform (single): ~a~%" grad)
       ;; 理论：内部二阶中心差分，边界一阶差分
       (assert-close (vt-ref grad 0) 1.0d0)       ; (f1-f0)/1 = 1
       (assert-close (vt-ref grad 1) 2.0d0)       ; (f2-f0)/2 = 2
