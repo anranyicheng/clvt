@@ -1,25 +1,28 @@
 ;;;; clvt.asd
 
 (asdf:defsystem #:clvt
-  :description "common lisp vector tensor libaray"
-  :author "xizang123321@gmail.com>"
+  :description "common lisp vector tensor library"
+  :author "xizang123321@gmail.com"
   :license  "MIT"
-  :version "0.0.1"
+  :version "0.2.0"
   :serial t
-  :components ((:file "package")
-	       (:file "utili")
-	       (:file "nan")
-               (:file "vector-tensor")
-	       (:file "map-reduce")
-	       (:file "random")
-	       (:file "vector-tensor-print")
-	       (:file "einsum")
-	       (:file "statistics-aggregation")
-	       (:file "arithmetic-operation")
-	       (:file "compatible-functions")
-	       (:file "rotate")
-	       (:file "activation")
-	       (:file "loss-probability")
-	       (:file "linalg")
-	       (:file "linalg-extensions")
-	       (:file "extensions")))
+  :components ((:file "src/package")
+               (:file "src/dtype")
+               (:file "src/util")
+               (:file "src/nan")
+               (:file "src/core")
+               (:file "src/iterator")
+               (:file "src/map-reduce")
+               (:file "src/io")
+               (:file "src/creation")
+               (:file "src/manip")
+               (:file "src/indexing")
+               (:file "src/join")
+               (:file "src/elementwise")
+               (:file "src/reduce-stats")
+               (:file "src/setops")
+               (:file "src/random")
+               (:file "src/linalg")
+               (:file "src/nn")
+               (:file "src/rotate")
+               (:file "src/extensions")))

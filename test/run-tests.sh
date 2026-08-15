@@ -33,6 +33,7 @@ SUITES[coverage-gap-test]="97 numpy/pytorch 覆盖差距测试"
 SUITES[comprehensive-test]="119 综合功能测试"
 SUITES[auto-compare-test]="63 JSON 自动对比测试"
 SUITES[benchmark-copy]="性能基准测试"
+SUITES[numpy-compare-test]="69 numpy/pytorch 实时对比测试"
 
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
@@ -88,6 +89,21 @@ check_asdf() {
         --eval '(require :asdf)' \
         --eval '(format t "ASDF ~a~%" (asdf:asdf-version))' 2>/dev/null \
         || { fail "ASDF 加载失败"; exit 1; }
+}
+
+check_python() {
+    if command -v python3 &>/dev/null; then
+        if python3 -c 'import numpy, torch' &>/dev/null; then
+            log "python3: numpy $(python3 -c 'import numpy;print(numpy.__version__)') / torch $(python3 -c 'import torch;print(torch.__version__)')"
+            return 0
+        else
+            warn "未找到 numpy/torch，跳过 numpy-compare-test"
+            return 1
+        fi
+    else
+        warn "未找到 python3，跳过 numpy-compare-test"
+        return 1
+    fi
 }
 
 # 运行单个测试套件
@@ -198,6 +214,8 @@ main() {
 
     # 检查环境
     check_sbcl
+    PY_AVAILABLE=0
+    check_python && PY_AVAILABLE=1 || true
 
     header "clvt 自动化测试"
     log "项目目录: $PROJECT_DIR"
@@ -222,10 +240,20 @@ main() {
             coverage-gap-test
             comprehensive-test
             auto-compare-test
+            numpy-compare-test
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)
         fi
+    fi
+
+    # python/numpy/torch 不可用时移除对比套件
+    if [[ "$PY_AVAILABLE" == "0" ]]; then
+        local filtered=()
+        for s in "${suites_to_run[@]}"; do
+            [[ "$s" == "numpy-compare-test" ]] || filtered+=("$s")
+        done
+        suites_to_run=("${filtered[@]}")
     fi
 
     log "将运行 ${#suites_to_run[@]} 个测试套件"

@@ -4,6 +4,14 @@ clvt (common lisp vector tensor) library.
 
 This is a tensor library written entirely in Common Lisp, collaboratively developed by the AI 'Zhipu Qingyan' (GLM5+) and 'DeepSeek' (v4pro), with extensive testing, bug fixes, and feature extensions contributed by MiMo (Xiaomi AI). The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community already has two relatively popular libraries, magicl and numcl, magicl lacks support for high-dimensional tensors and some important functions, while numcl emphasizes type inference and has some function interfaces that overlap with standard CL functions. The core foundation of the clvt library consists of three functions: vt-einsum, vt-map, and vt-reduce. Most other operations are built by combining these three core functions, making them easy to understand. Additionally, this library features excellent pretty-printing capabilities. Currently, the library has already implemented many basic tensor operations, and further improvements will be made in the future, aiming to implement as many NumPy features as possible, with some functions modeled after PyTorch. Functions in this library are all prefixed with vt-, which, when used with Slime, makes it very convenient to see which functions have been implemented. The majority of tests have been completed on SBCL.
 
+## 架构重构（2026-08-15）
+
+源码已从原来职责混杂的顶层文件重组为 `src/` 下按职责分层的 20 个模块，保持全部 `vt-*` 公共 API 签名兼容，详见下文「架构」一节与 [CHANGELOG.md](CHANGELOG.md)。
+
+- **性能**：逐元素核心 `vt-map` 按元素类型特化（消除浮点装箱），并恢复 `vt-fast-map` 编译期内联；`vt-+` / `vt-*` / `vt-add` / `vt-mul` / `vt-sin` / `vt-exp` 等常用运算在连续内存上达到或超越重构前性能。
+- **可移植**：`with-float-safe` 与 NaN / Inf 判定不再依赖 SBCL 内部符号。
+- **测试**：新增 `numpy-compare-test`，运行时调用 `python3 + numpy + torch` 实时对比结果（69 项）。总计 **900 个测试用例**全部通过。
+
 ## MiMo (Xiaomi AI) 贡献
 
 由 MiMo (Xiaomi AI) 进行了系统性的测试、bug 修复和功能扩展，详见 [CHANGELOG.md](CHANGELOG.md)。
@@ -484,16 +492,46 @@ vt-get-print-options ;; 获取打印选项
 
 自动化测试:
 ```bash
-# 运行所有测试 (834 个测试用例)
+# 运行所有测试 (900 个测试用例)
 bash test/run-tests.sh
 
 # 运行指定测试套件
 bash test/run-tests.sh --suite run_all_tests
 bash test/run-tests.sh --suite nested-test
 
+# 运行时调用 numpy/pytorch 实时对比结果 (需安装 python3 + numpy + torch)
+bash test/run-tests.sh --suite numpy-compare-test
+
 # 列出所有测试套件
 bash test/run-tests.sh --list
 ```
+
+## 架构
+
+源码按职责分层组织在 `src/` 目录下：
+
+| 文件 | 职责 |
+|------|------|
+| `package.lisp` | 包定义与公共 API 导出（按功能分组） |
+| `dtype.lisp` | 元素数据类型系统（单一事实来源） |
+| `util.lisp` | 浮点陷阱屏蔽、关键字参数解析、NaN 感知排序 |
+| `nan.lisp` | NaN / Inf 常量与判定（可移植，不依赖实现内部符号） |
+| `core.lisp` | 张量结构、步长、广播、连续判定、拷贝、填充 |
+| `iterator.lisp` | 统一迭代原语 |
+| `map-reduce.lisp` | `vt-map` / `vt-reduce` 逐元素映射与归约核心 |
+| `io.lisp` | 序列/数组互转与打印 |
+| `creation.lisp` | 张量创建 |
+| `manip.lisp` | 形状/视图/翻转/三角/填充 |
+| `indexing.lisp` | 索引、切片、选择 |
+| `join.lisp` | 连接、堆叠、追加、插入、删除 |
+| `elementwise.lisp` | 逐元素算术/数学/比较/逻辑 |
+| `reduce-stats.lisp` | 归约、统计、排序、NaN 感知统计 |
+| `setops.lisp` | 集合操作 |
+| `random.lisp` | 随机数生成 |
+| `linalg.lisp` | 线性代数（含 einsum） |
+| `nn.lisp` | 激活 / 损失 / softmax |
+| `rotate.lisp` | 图像旋转（对标 scipy.ndimage.rotate） |
+| `extensions.lisp` | 扩展功能 |
 
 ## License
 MIT

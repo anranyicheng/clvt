@@ -4,6 +4,48 @@
 
 ---
 
+## 2026-08-15 — 架构重构与性能优化
+
+### 架构重构
+
+从零重构了整个库，将原来职责混杂的 17 个顶层 `.lisp` 文件重组为 `src/` 下按职责分层的 20 个模块（详见 README「架构」一节），保持全部 `vt-*` 公共 API 签名兼容：
+
+- **内核层**：`dtype.lisp`（类型系统单一事实来源）、`core.lisp`（结构/步长/广播/连续判定/拷贝/填充）、`iterator.lisp`、`map-reduce.lisp`
+- **功能层**：`creation` / `manip` / `indexing` / `join` / `elementwise` / `reduce-stats` / `setops` / `linalg` / `nn` / `random` / `rotate` / `io` / `extensions`
+
+### 规范性修正
+
+- `with-float-safe` 改为 `#+sbcl` / `#-sbcl` 可移植实现
+- `nan.lisp` 不再依赖 `sb-kernel::float-nan-p` 等 SBCL 内部符号，改用 IEEE 754 可移植判定
+- 补齐 `vt-float-nan` / `vt-float-pos-inf` / `vt-float-neg-inf` / `vt-compute-logical-strides` 等「已导出但未定义」的悬空符号
+- `package.lisp` 导出按功能分组，`*vt-fun-list*` 自动收集
+- 修复 `benchmark-copy.lisp` 中非法 FORMAT 指令 `~30-50x`
+
+### 性能优化
+
+- `vt-map` 重写为按输出元素类型特化（`(the (simple-array double-float (*)) ...)`），消除浮点装箱
+- 恢复 `vt-fast-map` 编译期内联（`%inline1-loop` / `%inline2-loop` / `%cast-to`），`vt-+`/`vt-*`/`vt--`/`vt-/`、`vt-add`/`vt-sub`/`vt-mul`/`vt-div`/`vt-scale` 及一元数学函数（`vt-sin`/`vt-cos`/`vt-exp` 等）均内联算子，避免 `funcall` 装箱
+- 基准（100 万元素，暖机后）：`vt-+` ≈ 0.004s、`vt-add` ≈ 0.009s、`vt-sin` ≈ 0.027s，达到或超越重构前水平；内联路径装箱量从 ~56MB 降至 ~8MB（仅结果张量本身）
+
+### 测试体系
+
+- 新增 `test/numpy-compare-test.lisp` + `test/ref_compute.py`：SBCL 运行时调用 `python3` 实时生成 numpy / pytorch 参考结果并对比（69 项，覆盖创建/逐元素/归约/线性代数/神经网络/集合/形状/torch.topk）
+- `test/run-tests.sh` 更新：纳入新套件、python3/numpy/torch 可用性检查
+- 总计 **900 个测试用例**（831 原有 + 69 新增实时对比），全部通过 ✅
+
+### 回归修复
+
+通过 `example.lisp` 额外捕获并修复了重写引入的 4 处回归：
+
+| 问题 | 位置 | 修复 |
+|------|------|------|
+| `vt-gradient` 切片规格多余嵌套 / 引号变量 | `reduce-stats.lisp` | `'((1 2))`→`'(1 2)`、`'(2 n)`→`(list 2 n)` |
+| `vt-histogram` 缺失 `with-float-safe` 触发 NaN/Inf 浮点陷阱 | `reduce-stats.lisp` | 恢复包装 |
+| `vt-unique` 缺失 `with-float-safe` 触发 `(= +inf NaN)` 陷阱 | `setops.lisp` | 恢复包装 |
+| `vt-delete` 错误消息格式串与参数个数不匹配 | `join.lisp` | 补全 `~d` 占位符 |
+
+---
+
 ## 2026-08-10 — MiMo (Xiaomi AI) 项目审查与功能补充
 
 ### 项目审查
