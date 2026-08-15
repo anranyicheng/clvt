@@ -318,6 +318,7 @@
                        (let* ((red-shape (mapcar (lambda (a) (nth a in-shape)) axes))
                               (red-strides (vt-compute-strides red-shape))
                               (k -1))
+			 (declare (fixnum k))
                          (loop for i below rank
                                if (member i axes)
                                  collect (progn (incf k) (nth k red-strides))
