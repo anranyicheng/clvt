@@ -63,24 +63,49 @@
           (has-int :int32)
           (t :float64))))
 
+(declaim (inline %wrap-int8 %wrap-int16 %wrap-uint8 %wrap-uint16))
+
+(defun %wrap-int8 (v)
+  "将截断后的整数按 int8 范围 [-128,127] 回绕（NumPy 语义）。"
+  (let ((m (mod (truncate v) 256)))
+    (if (>= m 128) (- m 256) m)))
+
+(defun %wrap-int16 (v)
+  "将截断后的整数按 int16 范围 [-32768,32767] 回绕（NumPy 语义）。"
+  (let ((m (mod (truncate v) 65536)))
+    (if (>= m 32768) (- m 65536) m)))
+
+(defun %wrap-uint8 (v)
+  "将截断后的整数按 uint8 范围 [0,255] 回绕（NumPy 语义）。"
+  (mod (truncate v) 256))
+
+(defun %wrap-uint16 (v)
+  "将截断后的整数按 uint16 范围 [0,65535] 回绕（NumPy 语义）。"
+  (mod (truncate v) 65536))
+
 (defun vt-cast (val dtype)
-  "安全类型转换。浮点转整数时执行截断。"
+  "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。"
   (ecase dtype
     (:float64 (coerce val 'double-float))
     (:float32 (coerce val 'single-float))
     (:int64   (truncate val))
     (:int32   (truncate val))
-    (:int16   (truncate val))
-    (:int8    (truncate val))
-    (:uint8   (let ((v (truncate val))) (if (minusp v) (+ v 256) v)))
-    (:uint16  (let ((v (truncate val))) (if (minusp v) (+ v 65536) v)))))
+    (:int16   (%wrap-int16 val))
+    (:int8    (%wrap-int8 val))
+    (:uint8   (%wrap-uint8 val))
+    (:uint16  (%wrap-uint16 val))))
 
 (defun vt-cast-fun (dtype)
-  "返回将数值转换为 dtype 的转换函数。"
+  "返回将数值转换为 dtype 的转换函数（与 vt-cast 语义一致）。"
   (ecase dtype
     (:float64 (lambda (val) (coerce val 'double-float)))
     (:float32 (lambda (val) (coerce val 'single-float)))
-    ((:int64 :int32 :int16 :int8 :uint8 :uint16) #'truncate)))
+    (:int64   #'truncate)
+    (:int32   #'truncate)
+    (:int16   #'%wrap-int16)
+    (:int8    #'%wrap-int8)
+    (:uint8   #'%wrap-uint8)
+    (:uint16  #'%wrap-uint16)))
 
 (defun vt-dtype-default-value (dtype)
   "返回 dtype 对应的零值。"

@@ -46,6 +46,13 @@
 | `vt-unique` 缺失 `with-float-safe` 触发 `(= +inf NaN)` 陷阱 | `setops.lisp` | 恢复包装 |
 | `vt-delete` 错误消息格式串与参数个数不匹配 | `join.lisp` | 补全 `~d` 占位符 |
 
+### Bug 修复（数值转换与返回类型）
+
+- `vt-cast` 对 `:int8`/`:int16`/`:uint8`/`:uint16` 增加 NumPy 语义的回绕（mod）：超出范围的值不再直接返回导致 TYPE-ERROR，而是回绕到目标范围内（如 `(vt-cast 200.0 :int8)` → -56、`(vt-cast 256 :uint8)` → 0、`(vt-cast 65536 :uint16)` → 0）
+- `vt-cast-fun` 对 `:uint8`/`:uint16`/`:int8`/`:int16` 返回与 `vt-cast` 语义一致的转换函数（此前返回 `#'truncate`，负数行为不一致）
+- `vt-sinc` 整数输入时按 `%infer-float-dtype` 推断浮点结果类型（此前沿用整数 dtype 导致精度丢失）
+- `vt-gradient` 当 `axis=nil` 且输入为一维时返回单个 VT 对象（此前返回含单元素的列表，与 NumPy 不一致）
+
 ---
 
 ## 2026-08-10 — MiMo (Xiaomi AI) 项目审查与功能补充

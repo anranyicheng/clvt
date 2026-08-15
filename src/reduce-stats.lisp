@@ -664,4 +664,4 @@
                                            (apply #'vt-slice tensor (slice-specs ax 0 (- n 2))))))
                              (vt-concatenate ax (vt-/ dl hl) (vt-/ di hi) (vt-/ dr hr)))))))))
       (let ((results (loop for ax in axes for sp in spacings collect (grad-along ax sp))))
-        (if (and (integerp axis) (null (cdr axes))) (car results) results)))))
+        (if (and (or (null axis) (integerp axis)) (null (cdr results))) (car results) results)))))

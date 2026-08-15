@@ -215,5 +215,5 @@
   (vt-fast-map #'- vt :dtype dtype :out out))
 
 (defun vt-sinc (tensor &key out dtype)
-  (let* ((dt (or dtype (vt-dtype tensor))) (x-pi (vt-scale tensor pi)))
+  (let* ((dt (%infer-float-dtype tensor dtype)) (x-pi (vt-scale tensor pi :dtype dt)))
     (vt-map (lambda (x) (if (zerop x) 1.0d0 (/ (sin x) x))) x-pi :out out :dtype dt)))
