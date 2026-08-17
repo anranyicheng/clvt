@@ -11,23 +11,23 @@
   (declare (function fn) (optimize (speed 3) (safety 0)))
   (with-float-safe
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
-    (when (null tensors)
-      (error "vt-map 至少需要一个输入张量"))
-    (let* ((inputs (mapcar #'ensure-vt tensors))
-           (out-shape (reduce #'vt-broadcast-shapes (mapcar #'vt-shape inputs)))
-           (final-dtype (cond
-                          ((and out dtype (not (eq (vt-dtype out) dtype)))
-                           (error "vt-map: :out 类型 (~a) 与 :dtype (~a) 冲突"
-                                  (vt-dtype out) dtype))
-                          (out (vt-dtype out))
-                          (dtype dtype)
-                          (t (apply #'vt-promote-type (mapcar #'vt-dtype inputs)))))
-           (res (or out (make-vt out-shape 0 :dtype final-dtype))))
-      (when out
-        (unless (equal (vt-shape res) out-shape)
-          (error "vt-map: :out 形状 ~a 与广播结果 ~a 不匹配" (vt-shape res) out-shape)))
-      (%vt-map-run fn inputs res out-shape)
-      res))))
+      (when (null tensors)
+	(error "vt-map 至少需要一个输入张量"))
+      (let* ((inputs (mapcar #'ensure-vt tensors))
+             (out-shape (reduce #'vt-broadcast-shapes (mapcar #'vt-shape inputs)))
+             (final-dtype (cond
+                            ((and out dtype (not (eq (vt-dtype out) dtype)))
+                             (error "vt-map: :out 类型 (~a) 与 :dtype (~a) 冲突"
+                                    (vt-dtype out) dtype))
+                            (out (vt-dtype out))
+                            (dtype dtype)
+                            (t (apply #'vt-promote-type (mapcar #'vt-dtype inputs)))))
+             (res (or out (make-vt out-shape 0 :dtype final-dtype))))
+	(when out
+          (unless (equal (vt-shape res) out-shape)
+            (error "vt-map: :out 形状 ~a 与广播结果 ~a 不匹配" (vt-shape res) out-shape)))
+	(%vt-map-run fn inputs res out-shape)
+	res))))
 
 (defun %vt-map-run (fn inputs res out-shape)
   (let* ((n (length inputs))
@@ -334,11 +334,11 @@
                    (make-list rank :initial-element 0)
                    (loop for i from 0 below rank
                          if (member i axes) collect 0
-                         else collect
-                              (let ((out-idx (if keepdims i
-                                                 (count-if-not (lambda (x) (member x axes))
-                                                               (loop for j below i collect j)))))
-                                (nth out-idx res-strides))))))
+                           else collect
+				(let ((out-idx (if keepdims i
+                                                   (count-if-not (lambda (x) (member x axes))
+								 (loop for j below i collect j)))))
+                                  (nth out-idx res-strides))))))
         (declare (list arg-strides))
         (vt-fill res init-val)
         (when res-idx (vt-fill res-idx 0))
