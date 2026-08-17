@@ -267,7 +267,7 @@
 
 (defun vt-reduce (tensor axis init-val reducer-fn &key out dtype keepdims return-arg)
   "通用归约核心。axis 可为 nil/整数/整数列表。
-   reducer-fn 接收 (acc val)，返回 (values new-acc update-arg-p)。
+   reducer-fn 接收，返回。
    Returns: (values result arg-result)"
   (declare (type vt tensor)
            (type (or null fixnum list) axis)
@@ -281,22 +281,27 @@
            (out-shape (cond ((and global (not keepdims)) nil)
                             (global (make-list rank :initial-element 1))
                             ((not keepdims)
-                             (loop for d in in-shape for i from 0
+                             (loop for d in in-shape
+                                   for i fixnum from 0
                                    unless (member i axes) collect d))
-                            (t (loop for d in in-shape for i from 0
+                            (t (loop for d in in-shape
+                                     for i fixnum from 0
                                      collect (if (member i axes) 1 d)))))
            (axis-size (if axes
                           (reduce #'* (mapcar (lambda (a) (nth a in-shape)) axes)
                                   :initial-value 1)
                           (reduce #'* in-shape :initial-value 1))))
+      (declare (fixnum rank axis-size))
+      
       (when (or (zerop axis-size) (zerop (vt-size tensor)))
         (let ((empty-dtype (or dtype (and out (vt-dtype out)) (vt-dtype tensor))))
           (return-from vt-reduce
             (values (make-vt out-shape (or init-val 0) :dtype empty-dtype)
                     (when return-arg (make-vt out-shape 0 :dtype :int32))))))
+
       (let* ((final-dtype (cond
                             ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "vt-reduce: :out 类型 (~a) 与 :dtype (~a) 冲突"
+                             (error "vt-reduce: :out type (~a) 与 :dtype (~a) 冲突"
                                     (vt-dtype out) dtype))
                             (out (vt-dtype out))
                             (dtype dtype)
@@ -318,8 +323,8 @@
                        (let* ((red-shape (mapcar (lambda (a) (nth a in-shape)) axes))
                               (red-strides (vt-compute-strides red-shape))
                               (k -1))
-			 (declare (fixnum k))
-                         (loop for i below rank
+                         (declare (fixnum k))
+                         (loop for i fixnum below rank
                                if (member i axes)
                                  collect (progn (incf k) (nth k red-strides))
                                else collect 0)))
@@ -329,85 +334,102 @@
                    (make-list rank :initial-element 0)
                    (loop for i from 0 below rank
                          if (member i axes) collect 0
-                           else collect
-                                (let ((out-idx (if keepdims i
-                                                   (count-if-not (lambda (x) (member x axes))
-                                                                 (loop for j below i collect j)))))
-                                  (nth out-idx res-strides))))))
+                         else collect
+                              (let ((out-idx (if keepdims i
+                                                 (count-if-not (lambda (x) (member x axes))
+                                                               (loop for j below i collect j)))))
+                                (nth out-idx res-strides))))))
+        (declare (list arg-strides))
         (vt-fill res init-val)
         (when res-idx (vt-fill res-idx 0))
+        
         (let ((in-shp-vec (coerce in-shape 'simple-vector))
               (in-str-vec (coerce in-strides 'simple-vector))
               (osm-vec (coerce out-strides-map 'simple-vector))
               (arg-str-vec (coerce arg-strides 'simple-vector))
               (out-et (array-element-type res-data))
               (in-et (array-element-type in-data)))
-          (macrolet ((cast-to (lt form)
-                       `(if ,(subtypep lt 'integer) (truncate ,form) (coerce ,form ',lt)))
-                     (gen (lt ilt)
-                       `(labels ((recurse (depth in-ptr out-ptr arg-ptr arg-val)
-                                   (declare (type fixnum depth in-ptr out-ptr arg-ptr arg-val))
-                                   (if (= depth rank)
-                                       (let* ((val (aref ,(if ilt `(the (simple-array ,ilt (*)) in-data) 'in-data) in-ptr))
-                                              (raw-acc (aref (the (simple-array ,lt (*)) res-data) out-ptr)))
-                                         (multiple-value-bind (new-acc do-update-arg)
-                                             (funcall reducer-fn raw-acc val)
-                                           (setf (aref (the (simple-array ,lt (*)) res-data) out-ptr)
-                                                 (cast-to ,lt new-acc))
-                                           (when (and return-arg do-update-arg res-idx-data)
-                                             (setf (aref res-idx-data arg-ptr) arg-val))))
-                                       (let* ((dim (svref in-shp-vec depth))
-                                              (in-stride (svref in-str-vec depth))
-                                              (out-stride (svref osm-vec depth))
-                                              (arg-stride (svref arg-str-vec depth)))
-                                         (declare (type fixnum dim in-stride out-stride arg-stride))
-                                         (loop for i fixnum from 0 below dim do
-                                           (recurse (1+ depth) in-ptr out-ptr arg-ptr
-                                                    (+ arg-val (* i arg-stride)))
-                                           (incf in-ptr in-stride)
-                                           (incf out-ptr out-stride)
-                                           (when return-arg (incf arg-ptr out-stride)))))))
-                          (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
+          
+	  (macrolet ((cast-to (lt form)
+		       `(if ,(subtypep lt 'integer)
+			    (truncate ,form)
+			    (coerce ,form ',lt)))
+		     (gen (lt ilt)
+		       `(labels ((recurse (depth in-ptr out-ptr arg-ptr arg-val)
+				   (declare (type fixnum depth in-ptr out-ptr arg-ptr arg-val))
+				   (if (= depth rank)
+				       (let* ((val (aref ,(if ilt
+							      `(the (simple-array ,ilt (*)) in-data)
+							      'in-data)
+							 in-ptr))
+					      (raw-acc (aref (the (simple-array ,lt (*)) res-data)
+							     out-ptr)))
+					 (multiple-value-bind (new-acc do-update-arg)
+					     (funcall reducer-fn raw-acc val)
+					   (setf (aref (the (simple-array ,lt (*)) res-data)
+						       out-ptr)
+						 (cast-to ,lt new-acc))
+					   (when (and return-arg do-update-arg res-idx-data)
+					     (setf (aref res-idx-data arg-ptr) arg-val))))
+				       (let* ((dim (svref in-shp-vec depth))
+					      (in-stride (svref in-str-vec depth))
+					      (out-stride (svref osm-vec depth))
+					      (arg-stride (svref arg-str-vec depth)))
+					 (declare (type fixnum dim in-stride out-stride arg-stride))
+					 (loop for i fixnum from 0 below dim do
+					   (recurse (1+ depth) in-ptr out-ptr arg-ptr
+						    (+ arg-val (* i arg-stride)))
+					   (incf in-ptr in-stride)
+					   (incf out-ptr out-stride)
+					   (when return-arg (incf arg-ptr out-stride)))))))
+			  (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
+            
             (cond
-              ((equal out-et 'double-float)
-               (cond ((equal in-et 'double-float) (gen double-float double-float))
+	      ((equal out-et 'double-float)
+	       (cond ((equal in-et 'double-float) (gen double-float double-float))
                      ((equal in-et 'single-float) (gen double-float single-float))
                      ((equal in-et '(signed-byte 64)) (gen double-float (signed-byte 64)))
                      ((equal in-et '(signed-byte 32)) (gen double-float (signed-byte 32)))
                      (t (gen double-float nil))))
-              ((equal out-et 'single-float)
-               (cond ((equal in-et 'single-float) (gen single-float single-float))
+	      
+	      ((equal out-et 'single-float)
+	       (cond ((equal in-et 'single-float) (gen single-float single-float))
                      ((equal in-et 'double-float) (gen single-float double-float))
                      ((equal in-et '(signed-byte 64)) (gen single-float (signed-byte 64)))
                      ((equal in-et '(signed-byte 32)) (gen single-float (signed-byte 32)))
                      (t (gen single-float nil))))
-              ((equal out-et '(signed-byte 64))
-               (cond ((equal in-et '(signed-byte 64)) (gen (signed-byte 64) (signed-byte 64)))
+	      
+	      ((equal out-et '(signed-byte 64))
+	       (cond ((equal in-et '(signed-byte 64)) (gen (signed-byte 64) (signed-byte 64)))
                      (t (gen (signed-byte 64) nil))))
-              ((equal out-et '(signed-byte 32))
-               (cond ((equal in-et '(signed-byte 32)) (gen (signed-byte 32) (signed-byte 32)))
+	      
+	      ((equal out-et '(signed-byte 32))
+	       (cond ((equal in-et '(signed-byte 32)) (gen (signed-byte 32) (signed-byte 32)))
                      (t (gen (signed-byte 32) nil))))
-              (t
-               (labels ((recurse (depth in-ptr out-ptr arg-ptr arg-val)
-                          (declare (type fixnum depth in-ptr out-ptr arg-ptr arg-val))
-                          (if (= depth rank)
-                              (let* ((val (aref in-data in-ptr))
-                                     (raw-acc (aref res-data out-ptr)))
-                                (multiple-value-bind (new-acc do-update-arg)
-                                    (funcall reducer-fn raw-acc val)
-                                  (setf (aref res-data out-ptr) (vt-cast new-acc final-dtype))
-                                  (when (and return-arg do-update-arg res-idx-data)
-                                    (setf (aref res-idx-data arg-ptr) arg-val))))
-                              (let* ((dim (svref in-shp-vec depth))
-                                     (in-stride (svref in-str-vec depth))
-                                     (out-stride (svref osm-vec depth))
-                                     (arg-stride (svref arg-str-vec depth)))
-                                (declare (type fixnum dim in-stride out-stride arg-stride))
-                                (loop for i fixnum from 0 below dim do
-                                  (recurse (1+ depth) in-ptr out-ptr arg-ptr
-                                           (+ arg-val (* i arg-stride)))
-                                  (incf in-ptr in-stride)
-                                  (incf out-ptr out-stride)
-                                  (when return-arg (incf arg-ptr out-stride)))))))
-                 (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))))
-        (values res res-idx)))))
+	      
+	      (t
+	       (let ((res-data (the (simple-array * (*)) res-data))
+                     (in-data (the (simple-array * (*)) in-data)))
+                 (labels ((recurse (depth in-ptr out-ptr arg-ptr arg-val)
+                            (declare (type fixnum depth in-ptr out-ptr arg-ptr arg-val))
+                            (if (= depth rank)
+                                (let* ((val (aref in-data in-ptr))
+				       (raw-acc (aref res-data out-ptr)))
+                                  (multiple-value-bind (new-acc do-update-arg)
+				      (funcall reducer-fn raw-acc val)
+                                    (setf (aref res-data out-ptr) (vt-cast new-acc final-dtype))
+                                    (when (and return-arg do-update-arg res-idx-data)
+				      (setf (aref res-idx-data arg-ptr) arg-val))))
+                                (let* ((dim (svref in-shp-vec depth))
+				       (in-stride (svref in-str-vec depth))
+				       (out-stride (svref osm-vec depth))
+				       (arg-stride (svref arg-str-vec depth)))
+                                  (declare (type fixnum dim in-stride out-stride arg-stride))
+                                  (loop for i fixnum from 0 below dim do
+                                    (recurse (1+ depth) in-ptr out-ptr arg-ptr
+                                             (the fixnum (+ arg-val (* i arg-stride))))
+                                    (incf in-ptr in-stride)
+                                    (incf out-ptr out-stride)
+                                    (when return-arg (incf arg-ptr out-stride)))))))
+                   (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))))
+          (values res res-idx))))))

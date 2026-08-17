@@ -14,7 +14,8 @@
   (offset 0 :type fixnum)
   (dtype :float64 :type symbol))
 
-(declaim (inline vt-shape vt-strides vt-offset vt-data vt-dtype vt-p))
+(declaim (inline vt-shape vt-strides vt-offset vt-data vt-dtype vt-p
+		 vt-order vt-size))
 
 ;;; ------------------------------------------------------------------
 ;;; 访问器与尺寸
@@ -30,7 +31,7 @@
 
 (defun vt-size (vt)
   "张量的逻辑元素总数。"
-  (reduce #'* (vt-shape vt) :initial-value 1))
+  (the fixnum (reduce #'* (vt-shape vt) :initial-value 1)))
 
 (defun vt-shape-to-size (shape)
   "计算形状对应的总元素个数。"
