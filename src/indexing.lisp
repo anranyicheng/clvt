@@ -312,19 +312,32 @@
     (%make-vt :data result-data :shape (list idx-size) :strides '(1) :offset 0 :dtype result-type)))
 
 (defun vt-select (condlist choicelist &key (default 0))
-  "根据多个条件从多个数组中选择。"
-  (let* ((shape (vt-shape (car condlist)))
-         (result-type (apply #'vt-promote-type
-                             (append (mapcar #'vt-dtype choicelist)
-                                     (list (if (integerp default) :int64 :float64)))))
-         (result (vt-full shape default :dtype result-type)))
-    (vt-do-each (ptr val result)
-      (declare (ignore val))
-      (loop for i from 0 below (length condlist)
-            when (/= (aref (vt-data (nth i condlist)) ptr) 0)
-              do (setf (aref (vt-data result) ptr) (aref (vt-data (nth i choicelist)) ptr))
-                 (return)))
-    result))
+  "根据多个条件从多个数组中选择。
+   result = default
+   for i from n-1 downto 0:
+       result = vt-where(cond_i, choice_i, result)
+   支持广播和非连续视图。"
+  (let ((n (length condlist)))
+    (unless (= n (length choicelist))
+      (error "condlist and choicelist must have same length"))
+    (when (zerop n)
+      (error "condlist and choicelist cannot be empty"))
+
+    (let* ((broadcast-shape (apply #'vt-broadcast-shapes
+                                   (append (mapcar #'vt-shape condlist)
+                                           (mapcar #'vt-shape choicelist))))
+           ;; 默认值类型：整数按 int64，浮点按 float64（足够安全）
+           (default-dtype (if (integerp default) :int64 :float64))
+           ;; 所有可能值（choicelist + 默认值）的类型提升
+           (result-dtype (apply #'vt-promote-type
+                                (append (mapcar #'vt-dtype choicelist)
+                                        (list default-dtype))))
+           (result (vt-full broadcast-shape default :dtype result-dtype)))
+      (loop for i from (1- n) downto 0
+            for cond = (nth i condlist)
+            for choice = (nth i choicelist)
+            do (setf result (vt-where cond choice result)))
+      result)))
 
 (defun vt-extract (condition tensor)
   "根据条件提取元素。"

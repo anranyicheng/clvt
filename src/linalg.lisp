@@ -1437,7 +1437,7 @@
               (when (> (abs apq) tol)
                 (let* ((app (vt-ref a p p))
                        (aqq (vt-ref a q q))
-                       (theta (* 0.5d0 (atan (/ (* 2.0d0 apq) (- app aqq)))))
+                       (theta (* 0.5d0 (atan (* 2.0d0 apq) (- app aqq))))
                        (c (cos theta))
                        (s (sin theta)))
                   ;; Update A

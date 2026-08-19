@@ -12,18 +12,6 @@
 
 (declaim (inline vt-dtype-p vt-float-dtype-p vt-int-dtype-p vt-storage-dtype-p))
 
-(defun vt-dtype-p (x)
-  (not (null (member x *vt-dtypes*))))
-
-(defun vt-storage-dtype-p (x)
-  (not (null (member x *vt-storage-dtypes*))))
-
-(defun vt-float-dtype-p (dtype)
-  (member dtype '(:float32 :float64)))
-
-(defun vt-int-dtype-p (dtype)
-  (member dtype '(:int8 :int16 :int32 :int64)))
-
 (defun vt-dtype->lisp-type (dtype)
   "将内部 dtype 符号映射为 Common Lisp 数组元素类型。"
   (ecase dtype
@@ -41,27 +29,108 @@
   (ecase dtype
     (:float64 8)
     (:float32 4)
-    (:int64   #+sbcl sb-vm:n-word-bytes #-sbcl 8)
+    (:int64   8)
     (:int32   4)
     (:int16   2)
     (:int8    1)
     (:uint8   1)
     (:uint16  2)))
 
+(defun vt-dtype-p (x)
+  (not (null (member x *vt-dtypes*))))
+
+(defun vt-storage-dtype-p (x)
+  (not (null (member x *vt-storage-dtypes*))))
+
+(defun vt-float-dtype-p (dtype)
+  (member dtype '(:float32 :float64)))
+
+(defun vt-int-dtype-p (dtype)
+  (member dtype '(:int8 :int16 :int32 :int64)))
+
+(defun vt-signed-dtype-p (dtype)
+  (member dtype '(:int8 :int16 :int32 :int64)))
+
+(defun vt-unsigned-dtype-p (dtype)
+  (member dtype '(:uint8 :uint16))) ; 以后扩展 uint32/uint64 时在这里加
+
+(defun vt-int-bits (dtype)
+  (ecase dtype
+    ((:int8 :uint8)   8)
+    ((:int16 :uint16) 16)
+    (:int32           32)
+    (:int64           64)))
+
+(defun vt-bits->signed-dtype (bits)
+  (ecase bits
+    (8  :int8)
+    (16 :int16)
+    (32 :int32)
+    (64 :int64)))
+
+(defun vt-bits->unsigned-dtype (bits)
+  (ecase bits
+    (8  :uint8)
+    (16 :uint16)
+    (32 :uint32)     ; 如果以后不支持 uint32，可删除这两行
+    (64 :uint64)))   ; 如果以后不支持 uint64，可删除这两行
+
+(defun vt-next-signed-bits (unsigned-bits)
+  "返回能容纳 unsigned-bits 无符号整数范围的有符号位宽；若没有则返回 nil。"
+  (ecase unsigned-bits
+    (8  16)
+    (16 32)
+    (32 64)
+    (64 nil)))
+
 (defun vt-promote-type (&rest dtypes)
-  "推断运算结果类型，严格对标 NumPy 类型提升规则。"
-  (let ((has-f64 nil) (has-f32 nil) (has-i64 nil) (has-int nil))
+  (let ((has-f64 nil)
+        (has-f32 nil)
+        (max-signed-bits 0)
+        (max-unsigned-bits 0))
     (dolist (d dtypes)
-      (cond ((eq d :float64) (setf has-f64 t))
-            ((eq d :float32) (setf has-f32 t))
-            ((eq d :int64)   (setf has-i64 t))
-            ((vt-int-dtype-p d) (setf has-int t))))
-    (cond (has-f64 :float64)
-          ((and has-f32 has-i64) :float64)
-          (has-f32 :float32)
-          (has-i64 :int64)
-          (has-int :int32)
-          (t :float64))))
+      (cond
+        ((eq d :float64)
+         (setf has-f64 t))
+        ((eq d :float32)
+         (setf has-f32 t))
+        ((vt-signed-dtype-p d)
+         (setf max-signed-bits
+               (max max-signed-bits (vt-int-bits d))))
+        ((vt-unsigned-dtype-p d)
+         (setf max-unsigned-bits
+               (max max-unsigned-bits (vt-int-bits d))))))
+
+    (cond
+      ;; float64 优先
+      (has-f64 :float64)
+
+      ;; float32 与整数混合：超过 24 位有效位则提升到 float64
+      (has-f32
+       (if (> (max max-signed-bits max-unsigned-bits) 24)
+           :float64
+           :float32))
+
+      ;; 有符号 + 无符号混合
+      ((and (> max-signed-bits 0) (> max-unsigned-bits 0))
+       (if (> max-signed-bits max-unsigned-bits)
+           (vt-bits->signed-dtype max-signed-bits)
+           (let ((next-bits (vt-next-signed-bits max-unsigned-bits)))
+             (if next-bits
+                 (vt-bits->signed-dtype next-bits)
+                 :float64))))
+
+      ;; 只有有符号整数
+      ((> max-signed-bits 0)
+       (vt-bits->signed-dtype max-signed-bits))
+
+      ;; 只有无符号整数
+      ((> max-unsigned-bits 0)
+       (vt-bits->unsigned-dtype max-unsigned-bits))
+
+      ;; 空输入或未知类型兜底
+      (t :float64))))
+
 
 (declaim (inline %wrap-int8 %wrap-int16 %wrap-uint8 %wrap-uint16))
 

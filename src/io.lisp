@@ -138,27 +138,32 @@
           (aref data offset)))))
 
 (defun vt-to-array (vt &key dtype)
-  "将张量转换为原生多维数组。"
+  "将张量转换为原生多维数组。使用 vt-do-each 遍历，同时维护逻辑坐标。"
   (when dtype (setf vt (vt-astype vt dtype)))
   (let ((shape (vt-shape vt)))
     (if (null shape)
+        ;; 标量：0 维数组
         (make-array nil :initial-element (aref (vt-data vt) (vt-offset vt)))
-        (let ((arr (make-array shape :element-type (vt-element-type vt))))
+        ;; 非标量
+        (let* ((rank (length shape))
+               (dims (coerce shape 'simple-vector))          ; 各维度大小
+               (arr (make-array shape :element-type (vt-element-type vt)))
+               (coords (make-list rank :initial-element 0))) ; 初始坐标全 0
           (vt-do-each (ptr val vt)
             (declare (ignore val))
-            (multiple-value-bind (coords) (vt-unravel-offset ptr vt)
-              (setf (apply #'aref arr coords)
-                    (aref (vt-data vt) ptr))))
+            ;; 使用当前坐标设置目标数组
+            (setf (apply #'aref arr coords)
+                  (aref (vt-data vt) ptr))
+            ;; 更新坐标到下一个逻辑位置（C 顺序）
+            (let ((i (1- rank)))
+              (loop
+                (incf (nth i coords))                ; 当前位 +1
+                (when (< (nth i coords) (svref dims i))
+                  (return))                           ; 未溢出，更新完成
+                (setf (nth i coords) 0)              ; 溢出归零，进位
+                (decf i)
+                (when (< i 0) (return)))))           ; 所有位都溢出，遍历结束
           arr))))
-
-(defun vt-unravel-offset (ptr vt)
-  "将物理偏移 ptr 还原为逻辑坐标列表。"
-  (loop with rem = (- ptr (vt-offset vt))
-        for dim in (vt-shape vt)
-        for stride in (vt-strides vt)
-        collect (multiple-value-bind (q r) (floor rem stride)
-                  (setf rem r)
-                  q)))
 
 ;;; ------------------------------------------------------------------
 ;;; 打印

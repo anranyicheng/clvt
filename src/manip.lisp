@@ -311,29 +311,40 @@
 
 (defun vt-diagonal (tensor &key (offset 0))
   "提取对角线（支持 batch）。"
-  (let* ((in-shape (vt-shape tensor)) (rank (length in-shape)))
+  (let* ((in-shape (vt-shape tensor))
+         (rank (length in-shape)))
     (when (< rank 2) (error "vt-diagonal 要求秩 >= 2"))
-    (let* ((rows (nth (- rank 2) in-shape)) (cols (nth (1- rank) in-shape))
+    (let* ((batch-dims (subseq in-shape 0 (- rank 2)))
+           (rows (nth (- rank 2) in-shape))
+           (cols (nth (1- rank) in-shape))
            (r-init (if (> offset 0) 0 (- offset)))
            (c-init (if (> offset 0) offset 0))
            (diag-len (max 0 (min (- rows r-init) (- cols c-init))))
-           (out-shape (append (subseq in-shape 0 (- rank 2)) (list diag-len)))
+           (out-shape (append batch-dims (list diag-len)))
            (res (vt-zeros out-shape :dtype (vt-dtype tensor)))
            (res-data (vt-data res))
-           (in-data (vt-data tensor)) (in-strs (vt-strides tensor))
+           (in-data (vt-data tensor))
+           (in-strs (vt-strides tensor))
            (out-idx 0)
-           (batch-size (reduce #'* (subseq in-shape 0 (- rank 2)) :initial-value 1))
-           (str-r (nth (- rank 2) in-strs)) (str-c (nth (1- rank) in-strs))
+           (batch-size (reduce #'* batch-dims :initial-value 1))
+           (str-r (nth (- rank 2) in-strs))
+           (str-c (nth (1- rank) in-strs))
            (in-offset (vt-offset tensor)))
       (dotimes (batch batch-size)
-        (let ((in-ptr in-offset) (rem batch))
-          (loop for d from 0 below (- rank 2) do
-            (let ((dim (nth d in-shape)) (str (nth d in-strs)))
-              (multiple-value-bind (q r) (floor rem dim)
-                (incf in-ptr (* r str)) (setf rem q))))
+        (let ((in-ptr in-offset)
+              (rem batch))
+          ;; 关键修改：从最后一个 batch 维度开始反向解码，匹配 row-major 输出
+          (loop for d from (1- (length batch-dims)) downto 0
+                for dim = (nth d batch-dims)
+                for str = (nth d in-strs)
+                do (multiple-value-bind (q r) (floor rem dim)
+                     (incf in-ptr (* r str))
+                     (setf rem q)))
           (loop for i from 0 below diag-len
-                for src = (+ in-ptr (* (+ r-init i) str-r) (* (+ c-init i) str-c))
-                do (setf (aref res-data out-idx) (aref in-data src)) (incf out-idx))))
+                for src = (+ in-ptr (* (+ r-init i) str-r)
+                                      (* (+ c-init i) str-c))
+                do (setf (aref res-data out-idx) (aref in-data src))
+                   (incf out-idx))))
       res)))
 
 (defun vt-diag (tensor &key (k 0))
@@ -434,37 +445,86 @@
                   (if (< idx sk) idx (- period idx 1))))))
 
 (defun vt-pad (vt pad-width &key (mode :constant) (constant-values 0))
-  "对张量填充。mode: :constant/:edge/:wrap/:reflect/:symmetric。"
-  (let* ((shape (vt-shape vt)) (rank (length shape))
+  "对张量填充。mode: :constant/:edge/:wrap/:reflect/:symmetric。
+
+   constant-values 支持：
+   - 标量：所有维度左右填充相同值；
+   - (left right)：所有维度使用同一对前/后值；
+   - ((l0 r0) (l1 r1) ...)：每个维度指定前/后值（长度须等于 rank）。
+   角点取值符合 NumPy 逐轴填充顺序：后处理的轴覆盖先处理的轴。"
+  (let* ((shape (vt-shape vt))
+         (rank (length shape))
          (pad (%normalize-pad-width pad-width rank))
-         (cv (if (listp constant-values) constant-values (list constant-values constant-values)))
-         (c-left (vt-cast (first cv) (vt-dtype vt)))
-         (c-right (vt-cast (second cv) (vt-dtype vt)))
+
+         ;; 规范化 constant-values
+         (cv-norm
+           (cond
+             ((numberp constant-values)
+              (make-list rank :initial-element (list constant-values constant-values)))
+             ((and (listp constant-values)
+                   (= (length constant-values) 2)
+                   (every #'numberp constant-values))
+              (make-list rank :initial-element constant-values))
+             ((and (listp constant-values)
+                   (= (length constant-values) rank)
+                   (every (lambda (x)
+                            (and (listp x)
+                                 (= (length x) 2)
+                                 (every #'numberp x)))
+                          constant-values))
+              constant-values)
+             (t
+              (error "invalid constant-values: ~a" constant-values))))
+
+         (c-lefts (coerce (mapcar (lambda (cv) (vt-cast (first cv) (vt-dtype vt)))
+                                  cv-norm)
+                          'simple-vector))
+         (c-rights (coerce (mapcar (lambda (cv) (vt-cast (second cv) (vt-dtype vt)))
+                                   cv-norm)
+                           'simple-vector))
+
          (new-shape (loop for s in shape for (b a) in pad collect (+ s b a)))
          (out (vt-zeros new-shape :dtype (vt-dtype vt)))
-         (out-data (vt-data out)) (in-data (vt-data vt))
+         (out-data (vt-data out))
+         (in-data (vt-data vt))
          (in-offset (vt-offset vt))
          (out-strides (coerce (vt-compute-strides new-shape) 'simple-vector))
          (in-shape (coerce shape 'simple-vector))
          (in-strides (coerce (vt-strides vt) 'simple-vector))
          (pad-before (coerce (mapcar #'first pad) 'simple-vector))
          (out-size (vt-size out)))
+
     (loop for out-ptr fixnum from 0 below out-size do
-      (let ((rem out-ptr) (in-ptr in-offset) (is-const nil) (const-val c-left))
+      (let ((rem out-ptr)
+            (in-ptr in-offset)
+            (is-const nil)
+            (const-val 0))                     ; 初始值任意，is-const 为 nil 时不使用
         (loop for d from 0 below rank do
           (multiple-value-bind (out-idx r) (floor rem (svref out-strides d))
             (setf rem r)
-            (let* ((bk (svref pad-before d)) (sk (svref in-shape d))
-                   (offset (- out-idx bk)) (src-idx 0))
-              (cond ((< offset 0)
-                     (if (eq mode :constant)
-                         (unless is-const (setf is-const t const-val c-left))
-                         (setf src-idx (%pad-map mode (- offset) sk :left))))
-                    ((>= offset sk)
-                     (if (eq mode :constant)
-                         (unless is-const (setf is-const t const-val c-right))
-                         (setf src-idx (%pad-map mode (- offset sk -1) sk :right))))
-                    (t (setf src-idx offset)))
+            (let* ((bk (svref pad-before d))
+                   (sk (svref in-shape d))
+                   (offset (- out-idx bk))
+                   (src-idx 0))
+              (cond
+                ;; 左/上越界
+                ((< offset 0)
+                 (if (eq mode :constant)
+                     ;; 关键修复：无条件赋值，确保后处理的轴覆盖先处理的轴
+                     (setf is-const t const-val (svref c-lefts d))
+                     (setf src-idx (%pad-map mode (- offset) sk :left))))
+                ;; 右/下越界
+                ((>= offset sk)
+                 (if (eq mode :constant)
+                     (setf is-const t const-val (svref c-rights d))
+                     (setf src-idx (%pad-map mode (- offset sk -1) sk :right))))
+                ;; 内部元素
+                (t
+                 (setf src-idx offset)))
               (incf in-ptr (* src-idx (svref in-strides d))))))
-        (setf (aref out-data out-ptr) (if is-const const-val (aref in-data in-ptr)))))
+
+        (setf (aref out-data out-ptr)
+              (if is-const
+                  const-val
+                  (aref in-data in-ptr)))))
     out))

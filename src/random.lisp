@@ -125,27 +125,46 @@
                               collect (if (= d ax) (list j) '(:all))))))
         (let ((tmp (vt-copy si))) (vt-copy-into si sj) (vt-copy-into sj tmp))))
     tensor))
-
 (defun vt-random-multinomial (n pvals &key (size nil) (rng *vt-default-random-state*))
   (declare (random-state rng))
   (let* ((probs (if (vt-p pvals) (vt-to-list pvals) (coerce pvals 'list)))
-         (k (length probs))
-         (dummy1 (assert (> k 0) () "pvals 不能为空"))
-         (dummy2 (assert (every (lambda (p) (>= p 0)) probs) ()))
-         (total (reduce #'+ probs))
-         (dummy3 (assert (> total 0) ()))
-         (cdf (let ((cum 0.0d0))
-                (coerce (mapcar (lambda (p) (incf cum (/ p total)) cum) probs) 'vector)))
-         (out-shape (if size (append (if (listp size) size (list size)) (list k)) (list k)))
-         (result (vt-zeros out-shape :dtype :int64))
-         (res-data (vt-data result))
-         (total-trials (if size (reduce #'* (if (listp size) size (list size))) 1)))
-    (dotimes (trial total-trials)
-      (let ((counts (make-array k :element-type '(signed-byte 64) :initial-element 0)))
-        (dotimes (_ n)
-          (let ((r (random 1.0d0 rng)))
-            (loop for i from 0 below k
-                  when (<= r (aref cdf i)) do (incf (aref counts i)) (return))))
-        (loop for i from 0 below k
-              do (setf (aref res-data (+ (* trial k) i)) (aref counts i)))))
-    result))
+         (k (length probs)))
+    (assert (> k 0) () "pvals 不能为空")
+    (assert (every (lambda (p) (>= p 0)) probs) ())
+    (let ((total (reduce #'+ probs)))
+      (assert (> total 0) ())
+      ;; 计算 CDF，用双精度，强制最后一项为 1.0 以防浮点误差
+      (let ((cdf (make-array k :element-type 'double-float :initial-element 0.0d0)))
+        (let ((cum 0.0d0))
+          (loop for i from 0 below k
+                for p in probs
+                do (incf cum (/ p total))
+                   (setf (aref cdf i) cum)))
+        ;; 显式设置最后一项为 1.0，同时保留回退逻辑更保险
+        (setf (aref cdf (1- k)) 1.0d0)
+
+        (let* ((out-shape (if size (append (if (listp size) size (list size)) (list k)) (list k)))
+               (result (vt-zeros out-shape :dtype :int64))
+               (res-data (vt-data result))
+               (total-trials (if size (reduce #'* (if (listp size) size (list size))) 1)))
+          (dotimes (trial total-trials)
+            (let ((counts (make-array k :element-type '(signed-byte 64) :initial-element 0)))
+              (dotimes (_ n)
+                (let ((r (random 1.0d0 rng)))
+                  ;; 二分查找第一个 CDF >= r 的索引
+                  (let ((idx (binary-search-cdf cdf r)))
+                    (incf (aref counts idx)))))
+              (loop for i from 0 below k
+                    do (setf (aref res-data (+ (* trial k) i)) (aref counts i)))))
+          result)))))
+
+;; 辅助函数：二分查找
+(defun binary-search-cdf (cdf r)
+  (let ((lo 0) (hi (length cdf)))
+    (loop while (< lo hi) do
+      (let ((mid (floor (+ lo hi) 2)))
+        (if (< (aref cdf mid) r)
+            (setf lo (1+ mid))
+            (setf hi mid))))
+    ;; 回退：如果 r 大于所有 cdf，返回最后一个索引
+    (min lo (1- (length cdf)))))

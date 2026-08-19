@@ -68,11 +68,15 @@
 (defun vt-exp (vt &key out dtype) (vt-fast-map #'exp vt :out out :dtype (%infer-float-dtype vt dtype)))
 
 (defun vt-pow (vt power &key out dtype)
-  (let* ((dt (%infer-float-dtype vt dtype)) (nan (vt-get-nan dt)))
+  (let* ((dt (%infer-float-dtype vt dtype))
+         (nan (vt-get-nan dt)))
     (vt-map (lambda (x)
-              (cond ((and (zerop x) (zerop power)) 1.0d0)
-                    ((and (minusp x) (not (integerp power))) nan)
-                    (t (expt x power))))
+              (let ((result (handler-case
+                                (expt x power)
+                              (error () nan))))
+                (if (realp result)
+                    result
+                    nan)))
             vt :out out :dtype dt)))
 
 (defun vt-expt (vt power &key out dtype) (vt-pow vt power :out out :dtype dtype))
