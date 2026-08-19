@@ -338,7 +338,17 @@
 				(let ((out-idx (if keepdims i
                                                    (count-if-not (lambda (x) (member x axes))
 								 (loop for j below i collect j)))))
-                                  (nth out-idx res-strides))))))
+                                  (nth out-idx res-strides)))))
+             (idx-strides-map
+               (if (or (not return-arg) global)
+                   (make-list rank :initial-element 0)
+                   (loop for i from 0 below rank
+                         if (member i axes) collect 0
+                           else collect
+				(let ((out-idx (if keepdims i
+                                                   (count-if-not (lambda (x) (member x axes))
+								 (loop for j below i collect j)))))
+                                  (nth out-idx (vt-strides res-idx)))))))
         (declare (list arg-strides))
         (vt-fill res init-val)
         (when res-idx (vt-fill res-idx 0))
@@ -346,6 +356,7 @@
         (let ((in-shp-vec (coerce in-shape 'simple-vector))
               (in-str-vec (coerce in-strides 'simple-vector))
               (osm-vec (coerce out-strides-map 'simple-vector))
+              (ism-vec (coerce idx-strides-map 'simple-vector)) 
               (arg-str-vec (coerce arg-strides 'simple-vector))
               (out-et (array-element-type res-data))
               (in-et (array-element-type in-data)))
@@ -374,14 +385,15 @@
 				       (let* ((dim (svref in-shp-vec depth))
 					      (in-stride (svref in-str-vec depth))
 					      (out-stride (svref osm-vec depth))
+					      (idx-stride (svref ism-vec depth))         
 					      (arg-stride (svref arg-str-vec depth)))
-					 (declare (type fixnum dim in-stride out-stride arg-stride))
+					 (declare (type fixnum dim in-stride out-stride idx-stride arg-stride))
 					 (loop for i fixnum from 0 below dim do
-					   (recurse (1+ depth) in-ptr out-ptr arg-ptr
-						    (+ arg-val (* i arg-stride)))
+					   (recurse (the fixnum (1+ depth)) in-ptr out-ptr arg-ptr
+						    (the fixnum (+ arg-val (the fixnum (* i arg-stride)))))
 					   (incf in-ptr in-stride)
 					   (incf out-ptr out-stride)
-					   (when return-arg (incf arg-ptr out-stride)))))))
+					   (when return-arg (incf arg-ptr idx-stride))))))) 
 			  (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
             
             (cond
@@ -423,13 +435,14 @@
                                 (let* ((dim (svref in-shp-vec depth))
 				       (in-stride (svref in-str-vec depth))
 				       (out-stride (svref osm-vec depth))
+				       (idx-stride (svref ism-vec depth))
 				       (arg-stride (svref arg-str-vec depth)))
-                                  (declare (type fixnum dim in-stride out-stride arg-stride))
+                                  (declare (type fixnum dim in-stride out-stride idx-stride arg-stride))
                                   (loop for i fixnum from 0 below dim do
                                     (recurse (1+ depth) in-ptr out-ptr arg-ptr
-                                             (the fixnum (+ arg-val (* i arg-stride))))
+                                             (the fixnum (+ arg-val (the fixnum (* i arg-stride)))))
                                     (incf in-ptr in-stride)
                                     (incf out-ptr out-stride)
-                                    (when return-arg (incf arg-ptr out-stride)))))))
+                                    (when return-arg (incf arg-ptr idx-stride)))))))
                    (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))))
           (values res res-idx))))))
