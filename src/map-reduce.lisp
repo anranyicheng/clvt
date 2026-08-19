@@ -134,14 +134,30 @@
               ((equal (array-element-type res-data) '(signed-byte 64)) (gen (signed-byte 64)))
               ((equal (array-element-type res-data) '(signed-byte 32)) (gen (signed-byte 32)))
               (t
-               (let ((ptrs (copy-seq in-offsets)) (op (vt-offset res)))
-                 (declare (type simple-vector ptrs) (type fixnum op))
+               (let ((ptrs (copy-seq in-offsets))
+                     (indices (make-array rank :element-type 'fixnum :initial-element 0))
+                     (op (vt-offset res)))
+                 (declare (type simple-vector ptrs)
+                          (type (simple-array fixnum (*)) indices)
+                          (type fixnum op))
                  (dotimes (i size)
                    (gather ptrs)
                    (setf (aref res-data op) (call-fn))
-                   (incf op)
-                   (loop for k fixnum from 0 below n do (incf (aref ptrs k) 1))))))))
-    res))
+                   (let ((d (1- rank)))
+                     (loop
+                       (when (< d 0) (return))
+                       (incf (aref indices d))
+                       (if (< (aref indices d) (svref dims d))
+                           (progn (incf op (svref res-strides-vec d))
+                                  (loop for k fixnum from 0 below n do
+                                    (incf (aref ptrs k) (aref (svref in-strides k) d)))
+                                  (return))
+                           (progn (setf (aref indices d) 0)
+                                  (decf op (* (svref res-strides-vec d) (1- (svref dims d))))
+                                  (loop for k fixnum from 0 below n do
+                                    (decf (aref ptrs k) (* (aref (svref in-strides k) d) (1- (svref dims d)))))
+                                  (decf d))))))))))
+    res)))
 
 ;;; ------------------------------------------------------------------
 ;;; 二元特化（内部，供算术层使用）
@@ -228,7 +244,7 @@
                                      (and (equal (vt-shape ,(first tvs)) out-shape)
                                           (vt-contiguous-p ,(first tvs))))
                                  (eq (vt-dtype ,(first tvs)) (vt-dtype res)))
-                            (%vt-inline1-fast ,op ,(first tvs) res)
+                            (progn (%vt-inline1-fast ,op ,(first tvs) res) res)
                             (vt-map (function ,op) ,(first tvs) :out res)))
                     (2 `(if (and (vt-contiguous-p res)
                                  (or (= (vt-size ,(first tvs)) 1)
@@ -239,10 +255,9 @@
                                           (vt-contiguous-p ,(second tvs))))
                                  (eq (vt-dtype ,(first tvs)) (vt-dtype res))
                                  (eq (vt-dtype ,(second tvs)) (vt-dtype res)))
-                            (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
+                            (progn (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res) res)
                             (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
-                    (t `(apply #'vt-map ,fn ,@args)))
-                 res)))))))
+                    (t `(apply #'vt-map ,fn ,@args))))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 归约核心：vt-reduce
@@ -256,14 +271,23 @@
                 ((eq element-type 'single-float) +vt-sfloat-neg-inf+)
                 ((equal element-type '(signed-byte 64)) (- (expt 2 63)))
                 ((equal element-type '(signed-byte 32)) (- (expt 2 31)))
+                ((equal element-type '(unsigned-byte 64)) 0)
+                ((equal element-type '(unsigned-byte 32)) 0)
+                ((equal element-type '(unsigned-byte 16)) 0)
+                ((equal element-type '(unsigned-byte 8)) 0)
                 ((subtypep element-type 'integer) most-negative-fixnum)
                 (t 0)))
     (:min (cond ((eq element-type 'double-float) +vt-dfloat-pos-inf+)
                 ((eq element-type 'single-float) +vt-sfloat-pos-inf+)
                 ((equal element-type '(signed-byte 64)) (1- (expt 2 63)))
                 ((equal element-type '(signed-byte 32)) (1- (expt 2 31)))
+                ((equal element-type '(unsigned-byte 64)) (1- (expt 2 64)))
+                ((equal element-type '(unsigned-byte 32)) (1- (expt 2 32)))
+                ((equal element-type '(unsigned-byte 16)) (1- (expt 2 16)))
+                ((equal element-type '(unsigned-byte 8)) (1- (expt 2 8)))
                 ((subtypep element-type 'integer) most-positive-fixnum)
                 (t 0)))))
+
 
 (defun vt-reduce (tensor axis init-val reducer-fn &key out dtype keepdims return-arg)
   "通用归约核心。axis 可为 nil/整数/整数列表。
