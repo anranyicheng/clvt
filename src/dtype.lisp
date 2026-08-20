@@ -10,10 +10,12 @@
   '(:float64 :float32 :int64 :int32)
   "实际可分配底层数组的元素类型。")
 
-(declaim (inline vt-dtype-p vt-float-dtype-p vt-int-dtype-p vt-storage-dtype-p))
+(declaim
+ (inline vt-dtype-p vt-float-dtype-p vt-int-dtype-p vt-storage-dtype-p))
 
 (defun vt-dtype->lisp-type (dtype)
   "将内部 dtype 符号映射为 Common Lisp 数组元素类型。"
+  (declare (optimize (speed 3) (safety 0)))
   (ecase dtype
     (:float64 'double-float)
     (:float32 'single-float)
@@ -26,6 +28,7 @@
 
 (defun vt-dtype-itemsize (dtype)
   "返回每个元素的字节大小。"
+  (declare (optimize (speed 3) (safety 0)))
   (ecase dtype
     (:float64 8)
     (:float32 4)
@@ -37,21 +40,27 @@
     (:uint16  2)))
 
 (defun vt-dtype-p (x)
+  (declare (optimize (speed 3) (safety 0)))
   (not (null (member x *vt-dtypes*))))
 
 (defun vt-storage-dtype-p (x)
+  (declare (optimize (speed 3) (safety 0)))
   (not (null (member x *vt-storage-dtypes*))))
 
 (defun vt-float-dtype-p (dtype)
+  (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:float32 :float64)))
 
 (defun vt-int-dtype-p (dtype)
+  (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:int8 :int16 :int32 :int64)))
 
 (defun vt-signed-dtype-p (dtype)
+  (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:int8 :int16 :int32 :int64)))
 
 (defun vt-unsigned-dtype-p (dtype)
+  (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:uint8 :uint16))) ; 以后扩展 uint32/uint64 时在这里加
 
 (defun vt-int-bits (dtype)
@@ -62,6 +71,8 @@
     (:int64           64)))
 
 (defun vt-bits->signed-dtype (bits)
+  (declare (optimize (speed 3) (safety 0))
+	   (fixnum bits))
   (ecase bits
     (8  :int8)
     (16 :int16)
@@ -69,6 +80,8 @@
     (64 :int64)))
 
 (defun vt-bits->unsigned-dtype (bits)
+  (declare (optimize (speed 3) (safety 0))
+	   (fixnum bits))
   (ecase bits
     (8  :uint8)
     (16 :uint16)
@@ -77,6 +90,8 @@
 
 (defun vt-next-signed-bits (unsigned-bits)
   "返回能容纳 unsigned-bits 无符号整数范围的有符号位宽；若没有则返回 nil。"
+  (declare (optimize (speed 3) (safety 0))
+	   (fixnum unsigned-bits))
   (ecase unsigned-bits
     (8  16)
     (16 32)
@@ -84,10 +99,12 @@
     (64 nil)))
 
 (defun vt-promote-type (&rest dtypes)
+  (declare (optimize (speed 3) (safety 0)))
   (let ((has-f64 nil)
         (has-f32 nil)
         (max-signed-bits 0)
         (max-unsigned-bits 0))
+    (declare (type fixnum max-signed-bits max-unsigned-bits))
     (dolist (d dtypes)
       (cond
         ((eq d :float64)
@@ -96,10 +113,10 @@
          (setf has-f32 t))
         ((vt-signed-dtype-p d)
          (setf max-signed-bits
-               (max max-signed-bits (vt-int-bits d))))
+               (max max-signed-bits (the fixnum (vt-int-bits d)))))
         ((vt-unsigned-dtype-p d)
          (setf max-unsigned-bits
-               (max max-unsigned-bits (vt-int-bits d))))))
+               (max max-unsigned-bits (the fixnum (vt-int-bits d)))))))
 
     (cond
       ;; float64 优先
@@ -178,7 +195,9 @@
 
 (defun vt-dtype-default-value (dtype)
   "返回 dtype 对应的零值。"
+  (declare (optimize (speed 3) (safety 0)))
   (ecase dtype
     (:float64 0.0d0)
     (:float32 0.0f0)
     ((:int64 :int32 :int16 :int8 :uint8 :uint16) 0)))
+
