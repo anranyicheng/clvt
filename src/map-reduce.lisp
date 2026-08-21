@@ -30,6 +30,8 @@
 	res))))
 
 (defun %vt-map-run (fn inputs res out-shape)
+  (declare (optimize (speed 3) (safety 0))
+	   (list inputs out-shape))
   (let* ((n (length inputs))
          (res-data (vt-data res))
          (res-dtype (vt-dtype res))
@@ -271,6 +273,7 @@
 
 (defun vt-binary (fn t1 t2 &key out dtype)
   "二元逐元素运算（内部入口，等价于两参数 vt-map）。"
+  (declare (optimize (speed 3) (safety 0)))
   (apply #'vt-map fn (ensure-vt t1) (ensure-vt t2) :out out :dtype dtype))
 
 ;;; ------------------------------------------------------------------
@@ -279,9 +282,11 @@
 
 (defmacro %cast-to (lt form)
   "内联类型转换：整数截断，浮点 coerce。"
+  (declare (optimize (speed 3) (safety 0)))
   `(if ,(subtypep lt 'integer) (truncate ,form) (coerce ,form ',lt)))
 
 (defmacro %inline1-loop (lt op a res)
+  (declare (optimize (speed 3) (safety 0)))
   "一元内联循环（lt 为类型，op 为算子符号）。"
   `(let ((od (the (simple-array ,lt (*)) (vt-data ,res)))
          (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
@@ -295,6 +300,7 @@
 
 (defmacro %inline2-loop (lt op a b res)
   "二元内联循环（lt 为类型，op 为算子符号）。"
+  (declare (optimize (speed 3) (safety 0)))
   `(let ((od (the (simple-array ,lt (*)) (vt-data ,res)))
          (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
          (d1 (the (simple-array ,lt (*)) (vt-data ,b)))
@@ -308,6 +314,7 @@
        (incf op) (incf p0 s0) (incf p1 s1))))
 
 (defmacro %vt-inline1-fast (op a res)
+  (declare (optimize (speed 3) (safety 0)))
   "一元连续快路径（按输出类型派发，内联 op）。"
   `(let ((rd (vt-data ,res)))
      (cond ((equal (array-element-type rd) 'double-float) (%inline1-loop double-float ,op ,a ,res))
@@ -318,6 +325,7 @@
 
 (defmacro %vt-inline2-fast (op a b res)
   "二元连续快路径（按输出类型派发，内联 op）。"
+  (declare (optimize (speed 3) (safety 0)))
   `(let ((rd (vt-data ,res)))
      (cond ((equal (array-element-type rd) 'double-float) (%inline2-loop double-float ,op ,a ,b ,res))
            ((equal (array-element-type rd) 'single-float) (%inline2-loop single-float ,op ,a ,b ,res))
@@ -327,11 +335,13 @@
 
 (defmacro vt-fast-map (fn &rest args)
   "编译期内联已知算子的逐元素映射（一元/二元）；否则回退到 vt-map。"
+  (declare (optimize (speed 3) (safety 0)))
   (let ((op (and (consp fn) (eq (car fn) 'function) (symbolp (cadr fn)) (cadr fn))))
     (if (null op)
         `(apply #'vt-map ,fn ,@args)
         (multiple-value-bind (tensors dtype out)
 	    (parse-vt-op-args args)
+	  (declare (list tensors))
           (let* ((n (length tensors))
                  (tvs (loop repeat n collect (gensym "TV"))))
             (if (not (or (= n 1) (= n 2))) 

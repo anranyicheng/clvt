@@ -66,6 +66,7 @@
 
 (declaim (inline expand-ellipsis))
 (defun expand-ellipsis (input-subs output-sub vts)
+  (declare (optimize (speed 3) (safety 0)))
   (with-float-safe
     (let ((ellipsis-ranks nil))
       (declare (list ellipsis-ranks))
@@ -92,7 +93,7 @@
 		      collect (the fixnum (- i)))))
           (flet
 	      ((expand-sub (sub implicit-rank)
-                 (declare (list sub))
+                 (declare (list sub) (fixnum implicit-rank))
                  (let ((pos (position :ellipsis sub)))
                    (if (not pos) sub
                        (let* ((before (subseq sub 0 pos))
@@ -337,7 +338,8 @@
     (all-labels-vec label-dims-vec output-subs input-subs vts &key out)
   (declare (type simple-vector all-labels-vec)
            (type (simple-array fixnum (*)) label-dims-vec)
-           (type list output-subs input-subs vts))
+           (type list output-subs input-subs vts)
+	   (optimize (speed 3)))
   (with-float-safe
     (let* ((rank (length all-labels-vec))
            (n-vts (length vts))
@@ -399,7 +401,8 @@
                                                    (if (< lbl 0)
                                                        (+ 256 lbl)
                                                        lbl))))))
-          (declare (type boolean all-f64-p all-f32-p all-i64-p all-i32-p))
+          (declare (type boolean all-f64-p all-f32-p all-i64-p all-i32-p)
+		   (list out-shape))
           
           (let* ((output (or out (vt-zeros out-shape :dtype out-dtype))))
             (when out
@@ -503,9 +506,9 @@
                                           (stride-c (aref out-strides-vec pos-lbl)))
                                      (loop for i fixnum from 0 below dim do
                                        (loop-batch (rest b-labels)
-                                                   (+ off-a (* i stride-a))
-                                                   (+ off-b (* i stride-b))
-                                                   (+ off-c (* i stride-c))))))))
+                                                   (the fixnum (+ off-a (the fixnum (* i stride-a))))
+                                                   (the fixnum (+ off-b (the fixnum (* i stride-b))))
+                                                   (the fixnum (+ off-c (the fixnum (* i stride-c))))))))))
                           
                           (loop-batch batch-labels off-a-base off-b-base out-offset))
                         
@@ -665,7 +668,7 @@
   2. 类型推导与统一 (astype)。
   3. 下标解析与语义分析。
   4. 直接调用 einsum-execute (自动触发 Matmul 极速内核)。"
-  (declare (optimize (safety 0)))
+  (declare (optimize (speed 3) (safety 0)))
   (multiple-value-bind (tensors dtype-arg out-arg)
       (parse-vt-op-args args)    
     (let* ((clean-tensors (mapcar #'ensure-vt tensors))
