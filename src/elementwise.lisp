@@ -7,28 +7,29 @@
     (case (length args)
       (1 (vt-fast-map #'+ (first args)))
       (2 (vt-fast-map #'+ (first args) (second args)))
-      (t (reduce #'vt-+ args)))))
+      (t (apply #'vt-map #'+ args)))))
 
 (defun vt-* (&rest args)
   (with-float-safe
     (case (length args)
       (1 (vt-fast-map #'* (first args)))
       (2 (vt-fast-map #'* (first args) (second args)))
-      (t (reduce #'vt-* args)))))
+      (t (apply #'vt-map #'* args)))))
 
 (defun vt-- (vt &rest args)
   (with-float-safe
     (let ((first (ensure-vt vt)))
       (cond ((null args) (vt-fast-map #'- first))
             ((null (cdr args)) (vt-fast-map #'- first (first args)))
-            (t (reduce #'vt-- (cons first args)))))))
+            (t (apply #'vt-map #'- first args))))))
 
 (defun vt-/ (vt &rest args)
   (with-float-safe
     (let ((first (ensure-vt vt)))
       (cond ((null args) (vt-map (lambda (v) (/ 1.0d0 v)) first))
             ((null (cdr args)) (vt-fast-map #'/ first (first args)))
-            (t (reduce #'vt-/ (cons first args)))))))
+            (t (apply #'vt-map #'/ first args))))))
+
 
 (defun vt-add (a b &key dtype out) (vt-fast-map #'+ a b :dtype dtype :out out))
 (defun vt-sub (a b &key dtype out) (vt-fast-map #'- a b :dtype dtype :out out))
