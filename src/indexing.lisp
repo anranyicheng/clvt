@@ -2,8 +2,6 @@
 
 (in-package :clvt)
 
-(declaim (inline vt-ref vt-item))
-
 (defun vt-ref (vt &rest indices)
   "获取指定位置元素（支持负索引，带边界检查）。"
   (declare (optimize (speed 3) (safety 0)))
