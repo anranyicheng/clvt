@@ -734,7 +734,6 @@
 
 (defun vt-@ (vt1 vt2 &key dtype out)
   (vt-matmul vt1 vt2 :dtype dtype :out out))
-(in-package :clvt)
 
 (defun vt-dot (a b &key dtype out) 
   "点积/内积，支持任意维度： 
@@ -861,7 +860,8 @@
                      for val = (abs (aref data (+ off (* i s0) (* k s1))))
                      when (> val max-val)
                      do (setf max-val val max-row i))
-               (unless (zerop max-val)
+               ;; 使用小阈值而非 zerop，避免 denormalized float 导致数值不稳定
+               (unless (< max-val 1d-300)
                  ;; 交换行
                  (unless (= max-row k)
                    (rotatef (nth k piv) (nth max-row piv))

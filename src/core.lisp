@@ -276,32 +276,51 @@
                 (equal dest-shape src-shape))
            (let ((d-off (vt-offset dest)) (s-off (vt-offset src)))
              (declare (type fixnum d-off s-off size))
-             (dotimes (i size)
-               (setf (aref dest-data (+ d-off i))
-                     (vt-cast (aref src-data (+ s-off i)) dest-dtype)))))
+             (if (equal dest-dtype src-dtype)
+                 ;; 同型：直接 replace，零转换开销
+                 (replace dest-data src-data
+                          :start1 d-off :end1 (+ d-off size)
+                          :start2 s-off :end2 (+ s-off size))
+                 ;; 异型：按目标 dtype 特化的转换循环
+                 (let ((caster (vt-cast-fun dest-dtype)))
+                   (declare (type function caster))
+                   (dotimes (i size)
+                     (setf (aref dest-data (+ d-off i))
+                           (funcall caster (aref src-data (+ s-off i)))))))))
           ;; 慢速：非连续 / 广播 -> 通用 strided 迭代
           (t
            (%copy-strided dest-data dest-dtype (vt-strides dest) (vt-offset dest)
-                          src-data src-strides (vt-offset src)
+                          src-data src-dtype src-strides (vt-offset src)
                           dest-shape size)))
         dest))))
 
 (defun %copy-strided (dest-data dest-dtype dest-strides dest-offset
-                      src-data src-strides src-offset shape size)
-  "通用按步长/广播拷贝（里程表迭代，零动态分配）。"
+                      src-data src-dtype src-strides src-offset shape size)
+  "通用按步长/广播拷贝（里程表迭代，零动态分配）。
+
+优化：当 src-dtype 与 dest-dtype 相同时，跳过逐元素 vt-cast 的 ecase
+分派，直接原值拷贝；异型时在循环外用 vt-cast-fun 取出特化转换函数，
+避免每元素重复 ecase。"
   (let* ((rank (length shape))
          (dims (coerce shape 'simple-vector))
          (d-strs (coerce dest-strides 'simple-vector))
          (s-strs (coerce src-strides 'simple-vector))
          (indices (make-array rank :element-type 'fixnum :initial-element 0))
          (d-ptr dest-offset)
-         (s-ptr src-offset))
+         (s-ptr src-offset)
+         ;; 同型时为 nil（直接拷贝原值），异型时为转换函数
+         (caster (unless (equal dest-dtype src-dtype)
+                   (vt-cast-fun dest-dtype))))
     (declare (type simple-vector dims d-strs s-strs)
              (type (simple-array fixnum (*)) indices)
-             (type fixnum d-ptr s-ptr rank))
+             (type fixnum d-ptr s-ptr rank)
+             (type (or null function) caster))
     (when (zerop size) (return-from %copy-strided nil))
     (loop
-      (setf (aref dest-data d-ptr) (vt-cast (aref src-data s-ptr) dest-dtype))
+      (setf (aref dest-data d-ptr)
+            (if caster
+                (funcall caster (aref src-data s-ptr))
+                (aref src-data s-ptr)))
       (let ((depth (1- rank)))
         (loop
           (when (< depth 0) (return-from %copy-strided nil))
