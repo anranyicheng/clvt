@@ -377,7 +377,21 @@
    #:vt-count
    #:vt-clip-tensor
    #:vt-clamp
-   #:vt-copy-to!))
+   #:vt-copy-to!
+
+   ;; extensions2.lisp
+   #:vt-fliplr
+   #:vt-flipud
+   #:vt-ediff1d
+   #:vt-geomspace
+   #:vt-ravel-multi-index
+   #:vt-tril-indices
+   #:vt-triu-indices
+   #:vt-vander
+   #:vt-one-hot
+   #:vt-standardize
+   #:vt-layer-norm
+   #:vt-apply-along-axis))
 
 (in-package :clvt)
 
@@ -394,3 +408,4 @@
 
 
 (%refresh-vt-fun-list)
+

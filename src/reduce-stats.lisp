@@ -572,8 +572,16 @@
              (integrand (vt-map (lambda (l r hh) (* 0.5d0 (+ l r) hh)) left right h)))
         (vt-sum integrand :axis ax)))))
 
+(defun %normalize-mode-keyword (mode)
+  "将 \"full\", :full 归一化为关键字 :full，方便 numpy 用户习惯。"
+  (etypecase mode
+    (keyword mode)
+    (string (intern (string-upcase mode) "KEYWORD"))))
+
 (defun vt-correlate (a v &key (mode :full))
-  (let* ((a-flat (vt-contiguous (vt-flatten a))) (v-flat (vt-contiguous (vt-flatten v)))
+  "1D 互相关，对标 np.correlate。mode 支持关键字(:full/:valid/:same)或字符串。"
+  (let* ((mode-kw (%normalize-mode-keyword mode))
+         (a-flat (vt-contiguous (vt-flatten a))) (v-flat (vt-contiguous (vt-flatten v)))
          (n (vt-size a-flat)) (m (vt-size v-flat))
          (a-data (vt-data a-flat)) (v-data (vt-data v-flat)))
     (flet ((compute (k)
@@ -585,7 +593,7 @@
              (full (make-array full-len :element-type 'double-float)))
         (loop for k from (- offset) below n for i from 0
               do (setf (aref full i) (compute k)))
-        (ecase mode
+        (ecase mode-kw
           (:full (%make-vt :data full :shape (list full-len) :strides '(1) :offset 0 :dtype :float64))
           (:valid (let* ((len (max 0 (1+ (- n m)))) (start offset)
                          (data (make-array len :element-type 'double-float)))
@@ -597,7 +605,10 @@
                    (%make-vt :data data :shape (list out-len) :strides '(1) :offset 0 :dtype :float64))))))))
 
 (defun vt-convolve (a v &key (mode :full))
-  (vt-correlate (vt-contiguous a) (vt-contiguous (vt-flip v)) :mode mode))
+  "1D 卷积，对标 np.convolve。mode 支持关键字(:full/:valid/:same)或字符串。"
+  (vt-correlate (vt-contiguous a)
+		(vt-contiguous (vt-flip v))
+		:mode (%normalize-mode-keyword mode)))
 
 (defun vt-interp (x xp fp &key (left nil) (right nil))
   (let* ((xp-vt (if (eq (vt-dtype xp) :float64) xp (vt-astype xp :float64)))

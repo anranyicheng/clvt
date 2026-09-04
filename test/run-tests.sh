@@ -34,7 +34,7 @@ SUITES[comprehensive-test]="119 综合功能测试"
 SUITES[auto-compare-test]="63 JSON 自动对比测试"
 SUITES[benchmark-copy]="性能基准测试"
 SUITES[numpy-compare-test]="69 numpy/pytorch 实时对比测试"
-
+SUITES[extensions2-test]="37 新增函数测试 (fliplr/geomspace/one-hot/layer-norm等)"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -242,6 +242,7 @@ main() {
             comprehensive-test
             auto-compare-test
             numpy-compare-test
+	    extensions2-test
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)
