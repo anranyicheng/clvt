@@ -93,11 +93,12 @@ check_asdf() {
 
 check_python() {
     if command -v python3 &>/dev/null; then
-        if python3 -c 'import numpy, torch' &>/dev/null; then
-            log "python3: numpy $(python3 -c 'import numpy;print(numpy.__version__)') / torch $(python3 -c 'import torch;print(torch.__version__)')"
+        if python3 -c 'import numpy' &>/dev/null; then
+            log "python3: numpy $(python3 -c 'import numpy;print(numpy.__version__)')"
+            log "(numpy-compare-test 不再要求 torch，使用纯 numpy 实现)"
             return 0
         else
-            warn "未找到 numpy/torch，跳过 numpy-compare-test"
+            warn "未找到 numpy，跳过 numpy-compare-test"
             return 1
         fi
     else

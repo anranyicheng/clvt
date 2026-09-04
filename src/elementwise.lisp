@@ -26,7 +26,7 @@
 (defun vt-/ (vt &rest args)
   (with-float-safe
     (let ((first (ensure-vt vt)))
-      (cond ((null args) (vt-map (lambda (v) (/ 1.0d0 v)) first))
+      (cond ((null args) (vt-fast-map #'/ (make-vt nil 1 :dtype (vt-dtype first)) first))
             ((null (cdr args)) (vt-fast-map #'/ first (first args)))
             (t (apply #'vt-map #'/ first args))))))
 

@@ -423,14 +423,16 @@
 
 (defun vt-nanmean (tensor &key axis keepdims dtype out)
   (let* ((mask (vt-isnan tensor)) (not-nan (vt-logical-not mask))
-         (clean (vt-where mask 0.0d0 tensor))
-         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype :int64))
          (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype))) (error "vt-nanmean: :out 与 :dtype 冲突"))
                             (out (vt-dtype out)) (dtype dtype)
                             (t (if (eq (vt-dtype tensor) :float32) :float32 :float64))))
+         (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
+         (clean (vt-where mask zero tensor :dtype final-dtype))
+         ;; count 使用与最终结果相同的浮点dtype，避免float->int强制转换错误
+         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
          (nan (vt-get-nan final-dtype))
          (sum (vt-sum clean :axis axis :keepdims keepdims :dtype final-dtype :out out)))
-    (vt-map (lambda (s c) (if (zerop c) nan (/ s c))) sum count :dtype final-dtype :out sum)))
+    (vt-map (lambda (s c) (if (<= c zero) nan (/ s c))) sum count :dtype final-dtype :out sum)))
 
 (defun vt-nanvar (tensor &key axis keepdims (ddof 0) dtype out)
   (let* ((mask (vt-isnan tensor)) (not-nan (vt-logical-not mask))
@@ -438,14 +440,17 @@
                             (out (vt-dtype out)) (dtype dtype)
                             (t (if (eq (vt-dtype tensor) :float32) :float32 :float64))))
          (nan (vt-get-nan final-dtype)) (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
-         (clean (vt-where mask zero tensor))
-         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype :int64))
+         (clean (vt-where mask zero tensor :dtype final-dtype))
+         ;; count 使用浮点dtype
+         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
          (mean (vt-nanmean tensor :axis axis :keepdims t :dtype final-dtype))
          (sq-diff (vt-* (vt-map (lambda (c m) (* (- c m) (- c m))) clean mean :dtype final-dtype)
                         not-nan :dtype final-dtype))
          (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims :dtype final-dtype :out out))
-         (divisor (vt-map (lambda (c) (max 0 (- c ddof))) count :dtype :int64)))
-    (vt-map (lambda (s d) (if (<= d 0) nan (/ s d))) sum2 divisor :dtype final-dtype :out sum2)))
+         ;; divisor 使用浮点dtype
+         (ddof-f (coerce ddof (vt-dtype->lisp-type final-dtype)))
+         (divisor (vt-map (lambda (c) (if (< c ddof-f) zero (- c ddof-f))) count :dtype final-dtype)))
+    (vt-map (lambda (s d) (if (<= d zero) nan (/ s d))) sum2 divisor :dtype final-dtype :out sum2)))
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
   (let* ((final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype))) (error "vt-nanstd: :out 与 :dtype 冲突"))

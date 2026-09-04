@@ -1,0 +1,87 @@
+diff a/src/creation.lisp b/src/creation.lisp	(rejected hunks)
+@@ -55,27 +55,79 @@
+       res)))
+ 
+ (defun vt-arange (total-num &key (start 0) (step 1) (dtype :float64))
+-  "创建包含 total-num 个元素的等差数列一维张量。"
++  "创建包含 total-num 个元素的等差数列一维张量。
++
++优化：按 dtype 特化填充循环，避免逐元素 vt-cast 的 ecase 分派开销。"
+   (declare (fixnum total-num))
+   (when (and (numberp step) (zerop step))
+     (error "vt-arange: step 不能为 0"))
+   (let* ((data (make-array total-num :element-type (vt-dtype->lisp-type dtype)))
+          (shape (list total-num)))
+-    (loop for i fixnum below total-num
+-          do (setf (aref data i) (vt-cast (+ start (* i step)) dtype)))
++    (ecase dtype
++      (:float64
++       (let ((s (coerce start 'double-float))
++             (d (coerce step 'double-float)))
++         (declare (double-float s d))
++         (loop for i fixnum below total-num
++               do (setf (aref data i) (+ s (* d (coerce i 'double-float)))))))
++      (:float32
++       (let ((s (coerce start 'single-float))
++             (d (coerce step 'single-float)))
++         (declare (single-float s d))
++         (loop for i fixnum below total-num
++               do (setf (aref data i) (+ s (* d (coerce i 'single-float)))))))
++      ((:int64 :int32)
++       (let ((s (truncate start)) (d (truncate step)))
++         (declare (fixnum s d))
++         (loop for i fixnum below total-num
++               do (setf (aref data i) (+ s (* i d))))))
++      (:int16
++       (let ((s (truncate start)) (d (truncate step)))
++         (declare (fixnum s d))
++         (loop for i fixnum below total-num
++               do (setf (aref data i) (%wrap-int16 (+ s (* i d)))))))
++      (:int8
++       (let ((s (truncate start)) (d (truncate step)))
++         (declare (fixnum s d))
++         (loop for i fixnum below total-num
++               do (setf (aref data i) (%wrap-int8 (+ s (* i d)))))))
++      (:uint8
++       (let ((s (truncate start)) (d (truncate step)))
++         (declare (fixnum s d))
++         (loop for i fixnum below total-num
++               do (setf (aref data i) (%wrap-uint8 (+ s (* i d)))))))
++      (:uint16
++       (let ((s (truncate start)) (d (truncate step)))
++         (declare (fixnum s d))
++         (loop for i fixnum below total-num
++               do (setf (aref data i) (%wrap-uint16 (+ s (* i d))))))))
+     (%make-vt :data data :shape shape :strides (vt-compute-strides shape)
+               :offset 0 :dtype dtype)))
+ 
+ (defun vt-linspace (start end num &key (endpoint t) (dtype :float64))
+-  "创建线性间隔数组，对标 numpy.linspace。"
++  "创建线性间隔数组，对标 numpy.linspace。
++
++优化：按 dtype 特化填充循环，避免逐元素 vt-cast 的 ecase 分派开销。"
+   (when (<= num 0) (error "num 必须大于 0，当前值为 ~d" num))
+   (when (= num 1)
+     (return-from vt-linspace (make-vt (list 1) (vt-cast start dtype) :dtype dtype)))
+   (let* ((div (if endpoint (1- num) num))
+          (step (/ (- end start) div)))
+     (let ((data (make-array num :element-type (vt-dtype->lisp-type dtype))))
+-      (loop for i fixnum from 0 below num
+-            do (setf (aref data i) (vt-cast (+ start (* i step)) dtype)))
++      (ecase dtype
++        (:float64
++         (let ((s (coerce start 'double-float)) (d (coerce step 'double-float)))
++           (declare (double-float s d))
++           (loop for i fixnum below num
++                 do (setf (aref data i) (+ s (* d (coerce i 'double-float)))))))
++        (:float32
++         (let ((s (coerce start 'single-float)) (d (coerce step 'single-float)))
++           (declare (single-float s d))
++           (loop for i fixnum below num
++                 do (setf (aref data i) (+ s (* d (coerce i 'single-float)))))))
++        ((:int64 :int32 :int16 :int8 :uint8 :uint16)
++         (loop for i fixnum below num
++               do (setf (aref data i) (vt-cast (+ start (* i step)) dtype)))))
+       (%make-vt :data data :shape (list num) :strides '(1) :offset 0 :dtype dtype))))
+ 
+ (defun vt-logspace (start stop num &key (base 10.0d0) (endpoint t) (dtype :float64))

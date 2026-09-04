@@ -375,7 +375,9 @@
    #:vt-get-print-options
    #:vt-flatnonzero
    #:vt-count
-   #:vt-clip-tensor))
+   #:vt-clip-tensor
+   #:vt-clamp
+   #:vt-copy-to!))
 
 (in-package :clvt)
 
@@ -389,5 +391,6 @@
     (when (search "vt-" (symbol-name var) :test #'equalp)
       (push var *vt-fun-list*)))
   (setf *vt-fun-list* (nreverse *vt-fun-list*)))
+
 
 (%refresh-vt-fun-list)

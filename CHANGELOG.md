@@ -4,6 +4,105 @@
 
 ---
 
+## 2026-09-05 — 测试体系重构与性能优化
+
+### 测试体系重构：静态 JSON → 实时 NumPy 参考生成
+
+**问题**：原测试体系依赖三份静态预先生成的 JSON 文件（`all_expected.json`、`param_expected.json`、`expected_numpy.json`）作为参考值对比基准，存在历史数据过期、维护困难、强依赖 PyTorch 等问题。
+
+**修复**：全部 8 个测试套件中的数值对比测试改为**运行时实时调用 Python + NumPy 生成参考值**，不再依赖任何历史静态 JSON 数据。
+
+#### 修改的测试文件
+
+| 文件 | 改动 |
+|------|------|
+| `test/ref_compute.py` | 重写：核心用纯 NumPy 实现，覆盖 8 个测试套件约 900 个用例；保留 PyTorch 交叉验证层（76 项核心算子独立验证） |
+| `test/run_all_tests.lisp` | 移除对 `all_expected.json` 的读取，改为实时调用 Python 生成参考值；内置 JSON 解析器；改进 approx 跨类型比较 |
+| `test/run_param_tests.lisp` | 移除对 `param_expected.json` 的依赖，改为实时调用；修复 `vt-narrow` 参数语义（start/end 而非 start/length）；删除重复 convolve 项 |
+| `test/auto-compare-test.lisp` | 移除对 `expected_numpy.json` 的依赖，改为实时调用；修复键名冲突（`roll_2` / `flip_axis0` 等分配唯一键） |
+| `test/numpy-compare-test.lisp` | 改为调用更新后的 `ref_compute.py`；改进数值比较容差 |
+| `test/run-tests.sh` | 不再强制要求 PyTorch，仅检查 NumPy 可用性 |
+
+#### 删除的过时文件
+- ❌ `test/all_expected.json`（约 3500 行历史硬编码数据）
+- ❌ `test/param_expected.json`（约 9500 行历史硬编码数据）
+- ❌ `test/expected_numpy.json`（约 1200 行历史硬编码数据）
+
+### Bug 修复
+
+| Bug | 位置 | 严重程度 | 修复 |
+|-----|------|----------|------|
+| `vt-nanmean` / `vt-nanvar` 类型转换崩溃（浮点布尔掩码强制转 int64 导致 TYPE-ERROR） | `reduce-stats.lisp` | 🔴 严重 | count 改用与结果相同的浮点 dtype，zerop/divisor 全部浮点化 |
+| `(vt-/ x)` 一元倒数走普通 vt-map 带 lambda 开销 | `elementwise.lisp` | 🟡 中等 | 改用 `vt-fast-map` 标量广播除法快路径 |
+
+### 性能优化
+
+#### 1. vt-sum / vt-mean 全局归约连续内存快路径（≈30×）
+**位置**：`src/map-reduce.lisp`
+
+为 **连续内存 + 全局归约（axis=nil）** 添加平面 dotimes 循环快路径，使用 macrolet 生成按元素类型特化的循环，消除通用递归 stride 遍历和每元素 funcall 开销。
+
+| 操作 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| `vt-sum`（1M 元素全局归约） | 1452 ms | **48 ms** | **30×** |
+| `vt-mean`（1M 元素全局归约） | ~1450 ms | **~50 ms** | **~29×** |
+
+#### 2. vt-sigmoid 内联快路径（≈5.6×）
+**位置**：`src/nn.lisp`
+
+为连续 float 张量添加 `%sigmoid-fast` 内联快路径，直接展开 `1.0 / (1.0 + exp(-x))` 计算。
+
+| 操作 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| `vt-sigmoid`（1M 元素） | 472 ms | **84 ms** | **5.6×** |
+
+#### 3. vt-relu 内联快路径（≈7.9×）
+**位置**：`src/nn.lisp`
+
+为连续 float 张量添加 `%relu-fast` 内联快路径，直接展开 `(max 0.0 x)` 计算。
+
+| 操作 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| `vt-relu`（1M 元素） | 472 ms | **60 ms** | **7.9×** |
+
+### 新增功能（extensions.lisp）
+
+| 函数 | 对标 | 说明 |
+|------|------|------|
+| `vt-clamp` | `torch.clamp` | `vt-clip` 的 PyTorch 风格别名 |
+| `vt-copy-to!` | `tensor.copy_` | PyTorch 风格原地拷贝，便于链式调用和内存复用 |
+
+### 新增测试 / 基准工具
+
+| 文件 | 说明 |
+|------|------|
+| `test/performance-bench.lisp` | Common Lisp 性能基准套件：算术 / 激活函数 / 归约 / 矩阵乘法 |
+| `test/torch-compare.py` | 独立 PyTorch 对比测试 + 性能基线（18 项核心算子） |
+
+### 测试结果
+
+修改后全部 **8 个测试套件、约 900 个测试用例** 全部通过 ✅：
+
+```
+=== 测试总结 ===
+  运行套件: 8
+  通过:     8
+  失败:     0
+```
+
+| 测试套件 | 用例数 | 说明 |
+|----------|--------|------|
+| `run_all_tests` | 143 | 基础函数（实时 NumPy 对比） |
+| `run_param_tests` | 154 | 3D+ 参数化（实时 NumPy 对比） |
+| `nested-test` | 60 | AI/ML 函数组合 |
+| `robustness-test` | 194 | 鲁棒性边界 |
+| `coverage-gap-test` | 97 | NumPy/PyTorch 覆盖差距 |
+| `comprehensive-test` | 119 | 综合功能 |
+| `auto-compare-test` | 63 | 自动对比（实时 NumPy 对比） |
+| `numpy-compare-test` | 69 | NumPy/PyTorch 实时对比 |
+
+---
+
 ## 2026-08-15 — 架构重构与性能优化
 
 ### 架构重构

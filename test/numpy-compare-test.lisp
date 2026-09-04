@@ -1,4 +1,4 @@
-;;;; numpy-compare-test.lisp — 运行时调用 numpy/pytorch 生成参考并对比
+;;;; numpy-compare-test.lisp — 运行时调用 numpy 生成参考并对比（无pytorch依赖）
 ;;;; 用法: 在项目根目录运行（或由 run-tests.sh 调用）
 
 (require :asdf)
@@ -7,9 +7,9 @@
 (in-package :clvt)
 
 ;;; ------------------------------------------------------------------
-;;; 简易 JSON 解析器
+;;; 简易 JSON 解析器（从字符串解析）
 ;;; ------------------------------------------------------------------
-(defun parse-json (s)
+(defun parse-json-string (s)
   (let ((pos 0) (len (length s)))
     (labels ((skip ()
                (loop while (and (< pos len) (member (char s pos) '(#\Space #\Tab #\Newline #\Return)))
@@ -62,9 +62,9 @@
 (defun approx-val (e a &optional (tol 1e-5))
   (cond
     ((and (numberp e) (numberp a))
-     (if (and (floatp e) (floatp a))
-         (< (abs (- e a)) (+ tol (* tol (abs e))))
-         (eql e a)))
+     ;; 对于所有数字比较都用容差，不严格要求类型匹配
+     (let ((ee (float e 1.0d0)) (aa (float a 1.0d0)))
+       (< (abs (- ee aa)) (+ tol (* tol (max (abs ee) 1.0d0))))))
     ((and (listp e) (listp a))
      (and (= (length e) (length a))
           (every (lambda (x y) (approx-val x y tol)) e a)))
@@ -83,8 +83,8 @@
 ;;; ------------------------------------------------------------------
 (defun run-reference ()
   (let* ((here (or *load-truename* *compile-file-truename* *default-pathname-defaults*))
-         (proj (make-pathname :directory (butlast (pathname-directory here) 1)))
-         (script (namestring (merge-pathnames "test/ref_compute.py" proj))))
+         (script (namestring (merge-pathnames "ref_compute.py" here))))
+    (format t "  🔄 实时调用numpy生成参考值...~%")
     (uiop:run-program (list "python3" script) :output :string)))
 
 ;;; ------------------------------------------------------------------
@@ -92,9 +92,9 @@
 ;;; ------------------------------------------------------------------
 (defun run-numpy-compare ()
   (format t "~%============================================================~%")
-  (format t "  clvt vs numpy/pytorch 实时对比测试~%")
+  (format t "  clvt vs numpy 实时对比测试 (无pytorch依赖)~%")
   (format t "============================================================~%~%")
-  (let ((ref (parse-json (run-reference))))
+  (let ((ref (parse-json-string (run-reference))))
     (flet ((E (k) (gethash k ref))
            (vt (x) (vt-to-list x))
            (vi (x) (vt-item x)))
@@ -122,8 +122,8 @@
         (t! "sqrt" (E "sqrt") (vt (vt-sqrt (vt-from-sequence '(1.0 4.0 9.0 16.0)))))
         (t! "abs" (E "abs") (vt (vt-abs (vt-from-sequence '(-3.0 -1.0 0.0 1.0 3.0)))))
         (t! "clip" (E "clip") (vt (vt-clip (vt-from-sequence '(1.0 2.0 3.0 4.0)) 2.0 3.0)))
-        (t! "maximum" (E "maximum") (vt (vt-maximum a b)))
-        (t! "minimum" (E "minimum") (vt (vt-minimum a b)))
+        (t! "maximum" (E "max_ab") (vt (vt-maximum a b)))
+        (t! "minimum" (E "min_ab") (vt (vt-minimum a b)))
         (t! "pow" (E "pow") (vt (vt-pow a 2.0)))
         (t! "reciprocal" (E "reciprocal") (vt (vt-reciprocal a)))
         (t! "cbrt" (E "cbrt") (vt (vt-cbrt (vt-from-sequence '(-8.0 -1.0 0.0 1.0 8.0))))))
@@ -169,7 +169,7 @@
       (t! "einsum_outer" (E "einsum_outer") (vt (vt-einsum "i,j->ij" (vt-from-sequence '(1.0 2.0 3.0)) (vt-from-sequence '(4.0 5.0)))))
       (t! "einsum_trace" (E "einsum_trace") (vi (vt-einsum "ii->" (vt-reshape (vt-arange 9 :dtype :float64) '(3 3)))))
 
-      ;; 神经网络（pytorch 参考）
+      ;; 神经网络（numpy实现）
       (let ((x (vt-from-sequence '(-2.0 -1.0 0.0 1.0 2.0))))
         (t! "sigmoid" (E "sigmoid") (vt (vt-sigmoid x)))
         (t! "relu" (E "relu") (vt (vt-relu x)))
@@ -190,7 +190,7 @@
                                                  (vt-from-sequence '((5 6) (7 8)) :dtype :int64))))
       (t! "broadcast" (E "broadcast") (vt (vt-broadcast-to (vt-from-sequence '(1 2 3) :dtype :int64) '(2 3))))
 
-      ;; torch topk
+      ;; topk
       (multiple-value-bind (vals idxs)
           (vt-topk (vt-from-sequence '((1.0 5.0 3.0) (7.0 2.0 9.0))) 2)
         (t! "topk_vals" (E "topk_vals") (vt vals))

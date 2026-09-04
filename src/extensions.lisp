@@ -15,6 +15,19 @@
   (vt-map (lambda (x lo hi) (max lo (min hi x)))
           (ensure-vt tensor) (ensure-vt vmin) (ensure-vt vmax) :dtype dtype :out out))
 
+;;; ------------------------------------------------------------------
+;;; pytorch 风格别名
+;;; ------------------------------------------------------------------
+
+(defun vt-clamp (tensor vmin vmax &key out dtype)
+  "vt-clip 的 pytorch 风格别名。"
+  (vt-clip tensor vmin vmax :out out :dtype dtype))
+
+(defun vt-copy-to! (dst src)
+  "pytorch 风格原地拷贝：将 src 拷贝到 dst，返回 dst。"
+  (vt-copy-into dst src)
+  dst)
+
 (defun vt-flatnonzero (tensor &key (dtype :int64))
   "返回展平后非零元素的索引。"
   (let* ((flat (vt-ravel tensor)) (data (vt-data flat)) (size (vt-size flat))

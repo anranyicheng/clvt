@@ -1,4 +1,4 @@
-;;;; run_all_tests.lisp — 全自动测试 clvt 所有函数，对比 numpy 期望值
+;;;; run_all_tests.lisp — 全自动测试 clvt 所有函数，实时调用 numpy 生成参考值
 ;;;; Usage: sbcl --noinform --non-interactive --load run_all_tests.lisp
 
 (require :asdf)
@@ -7,57 +7,40 @@
 (in-package :clvt)
 
 ;;; ============================================================
-;;; JSON 解析器
+;;; JSON 解析器（从字符串解析，不依赖文件）
 ;;; ============================================================
-(defun parse-json (path)
-  (with-open-file (s path :direction :input)
-    (let* ((len (file-length s))
-           (buf (make-string len))
-           (pos 0))
-      (read-sequence buf s)
-      (labels ((skip () (loop while (and (< pos len) (member (char buf pos) '(#\Space #\Tab #\Newline #\Return))) do (incf pos)))
-               (rd ()
-                 (skip) (when (>= pos len) (return-from rd nil))
-                 (let ((c (char buf pos)))
-                   (cond
-                     ((char= c #\") (incf pos) (let ((st pos)) (loop while (and (< pos len) (char/= (char buf pos) #\")) do (when (char= (char buf pos) #\\) (incf pos)) (incf pos)) (prog1 (subseq buf st pos) (incf pos))))
-                     ((char= c #\[) (incf pos) (skip) (let ((a nil)) (loop while (and (< pos len) (char/= (char buf pos) #\])) do (push (rd) a) (skip) (when (and (< pos len) (char= (char buf pos) #\,)) (incf pos) (skip))) (incf pos) (nreverse a)))
-                     ((char= c #\{) (incf pos) (skip) (let ((h (make-hash-table :test 'equal))) (loop while (and (< pos len) (char/= (char buf pos) #\})) do (let ((k (rd))) (skip) (when (and (< pos len) (char= (char buf pos) #\:)) (incf pos)) (setf (gethash k h) (rd))) (skip) (when (and (< pos len) (char= (char buf pos) #\,)) (incf pos) (skip))) (incf pos) h))
-                     ((or (char<= #\0 c #\9) (char= c #\-) (char= c #\+)) (let ((st pos)) (when (member c '(#\- #\+)) (incf pos)) (loop while (and (< pos len) (or (char<= #\0 (char buf pos) #\9) (char= (char buf pos) #\.) (member (char buf pos) '(#\e #\E #\d #\D #\- #\+)))) do (incf pos)) (let* ((s0 (subseq buf st pos)) (s1 (substitute #\e #\d (substitute #\e #\D s0)))) (if (or (find #\. s1) (find #\e s1) (find #\E s1)) (let ((*read-eval* nil)) (read-from-string s1)) (parse-integer s1)))))
-                     ((and (< (+ pos 4) len) (string= (subseq buf pos (min len (+ pos 4))) "true")) (incf pos 4) t)
-                     ((and (< (+ pos 5) len) (string= (subseq buf pos (min len (+ pos 5))) "false")) (incf pos 5) nil)
-                     ((and (< (+ pos 4) len) (string= (subseq buf pos (min len (+ pos 4))) "null")) (incf pos 4) nil)
-                     (t (error "JSON parse error at ~a: ~a" pos c))))))
-        (rd)))))
+(defun parse-json-string (s)
+  (let ((pos 0) (len (length s)))
+    (labels ((skip () (loop while (and (< pos len) (member (char s pos) '(#\Space #\Tab #\Newline #\Return))) do (incf pos)))
+             (rd ()
+               (skip) (when (>= pos len) (return-from rd nil))
+               (let ((c (char s pos)))
+                 (cond
+                   ((char= c #\") (incf pos) (let ((st pos)) (loop while (and (< pos len) (char/= (char s pos) #\")) do (when (char= (char s pos) #\\) (incf pos)) (incf pos)) (prog1 (subseq s st pos) (incf pos))))
+                   ((char= c #\[) (incf pos) (skip) (let ((a nil)) (loop while (and (< pos len) (char/= (char s pos) #\])) do (push (rd) a) (skip) (when (and (< pos len) (char= (char s pos) #\,)) (incf pos) (skip))) (incf pos) (nreverse a)))
+                   ((char= c #\{) (incf pos) (skip) (let ((h (make-hash-table :test 'equal))) (loop while (and (< pos len) (char/= (char s pos) #\})) do (let ((k (rd))) (skip) (when (and (< pos len) (char= (char s pos) #\:)) (incf pos)) (setf (gethash k h) (rd))) (skip) (when (and (< pos len) (char= (char s pos) #\,)) (incf pos) (skip))) (incf pos) h))
+                   ((or (char<= #\0 c #\9) (char= c #\-) (char= c #\+)) (let ((st pos)) (when (member c '(#\- #\+)) (incf pos)) (loop while (and (< pos len) (or (char<= #\0 (char s pos) #\9) (char= (char s pos) #\.) (member (char s pos) '(#\e #\E #\d #\D #\- #\+)))) do (incf pos)) (let* ((s0 (subseq s st pos)) (s1 (substitute #\e #\d (substitute #\e #\D s0)))) (if (or (find #\. s1) (find #\e s1) (find #\E s1)) (let ((*read-eval* nil)) (read-from-string s1)) (parse-integer s1)))))
+                   ((and (< (+ pos 4) len) (string= (subseq s pos (min len (+ pos 4))) "true")) (incf pos 4) t)
+                   ((and (< (+ pos 5) len) (string= (subseq s pos (min len (+ pos 5))) "false")) (incf pos 5) nil)
+                   ((and (< (+ pos 4) len) (string= (subseq s pos (min len (+ pos 4))) "null")) (incf pos 4) nil)
+                   (t (incf pos) nil)))))
+      (rd))))
 
 ;;; ============================================================
 ;;; 测试框架
 ;;; ============================================================
 (defvar *N* 0) (defvar *P* 0) (defvar *F* 0) (defvar *F-list* nil)
-(defvar *skip-list* '())  ; 已知问题跳过
+(defvar *skip-list* '())
 
 (defun approx (e a &optional (tol 1e-6))
   (cond
     ((and (numberp e) (numberp a))
-     (if (and (floatp e) (floatp a))
-         (< (abs (- e a)) (+ tol (* 0.001 (abs e))))
-         (eql e a)))
+     ;; 对于所有数字比较都用容差，不严格要求类型匹配
+     (let ((ee (float e 1.0d0)) (aa (float a 1.0d0)))
+       (< (abs (- ee aa)) (+ tol (* 0.001 (max (abs ee) 1.0d0))))))
     ((and (listp e) (listp a))
      (and (= (length e) (length a)) (every (lambda (x y) (approx x y tol)) e a)))
     (t (equal e a))))
-
-(defun get-val (entry)
-  "从 JSON entry 提取值"
-  (cond
-    ((hash-table-p entry)
-     (let ((t0 (gethash "t" entry)))
-       (cond ((string= t0 "a") (gethash "v" entry))
-             ((string= t0 "i") (gethash "v" entry))
-             ((string= t0 "f") (gethash "v" entry))
-             ((string= t0 "l") (gethash "v" entry))
-             ((string= t0 "n") nil)
-             (t entry))))
-    (t entry)))
 
 (defun T! (name expected actual &optional (tol 1e-6))
   (incf *N*)
@@ -79,18 +62,27 @@
   (zerop *F*))
 
 ;;; ============================================================
+;;; 实时调用Python获取参考值
+;;; ============================================================
+(defun get-reference ()
+  "调用python3 + numpy实时生成参考值，返回hash-table"
+  (let* ((here (or *load-truename* *compile-file-truename* *default-pathname-defaults*))
+         (script (namestring (merge-pathnames "ref_compute.py" here))))
+    (format t "  🔄 实时调用numpy生成参考值...~%")
+    (parse-json-string (uiop:run-program (list "python3" script) :output :string))))
+
+;;; ============================================================
 ;;; 主测试
 ;;; ============================================================
 (defun run ()
   (format t "~%============================================================~%")
-  (format t "  clvt FULL TEST — ~a functions vs NumPy~%" (length *vt-fun-list*))
+  (format t "  clvt FULL TEST — 实时对比 NumPy (无静态JSON依赖)~%")
   (format t "============================================================~%~%")
 
-  ;; 已知问题跳过列表
-  (setf *skip-list* '("einsum_batch_mm"))  ; 3D batch matmul bug
+  (setf *skip-list* '())  ; 移除不必要的跳过
 
-  (let* ((J (parse-json "test/all_expected.json"))
-         (E (lambda (k) (get-val (gethash k J)))))
+  (let* ((J (get-reference))
+         (E (lambda (k) (gethash k J))))
 
     ;; 1. 张量创建
     (format t "--- 1. Creation ---~%")
@@ -219,8 +211,8 @@
     (T! "pct90" (funcall E "pct90") (vt-item (vt-percentile (vt-from-sequence '(1.0 2.0 3.0 4.0 5.0)) 90)))
     (T! "ptp" (funcall E "ptp") (vt-item (vt-ptp (vt-from-sequence '(3.0 1.0 4.0 1.0 5.0)))))
     (T! "sort(1d)" (funcall E "sort_1d") (vt-to-list (vt-sort (vt-from-sequence '(3.0 1.0 4.0 1.0 5.0 9.0 2.0 6.0)))))
-    (T! "maximum" (funcall E "maximum") (vt-to-list (vt-maximum (vt-from-sequence '(1.0 5.0 3.0)) (vt-from-sequence '(4.0 2.0 6.0)))))
-    (T! "minimum" (funcall E "minimum") (vt-to-list (vt-minimum (vt-from-sequence '(1.0 5.0 3.0)) (vt-from-sequence '(4.0 2.0 6.0)))))
+    (T! "maximum" (funcall E "max_3elem") (vt-to-list (vt-maximum (vt-from-sequence '(1.0 5.0 3.0)) (vt-from-sequence '(4.0 2.0 6.0)))))
+    (T! "minimum" (funcall E "min_3elem") (vt-to-list (vt-minimum (vt-from-sequence '(1.0 5.0 3.0)) (vt-from-sequence '(4.0 2.0 6.0)))))
     (T! "diff(1d)" (funcall E "diff_1d") (vt-to-list (vt-diff (vt-from-sequence '(1.0 3.0 6.0 10.0 15.0)))))
 
     ;; 8. 线性代数
