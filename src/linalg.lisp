@@ -334,6 +334,86 @@
           (incf a-ptr)))
       (incf c-ptr-base n))))
 
+;; 极速内核 5: double-float 转置 B 布局 (A: m×k 连续, B: n×k 连续)
+(declaim (inline %matmul-df-nt-fast-kernel))
+(defun %matmul-df-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+  "C[i, j] = sum_l A[i, l] * B[j, l]。
+   A: (m, k) 连续，B: (n, k) 连续，C: (m, n) 连续。"
+  (declare (type (simple-array double-float (*)) a-data b-data c-data)
+           (type fixnum m k n a-off b-off c-off)
+           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+  (let* ((k-main (the fixnum (logand k -4)))
+         (k-rem  (the fixnum (logand k 3))))
+    (declare (type fixnum k-main k-rem))
+    (loop for i of-type fixnum from 0 below m do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k))))))
+        (declare (type fixnum a-row))
+        (loop for j of-type fixnum from 0 below n do
+          (let ((a-ptr a-row)
+                (b-ptr (the fixnum (+ b-off (the fixnum (* j k)))))
+                (acc0 0.0d0) (acc1 0.0d0) (acc2 0.0d0) (acc3 0.0d0))
+            (declare (type fixnum a-ptr b-ptr)
+                     (type double-float acc0 acc1 acc2 acc3))
+            ;; 主体：每次处理 4 个 k
+            (dotimes (l (the fixnum (ash k-main -2)))
+              (declare (ignore l))
+              (incf acc0 (* (aref a-data a-ptr)
+                            (aref b-data b-ptr)))
+              (incf acc1 (* (aref a-data (the fixnum (1+ a-ptr)))
+                            (aref b-data (the fixnum (1+ b-ptr)))))
+              (incf acc2 (* (aref a-data (the fixnum (+ a-ptr 2)))
+                            (aref b-data (the fixnum (+ b-ptr 2)))))
+              (incf acc3 (* (aref a-data (the fixnum (+ a-ptr 3)))
+                            (aref b-data (the fixnum (+ b-ptr 3)))))
+              (incf a-ptr 4)
+              (incf b-ptr 4))
+            ;; 尾部
+            (dotimes (l k-rem)
+              (declare (ignore l))
+              (incf acc0 (* (aref a-data a-ptr) (aref b-data b-ptr)))
+              (incf a-ptr)
+              (incf b-ptr))
+            (setf (aref c-data (the fixnum (+ c-off (the fixnum (* i n)) j)))
+                  (+ acc0 acc1 acc2 acc3))))))))
+
+;; 极速内核 6: single-float 转置 B 布局
+(declaim (inline %matmul-sf-nt-fast-kernel))
+(defun %matmul-sf-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+  (declare (type (simple-array single-float (*)) a-data b-data c-data)
+           (type fixnum m k n a-off b-off c-off)
+           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+  (let* ((k-main (the fixnum (logand k -4)))
+         (k-rem  (the fixnum (logand k 3))))
+    (declare (type fixnum k-main k-rem))
+    (loop for i of-type fixnum from 0 below m do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k))))))
+        (declare (type fixnum a-row))
+        (loop for j of-type fixnum from 0 below n do
+          (let ((a-ptr a-row)
+                (b-ptr (the fixnum (+ b-off (the fixnum (* j k)))))
+                (acc0 0.0f0) (acc1 0.0f0) (acc2 0.0f0) (acc3 0.0f0))
+            (declare (type fixnum a-ptr b-ptr)
+                     (type single-float acc0 acc1 acc2 acc3))
+            (dotimes (l (the fixnum (ash k-main -2)))
+              (declare (ignore l))
+              (incf acc0 (* (aref a-data a-ptr)
+                            (aref b-data b-ptr)))
+              (incf acc1 (* (aref a-data (the fixnum (1+ a-ptr)))
+                            (aref b-data (the fixnum (1+ b-ptr)))))
+              (incf acc2 (* (aref a-data (the fixnum (+ a-ptr 2)))
+                            (aref b-data (the fixnum (+ b-ptr 2)))))
+              (incf acc3 (* (aref a-data (the fixnum (+ a-ptr 3)))
+                            (aref b-data (the fixnum (+ b-ptr 3)))))
+              (incf a-ptr 4)
+              (incf b-ptr 4))
+            (dotimes (l k-rem)
+              (declare (ignore l))
+              (incf acc0 (* (aref a-data a-ptr) (aref b-data b-ptr)))
+              (incf a-ptr)
+              (incf b-ptr))
+            (setf (aref c-data (the fixnum (+ c-off (the fixnum (* i n)) j)))
+                  (+ acc0 acc1 acc2 acc3))))))))
+
 (defun einsum-execute
     (all-labels-vec label-dims-vec output-subs input-subs vts &key out)
   (declare (type simple-vector all-labels-vec)
@@ -432,6 +512,71 @@
                         (some #'zerop out-shape)
                         (some #'zerop dims-vec))
                 (return-from einsum-execute output))
+	      ;; ★ P1-1: 纯逐元素 einsum 路由到 vt-map
+              ;; 形如 "ij,ij->ij" / "i,i->i" / "...ij,...ij->...ij"
+              (when (and (= n-vts 2)
+                         (equal (first input-subs) (second input-subs))
+                         (equal (first input-subs) output-subs)
+                         (or all-f64-p all-f32-p all-i64-p all-i32-p))
+                (return-from einsum-execute
+                  (vt-map #'* (first vts) (second vts) :out output)))
+              ;; ★ P1-2: 全收缩内积 "i,i->" / "ij,ij->" 专用内核
+              ;; 条件：两输入形状完全相同、output 为空
+              (when (and (= n-vts 2)
+                         (equal (first input-subs) (second input-subs))
+                         (null output-subs)
+                         (equal (vt-shape (first vts)) (vt-shape (second vts)))
+                         (or all-f64-p all-f32-p all-i64-p all-i32-p))
+                (let* ((a-c (vt-contiguous (first vts)))
+                       (b-c (vt-contiguous (second vts)))
+                       (n (vt-size a-c))
+                       (a-data (vt-data a-c))
+                       (b-data (vt-data b-c))
+                       (a-off (vt-offset a-c))
+                       (b-off (vt-offset b-c))
+                       (a-end (the fixnum (+ a-off n)))
+                       (result
+                         (cond
+                           (all-f64-p
+                            (let ((da (the (simple-array double-float (*)) a-data))
+                                  (db (the (simple-array double-float (*)) b-data))
+                                  (pa a-off) (pb b-off) (acc 0.0d0))
+                              (declare (type double-float acc) (type fixnum pa pb a-end))
+                              (loop while (< pa a-end) do
+                                (incf acc (* (aref da pa) (aref db pb)))
+                                (incf pa) (incf pb))
+                              acc))
+                           (all-f32-p
+                            (let ((da (the (simple-array single-float (*)) a-data))
+                                  (db (the (simple-array single-float (*)) b-data))
+                                  (pa a-off) (pb b-off) (acc 0.0f0))
+                              (declare (type single-float acc) (type fixnum pa pb a-end))
+                              (loop while (< pa a-end) do
+                                (incf acc (* (aref da pa) (aref db pb)))
+                                (incf pa) (incf pb))
+                              acc))
+                           (all-i64-p
+                            (let ((da (the (simple-array (signed-byte 64) (*)) a-data))
+                                  (db (the (simple-array (signed-byte 64) (*)) b-data))
+                                  (pa a-off) (pb b-off) (acc 0))
+                              (declare (type (signed-byte 64) acc) (type fixnum pa pb a-end))
+                              (loop while (< pa a-end) do
+                                (incf acc (* (aref da pa) (aref db pb)))
+                                (incf pa) (incf pb))
+                              acc))
+                           (all-i32-p
+                            (let ((da (the (simple-array (signed-byte 32) (*)) a-data))
+                                  (db (the (simple-array (signed-byte 32) (*)) b-data))
+                                  (pa a-off) (pb b-off) (acc 0))
+                              (declare (type (signed-byte 32) acc) (type fixnum pa pb a-end))
+                              (loop while (< pa a-end) do
+                                (incf acc (* (aref da pa) (aref db pb)))
+                                (incf pa) (incf pb))
+                              acc)))))
+                  (setf (aref (the (simple-array * (*)) (vt-data output))
+                              (vt-offset output))
+                        (vt-cast result out-dtype))
+                  (return-from einsum-execute output)))
               
               ;; 批量矩阵乘法 (BMM) 极速通道
               (when (and (= n-vts 2)
@@ -466,37 +611,53 @@
                            (data-b (aref in-data-vec 1)))
                       
                       ;; 宏：生成 4 种类型的 BMM 内层循环，避免代码重复
-                      (macrolet ((gen-bmm-logic (lisp-type kernel-name)
+		      (macrolet ((gen-bmm-logic (lisp-type kernel-nn kernel-nt)
                                    `(let ((da (the (simple-array ,lisp-type (*)) data-a))
                                           (db (the (simple-array ,lisp-type (*)) data-b))
                                           (dc (the (simple-array ,lisp-type (*)) out-data)))
-                                      (if (and (= sa-i d-j) (= sa-j 1) 
-                                               (= sb-k 1) (= so-k 1)
-                                               (= sb-j d-k) (= so-i d-k))
-                                          ;; 极速通道
-                                          (,kernel-name da db dc d-i d-j d-k off-a off-b off-c)
-                                          ;; 兼容通道
-                                          (loop for i-idx fixnum from 0 below d-i do
-                                            (let ((ptr-a-row-start (+ off-a (the fixnum (* i-idx sa-i))))
-                                                  (ptr-c-row-start (+ off-c (the fixnum (* i-idx so-i)))))
-                                              (loop for j-idx fixnum from 0 below d-j do
-                                                (let ((val-a (aref da (+ ptr-a-row-start (the fixnum (* j-idx sa-j)))))
-                                                      (ptr-b-start (+ off-b (the fixnum (* j-idx sb-j))))
-                                                      (ptr-c-start ptr-c-row-start))
-                                                  (loop for k-idx fixnum from 0 below d-k do
-                                                    (incf (aref dc ptr-c-start)
-                                                          (* val-a (aref db ptr-b-start)))
-                                                    (incf ptr-b-start sb-k)
-                                                    (incf ptr-c-start so-k))))))))))
+                                      (cond
+                                        ;; NN：A 行连续（j 步长 1），B 行连续（k 步长 1）
+                                        ((and (= sa-i d-j) (= sa-j 1)
+                                              (= sb-k 1) (= so-k 1)
+                                              (= sb-j d-k) (= so-i d-k))
+                                         (,kernel-nn da db dc d-i d-j d-k off-a off-b off-c))
+                                        ;; ★ P1-3: NT：A 行连续，B 转置连续（k 步长 1，j 步长 d-j）
+                                        ,@(when kernel-nt
+                                            `(((and (= sa-i d-j) (= sa-j 1)
+                                                    (= sb-k d-j) (= sb-j 1)
+                                                    (= so-i d-k) (= so-k 1))
+                                               (,kernel-nt da db dc d-i d-j d-k off-a off-b off-c))))
+                                        ;; 兼容回退
+                                        (t
+                                         (loop for i-idx fixnum from 0 below d-i do
+                                           (let ((ptr-a-row-start (+ off-a (the fixnum (* i-idx sa-i))))
+                                                 (ptr-c-row-start (+ off-c (the fixnum (* i-idx so-i)))))
+                                             (loop for j-idx fixnum from 0 below d-j do
+                                               (let ((val-a (aref da (+ ptr-a-row-start (the fixnum (* j-idx sa-j)))))
+                                                     (ptr-b-start (+ off-b (the fixnum (* j-idx sb-j))))
+                                                     (ptr-c-start ptr-c-row-start))
+                                                 (loop for k-idx fixnum from 0 below d-k do
+                                                   (incf (aref dc ptr-c-start)
+                                                         (* val-a (aref db ptr-b-start)))
+                                                   (incf ptr-b-start sb-k)
+                                                   (incf ptr-c-start so-k)))))))))))
                         
                         (labels
                             ((loop-batch (b-labels off-a off-b off-c)
                                (if (null b-labels)
-                                   (cond
-                                     (all-f64-p (gen-bmm-logic double-float %matmul-df-fast-kernel))
-                                     (all-f32-p (gen-bmm-logic single-float %matmul-sf-fast-kernel))
-                                     (all-i64-p (gen-bmm-logic (signed-byte 64) %matmul-i64-fast-kernel))
-                                     (all-i32-p (gen-bmm-logic (signed-byte 32) %matmul-i32-fast-kernel)))
+				   (cond
+                                     (all-f64-p (gen-bmm-logic double-float
+                                                               %matmul-df-fast-kernel
+                                                               %matmul-df-nt-fast-kernel))
+                                     (all-f32-p (gen-bmm-logic single-float
+                                                               %matmul-sf-fast-kernel
+                                                               %matmul-sf-nt-fast-kernel))
+                                     (all-i64-p (gen-bmm-logic (signed-byte 64)
+                                                               %matmul-i64-fast-kernel
+                                                               nil))
+                                     (all-i32-p (gen-bmm-logic (signed-byte 32)
+                                                               %matmul-i32-fast-kernel
+                                                               nil)))
                                    
                                    (let* ((lbl (first b-labels))
                                           (pos-lbl (position lbl all-labels-vec :test #'eql))
@@ -801,6 +962,7 @@
 
 (defun vt-trace (matrix &key dtype out)
   "矩阵迹: 对角线元素之和"
+  (assert (= 2 (vt-order matrix)))
   (with-float-safe
     (vt-sum (vt-diagonal matrix) :dtype dtype :out out)))
 
