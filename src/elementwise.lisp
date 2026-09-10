@@ -32,20 +32,30 @@
 
 
 (defun vt-add (a b &key dtype out) (vt-fast-map #'+ a b :dtype dtype :out out))
+
 (defun vt-sub (a b &key dtype out) (vt-fast-map #'- a b :dtype dtype :out out))
+
 (defun vt-mul (a b &key dtype out) (vt-fast-map #'* a b :dtype dtype :out out))
+
 (defun vt-div (a b &key dtype out) (vt-fast-map #'/ a b :dtype dtype :out out))
+
 (defun vt-scale (a b &key out dtype) (vt-fast-map #'* a b :out out :dtype dtype))
 
 (defun %infer-float-dtype (vt dtype)
   (or dtype (if (eq (vt-dtype vt) :float32) :float32 :float64)))
 
 (defun vt-sin (vt &key out dtype) (vt-fast-map #'sin vt :out out :dtype (%infer-float-dtype vt dtype)))
+
 (defun vt-cos (vt &key out dtype) (vt-fast-map #'cos vt :out out :dtype (%infer-float-dtype vt dtype)))
+
 (defun vt-tan (vt &key out dtype) (vt-fast-map #'tan vt :out out :dtype (%infer-float-dtype vt dtype)))
+
 (defun vt-atan (vt &key out dtype) (vt-fast-map #'atan vt :out out :dtype (%infer-float-dtype vt dtype)))
+
 (defun vt-sinh (vt &key out dtype) (vt-fast-map #'sinh vt :out out :dtype (%infer-float-dtype vt dtype)))
+
 (defun vt-cosh (vt &key out dtype) (vt-fast-map #'cosh vt :out out :dtype (%infer-float-dtype vt dtype)))
+
 (defun vt-tanh (vt &key out dtype) (vt-fast-map #'tanh vt :out out :dtype (%infer-float-dtype vt dtype)))
 
 (defun vt-asin (vt &key out dtype)
@@ -71,14 +81,17 @@
 (defun vt-pow (vt power &key out dtype)
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (vt-map (lambda (x)
-              (let ((result (handler-case
-                                (expt x power)
-                              (error () nan))))
-                (if (realp result)
-                    result
-                    nan)))
-            vt :out out :dtype dt)))
+    (cond
+      ;; 正整数幂：expt 对实数无错，无 try
+      ((and (integerp power) (plusp power))
+       (vt-map (lambda (x) (expt x power)) vt :out out :dtype dt))
+      ;; 其他：保留 handler-case
+      (t
+       (vt-map (lambda (x)
+                 (let ((result (handler-case (expt x power)
+                                 (error () nan))))
+                   (if (realp result) result nan)))
+               vt :out out :dtype dt)))))
 
 (defun vt-expt (vt power &key out dtype) (vt-pow vt power :out out :dtype dtype))
 
@@ -92,86 +105,124 @@
 
 (defun vt-log (vt &key base out dtype)
   (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt)) (neginf (vt-get-neg-inf dt)) (posinf (vt-get-pos-inf dt)))
+         (nan (vt-get-nan dt))
+	 (neginf (vt-get-neg-inf dt))
+	 (posinf (vt-get-pos-inf dt)))
     (cond
       ((and base (or (<= base 0) (= base 1)))
        (vt-map (lambda (x) (declare (ignore x)) nan) vt :out out :dtype dt))
       ((null base)
-       (vt-map (lambda (x) (if (> x 0) (log x) (if (zerop x) neginf nan))) vt :out out :dtype dt))
+       (vt-map (lambda (x)
+		 (if (> x 0)
+		     (log x)
+		     (if (zerop x)
+			 neginf nan)))
+	       vt :out out :dtype dt))
       (t
        (let ((zero-result (if (plusp (log base)) neginf posinf)))
-         (vt-map (lambda (x) (if (> x 0) (log x base) (if (zerop x) zero-result nan)))
+         (vt-map (lambda (x)
+		   (if (> x 0)
+		       (log x base)
+		       (if (zerop x)
+			   zero-result nan)))
                  vt :out out :dtype dt))))))
 
 (defun vt-log10 (vt &key out dtype) (vt-log vt :base 10.0d0 :out out :dtype dtype))
+
 (defun vt-log2 (vt &key out dtype) (vt-log vt :base 2.0d0 :out out :dtype dtype))
 
 (defun vt-abs (vt &key out dtype) (vt-fast-map #'abs vt :out out :dtype dtype))
+
 (defun vt-signum (vt &key out dtype) (vt-fast-map #'signum vt :out out :dtype dtype))
 
 (defun vt-positive-p (vt &key out (dtype :float64))
   (vt-map (lambda (v) (if (> v 0.0d0) 1.0d0 0.0d0)) vt :out out :dtype dtype))
+
 (defun vt-negative-p (vt &key out (dtype :float64))
   (vt-map (lambda (v) (if (< v 0.0d0) 1.0d0 0.0d0)) vt :out out :dtype dtype))
+
 (defun vt-zero-p (vt &key out (dtype :float64))
   (vt-map (lambda (v) (if (zerop v) 1.0d0 0.0d0)) vt :out out :dtype dtype))
+
 (defun vt-nonzero-p (vt &key out (dtype :float64))
   (vt-map (lambda (v) (if (zerop v) 0.0d0 1.0d0)) vt :out out :dtype dtype))
+
 (defun vt-even-p (vt &key out (dtype :float64))
   (vt-map (lambda (v) (if (evenp (floor v)) 1.0d0 0.0d0)) vt :out out :dtype dtype))
+
 (defun vt-odd-p (vt &key out (dtype :float64))
   (vt-map (lambda (v) (if (oddp (floor v)) 1.0d0 0.0d0)) vt :out out :dtype dtype))
 
 (defun vt-mod (vt divisor &key out dtype) (vt-map (lambda (x) (mod x divisor)) vt :out out :dtype dtype))
+
 (defun vt-rem (vt divisor &key out dtype) (vt-map (lambda (x) (rem x divisor)) vt :out out :dtype dtype))
+
 (defun vt-atan2 (vty vtx &key out dtype) (vt-fast-map #'atan vty vtx :out out :dtype dtype))
 
 (defun vt-floor (vt &key (divisor 1) out dtype)
   (vt-map (lambda (x) (let ((res (nth-value 0 (floor x divisor))))
-                        (if (floatp x) (float res x) res))) vt :out out :dtype dtype))
+                        (if (floatp x) (float res x) res)))
+	  vt :out out :dtype dtype))
 (defun vt-ceiling (vt &key (divisor 1) out dtype)
   (vt-map (lambda (x) (let ((res (nth-value 0 (ceiling x divisor))))
-                        (if (floatp x) (float res x) res))) vt :out out :dtype dtype))
+                        (if (floatp x) (float res x) res)))
+	  vt :out out :dtype dtype))
 (defun vt-round (vt &key (divisor 1) out dtype)
   (vt-map (lambda (x) (let ((res (nth-value 0 (round x divisor))))
-                        (if (floatp x) (float res x) res))) vt :out out :dtype dtype))
+                        (if (floatp x) (float res x) res)))
+	  vt :out out :dtype dtype))
 (defun vt-truncate (vt &key (divisor 1) out dtype)
   (vt-map (lambda (x) (let ((res (nth-value 0 (truncate x divisor))))
-                        (if (floatp x) (float res x) res))) vt :out out :dtype dtype))
+                        (if (floatp x) (float res x) res)))
+	  vt :out out :dtype dtype))
 (defun vt-rint (vt &key out dtype)
   (vt-map (lambda (x) (let ((res (nth-value 0 (round x))))
-                        (if (floatp x) (float res x) res))) vt :out out :dtype dtype))
+                        (if (floatp x) (float res x) res)))
+	  vt :out out :dtype dtype))
 
 (defun vt-= (t1 t2 &key (dtype :float64) out)
   (vt-map (lambda (a b) (if (= a b) 1.0d0 0.0d0)) (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-/= (t1 t2 &key (dtype :float64) out)
   (vt-map (lambda (a b) (if (/= a b) 1.0d0 0.0d0)) (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-< (t1 t2 &key (dtype :float64) out)
   (vt-map (lambda (a b) (if (< a b) 1.0d0 0.0d0)) (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-<= (t1 t2 &key (dtype :float64) out)
   (vt-map (lambda (a b) (if (<= a b) 1.0d0 0.0d0)) (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-> (t1 t2 &key (dtype :float64) out)
   (vt-map (lambda (a b) (if (> a b) 1.0d0 0.0d0)) (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt->= (t1 t2 &key (dtype :float64) out)
   (vt-map (lambda (a b) (if (>= a b) 1.0d0 0.0d0)) (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-rad2deg (vt &key out dtype)
-  (let ((factor (float (/ 180.0 pi) 1.0d0)))
-    (vt-map (lambda (x) (* x factor)) vt :out out :dtype (%infer-float-dtype vt dtype))))
+  (let* ((dt (%infer-float-dtype vt dtype))
+         (factor (if (eq dt :float32) (/ 180.0s0 (coerce pi 'single-float))
+                     (/ 180.0d0 pi))))
+    (vt-map (lambda (x) (* x factor)) vt :out out :dtype dt)))
+
 (defun vt-deg2rad (vt &key out dtype)
-  (let ((factor (float (/ pi 180.0) 1.0d0)))
-    (vt-map (lambda (x) (* x factor)) vt :out out :dtype (%infer-float-dtype vt dtype))))
+  (let* ((dt (%infer-float-dtype vt dtype))
+         (factor (if (eq dt :float32) (/ (coerce pi 'single-float) 180.0s0)
+                     (/ pi 180.0d0))))
+    (vt-map (lambda (x) (* x factor)) vt :out out :dtype dt)))
 
 (defun vt-maximum (t1 t2 &key out dtype)
   (vt-map (lambda (a b) (cond ((%nan-p a) a) ((%nan-p b) b) (t (max a b))))
+	  
           t1 t2 :out out :dtype dtype))
 (defun vt-minimum (t1 t2 &key out dtype)
   (vt-map (lambda (a b) (cond ((%nan-p a) a) ((%nan-p b) b) (t (min a b))))
           t1 t2 :out out :dtype dtype))
+
 (defun vt-fmax (t1 t2 &key out dtype)
   (vt-map (lambda (a b) (cond ((and (%nan-p a) (%nan-p b)) a)
                               ((%nan-p a) b) ((%nan-p b) a) (t (max a b))))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-fmin (t1 t2 &key out dtype)
   (vt-map (lambda (a b) (cond ((and (%nan-p a) (%nan-p b)) a)
                               ((%nan-p a) b) ((%nan-p b) a) (t (min a b))))
@@ -180,20 +231,28 @@
 (defun vt-logical-and (t1 t2 &key out (dtype :float64))
   (vt-map (lambda (a b) (if (and (not (zerop a)) (not (zerop b))) 1.0d0 0.0d0))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-logical-or (t1 t2 &key out (dtype :float64))
   (vt-map (lambda (a b) (if (or (not (zerop a)) (not (zerop b))) 1.0d0 0.0d0))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-logical-not (vt &key out (dtype :float64))
   (vt-map (lambda (v) (if (zerop v) 1.0d0 0.0d0)) vt :dtype dtype :out out))
+
 (defun vt-logical-xor (t1 t2 &key out (dtype :float64))
   (vt-map (lambda (a b) (if (not (eq (not (zerop a)) (not (zerop b)))) 1.0d0 0.0d0))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-and (t1 t2 &key out dtype) (vt-map #'logand (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-bit-ior (t1 t2 &key out dtype) (vt-map #'logior (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-bit-xor (t1 t2 &key out dtype) (vt-map #'logxor (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+
 (defun vt-bit-not (vt &key out dtype) (vt-map #'lognot vt :dtype dtype :out out))
+
 (defun vt-left-shift (vt shift &key out dtype) (vt-map (lambda (x) (ash x shift)) vt :dtype dtype :out out))
+
 (defun vt-right-shift (vt shift &key out dtype) (vt-map (lambda (x) (ash x (- shift))) vt :dtype dtype :out out))
 
 (defun vt-clip (vt min-val max-val &key out dtype)
@@ -204,22 +263,25 @@
           :dtype dtype :out out))
 
 (defun vt-cbrt (vt &key out dtype)
-  "逐元素立方根。使用 signum*expt(abs) 避免 expt 对负数的处理开销。"
-  (let* ((dt (%infer-float-dtype vt dtype)))
-    (if (eq dt :float32)
-        (vt-map (lambda (x) (* (signum x) (expt (abs x) (/ 3.0s0))))
-                vt :out out :dtype dt)
-        (vt-map (lambda (x) (* (signum x) (expt (abs x) (/ 3.0d0))))
-                vt :out out :dtype dt))))
+  "逐元素立方根。"
+  (let* ((dt (%infer-float-dtype vt dtype))
+         (third (if (eq dt :float32) (/ 3.0s0) (/ 3.0d0))))
+    (vt-map (lambda (x) (* (signum x) (expt (abs x) third)))
+            vt :out out :dtype dt)))
 
 (defun vt-hypot (t1 t2 &key out dtype)
-  (let ((dt (or dtype (if (or (eq (vt-dtype t1) :float32) (eq (vt-dtype t2) :float32)) :float32 :float64))))
+  (let* ((dt (or dtype (if (or (eq (vt-dtype (ensure-vt t1)) :float32)
+                               (eq (vt-dtype (ensure-vt t2)) :float32))
+                           :float32 :float64)))
+         (one (if (eq dt :float32) 1.0s0 1.0d0)))
     (vt-map (lambda (a b)
               (let ((abs-a (abs a)) (abs-b (abs b)))
-                (cond ((zerop abs-a) abs-b) ((zerop abs-b) abs-a)
-                      (t (* (max abs-a abs-b)
-                            (sqrt (+ 1.0d0 (let ((r (/ (min abs-a abs-b) (max abs-a abs-b))))
-                                             (* r r)))))))))
+                (cond ((zerop abs-a) abs-b)
+                      ((zerop abs-b) abs-a)
+                      (t (let* ((mx (max abs-a abs-b))
+                                (mn (min abs-a abs-b))
+                                (r  (/ mn mx)))
+                           (* mx (sqrt (+ one (* r r)))))))))
             (ensure-vt t1) (ensure-vt t2) :out out :dtype dt)))
 
 (defun vt-reciprocal (vt &key out dtype)

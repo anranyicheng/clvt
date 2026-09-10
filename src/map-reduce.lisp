@@ -22,7 +22,7 @@
                             (out (vt-dtype out))
                             (dtype dtype)
                             (t (apply #'vt-promote-type (mapcar #'vt-dtype inputs)))))
-             (res (or out (make-vt out-shape 0 :dtype final-dtype))))
+             (res (or out (%make-vt-uninit out-shape final-dtype))))
 	(when out
           (unless (equal (vt-shape res) out-shape)
             (error "vt-map: :out 形状 ~a 与广播结果 ~a 不匹配" (vt-shape res) out-shape)))
@@ -346,8 +346,7 @@
 (defun vt-reduce (tensor axis init-val reducer-fn &key out dtype keepdims return-arg)
   (declare (type vt tensor)
            (type (or null fixnum list) axis)
-           (type function reducer-fn)
-	   (optimize (speed 3)))
+           (type function reducer-fn))
   (with-float-safe
     (let* ((in-shape (vt-shape tensor))
            (rank (length in-shape))
@@ -383,7 +382,7 @@
                             (dtype dtype)
                             ((and init-val (or (floatp init-val) (%inf-p init-val))) :float64)
                             (t (vt-dtype tensor))))
-             (res (or out (make-vt out-shape 0 :dtype final-dtype))))
+             (res (or out (%make-vt-uninit out-shape final-dtype))))
 
         ;; ================================================================
         ;; 快路径 1：连续 + 全局归约（axis=nil, 不 keepdims, 无 arg）
@@ -446,7 +445,7 @@
                      (declare (type (signed-byte 64) acc) (type fixnum p end))
                      (loop while (< p end) do (incf acc (aref d p)) (incf p))
                      (store-fast acc))))))))
-	
+
         ;; ================================================================
         ;; 快路径 2：连续 + 末尾连续归约轴（无 arg）——消除 odometer
         ;; ================================================================
@@ -475,12 +474,15 @@
                              `(the ,lt (coerce ,form ',lt))))
                        ;; out-lt: 输出元素类型；in-lt: 输入元素类型；
                        ;; acc-lt: 累加器类型（必须是 in-lt 与 out-lt 的提升类型）
+                       ;; init-acc 在 outer 循环外只算一次（原版每次外层迭代都算一次）
                        (blk (out-lt in-lt acc-lt op)
                          `(progn
-                            (let ((ip in-off) (opos res-off))
-                              (declare (type fixnum ip opos))
+                            (let ((ip in-off) (opos res-off)
+                                  (init-acc (acc-init ,acc-lt init-val)))
+                              (declare (type fixnum ip opos)
+                                       (type ,acc-lt init-acc))
                               (dotimes (o outer)
-                                (let ((acc (acc-init ,acc-lt init-val)))
+                                (let ((acc init-acc))
                                   (declare (type ,acc-lt acc))
                                   (dotimes (i inner)
                                     (let ((v (aref (the (simple-array ,in-lt (*)) in-data) ip)))
@@ -545,7 +547,7 @@
                     (blk (signed-byte 64) (signed-byte 64) (signed-byte 64) :min))
                    ((and (equal res-et '(signed-byte 32)) (equal in-et '(signed-byte 32)))
                     (blk (signed-byte 32) (signed-byte 32) (signed-byte 32) :min))))))))
-	
+
         ;; ================================================================
         ;; 通用路径：任意轴 / keepdims / return-arg / 非连续
         ;; ================================================================
@@ -567,20 +569,20 @@
                      (loop for i from 0 below rank
                            if (member i axes) collect 0
                              else collect
-				  (let ((out-idx (if keepdims i
-                                                     (count-if-not (lambda (x) (member x axes))
-								   (loop for j below i collect j)))))
-				    (nth out-idx res-strides)))))
+                             (let ((out-idx (if keepdims i
+                                                (count-if-not (lambda (x) (member x axes))
+                                                              (loop for j below i collect j)))))
+                               (nth out-idx res-strides)))))
                (idx-strides-map
                  (if (or (not return-arg) global)
                      (make-list rank :initial-element 0)
                      (loop for i from 0 below rank
                            if (member i axes) collect 0
                              else collect
-				  (let ((out-idx (if keepdims i
-                                                     (count-if-not (lambda (x) (member x axes))
-								   (loop for j below i collect j)))))
-				    (nth out-idx res-idx-strides)))))
+                             (let ((out-idx (if keepdims i
+                                                (count-if-not (lambda (x) (member x axes))
+                                                              (loop for j below i collect j)))))
+                               (nth out-idx res-idx-strides)))))
                (arg-strides
                  (if return-arg
                      (if global
@@ -600,8 +602,10 @@
                (out-et (array-element-type res-data))
                (in-et (array-element-type in-data)))
 
-          (vt-fill res init-val)
-          (when res-idx (vt-fill res-idx 0))
+          ;; 优化：res 为新建（make-vt 已零填充）且 init-val=0 时，跳过全量填充
+          ;; res-idx 恒为新建零填充，无需再 fill
+          (unless (and (null out) (numberp init-val) (zerop init-val))
+            (vt-fill res init-val))
 
           (when (= rank 0)
             (let ((val (aref in-data in-offset)))
@@ -614,6 +618,7 @@
                         (setf (aref res-idx-data res-idx-offset) 0))
                       (return-from vt-reduce (values res res-idx)))
                     (return-from vt-reduce (values res nil))))))
+
           (macrolet
               ((cast-to (lt form)
                  (cond ((null lt) form)
@@ -700,9 +705,15 @@
                               (t (define-loop single-float nil :sum ,with-arg))))
                        ((equal out-et '(signed-byte 64))
                         (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :sum ,with-arg))
+                              ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 64) (signed-byte 32) :sum ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 64) double-float     :sum ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 64) single-float     :sum ,with-arg))
                               (t (define-loop (signed-byte 64) nil :sum ,with-arg))))
                        ((equal out-et '(signed-byte 32))
                         (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :sum ,with-arg))
+                              ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 32) (signed-byte 64) :sum ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 32) double-float     :sum ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 32) single-float     :sum ,with-arg))
                               (t (define-loop (signed-byte 32) nil :sum ,with-arg))))
                        (t (define-loop nil nil :sum ,with-arg))))
                     ((eq reducer-fn #'max)
@@ -721,9 +732,15 @@
                               (t (define-loop single-float nil :max ,with-arg))))
                        ((equal out-et '(signed-byte 64))
                         (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :max ,with-arg))
+                              ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 64) (signed-byte 32) :max ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 64) double-float     :max ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 64) single-float     :max ,with-arg))
                               (t (define-loop (signed-byte 64) nil :max ,with-arg))))
                        ((equal out-et '(signed-byte 32))
                         (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :max ,with-arg))
+                              ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 32) (signed-byte 64) :max ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 32) double-float     :max ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 32) single-float     :max ,with-arg))
                               (t (define-loop (signed-byte 32) nil :max ,with-arg))))
                        (t (define-loop nil nil :max ,with-arg))))
                     ((eq reducer-fn #'min)
@@ -742,9 +759,15 @@
                               (t (define-loop single-float nil :min ,with-arg))))
                        ((equal out-et '(signed-byte 64))
                         (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :min ,with-arg))
+                              ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 64) (signed-byte 32) :min ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 64) double-float     :min ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 64) single-float     :min ,with-arg))
                               (t (define-loop (signed-byte 64) nil :min ,with-arg))))
                        ((equal out-et '(signed-byte 32))
                         (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :min ,with-arg))
+                              ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 32) (signed-byte 64) :min ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 32) double-float     :min ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 32) single-float     :min ,with-arg))
                               (t (define-loop (signed-byte 32) nil :min ,with-arg))))
                        (t (define-loop nil nil :min ,with-arg))))
                     (t
@@ -763,9 +786,15 @@
                               (t (define-loop single-float nil :custom ,with-arg))))
                        ((equal out-et '(signed-byte 64))
                         (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :custom ,with-arg))
+                              ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 64) (signed-byte 32) :custom ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 64) double-float     :custom ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 64) single-float     :custom ,with-arg))
                               (t (define-loop (signed-byte 64) nil :custom ,with-arg))))
                        ((equal out-et '(signed-byte 32))
                         (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :custom ,with-arg))
+                              ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 32) (signed-byte 64) :custom ,with-arg))
+                              ((equal in-et 'double-float)     (define-loop (signed-byte 32) double-float     :custom ,with-arg))
+                              ((equal in-et 'single-float)     (define-loop (signed-byte 32) single-float     :custom ,with-arg))
                               (t (define-loop (signed-byte 32) nil :custom ,with-arg))))
                        (t (define-loop nil nil :custom ,with-arg)))))))
             (if return-arg
