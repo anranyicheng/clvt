@@ -58,13 +58,13 @@
   (nth-value 0 (vt-reduce condition axis 1
                           (lambda (acc val)
                             (values (if (and (/= acc 0) (/= val 0)) 1 0) nil))
-                          :dtype :int32 :keepdims keepdims)))
+                          :dtype :int64 :keepdims keepdims)))
 
 (defun vt-any (condition &key axis keepdims)
   (nth-value 0 (vt-reduce condition axis 0
                           (lambda (acc val)
                             (values (if (or (/= acc 0) (/= val 0)) 1 0) nil))
-                          :dtype :int32 :keepdims keepdims)))
+                          :dtype :int64 :keepdims keepdims)))
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) out)
   (vt-map (lambda (a b)

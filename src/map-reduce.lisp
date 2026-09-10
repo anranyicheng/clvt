@@ -415,15 +415,13 @@
                 ((subtypep element-type 'integer) most-positive-fixnum)
                 (t 0)))))
 
-
 (defun vt-reduce (tensor axis init-val reducer-fn &key out dtype keepdims return-arg)
   "通用归约核心。axis 可为 nil/整数/整数列表。
-   reducer-fn 接收，返回。
-   Returns: (values result arg-result)"
+   reducer-fn 接收 (当前累积值, 当前元素值)，返回 (新累积值, 是否更新arg索引)。
+   返回 (values result arg-result)。"
   (declare (type vt tensor)
            (type (or null fixnum list) axis)
-           (type function reducer-fn)
-           (optimize (speed 3) (safety 0)))
+           (type function reducer-fn))
   (with-float-safe
     (let* ((in-shape (vt-shape tensor))
            (rank (length in-shape))
@@ -443,7 +441,8 @@
                                   :initial-value 1)
                           (reduce #'* in-shape :initial-value 1))))
       (declare (fixnum rank axis-size))
-      
+
+      ;; 空输入处理
       (when (or (zerop axis-size) (zerop (vt-size tensor)))
         (let ((empty-dtype (or dtype (and out (vt-dtype out)) (vt-dtype tensor))))
           (return-from vt-reduce
@@ -451,18 +450,17 @@
                     (when return-arg (make-vt out-shape 0 :dtype :int32))))))
 
       ;; ================================================================
-      ;; 性能快路径：连续张量 + 全局归约(axis=nil, 不keepdims) -> 平面循环
-      ;; 比递归版本快 10-50 倍（消除递归和通用stride开销）
+      ;; 快速路径：连续张量 + 全局归约 (axis=nil, 不keepdims, 不需要arg)
       ;; ================================================================
       (when (and global (not keepdims) (not return-arg)
                  (vt-contiguous-p tensor))
         (let* ((final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                                    (error "vt-reduce: :out type (~a) 与 :dtype (~a) 冲突"
-                                           (vt-dtype out) dtype))
-                                   (out (vt-dtype out))
-                                   (dtype dtype)
-                                   ((and init-val (or (floatp init-val) (%inf-p init-val))) :float64)
-                                   (t (vt-dtype tensor))))
+                                   (error "vt-reduce: :out type (~a) 与 :dtype (~a) 冲突"
+                                          (vt-dtype out) dtype))
+                                  (out (vt-dtype out))
+                                  (dtype dtype)
+                                  ((and init-val (or (floatp init-val) (%inf-p init-val))) :float64)
+                                  (t (vt-dtype tensor))))
                (size (vt-size tensor))
                (in-data (vt-data tensor))
                (in-off (vt-offset tensor))
@@ -475,19 +473,17 @@
                              (vt-cast val final-dtype))
                        (return-from vt-reduce (values res nil)))))
             (cond
-              ;; double-float输入快路径
+              ;; double-float 输入
               ((equal in-et 'double-float)
                (let ((d (the (simple-array double-float (*)) in-data)))
                  (declare (type (simple-array double-float (*)) d))
                  (cond
-                   ;; sum
                    ((and (typep init-val 'double-float) (zerop init-val))
                     (let ((acc 0.0d0))
                       (declare (type double-float acc))
                       (loop for i fixnum from 0 below size do
                         (incf acc (aref d (+ in-off i))))
                       (make-result-fast acc)))
-                   ;; max
                    ((= init-val +vt-dfloat-neg-inf+)
                     (let ((acc +vt-dfloat-neg-inf+))
                       (declare (type double-float acc))
@@ -495,7 +491,6 @@
                         (let ((v (aref d (+ in-off i))))
                           (when (> v acc) (setf acc v))))
                       (make-result-fast acc)))
-                   ;; min
                    ((= init-val +vt-dfloat-pos-inf+)
                     (let ((acc +vt-dfloat-pos-inf+))
                       (declare (type double-float acc))
@@ -504,7 +499,7 @@
                           (when (< v acc) (setf acc v))))
                       (make-result-fast acc)))
                    (t nil))))
-              ;; single-float快路径
+              ;; single-float 输入
               ((equal in-et 'single-float)
                (let ((d (the (simple-array single-float (*)) in-data)))
                  (declare (type (simple-array single-float (*)) d))
@@ -514,7 +509,16 @@
                       (declare (type single-float acc))
                       (loop for i fixnum from 0 below size do (incf acc (aref d (+ in-off i))))
                       (make-result-fast acc))))))
-              ;; int64快路径(summation)
+              ;; int32 输入 (sum)
+              ((equal in-et '(signed-byte 32))
+               (when (eql init-val 0)
+                 (let ((d (the (simple-array (signed-byte 32) (*)) in-data))
+                       (acc 0))
+                   (declare (type (simple-array (signed-byte 32) (*)) d)
+                            (type (signed-byte 32) acc))
+                   (loop for i fixnum from 0 below size do (incf acc (aref d (+ in-off i))))
+                   (make-result-fast acc))))
+              ;; int64 输入 (sum)
               ((equal in-et '(signed-byte 64))
                (when (eql init-val 0)
                  (let ((d (the (simple-array (signed-byte 64) (*)) in-data))
@@ -524,6 +528,10 @@
                    (loop for i fixnum from 0 below size do (incf acc (aref d (+ in-off i))))
                    (make-result-fast acc))))))))
 
+      ;; ================================================================
+      ;; 通用路径：任意轴归约、keepdims、return-arg
+      ;; 优化：增量指针更新 + 内联常见 reducer + 消除运行时分支
+      ;; ================================================================
       (let* ((final-dtype (cond
                             ((and out dtype (not (eq (vt-dtype out) dtype)))
                              (error "vt-reduce: :out type (~a) 与 :dtype (~a) 冲突"
@@ -538,9 +546,35 @@
              (res-strides (vt-strides res))
              (res-idx (when return-arg (make-vt out-shape 0 :dtype :int32)))
              (res-idx-data (when res-idx (vt-data res-idx)))
+             (res-idx-offset (when res-idx (vt-offset res-idx)))
+             (res-idx-strides (when res-idx (vt-strides res-idx)))
              (in-data (vt-data tensor))
              (in-strides (vt-strides tensor))
              (in-offset (vt-offset tensor))
+             (in-shape-vec (coerce in-shape 'simple-vector))
+             (in-strides-vec (coerce in-strides 'simple-vector))
+             ;; 预计算输出和arg的步长映射
+             (out-strides-map
+               (if global
+                   (make-list rank :initial-element 0)
+                   (loop for i from 0 below rank
+                         if (member i axes) collect 0
+                           else collect
+                           (let ((out-idx (if keepdims i
+                                              (count-if-not (lambda (x) (member x axes))
+                                                            (loop for j below i collect j)))))
+                             (nth out-idx res-strides)))))
+             (idx-strides-map
+               (if (or (not return-arg) global)
+                   (make-list rank :initial-element 0)
+                   (loop for i from 0 below rank
+                         if (member i axes) collect 0
+                           else collect
+                           (let ((out-idx (if keepdims i
+                                              (count-if-not (lambda (x) (member x axes))
+                                                            (loop for j below i collect j)))))
+                             (nth out-idx res-idx-strides)))))
+             ;; 归约轴步长（用于计算arg索引）
              (arg-strides
                (if return-arg
                    (if global
@@ -554,121 +588,205 @@
                                  collect (progn (incf k) (nth k red-strides))
                                else collect 0)))
                    (make-list rank :initial-element 0)))
-             (out-strides-map
-               (if global
-                   (make-list rank :initial-element 0)
-                   (loop for i from 0 below rank
-                         if (member i axes) collect 0
-                           else collect
-				(let ((out-idx (if keepdims i
-                                                   (count-if-not (lambda (x) (member x axes))
-								 (loop for j below i collect j)))))
-                                  (nth out-idx res-strides)))))
-             (idx-strides-map
-               (if (or (not return-arg) global)
-                   (make-list rank :initial-element 0)
-                   (loop for i from 0 below rank
-                         if (member i axes) collect 0
-                           else collect
-				(let ((out-idx (if keepdims i
-                                                   (count-if-not (lambda (x) (member x axes))
-								 (loop for j below i collect j)))))
-                                  (nth out-idx (vt-strides res-idx)))))))
-        (declare (list arg-strides))
+             (out-strides-vec (coerce out-strides-map 'simple-vector))
+             (idx-strides-vec (coerce idx-strides-map 'simple-vector))
+             (arg-strides-vec (coerce arg-strides 'simple-vector))
+             (out-et (array-element-type res-data))
+             (in-et (array-element-type in-data)))
+        
+        ;; 初始化结果
         (vt-fill res init-val)
         (when res-idx (vt-fill res-idx 0))
-        
-        (let ((in-shp-vec (coerce in-shape 'simple-vector))
-              (in-str-vec (coerce in-strides 'simple-vector))
-              (osm-vec (coerce out-strides-map 'simple-vector))
-              (ism-vec (coerce idx-strides-map 'simple-vector)) 
-              (arg-str-vec (coerce arg-strides 'simple-vector))
-              (out-et (array-element-type res-data))
-              (in-et (array-element-type in-data)))
+
+        ;; 标量特殊处理（rank = 0）
+        (when (= rank 0)
+          (let ((val (aref in-data in-offset)))
+            (multiple-value-bind (new-acc do-update-arg)
+                (funcall reducer-fn init-val val)
+              (setf (aref res-data res-offset) (vt-cast new-acc final-dtype))
+              (if return-arg
+                  (progn
+                    (when do-update-arg
+                      (setf (aref res-idx-data res-idx-offset) 0))
+                    (return-from vt-reduce (values res res-idx)))
+                  (return-from vt-reduce (values res nil))))))
+
+        ;; 宏定义：根据 out-lt, in-lt, red-type, with-arg 生成循环
+        (macrolet
+            ((cast-to (lt form)
+               (cond
+                 ((null lt) form)  ; 无类型声明，直接使用原值
+                 ((subtypep lt 'integer)
+                  `(truncate ,form))
+                 (t
+                  `(coerce ,form ',lt))))
+             (define-loop (out-lt in-lt red-type with-arg)
+               (let ((out-array (if out-lt
+                                    `(the (simple-array ,out-lt (*)) res-data)
+                                    'res-data))
+                     (in-array (if in-lt
+                                   `(the (simple-array ,in-lt (*)) in-data)
+                                   'in-data)))
+                 `(let ((indices (make-array rank :element-type 'fixnum :initial-element 0)))
+                    (declare (type (simple-array fixnum (*)) indices))
+                    (let ((in-ptr in-offset)
+                          (out-ptr res-offset)
+                          ,@(when with-arg
+                              `((arg-ptr res-idx-offset)
+                                (arg-val 0))))
+                      (declare (type fixnum in-ptr out-ptr
+                                     ,@(when with-arg '(arg-ptr arg-val))))
+                      (block outer-loop
+                        (loop
+                          ;; --- 处理当前元素 ---
+                          (let* ((val (aref ,in-array in-ptr))
+                                 (raw-acc (aref ,out-array out-ptr)))
+                            ,(ecase red-type
+                               (:sum
+                                `(setf (aref ,out-array out-ptr)
+                                       (cast-to ,out-lt (+ raw-acc val))))
+                               (:max
+                                `(when (> val raw-acc)
+                                   (setf (aref ,out-array out-ptr)
+                                         (cast-to ,out-lt val))
+                                   ,(when with-arg
+                                      `(setf (aref res-idx-data arg-ptr) arg-val))))
+                               (:min
+                                `(when (< val raw-acc)
+                                   (setf (aref ,out-array out-ptr)
+                                         (cast-to ,out-lt val))
+                                   ,(when with-arg
+                                      `(setf (aref res-idx-data arg-ptr) arg-val))))
+                               (:custom
+                                (if with-arg
+                                    `(multiple-value-bind (new-acc do-update-arg)
+                                         (funcall reducer-fn raw-acc val)
+                                       (setf (aref ,out-array out-ptr)
+                                             (cast-to ,out-lt new-acc))
+                                       (when do-update-arg
+                                         (setf (aref res-idx-data arg-ptr) arg-val)))
+                                    `(multiple-value-bind (new-acc)
+                                         (funcall reducer-fn raw-acc val)
+                                       (setf (aref ,out-array out-ptr)
+                                             (cast-to ,out-lt new-acc)))))))
+                          
+                          ;; --- 递增索引并更新指针 ---
+                          (let ((d (1- rank)))
+                            (loop
+                              (incf (aref indices d))
+                              (incf in-ptr (svref in-strides-vec d))
+                              (incf out-ptr (svref out-strides-vec d))
+                              ,@(when with-arg
+                                  `((incf arg-ptr (svref idx-strides-vec d))
+                                    (incf arg-val (svref arg-strides-vec d))))
+                              (when (< (aref indices d) (svref in-shape-vec d))
+                                (return))
+                              ;; 进位：当前维度归零，回退指针
+                              (let ((dim (svref in-shape-vec d)))
+                                (decf in-ptr (* dim (svref in-strides-vec d)))
+                                (decf out-ptr (* dim (svref out-strides-vec d)))
+                                ,@(when with-arg
+                                    `((decf arg-ptr (* dim (svref idx-strides-vec d)))
+                                      (decf arg-val (* dim (svref arg-strides-vec d)))))
+                                (setf (aref indices d) 0)
+                                (decf d)
+                                (when (< d 0)
+                                  (return-from outer-loop)))))))))))
+             ;; 新增：生成类型选择的 cond 表达式
+             (generate-typed-cond (with-arg)
+               `(cond
+                  ;; SUM
+                  ((eq reducer-fn #'+)
+                   (cond
+                     ((equal out-et 'double-float)
+                      (cond ((equal in-et 'double-float) (define-loop double-float double-float :sum ,with-arg))
+                            ((equal in-et 'single-float) (define-loop double-float single-float :sum ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop double-float (signed-byte 64) :sum ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop double-float (signed-byte 32) :sum ,with-arg))
+                            (t (define-loop double-float nil :sum ,with-arg))))
+                     ((equal out-et 'single-float)
+                      (cond ((equal in-et 'single-float) (define-loop single-float single-float :sum ,with-arg))
+                            ((equal in-et 'double-float) (define-loop single-float double-float :sum ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop single-float (signed-byte 64) :sum ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop single-float (signed-byte 32) :sum ,with-arg))
+                            (t (define-loop single-float nil :sum ,with-arg))))
+                     ((equal out-et '(signed-byte 64))
+                      (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :sum ,with-arg))
+                            (t (define-loop (signed-byte 64) nil :sum ,with-arg))))
+                     ((equal out-et '(signed-byte 32))
+                      (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :sum ,with-arg))
+                            (t (define-loop (signed-byte 32) nil :sum ,with-arg))))
+                     (t (define-loop nil nil :sum ,with-arg))))
+                  ;; MAX
+                  ((eq reducer-fn #'max)
+                   (cond
+                     ((equal out-et 'double-float)
+                      (cond ((equal in-et 'double-float) (define-loop double-float double-float :max ,with-arg))
+                            ((equal in-et 'single-float) (define-loop double-float single-float :max ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop double-float (signed-byte 64) :max ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop double-float (signed-byte 32) :max ,with-arg))
+                            (t (define-loop double-float nil :max ,with-arg))))
+                     ((equal out-et 'single-float)
+                      (cond ((equal in-et 'single-float) (define-loop single-float single-float :max ,with-arg))
+                            ((equal in-et 'double-float) (define-loop single-float double-float :max ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop single-float (signed-byte 64) :max ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop single-float (signed-byte 32) :max ,with-arg))
+                            (t (define-loop single-float nil :max ,with-arg))))
+                     ((equal out-et '(signed-byte 64))
+                      (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :max ,with-arg))
+                            (t (define-loop (signed-byte 64) nil :max ,with-arg))))
+                     ((equal out-et '(signed-byte 32))
+                      (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :max ,with-arg))
+                            (t (define-loop (signed-byte 32) nil :max ,with-arg))))
+                     (t (define-loop nil nil :max ,with-arg))))
+                  ;; MIN
+                  ((eq reducer-fn #'min)
+                   (cond
+                     ((equal out-et 'double-float)
+                      (cond ((equal in-et 'double-float) (define-loop double-float double-float :min ,with-arg))
+                            ((equal in-et 'single-float) (define-loop double-float single-float :min ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop double-float (signed-byte 64) :min ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop double-float (signed-byte 32) :min ,with-arg))
+                            (t (define-loop double-float nil :min ,with-arg))))
+                     ((equal out-et 'single-float)
+                      (cond ((equal in-et 'single-float) (define-loop single-float single-float :min ,with-arg))
+                            ((equal in-et 'double-float) (define-loop single-float double-float :min ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop single-float (signed-byte 64) :min ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop single-float (signed-byte 32) :min ,with-arg))
+                            (t (define-loop single-float nil :min ,with-arg))))
+                     ((equal out-et '(signed-byte 64))
+                      (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :min ,with-arg))
+                            (t (define-loop (signed-byte 64) nil :min ,with-arg))))
+                     ((equal out-et '(signed-byte 32))
+                      (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :min ,with-arg))
+                            (t (define-loop (signed-byte 32) nil :min ,with-arg))))
+                     (t (define-loop nil nil :min ,with-arg))))
+                  ;; CUSTOM
+                  (t
+                   (cond
+                     ((equal out-et 'double-float)
+                      (cond ((equal in-et 'double-float) (define-loop double-float double-float :custom ,with-arg))
+                            ((equal in-et 'single-float) (define-loop double-float single-float :custom ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop double-float (signed-byte 64) :custom ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop double-float (signed-byte 32) :custom ,with-arg))
+                            (t (define-loop double-float nil :custom ,with-arg))))
+                     ((equal out-et 'single-float)
+                      (cond ((equal in-et 'single-float) (define-loop single-float single-float :custom ,with-arg))
+                            ((equal in-et 'double-float) (define-loop single-float double-float :custom ,with-arg))
+                            ((equal in-et '(signed-byte 64)) (define-loop single-float (signed-byte 64) :custom ,with-arg))
+                            ((equal in-et '(signed-byte 32)) (define-loop single-float (signed-byte 32) :custom ,with-arg))
+                            (t (define-loop single-float nil :custom ,with-arg))))
+                     ((equal out-et '(signed-byte 64))
+                      (cond ((equal in-et '(signed-byte 64)) (define-loop (signed-byte 64) (signed-byte 64) :custom ,with-arg))
+                            (t (define-loop (signed-byte 64) nil :custom ,with-arg))))
+                     ((equal out-et '(signed-byte 32))
+                      (cond ((equal in-et '(signed-byte 32)) (define-loop (signed-byte 32) (signed-byte 32) :custom ,with-arg))
+                            (t (define-loop (signed-byte 32) nil :custom ,with-arg))))
+                     (t (define-loop nil nil :custom ,with-arg)))))))
           
-	  (macrolet
-	      ((cast-to (lt form)
-		 `(if ,(subtypep lt 'integer)
-		      (truncate ,form)
-		      (coerce ,form ',lt)))
-	       (gen (lt ilt)
-		 `(labels ((recurse (depth in-ptr out-ptr arg-ptr arg-val)
-			     (declare (type fixnum depth in-ptr out-ptr arg-ptr arg-val))
-			     (if (= depth rank)
-				 (let* ((val (aref ,(if ilt
-							`(the (simple-array ,ilt (*)) in-data)
-							'in-data)
-						   in-ptr))
-					(raw-acc (aref (the (simple-array ,lt (*)) res-data)
-						       out-ptr)))
-				   (multiple-value-bind (new-acc do-update-arg)
-				       (funcall reducer-fn raw-acc val)
-				     (setf (aref (the (simple-array ,lt (*)) res-data)
-						 out-ptr)
-					   (cast-to ,lt new-acc))
-				     (when (and return-arg do-update-arg res-idx-data)
-				       (setf (aref res-idx-data arg-ptr) arg-val))))
-				 (let* ((dim (svref in-shp-vec depth))
-					(in-stride (svref in-str-vec depth))
-					(out-stride (svref osm-vec depth))
-					(idx-stride (svref ism-vec depth))         
-					(arg-stride (svref arg-str-vec depth)))
-				   (declare (type fixnum dim in-stride out-stride idx-stride arg-stride))
-				   (loop for i fixnum from 0 below dim do
-				     (recurse (the fixnum (1+ depth)) in-ptr out-ptr arg-ptr
-					      (the fixnum (+ arg-val (the fixnum (* i arg-stride)))))
-				     (incf in-ptr in-stride)
-				     (incf out-ptr out-stride)
-				     (when return-arg (incf arg-ptr idx-stride))))))) 
-		    (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))
-            
-            (cond
-	      ((equal out-et 'double-float)
-	       (cond ((equal in-et 'double-float) (gen double-float double-float))
-                     ((equal in-et 'single-float) (gen double-float single-float))
-                     ((equal in-et '(signed-byte 64)) (gen double-float (signed-byte 64)))
-                     ((equal in-et '(signed-byte 32)) (gen double-float (signed-byte 32)))
-                     (t (gen double-float nil))))
-	      
-	      ((equal out-et 'single-float)
-	       (cond ((equal in-et 'single-float) (gen single-float single-float))
-                     ((equal in-et 'double-float) (gen single-float double-float))
-                     ((equal in-et '(signed-byte 64)) (gen single-float (signed-byte 64)))
-                     ((equal in-et '(signed-byte 32)) (gen single-float (signed-byte 32)))
-                     (t (gen single-float nil))))
-	      
-	      ((equal out-et '(signed-byte 64))
-	       (cond ((equal in-et '(signed-byte 64)) (gen (signed-byte 64) (signed-byte 64)))
-                     (t (gen (signed-byte 64) nil))))
-	      
-	      ((equal out-et '(signed-byte 32))
-	       (cond ((equal in-et '(signed-byte 32)) (gen (signed-byte 32) (signed-byte 32)))
-                     (t (gen (signed-byte 32) nil))))
-	      
-	      (t
-	       (let ((res-data (the (simple-array * (*)) res-data))
-                     (in-data (the (simple-array * (*)) in-data)))
-                 (labels ((recurse (depth in-ptr out-ptr arg-ptr arg-val)
-                            (declare (type fixnum depth in-ptr out-ptr arg-ptr arg-val))
-                            (if (= depth rank)
-                                (let* ((val (aref in-data in-ptr))
-				       (raw-acc (aref res-data out-ptr)))
-                                  (multiple-value-bind (new-acc do-update-arg)
-				      (funcall reducer-fn raw-acc val)
-                                    (setf (aref res-data out-ptr) (vt-cast new-acc final-dtype))
-                                    (when (and return-arg do-update-arg res-idx-data)
-				      (setf (aref res-idx-data arg-ptr) arg-val))))
-                                (let* ((dim (svref in-shp-vec depth))
-				       (in-stride (svref in-str-vec depth))
-				       (out-stride (svref osm-vec depth))
-				       (idx-stride (svref ism-vec depth))
-				       (arg-stride (svref arg-str-vec depth)))
-                                  (declare (type fixnum dim in-stride out-stride idx-stride arg-stride))
-                                  (loop for i fixnum from 0 below dim do
-                                    (recurse (1+ depth) in-ptr out-ptr arg-ptr
-                                             (the fixnum (+ arg-val (the fixnum (* i arg-stride)))))
-                                    (incf in-ptr in-stride)
-                                    (incf out-ptr out-stride)
-                                    (when return-arg (incf arg-ptr idx-stride)))))))
-                   (recurse 0 in-offset res-offset (if res-idx (vt-offset res-idx) 0) 0))))))
-          (values res res-idx))))))
+          ;; 根据 return-arg 选择展开
+          (if return-arg
+              (generate-typed-cond t)
+              (generate-typed-cond nil)))
+        
+        (values res res-idx)))))
