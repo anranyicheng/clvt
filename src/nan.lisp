@@ -66,15 +66,22 @@
         (double-float (locally (declare (notinline /)) (/ -1.0d0 0.0d0)))))))
 
 (defconstant +vt-dfloat-nan+ (load-time-value (%make-nan 'double-float)))
+
 (defconstant +vt-sfloat-nan+ (load-time-value (%make-nan 'single-float)))
+
 (defconstant +vt-dfloat-pos-inf+ (load-time-value (%make-pos-inf 'double-float)))
+
 (defconstant +vt-sfloat-pos-inf+ (load-time-value (%make-pos-inf 'single-float)))
+
 (defconstant +vt-dfloat-neg-inf+ (load-time-value (%make-neg-inf 'double-float)))
+
 (defconstant +vt-sfloat-neg-inf+ (load-time-value (%make-neg-inf 'single-float)))
 
 ;; 向后兼容的别名
 (defconstant +vt-float-nan+ +vt-dfloat-nan+)
+
 (defconstant +vt-float-pos-inf+ +vt-dfloat-pos-inf+)
+
 (defconstant +vt-float-neg-inf+ +vt-dfloat-neg-inf+)
 
 ;;; ------------------------------------------------------------------

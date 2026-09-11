@@ -50,7 +50,8 @@
       (when (> diag-len 0)
         (let ((start-offset (+ (* r-start row-stride) (* c-start col-stride))))
           (loop for i fixnum from 0 below diag-len
-                for offset fixnum = start-offset then (+ offset row-stride col-stride)
+                for offset fixnum = start-offset
+		  then (+ offset row-stride col-stride)
                 do (setf (aref data offset) (vt-cast value dtype)))))
       res)))
 
@@ -195,16 +196,21 @@
   (let* ((nd (length vts-list))
          (dims (mapcar (lambda (v) (first (vt-shape v))) vts-list))
          (output-shape (if (and (eq indexing :xy) (>= nd 2))
-                           (let ((sh (copy-list dims))) (rotatef (first sh) (second sh)) sh)
+                           (let ((sh (copy-list dims)))
+			     (rotatef (first sh) (second sh)) sh)
                            dims))
          (target-axes (if (and (eq indexing :xy) (>= nd 2))
                           (let ((axes (loop for i below nd collect i)))
                             (rotatef (first axes) (second axes)) axes)
                           (loop for i below nd collect i))))
     (labels ((sparse-shape (i)
-               (loop for ax from 0 below nd collect (if (= ax (nth i target-axes)) (nth i dims) 1))))
+               (loop for ax from 0 below nd
+		     collect (if (= ax (nth i target-axes))
+				 (nth i dims)
+				 1))))
       (loop for i from 0 below nd for v in vts-list
             for src = (if copy (vt-copy v) v)
             for sp = (sparse-shape i)
-            collect (if sparse (vt-reshape src sp)
+            collect (if sparse
+			(vt-reshape src sp)
                         (vt-broadcast-to (vt-reshape src sp) output-shape))))))

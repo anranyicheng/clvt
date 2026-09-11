@@ -54,7 +54,8 @@
          (rdata (vt-data result)))
     (declare (fixnum div) (double-float log-s log-e sign-s))
     (dotimes (i num)
-      (let* ((frac (if (= div 0) 0d0 (/ (coerce i 'double-float) (coerce div 'double-float))))
+      (let* ((frac (if (= div 0) 0d0 (/ (coerce i 'double-float)
+					(coerce div 'double-float))))
              (lv (+ log-s (* frac (- log-e log-s))))
              (v (* sign-s (exp lv))))
         (setf (aref rdata i) v)))
@@ -67,19 +68,23 @@
   "多维索引→扁平索引，对标 np.ravel_multi_index。支持标量和批量模式。"
   (if (every #'numberp multi-index)
       (let ((strides (let ((s 1) (lst nil))
-                       (loop for d in (reverse shape) do (push s lst) (setf s (* s d)))
+                       (loop for d in (reverse shape)
+			     do (push s lst) (setf s (* s d)))
                        lst)))
         (reduce #'+ (mapcar #'* multi-index strides)))
       (let* ((n (length (car multi-index)))
              (strides (let ((s 1) (lst nil))
-                        (loop for d in (reverse shape) do (push s lst) (setf s (* s d))) lst))
+                        (loop for d in (reverse shape)
+			      do (push s lst) (setf s (* s d))) lst))
              (result (vt-zeros n :dtype :int64))
              (rdata (vt-data result)))
         (loop for i fixnum below n do
           (let ((idx 0))
             (declare (type (signed-byte 64) idx))
-            (loop for mi in multi-index for str in strides do
-              (incf idx (* (the fixnum (nth i mi)) (the fixnum str))))
+            (loop for mi in multi-index
+		  for str in strides
+		  do
+		     (incf idx (* (the fixnum (nth i mi)) (the fixnum str))))
             (setf (aref rdata i) idx)))
         result)))
 
@@ -95,10 +100,14 @@
       (loop for j fixnum below cols do
         (when (<= (- j i) k)
           (push i rows) (push j cl))))
-    (values (vt-from-array (make-array (length rows) :element-type '(signed-byte 64)
-                                       :initial-contents (nreverse rows)) :dtype :int64)
-            (vt-from-array (make-array (length cl) :element-type '(signed-byte 64)
-                                       :initial-contents (nreverse cl)) :dtype :int64))))
+    (values (vt-from-array
+	     (make-array (length rows) :element-type '(signed-byte 64)
+				       :initial-contents (nreverse rows))
+	     :dtype :int64)
+            (vt-from-array
+	     (make-array (length cl) :element-type '(signed-byte 64)
+				     :initial-contents (nreverse cl))
+	     :dtype :int64))))
 
 (defun vt-triu-indices (n &key (k 0) m)
   "返回上三角索引 (rows, cols)，对标 np.triu_indices。"
@@ -110,9 +119,11 @@
         (when (>= (- j i) k)
           (push i rows) (push j cl))))
     (values (vt-from-array (make-array (length rows) :element-type '(signed-byte 64)
-                                       :initial-contents (nreverse rows)) :dtype :int64)
+						     :initial-contents (nreverse rows))
+			   :dtype :int64)
             (vt-from-array (make-array (length cl) :element-type '(signed-byte 64)
-                                       :initial-contents (nreverse cl)) :dtype :int64))))
+						   :initial-contents (nreverse cl))
+			   :dtype :int64))))
 
 ;;; ------------------------------------------------------------------
 ;;; 6. vander
@@ -152,7 +163,9 @@
     (dotimes (i total)
       (let ((cls (aref xdata i)))
         (when (and (>= cls 0) (< cls num-classes))
-          (setf (row-major-aref (vt-data result) (+ (* i num-classes) cls)) one-val))))
+          (setf (row-major-aref (vt-data result)
+				(+ (* i num-classes) cls))
+		one-val))))
     result))
 
 ;;; ------------------------------------------------------------------
@@ -178,11 +191,15 @@
                       (loop for i from (- rank ndim) below rank collect i)))
          (mean (vt-mean vt :axis norm-axes :keepdims t :dtype dtype))
          (var (vt-var vt :axis norm-axes :keepdims t :dtype dtype))
-         (eps-typed (coerce eps (if (and dtype (eq dtype :float32)) 'single-float 'double-float)))
+         (eps-typed (coerce eps (if (and dtype (eq dtype :float32))
+				    'single-float
+				    'double-float)))
          (std (vt-sqrt (vt-+ var eps-typed :dtype dtype) :dtype dtype))
          (normed (vt-/ (vt-- vt mean :dtype dtype) std :dtype dtype)))
     (let ((result (if gamma (vt-* normed gamma :dtype dtype :out out)
-                      (if out (progn (vt-copy-into normed out) out) normed))))
+                      (if out
+			  (progn (vt-copy-into normed out) out)
+			  normed))))
       (if beta (vt-+ result beta :dtype dtype :out result) result))))
 
 ;;; ------------------------------------------------------------------

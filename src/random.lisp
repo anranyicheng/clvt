@@ -6,7 +6,9 @@
   "clvt 内部默认随机状态。")
 
 (defun vt-make-random-state (&optional seed)
-  #+sbcl (if (null seed) (make-random-state nil) (sb-ext::seed-random-state seed))
+  #+sbcl (if (null seed)
+	     (make-random-state nil)
+	     (sb-ext::seed-random-state seed))
   #-sbcl (typecase seed
            (null (make-random-state nil))
            (random-state (make-random-state seed))
@@ -18,14 +20,18 @@
 (declaim (inline %uniform-rand %normal-rand))
 (defun %uniform-rand (state)
   (random 1.0d0 state))
+
 (defun %normal-rand (state)
   (let ((u1 (max least-positive-double-float (random 1.0d0 state)))
         (u2 (random 1.0d0 state)))
-    (* (sqrt (* -2.0d0 (log u1))) (cos (* 2.0d0 pi u2)))))
+    (* (sqrt (* -2.0d0 (log u1)))
+       (cos (* 2.0d0 pi u2)))))
 
 (defun vt-random (shape &key (dtype :float64) (rng *vt-default-random-state*))
   (declare (list shape) (random-state rng))
-  (vt-map (lambda (x) (declare (ignore x)) (vt-cast (%uniform-rand rng) dtype))
+  (vt-map (lambda (x)
+	    (declare (ignore x))
+	    (vt-cast (%uniform-rand rng) dtype))
           (vt-zeros shape :dtype dtype)))
 
 (defun vt-random-uniform (shape &key (low 0.0d0) (high 1.0d0) (dtype :float64)
@@ -33,7 +39,9 @@
   (declare (list shape) (random-state rng))
   (assert (< low high) (low high))
   (let ((range (- high low)))
-    (vt-map (lambda (x) (declare (ignore x)) (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
+    (vt-map (lambda (x)
+	      (declare (ignore x))
+	      (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
             (vt-zeros shape :dtype dtype))))
 
 (defun vt-random-normal (shape &key (mean 0.0d0) (std 1.0d0) (dtype :float64)
@@ -42,29 +50,38 @@
   (let ((res (vt-zeros shape :dtype dtype)))
     (vt-do-each (ptr val res)
       (declare (ignore val))
-      (setf (aref (vt-data res) ptr) (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
+      (setf (aref (vt-data res) ptr)
+	    (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
     res))
 
-(defun vt-random-int (low high &key (size nil) (dtype :int64) (rng *vt-default-random-state*))
+(defun vt-random-int
+    (low high &key (size nil) (dtype :int64) (rng *vt-default-random-state*))
   (declare (random-state rng))
   (let ((range (- high low)))
     (assert (>= range 0) (high low))
     (if (zerop range)
-        (if size (vt-full size low :dtype dtype) (make-vt nil low :dtype dtype))
         (if size
-            (vt-astype (vt-map (lambda (x) (declare (ignore x)) (+ low (random range rng)))
+	    (vt-full size low :dtype dtype)
+	    (make-vt nil low :dtype dtype))
+        (if size
+            (vt-astype (vt-map (lambda (x)
+				 (declare (ignore x))
+				 (+ low (random range rng)))
                                (vt-zeros size :dtype dtype))
                        dtype)
             (make-vt nil (+ low (random range rng)) :dtype dtype)))))
 
-(defun vt-random-integers (low high &key (size nil) (dtype :int64) (rng *vt-default-random-state*))
+(defun vt-random-integers
+    (low high &key (size nil) (dtype :int64) (rng *vt-default-random-state*))
   (vt-random-int low high :size size :dtype dtype :rng rng))
 
 (defun vt-random-choice (a &key (size nil) (replace t) (p nil) (dtype nil)
                              (rng *vt-default-random-state*))
   (declare (random-state rng))
   (let* ((source (if (integerp a)
-                     (progn (assert (> a 0) (a)) (vt-arange a :dtype (or dtype :int64)))
+                     (progn (assert (> a 0)
+				    (a))
+			    (vt-arange a :dtype (or dtype :int64)))
                      (ensure-vt a)))
          (n (vt-size source)) (out-dtype (or dtype (vt-dtype source)))
          (src-data (vt-data source)) (src-offset (vt-offset source)))
@@ -75,10 +92,12 @@
                           (let ((total (reduce #'+ p)))
                             (assert (> total 0) ())
                             (let ((cum 0.0d0))
-                              (coerce (mapcar (lambda (w) (incf cum (/ w total)) cum) p) 'vector))))
+                              (coerce (mapcar (lambda (w) (incf cum (/ w total)) cum) p)
+				      'vector))))
                    nil)))
       (labels ((sample-one ()
-                 (cond ((and replace (null p)) (aref src-data (+ src-offset (random n rng))))
+                 (cond ((and replace (null p))
+			(aref src-data (+ src-offset (random n rng))))
                        ((and replace p)
                         (let ((r (random 1.0d0 rng)))
                           (loop for i from 0 below n
@@ -89,25 +108,32 @@
             (let ((result (vt-zeros size :dtype out-dtype)))
               (vt-do-each (ptr val result)
                 (declare (ignore val))
-                (setf (aref (vt-data result) ptr) (vt-cast (sample-one) out-dtype)))
+                (setf (aref (vt-data result) ptr)
+		      (vt-cast (sample-one) out-dtype)))
               result)
             (make-vt nil (vt-cast (sample-one) out-dtype) :dtype out-dtype))))))
 
 (defun vt-random-permutation (n &key (rng *vt-default-random-state*))
   (declare (random-state rng))
   (when (and (integerp n) (<= n 1))
-    (return-from vt-random-permutation (vt-arange (if (zerop n) 0 1) :dtype :int64)))
+    (return-from vt-random-permutation
+      (vt-arange (if (zerop n) 0 1) :dtype :int64)))
   (if (integerp n)
-      (let* ((arr (vt-arange n :dtype :int64)) (data (vt-data arr)))
+      (let* ((arr (vt-arange n :dtype :int64))
+	     (data (vt-data arr)))
         (loop for i from (1- n) downto 1 do
-          (let ((j (random (1+ i) rng))) (rotatef (aref data i) (aref data j))))
+          (let ((j (random (1+ i) rng)))
+	    (rotatef (aref data i) (aref data j))))
         arr)
       (let* ((tensor (ensure-vt n)) (result (vt-copy tensor))
              (first-dim (first (vt-shape result))))
         (loop for i from (1- first-dim) downto 1 do
           (let* ((j (random (1+ i) rng))
-                 (si (vt-slice result (list i))) (sj (vt-slice result (list j))))
-            (let ((tmp (vt-copy si))) (vt-copy-into si sj) (vt-copy-into sj tmp))))
+                 (si (vt-slice result (list i)))
+		 (sj (vt-slice result (list j))))
+            (let ((tmp (vt-copy si)))
+	      (vt-copy-into si sj)
+	      (vt-copy-into sj tmp))))
         result)))
 
 (defun vt-random-shuffle (tensor &key (axis 0) (rng *vt-default-random-state*))
@@ -143,10 +169,15 @@
         ;; 显式设置最后一项为 1.0，同时保留回退逻辑更保险
         (setf (aref cdf (1- k)) 1.0d0)
 
-        (let* ((out-shape (if size (append (if (listp size) size (list size)) (list k)) (list k)))
+        (let* ((out-shape (if size
+			      (append (if (listp size) size (list size))
+				      (list k))
+			      (list k)))
                (result (vt-zeros out-shape :dtype :int64))
                (res-data (vt-data result))
-               (total-trials (if size (reduce #'* (if (listp size) size (list size))) 1)))
+               (total-trials (if size
+				 (reduce #'* (if (listp size) size (list size)))
+				 1)))
           (dotimes (trial total-trials)
             (let ((counts (make-array k :element-type '(signed-byte 64) :initial-element 0)))
               (dotimes (_ n)
@@ -155,7 +186,8 @@
                   (let ((idx (binary-search-cdf cdf r)))
                     (incf (aref counts idx)))))
               (loop for i from 0 below k
-                    do (setf (aref res-data (+ (* trial k) i)) (aref counts i)))))
+                    do (setf (aref res-data (+ (* trial k) i))
+			     (aref counts i)))))
           result)))))
 
 ;; 辅助函数：二分查找

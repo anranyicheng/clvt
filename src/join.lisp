@@ -4,12 +4,14 @@
 
 (defun vt-concatenate (axis &rest vts)
   "沿指定轴连接数组。"
-  (when (null vts) (error "vt-concatenate 至少需要一个张量"))
+  (when (null vts)
+    (error "vt-concatenate 至少需要一个张量"))
   (let* ((shapes (mapcar #'vt-shape vts))
          (rank (length (car shapes)))
          (ax (vt-normalize-axis axis rank)))
     (loop for shape in shapes for i from 0
-          do (unless (= (length shape) rank) (error "张量 ~a 秩不匹配" i))
+          do (unless (= (length shape) rank)
+	       (error "张量 ~a 秩不匹配" i))
              (loop for d in shape for j from 0
                    unless (or (= j ax) (= d (nth j (car shapes))))
                      do (error "形状不匹配")))
@@ -17,7 +19,8 @@
            (total (reduce #'+ (mapcar (lambda (s) (nth ax s)) shapes)))
            (result-type (apply #'vt-promote-type (mapcar #'vt-dtype vts))))
       (setf (nth ax new-shape) total)
-      (let ((result (vt-zeros new-shape :dtype result-type)) (cur 0))
+      (let ((result (vt-zeros new-shape :dtype result-type))
+	    (cur 0))
         (dolist (vt vts)
           (let* ((axis-size (nth ax (vt-shape vt)))
                  (slice-args (loop for i below rank
@@ -49,12 +52,13 @@
 
 (defun vt-dstack (&rest vts)
   (when (null vts) (error "vt-dstack 至少需要一个张量"))
-  (let ((expanded (mapcar (lambda (vt)
-                            (let ((rank (length (vt-shape vt))))
-                              (cond ((= rank 1) (vt-reshape vt (append (vt-shape vt) '(1 1))))
-                                    ((= rank 2) (vt-reshape vt (append (vt-shape vt) '(1))))
-                                    (t vt))))
-                          vts)))
+  (let ((expanded
+	  (mapcar (lambda (vt)
+                    (let ((rank (length (vt-shape vt))))
+                      (cond ((= rank 1) (vt-reshape vt (append (vt-shape vt) '(1 1))))
+                            ((= rank 2) (vt-reshape vt (append (vt-shape vt) '(1))))
+                            (t vt))))
+                  vts)))
     (apply #'vt-concatenate 2 expanded)))
 
 (defun vt-append (arr values &key (axis nil))
@@ -67,7 +71,9 @@
           (unless (= (length (vt-shape arr-vt)) (length (vt-shape val-vt)))
             (error "vt-append: 维度不匹配"))
           (loop for i below rank
-                unless (or (= i ax) (= (nth i (vt-shape arr-vt)) (nth i (vt-shape val-vt))))
+                unless (or (= i ax)
+			   (= (nth i (vt-shape arr-vt))
+			      (nth i (vt-shape val-vt))))
                   do (error "vt-append: 轴 ~a 形状不匹配" i))
           (vt-concatenate ax arr-vt val-vt)))))
 
@@ -83,8 +89,12 @@
                      (pos (if (minusp obj) (+ size obj) obj)))
                 (when (or (< pos 0) (> pos size)) (error "索引 ~a 越界" obj))
                 (if (zerop val-size) flat
-                    (let ((left (if (> pos 0) (vt-slice flat (list 0 pos)) (vt-zeros '(0) :dtype (vt-dtype flat))))
-                          (right (if (< pos size) (vt-slice flat (list pos size)) (vt-zeros '(0) :dtype (vt-dtype flat)))))
+                    (let ((left (if (> pos 0)
+				    (vt-slice flat (list 0 pos))
+				    (vt-zeros '(0) :dtype (vt-dtype flat))))
+                          (right (if (< pos size)
+				     (vt-slice flat (list pos size))
+				     (vt-zeros '(0) :dtype (vt-dtype flat)))))
                       (vt-concatenate 0 left flat-val right))))
               (let ((num (length obj)))
                 (unless (or (= val-size num) (= val-size 1))
@@ -92,16 +102,25 @@
                 (let ((pairs (stable-sort
                               (if (= val-size 1)
                                   (loop for idx in obj collect (cons idx flat-val))
-                                  (loop for idx in obj for i from 0 below val-size
+                                  (loop for idx in obj
+					for i from 0 below val-size
                                         collect (cons idx (vt-narrow flat-val 0 i (1+ i)))))
                               #'> :key #'car)))
                   (loop with result = flat
                         for (raw-pos . val) in pairs
                         for size = (vt-size result)
-                        for pos = (if (minusp raw-pos) (+ size raw-pos) raw-pos)
-                        do (when (or (< pos 0) (> pos size)) (error "索引 ~a 越界" raw-pos))
-                           (let ((left (if (> pos 0) (vt-slice result (list 0 pos)) (vt-zeros '(0) :dtype (vt-dtype result))))
-                                 (right (if (< pos size) (vt-slice result (list pos size)) (vt-zeros '(0) :dtype (vt-dtype result)))))
+                        for pos = (if (minusp raw-pos)
+				      (+ size raw-pos)
+				      raw-pos)
+                        do (when (or (< pos 0)
+				     (> pos size))
+			     (error "索引 ~a 越界" raw-pos))
+                           (let ((left (if (> pos 0)
+					   (vt-slice result (list 0 pos))
+					   (vt-zeros '(0) :dtype (vt-dtype result))))
+                                 (right (if (< pos size)
+					    (vt-slice result (list pos size))
+					    (vt-zeros '(0) :dtype (vt-dtype result)))))
                              (setf result (vt-concatenate 0 left val right)))
                         finally (return result))))))
         (let* ((shape (vt-shape arr-vt)) (rank (length shape))
@@ -109,16 +128,21 @@
                (ax-size (nth ax shape))
                (obj-list (if (listp obj) obj (list obj)))
                (num (length obj-list))
-               (target-shape (loop for i below rank collect (if (= i ax) num (nth i shape))))
+               (target-shape (loop for i below rank
+				   collect (if (= i ax) num (nth i shape))))
                (values-vt (if (null (vt-shape values-vt))
                               (vt-full target-shape (vt-ref values-vt) :dtype (vt-dtype values-vt))
                               values-vt))
                (values-reshaped (vt-reshape values-vt target-shape))
-               (arr-slices (loop for i from 0 below ax-size collect (vt-narrow arr-vt ax i (1+ i))))
+               (arr-slices (loop for i from 0 below ax-size
+				 collect (vt-narrow arr-vt ax i (1+ i))))
                (value-blocks (if (= num 1)
                                  (list values-reshaped)
-                                 (loop for i from 0 below num collect (vt-narrow values-reshaped ax i (1+ i)))))
-               (pairs (stable-sort (loop for pos in obj-list for b in value-blocks collect (cons pos b))
+                                 (loop for i from 0 below num
+				       collect (vt-narrow values-reshaped ax i (1+ i)))))
+               (pairs (stable-sort (loop for pos in obj-list
+					 for b in value-blocks
+					 collect (cons pos b))
                                    #'> :key #'car)))
           (loop with slices = (copy-list arr-slices)
                 for (raw-pos . block) in pairs
@@ -159,7 +183,8 @@
           (let* ((ax (vt-normalize-axis axis rank)) (dim (nth ax sh))
                  (k (keep obj dim)))
             (if k
-                (apply #'vt-concatenate ax (loop for i in k collect (vt-narrow tensor ax i (1+ i))))
+                (apply #'vt-concatenate ax (loop for i in k
+						 collect (vt-narrow tensor ax i (1+ i))))
                 (let ((ns (copy-list sh)))
                   (setf (nth ax ns) 0)
                   (vt-zeros ns :dtype dtype))))))))

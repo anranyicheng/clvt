@@ -9,7 +9,8 @@
 (defun vt-flatten-sequence (seq)
   "深度优先遍历 seq 及其嵌套序列，返回所有原子元素的列表（行主序）。"
   (with-float-safe
-    (labels ((sequence-p (obj) (or (listp obj) (arrayp obj))))
+    (labels ((sequence-p (obj)
+	       (or (listp obj) (arrayp obj))))
       (if (not (sequence-p seq))
           (list seq)
           (let ((result '())
@@ -126,10 +127,13 @@
   (labels ((build (shape strides offset data)
              (if (null shape)
                  (aref data offset)
-                 (let ((dim (first shape)) (stride (first strides)) (result nil))
+                 (let ((dim (first shape))
+		       (stride (first strides))
+		       (result nil))
                    (loop for i fixnum from (1- dim) downto 0
                          for sub = (+ offset (* i stride))
-                         do (push (build (rest shape) (rest strides) sub data) result))
+                         do (push (build (rest shape) (rest strides) sub data)
+				  result))
                    result))))
     (let ((shape (vt-shape vt)) (strides (vt-strides vt))
           (offset (vt-offset vt)) (data (vt-data vt)))
@@ -174,8 +178,11 @@
 (defvar *vt-indent-step* 1 "缩进步长")
 
 (defun %type-category (type)
-  (cond ((or (eq type 'fixnum) (eq type 'integer) (eq type 'bit)
-             (and (listp type) (member (first type) '(signed-byte unsigned-byte))))
+  (cond ((or (eq type 'fixnum)
+	     (eq type 'integer)
+	     (eq type 'bit)
+             (and (listp type)
+		  (member (first type) '(signed-byte unsigned-byte))))
          :integer)
         ((member type '(single-float double-float short-float long-float float))
          :float)
@@ -194,12 +201,15 @@
     (otherwise (format nil "~a" val))))
 
 (defun %phys-idx (vt indices)
-  (loop with strides = (vt-strides vt) with offset = (vt-offset vt)
-        for idx in indices for stride in strides
+  (loop with strides = (vt-strides vt)
+	with offset = (vt-offset vt)
+        for idx in indices
+	for stride in strides
         sum (* idx stride) into res
         finally (return (+ res offset))))
 
-(defun print-vt-recursive (vt axis current-indices base-indent col-width element-type stream)
+(defun print-vt-recursive
+    (vt axis current-indices base-indent col-width element-type stream)
   (let* ((shape (vt-shape vt))
          (rank (length shape))
          (dim-size (nth axis shape))
@@ -251,7 +261,8 @@
         (t
          (let ((max-width 0))
            (labels ((scan-visible (current-idxs axis)
-                      (let ((dim (nth axis shape)) (is-last (= axis (1- (length shape)))))
+                      (let ((dim (nth axis shape))
+			    (is-last (= axis (1- (length shape)))))
                         (if is-last
                             (loop for i from 0 below (min dim (* 2 *vt-print-threshold*))
                                   for phys = (%phys-idx obj (append current-idxs (list i)))
