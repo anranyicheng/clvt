@@ -11,84 +11,457 @@
 		    (floor rem stride)
 		  (setf rem r) idx)))
 
-(defun vt-sum (tensor &key axis keepdims dtype out)
-  (let ((et (array-element-type (vt-data tensor))))
-    (nth-value 0 (vt-reduce tensor axis (get-reduction-identity :sum et)
-                            (lambda (acc val) (values (+ acc val) nil))
-                            :out out :dtype dtype :keepdims keepdims))))
+;;; ============================================================
+;;; 编译期算子描述
+;;; ============================================================
 
-(defun vt-amax (tensor &key axis keepdims dtype out)
-  (let ((et (array-element-type (vt-data tensor))))
-    (nth-value 0 (vt-reduce tensor axis (get-reduction-identity :max et)
-                            (lambda (acc val)
-                              (cond ((%nan-p val)
-				     (if (%nan-p acc)
-					 (values acc nil)
-					 (values val t)))
-                                    ((%nan-p acc) (values acc nil))
-                                    (t (if (> val acc)
-					   (values val t)
-					   (values acc nil)))))
-                            :out out :dtype dtype :keepdims keepdims))))
+(eval-when (:compile-toplevel :load-toplevel :execute)
 
-(defun vt-amin (tensor &key axis keepdims dtype out)
-  (let ((et (array-element-type (vt-data tensor))))
-    (nth-value 0 (vt-reduce tensor axis (get-reduction-identity :min et)
-                            (lambda (acc val)
-                              (cond ((%nan-p val)
-				     (if (%nan-p acc)
-					 (values acc nil)
-					 (values val t)))
-                                    ((%nan-p acc) (values acc nil))
-                                    (t (if (< val acc)
-					   (values val t)
-					   (values acc nil)))))
-                            :out out :dtype dtype :keepdims keepdims))))
+  (defparameter +kernel-lts+
+    '(double-float single-float (signed-byte 64) (signed-byte 32))
+    "内核支持的 Lisp 元素类型。")
 
-(defun vt-argmax (tensor &key axis out)
-  (let ((et (array-element-type (vt-data tensor))))
-    (nth-value 1 (vt-reduce tensor axis (get-reduction-identity :max et)
-                            (lambda (acc val)
-                              (cond ((%nan-p val)
-				     (if (%nan-p acc)
-					 (values acc nil)
-					 (values val t)))
-                                    ((%nan-p acc) (values acc nil))
-                                    (t (if (> val acc)
-					   (values val t)
-					   (values acc nil)))))
-                            :out out :return-arg t))))
+  (defun %op-arg-p (op)
+    "是否为 arg 类归约（输出索引）。"
+    (member op '(:argmax :argmin :nanargmax :nanargmin)))
 
-(defun vt-argmin (tensor &key axis out)
-  (let ((et (array-element-type (vt-data tensor))))
-    (nth-value 1 (vt-reduce tensor axis (get-reduction-identity :min et)
-                            (lambda (acc val)
-                              (cond ((%nan-p val)
-				     (if (%nan-p acc)
-					 (values acc nil)
-					 (values val t)))
-                                    ((%nan-p acc) (values acc nil))
-                                    (t (if (< val acc)
-					   (values val t)
-					   (values acc nil)))))
-                            :out out :return-arg t))))
+  (defun %op-base (op)
+    (ecase op
+      ((:max :nanmax :argmax :nanargmax) :max)
+      ((:min :nanmin :argmin :nanargmin) :min)
+      ((:sum :nansum) :sum)
+      ((:prod :nanprod) :prod)
+      ((:all) :all)
+      ((:any) :any)))
 
-(defun vt-prod (tensor &key axis keepdims dtype out)
-  (nth-value 0 (vt-reduce tensor axis 1
-                          (lambda (acc val) (values (* acc val) nil))
-                          :out out :dtype dtype :keepdims keepdims)))
+  (defun %op-nan-skip-p (op)
+    (member op '(:nanmax :nanmin :nansum :nanprod :nanargmax :nanargmin)))
 
-(defun vt-all (condition &key axis keepdims)
-  (nth-value 0 (vt-reduce condition axis 1
-                          (lambda (acc val)
-                            (values (if (and (/= acc 0) (/= val 0)) 1 0) nil))
-                          :dtype :int64 :keepdims keepdims)))
+  (defun %op-nan-prop-p (op)
+    (member op '(:max :min :argmax :argmin)))
 
-(defun vt-any (condition &key axis keepdims)
-  (nth-value 0 (vt-reduce condition axis 0
-                          (lambda (acc val)
-                            (values (if (or (/= acc 0) (/= val 0)) 1 0) nil))
-                          :dtype :int64 :keepdims keepdims)))
+  (defun %op-requires-float-p (op)
+    (member op '(:nanmax :nanmin :nanargmax :nanargmin)))
+
+  (defun %dtype->lt (dtype)
+    (case dtype
+      (:float64 'double-float)
+      (:float32 'single-float)
+      (:int64   '(signed-byte 64))
+      (:int32   '(signed-byte 32))
+      (t nil)))
+
+  (defun %et->lt (in-et)
+    (cond ((equal in-et 'double-float)     'double-float)
+          ((equal in-et 'single-float)     'single-float)
+          ((equal in-et '(signed-byte 64)) '(signed-byte 64))
+          ((equal in-et '(signed-byte 32)) '(signed-byte 32))
+          (t nil)))
+
+  (defun %lt-rank (lt)
+    (cond ((eq lt 'double-float) 5)
+          ((eq lt 'single-float) 4)
+          ((equal lt '(signed-byte 64)) 3)
+          ((equal lt '(signed-byte 32)) 2)
+          (t -1)))
+
+  (defun %op-acc-lt (op lt res-lt)
+    "累加器 Lisp 类型：sum/prod 提升到 lt/res-lt 中较宽者；
+     max/min/arg 用 lt；all/any 用 int64。"
+    (cond
+      ((member (%op-base op) '(:all :any)) '(signed-byte 64))
+      ((%op-arg-p op) lt)
+      (t (if (>= (%lt-rank lt) (%lt-rank res-lt)) lt res-lt))))
+
+  (defun %cast-form (lt form)
+    (cond ((eq lt 'double-float) `(coerce ,form 'double-float))
+          ((eq lt 'single-float) `(coerce ,form 'single-float))
+          ((member lt '((signed-byte 64) (signed-byte 32)) :test #'equal)
+           `(truncate ,form))
+          (t form)))
+
+  (defun %op-init (op lt res-lt)
+    "归约初始值（编译期常量，类型与 acc-lt 匹配）。"
+    (let* ((acc-lt (%op-acc-lt op lt res-lt))
+           (skip   (%op-nan-skip-p op)))
+      (ecase (%op-base op)
+        (:sum  (cond ((eq acc-lt 'double-float) 0.0d0)
+                     ((eq acc-lt 'single-float) 0.0s0)
+                     (t 0)))
+        (:prod (cond ((eq acc-lt 'double-float) 1.0d0)
+                     ((eq acc-lt 'single-float) 1.0s0)
+                     (t 1)))
+        (:all 1)
+        (:any 0)
+        (:max  (cond ((and skip (eq acc-lt 'double-float)) '(vt-get-nan :float64))
+                     ((and skip (eq acc-lt 'single-float)) '(vt-get-nan :float32))
+                     ((eq acc-lt 'double-float) '+vt-dfloat-neg-inf+)
+                     ((eq acc-lt 'single-float) '+vt-sfloat-neg-inf+)
+                     ((equal acc-lt '(signed-byte 64)) -9223372036854775808)
+                     ((equal acc-lt '(signed-byte 32)) -2147483648)
+                     (t 0)))
+        (:min  (cond ((and skip (eq acc-lt 'double-float)) '(vt-get-nan :float64))
+                     ((and skip (eq acc-lt 'single-float)) '(vt-get-nan :float32))
+                     ((eq acc-lt 'double-float) '+vt-dfloat-pos-inf+)
+                     ((eq acc-lt 'single-float) '+vt-sfloat-pos-inf+)
+                     ((equal acc-lt '(signed-byte 64)) 9223372036854775807)
+                     ((equal acc-lt '(signed-byte 32)) 2147483647)
+                     (t 0))))))
+
+  (defun %op-out-dtype (op in-dtype)
+    (case op
+      ((:all :any) :int64)
+      ((:argmax :argmin :nanargmax :nanargmin) :int32)
+      (t in-dtype)))
+
+  ) ; end eval-when
+
+;;; ============================================================
+;;; 归约步宏
+;;; ============================================================
+
+(defmacro %op-step (op acc val lt acc-lt)
+  "生成一次 acc ← f(acc, val) 更新。val 类型 lt，acc 类型 acc-lt。"
+  (let* ((base (%op-base op))
+         (skip (%op-nan-skip-p op))
+         (prop (%op-nan-prop-p op))
+         (float (subtypep lt 'float))
+         (casted (if (equal lt acc-lt) val (%cast-form acc-lt val))))
+    (ecase base
+      (:sum  (if (and skip float)
+                 `(when (not (%nan-p ,val)) (incf ,acc ,casted))
+                 `(incf ,acc ,casted)))
+      (:prod (if (and skip float)
+                 `(when (not (%nan-p ,val)) (setf ,acc (* ,acc ,casted)))
+                 `(setf ,acc (* ,acc ,casted))))
+      (:all  `(when (zerop ,val) (setf ,acc 0)))
+      (:any  `(when (/= ,val 0) (setf ,acc 1)))
+      (:max  (cond ((and skip float)
+                    `(cond ((%nan-p ,val) nil)
+                           ((%nan-p ,acc) (setf ,acc ,casted))
+                           ((> ,val ,acc) (setf ,acc ,casted))))
+                   ((and prop float)
+                    `(cond ((%nan-p ,acc) nil)
+                           ((%nan-p ,val) (setf ,acc ,casted))
+                           ((> ,val ,acc) (setf ,acc ,casted))))
+                   (t `(when (> ,val ,acc) (setf ,acc ,casted)))))
+      (:min  (cond ((and skip float)
+                    `(cond ((%nan-p ,val) nil)
+                           ((%nan-p ,acc) (setf ,acc ,casted))
+                           ((< ,val ,acc) (setf ,acc ,casted))))
+                   ((and prop float)
+                    `(cond ((%nan-p ,acc) nil)
+                           ((%nan-p ,val) (setf ,acc ,casted))
+                           ((< ,val ,acc) (setf ,acc ,casted))))
+                   (t `(when (< ,val ,acc) (setf ,acc ,casted))))))))
+
+(defmacro %op-arg-step (op acc best-i r val lt acc-lt)
+  "生成一次 arg 更新：acc ← val，best-i ← r。acc-lt 对 arg 恒等于 lt。"
+  (declare (ignore acc-lt))
+  (let* ((base (%op-base op))
+         (skip (%op-nan-skip-p op))
+         (prop (%op-nan-prop-p op))
+         (float (subtypep lt 'float)))
+    (ecase base
+      (:max (cond ((and skip float)
+                   `(cond ((%nan-p ,val) nil)
+                          ((%nan-p ,acc) (setf ,acc ,val ,best-i ,r))
+                          ((> ,val ,acc) (setf ,acc ,val ,best-i ,r))))
+                  ((and prop float)
+                   `(cond ((%nan-p ,val)
+                           (when (not (%nan-p ,acc))
+                             (setf ,acc ,val ,best-i ,r)))
+                          ((%nan-p ,acc) nil)
+                          ((> ,val ,acc) (setf ,acc ,val ,best-i ,r))))
+                  (t `(when (> ,val ,acc) (setf ,acc ,val ,best-i ,r)))))
+      (:min (cond ((and skip float)
+                   `(cond ((%nan-p ,val) nil)
+                          ((%nan-p ,acc) (setf ,acc ,val ,best-i ,r))
+                          ((< ,val ,acc) (setf ,acc ,val ,best-i ,r))))
+                  ((and prop float)
+                   `(cond ((%nan-p ,val)
+                           (when (not (%nan-p ,acc))
+                             (setf ,acc ,val ,best-i ,r)))
+                          ((%nan-p ,acc) nil)
+                          ((< ,val ,acc) (setf ,acc ,val ,best-i ,r))))
+                  (t `(when (< ,val ,acc) (setf ,acc ,val ,best-i ,r))))))))
+
+;;; ============================================================
+;;; 三条内核路径宏
+;;; ============================================================
+
+(defmacro %kernel-global (op lt res-lt)
+  "路径 1：连续 + 全局。"
+  (let* ((acc-lt (%op-acc-lt op lt res-lt))
+         (init   (%op-init   op lt res-lt))
+         (arg-p  (%op-arg-p  op))
+         (nan-skip-arg (and arg-p (%op-nan-skip-p op) (subtypep lt 'float))))
+    `(let ((d (the (simple-array ,lt (*)) in-data)))
+       (let ((acc (the ,acc-lt ,init))
+             ,@(when arg-p `((best-i 0)))
+             (p   (the fixnum in-off))
+             (end (the fixnum (+ in-off in-size))))
+         (declare (type fixnum p end)
+                  ,@(when arg-p '((type fixnum best-i))))
+         (loop while (< p end) do
+           (let ((v (the ,lt (aref d p))))
+             ,(if arg-p
+                  `(%op-arg-step ,op acc best-i (- p in-off) v ,lt ,acc-lt)
+                  `(%op-step ,op acc v ,lt ,acc-lt)))
+           (incf p))
+         ,@(when nan-skip-arg
+             `((when (%nan-p acc)
+                 (error "~a: All-NaN slice encountered" ',op))))
+         (setf (aref (the (simple-array ,res-lt (*)) res-data) res-off)
+               ,(%cast-form res-lt (if arg-p 'best-i 'acc)))))))
+
+(defmacro %kernel-single-axis (op lt res-lt)
+  "路径 2：连续 + 单轴。"
+  (let* ((acc-lt (%op-acc-lt op lt res-lt))
+         (init   (%op-init   op lt res-lt))
+         (arg-p  (%op-arg-p  op))
+         (nan-skip-arg (and arg-p (%op-nan-skip-p op) (subtypep lt 'float))))
+    `(let ((d  (the (simple-array ,lt (*)) in-data))
+           (od (the (simple-array ,res-lt (*)) res-data))
+           (init-v (the ,acc-lt ,init)))
+       (declare (type fixnum outer red inner))
+       (dotimes (o outer)
+         (let ((in-base (the fixnum (+ in-off (* o red inner)))))
+           (declare (type fixnum in-base))
+           (dotimes (i inner)
+             (let ((acc init-v)
+                   ,@(when arg-p `((best-i 0))))
+               (declare ,@(when arg-p '((type fixnum best-i))))
+               (dotimes (r red)
+                 (let ((v (the ,lt (aref d (the fixnum (+ in-base (* r inner) i))))))
+                   ,(if arg-p
+                        `(%op-arg-step ,op acc best-i r v ,lt ,acc-lt)
+                        `(%op-step ,op acc v ,lt ,acc-lt))))
+               ,@(when nan-skip-arg
+                   `((when (%nan-p acc)
+                       (error "~a: All-NaN slice encountered" ',op))))
+               (setf (aref od (the fixnum (+ res-off (* o inner) i)))
+                     ,(%cast-form res-lt (if arg-p 'best-i 'acc))))))))))
+
+(defmacro %kernel-general (op lt res-lt)
+  "路径 3：通用回退。"
+  (let* ((acc-lt (%op-acc-lt op lt res-lt))
+         (init   (%op-init   op lt res-lt))
+         (arg-p  (%op-arg-p  op))
+         (nan-skip-arg (and arg-p (%op-nan-skip-p op) (subtypep lt 'float))))
+    `(let ((d  (the (simple-array ,lt (*)) in-data))
+           (od (the (simple-array ,res-lt (*)) res-data)))
+       (declare (type fixnum n-red n-non red-size non-size))
+       (let ((non-idx (make-array (max n-non 1) :element-type 'fixnum :initial-element 0))
+             (red-idx (make-array (max n-red 1) :element-type 'fixnum :initial-element 0))
+             (init-v  (the ,acc-lt ,init)))
+         (declare (type (simple-array fixnum (*)) non-idx red-idx))
+         (dotimes (out-pos non-size)
+           (let ((base in-off))
+             (declare (type fixnum base))
+             (dotimes (dd n-non)
+               (incf base (* (aref non-idx dd) (svref non-strides dd))))
+             (fill red-idx 0)
+             (let ((acc init-v)
+                   ,@(when arg-p `((best-i 0))))
+               (declare (type ,acc-lt acc)
+                        ,@(when arg-p '((type fixnum best-i))))
+               (dotimes (r red-size)
+                 (let ((offset 0) (linear 0) (mult 1))
+                   (declare (type fixnum offset linear mult))
+                   (loop for dd fixnum from (1- n-red) downto 0 do
+                     (incf offset (* (aref red-idx dd) (svref red-strides-v dd)))
+                     (incf linear (* (aref red-idx dd) mult))
+                     (setf mult (* mult (svref red-sizes dd))))
+                   (let ((v (the ,lt (aref d (the fixnum (+ base offset))))))
+                     ,(if arg-p
+                          `(%op-arg-step ,op acc best-i linear v ,lt ,acc-lt)
+                          `(%op-step ,op acc v ,lt ,acc-lt))))
+                 (when (plusp n-red)
+                   (let ((dd (1- n-red)))
+                     (declare (type fixnum dd))
+                     (loop
+                       (incf (aref red-idx dd))
+                       (when (< (aref red-idx dd) (svref red-sizes dd)) (return))
+                       (setf (aref red-idx dd) 0)
+                       (decf dd)
+                       (when (< dd 0) (return))))))
+               ,@(when nan-skip-arg
+                   `((when (%nan-p acc)
+                       (error "~a: All-NaN slice encountered" ',op))))
+               (setf (aref od (the fixnum (+ res-off out-pos)))
+                     ,(%cast-form res-lt (if arg-p 'best-i 'acc))))
+             (when (plusp n-non)
+               (let ((dd (1- n-non)))
+                 (declare (type fixnum dd))
+                 (loop
+                   (incf (aref non-idx dd))
+                   (when (< (aref non-idx dd) (svref non-sizes dd)) (return))
+                   (setf (aref non-idx dd) 0)
+                   (decf dd)
+                   (when (< dd 0) (return)))))))))))
+
+;;; ============================================================
+;;; 统一生成宏
+;;; ============================================================
+
+(defmacro %def-vt-reduce (name op)
+  "为算子 op 生成函数 vt-<name>。对 in-et × res-lt 两级分派到类型特化内核。"
+  (let ((fn-name (intern (format nil "VT-~a" name)))
+        (arg-p   (%op-arg-p op))
+        (requires-float (%op-requires-float-p op)))
+    (flet ((dispatch (kernel-macro)
+             `(cond
+                ,@(loop for lt in +kernel-lts+
+                        unless (and requires-float (subtypep lt 'integer))
+                        collect
+                        `((equal in-et ',lt)
+                          (cond
+                            ,@(loop for rlt in +kernel-lts+
+                                    collect
+                                    `((equal res-lt ',rlt)
+                                      (,kernel-macro ,op ,lt ,rlt)))
+                            (t (error "unsupported output dtype ~a" res-lt)))))
+                (t (error "unsupported input dtype ~a" in-et)))))
+      `(defun ,fn-name (tensor &key axis keepdims dtype out)
+         (declare (type vt tensor)
+                  (type (or null fixnum list) axis)
+                  (type (or null vt) out))
+         (with-float-safe
+           (let* ((in-shape (vt-shape tensor))
+                  (rank (length in-shape))
+                  (axes (vt-normalize-axes axis rank))
+                  (global (null axes))
+                  (single-axis-p (and (= (length axes) 1) (not global)))
+                  (out-shape
+                    (cond ((and global (not keepdims)) nil)
+                          (global (make-list rank :initial-element 1))
+                          ((not keepdims)
+                           (loop for d in in-shape for i fixnum from 0
+                                 unless (member i axes) collect d))
+                          (t (loop for d in in-shape for i fixnum from 0
+                                   collect (if (member i axes) 1 d))))))
+             ;; ---- :out 形状校验 ----
+             (when (and out (not (equal (vt-shape out) out-shape)))
+               (error "vt-~a: :out shape ~a does not match expected ~a"
+                      ',name (vt-shape out) out-shape))
+             ;; ---- :out 与 :dtype 冲突校验 ----
+             (when (and out dtype (not (eq (vt-dtype out) dtype)))
+               (error "vt-~a: :out dtype ~a conflicts with :dtype ~a"
+                      ',name (vt-dtype out) dtype))
+             (let* ((axis-size (if axes
+                                   (reduce #'* (mapcar (lambda (a) (nth a in-shape)) axes)
+                                           :initial-value 1)
+                                   (reduce #'* in-shape :initial-value 1)))
+                    (in-data (vt-data tensor))
+                    (in-off  (vt-offset tensor))
+                    (in-et   (array-element-type in-data))
+                    (in-size (vt-size tensor))
+                    (final-out-dtype
+                      (or dtype
+                          (and out (vt-dtype out))
+                          (%op-out-dtype ,op (vt-dtype tensor))))
+                    (res-lt (%dtype->lt final-out-dtype))
+                    (res (or out (make-vt out-shape 0 :dtype final-out-dtype)))
+                    (res-data (vt-data res))
+                    (res-off  (vt-offset res)))
+               (declare (fixnum rank axis-size in-size))
+               (unless res-lt
+                 (error "vt-~a: unsupported output dtype ~a" ',name final-out-dtype))
+               ,@(when requires-float
+                   `((when (subtypep in-et 'integer)
+                       (error "~a: NaN-aware max/min/arg op on integer input" ',name))))
+               ;; ---- 空输入 ----
+               (when (or (zerop axis-size) (zerop in-size))
+                 ,@(when (and arg-p (%op-nan-skip-p op))
+                     `((error "~a: empty slice or All-NaN encountered" ',name)))
+                 ,(if arg-p
+                      `(progn (vt-fill res 0)
+                              (return-from ,fn-name res))
+                      `(progn
+                         (let ((lt (%et->lt in-et)))
+                           (vt-fill res
+                                    (cond
+                                      ,@(loop for rlt in +kernel-lts+
+                                              collect
+                                              `((equal res-lt ',rlt)
+                                                (cond
+                                                  ,@(loop for l in +kernel-lts+
+                                                          collect
+                                                          `((equal lt ',l)
+                                                            ,(%op-init op l rlt)))
+                                                  (t 0))))
+                                      (t 0))))
+                         (return-from ,fn-name res))))
+               ;; ---- 主分派 ----
+               (cond
+                 ;; 路径 1：连续 + 全局
+                 ((and global (vt-contiguous-p tensor))
+                  ,(dispatch '%kernel-global))
+                 ;; 路径 2：连续 + 单轴
+                 ((and single-axis-p
+                       (vt-contiguous-p tensor)
+                       (vt-contiguous-p res))
+                  (let* ((ax (first axes))
+                         (outer (reduce #'* in-shape :end ax :initial-value 1))
+                         (red   (nth ax in-shape))
+                         (inner (reduce #'* in-shape :start (1+ ax) :initial-value 1)))
+                    (declare (fixnum ax outer red inner))
+                    ,(dispatch '%kernel-single-axis)))
+                 ;; 路径 3：通用回退
+                 (t
+                  (when (and out (not (vt-contiguous-p res)))
+                    (error "vt-~a: :out must be contiguous in fallback path" ',name))
+                  (let* ((global-red  (null axes))
+                         (eff-red-axes (if global-red
+                                           (loop for i below rank collect i)
+                                           axes))
+                         (eff-non-axes (if global-red
+                                           nil
+                                           (loop for i below rank
+                                                 unless (member i axes) collect i)))
+                         (in-strides (vt-strides tensor))
+                         (in-shape-vec   (coerce in-shape 'simple-vector))
+                         (in-strides-vec (coerce in-strides 'simple-vector))
+                         (red-axes (coerce eff-red-axes 'simple-vector))
+                         (non-axes (coerce eff-non-axes 'simple-vector))
+                         (n-red (length eff-red-axes))
+                         (n-non (- rank n-red))
+                         (red-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
+                                         red-axes))
+                         (red-strides-v (map 'vector (lambda (a) (svref in-strides-vec a))
+                                             red-axes))
+                         (non-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
+                                         non-axes))
+                         (non-strides (map 'vector (lambda (a) (svref in-strides-vec a))
+                                           non-axes))
+                         (red-size (reduce #'* red-sizes :initial-value 1))
+                         (non-size (reduce #'* non-sizes :initial-value 1)))
+                    (declare (fixnum n-red n-non red-size non-size))
+                    ,(dispatch '%kernel-general))))
+               res)))))))
+
+;;; ============================================================
+;;; 归约族定义
+;;; ============================================================
+
+(%def-vt-reduce sum  :sum)
+(%def-vt-reduce prod :prod)
+(%def-vt-reduce amax :max)
+(%def-vt-reduce amin :min)
+(%def-vt-reduce all  :all)
+(%def-vt-reduce any  :any)
+
+(%def-vt-reduce nansum  :nansum)
+(%def-vt-reduce nanprod :nanprod)
+(%def-vt-reduce nanmax  :nanmax)
+(%def-vt-reduce nanmin  :nanmin)
+
+(%def-vt-reduce argmax    :argmax)
+(%def-vt-reduce argmin    :argmin)
+(%def-vt-reduce nanargmax :nanargmax)
+(%def-vt-reduce nanargmin :nanargmin)
+
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) out)
   (vt-map (lambda (a b)
@@ -563,11 +936,6 @@
 ;;; nan 感知统计
 ;;; ------------------------------------------------------------------
 
-(defun vt-nansum (tensor &key axis keepdims dtype out)
-  (let* ((mask (vt-isnan tensor))
-	 (clean (vt-where mask 0.0d0 tensor)))
-    (vt-sum clean :axis axis :keepdims keepdims :dtype dtype :out out)))
-
 (defun vt-nanmean (tensor &key axis keepdims dtype out)
   (let* ((mask (vt-isnan tensor))
 	 (not-nan (vt-logical-not mask))
@@ -621,52 +989,6 @@
          (var (vt-nanvar tensor :axis axis :keepdims keepdims :ddof ddof
 				:dtype final-dtype :out out)))
     (vt-sqrt var :dtype final-dtype :out var)))
-
-(defun vt-nanmax (tensor &key axis keepdims dtype out)
-  (if (member (vt-dtype tensor) '(:int32 :int64))
-      (vt-amax tensor :axis axis :keepdims keepdims :dtype dtype :out out)
-      (let* ((dt (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-			(error "vt-nanmax: :out 与 :dtype 冲突"))
-                       (out (vt-dtype out)) (dtype dtype) (t (vt-dtype tensor))))
-             (mask (vt-isnan tensor))
-             (clean (vt-where mask (vt-get-neg-inf dt) tensor :dtype dt))
-             (result (vt-amax clean :axis axis :keepdims keepdims :dtype dt :out out)))
-        (vt-where (vt-all mask :axis axis :keepdims keepdims)
-		  (vt-get-nan dt)
-		  result :dtype dt :out result))))
-
-(defun vt-nanmin (tensor &key axis keepdims dtype out)
-  (if (member (vt-dtype tensor) '(:int32 :int64))
-      (vt-amin tensor :axis axis :keepdims keepdims :dtype dtype :out out)
-      (let* ((dt (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-			(error "vt-nanmin: :out 与 :dtype 冲突"))
-                       (out (vt-dtype out)) (dtype dtype) (t (vt-dtype tensor))))
-             (mask (vt-isnan tensor))
-             (clean (vt-where mask (vt-get-pos-inf dt) tensor :dtype dt))
-             (result (vt-amin clean :axis axis :keepdims keepdims :dtype dt :out out)))
-        (vt-where (vt-all mask :axis axis :keepdims keepdims)
-		  (vt-get-nan dt)
-		  result :dtype dt :out result))))
-
-(defun vt-nanargmax (tensor &key axis out)
-  (if (member (vt-dtype tensor) '(:int32 :int64))
-      (vt-argmax tensor :axis axis :out out)
-      (vt-argmax (vt-where (vt-isnan tensor)
-			   (vt-get-neg-inf (vt-dtype tensor)) tensor)
-		 :axis axis :out out)))
-
-(defun vt-nanargmin (tensor &key axis out)
-  (if (member (vt-dtype tensor) '(:int32 :int64))
-      (vt-argmin tensor :axis axis :out out)
-      (vt-argmin (vt-where (vt-isnan tensor)
-			   (vt-get-pos-inf (vt-dtype tensor)) tensor)
-		 :axis axis :out out)))
-
-(defun vt-nanprod (tensor &key axis keepdims dtype out)
-  (if (member (vt-dtype tensor) '(:int32 :int64))
-      (vt-prod tensor :axis axis :keepdims keepdims :dtype dtype :out out)
-      (vt-prod (vt-where (vt-isnan tensor) 1.0d0 tensor)
-	       :axis axis :keepdims keepdims :dtype dtype :out out)))
 
 (defun vt-nanmedian (tensor &key axis keepdims out)
   (with-float-safe
