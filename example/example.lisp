@@ -166,17 +166,14 @@
         (check '(3 7) :int64 res "指定轴-axis1求和"))
       (let ((res (vt-reduce a2 0 0 #'+ :keepdims t)))
         (check '((4 6)) :int64 res "指定轴-keepdims")))
-
     ;; ----------------------------------------------------
-    ;; 3. 【核心更新】显式类型提升防截断 (替代旧的动态溢出提升)
-    ;; ----------------------------------------------------
-    ;; 3.1 全局乘法溢出：如果不指定 dtype，大数会被安全截断。
+    ;; 3. 全局乘法溢出：如果不指定 dtype，大数会被安全截断。
     ;; 必须显式指定 :float64 才能保留大数结果。
     (let ((res (vt-reduce (vt-from-sequence '(1000000000000 1000000000000 1000000000000) :dtype :int64) 
                           nil 1 #'* :dtype :float64)))
       (check 1.0e36 :float64 res "显式提升-全局乘法溢出"))
     
-    ;; 3.2 沿轴乘法溢出
+    ;; 3.1 沿轴乘法溢出
     (let ((a2 (vt-from-sequence '((1000000000000 1000000000000) (2 2)) :dtype :int64)))
       (let ((res (vt-reduce a2 1 1 #'* :dtype :float64)))
         (check '(1.0e24 4.0) :float64 res "显式提升-沿轴乘法溢出")))
@@ -211,7 +208,7 @@
         (assert (equal (vt-to-list idx) '(0 1 0)) () "2D-Argmin-索引断言失败")))
 
     ;; ----------------------------------------------------
-    ;; 5. 【核心新增】非连续内存视图归约 (转置测试)
+    ;; 5. 
     ;; 如果 reduce 未正确处理 strides，将得到错误结果
     ;; ----------------------------------------------------
     (let* ((a (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
@@ -3474,8 +3471,6 @@
 
   (format t "all vt-put tests passed successfully!~%"))
 
-
-
 ;;; 测试 vt-nan* 函数
 ;; 辅助：判断两个 double-float 是否均为 nan (即 (/= x x) 均为真)
 (defun both-nan-p (a b)
@@ -3486,13 +3481,12 @@
 
 (defun test-vt-nanmax-nanmin ()
   ;; ==========================================
-  ;; 测试 1: 1D 全 NaN (当前实现会错误返回 ±∞)
+  ;; 测试 1: 1D 全 NaN
   ;; ==========================================
   (let ((a (vt-from-sequence
 	    (list (vt-get-nan :float64) (vt-get-nan :float64)))))
-    (assert-nan (vt-nanmax a))   ; 预期: nan，当前漏洞返回: -∞
-    (assert-nan (vt-nanmin a)))  ; 预期: nan，当前漏洞返回: +∞
-
+    (assert-nan (vt-nanmax a))
+    (assert-nan (vt-nanmin a)))
   ;; ==========================================
   ;; 测试 2: 1D 混合 (存在有效数值，原有逻辑正常)
   ;; ==========================================
@@ -3509,7 +3503,7 @@
     (assert-nan (vt-nanmin a)))
 
   ;; ==========================================
-  ;; 测试 4: 2D 混合 沿轴归约 (关键漏洞暴露点)
+  ;; 测试 4: 2D 混合 沿轴归约
   ;; ==========================================
   (let ((a (vt-from-sequence (list (list 1.0d0 (vt-get-nan :float64))
                                    (list (vt-get-nan :float64) (vt-get-nan :float64))))))
@@ -3521,7 +3515,7 @@
       ;; 第0行结果应为 1.0
       (assert (= (vt-item (vt-slice res-max-1 '(0))) 1.0d0))
       (assert (= (vt-item (vt-slice res-min-1 '(0))) 1.0d0))
-      ;; 第1行结果应为 NaN (当前漏洞返回 ±∞)
+      ;; 第1行结果应为 NaN 
       (assert-nan (vt-slice res-max-1 '(1)))
       (assert-nan (vt-slice res-min-1 '(1))))
 
@@ -3532,7 +3526,7 @@
       ;; 第0列结果应为 1.0
       (assert (= (vt-item (vt-slice res-max-0 '(0))) 1.0d0))
       (assert (= (vt-item (vt-slice res-min-0 '(0))) 1.0d0))
-      ;; 第1列结果应为 NaN (当前漏洞返回 ±∞)
+      ;; 第1列结果应为 NaN 
       (assert-nan (vt-slice res-max-0 '(1)))
       (assert-nan (vt-slice res-min-0 '(1)))))
 
