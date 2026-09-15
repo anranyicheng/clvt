@@ -129,20 +129,73 @@
            (vt-einsum sub a-vt b-vt))))
       (t (error "axes 必须是整数或两个整数列表")))))
 
-(defun vt-topk (tensor k &key (axis -1) (largest t) (sorted t))
-  "沿轴取前 k 个最大/最小值及其索引。"
-  (let* ((shape (vt-shape tensor))
-	 (rank (length shape))
+(defun %gather-along-axis (source indices axis)
+  "沿 axis 用 indices 中的整数作为索引从 source 中取值（PyTorch gather 语义）。
+   要求 source 和 indices 形状相同；结果形状 = source.shape。
+   indices 只沿 axis 取整数，其余维度与 source 一一对应。"
+  (let* ((shape (vt-shape source))
+         (rank (length shape))
          (ax (vt-normalize-axis axis rank))
-	 (ax-dim (nth ax shape)))
-    (when (> k ax-dim) (error "vt-topk: k (~a) 不能大于轴大小 (~a)" k ax-dim))
-    (let* ((sorted-tensor (vt-sort tensor :axis ax))
+         (src-c (vt-contiguous source))
+         (idx-c (vt-contiguous indices))
+         (src-data (vt-data src-c))
+         (idx-data (vt-data idx-c))
+         (result-data (make-array (vt-size source)
+                                  :element-type (array-element-type src-data))))
+    (let* ((outer (reduce #'* (subseq shape 0 ax) :initial-value 1))
+           (inner (reduce #'* (subseq shape (1+ ax)) :initial-value 1))
+           (k     (nth ax shape))
+           (total (* outer k inner)))
+      (declare (fixnum outer inner k total))
+      (dotimes (flat total)
+        (let* ((i  (mod flat inner))
+               (oj (floor flat inner))
+               (o  (floor oj k))
+               (gidx (truncate (aref idx-data flat)))
+               (src-flat (+ (* o k inner) (* gidx inner) i)))
+          (setf (aref result-data flat) (aref src-data src-flat))))
+      (%make-vt :data result-data
+                :shape shape
+                :strides (vt-compute-strides shape)
+                :offset 0
+                :dtype (vt-dtype source)))))
+
+(defun vt-topk (tensor k &key (axis -1) (largest t) (sorted t))
+  "沿轴取前 k 个最大/最小值及其索引。
+   largest = t (默认)：取最大的 k 个。
+   largest = nil：取最小的 k 个。
+   sorted = t (默认)：
+     返回结果按值排列（largest=t 时降序，largest=nil 时升序）。
+   sorted = nil：
+     返回结果按原始位置（轴索引）升序排列，
+     即先选出 top-k 的元素，再按它们在原张量轴上的出现顺序输出。
+     与 PyTorch torch.topk(..., sorted=False) 的「顺序未定义」不同，
+     clvt 给出确定的位置序，便于复现。
+   返回两个值：(values, indices)，都沿 axis 大小为 k。
+   示例：
+     x = [3, 1, 4, 1, 5, 9, 2, 6]
+     (vt-topk x 3)             => values=[9, 6, 5], indices=[5, 7, 4]
+     (vt-topk x 3 :sorted nil) => values=[5, 9, 6], indices=[4, 5, 7]
+     (vt-topk x 3 :largest nil)
+                               => values=[1, 1, 2], indices=[1, 3, 6]"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (ax (vt-normalize-axis axis rank))
+         (ax-dim (nth ax shape)))
+    (when (minusp k)
+      (error "vt-topk: k (~a) 必须非负" k))
+    (when (> k ax-dim)
+      (error "vt-topk: k (~a) 不能大于轴大小 (~a)" k ax-dim))
+    (let* ((sorted-tensor  (vt-sort    tensor :axis ax))
            (sorted-indices (vt-argsort tensor :axis ax))
            (vals (if largest
-                     (vt-flip (vt-narrow sorted-tensor ax (- ax-dim k) ax-dim) :axis ax)
-                     (vt-narrow sorted-tensor ax 0 k)))
+                     (vt-flip (vt-narrow sorted-tensor  ax (- ax-dim k) ax-dim) :axis ax)
+                     (vt-narrow sorted-tensor  ax 0 k)))
            (idxs (if largest
                      (vt-flip (vt-narrow sorted-indices ax (- ax-dim k) ax-dim) :axis ax)
                      (vt-narrow sorted-indices ax 0 k))))
-      (declare (ignore sorted))
-      (values vals idxs))))
+      (if sorted
+          (values vals idxs)
+          (let* ((perm (vt-argsort idxs :axis ax)))
+            (values (%gather-along-axis vals perm ax)
+                    (%gather-along-axis idxs perm ax)))))))

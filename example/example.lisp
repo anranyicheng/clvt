@@ -5788,75 +5788,138 @@
     (format t "✅ test-vt-split 测试通过！~%")))
 
 (defun test-vt-choose ()
-  "测试 vt-choose 的类型推断、负索引以及非连续内存安全性"
-  
+  "测试 vt-choose 的类型推断、负索引、广播规则以及非连续内存安全性。
+
+   新版语义（与 NumPy 严格对齐）：
+   - 签名: (vt-choose choices indices &key mode)
+   - idx 与所有 choices 一起广播；输出形状 = 广播结果。
+   - mode = :raise (默认): 负索引报错。
+   - mode = :wrap: 负索引按 n 回绕。"
+
   ;; ==========================================
-  ;; 场景 1: 基础功能、动态类型提升与负索引
+  ;; 场景 1: 基础功能、类型提升与负索引（:mode :wrap）
   ;; ==========================================
-  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))      ; fixnum
-         (c2 (vt-from-sequence '((1.0 2.0) (3.0 4.0))))  ; double-float
-         ;; 索引含义：
-         ;; 0 选 c1, 1 选 c2
-         ;; -1 选倒数第1个(即 c2), -2 选倒数第2个(即 c1)
-         (idx (vt-from-sequence '(0 1 -1 -2) :dtype :int64))
-         
-         ;; 执行：混合类型应自动提升为 double-float
-         (res-mixed (vt-choose (list c1 c2) idx)))
-    
-    ;; 断言类型提升正确
+  ;; NumPy: np.choose([[0,1],[-1,-2]], [c1, c2], mode='wrap')
+  ;;        => [[10.0, 2.0], [3.0, 40.0]]
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))
+         (c2 (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+         (idx (vt-from-sequence '((0 1) (-1 -2)) :dtype :int64))
+         (res-mixed (vt-choose (list c1 c2) idx :mode :wrap)))
     (assert (eq (vt-dtype res-mixed) :float64)
-            (res-mixed) "类型提升错误: 期望 double-float, 得到 ~a" (vt-dtype res-mixed))
-    
-    ;; 断言数据提取正确
-    ;; i=0 (idx=0) -> c1[0] = 10
-    ;; i=1 (idx=1) -> c2[1] = 2.0
-    ;; i=2 (idx=-1->1) -> c2[2] = 3.0
-    ;; i=3 (idx=-2->0) -> c1[3] = 40
-    (assert (equal (vt-to-list res-mixed) '(10.0 2.0 3.0 40.0))
-            (res-mixed) "混合结果错误: 期望 (10.0 2.0 3.0 40.0), 得到 ~a" (vt-to-list res-mixed)))
-
+            (res-mixed) "类型提升错误: 期望 :float64, 得到 ~a" (vt-dtype res-mixed))
+    (assert (equal (vt-shape res-mixed) '(2 2))
+            (res-mixed) "形状错误: 期望 (2 2), 得到 ~a" (vt-shape res-mixed))
+    (assert (equal (vt-to-list res-mixed) '((10.0 2.0) (3.0 40.0)))
+            (res-mixed) "混合结果错误: 期望 ((10.0 2.0) (3.0 40.0)), 得到 ~a"
+            (vt-to-list res-mixed)))
 
   ;; ==========================================
-  ;; 场景 2: 纯 fixnum 类型保持
+  ;; 场景 1b: 默认 :mode :raise 时负索引应报错
   ;; ==========================================
+  ;; NumPy: np.choose([[0,1],[-1,-2]], [c1, c2]) => ValueError
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))
+         (c2 (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+         (idx (vt-from-sequence '((0 1) (-1 -2)) :dtype :int64))
+         (got-error nil))
+    (handler-case (vt-choose (list c1 c2) idx)
+      (error () (setf got-error t)))
+    (assert got-error () "默认模式下负索引应报错，但未触发"))
+
+  ;; ==========================================
+  ;; 场景 2: 纯 int64 类型保持
+  ;; ==========================================
+  ;; NumPy: np.choose([[0,1],[1,0]], [c1, c2])
+  ;;        => [[10, 200], [300, 40]]
   (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))
          (c2 (vt-from-sequence '((100 200) (300 400)) :dtype :int64))
-         (idx (vt-from-sequence '(0 1 1 0) :dtype :int64))
+         (idx (vt-from-sequence '((0 1) (1 0)) :dtype :int64))
          (res-fix (vt-choose (list c1 c2) idx)))
-    
-    ;; 断言类型被正确保持为 fixnum，没有被强制转为 double-float
     (assert (eq (vt-dtype res-fix) :int64)
-            (res-fix) "类型保持错误: 期望 fixnum, 得到 ~a" (vt-dtype res-fix))
-    
-    (assert (equal (vt-to-list res-fix) '(10 200 300 40))
-            (res-fix) "Fixnum 结果错误: 期望 (10 200 300 40), 得到 ~a" (vt-to-list res-fix)))
-
+            (res-fix) "类型保持错误: 期望 :int64, 得到 ~a" (vt-dtype res-fix))
+    (assert (equal (vt-to-list res-fix) '((10 200) (300 40)))
+            (res-fix) "int64 结果错误: 期望 ((10 200) (300 40)), 得到 ~a"
+            (vt-to-list res-fix)))
 
   ;; ==========================================
-  ;; 场景 3: 非连续内存视图安全性测试 (核心缺陷验证)
+  ;; 场景 3: 非连续内存视图安全性
   ;; ==========================================
-  (let* ((base (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64)) ; shape (2, 3)
-         ;; 转置后 shape 变为 (3, 2)，底层 strides 改变，属于非连续视图
-         ;; view-a 的逻辑内容是 ((1 4) (2 5) (3 6))
-         ;; 展平后逻辑顺序应为 (1 4 2 5 3 6)
-         (view-a (vt-transpose base)) 
-         
+  ;; base (2,3) -> 转置为 (3,2)，逻辑内容 ((1 4) (2 5) (3 6))
+  ;; idx 全 0，强制从 view-a 取值
+  (let* ((base (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
+         (view-a (vt-transpose base))
          (c2 (vt-zeros '(3 2) :dtype :int64))
-         ;; idx 全为 0，强制只从 view-a 中取值
-         (idx (vt-from-sequence '(0 0 0 0 0 0) :dtype :int64))
-         
+         (idx (vt-from-sequence '((0 0) (0 0) (0 0)) :dtype :int64))
          (res-view (vt-choose (list view-a c2) idx)))
-    
     (assert (eq (vt-dtype res-view) :int64)
-            (res-view) "视图类型错误: 期望 fixnum, 得到 ~a" (vt-dtype res-view))
-    
-    ;; 如果没有修复 (没有调用 vt-flatten)，直接按 i 读取底层物理内存，
-    ;; 读到的会是 base 的原始连续数据 (1 2 3 4 5 6)，而不是逻辑视图的 (1 4 2 5 3 6)
-    (assert (equal (vt-to-list res-view) '(1 4 2 5 3 6))
-            (res-view) "非连续视图读取错误: 期望 (1 4 2 5 3 6), 得到 ~a" (vt-to-list res-view)))
+            (res-view) "视图类型错误: 期望 :int64, 得到 ~a" (vt-dtype res-view))
+    (assert (equal (vt-to-list res-view) '((1 4) (2 5) (3 6)))
+            (res-view) "非连续视图读取错误: 期望 ((1 4) (2 5) (3 6)), 得到 ~a"
+            (vt-to-list res-view)))
+
+  ;; ==========================================
+  ;; 场景 4: 广播 — idx 形状 (2,1) 广播到 (2,2)
+  ;; ==========================================
+  ;; NumPy: np.choose([[0],[1]], [c1, c2])
+  ;;        => [[10, 20], [3.0, 4.0]]  (dtype 提升为 float64)
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))
+         (c2 (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+         (idx (vt-from-sequence '((0) (1)) :dtype :int64))
+         (res (vt-choose (list c1 c2) idx)))
+    (assert (equal (vt-shape res) '(2 2))
+            (res) "形状错误: 期望 (2 2), 得到 ~a" (vt-shape res))
+    (assert (equal (vt-to-list res) '((10.0 20.0) (3.0 4.0)))
+            (res) "广播结果错误: 期望 ((10 20) (3.0 4.0)), 得到 ~a"
+            (vt-to-list res)))
+
+  ;; ==========================================
+  ;; 场景 5: 形状不匹配应报错（NumPy 严格模式）
+  ;; ==========================================
+  ;; NumPy: np.choose([0,1,-1,-2], [c1, c2], mode='wrap') => ValueError
+  (let* ((c1 (vt-from-sequence '((10 20) (30 40)) :dtype :int64))
+         (c2 (vt-from-sequence '((1.0 2.0) (3.0 4.0))))
+         (idx (vt-from-sequence '(0 1 -1 -2) :dtype :int64))
+         (got-error nil))
+    (handler-case (vt-choose (list c1 c2) idx :mode :wrap)
+      (error () (setf got-error t)))
+    (assert got-error ()
+            "1D idx 与 2D choices 形状不匹配时应报错，但未触发"))
+
+  ;; ==========================================
+  ;; 场景 6: 标量 idx + 标量 choices → 标量输出
+  ;; ==========================================
+  ;; NumPy: np.choose(1, [10, 20, 30]) => 20
+  (let ((res (vt-choose '(10 20 30) 1)))
+    (assert (null (vt-shape res))
+            (res) "标量输出形状错误: 期望 nil, 得到 ~a" (vt-shape res))
+    (assert (= (vt-ref res) 20)
+            (res) "标量输出值错误: 期望 20, 得到 ~a" (vt-ref res)))
+
+  ;; ==========================================
+  ;; 场景 6b: 标量 idx + :mode :wrap + 负索引
+  ;; ==========================================
+  ;; NumPy: np.choose(-1, [10, 20, 30], mode='wrap') => 30
+  (let ((res (vt-choose '(10 20 30) -1 :mode :wrap)))
+    (assert (null (vt-shape res)) (res) "标量输出形状错误")
+    (assert (= (vt-ref res) 30)
+            (res) "标量输出值错误: 期望 30, 得到 ~a" (vt-ref res)))
+
+  ;; ==========================================
+  ;; 场景 7: 索引越界报错
+  ;; ==========================================
+  (let ((got-error nil))
+    (handler-case (vt-choose '(10 20 30) 5)
+      (error () (setf got-error t)))
+    (assert got-error () "索引越界应报错，但未触发"))
+
+  ;; ==========================================
+  ;; 场景 8: 空 choices 报错
+  ;; ==========================================
+  (let ((got-error nil))
+    (handler-case (vt-choose '() (vt-from-sequence '(0) :dtype :int64))
+      (error () (setf got-error t)))
+    (assert got-error () "空 choices 应报错，但未触发"))
 
   (format t "✅ test-vt-choose 所有测试通过！~%"))
-
 
 ;;; =========================================
 ;;; vt-dstack 测试

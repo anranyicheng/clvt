@@ -211,14 +211,19 @@
                          :shape (list count 0) :strides '(0 1) :offset 0 :dtype final))))))
 
 (defun vt-nonzero (condition)
-  "返回非零元素在各维度的索引列表（对标 torch.nonzero(as_tuple=true)）。"
+  "返回非零元素在各维度的索引列表（对标 torch.nonzero(as_tuple=true)）。
+   rank = 0（标量）时，返回 (list (vt-zeros '(0) :dtype :int64))：
+   - 长度 1 的列表，表示「存在非零元素」；
+   - 内含形状 (0) 的空索引张量，表示「0 维张量没有可索引的维度」。
+   这样既能区分「非零标量」与「零标量」（后者走 (zerop num) 分支返回 nil），
+   又与 NumPy 对 0 维输入的 (array([0]),) 语义在「有个元素被选中」这一点上对齐。"
   (let* ((condition (if (numberp condition)
-			(ensure-vt condition)
-			condition))
+                        (ensure-vt condition)
+                        condition))
          (shape (vt-shape condition))
-	 (rank (length shape))
+         (rank (length shape))
          (data (vt-data condition))
-	 (offset (vt-offset condition))
+         (offset (vt-offset condition))
          (in-strides (vt-strides condition))
          (logic-strides (vt-compute-strides shape))
          (nz '()))
@@ -226,29 +231,37 @@
                (if (= depth rank)
                    (unless (zerop (aref data ptr)) (push logic-idx nz))
                    (let ((dim (nth depth shape))
-			 (in-stride (nth depth in-strides))
+                         (in-stride (nth depth in-strides))
                          (logic-stride (nth depth logic-strides)))
                      (loop for i from 0 below dim do
                        (recurse (1+ depth)
-				(+ logic-idx (* i logic-stride))
-				(+ ptr (* i in-stride))))))))
+                                (+ logic-idx (* i logic-stride))
+                                (+ ptr (* i in-stride))))))))
       (recurse 0 0 offset))
     (setf nz (nreverse nz))
     (let ((num (length nz)))
-      (if (zerop num)
-          (loop repeat rank collect (vt-zeros '(0) :dtype :int64))
-          (let ((arrays (loop repeat rank
-			      collect (make-array num :element-type '(signed-byte 64)))))
-            (loop for flat in nz for i from 0 do
-              (let ((rem flat))
-                (loop for d from 0 below rank
-		      for stride in logic-strides do
-                  (let ((coord (floor rem stride)))
-                    (setf (aref (nth d arrays) i) coord)
-                    (decf rem (* coord stride))))))
-            (loop for arr in arrays
-                  collect (%make-vt :data arr :shape (list num) :strides '(1)
-				    :offset 0 :dtype :int64)))))))
+      (cond
+        ((zerop rank)
+         (list (vt-zeros '(0) :dtype :int64)))
+        ((zerop num)
+         (loop repeat rank collect (vt-zeros '(0) :dtype :int64)))
+        (t
+         (let ((arrays (loop repeat rank
+                             collect (make-array num
+                                                 :element-type '(signed-byte 64)))))
+           (loop for flat in nz for i from 0 do
+             (let ((rem flat))
+               (loop for d from 0 below rank
+                     for stride in logic-strides do
+                 (let ((coord (floor rem stride)))
+                   (setf (aref (nth d arrays) i) coord)
+                   (decf rem (* coord stride))))))
+           (loop for arr in arrays
+                 collect (%make-vt :data arr
+                                   :shape (list num)
+                                   :strides '(1)
+                                   :offset 0
+                                   :dtype :int64))))))))
 
 (defun vt-take (tensor indices &key axis)
   "按索引取值（axis 为 nil 时展平取值，否则沿指定轴 gather）。"
@@ -361,25 +374,65 @@
                  (setf (aref data phys) (vt-cast val (vt-dtype tensor))))))
     tensor))
 
-(defun vt-choose (choices indices)
-  "根据索引数组从多个数组中选择值。"
-  (let* ((n (length choices))
-	 (flat-idx (vt-flatten indices))
-         (flat-choices (mapcar #'vt-flatten choices))
-         (idx-data (vt-data flat-idx))
-	 (idx-size (vt-size flat-idx))
-         (result-type (apply #'vt-promote-type (mapcar #'vt-dtype flat-choices)))
-         (result-data (make-array idx-size
-				  :element-type
-				  (vt-dtype->lisp-type result-type))))
-    (loop for i from 0 below idx-size
-          for raw = (truncate (aref idx-data i))
-          for idx = (if (minusp raw) (+ raw n) raw)
-          do (when (or (< idx 0) (>= idx n)) (error "选择索引 ~a 越界" idx))
-             (setf (aref result-data i)
-		   (vt-cast (aref (vt-data (nth idx flat-choices)) i) result-type)))
-    (%make-vt :data result-data :shape (list idx-size) :strides '(1)
-	      :offset 0 :dtype result-type)))
+(defun vt-choose (choices indices &key (mode :raise))
+  "根据索引数组从多个数组中选择值。对标 numpy.choose。
+   choices : 候选张量列表，长度为 n。
+   indices : 整数索引张量。
+   mode    : 越界索引的处理方式，对标 np.choose 的 mode 参数：
+             :raise (默认) — 负数或 >= n 都报错；
+             :wrap         — 索引按 n 取模（-1 -> n-1）；
+             :clip         — 索引裁剪到 [0, n-1]（-1 -> 0）。
+   广播规则（与 NumPy 一致）：
+     indices 与所有 choices 一起参与广播，输出形状为
+       broadcast(indices.shape, choices[0].shape, choices[1].shape, ...)
+   输出 dtype 为所有 choices 的提升类型。
+   示例：
+     (vt-choose (list c0 c1) idx)
+       c0 = ((1 2) (3 4)), c1 = ((10 20) (30 40)), idx = ((1 0) (1 1))
+       => shape (2 2), 值 ((10 2) (30 40))
+     (vt-choose (list c0 c1) idx)   ; idx = ((0) (1)) shape (2,1)
+       => shape (2 2), 值 ((1 2) (30 40))   ; 与 NumPy 一致"
+
+  (let ((n (length choices)))
+    (when (zerop n)
+      (error "vt-choose: choices 不能为空"))
+
+    (let* ((idx-vt      (ensure-vt indices))
+           (choice-vts  (mapcar #'ensure-vt choices))
+           (final-shape (reduce #'vt-broadcast-shapes
+                                (cons (vt-shape idx-vt)
+                                      (mapcar #'vt-shape choice-vts))))
+           (idx-b       (vt-contiguous (vt-broadcast-to idx-vt final-shape)))
+           (flat-choices
+             (mapcar (lambda (c)
+                       (vt-contiguous (vt-broadcast-to c final-shape)))
+                     choice-vts))
+           (final-size  (vt-shape-to-size final-shape))
+           (idx-data    (vt-data idx-b))
+           (idx-off     (vt-offset idx-b))
+           (result-type (apply #'vt-promote-type
+                               (mapcar #'vt-dtype flat-choices)))
+           (result-data (make-array final-size
+                                    :element-type
+                                    (vt-dtype->lisp-type result-type))))
+      (loop for i from 0 below final-size
+            for raw = (truncate (aref idx-data (+ idx-off i)))
+            for idx = (ecase mode
+                        (:raise raw)
+                        (:wrap  (mod raw n))
+                        (:clip  (max 0 (min (1- n) raw))))
+            do (when (or (< idx 0) (>= idx n))
+                 (error "vt-choose: 索引 ~a 越界 (choices 数量 ~a)" raw n))
+               (let* ((cv (nth idx flat-choices))
+                      (cd (vt-data cv))
+                      (co (vt-offset cv)))
+                 (setf (aref result-data i)
+                       (vt-cast (aref cd (+ co i)) result-type))))
+      (%make-vt :data result-data
+                :shape final-shape
+                :strides (vt-compute-strides final-shape)
+                :offset 0
+                :dtype result-type))))
 
 (defun vt-select (condlist choicelist &key (default 0))
   "根据多个条件从多个数组中选择。

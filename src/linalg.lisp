@@ -1435,7 +1435,8 @@
                    (let ((sum 0.0d0))
                      (loop for r from 0 below m
                            for ptr = (+ u-off (* r u-s0) (* col u-s1))
-                           do (incf sum (expt (aref u-data ptr) 2)))
+                           do (incf sum (* (aref u-data ptr)
+					   (aref u-data ptr))))
                      sum))
                  (col-dot (c1 c2)
                    (let ((sum 0.0d0))
@@ -1477,8 +1478,8 @@
               (incf sweep))
             (let* ((s-vec (make-array k :element-type 'double-float))
                    (u-k (vt-zeros (list m k) :dtype :float64))
-                   (pairs (sort (loop for col from 0 below n
-                                      collect (cons (sqrt (col-norm-sq col)) col))
+                   (pairs (stable-sort (loop for col from 0 below n
+					     collect (cons (sqrt (col-norm-sq col)) col))
                                 #'> :key #'car)))
               (dotimes (new-i k)
                 (destructuring-bind (val . old-col) (nth new-i pairs)

@@ -38,28 +38,51 @@
 ;;; ------------------------------------------------------------------
 ;;; 3. geomspace — 等比数列（对标 np.geomspace）
 ;;; ------------------------------------------------------------------
+
 (defun vt-geomspace (start stop num &key (dtype :float64) (endpoint t))
-  "等比数列（对数尺度等间距），对标 np.geomspace。start/stop 必须同号且非零。"
+  "等比数列（对数尺度等间距），对标 np.geomspace。
+   前置条件（否则报错）：
+   - num >= 1
+   - start 和 stop 均非零
+   - start 和 stop 同号
+   符号处理：结果为全正或全负，符号取自 start（= stop 的符号）。
+   示例：
+     (vt-geomspace 1 1000 4)    => [1, 10, 100, 1000]
+     (vt-geomspace -1 -1000 4)  => [-1, -10, -100, -1000]
+     (vt-geomspace 1 -100 5)    => error（异号）
+     (vt-geomspace 0 100 5)     => error（含零）"
   (declare (fixnum num))
-  (when (< num 1) (error "vt-geomspace: num must be >= 1"))
-  (when (= num 1)
-    (return-from vt-geomspace (vt-full (list 1) start :dtype dtype)))
-  (let* ((s (coerce start 'double-float))
-         (e (coerce stop 'double-float))
-         (log-s (log (abs s)))
-         (log-e (log (abs e)))
-         (sign-s (if (minusp s) -1d0 1d0))
-         (div (if endpoint (1- num) num))
-         (result (vt-zeros (list num) :dtype :float64))
-         (rdata (vt-data result)))
-    (declare (fixnum div) (double-float log-s log-e sign-s))
-    (dotimes (i num)
-      (let* ((frac (if (= div 0) 0d0 (/ (coerce i 'double-float)
-					(coerce div 'double-float))))
-             (lv (+ log-s (* frac (- log-e log-s))))
-             (v (* sign-s (exp lv))))
-        (setf (aref rdata i) v)))
-    (if (eq dtype :float32) (vt-astype result :float32) result)))
+  (when (< num 1)
+    (error "vt-geomspace: num 必须 >= 1，当前为 ~a" num))
+
+  (let ((s (coerce start 'double-float))
+        (e (coerce stop  'double-float)))
+    ;; ---- 前置校验：与 NumPy 一致 ----
+    (when (or (zerop s) (zerop e))
+      (error "vt-geomspace: start (~a) 和 stop (~a) 均不能为零" start stop))
+    (when (not (eql (minusp s) (minusp e)))
+      (error "vt-geomspace: start (~a) 和 stop (~a) 必须同号" start stop))
+
+    (when (= num 1)
+      (return-from vt-geomspace
+        (vt-full (list 1) s :dtype dtype)))
+
+    (let* ((log-s (log (abs s)))
+           (log-e (log (abs e)))
+           (sign  (if (minusp s) -1d0 1d0))
+           (div   (if endpoint (1- num) num))
+           (result (vt-zeros (list num) :dtype :float64))
+           (rdata  (vt-data result)))
+      (declare (type fixnum div)
+               (type double-float log-s log-e sign))
+      (dotimes (i num)
+        (let* ((frac (if (= div 0) 0d0
+                         (/ (coerce i 'double-float)
+                            (coerce div 'double-float))))
+               (lv (+ log-s (* frac (- log-e log-s))))
+               (v  (* sign (exp lv))))
+          (setf (aref rdata i) v)))
+      (if (eq dtype :float32) (vt-astype result :float32) result))))
 
 ;;; ------------------------------------------------------------------
 ;;; 4. ravel-multi-index
@@ -185,22 +208,48 @@
 ;;; 9. Layer Normalization
 ;;; ------------------------------------------------------------------
 (defun vt-layer-norm (vt normalized-shape &key (eps 1d-5) gamma beta dtype out)
-  "Layer Normalization，对标 torch.nn.functional.layer_norm。"
-  (let* ((norm-axes (let ((rank (length (vt-shape vt)))
-                          (ndim (length normalized-shape)))
-                      (loop for i from (- rank ndim) below rank collect i)))
-         (mean (vt-mean vt :axis norm-axes :keepdims t :dtype dtype))
-         (var (vt-var vt :axis norm-axes :keepdims t :dtype dtype))
-         (eps-typed (coerce eps (if (and dtype (eq dtype :float32))
-				    'single-float
-				    'double-float)))
-         (std (vt-sqrt (vt-+ var eps-typed :dtype dtype) :dtype dtype))
-         (normed (vt-/ (vt-- vt mean :dtype dtype) std :dtype dtype)))
-    (let ((result (if gamma (vt-* normed gamma :dtype dtype :out out)
-                      (if out
-			  (progn (vt-copy-into normed out) out)
-			  normed))))
-      (if beta (vt-+ result beta :dtype dtype :out result) result))))
+  "Layer Normalization，对标 torch.nn.functional.layer_norm。
+   normalized-shape 是输入张量的尾部形状，要求：
+   - 其秩 <= 输入张量的秩；
+   - 与输入张量的尾部维度逐一相等。
+   例如 vt-shape=(2,3,4) 时 normalized-shape 可为 (4)、(3,4)、(2,3,4)。
+   gamma / beta 的形状必须严格等于 normalized-shape。"
+  (let* ((in-shape (vt-shape vt))
+         (rank (length in-shape))
+         (ndim (length normalized-shape)))
+
+    ;; 两层前置校验，避免误导性的 \"轴重复\" 报错
+    (when (> ndim rank)
+      (error "vt-layer-norm: normalized-shape 秩 (~a) 不能大于输入张量秩 (~a)"
+             ndim rank))
+    (let ((tail (subseq in-shape (- rank ndim))))
+      (unless (equal tail normalized-shape)
+        (error "vt-layer-norm: normalized-shape ~a 与输入尾部维度 ~a 不匹配"
+               normalized-shape tail)))
+
+    ;; gamma / beta 形状校验（原来没有，补上）
+    (when gamma
+      (unless (equal (vt-shape gamma) normalized-shape)
+        (error "vt-layer-norm: gamma 形状 ~a 与 normalized-shape ~a 不匹配"
+               (vt-shape gamma) normalized-shape)))
+    (when beta
+      (unless (equal (vt-shape beta) normalized-shape)
+        (error "vt-layer-norm: beta 形状 ~a 与 normalized-shape ~a 不匹配"
+               (vt-shape beta) normalized-shape)))
+
+    (let* ((norm-axes (loop for i from (- rank ndim) below rank collect i))
+           (mean (vt-mean vt :axis norm-axes :keepdims t :dtype dtype))
+           (var (vt-var vt :axis norm-axes :keepdims t :dtype dtype))
+           (eps-typed (coerce eps (if (and dtype (eq dtype :float32))
+                                      'single-float
+                                      'double-float)))
+           (std (vt-sqrt (vt-+ var eps-typed :dtype dtype) :dtype dtype))
+           (normed (vt-/ (vt-- vt mean :dtype dtype) std :dtype dtype)))
+      (let ((result (if gamma (vt-* normed gamma :dtype dtype :out out)
+                        (if out
+                            (progn (vt-copy-into normed out) out)
+                            normed))))
+        (if beta (vt-+ result beta :dtype dtype :out result) result)))))
 
 ;;; ------------------------------------------------------------------
 ;;; 10. apply-along-axis

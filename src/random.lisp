@@ -75,43 +75,127 @@
     (low high &key (size nil) (dtype :int64) (rng *vt-default-random-state*))
   (vt-random-int low high :size size :dtype dtype :rng rng))
 
+
 (defun vt-random-choice (a &key (size nil) (replace t) (p nil) (dtype nil)
                              (rng *vt-default-random-state*))
+  "从一维数组 a 中抽样。
+   a        : 整数 n（表示从 [0, n) 抽样）或一维张量。
+   size     : nil → 返回 0 维张量；否则返回形状为 size 的张量。
+              整数 → 1D 张量；list → 多维张量。
+   replace  : t（默认）有放回；nil 无放回。
+   p        : 权重列表（长度 = n，非负，总和 > 0）。
+   dtype    : 输出 dtype，默认与 a 一致。
+   rng      : 随机状态。
+   对标 numpy.random.choice / torch.multinomial。"
+
   (declare (random-state rng))
   (let* ((source (if (integerp a)
-                     (progn (assert (> a 0)
-				    (a))
-			    (vt-arange a :dtype (or dtype :int64)))
+                     (progn (assert (> a 0) (a))
+                            (vt-arange a :dtype (or dtype :int64)))
                      (ensure-vt a)))
-         (n (vt-size source)) (out-dtype (or dtype (vt-dtype source)))
-         (src-data (vt-data source)) (src-offset (vt-offset source)))
+         (n (vt-size source))
+         (out-dtype (or dtype (vt-dtype source)))
+         (src-data (vt-data source))
+         (src-offset (vt-offset source))
+         (size-shape (when size
+                       (if (listp size) size (list size))))
+         (size-total (if size-shape
+                         (reduce #'* size-shape :initial-value 1)
+                         1)))
     (assert (> n 0) (n))
-    (let ((cdf (if p
-                   (progn (assert (= (length p) n) (p n))
-                          (assert (every (lambda (w) (>= w 0)) p) ())
-                          (let ((total (reduce #'+ p)))
-                            (assert (> total 0) ())
-                            (let ((cum 0.0d0))
-                              (coerce (mapcar (lambda (w) (incf cum (/ w total)) cum) p)
-				      'vector))))
-                   nil)))
-      (labels ((sample-one ()
-                 (cond ((and replace (null p))
-			(aref src-data (+ src-offset (random n rng))))
-                       ((and replace p)
-                        (let ((r (random 1.0d0 rng)))
-                          (loop for i from 0 below n
-                                when (<= r (aref cdf i)) return (aref src-data (+ src-offset i))
-                                finally (return (aref src-data (+ src-offset (1- n)))))))
-                       (t (error "vt-random-choice: replace=nil 暂不支持")))))
-        (if size
-            (let ((result (vt-zeros size :dtype out-dtype)))
-              (vt-do-each (ptr val result)
-                (declare (ignore val))
-                (setf (aref (vt-data result) ptr)
-		      (vt-cast (sample-one) out-dtype)))
-              result)
-            (make-vt nil (vt-cast (sample-one) out-dtype) :dtype out-dtype))))))
+    ;; --- 概率向量：归一化 CDF（用于有放回） ---
+    (let ((cdf (when p
+                 (assert (= (length p) n) (p n))
+                 (assert (every (lambda (w) (>= w 0)) p) ())
+                 (let ((total (reduce #'+ p)))
+                   (assert (> total 0) ())
+                   (let ((cum 0.0d0))
+                     (coerce (mapcar (lambda (w)
+                                       (incf cum (/ w total)) cum)
+                                     p)
+                             'vector))))))
+      ;; --- 无放回：size 上限校验 ---
+      (when (and (not replace) size)
+        (when (> size-total n)
+          (error "vt-random-choice: replace=nil 时 size 总数 (~a) 不能大于 n (~a)"
+                 size-total n)))
+      (labels
+          ((sample-uniform-replace ()
+             (aref src-data (+ src-offset (random n rng))))
+
+           (sample-weighted-replace ()
+             (let ((r (random 1.0d0 rng)))
+               (loop for i from 0 below n
+                     when (<= r (aref cdf i))
+                       return (aref src-data (+ src-offset i))
+                     finally (return (aref src-data (+ src-offset (1- n)))))))
+
+           (sample-uniform-no-replace-batch (k)
+             (let ((idx (make-array n :element-type 'fixnum
+                                      :initial-contents (loop for i below n collect i))))
+               (loop for i from 0 below k do
+                 (let ((j (+ i (random (- n i) rng))))
+                   (rotatef (aref idx i) (aref idx j))))
+               (loop for i from 0 below k
+                     collect (aref src-data (+ src-offset (aref idx i))))))
+
+           (sample-weighted-no-replace-batch (k)
+             (let* ((weights (coerce (or p (make-list n :initial-element 1.0d0))
+                                     'vector))
+                    (result (make-array k)))
+               (dotimes (slot k)
+                 (let ((total 0.0d0))
+                   (dotimes (i n) (incf total (aref weights i)))
+                   (when (<= total 0.0d0)
+                     (error "vt-random-choice: 无放回抽样权重耗尽"))
+                   (let* ((r (* (random 1.0d0 rng) total))
+                          (cum 0.0d0)
+                          (chosen -1))
+                     (dotimes (i n)
+                       (when (>= chosen 0) (return))
+                       (incf cum (aref weights i))
+                       (when (<= r cum) (setf chosen i)))
+                     (when (minusp chosen)
+                       (dotimes (i n)
+                         (when (plusp (aref weights i))
+                           (setf chosen i) (return))))
+                     (when (minusp chosen)
+                       (error "vt-random-choice: 无放回抽样失败"))
+                     (setf (aref weights chosen) 0.0d0)
+                     (setf (aref result slot)
+                           (aref src-data (+ src-offset chosen))))))
+               (coerce result 'list))))
+
+        (cond
+          ;; ---- size = nil：返回 0 维张量 ----
+          ((null size)
+           (make-vt nil
+                    (vt-cast (if cdf (sample-weighted-replace)
+                                 (sample-uniform-replace))
+                             out-dtype)
+                    :dtype out-dtype))
+
+          ;; ---- 无放回批量 ----
+          ((not replace)
+           (let* ((vals (if cdf
+                            (sample-weighted-no-replace-batch size-total)
+                            (sample-uniform-no-replace-batch size-total)))
+                  (result (vt-zeros size-shape :dtype out-dtype))
+                  (rdata (vt-data result)))
+             (loop for v in vals for i from 0
+                   do (setf (aref rdata i) (vt-cast v out-dtype)))
+             result))
+
+          ;; ---- 有放回批量 ----
+          (t
+           (let ((result (vt-zeros size-shape :dtype out-dtype)))
+             (vt-do-each (ptr val result)
+               (declare (ignore val))
+               (setf (aref (vt-data result) ptr)
+                     (vt-cast (if cdf (sample-weighted-replace)
+                                  (sample-uniform-replace))
+                              out-dtype)))
+             result)))))))
 
 (defun vt-random-permutation (n &key (rng *vt-default-random-state*))
   (declare (random-state rng))

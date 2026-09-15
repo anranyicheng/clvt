@@ -788,14 +788,27 @@
            (bins (or bins 10))
 	   (data-min nil)
 	   (data-max nil))
+      (unless (and (integerp bins) (plusp bins))
+        (error "vt-histogram: bins (~a) 必须为正整数" bins))
+
       (if range
-	  (setf data-min (first range) data-max (second range))
-          (progn (unless (= (vt-item (vt-all (vt-isfinite tensor))) 1.0d0)
-                   (error "自动确定 bin 范围需要有限输入"))
-                 (setf data-min (vt-item (vt-amin tensor))
-		       data-max (vt-item (vt-amax tensor)))))
-      (when (= data-min data-max)
-	(setf data-min (- data-min 0.5) data-max (+ data-max 0.5)))
+          (progn
+            (unless (and (listp range) (= (length range) 2))
+              (error "vt-histogram: range 必须是 (min max) 二元列表，得到 ~a"
+                     range))
+            (setf data-min (first range)
+                  data-max (second range))
+            (unless (< data-min data-max)
+              (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
+                     data-max data-min)))
+          (progn
+            (unless (= (vt-item (vt-all (vt-isfinite tensor))) 1.0d0)
+              (error "自动确定 bin 范围需要有限输入"))
+            (setf data-min (vt-item (vt-amin tensor))
+                  data-max (vt-item (vt-amax tensor)))
+            (when (= data-min data-max)
+              (setf data-min (- data-min 0.5)
+                    data-max (+ data-max 0.5)))))
       (let* ((bin-width (/ (- data-max data-min) bins))
              (hist (make-array bins :initial-element 0))
              (edges (make-array (1+ bins) :element-type t)))
