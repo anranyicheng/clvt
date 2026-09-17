@@ -685,6 +685,293 @@
   (format t "~%all vt-slice tests passed.~%")
 
   )
+;;;; test-vt-slice.lisp — vt-slice 全面测试
+
+(defmacro %signals-error (&body body)
+  "执行 body，若捕获到 error 则返回 t，否则返回 nil。"
+  `(handler-case (progn ,@body nil)
+     (error () t)))
+
+(defun test-vt-slice-1 ()
+  "全面测试 vt-slice 的功能与边界，全部用 assert 检查。
+
+   覆盖：
+   - 1D / 2D / 3D 张量
+   - 整数索引降维、范围切片、:all、(t)、:elli、:newa
+   - 正/负 step、负端点、nil 端点
+   - 空切片
+   - 视图语义（共享 data、strides、写入传播）
+   - 与非连续视图（转置）交互
+   - 错误路径（越界、step=0、重复 :elli、无效 spec）
+
+   与 NumPy 切片语义严格对齐：
+   - end 永远不包含（不论 step 正负）
+   - step < 0 时省略 end 相当于切到索引 0（含）
+   - :elli 按位置展开为前置 :all"
+
+  (format t "~&=== 测试 vt-slice ===~%")
+
+  ;; =================================================================
+  ;; 1. 1D 张量：基础语义
+  ;; =================================================================
+  (let ((x (vt-arange 10 :dtype :float64)))     ; 0.0 .. 9.0
+    ;; --- 整数索引 → 0 维 ---
+    (assert (null (vt-shape (vt-slice x '(3))))
+            () "整数索引应返回 0 维，实际 ~a" (vt-shape (vt-slice x '(3))))
+    (assert (= (vt-ref (vt-slice x '(3))) 3.0d0)
+            () "vt-slice x (3) 应为 3.0d0")
+    (assert (eq (vt-dtype (vt-slice x '(3))) :float64)
+            () "切片应保持 dtype")
+
+    ;; --- 负整数索引 ---
+    (assert (= (vt-ref (vt-slice x '(-1)))  9.0d0)
+            () "x[-1] 应为 9.0d0")
+    (assert (= (vt-ref (vt-slice x '(-10))) 0.0d0)
+            () "x[-10] 应为 0.0d0")
+
+    ;; --- 基本范围切片（end 不含）---
+    (assert (equal (vt-shape (vt-slice x '(2 5))) '(3)))
+    (assert (equalp (vt-to-list (vt-slice x '(2 5)))
+                    '(2.0d0 3.0d0 4.0d0)))
+
+    ;; --- 步长 2 ---
+    (assert (equalp (vt-to-list (vt-slice x '(0 10 2)))
+                    '(0.0d0 2.0d0 4.0d0 6.0d0 8.0d0)))
+
+    ;; --- 负 step：end 不含 ---
+    (assert (equalp (vt-to-list (vt-slice x '(4 1 -1)))
+                    '(4.0d0 3.0d0 2.0d0)))
+    (assert (equalp (vt-to-list (vt-slice x '(9 0 -2)))
+                    '(9.0d0 7.0d0 5.0d0 3.0d0 1.0d0)))
+    ;; ★ 关键：负 step + end=nil → 切到索引 0（含）
+    (assert (equalp (vt-to-list (vt-slice x '(9 nil -1)))
+                    '(9.0d0 8.0d0 7.0d0 6.0d0 5.0d0 4.0d0 3.0d0 2.0d0 1.0d0 0.0d0)))
+    (assert (equalp (vt-to-list (vt-slice x '(nil nil -1)))
+                    '(9.0d0 8.0d0 7.0d0 6.0d0 5.0d0 4.0d0 3.0d0 2.0d0 1.0d0 0.0d0)))
+    (assert (equalp (vt-to-list (vt-slice x '(nil nil -2)))
+                    '(9.0d0 7.0d0 5.0d0 3.0d0 1.0d0)))
+
+    ;; --- 负端点 ---
+    (assert (equalp (vt-to-list (vt-slice x '(-3 -1))) '(7.0d0 8.0d0)))
+
+    ;; --- nil 端点 ---
+    (assert (equalp (vt-to-list (vt-slice x '(nil 4)))
+                    '(0.0d0 1.0d0 2.0d0 3.0d0)))
+    (assert (equalp (vt-to-list (vt-slice x '(2 nil)))
+                    '(2.0d0 3.0d0 4.0d0 5.0d0 6.0d0 7.0d0 8.0d0 9.0d0)))
+    (assert (equalp (vt-to-list (vt-slice x '(nil nil)))
+                    (vt-to-list x)))
+
+    ;; --- :all / (t) 等价 ---
+    (assert (equal (vt-shape (vt-slice x '(:all))) '(10)))
+    (assert (equalp (vt-to-list (vt-slice x '(:all))) (vt-to-list x)))
+    (assert (equalp (vt-to-list (vt-slice x '(t)))    (vt-to-list x)))
+
+    ;; --- :elli 在 1D 上等价 :all ---
+    (assert (equal (vt-shape (vt-slice x '(:elli))) '(10)))
+
+    ;; --- :newa ---
+    (assert (equal (vt-shape (vt-slice x '(:newa)))          '(1 10)))
+    (assert (equal (vt-shape (vt-slice x '(:newa) '(:newa))) '(1 1 10)))
+
+    ;; --- 空切片 ---
+    (assert (equal (vt-shape (vt-slice x '(5 5))) '(0)))
+    (assert (equal (vt-shape (vt-slice x '(7 3))) '(0))))
+
+  ;; =================================================================
+  ;; 2. 2D 张量
+  ;; =================================================================
+  (let ((x (vt-from-sequence '((1 2 3 4)
+                                (5 6 7 8)
+                                (9 10 11 12))
+                             :dtype :int64)))     ; shape (3, 4)
+    ;; --- 全选 / 省略尾轴 ---
+    (assert (equal (vt-shape (vt-slice x '(:all) '(:all))) '(3 4)))
+    (assert (equal (vt-shape (vt-slice x '(:all)))         '(3 4)))
+    (assert (equal (vt-shape (vt-slice x))                 '(3 4)))
+
+    ;; --- 单整数索引降维 ---
+    (assert (equal  (vt-shape (vt-slice x '(0)))    '(4)))
+    (assert (equalp (vt-to-list (vt-slice x '(0)))  '(1 2 3 4)))
+    (assert (equalp (vt-to-list (vt-slice x '(-1))) '(9 10 11 12)))
+
+    ;; --- 双整数索引 → 0 维 ---
+    (assert (null (vt-shape (vt-slice x '(1) '(2)))))
+    (assert (= (vt-ref (vt-slice x '(1) '(2)))    7))
+    (assert (= (vt-ref (vt-slice x '(-1) '(-2)))  11))
+
+    ;; --- 列切片 ---
+    (assert (equalp (vt-to-list (vt-slice x '(:all) '(1 3)))
+                    '((2 3) (6 7) (10 11))))
+
+    ;; --- 行切片 ---
+    (assert (equalp (vt-to-list (vt-slice x '(0 2) '(:all)))
+                    '((1 2 3 4) (5 6 7 8))))
+
+    ;; --- 列反向（对照 NumPy x[:, ::-1]）---
+    (assert (equalp (vt-to-list (vt-slice x '(:all) '(nil nil -1)))
+                    '((4 3 2 1) (8 7 6 5) (12 11 10 9))))
+
+    ;; --- :elli 位置变化 ---
+    (assert (equal (vt-shape (vt-slice x '(0) '(:elli)))    '(4)))
+    (assert (equal (vt-shape (vt-slice x '(:elli) '(1)))    '(3)))
+    (assert (equalp (vt-to-list (vt-slice x '(:elli) '(1))) '(2 6 10)))
+
+    ;; --- :newa 位置变化 ---
+    (assert (equal (vt-shape (vt-slice x '(:newa) '(:all) '(:all))) '(1 3 4)))
+    (assert (equal (vt-shape (vt-slice x '(:all) '(:newa) '(:all))) '(3 1 4)))
+    (assert (equal (vt-shape (vt-slice x '(:all) '(:all) '(:newa))) '(3 4 1)))
+
+    ;; --- :newa + 整数索引 ---
+    (assert (equal (vt-shape (vt-slice x '(:newa) '(1) '(:all))) '(1 4))))
+
+  ;; =================================================================
+  ;; 3. 3D 张量（多轴组合）
+  ;; =================================================================
+  ;; x = [[[1  2  3]      x[..., 1]    = [[2 5] [8 11]]       (最后一列)
+  ;;       [4  5  6]]     x[:, 1, :]   = [[4 5 6] [10 11 12]]  (中间一行)
+  ;;      [[7  8  9]      x[0, ..., 1] = [2 5]
+  ;;       [10 11 12]]]
+  (let ((x (vt-from-sequence '(((1 2 3) (4 5 6))
+                                ((7 8 9) (10 11 12)))
+                             :dtype :int64)))     ; shape (2, 2, 3)
+    ;; --- 整数索引 + :all 补全 ---
+    (assert (equal (vt-shape (vt-slice x '(1) '(:all) '(:all)))   '(2 3)))
+    (assert (equal (vt-shape (vt-slice x '(:all) '(0) '(:all)))   '(2 3)))
+    (assert (equal (vt-shape (vt-slice x '(:all) '(:all) '(1)))   '(2 2)))
+
+    ;; --- 全部整数索引 → 0 维 ---
+    (assert (null (vt-shape (vt-slice x '(0) '(1) '(2)))))
+    (assert (= (vt-ref (vt-slice x '(0) '(1) '(2)))      6))
+    (assert (= (vt-ref (vt-slice x '(-1) '(-1) '(-1)))   12))
+
+    ;; --- 混合：整数 + 范围 ---
+    (assert (equal (vt-shape (vt-slice x '(0) '(0 2) '(:all)))  '(2 3)))
+    (assert (equal (vt-shape (vt-slice x '(0) '(:all) '(0 2)))  '(2 2)))
+    (assert (equalp (vt-to-list (vt-slice x '(0) '(:all) '(0 2)))
+                    '((1 2) (4 5))))
+
+    ;; --- :newa 与整数索引混合 ---
+    (assert (equal (vt-shape (vt-slice x '(:newa) '(0) '(:all) '(:all)))
+                   '(1 2 3)))
+
+    ;; --- :elli 配合整数索引 ---
+    ;;   (vt-slice x '(:elli) '(1))      展开为 :all :all (1) → x[:, :, 1]
+    ;;   (vt-slice x '(0) '(:elli) '(1)) 展开为 (0) :all (1)   → x[0, :, 1]
+    ;;   (vt-slice x '(0) '(1) '(:elli)) 展开为 (0) (1) :all   → x[0, 1, :]
+    (assert (equal (vt-shape (vt-slice x '(:elli) '(1)))          '(2 2)))
+    (assert (equal (vt-shape (vt-slice x '(0) '(:elli) '(1)))     '(2)))
+    (assert (equal (vt-shape (vt-slice x '(0) '(1) '(:elli)))     '(3)))
+
+    ;; --- 值检查：x[..., 1] = 最后一列 ---
+    (assert (equalp (vt-to-list (vt-slice x '(:elli) '(1)))
+                    '((2 5) (8 11)))
+            () "x[..., 1] 应为 ((2 5) (8 11))，得到 ~a"
+            (vt-to-list (vt-slice x '(:elli) '(1))))
+
+    ;; --- 值检查：x[0, ..., 1] = 第一个切片的最后一列 ---
+    (assert (equalp (vt-to-list (vt-slice x '(0) '(:elli) '(1)))  '(2 5))
+            () "x[0, ..., 1] 应为 (2 5)，得到 ~a"
+            (vt-to-list (vt-slice x '(0) '(:elli) '(1))))
+
+    ;; --- 值检查：x[0, 1, :] = 第一个切片中间一行 ---
+    (assert (equalp (vt-to-list (vt-slice x '(0) '(1) '(:elli)))  '(4 5 6))
+            () "x[0, 1, :] 应为 (4 5 6)，得到 ~a"
+            (vt-to-list (vt-slice x '(0) '(1) '(:elli))))
+
+    ;; --- 对照：x[:, 1, :] 需显式指定三个 spec，不能用 :elli ---
+    (assert (equalp (vt-to-list (vt-slice x '(:all) '(1) '(:all)))
+                    '((4 5 6) (10 11 12)))
+            () "x[:, 1, :] 应为 ((4 5 6) (10 11 12))，得到 ~a"
+            (vt-to-list (vt-slice x '(:all) '(1) '(:all))))
+
+    ;; --- 对照：x[:, :, 1] 与 x[..., 1] 等价 ---
+    (assert (equalp (vt-to-list (vt-slice x '(:all) '(:all) '(1)))
+                    (vt-to-list (vt-slice x '(:elli) '(1))))
+            () "x[:, :, 1] 与 x[..., 1] 应等价"))
+
+  ;; =================================================================
+  ;; 4. 视图语义：不拷贝，strides/offset 正确
+  ;; =================================================================
+  (let* ((base (vt-from-sequence '((1 2 3) (4 5 6)) :dtype :int64))
+         (view (vt-slice base '(0 2) '(:all)))       ; shape (2, 3)
+         ;; 完全反向，等价 Python x[:, ::-1]（end 用 nil 才能切到索引 0）
+         (rev  (vt-slice base '(:all) '(nil nil -1))))
+
+    ;; 视图共享底层 data
+    (assert (eq (vt-data view) (vt-data base))
+            () "切片视图应共享底层 data")
+    (assert (eq (vt-data rev)  (vt-data base))
+            () "负 step 视图也应共享底层 data")
+
+    ;; 数值正确：完全反向
+    (assert (equalp (vt-to-list rev) '((3 2 1) (6 5 4)))
+            () "x[:, ::-1] 应为 ((3 2 1) (6 5 4))，得到 ~a"
+            (vt-to-list rev))
+
+    ;; Python 语义的 x[:, 2:0:-1] —— end 不含，只到列 1
+    (assert (equalp (vt-to-list (vt-slice base '(:all) '(2 0 -1)))
+                    '((3 2) (6 5)))
+            () "x[:, 2:0:-1] 应为 ((3 2) (6 5))，得到 ~a"
+            (vt-to-list (vt-slice base '(:all) '(2 0 -1))))
+
+    ;; x[:, ::-2] —— 倒序取偶数列
+    (assert (equalp (vt-to-list (vt-slice base '(:all) '(nil nil -2)))
+                    '((3 1) (6 4)))
+            () "x[:, ::-2] 应为 ((3 1) (6 4))，得到 ~a"
+            (vt-to-list (vt-slice base '(:all) '(nil nil -2))))
+
+    ;; 修改视图应影响 base（零拷贝语义）
+    (setf (vt-ref view 0 0) 999)
+    (assert (= (vt-ref base 0 0) 999)
+            () "修改视图应反映到底层 base"))
+
+  ;; =================================================================
+  ;; 5. 错误路径
+  ;; =================================================================
+  ;; 整数索引越界
+  (assert (%signals-error (vt-slice (vt-arange 5) '(5)))
+          () "整数索引 5 越界应报错")
+  (assert (%signals-error (vt-slice (vt-arange 5) '(-6)))
+          () "整数索引 -6 越界应报错")
+
+  ;; step = 0
+  (assert (%signals-error (vt-slice (vt-arange 5) '(0 3 0)))
+          () "step=0 应报错")
+
+  ;; 重复 :elli
+  (assert (%signals-error (vt-slice (vt-arange 5) '(:elli) '(:elli)))
+          () "重复 :elli 应报错")
+
+  ;; 无效 spec
+  (assert (%signals-error (vt-slice (vt-arange 5) '("bad")))
+          () "非法 spec 应报错")
+  (assert (%signals-error (vt-slice (vt-arange 5) '(:bogus)))
+          () "未知关键字应报错")
+
+  ;; 索引数超过秩
+  (assert (%signals-error
+           (vt-slice (vt-arange 5) '(:all) '(:all) '(:all)))
+          () "索引数超秩应报错")
+
+  ;; =================================================================
+  ;; 6. 与非连续视图（转置）配合
+  ;; =================================================================
+  (let* ((x  (vt-arange 24 :dtype :float64))
+         (x2 (vt-reshape x '(2 3 4)))
+         (t2 (vt-transpose x2 '(1 0 2))))     ; shape (3, 2, 4)
+    ;; 非连续视图切片
+    (assert (equal (vt-shape (vt-slice t2 '(0) '(:all) '(:all))) '(2 4)))
+    (assert (equal (vt-shape (vt-slice t2 '(:all) '(1) '(:all))) '(3 4)))
+    (assert (equal (vt-shape (vt-slice t2 '(:all) '(:all) '(0 2)))
+                   '(3 2 2)))
+
+    ;; 值验证：t2[i, j, k] = x2[j, i, k]
+    (assert (= (vt-ref t2 1 0 2) (vt-ref x2 0 1 2))
+            () "转置视图索引应一致"))
+
+  (format t "~&✅ test-vt-slice 全部通过~%")
+  t)
 
 (defun test-vt-ref ()
   "测试 vt-ref 及 setf vt-ref 的各种情况。"
@@ -6216,6 +6503,7 @@
   (test-vt-reshape)
   (test-vt-from-sequence)
   (test-vt-slice)
+  (test-vt-slice-1)
   (test-vt-ref)
   (test-vt-ravel)
   (test-vt-swapaxes)
