@@ -7,8 +7,8 @@
   :version "0.2.0"
   :serial t
   :components ((:file "src/package")
+	       (:file "src/util")
                (:file "src/dtype")
-               (:file "src/util")
                (:file "src/nan")
                (:file "src/core")
                (:file "src/iterator")

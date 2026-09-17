@@ -169,17 +169,28 @@
   "将截断后的整数按 uint16 范围 [0,65535] 回绕（NumPy 语义）。"
   (mod (truncate v) 65536))
 
+(defun %wrap-int32 (v)
+  (let ((m (mod (truncate v) #.(expt 2 32))))
+    (if (>= m #.(expt 2 31))
+	(- m #.(expt 2 32)) m)))
+
+(defun %wrap-int64 (v)
+  (let ((m (mod (truncate v) #.(expt 2 64))))
+    (if (>= m #.(expt 2 63))
+	(- m #.(expt 2 64)) m)))
+
 (defun vt-cast (val dtype)
   "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。"
-  (ecase dtype
-    (:float64 (coerce val 'double-float))
-    (:float32 (coerce val 'single-float))
-    (:int64   (truncate val))
-    (:int32   (truncate val))
-    (:int16   (%wrap-int16 val))
-    (:int8    (%wrap-int8 val))
-    (:uint8   (%wrap-uint8 val))
-    (:uint16  (%wrap-uint16 val))))
+  (with-float-safe
+    (ecase dtype
+      (:float64 (coerce val 'double-float))
+      (:float32 (coerce val 'single-float))
+      (:int64   (%wrap-int64 val))
+      (:int32   (%wrap-int32 val))
+      (:int16   (%wrap-int16 val))
+      (:int8    (%wrap-int8 val))
+      (:uint8   (%wrap-uint8 val))
+      (:uint16  (%wrap-uint16 val)))))
 
 (defun vt-cast-fun (dtype)
   "返回将数值转换为 dtype 的转换函数（与 vt-cast 语义一致）。"
