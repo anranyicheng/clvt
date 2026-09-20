@@ -15,6 +15,7 @@
    #:vt-offset
    #:vt-data
    #:vt-element-type
+   #:vt-dtype
    #:vt-order
    #:vt-size
    #:vt-p
