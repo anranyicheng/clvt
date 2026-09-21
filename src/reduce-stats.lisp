@@ -40,9 +40,6 @@
   (defun %op-nan-prop-p (op)
     (member op '(:max :min :argmax :argmin)))
 
-  (defun %op-requires-float-p (op)
-    (member op '(:nanmax :nanmin :nanargmax :nanargmin)))
-
   (defun %dtype->lt (dtype)
     (case dtype
       (:float64 'double-float)
@@ -308,12 +305,10 @@
 (defmacro %def-vt-reduce (name op)
   "为算子 op 生成函数 vt-<name>。对 in-et × res-lt 两级分派到类型特化内核。"
   (let ((fn-name (intern (format nil "VT-~a" name)))
-        (arg-p   (%op-arg-p op))
-        (requires-float (%op-requires-float-p op)))
+        (arg-p   (%op-arg-p op)))
     (flet ((dispatch (kernel-macro)
              `(cond
                 ,@(loop for lt in +kernel-lts+
-                        unless (and requires-float (subtypep lt 'integer))
                         collect
                         `((equal in-et ',lt)
                           (cond
@@ -368,9 +363,6 @@
                (declare (fixnum rank axis-size in-size))
                (unless res-lt
                  (error "vt-~a: unsupported output dtype ~a" ',name final-out-dtype))
-               ,@(when requires-float
-                   `((when (subtypep in-et 'integer)
-                       (error "~a: NaN-aware max/min/arg op on integer input" ',name))))
                ;; ---- 空输入 ----
                (when (or (zerop axis-size) (zerop in-size))
                  ,@(when (and arg-p (%op-nan-skip-p op))
