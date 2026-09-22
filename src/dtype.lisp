@@ -85,8 +85,8 @@
   (ecase bits
     (8  :uint8)
     (16 :uint16)
-    (32 :uint32)     ; 如果以后不支持 uint32，可删除这两行
-    (64 :uint64)))   ; 如果以后不支持 uint64，可删除这两行
+    (32 :uint32)    
+    (64 :uint64))) 
 
 (defun vt-next-signed-bits (unsigned-bits)
   "返回能容纳 unsigned-bits 无符号整数范围的有符号位宽；若没有则返回 nil。"
@@ -148,39 +148,67 @@
       ;; 空输入或未知类型兜底
       (t :float64))))
 
-
-(declaim (inline %wrap-int8 %wrap-int16 %wrap-uint8 %wrap-uint16))
+(declaim (inline %wrap-int8 %wrap-int16 %wrap-uint8 %wrap-uint16
+                 %wrap-int32 %wrap-int64
+                 %coerce-int8 %coerce-int16 %coerce-uint8 %coerce-uint16
+                 %coerce-int32 %coerce-int64))
 
 (defun %wrap-int8 (v)
-  "将截断后的整数按 int8 范围 [-128,127] 回绕（NumPy 语义）。"
-  (let ((m (mod (truncate v) 256)))
+  "int8 范围 [-128,127] 回绕（NumPy 语义），NaN/Inf→0。"
+  (let ((m (mod (%safe-truncate v) 256)))
     (if (>= m 128) (- m 256) m)))
 
 (defun %wrap-int16 (v)
-  "将截断后的整数按 int16 范围 [-32768,32767] 回绕（NumPy 语义）。"
-  (let ((m (mod (truncate v) 65536)))
+  "int16 范围 [-32768,32767] 回绕（NumPy 语义），NaN/Inf→0。"
+  (let ((m (mod (%safe-truncate v) 65536)))
     (if (>= m 32768) (- m 65536) m)))
 
 (defun %wrap-uint8 (v)
-  "将截断后的整数按 uint8 范围 [0,255] 回绕（NumPy 语义）。"
-  (mod (truncate v) 256))
+  "uint8 范围 [0,255] 回绕（NumPy 语义），NaN/Inf→0。"
+  (mod (%safe-truncate v) 256))
 
 (defun %wrap-uint16 (v)
-  "将截断后的整数按 uint16 范围 [0,65535] 回绕（NumPy 语义）。"
-  (mod (truncate v) 65536))
+  "uint16 范围 [0,65535] 回绕（NumPy 语义），NaN/Inf→0。"
+  (mod (%safe-truncate v) 65536))
 
 (defun %wrap-int32 (v)
-  (let ((m (mod (truncate v) #.(expt 2 32))))
+  (let ((m (mod (%safe-truncate v) #.(expt 2 32))))
     (if (>= m #.(expt 2 31))
-	(- m #.(expt 2 32)) m)))
+ 	(- m #.(expt 2 32)) m)))
 
 (defun %wrap-int64 (v)
-  (let ((m (mod (truncate v) #.(expt 2 64))))
+  (let ((m (mod (%safe-truncate v) #.(expt 2 64))))
     (if (>= m #.(expt 2 63))
-	(- m #.(expt 2 64)) m)))
+ 	(- m #.(expt 2 64)) m)))
+
+;;; 范围检查 + 回退到 wrap 的快速 coerce（热路径用，避免不必要 mod）
+(defun %coerce-int64 (v)
+  (let ((n (if (and (floatp v) (%nan-or-inf-p v)) 0 (truncate v))))
+    (if (typep n '(signed-byte 64)) n (%wrap-int64 n))))
+
+(defun %coerce-int32 (v)
+  (let ((n (if (and (floatp v) (%nan-or-inf-p v)) 0 (truncate v))))
+    (if (typep n '(signed-byte 32)) n (%wrap-int32 n))))
+
+(defun %coerce-int16 (v)
+  (let ((n (if (and (floatp v) (%nan-or-inf-p v)) 0 (truncate v))))
+    (if (typep n '(signed-byte 16)) n (%wrap-int16 n))))
+
+(defun %coerce-int8 (v)
+  (let ((n (if (and (floatp v) (%nan-or-inf-p v)) 0 (truncate v))))
+    (if (typep n '(signed-byte 8)) n (%wrap-int8 n))))
+
+(defun %coerce-uint8 (v)
+  (let ((n (if (and (floatp v) (%nan-or-inf-p v)) 0 (truncate v))))
+    (if (typep n '(unsigned-byte 8)) n (%wrap-uint8 n))))
+
+(defun %coerce-uint16 (v)
+  (let ((n (if (and (floatp v) (%nan-or-inf-p v)) 0 (truncate v))))
+    (if (typep n '(unsigned-byte 16)) n (%wrap-uint16 n))))
 
 (defun vt-cast (val dtype)
-  "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。"
+  "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。
+   NaN/Inf 转整数返回 0（确定性哨兵）"
   (with-float-safe
     (ecase dtype
       (:float64 (coerce val 'double-float))
@@ -193,12 +221,12 @@
       (:uint16  (%wrap-uint16 val)))))
 
 (defun vt-cast-fun (dtype)
-  "返回将数值转换为 dtype 的转换函数（与 vt-cast 语义一致）。"
+  "返回将数值转换为 dtype 的转换函数(与 vt-cast 语义一致：回绕 + NaN 安全)"
   (ecase dtype
     (:float64 (lambda (val) (coerce val 'double-float)))
     (:float32 (lambda (val) (coerce val 'single-float)))
-    (:int64   #'truncate)
-    (:int32   #'truncate)
+    (:int64   #'%coerce-int64)
+    (:int32   #'%coerce-int32)
     (:int16   #'%wrap-int16)
     (:int8    #'%wrap-int8)
     (:uint8   #'%wrap-uint8)

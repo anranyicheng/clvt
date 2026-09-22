@@ -129,3 +129,18 @@
 
 (defun %neg-inf-p (x)
   (and (floatp x) (< x most-negative-double-float)))
+
+(defun %nan-or-inf-p (x)
+  "浮点 NaN 或 ±Inf 判定。调用方需屏蔽浮点陷阱。"
+  (and (floatp x)
+       (or (not (= x x))
+	   (> (abs x) most-positive-double-float))))
+
+(declaim (inline %safe-truncate))
+(defun %safe-truncate (v)
+  "把数值截断为整数；浮点 NaN/±Inf 返回 0。调用方需屏蔽浮点陷阱。"
+  (if (floatp v)
+      (if (%nan-or-inf-p v)
+	  0
+	  (truncate v))
+      (truncate v)))

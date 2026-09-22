@@ -73,8 +73,8 @@
   (defun %cast-form (lt form)
     (cond ((eq lt 'double-float) `(coerce ,form 'double-float))
           ((eq lt 'single-float) `(coerce ,form 'single-float))
-          ((member lt '((signed-byte 64) (signed-byte 32)) :test #'equal)
-           `(truncate ,form))
+          ((equal lt '(signed-byte 64)) `(%coerce-int64 ,form))
+	  ((equal lt '(signed-byte 32)) `(%coerce-int32 ,form))
           (t form)))
 
   (defun %op-init (op lt res-lt)
@@ -366,7 +366,7 @@
                ;; ---- 空输入 ----
                (when (or (zerop axis-size) (zerop in-size))
                  ,@(when (and arg-p (%op-nan-skip-p op))
-                     `((error "~a: empty slice or All-NaN encountered" ',name)))
+                     `((error "~a: empty slice encountered" ',name)))
                  ,(if arg-p
                       `(progn (vt-fill res 0)
                               (return-from ,fn-name res))

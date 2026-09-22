@@ -316,7 +316,7 @@
   (vt-map (lambda (x) (ash x (- shift))) vt :dtype dtype :out out))
 
 (defun vt-clip (vt min-val max-val &key out dtype)
-  (vt-map (lambda (x) (max min-val (min max-val x)))
+  (vt-map (lambda (x) (min max-val (max min-val x)))
 	  vt :dtype dtype :out out))
 
 (defun vt-lerp (start end weight &key out dtype)

@@ -123,21 +123,22 @@
 (declaim (inline vt-broadcast-shapes))
 
 (defun vt-broadcast-shapes (shape1 shape2)
-  "计算广播后的结果形状，严格对标 NumPy。"
-  (declare (list shape1 shape2) (optimize (speed 3) (safety 0)))
+  "计算广播后的结果形状，严格对标 NumPy（右对齐，短形状左侧补 1）。"
+  (declare (list shape1 shape2)
+	   (optimize (speed 3) (safety 0)))
   (let* ((len1 (length shape1))
          (len2 (length shape2))
          (max-len (max len1 len2))
          (result (make-list max-len)))
     (declare (type fixnum len1 len2 max-len))
     (do ((i 0 (1+ i))
-         (s1 (nthcdr (- max-len len1) shape1) (cdr s1))
-         (s2 (nthcdr (- max-len len2) shape2) (cdr s2))
+         (s1 (append (make-list (- max-len len1) :initial-element 1) shape1) (cdr s1))
+         (s2 (append (make-list (- max-len len2) :initial-element 1) shape2) (cdr s2))
          (r result (cdr r)))
         ((= i max-len) result)
       (declare (type fixnum i))
-      (let ((dim1 (if s1 (the fixnum (car s1)) 1))
-            (dim2 (if s2 (the fixnum (car s2)) 1)))
+      (let ((dim1 (the fixnum (car s1)))
+            (dim2 (the fixnum (car s2))))
         (declare (type fixnum dim1 dim2))
         (cond ((= dim1 dim2) (setf (car r) dim1))
               ((= dim1 1)    (setf (car r) dim2))
@@ -232,128 +233,132 @@
 ;;; ------------------------------------------------------------------
 ;;; 拷贝与类型转换
 ;;; ------------------------------------------------------------------
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun %astype-cast-form (out-lt src-expr)
+    "整数走安全 coerce/回绕。"
+    (cond ((equal out-lt '(signed-byte 64)) `(%coerce-int64 ,src-expr))
+          ((equal out-lt '(signed-byte 32)) `(%coerce-int32 ,src-expr))
+          ((subtypep out-lt 'integer)      `(truncate ,src-expr))
+          (t                               `(coerce ,src-expr ',out-lt)))))
 
 (defun vt-astype (tensor new-dtype)
   "将张量转换为新类型（浮点转整数截断）。返回连续的新张量。"
   (declare (optimize (speed 3) (safety 0)))
-  (let* ((shape (vt-shape tensor))
-         (rank (length shape))
-         (size (vt-shape-to-size shape))
-         (in-data (vt-data tensor))
-         (in-strides (vt-strides tensor))
-         (in-offset (vt-offset tensor))
-         (new-lisp-type (vt-dtype->lisp-type new-dtype))
-         ;; 优化 1：绕过 make-vt，避免初始零填充；元素马上全部被覆盖
-         (new-data (make-array size :element-type new-lisp-type))
-         (new (%make-vt :data new-data
-                        :shape shape
-                        :strides (vt-compute-strides shape)
-                        :offset 0
-                        :dtype new-dtype)))
-    (declare (type fixnum rank size in-offset))
-    (cond
-      ;; ---- 标量 ----
-      ((zerop rank)
-       (setf (aref new-data 0)
-             (funcall (vt-cast-fun new-dtype) (aref in-data in-offset))))
+  (with-float-safe 
+    (let* ((shape (vt-shape tensor))
+           (rank (length shape))
+           (size (vt-shape-to-size shape))
+           (in-data (vt-data tensor))
+           (in-strides (vt-strides tensor))
+           (in-offset (vt-offset tensor))
+           (new-lisp-type (vt-dtype->lisp-type new-dtype))
+           (new-data (make-array size :element-type new-lisp-type))
+           (new (%make-vt :data new-data
+                          :shape shape
+                          :strides (vt-compute-strides shape)
+                          :offset 0
+                          :dtype new-dtype)))
+      (declare (type fixnum rank size in-offset))
+      (cond
+	;; ---- 标量 ----
+	((zerop rank)
+	 (setf (aref new-data 0)
+               (funcall (vt-cast-fun new-dtype) (aref in-data in-offset))))
 
-      ;; ---- 连续视图 ----
-      ((vt-contiguous-p tensor)
-       (let ((in-et (array-element-type in-data)))
-         (macrolet ((spec (in-lt out-lt)
-                      ;; 优化 2：aref + 转换全部内联，无 funcall、无泛型 aref
-                      (let ((expr (if (subtypep out-lt 'integer)
-                                      `(truncate (aref src p))
-                                      `(coerce (aref src p) ',out-lt))))
-                        `(let ((src (the (simple-array ,in-lt (*)) in-data))
-                               (dst (the (simple-array ,out-lt (*)) new-data))
-                               (p in-offset))
-                           (declare (type (simple-array ,in-lt (*)) src)
-                                    (type (simple-array ,out-lt (*)) dst)
-                                    (type fixnum p))
-                           (dotimes (i size)
-                             (setf (aref dst i) ,expr)
-                             (incf p)))))
-                    (memcpy (lt)
-                      `(replace (the (simple-array ,lt (*)) new-data)
-                                (the (simple-array ,lt (*)) in-data)
-                                :start1 0 :end1 size
-                                :start2 in-offset
-                                :end2 (the fixnum (+ in-offset size)))))
-           (cond
-             ;; 同型：memcpy
-             ((and (equal in-et 'double-float)      (equal new-lisp-type 'double-float))
-              (memcpy double-float))
-             ((and (equal in-et 'single-float)      (equal new-lisp-type 'single-float))
-              (memcpy single-float))
-             ((and (equal in-et '(signed-byte 64))  (equal new-lisp-type '(signed-byte 64)))
-              (memcpy (signed-byte 64)))
-             ((and (equal in-et '(signed-byte 32))  (equal new-lisp-type '(signed-byte 32)))
-              (memcpy (signed-byte 32)))
-             ;; double-float 源
-             ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 64)))
-              (spec double-float (signed-byte 64)))
-             ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 32)))
-              (spec double-float (signed-byte 32)))
-             ((and (equal in-et 'double-float) (equal new-lisp-type 'single-float))
-              (spec double-float single-float))
-             ;; single-float 源
-             ((and (equal in-et 'single-float) (equal new-lisp-type 'double-float))
-              (spec single-float double-float))
-             ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 64)))
-              (spec single-float (signed-byte 64)))
-             ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 32)))
-              (spec single-float (signed-byte 32)))
-             ;; int64 源
-             ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'double-float))
-              (spec (signed-byte 64) double-float))
-             ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'single-float))
-              (spec (signed-byte 64) single-float))
-             ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 32)))
-              (spec (signed-byte 64) (signed-byte 32)))
-             ;; int32 源
-             ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'double-float))
-              (spec (signed-byte 32) double-float))
-             ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'single-float))
-              (spec (signed-byte 32) single-float))
-             ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 64)))
-              (spec (signed-byte 32) (signed-byte 64)))
-             ;; 其他组合：通用 fallback（仍走一次指针扫描，但去掉了泛型转换变量）
-             (t
-              (let ((conv (vt-cast-fun new-dtype))
-                    (p in-offset))
-                (declare (type fixnum p))
-                (dotimes (i size)
-                  (setf (aref new-data i)
-                        (funcall conv (aref in-data p)))
-                  (incf p))))))))
+	;; ---- 连续视图 ----
+	((vt-contiguous-p tensor)
+	 (let ((in-et (array-element-type in-data)))
+           (macrolet ((spec (in-lt out-lt)
+			(let ((expr (%astype-cast-form out-lt '(aref src p))))
+                          `(let ((src (the (simple-array ,in-lt (*)) in-data))
+				 (dst (the (simple-array ,out-lt (*)) new-data))
+				 (p in-offset))
+                             (declare (type (simple-array ,in-lt (*)) src)
+                                      (type (simple-array ,out-lt (*)) dst)
+                                      (type fixnum p))
+                             (dotimes (i size)
+                               (setf (aref dst i) ,expr)
+                               (incf p)))))
+                      (memcpy (lt)
+			`(replace (the (simple-array ,lt (*)) new-data)
+                                  (the (simple-array ,lt (*)) in-data)
+                                  :start1 0 :end1 size
+                                  :start2 in-offset
+                                  :end2 (the fixnum (+ in-offset size)))))
+             (cond
+               ;; 同型：memcpy
+               ((and (equal in-et 'double-float)      (equal new-lisp-type 'double-float))
+		(memcpy double-float))
+               ((and (equal in-et 'single-float)      (equal new-lisp-type 'single-float))
+		(memcpy single-float))
+               ((and (equal in-et '(signed-byte 64))  (equal new-lisp-type '(signed-byte 64)))
+		(memcpy (signed-byte 64)))
+               ((and (equal in-et '(signed-byte 32))  (equal new-lisp-type '(signed-byte 32)))
+		(memcpy (signed-byte 32)))
+               ;; double-float 源
+               ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 64)))
+		(spec double-float (signed-byte 64)))
+               ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 32)))
+		(spec double-float (signed-byte 32)))
+               ((and (equal in-et 'double-float) (equal new-lisp-type 'single-float))
+		(spec double-float single-float))
+               ;; single-float 源
+               ((and (equal in-et 'single-float) (equal new-lisp-type 'double-float))
+		(spec single-float double-float))
+               ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 64)))
+		(spec single-float (signed-byte 64)))
+               ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 32)))
+		(spec single-float (signed-byte 32)))
+               ;; int64 源
+               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'double-float))
+		(spec (signed-byte 64) double-float))
+               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'single-float))
+		(spec (signed-byte 64) single-float))
+               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 32)))
+		(spec (signed-byte 64) (signed-byte 32)))
+               ;; int32 源
+               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'double-float))
+		(spec (signed-byte 32) double-float))
+               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'single-float))
+		(spec (signed-byte 32) single-float))
+               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 64)))
+		(spec (signed-byte 32) (signed-byte 64)))
+               ;; 其他组合：通用 fallback（仍走一次指针扫描，但去掉了泛型转换变量）
+               (t
+		(let ((conv (vt-cast-fun new-dtype))
+                      (p in-offset))
+                  (declare (type fixnum p))
+                  (dotimes (i size)
+                    (setf (aref new-data i)
+                          (funcall conv (aref in-data p)))
+                    (incf p))))))))
 
-      ;; ---- 非连续视图 ----
-      (t
-       (let ((converter (vt-cast-fun new-dtype))
-             (dims (coerce shape 'simple-vector))
-             (i-strs (coerce in-strides 'simple-vector))
-             (indices (make-array rank :element-type 'fixnum :initial-element 0))
-             (i-ptr in-offset))
-         (declare (type simple-vector dims i-strs)
-                  (type (simple-array fixnum (*)) indices)
-                  (type fixnum i-ptr))
-         (dotimes (k size)
-           (setf (aref new-data k)
-                 (funcall converter (aref in-data i-ptr)))
-           (let ((d (the fixnum (1- rank))))
-             (declare (type fixnum d))
-             (loop
-               (when (< d 0) (return))
-               (incf (aref indices d))
-               (incf i-ptr (the fixnum (svref i-strs d)))
-               (when (< (aref indices d) (the fixnum (svref dims d)))
-                 (return))
-               (let ((dim (the fixnum (svref dims d))))
-                 (decf i-ptr (* dim (the fixnum (svref i-strs d))))
-                 (setf (aref indices d) 0)
-                 (decf d))))))))
-    new))
+	;; ---- 非连续视图 ----
+	(t
+	 (let ((converter (vt-cast-fun new-dtype))
+               (dims (coerce shape 'simple-vector))
+               (i-strs (coerce in-strides 'simple-vector))
+               (indices (make-array rank :element-type 'fixnum :initial-element 0))
+               (i-ptr in-offset))
+           (declare (type simple-vector dims i-strs)
+                    (type (simple-array fixnum (*)) indices)
+                    (type fixnum i-ptr))
+           (dotimes (k size)
+             (setf (aref new-data k)
+                   (funcall converter (aref in-data i-ptr)))
+             (let ((d (the fixnum (1- rank))))
+               (declare (type fixnum d))
+               (loop
+		 (when (< d 0) (return))
+		 (incf (aref indices d))
+		 (incf i-ptr (the fixnum (svref i-strs d)))
+		 (when (< (aref indices d) (the fixnum (svref dims d)))
+                   (return))
+		 (let ((dim (the fixnum (svref dims d))))
+                   (decf i-ptr (* dim (the fixnum (svref i-strs d))))
+                   (setf (aref indices d) 0)
+                   (decf d))))))))
+      new)))
 
 (defun vt-copy (vt &key dtype)
   "深度拷贝：返回独立、内存连续的新张量。可选类型转换。"

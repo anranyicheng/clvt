@@ -2,19 +2,32 @@
 
 (defvar *vt-einsum-parse-cache* (make-hash-table :test 'equal))
 
+(defvar *vt-einsum-cache-lock*
+  (sb-thread:make-mutex :name "einsum-cache-lock"))
+
+(defconstant +vt-einsum-cache-max+ 1024)
+
+(defmacro %with-einsum-cache-lock (&body body)
+  `(sb-thread:with-mutex (*vt-einsum-cache-lock*) ,@body))
+  
 (declaim (inline get-parsed-subscripts))
 (defun get-parsed-subscripts (str)
   (declare (optimize (speed 3) (safety 0)) (simple-string str))
-  (let ((cached (gethash str *vt-einsum-parse-cache*)))
-    (if cached
-        (values (the list (first cached))
-		(the list (second cached))
-		(the boolean (third cached)))
-        (multiple-value-bind (inputs output explicit-p)
-	    (parse-subscript-tokens str)
-          (setf (gethash str *vt-einsum-parse-cache*)
-		(list inputs output explicit-p))
-          (values inputs output explicit-p)))))
+   (%with-einsum-cache-lock
+    (let ((cached (gethash str *vt-einsum-parse-cache*)))
+      (if cached
+          (values (the list (first cached))
+                  (the list (second cached))
+                  (the boolean (third cached)))
+          (multiple-value-bind (inputs output explicit-p)
+              (parse-subscript-tokens str)
+            ;; 缓存超限时整体清空，简单有效的近似 LRU
+            (when (>= (hash-table-count *vt-einsum-parse-cache*)
+                      +vt-einsum-cache-max+)
+              (clrhash *vt-einsum-parse-cache*))
+            (setf (gethash str *vt-einsum-parse-cache*)
+                  (list inputs output explicit-p))
+            (values inputs output explicit-p))))))
 
 (declaim (inline parse-subscript-tokens))
 (defun parse-subscript-tokens (str)
@@ -967,15 +980,23 @@
     (vt-sum (vt-diagonal matrix) :dtype dtype :out out)))
 
 (defun vt-norm (vt &key axis keepdims dtype out)
-  "l2 范数 (欧几里得范数)
-   优化: 如果提供 out，求和与开方将原地执行，零临时内存分配。"
+  "l2 范数（欧几里得范数）
+   - 整数输入按 NumPy 语义提升到 float64，避免整数 sqrt 截断。
+   - 若提供 out，求和与开方将原地执行，零临时内存分配。"
   (with-float-safe
-    (let ((sq (vt-square vt)))
+    (let* ((in-dtype (vt-dtype vt))
+           (effective-dtype (or dtype
+                                (if (vt-float-dtype-p in-dtype)
+                                    in-dtype
+                                    :float64)))
+           (sq (if (vt-float-dtype-p in-dtype)
+                   (vt-square vt)
+                   (vt-square (vt-astype vt :float64)))))
       (if axis
           (let ((sum-res (vt-sum sq :axis axis :keepdims keepdims
-                                 :dtype dtype :out out)))
+                                    :dtype effective-dtype :out out)))
             (vt-sqrt sum-res :dtype (vt-dtype sum-res) :out sum-res))
-          (let ((sum-res (vt-sum sq :dtype dtype :out out)))
+          (let ((sum-res (vt-sum sq :dtype effective-dtype :out out)))
             (vt-sqrt sum-res :dtype (vt-dtype sum-res) :out sum-res))))))
 
 (defun vt-l1-norm (vt &key axis keepdims dtype out)

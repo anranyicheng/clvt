@@ -71,9 +71,14 @@
                  (5 (funcall fn (aref vals 0) (aref vals 1) (aref vals 2) (aref vals 3) (aref vals 4)))
                  (otherwise (apply fn (coerce vals 'list))))))
       (macrolet ((cast-to (lt form)
-                   (if (subtypep lt 'integer)
-                       `(truncate ,form)
-                       `(the ,lt (coerce ,form ',lt))))
+		   (cond ((and (consp lt) (equal lt '(signed-byte 64)))
+                          `(%coerce-int64 ,form))
+                         ((and (consp lt) (equal lt '(signed-byte 32)))
+                          `(%coerce-int32 ,form))
+                         ((subtypep lt 'integer)
+                          `(truncate ,form))
+                         (t
+                          `(the ,lt (coerce ,form ',lt)))))
                  ;; 快路径：连续 + 输入/输出同类型 + n=k（k=1..5）
                  ;; 展开后与原代码逐字等价，只是把 5 份重复合并
                  (same-k (lt k)
@@ -164,17 +169,19 @@
               ((equal (array-element-type res-data) '(signed-byte 64)) (gen (signed-byte 64)))
               ((equal (array-element-type res-data) '(signed-byte 32)) (gen (signed-byte 32)))
               (t
-               ;; 非特化类型：保持原实现（无 cast，通用 aref）
+	       ;; 非特化类型（int8/int16/uint8/uint16 等）：按 dtype 回绕后写入，
+               ;; 避免溢出写入 specialized-array 崩溃
                (let ((ptrs (copy-seq in-offsets))
                      (vals (make-array n))
                      (indices (make-array rank :element-type 'fixnum :initial-element 0))
+		     (conv (vt-cast-fun res-dtype))
                      (op res-off))
                  (declare (type simple-vector ptrs vals)
                           (type (simple-array fixnum (*)) indices)
                           (type fixnum op))
                  (dotimes (i size)
                    (gather ptrs vals)
-                   (setf (aref res-data op) (call-fn vals))
+		   (setf (aref res-data op) (funcall conv (call-fn vals)))
                    (let ((d (1- rank)))
                      (loop
                        (when (< d 0) (return))
@@ -209,9 +216,14 @@
 ;;; ------------------------------------------------------------------
 
 (defmacro %cast-to (lt form)
-  "内联类型转换：整数截断，浮点 coerce。"
+  ;; "内联类型转换：整数截断，浮点 coerce。"
+  "内联类型转换：整数类型走安全 coerce/回绕，浮点 coerce。"
   (declare (optimize (speed 3) (safety 0)))
-  `(if ,(subtypep lt 'integer) (truncate ,form) (coerce ,form ',lt)))
+  ;; `(if ,(subtypep lt 'integer) (truncate ,form) (coerce ,form ',lt)))
+  (cond ((equal lt '(signed-byte 64)) `(%coerce-int64 ,form))
+        ((equal lt '(signed-byte 32)) `(%coerce-int32 ,form))
+        ((subtypep lt 'integer)        `(truncate ,form))
+        (t                              `(coerce ,form ',lt))))
 
 (defmacro %inline1-loop (lt op a res)
   (declare (optimize (speed 3) (safety 0)))

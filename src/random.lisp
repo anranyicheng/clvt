@@ -6,18 +6,24 @@
   "clvt 内部默认随机状态。")
 
 (defun vt-make-random-state (&optional seed)
-  #+sbcl (if (null seed)
+ (if (null seed)
 	     (make-random-state nil)
-	     (sb-ext::seed-random-state seed))
-  #-sbcl (typecase seed
-           (null (make-random-state nil))
-           (random-state (make-random-state seed))
-           (t (make-random-state seed))))
+	     (sb-ext::seed-random-state seed)))
+
+(defvar *vt-random-state-lock*
+  (sb-thread:make-mutex :name "vt-random-state"))
 
 (defun vt-random-seed (seed)
-  (setf *vt-default-random-state* (vt-make-random-state seed)))
+  (sb-thread:with-mutex (*vt-random-state-lock*)
+    (setf *vt-default-random-state* (vt-make-random-state seed))))
 
-(declaim (inline %uniform-rand %normal-rand))
+(declaim (inline %copy-default-rng))
+(defun %copy-default-rng ()
+  "在锁保护下返回默认随机状态的拷贝，避免多线程直接共享 mutable random-state。"
+  (sb-thread:with-mutex (*vt-random-state-lock*)
+    (make-random-state *vt-default-random-state*)))
+
+  (declaim (inline %uniform-rand %normal-rand))
 (defun %uniform-rand (state)
   (random 1.0d0 state))
 
@@ -27,26 +33,29 @@
     (* (sqrt (* -2.0d0 (log u1)))
        (cos (* 2.0d0 pi u2)))))
 
-(defun vt-random (shape &key (dtype :float64) (rng *vt-default-random-state*))
-  (declare (list shape) (random-state rng))
+(defun vt-random (shape &key (dtype :float64) (rng nil))
+  (declare (list shape))
+  (setf rng (or rng (%copy-default-rng)))
   (vt-map (lambda (x)
 	    (declare (ignore x))
 	    (vt-cast (%uniform-rand rng) dtype))
           (vt-zeros shape :dtype dtype)))
 
-(defun vt-random-uniform (shape &key (low 0.0d0) (high 1.0d0) (dtype :float64)
-                                  (rng *vt-default-random-state*))
-  (declare (list shape) (random-state rng))
+(defun vt-random-uniform
+    (shape &key (low 0.0d0) (high 1.0d0) (dtype :float64) (rng nil))
+  (declare (list shape))
   (assert (< low high) (low high))
+  (setf rng (or rng (%copy-default-rng)))
   (let ((range (- high low)))
     (vt-map (lambda (x)
 	      (declare (ignore x))
 	      (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
             (vt-zeros shape :dtype dtype))))
 
-(defun vt-random-normal (shape &key (mean 0.0d0) (std 1.0d0) (dtype :float64)
-                                 (rng *vt-default-random-state*))
-  (declare (list shape) (random-state rng))
+(defun vt-random-normal
+    (shape &key (mean 0.0d0) (std 1.0d0) (dtype :float64) (rng nil))
+  (declare (list shape))
+  (setf rng (or rng (%copy-default-rng)))
   (let ((res (vt-zeros shape :dtype dtype)))
     (vt-do-each (ptr val res)
       (declare (ignore val))
@@ -55,8 +64,8 @@
     res))
 
 (defun vt-random-int
-    (low high &key (size nil) (dtype :int64) (rng *vt-default-random-state*))
-  (declare (random-state rng))
+    (low high &key (size nil) (dtype :int64) (rng nil))
+  (setf rng (or rng (%copy-default-rng)))
   (let ((range (- high low)))
     (assert (>= range 0) (high low))
     (if (zerop range)
@@ -72,12 +81,13 @@
             (make-vt nil (+ low (random range rng)) :dtype dtype)))))
 
 (defun vt-random-integers
-    (low high &key (size nil) (dtype :int64) (rng *vt-default-random-state*))
+    (low high &key (size nil) (dtype :int64) (rng nil))
+  (setf rng (or rng (%copy-default-rng)))
   (vt-random-int low high :size size :dtype dtype :rng rng))
 
 
-(defun vt-random-choice (a &key (size nil) (replace t) (p nil) (dtype nil)
-                             (rng *vt-default-random-state*))
+(defun vt-random-choice
+    (a &key (size nil) (replace t) (p nil) (dtype nil) (rng nil))
   "从一维数组 a 中抽样。
    a        : 整数 n（表示从 [0, n) 抽样）或一维张量。
    size     : nil → 返回 0 维张量；否则返回形状为 size 的张量。
@@ -87,8 +97,7 @@
    dtype    : 输出 dtype，默认与 a 一致。
    rng      : 随机状态。
    对标 numpy.random.choice / torch.multinomial。"
-
-  (declare (random-state rng))
+  (setf rng (or rng (%copy-default-rng)))  
   (let* ((source (if (integerp a)
                      (progn (assert (> a 0) (a))
                             (vt-arange a :dtype (or dtype :int64)))
@@ -197,8 +206,8 @@
                               out-dtype)))
              result)))))))
 
-(defun vt-random-permutation (n &key (rng *vt-default-random-state*))
-  (declare (random-state rng))
+(defun vt-random-permutation (n &key (rng nil))
+  (setf rng (or rng (%copy-default-rng)))
   (when (and (integerp n) (<= n 1))
     (return-from vt-random-permutation
       (vt-arange (if (zerop n) 0 1) :dtype :int64)))
@@ -220,8 +229,8 @@
 	      (vt-copy-into sj tmp))))
         result)))
 
-(defun vt-random-shuffle (tensor &key (axis 0) (rng *vt-default-random-state*))
-  (declare (random-state rng))
+(defun vt-random-shuffle (tensor &key (axis 0) (rng nil))
+  (setf rng (or rng (%copy-default-rng)))
   (let* ((ax (vt-normalize-axis axis (length (vt-shape tensor))))
          (dim (nth ax (vt-shape tensor))))
     (when (<= dim 1) (return-from vt-random-shuffle tensor))
@@ -235,8 +244,8 @@
                               collect (if (= d ax) (list j) '(:all))))))
         (let ((tmp (vt-copy si))) (vt-copy-into si sj) (vt-copy-into sj tmp))))
     tensor))
-(defun vt-random-multinomial (n pvals &key (size nil) (rng *vt-default-random-state*))
-  (declare (random-state rng))
+(defun vt-random-multinomial (n pvals &key (size nil) (rng nil))
+  (setf rng (or rng (%copy-default-rng)))
   (let* ((probs (if (vt-p pvals) (vt-to-list pvals) (coerce pvals 'list)))
          (k (length probs)))
     (assert (> k 0) () "pvals 不能为空")
