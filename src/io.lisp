@@ -257,20 +257,33 @@
         ((and shape (zerop (reduce #'* shape :initial-value 1)))
          (format stream "[] (empty)"))
         ((null shape)
-         (format stream "~a" (%format-number (aref (vt-data obj) (vt-offset obj)) element-type)))
+         (format stream "~a"
+                 (%format-number (aref (vt-data obj) (vt-offset obj)) element-type)))
         (t
          (let ((max-width 0))
-           (labels ((scan-visible (current-idxs axis)
-                      (let ((dim (nth axis shape))
-			    (is-last (= axis (1- (length shape)))))
-                        (if is-last
-                            (loop for i from 0 below (min dim (* 2 *vt-print-threshold*))
-                                  for phys = (%phys-idx obj (append current-idxs (list i)))
-                                  for w = (length (%format-number (aref (vt-data obj) phys) element-type))
-                                  do (setf max-width (max max-width w)))
-                            (loop for i from 0 below (min dim *vt-print-threshold*)
-                                  do (scan-visible (append current-idxs (list i)) (1+ axis)))))))
-             (scan-visible nil 0))
+           (labels ((visible-indices (dim)
+                      "返回 print-vt-recursive 在给定 dim 下真正会打印的轴索引列表。
+                       与 print-vt-recursive 的截断规则严格一致：
+                       截断时 = 头 threshold 个 ∪ 尾 threshold 个；否则 = 全部。"
+                      (let ((edge *vt-print-threshold*))
+                        (if (> dim (* 2 edge))
+                            (append (loop for i from 0 below edge collect i)
+                                    (loop for i from (- dim edge) below dim collect i))
+                            (loop for i from 0 below dim collect i))))
+                    (scan-axis (current-idxs axis)
+                      "递归遍历，把实际会被打印的每个元素都扫一遍，累计 max-width。"
+                      (let* ((dim (nth axis shape))
+                             (is-last (= axis (1- (length shape)))))
+                        (dolist (i (visible-indices dim))
+                          (if is-last
+                              (let* ((phys (%phys-idx obj (append current-idxs (list i))))
+                                     (w (length (%format-number
+                                                 (aref (vt-data obj) phys)
+                                                 element-type))))
+                                (setf max-width (max max-width w)))
+                              (scan-axis (append current-idxs (list i))
+                                         (1+ axis)))))))
+             (scan-axis nil 0))
            (incf max-width 1)
            (fresh-line stream)
            (format stream "  ")

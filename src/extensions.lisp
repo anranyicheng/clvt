@@ -50,82 +50,128 @@
 	(vt-from-sequence result :dtype dtype)
 	(vt-zeros '(0) :dtype dtype))))
 
+(defparameter *vt-einsum-label-pool*
+  (let ((chars '()))
+    (loop for code from 33 to 126         
+          for ch = (code-char code)
+          unless (member ch '(#\. #\, #\- #\>))
+	    do (push ch chars))
+    (coerce (nreverse chars) 'simple-vector))
+  "einsum 标签池。排除 . , - > 和空白后约 90 个唯一字符。
+   vt-einsum 解析器把每个非特殊字符视作一个独立标签，
+   因此本池容量即单次 einsum 允许的最大维度数上限。")
+
+(defun %vt-einsum-pool-size ()
+  "标签池容量。"
+  (length *vt-einsum-label-pool*))
+
+(defun %vt-einsum-labels (n &optional (start 0))
+  "从标签池的第 start 个位置开始取 n 个唯一标签。
+   若 n + start 超过池容量则报错。返回字符列表。"
+  (declare (type fixnum n start)
+           (optimize (speed 3) (safety 1)))
+  (let* ((pool *vt-einsum-label-pool*)
+         (size (length pool))
+         (end  (+ start n)))
+    (declare (type fixnum size end))
+    (when (> end size)
+      (error "einsum 标签池不足：需要 ~a 个标签（起始位置 ~a），池容量仅 ~a。
+              请降低参与 einsum 的张量维度。"
+             n start size))
+    (loop for i fixnum from start below end
+          collect (aref pool i))))
+
+(defun %vt-einsum-string (input-subs output-sub)
+  "把若干下标字符列表拼成 vt-einsum 接受的字符串，
+   例如 input-subs = ((#\\a #\\b) (#\\b #\\c)), output-sub = (#\\a #\\c)
+        返回 \"ab,bc->ac\"。"
+  (with-output-to-string (s)
+    (loop for sub in input-subs
+          for first = t then nil
+          do (unless first (write-char #\, s))
+             (dolist (ch sub) (write-char ch s)))
+    (write-string "->" s)
+    (dolist (ch output-sub) (write-char ch s))))
+
 (defun vt-inner (a b &key dtype out)
-  "内积（对标 numpy.inner）。"
+  "内积（对标 numpy.inner）。
+   - 1D × 1D：标量内积。
+   - ND × MD：a 的最后一维与 b 的最后一维收缩，
+     输出形状 = a.shape[:-1] ++ b.shape[:-1]。"
   (let* ((a-vt (ensure-vt a))
-	 (b-vt (ensure-vt b))
+         (b-vt (ensure-vt b))
          (ar (length (vt-shape a-vt)))
-	 (br (length (vt-shape b-vt))))
-    (cond ((and (= ar 1) (= br 1))
-	   (vt-einsum "i,i->" a-vt b-vt :dtype dtype :out out))
-          (t (let* ((af (1- ar)) (bf (1- br))
-				 (a-labels (loop for i below af
-						 collect (code-char (+ #.(char-code #\a) i))))
-				 (b-labels (loop for i below bf
-						 collect (code-char (+ #.(char-code #\a) (+ af i)))))
-				 (c-label #\z)
-				 (sub (format nil "~{~a~},~{~a~}->~{~a~}"
-					      (append a-labels (list c-label))
-					      (append b-labels (list c-label))
-					      (append a-labels b-labels))))
-               (vt-einsum sub a-vt b-vt :dtype dtype :out out))))))
+         (br (length (vt-shape b-vt))))
+    (cond
+      ((and (= ar 1) (= br 1))
+       (vt-einsum "i,i->" a-vt b-vt :dtype dtype :out out))
+      (t
+       (let* ((af (1- ar))
+              (bf (1- br))
+              (all     (%vt-einsum-labels (+ af bf 1)))
+              (a-free  (subseq all 0 af))            
+              (b-free  (subseq all af (+ af bf)))    
+              (c-label (nth (+ af bf) all))          
+              (a-sub   (append a-free (list c-label)))
+              (b-sub   (append b-free (list c-label)))
+              (out-sub (append a-free b-free))
+              (sub     (%vt-einsum-string (list a-sub b-sub) out-sub)))
+         (vt-einsum sub a-vt b-vt :dtype dtype :out out))))))
 
 (defun vt-tensordot (a b &key (axes 2))
-  "张量缩并（对标 numpy.tensordot）。"
+  "张量缩并（对标 numpy.tensordot）。
+   axes 为整数 n：a 的最后 n 维与 b 的前 n 维收缩。
+   axes 为 (a-axes b-axes)：按指定轴列表收缩（两列表长度必须相等）。"
   (let* ((a-vt (ensure-vt a))
-	 (b-vt (ensure-vt b))
+         (b-vt (ensure-vt b))
          (ar (length (vt-shape a-vt)))
-	 (br (length (vt-shape b-vt))))
+         (br (length (vt-shape b-vt))))
     (cond
       ((integerp axes)
        (let* ((n axes)
-	      (af (- ar n))
-	      (bf (- br n))
-              (all (loop for i below (+ af n bf)
-			 collect (code-char (+ #.(char-code #\a) i))))
-              (a-free (subseq all 0 af))
-	      (contract (subseq all af (+ af n)))
-              (b-free (subseq all (+ af n)))
-              (sub (format nil "~{~a~},~{~a~}->~{~a~}"
-                           (append a-free contract)
-			   (append contract b-free)
-			   (append a-free b-free))))
+              (af (- ar n))                      
+              (bf (- br n))                      
+              (all      (%vt-einsum-labels (+ af n bf)))
+              (a-free   (subseq all 0 af))       
+              (contract (subseq all af (+ af n)))
+              (b-free   (subseq all (+ af n)))   
+              (sub (%vt-einsum-string
+                    (list (append a-free contract)
+                          (append contract b-free))
+                    (append a-free b-free))))
          (vt-einsum sub a-vt b-vt)))
       ((and (listp axes) (= (length axes) 2))
-       (let* ((a-axes (if (listp (first axes))
-			  (first axes)
-			  (list (first axes))))
-              (b-axes (if (listp (second axes))
-			  (second axes)
-			  (list (second axes))))
+       (let* ((a-axes (if (listp (first axes))  (first axes)  (list (first axes))))
+              (b-axes (if (listp (second axes)) (second axes) (list (second axes))))
               (n (length a-axes)))
-         (unless (= n (length b-axes)) (error "axes 子列表长度必须一致"))
-         (let* ((all (loop for i below (+ (- ar n) n (- br n))
-			   collect (code-char (+ #.(char-code #\a) i))))
-                (a-free (loop for i below ar
-			      unless (member i a-axes)
-				collect (pop all)))
+         (unless (= n (length b-axes))
+           (error "axes 子列表长度必须一致"))
+         (let* ((af (- ar n))
+                (bf (- br n))
+                (all (%vt-einsum-labels (+ af n bf)))
+                (a-free   (loop for i below ar
+                                unless (member i a-axes)
+                                  collect (pop all)))
                 (contract (loop repeat n collect (pop all)))
-                (b-free (loop for i below br
-			      unless (member i b-axes)
-				collect (pop all)))
-                (a-sub (let ((fi 0)
-			     (ci 0)
-			     (res (make-list ar)))
+                (b-free   (loop for i below br
+                                unless (member i b-axes)
+                                  collect (pop all)))
+                (a-sub (let ((fi 0) (ci 0) (res (make-list ar)))
                          (loop for ax from 0 below ar do
-                           (setf (nth ax res) (if (member ax a-axes)
-						  (nth ci (prog1 contract (incf ci)))
-                                                  (nth fi (prog1 a-free (incf fi))))))
-			 res))
+                           (setf (nth ax res)
+                                 (if (member ax a-axes)
+                                     (nth ci (prog1 contract (incf ci)))
+                                     (nth fi (prog1 a-free   (incf fi))))))
+                         res))
                 (b-sub (let ((fi 0) (ci 0) (res (make-list br)))
                          (loop for ax from 0 below br do
                            (setf (nth ax res)
-				 (if (member ax b-axes)
-				     (nth (prog1 ci (incf ci)) contract)
-				     (nth (prog1 fi (incf fi)) b-free))))
+                                 (if (member ax b-axes)
+                                     (nth (prog1 ci (incf ci)) contract)
+                                     (nth (prog1 fi (incf fi)) b-free))))
                          res))
-                (sub (format nil "~{~a~},~{~a~}->~{~a~}"
-			     a-sub b-sub (append a-free b-free))))
+                (sub (%vt-einsum-string (list a-sub b-sub)
+                                        (append a-free b-free))))
            (vt-einsum sub a-vt b-vt))))
       (t (error "axes 必须是整数或两个整数列表")))))
 

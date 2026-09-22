@@ -5,21 +5,44 @@
 ;;; ------------------------------------------------------------------
 ;;; 重塑 / 视图 / 转置
 ;;; ------------------------------------------------------------------
-
 (defun %resolve-minus-one (new-shape total-size)
-  "解析形状中的 -1 占位符。"
-  (let ((neg-idx (position -1 new-shape)))
-    (if (null neg-idx)
-        new-shape
-        (let* ((known (reduce #'* (remove -1 new-shape) :initial-value 1))
-               (shape (copy-list new-shape)))
-          (cond ((zerop known)
-                 (if (zerop total-size)
-                     (progn (setf (nth neg-idx shape) 0) shape)
-                     (error "无法将形状 ~a 重塑为含 -1 的 ~a" nil new-shape)))
-                ((not (zerop (rem total-size known)))
-                 (error "无法将形状重塑为含 -1 的 ~a" new-shape))
-                (t (setf (nth neg-idx shape) (/ total-size known)) shape))))))
+  "解析形状中的 -1 占位符。
+   - 形状中最多允许出现一个 -1，多个 -1 报错。
+   - 若形状不含 -1，原样返回。
+   - 若含一个 -1：
+       * 已知维度乘积 known ≠ 0：要求 total-size 能被 known 整除，
+         该位置解析为 total-size / known；
+       * known = 0 且 total-size = 0：该位置解析为 0（与 NumPy 一致，
+         例如 shape=(0 -1)、total=0 → (0 0)）；
+       * known = 0 且 total-size ≠ 0：报错（无法确定未定维度）。"
+  (declare (list new-shape)
+           (type integer total-size)
+           (optimize (speed 3) (safety 1)))
+  (let ((n-neg (count -1 new-shape)))
+    (cond
+      ((zerop n-neg)
+       new-shape)
+      ((> n-neg 1)
+       (error "形状 ~a 中 -1 至多出现一次，实际出现 ~a 次"
+              new-shape n-neg))
+      (t
+       (let* ((neg-idx (position -1 new-shape))
+              (known   (reduce #'* (remove -1 new-shape) :initial-value 1))
+              (shape   (copy-list new-shape)))
+         (declare (type fixnum neg-idx)
+                  (type integer known))
+         (cond
+           ((zerop known)
+            (if (zerop total-size)
+                (progn (setf (nth neg-idx shape) 0) shape)
+                (error "无法将元素总数 ~a 重塑为形状 ~a（已知维度乘积为 0，-1 无法确定）"
+                       total-size new-shape)))
+           ((not (zerop (rem total-size known)))
+            (error "无法将元素总数 ~a 重塑为形状 ~a（不能被已知维度乘积 ~a 整除）"
+                   total-size new-shape known))
+           (t
+            (setf (nth neg-idx shape) (truncate total-size known))
+            shape)))))))
 
 (defun vt-view (vt new-shape)
   "零拷贝重塑视图（对标 pytorch tensor.view），要求输入连续。"
@@ -485,19 +508,49 @@
           (t (error "pad-width 长度 ~a 与秩 ~a 不匹配" (length pad-width) rank)))))
 
 (defun %pad-map (mode dist sk side)
+  "计算 padding 时，把越界坐标 dist 映射回原始轴 [0, sk) 内的索引。
+   dist  > 0，表示越界距离（从最近边界算起）。
+   sk    = 原轴长度（调用方保证 sk >= 0）。
+   side  = :left（左/上越界）或 :right（右/下越界）。
+   前置条件：dist > 0；sk > 0 或 mode 为 :constant（由调用方处理）。"
   (when (and (<= sk 0) (not (eq mode :constant)))
-    (error "无法用 mode ~a 扩展空轴" mode))
+    (error "无法用 mode ~a 扩展空轴 (sk=~a)" mode sk))
   (ecase mode
-    (:edge (if (eq side :left) 0 (1- sk)))
-    (:wrap (mod (if (eq side :left) (- sk dist) (1- dist)) sk))
-    (:reflect (let* ((period (* 2 (1- sk)))
-                     (x (if (eq side :left) dist (- sk 1 dist)))
-                     (idx (mod x period)))
-                (if (< idx sk) idx (- period idx))))
-    (:symmetric (let* ((period (* 2 sk))
-                       (x (if (eq side :left) (- dist) (+ sk dist -1)))
-                       (idx (mod x period)))
-                  (if (< idx sk) idx (- period idx 1))))))
+    ;; ---- :edge：越界一律取最近端点 ----
+    (:edge
+     (if (eq side :left)
+	 0
+	 (1- sk)))
+    ;; ---- :wrap：按 sk 取模循环 ----
+    (:wrap
+     (mod (if (eq side :left)
+	      (- sk dist)
+	      (1- dist)) sk))
+    ;; ---- :reflect：以边界为轴心反射，周期 = 2*(sk-1) ----
+    ;; sk = 1 时无法构成有效周期（period = 0），与 NumPy / scipy 一致报错。
+    (:reflect
+     (when (< sk 2)
+       (error "无法用 mode :reflect 扩展长度为 ~a 的轴（需 >= 2）" sk))
+     (let* ((period (* 2 (1- sk)))
+            (x   (if (eq side :left)
+		     dist
+		     (- sk 1 dist)))
+            (idx (mod x period)))
+       (if (< idx sk)
+	   idx
+	   (- period idx))))
+    ;; ---- :symmetric：以边界元素为轴心镜像，周期 = 2*sk ----
+    ;; sk = 1 时退化为常值映射到索引 0，天然安全，无需特殊处理。
+    (:symmetric
+     (let* ((period (* 2 sk))
+            (x   (if (eq side :left)
+		     (- dist)
+		     (+ sk dist -1)))
+            (idx (mod x period)))
+       (if (< idx sk)
+	   idx
+	   (- period idx 1))))))
+
 
 (defun vt-pad (vt pad-width &key (mode :constant) (constant-values 0))
   "对张量填充。mode: :constant/:edge/:wrap/:reflect/:symmetric。

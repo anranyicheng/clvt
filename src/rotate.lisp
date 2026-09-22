@@ -204,6 +204,7 @@
    (let ((m (clvt:vt-from-sequence '((1 0) (0 1)))))
      (vt-rotate m 30 :order 0 :reshape t :center '(0 0)))
   "
+  (assert (= 2 (vt-order tensor)))
   (let* ((shape (vt-shape tensor))
          (rows (first shape))
          (cols (second shape))
