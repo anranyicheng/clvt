@@ -243,6 +243,9 @@ main() {
             auto-compare-test
             numpy-compare-test
 	    extensions2-test
+	    nan-random-test
+	    property-test
+	    test-extensions
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)
