@@ -46,9 +46,11 @@
            (col-stride (second (vt-strides res)))
            (r-start (max 0 (- k)))
            (c-start (max 0 k))
-           (diag-len (max 0 (min (- rows r-start) (- cols c-start)))))
+           (diag-len (max 0 (min (- rows r-start)
+				 (- cols c-start)))))
       (when (> diag-len 0)
-        (let ((start-offset (+ (* r-start row-stride) (* c-start col-stride))))
+        (let ((start-offset (+ (* r-start row-stride)
+			       (* c-start col-stride))))
           (loop for i fixnum from 0 below diag-len
                 for offset fixnum = start-offset
 		  then (+ offset row-stride col-stride)
@@ -111,18 +113,21 @@
 优化：按 dtype 特化填充循环，避免逐元素 vt-cast 的 ecase 分派开销。"
   (when (<= num 0) (error "num 必须大于 0，当前值为 ~d" num))
   (when (= num 1)
-    (return-from vt-linspace (make-vt (list 1) (vt-cast start dtype) :dtype dtype)))
+    (return-from vt-linspace
+      (make-vt (list 1) (vt-cast start dtype) :dtype dtype)))
   (let* ((div (if endpoint (1- num) num))
          (step (/ (- end start) div)))
     (let ((data (make-array num :element-type (vt-dtype->lisp-type dtype))))
       (ecase dtype
         (:float64
-         (let ((s (coerce start 'double-float)) (d (coerce step 'double-float)))
+         (let ((s (coerce start 'double-float))
+	       (d (coerce step 'double-float)))
            (declare (double-float s d))
            (loop for i fixnum below num
                  do (setf (aref data i) (+ s (* d (coerce i 'double-float)))))))
         (:float32
-         (let ((s (coerce start 'single-float)) (d (coerce step 'single-float)))
+         (let ((s (coerce start 'single-float))
+	       (d (coerce step 'single-float)))
            (declare (single-float s d))
            (loop for i fixnum below num
                  do (setf (aref data i) (+ s (* d (coerce i 'single-float)))))))
@@ -164,7 +169,8 @@
     (labels ((recurse (depth indices flat-idx)
                (if (= depth rank)
                    (setf (aref data flat-idx) (vt-cast (funcall fn indices) dtype))
-                   (let ((dim (nth depth shape)) (stride (nth depth (vt-strides result))))
+                   (let ((dim (nth depth shape))
+			 (stride (nth depth (vt-strides result))))
                      (loop for i from 0 below dim
                            do (recurse (1+ depth) (append indices (list i))
                                        (+ flat-idx (* i stride))))))))
@@ -173,10 +179,14 @@
 
 (defun vt-kron (a b)
   "Kronecker 积（对标 numpy.kron）。"
-  (let ((a-shape (vt-shape a)) (b-shape (vt-shape b)))
-    (when (null a-shape) (setf a-shape '(1)))
-    (when (null b-shape) (setf b-shape '(1)))
-    (let* ((nda (length a-shape)) (ndb (length b-shape))
+  (let ((a-shape (vt-shape a))
+	(b-shape (vt-shape b)))
+    (when (null a-shape)
+      (setf a-shape '(1)))
+    (when (null b-shape)
+      (setf b-shape '(1)))
+    (let* ((nda (length a-shape))
+	   (ndb (length b-shape))
            (max-ndim (max nda ndb))
            (a-pad (append (make-list (- max-ndim nda) :initial-element 1) a-shape))
            (b-pad (append (make-list (- max-ndim ndb) :initial-element 1) b-shape))
@@ -185,8 +195,11 @@
             do (push da a-new) (push 1 a-new)
                (push 1 b-new) (push db b-new)
                (push (* da db) final))
-      (setf a-new (nreverse a-new) b-new (nreverse b-new) final (nreverse final))
-      (let ((a-r (vt-reshape a a-new)) (b-r (vt-reshape b b-new)))
+      (setf a-new (nreverse a-new))
+      (setf b-new (nreverse b-new))
+      (setf final (nreverse final))
+      (let ((a-r (vt-reshape a a-new))
+	    (b-r (vt-reshape b b-new)))
         (vt-view (vt-* a-r b-r) final)))))
 
 (defun vt-meshgrid (vts-list &key (indexing :xy) (sparse nil) (copy t))

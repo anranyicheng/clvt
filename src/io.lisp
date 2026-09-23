@@ -42,69 +42,70 @@
 (defun vt-from-sequence (contents &key (dtype :float64))
   "从嵌套序列创建张量（行主序）。支持任意维度规则嵌套；空序列 -> 形状 (0)。"
   (with-float-safe
-    (labels ((infer-shape (seq)
-               (typecase seq
-                 (list
-                  (if (null seq)
-                      (list 0)
-                      (let* ((first (car seq))
-                             (rest-shape (typecase first
-                                           (list (infer-shape first))
-                                           (vector (infer-shape first))
-                                           (t nil))))
-                        (if rest-shape
-                            (cons (length seq)
-                                  (loop for sub in (cdr seq)
-                                        unless (equal (infer-shape sub) rest-shape)
-                                          do (error "不规则嵌套")
-                                        finally (return rest-shape)))
-                            (progn
+    (labels
+	((infer-shape (seq)
+           (typecase seq
+             (list
+              (if (null seq)
+                  (list 0)
+                  (let* ((first (car seq))
+                         (rest-shape (typecase first
+                                       (list (infer-shape first))
+                                       (vector (infer-shape first))
+                                       (t nil))))
+                    (if rest-shape
+                        (cons (length seq)
                               (loop for sub in (cdr seq)
-                                    when (or (listp sub) (typep sub 'vector))
-                                      do (error "不规则嵌套"))
-                              (list (length seq)))))))
-                 (vector
-                  (let ((len (length seq)))
-                    (if (zerop len) (list 0)
-                        (let* ((first (aref seq 0))
-                               (rest-shape (typecase first
-                                             (list (infer-shape first))
-                                             (vector (infer-shape first))
-                                             (t nil))))
-                          (if rest-shape
-                              (cons len
-                                    (loop for i from 1 below len
-                                          for sub = (aref seq i)
-                                          unless (equal (infer-shape sub) rest-shape)
-                                            do (error "不规则嵌套")
-                                          finally (return rest-shape)))
-                              (progn
+                                    unless (equal (infer-shape sub) rest-shape)
+                                      do (error "不规则嵌套")
+                                    finally (return rest-shape)))
+                        (progn
+                          (loop for sub in (cdr seq)
+                                when (or (listp sub) (typep sub 'vector))
+                                  do (error "不规则嵌套"))
+                          (list (length seq)))))))
+             (vector
+              (let ((len (length seq)))
+                (if (zerop len) (list 0)
+                    (let* ((first (aref seq 0))
+                           (rest-shape (typecase first
+                                         (list (infer-shape first))
+                                         (vector (infer-shape first))
+                                         (t nil))))
+                      (if rest-shape
+                          (cons len
                                 (loop for i from 1 below len
                                       for sub = (aref seq i)
-                                      when (or (listp sub) (typep sub 'vector))
-                                        do (error "不规则嵌套"))
-                                (list len)))))))
-                 (t (error "无法从 ~s 创建张量" seq))))
-             (fill-tensor (data seq shape strides flat-idx)
-               (if (null shape)
-                   (setf (aref data flat-idx)
-                         (coerce seq (vt-dtype->lisp-type dtype)))
-                   (let ((stride (first strides)) (current flat-idx))
-                     (typecase seq
-                       (list
-                        (dolist (elem seq)
-                          (fill-tensor data elem (rest shape) (rest strides) current)
-                          (incf current stride)))
-                       (vector
-                        (loop for elem across seq do
-                          (fill-tensor data elem (rest shape) (rest strides) current)
-                          (incf current stride)))
-                       (t (error "fill-tensor: 不支持的序列类型")))))))
+                                      unless (equal (infer-shape sub) rest-shape)
+                                        do (error "不规则嵌套")
+                                      finally (return rest-shape)))
+                          (progn
+                            (loop for i from 1 below len
+                                  for sub = (aref seq i)
+                                  when (or (listp sub) (typep sub 'vector))
+                                    do (error "不规则嵌套"))
+                            (list len)))))))
+             (t (error "无法从 ~s 创建张量" seq))))
+         (fill-tensor (data seq shape strides flat-idx)
+           (if (null shape)
+               (setf (aref data flat-idx)
+                     (coerce seq (vt-dtype->lisp-type dtype)))
+               (let ((stride (first strides)) (current flat-idx))
+                 (typecase seq
+                   (list
+                    (dolist (elem seq)
+                      (fill-tensor data elem (rest shape) (rest strides) current)
+                      (incf current stride)))
+                   (vector
+                    (loop for elem across seq do
+                      (fill-tensor data elem (rest shape) (rest strides) current)
+                      (incf current stride)))
+                   (t (error "fill-tensor: 不支持的序列类型")))))))
       (let* ((shape (infer-shape contents))
              (size (vt-shape-to-size shape))
              (lisp-type (vt-dtype->lisp-type dtype))
              (data (make-array size :element-type lisp-type
-                                     :initial-element (coerce 0 lisp-type)))
+                                    :initial-element (coerce 0 lisp-type)))
              (strides (vt-compute-strides shape)))
         (fill-tensor data contents shape strides 0)
         (%make-vt :data data :shape shape :strides strides :offset 0 :dtype dtype)))))
@@ -112,31 +113,34 @@
 (defun vt-flatten-to-nested (dims data)
   "将行主序一维 data 转换为符合 dims 的嵌套列表。"
   (let ((idx 0))
-    (labels ((recurse (dims)
-               (if (null dims)
-                   (prog1 (aref data idx) (incf idx))
-                   (let ((n (first dims)) (result nil))
-                     (dotimes (i n)
-                       (declare (fixnum i))
-                       (push (recurse (rest dims)) result))
-                     (nreverse result)))))
+    (labels
+	((recurse (dims)
+           (if (null dims)
+               (prog1 (aref data idx) (incf idx))
+               (let ((n (first dims)) (result nil))
+                 (dotimes (i n)
+                   (declare (fixnum i))
+                   (push (recurse (rest dims)) result))
+                 (nreverse result)))))
       (recurse dims))))
 
 (defun vt-to-list (vt)
   "将张量转换为嵌套列表，正确处理任意 strides/offset 的视图。"
-  (labels ((build (shape strides offset data)
-             (if (null shape)
-                 (aref data offset)
-                 (let ((dim (first shape))
-		       (stride (first strides))
-		       (result nil))
-                   (loop for i fixnum from (1- dim) downto 0
-                         for sub = (+ offset (* i stride))
-                         do (push (build (rest shape) (rest strides) sub data)
-				  result))
-                   result))))
-    (let ((shape (vt-shape vt)) (strides (vt-strides vt))
-          (offset (vt-offset vt)) (data (vt-data vt)))
+  (labels
+      ((build (shape strides offset data)
+         (if (null shape)
+             (aref data offset)
+             (let ((dim (first shape))
+		   (stride (first strides))
+		   (result nil))
+               (loop for i fixnum from (1- dim) downto 0
+                     for sub = (+ offset (* i stride))
+                     do (push (build (rest shape) (rest strides) sub data)
+			      result))
+               result))))
+    (let ((shape (vt-shape vt))
+	  (strides (vt-strides vt))
+	  (offset (vt-offset vt)) (data (vt-data vt)))
       (if shape
           (build shape strides offset data)
           (aref data offset)))))
@@ -229,21 +233,24 @@
       (cond
         ((not truncated-p)
          (loop for i from 0 below dim-size
-               when (> i 0) do (if is-last-axis
-                                   (write-string ", " stream)
-                                   (format stream ",~%~v@a" current-level-indent ""))
+               when (> i 0)
+		 do (if is-last-axis
+                        (write-string ", " stream)
+                        (format stream ",~%~v@a" current-level-indent ""))
                do (print-item i)))
         (t
          (loop for i from 0 below edge
-               when (> i 0) do (if is-last-axis
-                                   (write-string ", " stream)
-                                   (format stream ",~%~v@a" current-level-indent ""))
+               when (> i 0)
+		 do (if is-last-axis
+                        (write-string ", " stream)
+                        (format stream ",~%~v@a" current-level-indent ""))
                do (print-item i))
          (if is-last-axis
              (format stream ", ...")
              (format stream ",~%~v@a..." current-level-indent ""))
          (loop for i from (- dim-size edge) below dim-size
-               do (progn (if is-last-axis
+               do
+		  (progn (if is-last-axis
                              (write-string ", " stream)
                              (format stream ",~%~v@a" current-level-indent ""))
                          (print-item i))))))

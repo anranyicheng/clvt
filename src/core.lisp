@@ -55,7 +55,8 @@
   (declare (list shape) (optimize (speed 3) (safety 0)))
   (if (null shape)
       nil
-      (let ((result nil) (stride 1))
+      (let ((result nil)
+	    (stride 1))
         (declare (type fixnum stride))
         (do ((tail (reverse shape) (cdr tail)))
             ((null tail) result)
@@ -159,12 +160,13 @@
     (declare (type fixnum target-len orig-len rank-diff))
     (when (minusp rank-diff)
       (error "vt-broadcast-strides: 原始形状 ~a 的秩大于目标形状 ~a" orig-shape target-shape))
-    (let ((t-tail result) (t-shp target-shape))
+    (let ((t-tail result)
+	  (t-shp target-shape))
       (dotimes (i rank-diff)
         (declare (type fixnum i))
-        (setf (car t-tail) 0
-              t-tail (cdr t-tail)
-              t-shp (cdr t-shp)))
+        (setf (car t-tail) 0)
+	(setf t-tail (cdr t-tail))
+	(setf t-shp (cdr t-shp)))
       (do ((o-shp orig-shape (cdr o-shp))
            (o-str orig-strides (cdr o-str)))
           ((null o-shp) result)
@@ -172,9 +174,12 @@
               (o-dim (the fixnum (car o-shp))))
           (unless (or (= o-dim t-dim) (= o-dim 1))
             (error "vt-broadcast-strides: 形状不匹配! ~a vs ~a" o-dim t-dim))
-          (setf (car t-tail) (if (= o-dim 1) 0 (the fixnum (car o-str)))
-                t-tail (cdr t-tail)
-                t-shp (cdr t-shp)))))))
+          (setf (car t-tail)
+		(if (= o-dim 1)
+		    0
+		    (the fixnum (car o-str))))
+          (setf t-tail (cdr t-tail))
+          (setf t-shp (cdr t-shp)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 轴归一化
@@ -208,8 +213,10 @@
 
 (defun vt-contiguous-p (vt)
   "判断张量是否为 C 连续（可安全重塑）。对标 numpy 的 c_contiguous 判定。"
-  (let ((shape (vt-shape vt)) (strides (vt-strides vt)))
-    (if (or (null shape) (some #'zerop shape))
+  (let ((shape (vt-shape vt))
+	(strides (vt-strides vt)))
+    (if (or (null shape)
+	    (some #'zerop shape))
         t
         (let ((expected 1) (contiguous t))
           (declare (type fixnum expected))
@@ -273,23 +280,24 @@
         ;; ---- 连续视图 ----
         ((vt-contiguous-p tensor)
          (let ((in-et (array-element-type in-data)))
-           (macrolet ((spec (in-lt out-lt)
-                        (let ((expr (%astype-cast-form out-lt '(aref src p))))
-                          `(let ((src (the (simple-array ,in-lt (*)) in-data))
-                                 (dst (the (simple-array ,out-lt (*)) new-data))
-                                 (p in-offset))
-                             (declare (type (simple-array ,in-lt (*)) src)
-                                      (type (simple-array ,out-lt (*)) dst)
-                                      (type fixnum p))
-                             (dotimes (i size)
-                               (setf (aref dst i) ,expr)
-                               (incf p)))))
-                      (memcpy (lt)
-                        `(replace (the (simple-array ,lt (*)) new-data)
-                                  (the (simple-array ,lt (*)) in-data)
-                                  :start1 0 :end1 size
-                                  :start2 in-offset
-                                  :end2 (the fixnum (+ in-offset size)))))
+           (macrolet
+	       ((spec (in-lt out-lt)
+                  (let ((expr (%astype-cast-form out-lt '(aref src p))))
+                    `(let ((src (the (simple-array ,in-lt (*)) in-data))
+                           (dst (the (simple-array ,out-lt (*)) new-data))
+                           (p in-offset))
+                       (declare (type (simple-array ,in-lt (*)) src)
+                                (type (simple-array ,out-lt (*)) dst)
+                                (type fixnum p))
+                       (dotimes (i size)
+                         (setf (aref dst i) ,expr)
+                         (incf p)))))
+                (memcpy (lt)
+                  `(replace (the (simple-array ,lt (*)) new-data)
+                            (the (simple-array ,lt (*)) in-data)
+                            :start1 0 :end1 size
+                            :start2 in-offset
+                            :end2 (the fixnum (+ in-offset size)))))
              (cond
                ;; ============================================================
                ;; 同型 memcpy
@@ -442,8 +450,10 @@
 (defun vt-copy-into (dest src)
   "将 src 拷贝到 dest（支持广播与类型转换）。返回 dest。"
   (setf src (ensure-vt src))
-  (let ((dest-shape (vt-shape dest)) (src-shape (vt-shape src)))
-    (loop for d in dest-shape for s in (vt-strides dest)
+  (let ((dest-shape (vt-shape dest))
+	(src-shape (vt-shape src)))
+    (loop for d in dest-shape
+	  for s in (vt-strides dest)
           when (and (> d 1) (zerop s))
             do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d))
     (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
@@ -457,15 +467,19 @@
              (size (vt-shape-to-size dest-shape)))
         (cond
           ;; 极速：连续 + 同型 -> memcpy
-          ((and (vt-contiguous-p dest) (vt-contiguous-p src)
-                (equal dest-shape src-shape) (equal dest-dtype src-dtype))
+          ((and (vt-contiguous-p dest)
+		(vt-contiguous-p src)
+                (equal dest-shape src-shape)
+		(equal dest-dtype src-dtype))
            (replace dest-data src-data
                     :start1 (vt-offset dest) :end1 (+ (vt-offset dest) size)
                     :start2 (vt-offset src) :end2 (+ (vt-offset src) size)))
           ;; 中速：连续 + 同形 -> 单层类型转换循环
-          ((and (vt-contiguous-p dest) (vt-contiguous-p src)
+          ((and (vt-contiguous-p dest)
+		(vt-contiguous-p src)
                 (equal dest-shape src-shape))
-           (let ((d-off (vt-offset dest)) (s-off (vt-offset src)))
+           (let ((d-off (vt-offset dest))
+		 (s-off (vt-offset src)))
              (declare (type fixnum d-off s-off size))
              (if (equal dest-dtype src-dtype)
                  ;; 同型：直接 replace，零转换开销
@@ -506,7 +520,8 @@
              (type (simple-array fixnum (*)) indices)
              (type fixnum d-ptr s-ptr rank)
              (type (or null function) caster))
-    (when (zerop size) (return-from %copy-strided nil))
+    (when (zerop size)
+      (return-from %copy-strided nil))
     (loop
       (setf (aref dest-data d-ptr)
             (if caster
@@ -514,7 +529,8 @@
                 (aref src-data s-ptr)))
       (let ((depth (1- rank)))
         (loop
-          (when (< depth 0) (return-from %copy-strided nil))
+          (when (< depth 0)
+	    (return-from %copy-strided nil))
           (incf (aref indices depth))
           (if (< (aref indices depth) (svref dims depth))
               (progn (incf d-ptr (svref d-strs depth))

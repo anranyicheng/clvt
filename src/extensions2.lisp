@@ -155,12 +155,14 @@
       (loop for j fixnum below cols do
         (when (>= (- j i) k)
           (push i rows) (push j cl))))
-    (values (vt-from-array (make-array (length rows) :element-type '(signed-byte 64)
-                                                 :initial-contents (nreverse rows))
-                           :dtype :int64)
-            (vt-from-array (make-array (length cl) :element-type '(signed-byte 64)
-                                                 :initial-contents (nreverse cl))
-                           :dtype :int64))))
+    (values (vt-from-array
+	     (make-array (length rows) :element-type '(signed-byte 64)
+                                       :initial-contents (nreverse rows))
+             :dtype :int64)
+            (vt-from-array
+	     (make-array (length cl) :element-type '(signed-byte 64)
+                                     :initial-contents (nreverse cl))
+             :dtype :int64))))
 
 ;;; ------------------------------------------------------------------
 ;;; 6. vander

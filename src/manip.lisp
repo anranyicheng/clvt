@@ -136,7 +136,10 @@
          (ax1 (vt-normalize-axis axis1 rank))
          (ax2 (vt-normalize-axis axis2 rank)))
     (vt-transpose vt (loop for i from 0 below rank
-                           collect (cond ((= i ax1) ax2) ((= i ax2) ax1) (t i))))))
+                           collect
+			   (cond ((= i ax1) ax2)
+				 ((= i ax2) ax1)
+				 (t i))))))
 
 (defun vt-moveaxis (tensor source destination)
   "移动轴。source/destination 可为整数或整数列表。"
@@ -194,7 +197,8 @@
     (unless (equal bs new-shape)
       (error "形状 ~a 不能广播到 ~a" (vt-shape vt) new-shape))
     (%make-vt :data (vt-data vt) :shape new-shape
-              :strides (vt-broadcast-strides (vt-shape vt) new-shape (vt-strides vt))
+              :strides (vt-broadcast-strides
+			(vt-shape vt) new-shape (vt-strides vt))
               :offset (vt-offset vt) :dtype (vt-dtype vt))))
 
 ;;; ------------------------------------------------------------------
@@ -209,12 +213,14 @@
                   :strides (mapcar #'- strides)
                   :offset (+ (vt-offset vt)
                              (loop for d in shape
-				   for s in strides sum (* (1- d) s)))
+				   for s in strides
+				   sum (* (1- d) s)))
                   :dtype (vt-dtype vt))
         (let* ((rank (length shape))
                (ax (vt-normalize-axis axis rank))
                (strides (copy-list strides))
-               (dim (nth ax shape)) (old-stride (nth ax strides)))
+               (dim (nth ax shape))
+	       (old-stride (nth ax strides)))
           (setf (nth ax strides) (- old-stride))
           (%make-vt :data (vt-data vt) :shape shape :strides strides
                     :offset (+ (vt-offset vt) (* (1- dim) old-stride))
@@ -239,19 +245,28 @@
          (if (zerop n) vt
              (let ((s (mod (car shift-list) n)))
                (if (zerop s) vt
-                   (vt-concatenate ax
-				   (apply #'vt-slice vt (loop for i below (length sh)
-							      collect (if (= i ax) (list (- n s) n) '(:all))))
-				   (apply #'vt-slice vt (loop for i below (length sh)
-							      collect (if (= i ax) (list 0 (- n s)) '(:all))))))))))
+                   (vt-concatenate
+		    ax
+		    (apply #'vt-slice vt (loop for i below (length sh)
+					       collect
+					       (if (= i ax)
+						   (list (- n s) n)
+						   '(:all))))
+		    (apply #'vt-slice vt (loop for i below (length sh)
+					       collect
+					       (if (= i ax)
+						   (list 0 (- n s))
+						   '(:all))))))))))
       (t
        (let* ((flat (vt-flatten vt)) (n (vt-size flat)))
          (if (zerop n) (vt-reshape flat (vt-shape vt))
              (let ((s (mod (car shift-list) n)))
-               (if (zerop s) (vt-reshape flat (vt-shape vt))
-                   (vt-reshape (vt-concatenate 0
-					       (vt-slice flat (list (- n s) n))
-					       (vt-slice flat (list 0 (- n s))))
+               (if (zerop s)
+		   (vt-reshape flat (vt-shape vt))
+                   (vt-reshape (vt-concatenate
+				0
+				(vt-slice flat (list (- n s) n))
+				(vt-slice flat (list 0 (- n s))))
                                (vt-shape vt))))))))))
 
 ;;; ------------------------------------------------------------------
@@ -260,9 +275,11 @@
 
 (defun vt-narrow (vt axis start end)
   "零拷贝切片（等价 pytorch narrow）。"
-  (let* ((shape (copy-list (vt-shape vt))) (rank (length shape))
-					   (ax (vt-normalize-axis axis rank)) (strides (vt-strides vt))
-					   (dim-size (nth ax shape)))
+  (let* ((shape (copy-list (vt-shape vt)))
+	 (rank (length shape))
+	 (ax (vt-normalize-axis axis rank))
+	 (strides (vt-strides vt))
+	 (dim-size (nth ax shape)))
     (when (or (< start 0) (> end dim-size))
       (error "切片索引 [~a, ~a) 越界，轴大小 ~a" start end dim-size))
     (when (< end start)
@@ -274,14 +291,17 @@
 
 (defun vt-split (tensor indices-or-sections &key (axis 0))
   "沿轴分割（对标 numpy array_split）。"
-  (let* ((shape (vt-shape tensor)) (rank (length shape))
-				   (ax (vt-normalize-axis axis rank)) (dim-size (nth ax shape)))
+  (let* ((shape (vt-shape tensor))
+	 (rank (length shape))
+	 (ax (vt-normalize-axis axis rank))
+	 (dim-size (nth ax shape)))
     (cond
       ((integerp indices-or-sections)
        (let* ((n indices-or-sections)
               (base (floor dim-size n))
 	      (rem (rem dim-size n)))
-         (loop with start = 0 for i from 0 below n
+         (loop with start = 0
+	       for i from 0 below n
                for chunk = (if (< i rem) (1+ base) base)
                collect (prog1 (vt-narrow tensor ax start (+ start chunk))
                          (incf start chunk)))))
@@ -289,7 +309,8 @@
        (let ((points (append '(0) indices-or-sections (list dim-size))))
          (setf points (mapcar (lambda (p) (if (minusp p) (+ p dim-size) p)) points))
          (setf points (mapcar (lambda (p) (max 0 (min p dim-size))) points))
-         (loop for (s e) on points by #'cdr while e
+         (loop for (s e) on points by #'cdr
+	       while e
                collect (vt-narrow tensor ax s e))))
       (t (error "indices-or-sections 必须是整数或整数列表")))))
 
@@ -301,7 +322,8 @@
       (vt-split vt indices-or-sections :axis 0)
       (vt-split vt indices-or-sections :axis 1)))
 
-(defun vt-dsplit (vt indices-or-sections) (vt-split vt indices-or-sections :axis 2))
+(defun vt-dsplit (vt indices-or-sections)
+  (vt-split vt indices-or-sections :axis 2))
 
 ;;; ------------------------------------------------------------------
 ;;; 三角与对角
@@ -309,11 +331,12 @@
 
 (defun vt-triu (tensor &key (k 0))
   "上三角矩阵（支持 batch）。"
-  (let* ((res (vt-copy tensor)) (res-data (vt-data res))
-				(rank (length (vt-shape res)))
-				(shape-vec (coerce (vt-shape res) 'simple-vector))
-				(strs-vec (coerce (vt-strides res) 'simple-vector))
-				(zero (coerce 0 (vt-element-type res))))
+  (let* ((res (vt-copy tensor))
+	 (res-data (vt-data res))
+	 (rank (length (vt-shape res)))
+	 (shape-vec (coerce (vt-shape res) 'simple-vector))
+	 (strs-vec (coerce (vt-strides res) 'simple-vector))
+	 (zero (coerce 0 (vt-element-type res))))
     (when (< rank 2) (error "vt-triu 要求秩 >= 2"))
     (labels ((recurse (depth ptr)
                (if (= depth (- rank 2))
@@ -335,11 +358,12 @@
 
 (defun vt-tril (tensor &key (k 0))
   "下三角矩阵（支持 batch）。"
-  (let* ((res (vt-copy tensor)) (res-data (vt-data res))
-				(rank (length (vt-shape res)))
-				(shape-vec (coerce (vt-shape res) 'simple-vector))
-				(strs-vec (coerce (vt-strides res) 'simple-vector))
-				(zero (coerce 0 (vt-element-type res))))
+  (let* ((res (vt-copy tensor))
+	 (res-data (vt-data res))
+	 (rank (length (vt-shape res)))
+	 (shape-vec (coerce (vt-shape res) 'simple-vector))
+	 (strs-vec (coerce (vt-strides res) 'simple-vector))
+	 (zero (coerce 0 (vt-element-type res))))
     (when (< rank 2) (error "vt-tril 要求秩 >= 2"))
     (labels ((recurse (depth ptr)
                (if (= depth (- rank 2))
@@ -402,15 +426,16 @@
   (let* ((shape (vt-shape tensor)) (rank (length shape)))
     (cond
       ((= rank 1)
-       (let* ((n (first shape)) (dim (+ n (abs k)))
-				(res (vt-zeros (list dim dim) :dtype (vt-dtype tensor)))
-				(res-data (vt-data res))
-				(in-data (vt-data tensor))
-				(in-offset (vt-offset tensor))
-				(in-stride (first (vt-strides tensor)))
-				(row-stride (first (vt-strides res)))
-				(col-stride (second (vt-strides res)))
-				(start (if (> k 0) (* k col-stride) (* (- k) row-stride))))
+       (let* ((n (first shape))
+	      (dim (+ n (abs k)))
+	      (res (vt-zeros (list dim dim) :dtype (vt-dtype tensor)))
+	      (res-data (vt-data res))
+	      (in-data (vt-data tensor))
+	      (in-offset (vt-offset tensor))
+	      (in-stride (first (vt-strides tensor)))
+	      (row-stride (first (vt-strides res)))
+	      (col-stride (second (vt-strides res)))
+	      (start (if (> k 0) (* k col-stride) (* (- k) row-stride))))
          (loop for i from 0 below n
                for src = (+ in-offset (* i in-stride))
                for dst = start then (+ dst row-stride col-stride)
@@ -433,7 +458,9 @@
              (parts (loop for i from 0 below size
 			  for rep in reps
                           when (> rep 0)
-                            collect (make-vt (list rep) (vt-ref flat i) :dtype (vt-dtype vt)))))
+                            collect
+			    (make-vt (list rep) (vt-ref flat i)
+				     :dtype (vt-dtype vt)))))
         (if parts
 	    (apply #'vt-concatenate 0 parts)
 	    (vt-zeros '(0) :dtype (vt-dtype vt))))
@@ -443,17 +470,19 @@
              (reps (if (listp repeats)
 		       repeats
 		       (make-list ax-size :initial-element repeats)))
-             (slices (loop for i from 0 below ax-size
-			   for rep in reps
-                           for part = (apply #'vt-slice vt
-                                             (loop for d below (length sh)
-                                                   collect (if (= d ax)
-							       (list i (1+ i))
-							       '(:all))))
-                           when (> rep 0)
-                             collect (if (= rep 1) part
-                                         (apply #'vt-concatenate ax (loop repeat rep
-									  collect part))))))
+             (slices
+	       (loop for i from 0 below ax-size
+		     for rep in reps
+                     for part = (apply #'vt-slice vt
+                                       (loop for d below (length sh)
+                                             collect (if (= d ax)
+							 (list i (1+ i))
+							 '(:all))))
+                     when (> rep 0)
+                       collect (if (= rep 1) part
+                                   (apply #'vt-concatenate
+					  ax (loop repeat rep
+						   collect part))))))
         (if slices (apply #'vt-concatenate ax slices)
             (let ((zero-shape (copy-list sh)))
               (setf (nth ax zero-shape) 0)
@@ -464,13 +493,17 @@
   (let* ((sh (vt-shape vt))
          (reps-list (if (listp reps) reps (list reps)))
          (ndim (max (length sh) (length reps-list)))
-         (padded-sh (append (make-list (- ndim (length sh)) :initial-element 1) sh))
-         (padded-reps (append (make-list (- ndim (length reps-list)) :initial-element 1) reps-list))
+         (padded-sh (append (make-list (- ndim (length sh))
+				       :initial-element 1) sh))
+         (padded-reps (append (make-list (- ndim (length reps-list))
+					 :initial-element 1) reps-list))
          (result (vt-reshape vt padded-sh)))
     (loop for axis from 0 below ndim
 	  for rep = (nth axis padded-reps)
           when (> rep 1)
-            do (setf result (apply #'vt-concatenate axis (loop repeat rep collect result))))
+            do (setf result (apply #'vt-concatenate
+				   axis
+				   (loop repeat rep collect result))))
     (vt-view result (mapcar #'* padded-sh padded-reps))))
 
 ;;; ------------------------------------------------------------------

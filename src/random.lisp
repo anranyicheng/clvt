@@ -6,9 +6,9 @@
   "clvt 内部默认随机状态。")
 
 (defun vt-make-random-state (&optional seed)
- (if (null seed)
-	     (make-random-state nil)
-	     (sb-ext::seed-random-state seed)))
+  (if (null seed)
+      (make-random-state nil)
+      (sb-ext::seed-random-state seed)))
 
 (defvar *vt-random-state-lock*
   (sb-thread:make-mutex :name "vt-random-state"))
@@ -23,7 +23,7 @@
   (sb-thread:with-mutex (*vt-random-state-lock*)
     (make-random-state *vt-default-random-state*)))
 
-  (declaim (inline %uniform-rand %normal-rand))
+(declaim (inline %uniform-rand %normal-rand))
 (defun %uniform-rand (state)
   (random 1.0d0 state))
 
@@ -219,7 +219,7 @@
 	    (rotatef (aref data i) (aref data j))))
         arr)
       (let* ((tensor (ensure-vt n)) (result (vt-copy tensor))
-             (first-dim (first (vt-shape result))))
+				    (first-dim (first (vt-shape result))))
         (loop for i from (1- first-dim) downto 1 do
           (let* ((j (random (1+ i) rng))
                  (si (vt-slice result (list i)))

@@ -219,7 +219,6 @@
   ;; "内联类型转换：整数截断，浮点 coerce。"
   "内联类型转换：整数类型走安全 coerce/回绕，浮点 coerce。"
   (declare (optimize (speed 3) (safety 0)))
-  ;; `(if ,(subtypep lt 'integer) (truncate ,form) (coerce ,form ',lt)))
   (cond ((equal lt '(signed-byte 64)) `(%coerce-int64 ,form))
         ((equal lt '(signed-byte 32)) `(%coerce-int32 ,form))
         ((subtypep lt 'integer)        `(truncate ,form))
@@ -278,7 +277,10 @@
 (defmacro vt-fast-map (fn &rest args)
   "编译期内联已知算子的逐元素映射（一元/二元）；否则回退到 vt-map。"
   (declare (optimize (speed 3) (safety 0)))
-  (let ((op (and (consp fn) (eq (car fn) 'function) (symbolp (cadr fn)) (cadr fn))))
+  (let ((op (and (consp fn)
+		 (eq (car fn) 'function)
+		 (symbolp (cadr fn))
+		 (cadr fn))))
     (if (null op)
         `(apply #'vt-map ,fn ,@args)
         (multiple-value-bind (tensors dtype out)

@@ -9,10 +9,12 @@
   (let* ((shapes (mapcar #'vt-shape vts))
          (rank (length (car shapes)))
          (ax (vt-normalize-axis axis rank)))
-    (loop for shape in shapes for i from 0
+    (loop for shape in shapes
+	  for i from 0
           do (unless (= (length shape) rank)
 	       (error "张量 ~a 秩不匹配" i))
-             (loop for d in shape for j from 0
+             (loop for d in shape
+		   for j from 0
                    unless (or (= j ax) (= d (nth j (car shapes))))
                      do (error "形状不匹配")))
     (let* ((new-shape (copy-list (car shapes)))
@@ -83,7 +85,7 @@
          (values-vt (ensure-vt values :dtype (vt-dtype arr-vt))))
     (if (null axis)
         (let* ((flat (vt-flatten arr-vt)) (flat-val (vt-flatten values-vt))
-               (val-size (vt-size flat-val)))
+					  (val-size (vt-size flat-val)))
           (if (integerp obj)
               (let* ((size (vt-size flat))
                      (pos (if (minusp obj) (+ size obj) obj)))
@@ -101,7 +103,8 @@
                   (error "flat mode: values 大小 ~a ≠ 索引数 ~a" val-size num))
                 (let ((pairs (stable-sort
                               (if (= val-size 1)
-                                  (loop for idx in obj collect (cons idx flat-val))
+                                  (loop for idx in obj
+					collect (cons idx flat-val))
                                   (loop for idx in obj
 					for i from 0 below val-size
                                         collect (cons idx (vt-narrow flat-val 0 i (1+ i)))))
@@ -123,27 +126,32 @@
 					    (vt-zeros '(0) :dtype (vt-dtype result)))))
                              (setf result (vt-concatenate 0 left val right)))
                         finally (return result))))))
-        (let* ((shape (vt-shape arr-vt)) (rank (length shape))
-               (ax (vt-normalize-axis axis rank))
-               (ax-size (nth ax shape))
-               (obj-list (if (listp obj) obj (list obj)))
-               (num (length obj-list))
-               (target-shape (loop for i below rank
-				   collect (if (= i ax) num (nth i shape))))
-               (values-vt (if (null (vt-shape values-vt))
-                              (vt-full target-shape (vt-ref values-vt) :dtype (vt-dtype values-vt))
-                              values-vt))
-               (values-reshaped (vt-reshape values-vt target-shape))
-               (arr-slices (loop for i from 0 below ax-size
-				 collect (vt-narrow arr-vt ax i (1+ i))))
-               (value-blocks (if (= num 1)
-                                 (list values-reshaped)
-                                 (loop for i from 0 below num
-				       collect (vt-narrow values-reshaped ax i (1+ i)))))
-               (pairs (stable-sort (loop for pos in obj-list
+        (let* ((shape (vt-shape arr-vt))
+	       (rank (length shape))
+	       (ax (vt-normalize-axis axis rank))
+	       (ax-size (nth ax shape))
+	       (obj-list (if (listp obj) obj (list obj)))
+	       (num (length obj-list))
+	       (target-shape
+		 (loop for i below rank
+		       collect (if (= i ax) num (nth i shape))))
+	       (values-vt
+		 (if (null (vt-shape values-vt))
+		     (vt-full target-shape (vt-ref values-vt) :dtype (vt-dtype values-vt))
+		     values-vt))
+	       (values-reshaped (vt-reshape values-vt target-shape))
+	       (arr-slices
+		 (loop for i from 0 below ax-size
+		       collect (vt-narrow arr-vt ax i (1+ i))))
+	       (value-blocks
+		 (if (= num 1)
+		     (list values-reshaped)
+		     (loop for i from 0 below num
+			   collect (vt-narrow values-reshaped ax i (1+ i)))))
+	       (pairs (stable-sort (loop for pos in obj-list
 					 for b in value-blocks
 					 collect (cons pos b))
-                                   #'> :key #'car)))
+				   #'> :key #'car)))
           (loop with slices = (copy-list arr-slices)
                 for (raw-pos . block) in pairs
                 for size = (length slices)
@@ -155,14 +163,16 @@
 (defun vt-delete (arr obj &key (axis nil))
   "对标 numpy.delete 删除元素。"
   (let* ((tensor (ensure-vt arr)) (sh (vt-shape tensor)) (rank (length sh))
-         (dtype (vt-dtype tensor)))
+				  (dtype (vt-dtype tensor)))
     (labels ((norm-idx (idx dim)
                (let ((n (if (minusp idx) (+ idx dim) idx)))
-                 (unless (<= 0 n (1- dim)) (error "索引 ~d 越界（轴大小 ~d）" idx dim))
+                 (unless (<= 0 n (1- dim))
+		   (error "索引 ~d 越界（轴大小 ~d）" idx dim))
                  n))
              (norm-end (idx dim)
                (let ((n (if (minusp idx) (+ idx dim) idx)))
-                 (unless (<= 0 n dim) (error "切片端点 ~d 越界（轴大小 ~d）" idx dim))
+                 (unless (<= 0 n dim)
+		   (error "切片端点 ~d 越界（轴大小 ~d）" idx dim))
                  n))
              (keep (obj dim)
                (let ((del (make-hash-table :test 'eql)))
@@ -171,17 +181,20 @@
                          ((and (listp obj) (eq (first obj) :slice))
                           (destructuring-bind (_ s e) obj
                             (declare (ignore _))
-                            (let ((ss (norm-end s dim)) (ee (norm-end e dim)))
+                            (let ((ss (norm-end s dim))
+				  (ee (norm-end e dim)))
                               (loop for i from ss below ee do (add i)))))
                          ((listp obj) (dolist (idx obj) (add (norm-idx idx dim))))
                          (t (error "无效 obj 类型 ~a" obj))))
-                 (loop for i from 0 below dim unless (gethash i del) collect i))))
+                 (loop for i from 0 below dim
+		       unless (gethash i del) collect i))))
       (if (null axis)
           (let* ((flat (vt-ravel tensor)) (k (keep obj (vt-size flat))))
             (if k (vt-take flat (vt-from-sequence k :dtype :int64))
                 (vt-zeros '(0) :dtype dtype)))
-          (let* ((ax (vt-normalize-axis axis rank)) (dim (nth ax sh))
-                 (k (keep obj dim)))
+          (let* ((ax (vt-normalize-axis axis rank))
+		 (dim (nth ax sh))
+		 (k (keep obj dim)))
             (if k
                 (apply #'vt-concatenate ax (loop for i in k
 						 collect (vt-narrow tensor ax i (1+ i))))

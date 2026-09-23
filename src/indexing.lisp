@@ -262,7 +262,8 @@
 	     (vt-zeros (list 0 rank) :dtype final))
             ((> rank 0)
              (let ((final-data (make-array total :element-type lisp-type)))
-               (loop for i from 0 below total for idx across result
+               (loop for i from 0 below total
+		     for idx across result
                      do (setf (aref final-data i) idx))
                (%make-vt :data final-data :shape (list count rank) :strides (list rank 1)
                          :offset 0 :dtype final)))
@@ -417,10 +418,12 @@
 				  collect (aref (vt-data flat) i))))))
          (n-values (length val-list)) (shape (vt-shape tensor))
          (strides (vt-strides tensor)) (offset (vt-offset tensor)) (data (vt-data tensor)))
-    (loop for raw in idx-list for vi from 0
+    (loop for raw in idx-list
+	  for vi from 0
           for val = (nth (mod vi n-values) val-list)
           do (let ((idx raw))
-               (when (and (minusp idx) (>= idx (- total))) (incf idx total))
+               (when (and (minusp idx) (>= idx (- total)))
+		 (incf idx total))
                (cond ((and (>= idx 0) (< idx total)) nil)
                      ((eq mode :clip) (setq idx (max 0 (min idx (1- total)))))
                      ((eq mode :wrap) (setq idx (mod idx total)))
@@ -543,7 +546,8 @@
          (v-data (vt-data v-flat))
 	 (v-size (vt-size v-flat))
          (result (make-array v-size :element-type '(signed-byte 64))))
-    (loop for i from 0 below v-size for val = (aref v-data i)
+    (loop for i from 0 below v-size
+	  for val = (aref v-data i)
           do (let ((lo 0) (hi size))
                (loop while (< lo hi) do
                  (let ((mid (ash (+ lo hi) -1)))
@@ -559,13 +563,17 @@
 (defun vt-bincount (x &key (minlength 0))
   "统计非负整数出现次数。"
   (let* ((flat (vt-flatten x))
-         (maxval (if (zerop (vt-size flat)) -1 (vt-item (vt-amax flat))))
+         (maxval (if (zerop (vt-size flat))
+		     -1
+		     (vt-item (vt-amax flat))))
          (size (max (1+ maxval) minlength))
-         (result (make-array size :element-type '(signed-byte 64) :initial-element 0)))
+         (result (make-array size :element-type '(signed-byte 64)
+				  :initial-element 0)))
     (vt-do-each (ptr val flat)
       (declare (ignore ptr))
       (let ((idx (truncate val)))
-        (when (or (minusp idx) (>= idx size)) (error "vt-bincount: 索引 ~a 越界" idx))
+        (when (or (minusp idx) (>= idx size))
+	  (error "vt-bincount: 索引 ~a 越界" idx))
         (incf (aref result idx))))
     (%make-vt :data result :shape (list size) :strides '(1)
 	      :offset 0 :dtype :int64)))
