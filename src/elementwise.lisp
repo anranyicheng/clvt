@@ -4,38 +4,64 @@
 
 (defun vt-+ (&rest args)
   (with-float-safe
-    (case (length args)
-      (1 (vt-fast-map #'+ (first args)))
-      (2 (vt-fast-map #'+ (first args) (second args)))
-      (3 (vt-fast-map #'+ (first args) (second args) (third args))) 
-      (t (apply #'vt-map #'+ args)))))
+    (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
+      (case (length tensors)
+        (1 (vt-fast-map #'+ (first tensors)
+                            :dtype dtype :out out))
+        (2 (vt-fast-map #'+ (first tensors)
+                            (second tensors)
+                            :dtype dtype :out out))
+        (3 (vt-fast-map #'+ (first tensors)
+                            (second tensors)
+                            (third tensors)
+                            :dtype dtype :out out))
+        (t (apply #'vt-map #'+ args))))))
 
 (defun vt-* (&rest args)
   (with-float-safe
-    (case (length args)
-      (1 (vt-fast-map #'* (first args)))
-      (2 (vt-fast-map #'* (first args) (second args)))
-      (3 (vt-fast-map #'* (first args) (second args) (third args))) 
-      (t (apply #'vt-map #'* args)))))
+    (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
+      (case (length tensors)
+        (1 (vt-fast-map #'* (first tensors)
+                            :dtype dtype :out out))
+        (2 (vt-fast-map #'* (first tensors)
+                            (second tensors)
+                            :dtype dtype :out out))
+        (3 (vt-fast-map #'* (first tensors)
+                            (second tensors)
+                            (third tensors)
+                            :dtype dtype :out out))
+        (t (apply #'vt-map #'* args))))))
 
 (defun vt-- (vt &rest args)
+  "一元：-vt；二元及以上：vt - arg1 - arg2 - ...
+   VT 是第一个张量，其余从 ARGS 解析。"
   (with-float-safe
-    (let ((first (ensure-vt vt)))
-      (cond ((null args) (vt-fast-map #'- first))
-            ((null (cdr args)) (vt-fast-map #'- first (first args)))
-            ((null (cddr args))                                 
-             (vt-fast-map #'- first (first args) (second args)))
-            (t (apply #'vt-map #'- first args))))))
+    (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
+      (let ((all (cons (ensure-vt vt) tensors)))
+        (case (length all)
+          (1 (vt-fast-map #'- (first all)
+                              :dtype dtype :out out))
+          (2 (vt-fast-map #'- (first all) (second all)
+                              :dtype dtype :out out))
+          (3 (vt-fast-map #'- (first all) (second all) (third all)
+                              :dtype dtype :out out))
+          (t (apply #'vt-map #'- all)))))))
 
 (defun vt-/ (vt &rest args)
+  "一元：1 / vt（倒数）；二元及以上：vt / arg1 / arg2 / ...
+   VT 是第一个张量，其余从 ARGS 解析。"
   (with-float-safe
-    (let ((first (ensure-vt vt)))
-      (cond ((null args)
-             (vt-fast-map #'/ (make-vt nil 1 :dtype (vt-dtype first)) first))
-            ((null (cdr args)) (vt-fast-map #'/ first (first args)))
-            ((null (cddr args))                               
-             (vt-fast-map #'/ first (first args) (second args)))
-            (t (apply #'vt-map #'/ first args))))))
+    (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
+      (let ((all (cons (ensure-vt vt) tensors)))
+        (case (length all)
+          (1 (vt-fast-map #'/ (make-vt nil 1 :dtype (vt-dtype (first all)))
+                              (first all)
+                              :dtype dtype :out out))
+          (2 (vt-fast-map #'/ (first all) (second all)
+                              :dtype dtype :out out))
+          (3 (vt-fast-map #'/ (first all) (second all) (third all)
+                              :dtype dtype :out out))
+          (t (apply #'vt-map #'/ all)))))))
 
 (defun vt-add (a b &key dtype out)
   (vt-fast-map #'+ a b :dtype dtype :out out))
@@ -114,10 +140,8 @@
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
     (cond
-      ;; 正整数幂：expt 对实数无错，无 try
       ((and (integerp power) (plusp power))
        (vt-map (lambda (x) (expt x power)) vt :out out :dtype dt))
-      ;; 其他：保留 handler-case
       (t
        (vt-map (lambda (x)
                  (let ((result (handler-case (expt x power)
@@ -220,56 +244,67 @@
 	    (let ((res (nth-value 0 (floor x divisor))))
               (if (floatp x) (float res x) res)))
 	  vt :out out :dtype dtype))
+
 (defun vt-ceiling (vt &key (divisor 1) out dtype)
   (vt-map (lambda (x)
 	    (let ((res (nth-value 0 (ceiling x divisor))))
               (if (floatp x) (float res x) res)))
 	  vt :out out :dtype dtype))
+
 (defun vt-round (vt &key (divisor 1) out dtype)
   (vt-map (lambda (x)
 	    (let ((res (nth-value 0 (round x divisor))))
               (if (floatp x) (float res x) res)))
 	  vt :out out :dtype dtype))
+
 (defun vt-truncate (vt &key (divisor 1) out dtype)
   (vt-map (lambda (x)
 	    (let ((res (nth-value 0 (truncate x divisor))))
               (if (floatp x) (float res x) res)))
 	  vt :out out :dtype dtype))
+
 (defun vt-rint (vt &key out dtype)
   (vt-map (lambda (x)
 	    (let ((res (nth-value 0 (round x))))
               (if (floatp x) (float res x) res)))
 	  vt :out out :dtype dtype))
 
+(declaim (inline %op-eq %op-ne %op-lt %op-le %op-gt %op-ge))
+(defun %op-eq (a b) (if (=  a b) 1.0d0 0.0d0))
+
+(defun %op-ne (a b) (if (/= a b) 1.0d0 0.0d0))
+
+(defun %op-lt (a b) (if (<  a b) 1.0d0 0.0d0))
+
+(defun %op-le (a b) (if (<= a b) 1.0d0 0.0d0))
+
+(defun %op-gt (a b) (if (>  a b) 1.0d0 0.0d0))
+
+(defun %op-ge (a b) (if (>= a b) 1.0d0 0.0d0))
+
 (defun vt-= (t1 t2 &key (dtype :float64) out)
-  (vt-map (lambda (a b)
-	    (if (= a b) 1.0d0 0.0d0))
-	  (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-eq (ensure-vt t1) (ensure-vt t2)
+               :dtype dtype :out out))
 
 (defun vt-/= (t1 t2 &key (dtype :float64) out)
-  (vt-map (lambda (a b)
-	    (if (/= a b) 1.0d0 0.0d0))
-	  (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-ne (ensure-vt t1) (ensure-vt t2)
+               :dtype dtype :out out))
 
 (defun vt-< (t1 t2 &key (dtype :float64) out)
-  (vt-map (lambda (a b)
-	    (if (< a b) 1.0d0 0.0d0))
-	  (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-lt (ensure-vt t1) (ensure-vt t2)
+               :dtype dtype :out out))
 
 (defun vt-<= (t1 t2 &key (dtype :float64) out)
-  (vt-map (lambda (a b)
-	    (if (<= a b) 1.0d0 0.0d0))
-	  (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-le (ensure-vt t1) (ensure-vt t2)
+               :dtype dtype :out out))
 
 (defun vt-> (t1 t2 &key (dtype :float64) out)
-  (vt-map (lambda (a b)
-	    (if (> a b) 1.0d0 0.0d0))
-	  (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-gt (ensure-vt t1) (ensure-vt t2)
+               :dtype dtype :out out))
 
 (defun vt->= (t1 t2 &key (dtype :float64) out)
-  (vt-map (lambda (a b)
-	    (if (>= a b) 1.0d0 0.0d0))
-	  (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-ge (ensure-vt t1) (ensure-vt t2)
+               :dtype dtype :out out))
 
 (defun vt-rad2deg (vt &key out dtype)
   (let* ((dt (%infer-float-dtype vt dtype))
@@ -353,9 +388,17 @@
   (vt-map (lambda (x) (ash x (- shift)))
 	  vt :dtype dtype :out out))
 
+(declaim (inline %op-clip))
+(defun %op-clip (x minv maxv)
+  "三元 clip：x 先和 maxv 比较，再和 minv 比较。
+   与 (min max-val (max min-val x)) 语义一致。"
+  (let ((x (if (> x maxv) maxv x)))
+    (if (< x minv) minv x)))
+
 (defun vt-clip (vt min-val max-val &key out dtype)
-  (vt-map (lambda (x) (min max-val (max min-val x)))
-	  vt :dtype dtype :out out))
+  "逐元素裁剪。MIN-VAL / MAX-VAL 是标量（不是张量）。
+   语义：clip(x, min, max) = min(max, max(min, x))"
+  (vt-fast-map #'%op-clip vt min-val max-val :dtype dtype :out out))
 
 (defun vt-lerp (start end weight &key out dtype)
   (vt-map (lambda (s e w)

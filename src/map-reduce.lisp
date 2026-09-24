@@ -471,57 +471,58 @@
                  (cadr fn))))
     (if (null op)
         `(apply #'vt-map ,fn ,@args)
-        (multiple-value-bind (tensors dtype out)
+        (multiple-value-bind (tensors dtype out)         
             (parse-vt-op-args args)
           (declare (list tensors))
           (let* ((n (length tensors))
                  (tvs (loop repeat n collect (gensym "TV"))))
             (if (not (or (= n 1) (= n 2) (= n 3)))
                 `(apply #'vt-map ,fn ,@args)
-                `(let (,@(loop for tv in tvs for tf in tensors
-                               collect `(,tv (ensure-vt ,tf))))
-                   (let* ((out-shape (reduce #'vt-broadcast-shapes
-                                             (mapcar #'vt-shape (list ,@tvs))))
-                          (final-dtype (cond ((and ,out ,dtype
-                                                   (not (eq (vt-dtype ,out) ,dtype)))
-                                              (error "类型冲突: :out (~a) vs :dtype (~a)"
-                                                     (vt-dtype ,out) ,dtype))
-                                             (,out (vt-dtype ,out))
-                                             (,dtype ,dtype)
-                                             (t (apply #'vt-promote-type
-                                                       (mapcar #'vt-dtype (list ,@tvs))))))
-                          (res (or ,out (make-vt out-shape 0 :dtype final-dtype))))
-                     (when ,out
-                       (unless (equal (vt-shape res) out-shape)
-                         (error ":out 形状 ~a 与广播结果 ~a 不匹配"
-                                (vt-shape res) out-shape)))
-                     ,(let* ((dtype-check
-                               `(and ,@(loop for tv in tvs
-                                             collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
-                             (simple-check
-                               `(and ,@(loop for tv in tvs
-                                             collect `(and (vt-contiguous-p ,tv)
-                                                           (equal (vt-shape ,tv) out-shape))))))
-                        (cond
-                          ((= n 1)
-                           `(if ,dtype-check
-                                (if ,simple-check
-                                    (%vt-inline1-fast ,op ,(first tvs) res)
-                                    (%vt-inline1-strided-fast ,op ,(first tvs) res))
-                                (vt-map (function ,op) ,(first tvs) :out res)))
-                          ((= n 2)
-                           `(if ,dtype-check
-                                (if ,simple-check
-                                    (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
-                                    (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res))
-                                (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
-                          (t
-                           `(if ,dtype-check
-                                (if ,simple-check
-                                    (%vt-inline3-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res)
-                                    (%vt-inline3-strided-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res))
-                                (vt-map (function ,op) ,(first tvs) ,(second tvs) ,(third tvs) :out res)))))
-                     res))))))))
+                `(with-float-safe                                 
+                   (let (,@(loop for tv in tvs for tf in tensors
+                                 collect `(,tv (ensure-vt ,tf))))
+                     (let* ((out-shape (reduce #'vt-broadcast-shapes
+                                               (mapcar #'vt-shape (list ,@tvs))))
+                            (final-dtype (cond ((and ,out ,dtype
+                                                     (not (eq (vt-dtype ,out) ,dtype)))
+                                                (error "类型冲突: :out (~a) vs :dtype (~a)"
+                                                       (vt-dtype ,out) ,dtype))
+                                               (,out (vt-dtype ,out))
+                                               (,dtype ,dtype)
+                                               (t (apply #'vt-promote-type
+                                                         (mapcar #'vt-dtype (list ,@tvs))))))
+                            (res (or ,out (make-vt out-shape 0 :dtype final-dtype))))
+                       (when ,out
+                         (unless (equal (vt-shape res) out-shape)
+                           (error ":out 形状 ~a 与广播结果 ~a 不匹配"
+                                  (vt-shape res) out-shape)))
+                       ,(let* ((dtype-check
+                                 `(and ,@(loop for tv in tvs
+                                               collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
+                               (simple-check
+                                 `(and ,@(loop for tv in tvs
+                                               collect `(and (vt-contiguous-p ,tv)
+                                                             (equal (vt-shape ,tv) out-shape))))))
+                          (cond
+                            ((= n 1)
+                             `(if ,dtype-check
+                                  (if ,simple-check
+                                      (%vt-inline1-fast ,op ,(first tvs) res)
+                                      (%vt-inline1-strided-fast ,op ,(first tvs) res))
+                                  (vt-map (function ,op) ,(first tvs) :out res)))
+                            ((= n 2)
+                             `(if ,dtype-check
+                                  (if ,simple-check
+                                      (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
+                                      (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res))
+                                  (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
+                            (t
+                             `(if ,dtype-check
+                                  (if ,simple-check
+                                      (%vt-inline3-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res)
+                                      (%vt-inline3-strided-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res))
+                                  (vt-map (function ,op) ,(first tvs) ,(second tvs) ,(third tvs) :out res)))))
+                       res)))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 归约核心：vt-reduce

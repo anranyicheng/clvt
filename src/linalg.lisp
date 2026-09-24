@@ -7,6 +7,16 @@
 
 (defconstant +vt-einsum-cache-max+ 1024)
 
+;;; 多线程 GEMM 调度
+(defvar *matmul-thread-count* 4
+  "并行 GEMM 的最大工作线程数。建议设为 CPU 物理核数。")
+
+(defvar *matmul-parallel-threshold* 5000000
+  "当 m*k*n 低于该阈值时走单线程，避免线程创建开销。")
+
+(defvar *enable-parallel-matmul* t
+  "全局开关：nil 则强制所有 GEMM 走单线程（调试用）。")
+
 (defmacro %with-einsum-cache-lock (&body body)
   `(sb-thread:with-mutex (*vt-einsum-cache-lock*) ,@body))
   
@@ -183,193 +193,398 @@
 			   'simple-vector)))
             (values all-labels label-dims final-output-subs)))))))
 
-;; 极速内核 1: double-float 
+;; ;; 极速内核 1: double-float 
+;; (declaim (inline %matmul-df-fast-kernel))
+;; (defun %matmul-df-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+;;   (declare (type (simple-array double-float (*)) a-data b-data c-data)
+;;            (type fixnum m k n a-off b-off c-off)
+;;            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+;;   (let ((a-ptr a-off)
+;;         (c-row c-off)
+;;         (n-main (the fixnum (logand n -4)))
+;;         (n-rem  (the fixnum (logand n 3))))
+;;     (declare (type fixnum a-ptr c-row n-main n-rem))
+;;     (loop for i of-type fixnum from 0 below m do
+;;       (loop for l of-type fixnum from 0 below k do
+;;         (let ((a-val (aref a-data a-ptr))
+;;               (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
+;;               (c-ptr c-row))
+;;           (declare (type double-float a-val)
+;;                    (type fixnum b-ptr c-ptr))
+;;           (loop for j of-type fixnum from 0 below n-main by 4 do
+;;             (let ((c0 (aref c-data c-ptr))
+;;                   (c1 (aref c-data (the fixnum (1+ c-ptr))))
+;;                   (c2 (aref c-data (the fixnum (+ c-ptr 2))))
+;;                   (c3 (aref c-data (the fixnum (+ c-ptr 3))))
+;;                   (b0 (aref b-data b-ptr))
+;;                   (b1 (aref b-data (the fixnum (1+ b-ptr))))
+;;                   (b2 (aref b-data (the fixnum (+ b-ptr 2))))
+;;                   (b3 (aref b-data (the fixnum (+ b-ptr 3)))))
+;;               (declare (type double-float c0 c1 c2 c3 b0 b1 b2 b3))
+;;               (setf (aref c-data c-ptr)
+;; 		    (the double-float (+ c0 (the double-float (* a-val b0)))))
+;;               (setf (aref c-data (the fixnum (1+ c-ptr)))
+;; 		    (the double-float (+ c1 (the double-float (* a-val b1)))))
+;;               (setf (aref c-data (the fixnum (+ c-ptr 2)))
+;; 		    (the double-float (+ c2 (the double-float (* a-val b2)))))
+;;               (setf (aref c-data (the fixnum (+ c-ptr 3)))
+;; 		    (the double-float (+ c3 (the double-float (* a-val b3))))))
+;;             (incf c-ptr 4)
+;;             (incf b-ptr 4))
+;;           (loop for j of-type fixnum from 0 below n-rem do
+;;             (let ((cv (aref c-data c-ptr))
+;;                   (bv (aref b-data b-ptr)))
+;;               (declare (type double-float cv bv))
+;;               (setf (aref c-data c-ptr)
+;; 		    (the double-float (+ cv (the double-float (* a-val bv))))))
+;;             (incf c-ptr)
+;;             (incf b-ptr)))
+;;         (incf a-ptr))
+;;       (incf c-row n))))
+
+;; ;; 极速内核 2: int64
+;; (declaim (inline %matmul-i64-fast-kernel))
+;; (defun %matmul-i64-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+;;   (declare (type (simple-array (signed-byte 64) (*)) a-data b-data c-data)
+;;            (type fixnum m k n a-off b-off c-off)
+;;            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+;;   (let ((a-ptr a-off)
+;;         (c-ptr-base c-off))
+;;     (declare (type fixnum a-ptr c-ptr-base))
+;;     (loop for i of-type fixnum from 0 below m do
+;;       (let ((b-ptr-base b-off))
+;;         (declare (type fixnum b-ptr-base))
+;;         (loop for l of-type fixnum from 0 below k do
+;;           (let ((a-val (aref a-data a-ptr)))
+;;             (declare (type (signed-byte 64) a-val))
+;;             (let ((b-ptr b-ptr-base)
+;;                   (c-ptr c-ptr-base))
+;;               (declare (type fixnum b-ptr c-ptr))
+;;               (loop for j of-type fixnum from 0 below n do
+;;                 (setf (aref c-data c-ptr)
+;;                       (the (signed-byte 64)
+;;                            (+ (the (signed-byte 64) (aref c-data c-ptr))
+;;                               (the (signed-byte 64)
+;;                                    (* a-val
+;;                                       (the (signed-byte 64)
+;; 					   (aref b-data b-ptr)))))))
+;;                 (incf c-ptr)
+;;                 (incf b-ptr)))
+;;             (incf b-ptr-base n))
+;;           (incf a-ptr)))
+;;       (incf c-ptr-base n))))
+
+;; ;; 极速内核 3: single-float (float32)
+;; (declaim (inline %matmul-sf-fast-kernel))
+;; (defun %matmul-sf-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+;;   (declare (type (simple-array single-float (*)) a-data b-data c-data)
+;;            (type fixnum m k n a-off b-off c-off)
+;;            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+;;   (let ((a-ptr a-off)
+;;         (c-row c-off)
+;;         (n-main (the fixnum (logand n -4)))
+;;         (n-rem  (the fixnum (logand n 3))))
+;;     (declare (type fixnum a-ptr c-row n-main n-rem))
+;;     (loop for i of-type fixnum from 0 below m do
+;;       (loop for l of-type fixnum from 0 below k do
+;;         (let ((a-val (aref a-data a-ptr))
+;;               (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
+;;               (c-ptr c-row))
+;;           (declare (type single-float a-val)
+;;                    (type fixnum b-ptr c-ptr))
+;;           ;; 4路循环展开
+;;           (loop for j of-type fixnum from 0 below n-main by 4 do
+;;             (let ((c0 (aref c-data c-ptr))
+;;                   (c1 (aref c-data (the fixnum (1+ c-ptr))))
+;;                   (c2 (aref c-data (the fixnum (+ c-ptr 2))))
+;;                   (c3 (aref c-data (the fixnum (+ c-ptr 3))))
+;;                   (b0 (aref b-data b-ptr))
+;;                   (b1 (aref b-data (the fixnum (1+ b-ptr))))
+;;                   (b2 (aref b-data (the fixnum (+ b-ptr 2))))
+;;                   (b3 (aref b-data (the fixnum (+ b-ptr 3)))))
+;;               (declare (type single-float c0 c1 c2 c3 b0 b1 b2 b3))
+;;               (setf (aref c-data c-ptr)
+;; 		    (the single-float (+ c0 (the single-float (* a-val b0)))))
+;;               (setf (aref c-data (the fixnum (1+ c-ptr)))
+;; 		    (the single-float (+ c1 (the single-float (* a-val b1)))))
+;;               (setf (aref c-data (the fixnum (+ c-ptr 2)))
+;; 		    (the single-float (+ c2 (the single-float (* a-val b2)))))
+;;               (setf (aref c-data (the fixnum (+ c-ptr 3)))
+;; 		    (the single-float (+ c3 (the single-float (* a-val b3))))))
+;;             (incf c-ptr 4)
+;;             (incf b-ptr 4))
+;;           ;; 处理剩余不足4的尾部
+;;           (loop for j of-type fixnum from 0 below n-rem do
+;;             (let ((cv (aref c-data c-ptr))
+;;                   (bv (aref b-data b-ptr)))
+;;               (declare (type single-float cv bv))
+;;               (setf (aref c-data c-ptr)
+;; 		    (the single-float (+ cv (the single-float (* a-val bv))))))
+;;             (incf c-ptr)
+;;             (incf b-ptr)))
+;;         (incf a-ptr))
+;;       (incf c-row n))))
+
+;; ;; 极速内核 4: int32 (signed-byte 32)
+;; (declaim (inline %matmul-i32-fast-kernel))
+;; (defun %matmul-i32-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+;;   (declare (type (simple-array (signed-byte 32) (*)) a-data b-data c-data)
+;;            (type fixnum m k n a-off b-off c-off)
+;;            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+;;   (let ((a-ptr a-off)
+;;         (c-ptr-base c-off))
+;;     (declare (type fixnum a-ptr c-ptr-base))
+;;     (loop for i of-type fixnum from 0 below m do
+;;       (let ((b-ptr-base b-off))
+;;         (declare (type fixnum b-ptr-base))
+;;         (loop for l of-type fixnum from 0 below k do
+;;           (let ((a-val (aref a-data a-ptr)))
+;;             (declare (type (signed-byte 32) a-val))
+;;             (let ((b-ptr b-ptr-base)
+;;                   (c-ptr c-ptr-base))
+;;               (declare (type fixnum b-ptr c-ptr))
+;;               (loop for j of-type fixnum from 0 below n do
+;;                 (setf (aref c-data c-ptr)
+;;                       (the (signed-byte 32)
+;;                            (+ (the (signed-byte 32) (aref c-data c-ptr))
+;;                               (the (signed-byte 32)
+;;                                    (* a-val
+;;                                       (the (signed-byte 32)
+;; 					   (aref b-data b-ptr)))))))
+;;                 (incf c-ptr)
+;;                 (incf b-ptr)))
+;;             (incf b-ptr-base n))
+;;           (incf a-ptr)))
+;;       (incf c-ptr-base n))))
+
+;; ;; 极速内核 5: double-float 转置 B 布局 (A: m×k 连续, B: n×k 连续)
+;; (declaim (inline %matmul-df-nt-fast-kernel))
+;; (defun %matmul-df-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+;;   "C[i, j] = sum_l A[i, l] * B[j, l]。
+;;    A: (m, k) 连续，B: (n, k) 连续，C: (m, n) 连续。"
+;;   (declare (type (simple-array double-float (*)) a-data b-data c-data)
+;;            (type fixnum m k n a-off b-off c-off)
+;;            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+;;   (let* ((k-main (the fixnum (logand k -4)))
+;;          (k-rem  (the fixnum (logand k 3))))
+;;     (declare (type fixnum k-main k-rem))
+;;     (loop for i of-type fixnum from 0 below m do
+;;       (let ((a-row (the fixnum (+ a-off (the fixnum (* i k))))))
+;;         (declare (type fixnum a-row))
+;;         (loop for j of-type fixnum from 0 below n do
+;;           (let ((a-ptr a-row)
+;;                 (b-ptr (the fixnum (+ b-off (the fixnum (* j k)))))
+;;                 (acc0 0.0d0) (acc1 0.0d0) (acc2 0.0d0) (acc3 0.0d0))
+;;             (declare (type fixnum a-ptr b-ptr)
+;;                      (type double-float acc0 acc1 acc2 acc3))
+;;             ;; 主体：每次处理 4 个 k
+;;             (dotimes (l (the fixnum (ash k-main -2)))
+;;               (declare (ignore l))
+;;               (incf acc0 (* (aref a-data a-ptr)
+;;                             (aref b-data b-ptr)))
+;;               (incf acc1 (* (aref a-data (the fixnum (1+ a-ptr)))
+;;                             (aref b-data (the fixnum (1+ b-ptr)))))
+;;               (incf acc2 (* (aref a-data (the fixnum (+ a-ptr 2)))
+;;                             (aref b-data (the fixnum (+ b-ptr 2)))))
+;;               (incf acc3 (* (aref a-data (the fixnum (+ a-ptr 3)))
+;;                             (aref b-data (the fixnum (+ b-ptr 3)))))
+;;               (incf a-ptr 4)
+;;               (incf b-ptr 4))
+;;             ;; 尾部
+;;             (dotimes (l k-rem)
+;;               (declare (ignore l))
+;;               (incf acc0 (* (aref a-data a-ptr) (aref b-data b-ptr)))
+;;               (incf a-ptr)
+;;               (incf b-ptr))
+;;             (setf (aref c-data (the fixnum (+ c-off (the fixnum (* i n)) j)))
+;;                   (+ acc0 acc1 acc2 acc3))))))))
+
+;; ;; 极速内核 6: single-float 转置 B 布局
+;; (declaim (inline %matmul-sf-nt-fast-kernel))
+;; (defun %matmul-sf-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+;;   (declare (type (simple-array single-float (*)) a-data b-data c-data)
+;;            (type fixnum m k n a-off b-off c-off)
+;;            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+;;   (let* ((k-main (the fixnum (logand k -4)))
+;;          (k-rem  (the fixnum (logand k 3))))
+;;     (declare (type fixnum k-main k-rem))
+;;     (loop for i of-type fixnum from 0 below m do
+;;       (let ((a-row (the fixnum (+ a-off (the fixnum (* i k))))))
+;;         (declare (type fixnum a-row))
+;;         (loop for j of-type fixnum from 0 below n do
+;;           (let ((a-ptr a-row)
+;;                 (b-ptr (the fixnum (+ b-off (the fixnum (* j k)))))
+;;                 (acc0 0.0f0) (acc1 0.0f0) (acc2 0.0f0) (acc3 0.0f0))
+;;             (declare (type fixnum a-ptr b-ptr)
+;;                      (type single-float acc0 acc1 acc2 acc3))
+;;             (dotimes (l (the fixnum (ash k-main -2)))
+;;               (declare (ignore l))
+;;               (incf acc0 (* (aref a-data a-ptr)
+;;                             (aref b-data b-ptr)))
+;;               (incf acc1 (* (aref a-data (the fixnum (1+ a-ptr)))
+;;                             (aref b-data (the fixnum (1+ b-ptr)))))
+;;               (incf acc2 (* (aref a-data (the fixnum (+ a-ptr 2)))
+;;                             (aref b-data (the fixnum (+ b-ptr 2)))))
+;;               (incf acc3 (* (aref a-data (the fixnum (+ a-ptr 3)))
+;;                             (aref b-data (the fixnum (+ b-ptr 3)))))
+;;               (incf a-ptr 4)
+;;               (incf b-ptr 4))
+;;             (dotimes (l k-rem)
+;;               (declare (ignore l))
+;;               (incf acc0 (* (aref a-data a-ptr) (aref b-data b-ptr)))
+;;               (incf a-ptr)
+;;               (incf b-ptr))
+;;             (setf (aref c-data (the fixnum (+ c-off (the fixnum (* i n)) j)))
+;;                   (+ acc0 acc1 acc2 acc3))))))))
+
+
+;;; ------------------------------------------------------------------
+;;; 通用并行调度器（无类型约束，rows-fn 负责全部计算）
+;;; ------------------------------------------------------------------
+
+(declaim (notinline call-parallel-gemm))
+(defun call-parallel-gemm (rows-fn a-data b-data c-data m k n a-off b-off c-off)
+  "把 m 行切成若干份，每份一个 worker 线程执行 rows-fn。
+   rows-fn 签名: (a-data b-data c-data k n a-off b-off c-off i-start i-end)。"
+  (declare (type function rows-fn)
+           (type fixnum m k n a-off b-off c-off)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (cond
+    ((or (not *enable-parallel-matmul*)
+         (< m 64)
+         (< (* m k n) *matmul-parallel-threshold*))
+     (funcall rows-fn a-data b-data c-data k n a-off b-off c-off 0 m))
+    (t
+     (let* ((nthreads (max 1 (min *matmul-thread-count* m)))
+            (rows-per (ceiling m nthreads))
+            (threads nil))
+       (declare (type fixnum nthreads rows-per))
+       (loop for tid of-type fixnum from 0 below nthreads
+             do (let* ((i-start (the fixnum (* tid rows-per)))
+                       (i-end   (the fixnum (min m (+ i-start rows-per)))))
+                  (declare (type fixnum i-start i-end))
+                  (when (< i-start i-end)
+                    (push (sb-thread:make-thread
+                           (lambda ()
+                             (funcall rows-fn a-data b-data c-data k n
+                                      a-off b-off c-off i-start i-end)))
+                          threads))))
+       (dolist (th threads)
+         (sb-thread:join-thread th))
+       nil))))
+
+;;; ------------------------------------------------------------------
+;;; 行范围内核 1: double-float NN
+;;; ------------------------------------------------------------------
+(declaim (inline %matmul-df-rows))
+(defun %matmul-df-rows (a-data b-data c-data k n
+                        a-off b-off c-off i-start i-end)
+  "C[i-start..i-end, :] += A[i-start..i-end, :] * B[:, :]。
+   A: (·,k) 行主序，B: (k,n) 行主序，C: (·,n) 行主序。"
+  (declare (type (simple-array double-float (*)) a-data b-data c-data)
+           (type fixnum k n a-off b-off c-off i-start i-end)
+           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+  (let ((n-main (the fixnum (logand n -4))))
+    (declare (type fixnum n-main))
+    (loop for i of-type fixnum from i-start below i-end do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+            (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+        (declare (type fixnum a-row c-row))
+        (loop for l of-type fixnum from 0 below k do
+          (let ((a-val (aref a-data (the fixnum (+ a-row l))))
+                (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
+                (c-ptr c-row))
+            (declare (type double-float a-val)
+                     (type fixnum b-ptr c-ptr))
+            (loop for j of-type fixnum from 0 below n-main by 4 do
+              (incf (aref c-data c-ptr)
+                    (the double-float (* a-val (aref b-data b-ptr))))
+              (incf (aref c-data (the fixnum (1+ c-ptr)))
+                    (the double-float (* a-val (aref b-data (the fixnum (1+ b-ptr))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 2)))
+                    (the double-float (* a-val (aref b-data (the fixnum (+ b-ptr 2))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 3)))
+                    (the double-float (* a-val (aref b-data (the fixnum (+ b-ptr 3))))))
+              (incf c-ptr 4)
+              (incf b-ptr 4))
+            (loop for j of-type fixnum from n-main below n do
+              (incf (aref c-data c-ptr)
+                    (the double-float (* a-val (aref b-data b-ptr))))
+              (incf c-ptr)
+              (incf b-ptr))))))))
+
 (declaim (inline %matmul-df-fast-kernel))
 (defun %matmul-df-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
-  (declare (type (simple-array double-float (*)) a-data b-data c-data)
-           (type fixnum m k n a-off b-off c-off)
-           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
-  (let ((a-ptr a-off)
-        (c-row c-off)
-        (n-main (the fixnum (logand n -4)))
-        (n-rem  (the fixnum (logand n 3))))
-    (declare (type fixnum a-ptr c-row n-main n-rem))
-    (loop for i of-type fixnum from 0 below m do
-      (loop for l of-type fixnum from 0 below k do
-        (let ((a-val (aref a-data a-ptr))
-              (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
-              (c-ptr c-row))
-          (declare (type double-float a-val)
-                   (type fixnum b-ptr c-ptr))
-          (loop for j of-type fixnum from 0 below n-main by 4 do
-            (let ((c0 (aref c-data c-ptr))
-                  (c1 (aref c-data (the fixnum (1+ c-ptr))))
-                  (c2 (aref c-data (the fixnum (+ c-ptr 2))))
-                  (c3 (aref c-data (the fixnum (+ c-ptr 3))))
-                  (b0 (aref b-data b-ptr))
-                  (b1 (aref b-data (the fixnum (1+ b-ptr))))
-                  (b2 (aref b-data (the fixnum (+ b-ptr 2))))
-                  (b3 (aref b-data (the fixnum (+ b-ptr 3)))))
-              (declare (type double-float c0 c1 c2 c3 b0 b1 b2 b3))
-              (setf (aref c-data c-ptr)
-		    (the double-float (+ c0 (the double-float (* a-val b0)))))
-              (setf (aref c-data (the fixnum (1+ c-ptr)))
-		    (the double-float (+ c1 (the double-float (* a-val b1)))))
-              (setf (aref c-data (the fixnum (+ c-ptr 2)))
-		    (the double-float (+ c2 (the double-float (* a-val b2)))))
-              (setf (aref c-data (the fixnum (+ c-ptr 3)))
-		    (the double-float (+ c3 (the double-float (* a-val b3))))))
-            (incf c-ptr 4)
-            (incf b-ptr 4))
-          (loop for j of-type fixnum from 0 below n-rem do
-            (let ((cv (aref c-data c-ptr))
-                  (bv (aref b-data b-ptr)))
-              (declare (type double-float cv bv))
-              (setf (aref c-data c-ptr)
-		    (the double-float (+ cv (the double-float (* a-val bv))))))
-            (incf c-ptr)
-            (incf b-ptr)))
-        (incf a-ptr))
-      (incf c-row n))))
+  (call-parallel-gemm #'%matmul-df-rows
+                      a-data b-data c-data m k n a-off b-off c-off))
 
-;; 极速内核 2: int64
-(declaim (inline %matmul-i64-fast-kernel))
-(defun %matmul-i64-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
-  (declare (type (simple-array (signed-byte 64) (*)) a-data b-data c-data)
-           (type fixnum m k n a-off b-off c-off)
+;;; ------------------------------------------------------------------
+;;; 行范围内核 2: single-float NN
+;;; ------------------------------------------------------------------
+(declaim (inline %matmul-sf-rows))
+(defun %matmul-sf-rows (a-data b-data c-data k n
+                        a-off b-off c-off i-start i-end)
+  (declare (type (simple-array single-float (*)) a-data b-data c-data)
+           (type fixnum k n a-off b-off c-off i-start i-end)
            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
-  (let ((a-ptr a-off)
-        (c-ptr-base c-off))
-    (declare (type fixnum a-ptr c-ptr-base))
-    (loop for i of-type fixnum from 0 below m do
-      (let ((b-ptr-base b-off))
-        (declare (type fixnum b-ptr-base))
+  (let ((n-main (the fixnum (logand n -4))))
+    (declare (type fixnum n-main))
+    (loop for i of-type fixnum from i-start below i-end do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+            (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+        (declare (type fixnum a-row c-row))
         (loop for l of-type fixnum from 0 below k do
-          (let ((a-val (aref a-data a-ptr)))
-            (declare (type (signed-byte 64) a-val))
-            (let ((b-ptr b-ptr-base)
-                  (c-ptr c-ptr-base))
-              (declare (type fixnum b-ptr c-ptr))
-              (loop for j of-type fixnum from 0 below n do
-                (setf (aref c-data c-ptr)
-                      (the (signed-byte 64)
-                           (+ (the (signed-byte 64) (aref c-data c-ptr))
-                              (the (signed-byte 64)
-                                   (* a-val
-                                      (the (signed-byte 64)
-					   (aref b-data b-ptr)))))))
-                (incf c-ptr)
-                (incf b-ptr)))
-            (incf b-ptr-base n))
-          (incf a-ptr)))
-      (incf c-ptr-base n))))
+          (let ((a-val (aref a-data (the fixnum (+ a-row l))))
+                (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
+                (c-ptr c-row))
+            (declare (type single-float a-val)
+                     (type fixnum b-ptr c-ptr))
+            (loop for j of-type fixnum from 0 below n-main by 4 do
+              (incf (aref c-data c-ptr)
+                    (the single-float (* a-val (aref b-data b-ptr))))
+              (incf (aref c-data (the fixnum (1+ c-ptr)))
+                    (the single-float (* a-val (aref b-data (the fixnum (1+ b-ptr))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 2)))
+                    (the single-float (* a-val (aref b-data (the fixnum (+ b-ptr 2))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 3)))
+                    (the single-float (* a-val (aref b-data (the fixnum (+ b-ptr 3))))))
+              (incf c-ptr 4)
+              (incf b-ptr 4))
+            (loop for j of-type fixnum from n-main below n do
+              (incf (aref c-data c-ptr)
+                    (the single-float (* a-val (aref b-data b-ptr))))
+              (incf c-ptr)
+              (incf b-ptr))))))))
 
-;; 极速内核 3: single-float (float32)
 (declaim (inline %matmul-sf-fast-kernel))
 (defun %matmul-sf-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
-  (declare (type (simple-array single-float (*)) a-data b-data c-data)
-           (type fixnum m k n a-off b-off c-off)
-           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
-  (let ((a-ptr a-off)
-        (c-row c-off)
-        (n-main (the fixnum (logand n -4)))
-        (n-rem  (the fixnum (logand n 3))))
-    (declare (type fixnum a-ptr c-row n-main n-rem))
-    (loop for i of-type fixnum from 0 below m do
-      (loop for l of-type fixnum from 0 below k do
-        (let ((a-val (aref a-data a-ptr))
-              (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
-              (c-ptr c-row))
-          (declare (type single-float a-val)
-                   (type fixnum b-ptr c-ptr))
-          ;; 4路循环展开
-          (loop for j of-type fixnum from 0 below n-main by 4 do
-            (let ((c0 (aref c-data c-ptr))
-                  (c1 (aref c-data (the fixnum (1+ c-ptr))))
-                  (c2 (aref c-data (the fixnum (+ c-ptr 2))))
-                  (c3 (aref c-data (the fixnum (+ c-ptr 3))))
-                  (b0 (aref b-data b-ptr))
-                  (b1 (aref b-data (the fixnum (1+ b-ptr))))
-                  (b2 (aref b-data (the fixnum (+ b-ptr 2))))
-                  (b3 (aref b-data (the fixnum (+ b-ptr 3)))))
-              (declare (type single-float c0 c1 c2 c3 b0 b1 b2 b3))
-              (setf (aref c-data c-ptr)
-		    (the single-float (+ c0 (the single-float (* a-val b0)))))
-              (setf (aref c-data (the fixnum (1+ c-ptr)))
-		    (the single-float (+ c1 (the single-float (* a-val b1)))))
-              (setf (aref c-data (the fixnum (+ c-ptr 2)))
-		    (the single-float (+ c2 (the single-float (* a-val b2)))))
-              (setf (aref c-data (the fixnum (+ c-ptr 3)))
-		    (the single-float (+ c3 (the single-float (* a-val b3))))))
-            (incf c-ptr 4)
-            (incf b-ptr 4))
-          ;; 处理剩余不足4的尾部
-          (loop for j of-type fixnum from 0 below n-rem do
-            (let ((cv (aref c-data c-ptr))
-                  (bv (aref b-data b-ptr)))
-              (declare (type single-float cv bv))
-              (setf (aref c-data c-ptr)
-		    (the single-float (+ cv (the single-float (* a-val bv))))))
-            (incf c-ptr)
-            (incf b-ptr)))
-        (incf a-ptr))
-      (incf c-row n))))
+  (call-parallel-gemm #'%matmul-sf-rows
+                      a-data b-data c-data m k n a-off b-off c-off))
 
-;; 极速内核 4: int32 (signed-byte 32)
-(declaim (inline %matmul-i32-fast-kernel))
-(defun %matmul-i32-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
-  (declare (type (simple-array (signed-byte 32) (*)) a-data b-data c-data)
-           (type fixnum m k n a-off b-off c-off)
-           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
-  (let ((a-ptr a-off)
-        (c-ptr-base c-off))
-    (declare (type fixnum a-ptr c-ptr-base))
-    (loop for i of-type fixnum from 0 below m do
-      (let ((b-ptr-base b-off))
-        (declare (type fixnum b-ptr-base))
-        (loop for l of-type fixnum from 0 below k do
-          (let ((a-val (aref a-data a-ptr)))
-            (declare (type (signed-byte 32) a-val))
-            (let ((b-ptr b-ptr-base)
-                  (c-ptr c-ptr-base))
-              (declare (type fixnum b-ptr c-ptr))
-              (loop for j of-type fixnum from 0 below n do
-                (setf (aref c-data c-ptr)
-                      (the (signed-byte 32)
-                           (+ (the (signed-byte 32) (aref c-data c-ptr))
-                              (the (signed-byte 32)
-                                   (* a-val
-                                      (the (signed-byte 32)
-					   (aref b-data b-ptr)))))))
-                (incf c-ptr)
-                (incf b-ptr)))
-            (incf b-ptr-base n))
-          (incf a-ptr)))
-      (incf c-ptr-base n))))
-
-;; 极速内核 5: double-float 转置 B 布局 (A: m×k 连续, B: n×k 连续)
-(declaim (inline %matmul-df-nt-fast-kernel))
-(defun %matmul-df-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
-  "C[i, j] = sum_l A[i, l] * B[j, l]。
-   A: (m, k) 连续，B: (n, k) 连续，C: (m, n) 连续。"
+;;; ------------------------------------------------------------------
+;;; 行范围内核 3: double-float NT (B 已转置，B: n×k 行主序)
+;;; ------------------------------------------------------------------
+(declaim (inline %matmul-df-nt-rows))
+(defun %matmul-df-nt-rows (a-data b-data c-data k n
+                           a-off b-off c-off i-start i-end)
+  "C[i,j] = sum_l A[i,l] * B[j,l]。
+   A: (·,k) 行主序；B: (n,k) 行主序；C: (·,n) 行主序。"
   (declare (type (simple-array double-float (*)) a-data b-data c-data)
-           (type fixnum m k n a-off b-off c-off)
+           (type fixnum k n a-off b-off c-off i-start i-end)
            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
-  (let* ((k-main (the fixnum (logand k -4)))
-         (k-rem  (the fixnum (logand k 3))))
-    (declare (type fixnum k-main k-rem))
-    (loop for i of-type fixnum from 0 below m do
-      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k))))))
-        (declare (type fixnum a-row))
+  (let ((k-main (the fixnum (logand k -4))))
+    (declare (type fixnum k-main))
+    (loop for i of-type fixnum from i-start below i-end do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+            (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+        (declare (type fixnum a-row c-row))
         (loop for j of-type fixnum from 0 below n do
           (let ((a-ptr a-row)
                 (b-ptr (the fixnum (+ b-off (the fixnum (* j k)))))
                 (acc0 0.0d0) (acc1 0.0d0) (acc2 0.0d0) (acc3 0.0d0))
             (declare (type fixnum a-ptr b-ptr)
                      (type double-float acc0 acc1 acc2 acc3))
-            ;; 主体：每次处理 4 个 k
-            (dotimes (l (the fixnum (ash k-main -2)))
-              (declare (ignore l))
+            (loop for l of-type fixnum from 0 below k-main by 4 do
               (incf acc0 (* (aref a-data a-ptr)
                             (aref b-data b-ptr)))
               (incf acc1 (* (aref a-data (the fixnum (1+ a-ptr)))
@@ -380,35 +595,40 @@
                             (aref b-data (the fixnum (+ b-ptr 3)))))
               (incf a-ptr 4)
               (incf b-ptr 4))
-            ;; 尾部
-            (dotimes (l k-rem)
-              (declare (ignore l))
+            (loop for l of-type fixnum from k-main below k do
               (incf acc0 (* (aref a-data a-ptr) (aref b-data b-ptr)))
               (incf a-ptr)
               (incf b-ptr))
-            (setf (aref c-data (the fixnum (+ c-off (the fixnum (* i n)) j)))
+	    (incf (aref c-data (the fixnum (+ c-row j)))
                   (+ acc0 acc1 acc2 acc3))))))))
 
-;; 极速内核 6: single-float 转置 B 布局
-(declaim (inline %matmul-sf-nt-fast-kernel))
-(defun %matmul-sf-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+(declaim (inline %matmul-df-nt-fast-kernel))
+(defun %matmul-df-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+  (call-parallel-gemm #'%matmul-df-nt-rows
+                      a-data b-data c-data m k n a-off b-off c-off))
+
+;;; ------------------------------------------------------------------
+;;; 行范围内核 4: single-float NT
+;;; ------------------------------------------------------------------
+(declaim (inline %matmul-sf-nt-rows))
+(defun %matmul-sf-nt-rows (a-data b-data c-data k n
+                           a-off b-off c-off i-start i-end)
   (declare (type (simple-array single-float (*)) a-data b-data c-data)
-           (type fixnum m k n a-off b-off c-off)
+           (type fixnum k n a-off b-off c-off i-start i-end)
            (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
-  (let* ((k-main (the fixnum (logand k -4)))
-         (k-rem  (the fixnum (logand k 3))))
-    (declare (type fixnum k-main k-rem))
-    (loop for i of-type fixnum from 0 below m do
-      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k))))))
-        (declare (type fixnum a-row))
+  (let ((k-main (the fixnum (logand k -4))))
+    (declare (type fixnum k-main))
+    (loop for i of-type fixnum from i-start below i-end do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+            (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+        (declare (type fixnum a-row c-row))
         (loop for j of-type fixnum from 0 below n do
           (let ((a-ptr a-row)
                 (b-ptr (the fixnum (+ b-off (the fixnum (* j k)))))
                 (acc0 0.0f0) (acc1 0.0f0) (acc2 0.0f0) (acc3 0.0f0))
             (declare (type fixnum a-ptr b-ptr)
                      (type single-float acc0 acc1 acc2 acc3))
-            (dotimes (l (the fixnum (ash k-main -2)))
-              (declare (ignore l))
+            (loop for l of-type fixnum from 0 below k-main by 4 do
               (incf acc0 (* (aref a-data a-ptr)
                             (aref b-data b-ptr)))
               (incf acc1 (* (aref a-data (the fixnum (1+ a-ptr)))
@@ -419,13 +639,115 @@
                             (aref b-data (the fixnum (+ b-ptr 3)))))
               (incf a-ptr 4)
               (incf b-ptr 4))
-            (dotimes (l k-rem)
-              (declare (ignore l))
+            (loop for l of-type fixnum from k-main below k do
               (incf acc0 (* (aref a-data a-ptr) (aref b-data b-ptr)))
               (incf a-ptr)
               (incf b-ptr))
-            (setf (aref c-data (the fixnum (+ c-off (the fixnum (* i n)) j)))
+	    (incf (aref c-data (the fixnum (+ c-row j)))
                   (+ acc0 acc1 acc2 acc3))))))))
+
+(declaim (inline %matmul-sf-nt-fast-kernel))
+(defun %matmul-sf-nt-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+  (call-parallel-gemm #'%matmul-sf-nt-rows
+                      a-data b-data c-data m k n a-off b-off c-off))
+
+;;; ------------------------------------------------------------------
+;;; 行范围内核 5: int64
+;;; ------------------------------------------------------------------
+(declaim (inline %matmul-i64-rows))
+(defun %matmul-i64-rows (a-data b-data c-data k n
+                         a-off b-off c-off i-start i-end)
+  "C[i-start..i-end, :] += A[i-start..i-end, :] * B[:, :] (int64)。"
+  (declare (type (simple-array (signed-byte 64) (*)) a-data b-data c-data)
+           (type fixnum k n a-off b-off c-off i-start i-end)
+           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+  (let ((n-main (the fixnum (logand n -4))))
+    (declare (type fixnum n-main))
+    (loop for i of-type fixnum from i-start below i-end do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+            (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+        (declare (type fixnum a-row c-row))
+        (loop for l of-type fixnum from 0 below k do
+          (let ((a-val (aref a-data (the fixnum (+ a-row l))))
+                (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
+                (c-ptr c-row))
+            (declare (type (signed-byte 64) a-val)
+                     (type fixnum b-ptr c-ptr))
+            (loop for j of-type fixnum from 0 below n-main by 4 do
+              (incf (aref c-data c-ptr)
+                    (the (signed-byte 64)
+                         (* a-val (the (signed-byte 64) (aref b-data b-ptr)))))
+              (incf (aref c-data (the fixnum (1+ c-ptr)))
+                    (the (signed-byte 64)
+                         (* a-val (the (signed-byte 64) (aref b-data (the fixnum (1+ b-ptr)))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 2)))
+                    (the (signed-byte 64)
+                         (* a-val (the (signed-byte 64) (aref b-data (the fixnum (+ b-ptr 2)))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 3)))
+                    (the (signed-byte 64)
+                         (* a-val (the (signed-byte 64) (aref b-data (the fixnum (+ b-ptr 3)))))))
+              (incf c-ptr 4)
+              (incf b-ptr 4))
+            (loop for j of-type fixnum from n-main below n do
+              (incf (aref c-data c-ptr)
+                    (the (signed-byte 64)
+                         (* a-val (the (signed-byte 64) (aref b-data b-ptr)))))
+              (incf c-ptr)
+              (incf b-ptr))))))))
+
+(declaim (inline %matmul-i64-fast-kernel))
+(defun %matmul-i64-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+  (call-parallel-gemm #'%matmul-i64-rows
+                      a-data b-data c-data m k n a-off b-off c-off))
+
+;;; ------------------------------------------------------------------
+;;; 行范围内核 5: int32
+;;; ------------------------------------------------------------------
+(declaim (inline %matmul-i32-rows))
+(defun %matmul-i32-rows (a-data b-data c-data k n
+                         a-off b-off c-off i-start i-end)
+  "C[i-start..i-end, :] += A[i-start..i-end, :] * B[:, :] (int32)。"
+  (declare (type (simple-array (signed-byte 32) (*)) a-data b-data c-data)
+           (type fixnum k n a-off b-off c-off i-start i-end)
+           (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+  (let ((n-main (the fixnum (logand n -4))))
+    (declare (type fixnum n-main))
+    (loop for i of-type fixnum from i-start below i-end do
+      (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+            (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+        (declare (type fixnum a-row c-row))
+        (loop for l of-type fixnum from 0 below k do
+          (let ((a-val (aref a-data (the fixnum (+ a-row l))))
+                (b-ptr (the fixnum (+ b-off (the fixnum (* l n)))))
+                (c-ptr c-row))
+            (declare (type (signed-byte 32) a-val)
+                     (type fixnum b-ptr c-ptr))
+            (loop for j of-type fixnum from 0 below n-main by 4 do
+              (incf (aref c-data c-ptr)
+                    (the (signed-byte 32)
+                         (* a-val (the (signed-byte 32) (aref b-data b-ptr)))))
+              (incf (aref c-data (the fixnum (1+ c-ptr)))
+                    (the (signed-byte 32)
+                         (* a-val (the (signed-byte 32) (aref b-data (the fixnum (1+ b-ptr)))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 2)))
+                    (the (signed-byte 32)
+                         (* a-val (the (signed-byte 32) (aref b-data (the fixnum (+ b-ptr 2)))))))
+              (incf (aref c-data (the fixnum (+ c-ptr 3)))
+                    (the (signed-byte 32)
+                         (* a-val (the (signed-byte 32) (aref b-data (the fixnum (+ b-ptr 3)))))))
+              (incf c-ptr 4)
+              (incf b-ptr 4))
+            (loop for j of-type fixnum from n-main below n do
+              (incf (aref c-data c-ptr)
+                    (the (signed-byte 32)
+                         (* a-val (the (signed-byte 32) (aref b-data b-ptr)))))
+              (incf c-ptr)
+              (incf b-ptr))))))))
+
+(declaim (inline %matmul-i32-fast-kernel))
+(defun %matmul-i32-fast-kernel (a-data b-data c-data m k n a-off b-off c-off)
+  (call-parallel-gemm #'%matmul-i32-rows
+                      a-data b-data c-data m k n a-off b-off c-off))
 
 (defun einsum-execute
     (all-labels-vec label-dims-vec output-subs input-subs vts &key out)
