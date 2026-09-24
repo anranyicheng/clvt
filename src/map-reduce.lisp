@@ -254,6 +254,192 @@
        (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1))))
        (incf op) (incf p0 s0) (incf p1 s1))))
 
+;;; ------------------------------------------------------------------
+;;; 非连续 + 广播内联路径
+;;; 与 %inline1/2-loop 的区别：用 strides 遍历，支持非连续/广播输入
+;;; 与 vt-map noncontig 的区别：op 是宏展开的符号，无 funcall 装箱
+;;; ------------------------------------------------------------------
+
+(defmacro %inline1-strided (lt op a res)
+  "一元 strides 遍历（内联 op）。RES 必须连续。"
+  `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
+          (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
+          (rs (coerce (vt-strides ,res) 'simple-vector))
+          (s0 (coerce (vt-broadcast-strides
+                       (vt-shape ,a) (vt-shape ,res) (vt-strides ,a))
+                      'simple-vector))
+          (dims (coerce (vt-shape ,res) 'simple-vector))
+          (rank (length dims))
+          (p0 (vt-offset ,a))
+          (op (vt-offset ,res)))
+     (declare (type (simple-array ,lt (*)) od d0)
+              (type simple-vector rs s0 dims)
+              (type fixnum rank p0 op))
+     (if (= rank 0)
+         (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0))))
+         (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
+           (declare (type (simple-array fixnum (*)) idx))
+           (block outer
+             (loop
+               (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0))))
+               (let ((d (1- rank)))
+                 (loop
+                   (incf (aref idx d))
+                   (incf p0 (svref s0 d))
+                   (incf op (svref rs d))
+                   (when (< (aref idx d) (svref dims d)) (return))
+                   (let ((dim (svref dims d)))
+                     (decf p0 (* dim (svref s0 d)))
+                     (decf op (* dim (svref rs d)))
+                     (setf (aref idx d) 0)
+                     (decf d)
+                     (when (< d 0) (return-from outer)))))))))))
+
+(defmacro %inline2-strided (lt op a b res)
+  "二元 strides 遍历（内联 op）。RES 必须连续。"
+  `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
+          (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
+          (d1 (the (simple-array ,lt (*)) (vt-data ,b)))
+          (rs (coerce (vt-strides ,res) 'simple-vector))
+          (s0 (coerce (vt-broadcast-strides
+                       (vt-shape ,a) (vt-shape ,res) (vt-strides ,a))
+                      'simple-vector))
+          (s1 (coerce (vt-broadcast-strides
+                       (vt-shape ,b) (vt-shape ,res) (vt-strides ,b))
+                      'simple-vector))
+          (dims (coerce (vt-shape ,res) 'simple-vector))
+          (rank (length dims))
+          (p0 (vt-offset ,a)) (p1 (vt-offset ,b))
+          (op (vt-offset ,res)))
+     (declare (type (simple-array ,lt (*)) od d0 d1)
+              (type simple-vector rs s0 s1 dims)
+              (type fixnum rank p0 p1 op))
+     (if (= rank 0)
+         (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1))))
+         (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
+           (declare (type (simple-array fixnum (*)) idx))
+           (block outer
+             (loop
+               (setf (aref od op)
+                     (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1))))
+               (let ((d (1- rank)))
+                 (loop
+                   (incf (aref idx d))
+                   (incf p0 (svref s0 d))
+                   (incf p1 (svref s1 d))
+                   (incf op (svref rs d))
+                   (when (< (aref idx d) (svref dims d)) (return))
+                   (let ((dim (svref dims d)))
+                     (decf p0 (* dim (svref s0 d)))
+                     (decf p1 (* dim (svref s1 d)))
+                     (decf op (* dim (svref rs d)))
+                     (setf (aref idx d) 0)
+                     (decf d)
+                     (when (< d 0) (return-from outer)))))))))))
+
+(defmacro %inline3-loop (lt op a b c res)
+  "三元连续内联循环。"
+  `(let ((od (the (simple-array ,lt (*)) (vt-data ,res)))
+         (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
+         (d1 (the (simple-array ,lt (*)) (vt-data ,b)))
+         (d2 (the (simple-array ,lt (*)) (vt-data ,c)))
+         (p0 (vt-offset ,a)) (p1 (vt-offset ,b)) (p2 (vt-offset ,c))
+         (s0 (if (= (vt-size ,a) 1) 0 1))
+         (s1 (if (= (vt-size ,b) 1) 0 1))
+         (s2 (if (= (vt-size ,c) 1) 0 1))
+         (op (vt-offset ,res)))
+     (declare (type (simple-array ,lt (*)) od d0 d1 d2)
+              (type fixnum p0 p1 p2 s0 s1 s2 op))
+     (loop for i fixnum from 0 below (vt-size ,res) do
+       (setf (aref od op)
+             (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1) (aref d2 p2))))
+       (incf op) (incf p0 s0) (incf p1 s1) (incf p2 s2))))
+
+(defmacro %inline3-strided (lt op a b c res)
+  "三元 strides 遍历。"
+  `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
+          (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
+          (d1 (the (simple-array ,lt (*)) (vt-data ,b)))
+          (d2 (the (simple-array ,lt (*)) (vt-data ,c)))
+          (rs (coerce (vt-strides ,res) 'simple-vector))
+          (s0 (coerce (vt-broadcast-strides
+                       (vt-shape ,a) (vt-shape ,res) (vt-strides ,a))
+                      'simple-vector))
+          (s1 (coerce (vt-broadcast-strides
+                       (vt-shape ,b) (vt-shape ,res) (vt-strides ,b))
+                      'simple-vector))
+          (s2 (coerce (vt-broadcast-strides
+                       (vt-shape ,c) (vt-shape ,res) (vt-strides ,c))
+                      'simple-vector))
+          (dims (coerce (vt-shape ,res) 'simple-vector))
+          (rank (length dims))
+          (p0 (vt-offset ,a)) (p1 (vt-offset ,b)) (p2 (vt-offset ,c))
+          (op (vt-offset ,res)))
+     (declare (type (simple-array ,lt (*)) od d0 d1 d2)
+              (type simple-vector rs s0 s1 s2 dims)
+              (type fixnum rank p0 p1 p2 op))
+     (if (= rank 0)
+         (setf (aref od op)
+               (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1) (aref d2 p2))))
+         (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
+           (declare (type (simple-array fixnum (*)) idx))
+           (block outer
+             (loop
+               (setf (aref od op)
+                     (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1) (aref d2 p2))))
+               (let ((d (1- rank)))
+                 (loop
+                   (incf (aref idx d))
+                   (incf p0 (svref s0 d))
+                   (incf p1 (svref s1 d))
+                   (incf p2 (svref s2 d))
+                   (incf op (svref rs d))
+                   (when (< (aref idx d) (svref dims d)) (return))
+                   (let ((dim (svref dims d)))
+                     (decf p0 (* dim (svref s0 d)))
+                     (decf p1 (* dim (svref s1 d)))
+                     (decf p2 (* dim (svref s2 d)))
+                     (decf op (* dim (svref rs d)))
+                     (setf (aref idx d) 0)
+                     (decf d)
+                     (when (< d 0) (return-from outer)))))))))))
+
+(defmacro %vt-inline1-strided-fast (op a res)
+  "一元非连续/广播快路径。"
+  `(let ((rd (vt-data ,res)))
+     (cond ((equal (array-element-type rd) 'double-float)     (%inline1-strided double-float ,op ,a ,res))
+           ((equal (array-element-type rd) 'single-float)     (%inline1-strided single-float ,op ,a ,res))
+           ((equal (array-element-type rd) '(signed-byte 64)) (%inline1-strided (signed-byte 64) ,op ,a ,res))
+           ((equal (array-element-type rd) '(signed-byte 32)) (%inline1-strided (signed-byte 32) ,op ,a ,res))
+           (t (vt-map (function ,op) ,a :out ,res)))))
+
+(defmacro %vt-inline2-strided-fast (op a b res)
+  "二元非连续/广播快路径。"
+  `(let ((rd (vt-data ,res)))
+     (cond ((equal (array-element-type rd) 'double-float)     (%inline2-strided double-float ,op ,a ,b ,res))
+           ((equal (array-element-type rd) 'single-float)     (%inline2-strided single-float ,op ,a ,b ,res))
+           ((equal (array-element-type rd) '(signed-byte 64)) (%inline2-strided (signed-byte 64) ,op ,a ,b ,res))
+           ((equal (array-element-type rd) '(signed-byte 32)) (%inline2-strided (signed-byte 32) ,op ,a ,b ,res))
+           (t (vt-map (function ,op) ,a ,b :out ,res)))))
+
+(defmacro %vt-inline3-fast (op a b c res)
+  "三元连续快路径。"
+  `(let ((rd (vt-data ,res)))
+     (cond ((equal (array-element-type rd) 'double-float)     (%inline3-loop double-float ,op ,a ,b ,c ,res))
+           ((equal (array-element-type rd) 'single-float)     (%inline3-loop single-float ,op ,a ,b ,c ,res))
+           ((equal (array-element-type rd) '(signed-byte 64)) (%inline3-loop (signed-byte 64) ,op ,a ,b ,c ,res))
+           ((equal (array-element-type rd) '(signed-byte 32)) (%inline3-loop (signed-byte 32) ,op ,a ,b ,c ,res))
+           (t (vt-map (function ,op) ,a ,b ,c :out ,res)))))
+
+(defmacro %vt-inline3-strided-fast (op a b c res)
+  "三元非连续/广播快路径。"
+  `(let ((rd (vt-data ,res)))
+     (cond ((equal (array-element-type rd) 'double-float)     (%inline3-strided double-float ,op ,a ,b ,c ,res))
+           ((equal (array-element-type rd) 'single-float)     (%inline3-strided single-float ,op ,a ,b ,c ,res))
+           ((equal (array-element-type rd) '(signed-byte 64)) (%inline3-strided (signed-byte 64) ,op ,a ,b ,c ,res))
+           ((equal (array-element-type rd) '(signed-byte 32)) (%inline3-strided (signed-byte 32) ,op ,a ,b ,c ,res))
+           (t (vt-map (function ,op) ,a ,b ,c :out ,res)))))
+
 (defmacro %vt-inline1-fast (op a res)
   (declare (optimize (speed 3) (safety 0)))
   "一元连续快路径（按输出类型派发，内联 op）。"
@@ -275,20 +461,22 @@
            (t (vt-map (function ,op) ,a ,b :out ,res)))))
 
 (defmacro vt-fast-map (fn &rest args)
-  "编译期内联已知算子的逐元素映射（一元/二元）；否则回退到 vt-map。"
+  "编译期内联已知算子的逐元素映射（一元/二元/三元）。
+   优先走内联路径，任何维度/连续性组合都有对应快路径；
+   仅在 dtype 不匹配或参数个数 > 3 时回退到 vt-map。"
   (declare (optimize (speed 3) (safety 0)))
   (let ((op (and (consp fn)
-		 (eq (car fn) 'function)
-		 (symbolp (cadr fn))
-		 (cadr fn))))
+                 (eq (car fn) 'function)
+                 (symbolp (cadr fn))
+                 (cadr fn))))
     (if (null op)
         `(apply #'vt-map ,fn ,@args)
         (multiple-value-bind (tensors dtype out)
-	    (parse-vt-op-args args)
-	  (declare (list tensors))
+            (parse-vt-op-args args)
+          (declare (list tensors))
           (let* ((n (length tensors))
                  (tvs (loop repeat n collect (gensym "TV"))))
-            (if (not (or (= n 1) (= n 2))) 
+            (if (not (or (= n 1) (= n 2) (= n 3)))
                 `(apply #'vt-map ,fn ,@args)
                 `(let (,@(loop for tv in tvs for tf in tensors
                                collect `(,tv (ensure-vt ,tf))))
@@ -307,27 +495,33 @@
                        (unless (equal (vt-shape res) out-shape)
                          (error ":out 形状 ~a 与广播结果 ~a 不匹配"
                                 (vt-shape res) out-shape)))
-                     ,(if (= n 1)
-                          `(if (and (vt-contiguous-p res)
-                                    (or (= (vt-size ,(first tvs)) 1)
-                                        (and (equal (vt-shape ,(first tvs)) out-shape)
-                                             (vt-contiguous-p ,(first tvs))))
-                                    (eq (vt-dtype ,(first tvs)) (vt-dtype res)))
-                               (%vt-inline1-fast ,op ,(first tvs) res)
-                               (vt-map (function ,op) ,(first tvs) :out res))
-                          `(if (and (vt-contiguous-p res)
-                                    (or (= (vt-size ,(first tvs)) 1)
-                                        (and (equal (vt-shape ,(first tvs)) out-shape)
-                                             (vt-contiguous-p ,(first tvs))))
-                                    (or (= (vt-size ,(second tvs)) 1)
-                                        (and (equal (vt-shape ,(second tvs)) out-shape)
-                                             (vt-contiguous-p ,(second tvs))))
-                                    (eq (vt-dtype ,(first tvs)) (vt-dtype res))
-                                    (eq (vt-dtype ,(second tvs)) (vt-dtype res)))
-                               (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
-                               (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
+                     ,(let* ((dtype-check
+                               `(and ,@(loop for tv in tvs
+                                             collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
+                             (simple-check
+                               `(and ,@(loop for tv in tvs
+                                             collect `(and (vt-contiguous-p ,tv)
+                                                           (equal (vt-shape ,tv) out-shape))))))
+                        (cond
+                          ((= n 1)
+                           `(if ,dtype-check
+                                (if ,simple-check
+                                    (%vt-inline1-fast ,op ,(first tvs) res)
+                                    (%vt-inline1-strided-fast ,op ,(first tvs) res))
+                                (vt-map (function ,op) ,(first tvs) :out res)))
+                          ((= n 2)
+                           `(if ,dtype-check
+                                (if ,simple-check
+                                    (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
+                                    (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res))
+                                (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
+                          (t
+                           `(if ,dtype-check
+                                (if ,simple-check
+                                    (%vt-inline3-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res)
+                                    (%vt-inline3-strided-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res))
+                                (vt-map (function ,op) ,(first tvs) ,(second tvs) ,(third tvs) :out res)))))
                      res))))))))
-
 
 ;;; ------------------------------------------------------------------
 ;;; 归约核心：vt-reduce
