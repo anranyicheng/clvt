@@ -6,6 +6,7 @@
   :license  "MIT"
   :version "0.2.0"
   :serial t
+  :depends-on (#+sbcl #:sb-simd)
   :components ((:file "src/package")
 	       (:file "src/util")
 	       (:file "src/nan")
@@ -23,6 +24,7 @@
                (:file "src/setops")
                (:file "src/random")
                (:file "src/linalg")
+	       #+sbcl (:file "src/simd-matmul")
                (:file "src/nn")
                (:file "src/rotate")
                (:file "src/extensions")

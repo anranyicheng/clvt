@@ -246,6 +246,7 @@ main() {
 	    nan-random-test
 	    property-test
 	    test-extensions
+	    simd-test
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)

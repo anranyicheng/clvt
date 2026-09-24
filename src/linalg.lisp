@@ -1,5 +1,9 @@
 (in-package :clvt)
 
+(defvar *simd-matmul-2d-fn* nil
+  "由 simd-matmul.lisp 注册的 SIMD 2D matmul 快速路径。
+   返回 VT 表示成功，返回 NIL 表示 vt-matmul 回退到 einsum。")
+
 (defvar *vt-einsum-parse-cache* (make-hash-table :test 'equal))
 
 (defvar *vt-einsum-cache-lock*
@@ -970,7 +974,9 @@
     (cond
       ;; 2d @ 2d → 2d（矩阵乘法）
       ((and (= ra 2) (= rb 2))
-       (vt-einsum "ij,jk->ik" a b :dtype dtype :out out))
+       (or (and *simd-matmul-2d-fn*
+		(funcall *simd-matmul-2d-fn* a b dtype out))
+	   (vt-einsum "ij,jk->ik" a b :dtype dtype :out out)))
       ;; 1d @ 1d → 标量（内积）
       ((and (= ra 1) (= rb 1))
        (vt-einsum "i,i->" a b :dtype dtype :out out))
