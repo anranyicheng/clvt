@@ -4706,38 +4706,233 @@
 ;; --------------------------------------------------------------------
 ;; 随机数生成
 ;; --------------------------------------------------------------------
+
+(defmacro %check (name &body body)
+  "每个子测试独立报告——一个失败不影响后续。"
+  `(handler-case
+       (progn ,@body
+              (format t "  [OK]   ~a~%" ,name))
+     (error (e)
+       (format t "  [FAIL] ~a: ~a~%" ,name e)
+       (error e))))
+
+(defun %same-vt-p (a b)
+  (and (equal (vt-shape a) (vt-shape b))
+       (equal (vt-to-list a) (vt-to-list b))))
+
+(defun %mean-of (vt)
+  (/ (reduce #'+ (vt-to-list (vt-flatten vt))) (vt-size vt)))
+
+(defun %std-of (vt)
+  (let* ((lst (vt-to-list (vt-flatten vt)))
+         (n (length lst))
+         (m (/ (reduce #'+ lst) n))
+         (var (/ (reduce #'+ (mapcar (lambda (x) (expt (- x m) 2)) lst)) n)))
+    (sqrt var)))
+
 (defun test-random ()
-  ;; vt-random-uniform 形状与范围
-  (let* ((shape '(5 4))
-         (r (vt-random-uniform shape :low 0 :high 10)))
-    (assert (equal (vt-shape r) shape))
-    ;; 确保所有元素在 [0,10) 内
-    (vt-do-each (ptr val r)
-      (declare (ignore ptr))
-      (assert (and (>= val 0.0d0) (< val 10.0d0)))))
+  (format t "~%===== 随机数生成测试 =====~%")
 
-  ;; vt-random-normal 形状与种子复现
-  (vt-random-seed (make-random-state t))   ; 设置种子
-  (let* ((shape '(3 3))
-         (r1 (vt-random-normal shape :mean 0 :std 1))
-         ;; 再次设置相同种子
-         (_ (vt-random-seed (make-random-state t)))
-         (r2 (vt-random-normal shape :mean 0 :std 1)))
-    (declare (ignorable _ r2))
-    (assert (equal (vt-shape r1) shape))
-    ;; 由于种子可能非确定，不强求相等，但至少形状对
-    (assert (equal '(3 3) (vt-shape r1)))
-    (assert (= (vt-size r1) 9)))
+  ;; ---------- 1. 基础分布：形状与取值范围 ----------
+  (%check "vt-random 形状"
+    (assert (equal (vt-shape (vt-random '(5 4))) '(5 4))))
 
-  ;; vt-random-int 范围
-  (let* ((r (vt-random-int 5 10 :size '(10))))
-    (assert (equal (vt-shape r) '(10)))
-    (vt-do-each (ptr val r)
-      (declare (ignore ptr))
-      (assert (and (>= val 5) (< val 10)))))
+  (%check "vt-random-uniform 形状 + 范围 [0, 10)"
+    (let ((r (vt-random-uniform '(10000) :low 0.0d0 :high 10.0d0)))
+      (assert (equal (vt-shape r) '(10000)))
+      (dolist (v (vt-to-list (vt-flatten r)))
+        (assert (and (>= v 0.0d0) (< v 10.0d0))))
+      ;; 均匀性粗检：均值 ≈ 5
+      (assert (< (abs (- (%mean-of r) 5.0d0)) 0.2d0))))
 
-  (format t "~%test-random passed.~%"))
+  (%check "vt-random-normal 形状 + 统计合理"
+    (let ((r (vt-random-normal '(1000) :mean 0.0d0 :std 1.0d0)))
+      (assert (equal (vt-shape r) '(1000)))
+      ;; 均值 ≈ 0，std ≈ 1（1000 样本，容差放宽）
+      (assert (< (abs (%mean-of r)) 0.2d0))
+      (assert (< (abs (- (%std-of r) 1.0d0)) 0.15d0))))
 
+  (%check "vt-random-normal 自定义 mean / std"
+    (let ((r (vt-random-normal '(1000) :mean 10.0d0 :std 0.5d0)))
+      (assert (< (abs (- (%mean-of r) 10.0d0)) 0.2d0))
+      (assert (< (abs (- (%std-of r) 0.5d0)) 0.1d0))))
+
+  (%check "vt-random-int 形状 + 整数范围 [5, 10)"
+    (let ((r (vt-random-int 5 10 :size '(1000) :dtype :int64)))
+      (assert (equal (vt-shape r) '(1000)))
+      (dolist (v (vt-to-list (vt-flatten r)))
+        (assert (and (integerp v) (>= v 5) (< v 10))))))
+
+  (%check "vt-random-integers 别名"
+    (let ((r (vt-random-integers 0 3 :size '(100))))
+      (assert (equal (vt-shape r) '(100)))
+      (dolist (v (vt-to-list (vt-flatten r)))
+        (assert (member v '(0 1 2))))))
+
+  ;; ---------- 2. 种子复现 ----------
+  (%check "vt-random-seed 整数：同 seed 同序列"
+    (vt-random-seed 42)
+    (let ((r1 (vt-random-normal '(5))))
+      (vt-random-seed 42)
+      (let ((r2 (vt-random-normal '(5))))
+        (assert (%same-vt-p r1 r2) ()
+                "同 seed 42 两次结果应相同：~a vs ~a"
+                (vt-to-list r1) (vt-to-list r2)))))
+
+  (%check "vt-random-seed 不同 seed：不同序列"
+    (vt-random-seed 42)
+    (let ((r1 (vt-random-normal '(5))))
+      (vt-random-seed 100)
+      (let ((r2 (vt-random-normal '(5))))
+        (assert (not (%same-vt-p r1 r2))
+                () "不同 seed 应产生不同序列"))))
+
+  (%check "连续调用 vt-random-*：序列推进（不重复）"
+    (vt-random-seed 42)
+    (let ((r1 (vt-random-normal '(5)))
+          (r2 (vt-random-normal '(5)))
+          (r3 (vt-random-normal '(5))))
+      (assert (not (%same-vt-p r1 r2)) () "连续调用应不同（1 vs 2）")
+      (assert (not (%same-vt-p r2 r3)) () "连续调用应不同（2 vs 3）")))
+
+  ;; ---------- 3. 作用域隔离（with-seed） ----------
+  (%check "with-seed 作用域内可复现"
+    (let ((a (with-seed (42) (vt-random-normal '(5))))
+          (b (with-seed (42) (vt-random-normal '(5)))))
+      (assert (%same-vt-p a b) () "with-seed 42 两次应相同")))
+
+  (%check "with-seed 不污染全局"
+    (vt-random-seed 100)
+    (let ((global-before (vt-random-normal '(5))))
+      (vt-random-seed 100)                   ; 重置
+      (with-seed (42)
+        (vt-random-normal '(5)))             ; 作用域内用 42
+      ;; 出作用域后应恢复用 100
+      (let ((global-after (vt-random-normal '(5))))
+        (assert (%same-vt-p global-before global-after) ()
+                "with-seed 不应污染全局状态"))))
+
+  ;; ---------- 4. Generator + SeedSequence ----------
+  (%check "make-generator：同 seed 同序列"
+    (let* ((g1 (make-generator 42))
+           (g2 (make-generator 42))
+           (r1 (vt-random-normal '(5) :rng g1))
+           (r2 (vt-random-normal '(5) :rng g2)))
+      (assert (%same-vt-p r1 r2) () "同 seed generator 应产生相同序列")))
+
+  (%check "make-generator：推进后不同"
+    (let* ((g (make-generator 42))
+           (r1 (vt-random-normal '(5) :rng g))
+           (r2 (vt-random-normal '(5) :rng g)))
+      (assert (not (%same-vt-p r1 r2)) ()
+              "同一 generator 连续调用应不同")))
+
+  (%check "spawn-generators：N 个独立 generator"
+    (let* ((gens (spawn-generators 42 4))
+           (seqs (mapcar (lambda (g) (vt-to-list (vt-random-normal '(5) :rng g)))
+                         gens)))
+      (assert (= (length gens) 4))
+      ;; 4 个 generator 产生的序列两两不同
+      (loop for i from 0 below 4 do
+        (loop for j from (1+ i) below 4 do
+          (assert (not (equal (nth i seqs) (nth j seqs))) ()
+                  "generator ~a 和 ~a 序列不应相同" i j)))))
+
+  (%check "spawn-generators：同 master-seed 完全可复现"
+    (let* ((gens-a (spawn-generators 42 3))
+           (gens-b (spawn-generators 42 3))
+           (seqs-a (mapcar (lambda (g)
+                             (vt-to-list (vt-random-normal '(5) :rng g)))
+                           gens-a))
+           (seqs-b (mapcar (lambda (g)
+                             (vt-to-list (vt-random-normal '(5) :rng g)))
+                           gens-b)))
+      (assert (equal seqs-a seqs-b) ()
+              "同 master-seed 应产生完全相同的 generators")))
+
+  (%check "with-generator 作用域"
+    (let* ((g (make-generator 42))
+           (r (with-generator (g) (vt-random-normal '(5)))))
+      (assert (equal (vt-shape r) '(5)))))
+
+  ;; ---------- 5. choice / permutation / shuffle ----------
+  (%check "vt-random-choice 整数范围"
+    (let ((r (vt-random-choice 10 :size 100)))
+      (assert (equal (vt-shape r) '(100)))
+      (dolist (v (vt-to-list (vt-flatten r)))
+        (assert (and (integerp v) (>= v 0) (< v 10))))))
+
+  (%check "vt-random-choice 数组元素"
+    (let* ((arr (vt-from-sequence '(10 20 30 40 50) :dtype :int64))
+           (r (vt-random-choice arr :size 100)))
+      (dolist (v (vt-to-list (vt-flatten r)))
+        (assert (member v '(10 20 30 40 50))))))
+
+  (%check "vt-random-choice replace=nil 无重复"
+    (let ((r (vt-random-choice 10 :size 10 :replace nil)))
+      (let ((lst (sort (copy-list (vt-to-list (vt-flatten r))) #'<)))
+        (assert (equal lst '(0 1 2 3 4 5 6 7 8 9)) ()
+                "无放回抽 10/10 应恰好是 0..9"))))
+
+  (%check "vt-random-choice 加权偏向"
+    (let ((r (vt-random-choice 3 :size 10000 :p '(9.0d0 0.5d0 0.5d0))))
+      (let ((cnt0 (count 0 (vt-to-list (vt-flatten r))))
+            (cnt1 (count 1 (vt-to-list (vt-flatten r)))))
+        ;; 权重 9:0.5，cnt0 应远大于 cnt1
+        (assert (> cnt0 (* 5 cnt1)) ()
+                "权重 9:0.5 时 0 应远多于 1（cnt0=~a cnt1=~a）" cnt0 cnt1))))
+
+  (%check "vt-random-permutation 整数"
+    (let ((p (vt-random-permutation 100)))
+      (assert (equal (vt-shape p) '(100)))
+      (let ((lst (sort (copy-list (vt-to-list (vt-flatten p))) #'<)))
+        (assert (equal lst (loop for i below 100 collect i)) ()
+                "permutation 应是 0..99 的排列"))))
+
+  (%check "vt-random-permutation 边界"
+    (assert (equal (vt-to-list (vt-flatten (vt-random-permutation 0))) '()))
+    (assert (equal (vt-to-list (vt-flatten (vt-random-permutation 1))) '(0))))
+
+  (%check "vt-random-shuffle 就地洗牌"
+    (let* ((x (vt-from-sequence (loop for i below 50 collect i) :dtype :int64))
+           (orig (copy-list (vt-to-list (vt-flatten x))))
+           (result (vt-random-shuffle x)))
+      (assert (eq result x) () "shuffle 应就地返回同一对象")
+      (let ((after (sort (copy-list (vt-to-list (vt-flatten x))) #'<)))
+        (assert (equal orig after) () "shuffle 后元素多重集应不变"))))
+
+  ;; ---------- 6. multinomial ----------
+  (%check "vt-random-multinomial 计数和"
+    (let ((counts (vt-random-multinomial 100 '(0.2d0 0.3d0 0.5d0))))
+      (assert (equal (vt-shape counts) '(3)))
+      (let ((total (reduce #'+ (vt-to-list (vt-flatten counts)))))
+        (assert (= total 100) () "总数应等于 n=100"))))
+
+  (%check "vt-random-multinomial 分布偏向"
+    ;; p = (0.9, 0.1)，抽 1000 次，第一个类别应占多数
+    (let* ((counts (vt-random-multinomial 1000 '(0.9d0 0.1d0)))
+           (lst (vt-to-list (vt-flatten counts))))
+      (assert (> (first lst) (* 3 (second lst))) ()
+              "0.9:0.1 权重下第一类别应显著多于第二")))
+
+  (%check "vt-random-multinomial 批量"
+    (let ((counts (vt-random-multinomial 10 '(0.5d0 0.5d0) :size 5)))
+      (assert (equal (vt-shape counts) '(5 2)))
+      ;; 每个 batch 计数和 = 10
+      (dotimes (i 5)
+        (let ((row (vt-to-list (vt-slice counts (list i) (list :all)))))
+          (assert (= (reduce #'+ row) 10))))))
+
+  ;; ---------- 7. dtype 支持 ----------
+  (%check "vt-random dtype float32"
+    (let ((r (vt-random-uniform '(100) :dtype :float32)))
+      (assert (eq (vt-dtype r) :float32))))
+
+  (%check "vt-random-int dtype int64"
+    (let ((r (vt-random-int 0 10 :size '(10) :dtype :int64)))
+      (assert (eq (vt-dtype r) :int64))))
+
+  (format t "~%test-random 完成。~%"))
 
 ;; --------------------------------------------------------------------
 ;; 激活函数补充测试

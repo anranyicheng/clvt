@@ -318,6 +318,14 @@
    #:vt-random-permutation
    #:vt-random-shuffle
    #:vt-random-multinomial
+   ;; SeedSequence
+   #:vt-seed-sequence #:make-seed-sequence #:vt-seed-sequence-entropy
+   #:seed-sequence-spawn #:seed-sequence-generate-state
+   ;; Generator
+   #:vt-generator #:make-generator #:vt-generator-state
+   #:generator-from-seed-sequence #:spawn-generators
+   ;; 作用域宏
+   #:with-seed #:with-generator
 
    ;; ------------------------------------------------------------------
    ;; nan / inf 相关 (nan.lisp)
