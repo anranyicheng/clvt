@@ -12,8 +12,8 @@
 (defconstant +vt-einsum-cache-max+ 1024)
 
 ;;; 多线程 GEMM 调度
-(defvar *matmul-thread-count* 4
-  "并行 GEMM 的最大工作线程数。建议设为 CPU 物理核数。")
+(defvar *matmul-thread-count* (- *processor-number* 1)
+  "并行 GEMM 的最大工作线程数。建议设为 CPU 物理核数-1。")
 
 (defvar *matmul-parallel-threshold* 5000000
   "当 m*k*n 低于该阈值时走单线程，避免线程创建开销。")

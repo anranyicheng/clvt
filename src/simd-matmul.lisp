@@ -8,7 +8,7 @@
 (defvar *simd-matmul-enabled* t)
 (defvar *simd-matmul-threshold* 50000)
 (defvar *simd-matmul-thread-threshold* 5000000)
-(defvar *simd-matmul-thread-count* 4)
+(defvar *simd-matmul-thread-count* (- *processor-number* 1))
 
 ;;; ============================================================
 ;;; SIMD 内核宏

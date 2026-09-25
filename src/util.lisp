@@ -2,6 +2,16 @@
 
 (in-package :clvt)
 
+(defvar *processor-number*
+  (or (ignore-errors
+       (sb-alien:alien-funcall
+	(sb-alien:extern-alien
+	 "sysconf"
+	 (function sb-alien:long sb-alien:int))
+	(or sb-unix::sc-nprocessors-onln 84)))
+      4)
+  "系统cpu核心数量")
+
 (defmacro with-float-safe (&body body)
   "在 IEEE 754 陷阱被屏蔽的环境下执行 body，使 0/0、溢出等产生 nan/inf 而非报错。"
   #+sbcl `(sb-int:with-float-traps-masked
