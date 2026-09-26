@@ -39,8 +39,10 @@
                   (t (error "~s 不是序列" s)))))
             (nreverse result))))))
 
-(defun vt-from-sequence (contents &key (dtype :float64))
-  "从嵌套序列创建张量（行主序）。支持任意维度规则嵌套；空序列 -> 形状 (0)。"
+(defun vt-from-sequence (contents &key (dtype :float64) (fast nil))
+  "从嵌套序列创建张量（行主序）。支持任意维度规则嵌套；空序列 -> 形状 (0)。
+   fast t 意味着直接使用 coerce 转换，可能报错
+        nil 则用 vt-cast 安全转换 (默认)"
   (with-float-safe
     (labels
 	((infer-shape (seq)
@@ -89,7 +91,9 @@
          (fill-tensor (data seq shape strides flat-idx)
            (if (null shape)
                (setf (aref data flat-idx)
-                     (coerce seq (vt-dtype->lisp-type dtype)))
+		     (if fast
+			 (coerce seq (vt-dtype->lisp-type dtype))
+			 (vt-cast seq dtype)))
                (let ((stride (first strides)) (current flat-idx))
                  (typecase seq
                    (list
@@ -145,23 +149,31 @@
           (build shape strides offset data)
           (aref data offset)))))
 
-(defun vt-to-array (vt &key dtype)
-  "将张量转换为原生多维数组。使用 vt-do-each 遍历，同时维护逻辑坐标。"
+(defun vt-to-array (vt &key dtype (fast nil))
+  "将张量转换为原生多维数组。使用 vt-do-each 遍历，同时维护逻辑坐标。
+   fast t 意味着直接使用 coerce 转换，可能报错
+        nil 则用 vt-cast 安全转换 (默认)"
   (when dtype (setf vt (vt-astype vt dtype)))
-  (let ((shape (vt-shape vt)))
+  (let ((shape (vt-shape vt))
+	(lisp-type (vt-dtype->lisp-type dtype)))
     (if (null shape)
         ;; 标量：0 维数组
-        (make-array nil :initial-element (aref (vt-data vt) (vt-offset vt)))
+        (make-array nil
+		    :initial-element
+		    (aref (vt-data vt) (vt-offset vt))
+		    :element-type lisp-type)
         ;; 非标量
         (let* ((rank (length shape))
                (dims (coerce shape 'simple-vector))          ; 各维度大小
-               (arr (make-array shape :element-type (vt-element-type vt)))
+               (arr (make-array shape :element-type lisp-type))
                (coords (make-list rank :initial-element 0))) ; 初始坐标全 0
           (vt-do-each (ptr val vt)
             (declare (ignore val))
             ;; 使用当前坐标设置目标数组
             (setf (apply #'aref arr coords)
-                  (aref (vt-data vt) ptr))
+		  (if fast
+                      (coerce (aref (vt-data vt) ptr) lisp-type)
+		      (vt-cast (aref (vt-data vt) ptr) dtype)))
             ;; 更新坐标到下一个逻辑位置（C 顺序）
             (let ((i (1- rank)))
               (loop

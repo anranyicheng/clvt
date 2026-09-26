@@ -141,8 +141,10 @@
   (vt-map (lambda (x) (expt base x))
           (vt-linspace start stop num :endpoint endpoint :dtype dtype)))
 
-(defun vt-from-array (arr &key (dtype nil))
-  "从标准 CL 多维数组创建张量（保持维度）。"
+(defun vt-from-array (arr &key (dtype nil) (fast nil))
+  "从标准 CL 多维数组创建张量（保持维度）。
+   fast t 意味着直接使用 coerce 转换，可能报错
+        nil 则用 vt-cast 安全转换(默认)"
   (let* ((shape (array-dimensions arr))
          (size (vt-shape-to-size shape))
          (cl-etype (array-element-type arr))
@@ -153,9 +155,13 @@
                       ((subtypep cl-etype 'fixnum) :int64)
                       (t :float64)))
          (final (or dtype infer))
-         (data (make-array size :element-type (vt-dtype->lisp-type final))))
-    (dotimes (i size)
-      (setf (aref data i) (vt-cast (row-major-aref arr i) final)))
+	 (lisp-type (vt-dtype->lisp-type final))
+         (data (make-array size :element-type lisp-type)))
+    (if fast
+	(dotimes (i size)
+	  (setf (aref data i) (coerce (row-major-aref arr i) lisp-type)))
+	(dotimes (i size)
+	  (setf (aref data i) (vt-cast (row-major-aref arr i) final))))    
     (%make-vt :data data :shape shape :strides (vt-compute-strides shape)
               :offset 0 :dtype final)))
 
