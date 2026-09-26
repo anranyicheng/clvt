@@ -449,6 +449,7 @@
 ;;; ------------------------------------------------------------------
 ;;; 别名检测辅助（放在 vt-copy-into 之前）
 ;;; ------------------------------------------------------------------
+
 (defun %vt-views-overlap-p (a b)
   "判断两个 vt 视图是否共享底层物理数组，且其访问的物理索引区间存在交集。
    目的：为 vt-copy-into 提供别名检测。当 dest 与 src 别名且区间重叠时，
@@ -481,132 +482,227 @@
            (multiple-value-bind (b-lo b-hi) (span b)
              (and (<= a-lo b-hi) (<= b-lo a-hi)))))))
 
+(defun %copy-strided-hi (dest-data dest-dtype dest-strides dest-off
+                         src-data src-strides src-off
+                         shape size same-dtype)
+  "rank ≥ 4 的通用里程计。
+   - 预计算 (1- dim) 数组，避免每次回退重复计算
+   - 内层循环用局部变量缓存 indices/dims/stride
+   - 同 dtype 时直接拷贝，异 dtype 时循环外取 caster"
+  (declare (type fixnum size dest-off src-off)
+           (type list shape dest-strides src-strides)
+           (optimize (speed 3) (safety 0)))
+  (when (zerop size) (return-from %copy-strided-hi nil))
+  (let* ((rank   (length shape))
+         (dims   (coerce shape 'simple-vector))
+         (d-strs (coerce dest-strides 'simple-vector))
+         (s-strs (coerce src-strides 'simple-vector))
+         (dims-1 (make-array rank :element-type 'fixnum))
+         (indices (make-array rank :element-type 'fixnum :initial-element 0))
+         (caster (unless same-dtype (vt-cast-fun dest-dtype)))
+         (d-ptr dest-off)
+         (s-ptr src-off))
+    (declare (type fixnum rank d-ptr s-ptr)
+             (type simple-vector dims d-strs s-strs)
+             (type (simple-array fixnum (*)) dims-1 indices)
+             (type (or null function) caster))
+    (loop for i fixnum from 0 below rank
+          do (setf (aref dims-1 i)
+                   (1- (the fixnum (svref dims i)))))
+    (loop
+      (setf (aref dest-data d-ptr)
+            (if caster
+                (funcall caster (aref src-data s-ptr))
+                (aref src-data s-ptr)))
+      (let ((depth (the fixnum (1- rank))))
+        (declare (type fixnum depth))
+        (loop
+          (when (< depth 0) (return-from %copy-strided-hi nil))
+          (let ((i (the fixnum (1+ (the fixnum (aref indices depth))))))
+            (declare (type fixnum i))
+            (if (< i (the fixnum (svref dims depth)))
+                (progn
+                  (setf (aref indices depth) i)
+                  (incf d-ptr (the fixnum (svref d-strs depth)))
+                  (incf s-ptr (the fixnum (svref s-strs depth)))
+                  (return))
+                (progn
+                  (setf (aref indices depth) 0)
+                  (decf d-ptr (* (the fixnum (svref d-strs depth))
+                                 (the fixnum (aref dims-1 depth))))
+                  (decf s-ptr (* (the fixnum (svref s-strs depth))
+                                 (the fixnum (aref dims-1 depth))))
+                  (decf depth)))))))))
+
+(defun %copy-generic (dest-data dest-dtype dest-strides dest-off
+                      src-data src-strides src-off
+                      shape size rank same-dtype)
+  "通用拷贝：rank 0/1/2/3 走专门化嵌套循环；rank ≥ 4 退回里程计。
+   所有路径单遍遍历，无中间缓冲。"
+  (declare (type fixnum size dest-off src-off rank)
+           (type list shape dest-strides src-strides)
+           (optimize (speed 3) (safety 0)))
+  (when (zerop size) (return-from %copy-generic nil))
+  (let ((caster (unless same-dtype (vt-cast-fun dest-dtype))))
+    (declare (type (or null function) caster))
+    (case rank
+      ;; ---------- rank 0：标量 ----------
+      (0 (setf (aref dest-data dest-off)
+               (if caster
+                   (funcall caster (aref src-data src-off))
+                   (aref src-data src-off))))
+
+      ;; ---------- rank 1 ----------
+      (1 (let* ((d0  (the fixnum (first shape)))
+                (ds0 (the fixnum (first dest-strides)))
+                (ss0 (the fixnum (first src-strides))))
+           (declare (type fixnum d0 ds0 ss0))
+           (if caster
+               (loop for i fixnum from 0 below d0
+                     for dp fixnum = dest-off then (+ dp ds0)
+                     for sp fixnum = src-off  then (+ sp ss0)
+                     do (setf (aref dest-data dp)
+                              (funcall caster (aref src-data sp))))
+               (loop for i fixnum from 0 below d0
+                     for dp fixnum = dest-off then (+ dp ds0)
+                     for sp fixnum = src-off  then (+ sp ss0)
+                     do (setf (aref dest-data dp) (aref src-data sp))))))
+
+      ;; ---------- rank 2 ----------
+      (2 (let* ((d0  (the fixnum (first shape)))
+                (d1  (the fixnum (second shape)))
+                (ds0 (the fixnum (first dest-strides)))
+                (ds1 (the fixnum (second dest-strides)))
+                (ss0 (the fixnum (first src-strides)))
+                (ss1 (the fixnum (second src-strides))))
+           (declare (type fixnum d0 d1 ds0 ds1 ss0 ss1))
+           (if caster
+               (loop for i0 fixnum from 0 below d0
+                     for dp0 fixnum = dest-off then (+ dp0 ds0)
+                     for sp0 fixnum = src-off  then (+ sp0 ss0)
+                     do (loop for i1 fixnum from 0 below d1
+                              for dp fixnum = dp0 then (+ dp ds1)
+                              for sp fixnum = sp0 then (+ sp ss1)
+                              do (setf (aref dest-data dp)
+                                       (funcall caster (aref src-data sp)))))
+               (loop for i0 fixnum from 0 below d0
+                     for dp0 fixnum = dest-off then (+ dp0 ds0)
+                     for sp0 fixnum = src-off  then (+ sp0 ss0)
+                     do (loop for i1 fixnum from 0 below d1
+                              for dp fixnum = dp0 then (+ dp ds1)
+                              for sp fixnum = sp0 then (+ sp ss1)
+                              do (setf (aref dest-data dp)
+                                       (aref src-data sp)))))))
+
+      ;; ---------- rank 3 ----------
+      (3 (let* ((d0  (the fixnum (first shape)))
+                (d1  (the fixnum (second shape)))
+                (d2  (the fixnum (third shape)))
+                (ds0 (the fixnum (first dest-strides)))
+                (ds1 (the fixnum (second dest-strides)))
+                (ds2 (the fixnum (third dest-strides)))
+                (ss0 (the fixnum (first src-strides)))
+                (ss1 (the fixnum (second src-strides)))
+                (ss2 (the fixnum (third src-strides))))
+           (declare (type fixnum d0 d1 d2 ds0 ds1 ds2 ss0 ss1 ss2))
+           (if caster
+               (loop for i0 fixnum from 0 below d0
+                     for dp0 fixnum = dest-off then (+ dp0 ds0)
+                     for sp0 fixnum = src-off  then (+ sp0 ss0)
+                     do (loop for i1 fixnum from 0 below d1
+                              for dp1 fixnum = dp0 then (+ dp1 ds1)
+                              for sp1 fixnum = sp0 then (+ sp1 ss1)
+                              do (loop for i2 fixnum from 0 below d2
+                                       for dp fixnum = dp1 then (+ dp ds2)
+                                       for sp fixnum = sp1 then (+ sp ss2)
+                                       do (setf (aref dest-data dp)
+                                                (funcall caster (aref src-data sp))))))
+               (loop for i0 fixnum from 0 below d0
+                     for dp0 fixnum = dest-off then (+ dp0 ds0)
+                     for sp0 fixnum = src-off  then (+ sp0 ss0)
+                     do (loop for i1 fixnum from 0 below d1
+                              for dp1 fixnum = dp0 then (+ dp1 ds1)
+                              for sp1 fixnum = sp0 then (+ sp1 ss1)
+                              do (loop for i2 fixnum from 0 below d2
+                                       for dp fixnum = dp1 then (+ dp ds2)
+                                       for sp fixnum = sp1 then (+ sp ss2)
+                                       do (setf (aref dest-data dp)
+                                                (aref src-data sp))))))))
+
+      ;; ---------- rank ≥ 4：退回里程计 ----------
+      (otherwise
+       (%copy-strided-hi dest-data dest-dtype dest-strides dest-off
+                         src-data src-strides src-off
+                         shape size same-dtype)))))
+
 ;;; ------------------------------------------------------------------
 ;;; 拷贝入口
 ;;; ------------------------------------------------------------------
 
 (defun vt-copy-into (dest src)
   "将 src 拷贝到 dest（支持广播与类型转换）。返回 dest。
-
    语义契约：
    1. dest 形状必须能容纳 src 广播后的形状，否则报错。
    2. dest 中「dim>1 且 stride=0」的广播维度是只读的，写入会报错。
-   3. 当 dest 与 src 共享底层数组且物理区间重叠时，先对 src 做快照，
-      使拷贝具有 memmove 语义（等价于 numpy 对重叠视图的处理），
-      调用方无需关心 dest 与 src 是否别名。"
+   3. 当 dest 与 src 共享底层数组且物理区间重叠时，先对 src 做快照。"
   (setf src (ensure-vt src))
   (let ((dest-shape (vt-shape dest))
         (src-shape  (vt-shape src)))
-    ;; ---- 1) dest 可写性检查 ----------------------------------------
-    (loop for d in dest-shape
-          for s in (vt-strides dest)
-          when (and (> d 1) (zerop s))
-            do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d))
-    ;; ---- 2) 形状兼容性检查 ------------------------------------------
+    ;; ---- 1) 可写性检查 ------------------------------------------------
+    (when (plusp (vt-size dest))
+      (loop for d in dest-shape
+            for s in (vt-strides dest)
+            when (and (> d 1) (zerop s))
+              do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d)))
+    ;; ---- 2) 形状兼容性 ------------------------------------------------
     (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
       (unless (equal final-shape dest-shape)
         (error "vt-copy-into: dest 形状 ~a 无法容纳 src 广播后 ~a"
                dest-shape final-shape)))
-    ;; ---- 3) 别名保护：重叠 → 用 vt-do-each 快照 src ----------------
-    ;; 快照后 src 是独立连续的 vt，后续所有分支都不再与 dest 别名。
+    ;; ---- 3) 别名保护：重叠 → 深拷贝 src 作快照 ------------------------
     (when (%vt-views-overlap-p dest src)
-      (let* ((shape (vt-shape src))
-             (size  (vt-shape-to-size shape))
-             (data  (vt-data src))
-             (et    (array-element-type data))
-             (tmp   (make-array size :element-type et))
-             (i     0))
-        (declare (type fixnum i size))
-        (vt-do-each (p v src)
-          (declare (ignore p))
-          (setf (aref tmp i) v)
-          (incf i))
-        (setf src (%make-vt :data tmp
-                            :shape shape
-                            :strides (vt-compute-strides shape)
-                            :offset 0
-                            :dtype (vt-dtype src)))))
-    ;; ---- 4) 实际拷贝 -----------------------------------------------
-    (let* ((dest-data   (vt-data dest))
-           (src-data    (vt-data src))
-           (dest-dtype  (vt-dtype dest))
-           (src-dtype   (vt-dtype src))
-           (src-strides (vt-broadcast-strides src-shape dest-shape
-                                              (vt-strides src)))
-           (size        (vt-shape-to-size dest-shape)))
-      (declare (type fixnum size))
+      (setf src (vt-copy src)))
+    ;; ---- 4) 参数预计算 ------------------------------------------------
+    (let* ((dest-data    (vt-data dest))
+           (src-data     (vt-data src))
+           (dest-dtype   (vt-dtype dest))
+           (src-dtype    (vt-dtype src))
+           (dest-strides (vt-strides dest))
+           (src-strides  (vt-broadcast-strides
+                          src-shape dest-shape (vt-strides src)))
+           (dest-off     (vt-offset dest))
+           (src-off      (vt-offset src))
+           (size         (vt-shape-to-size dest-shape))
+           (rank         (length dest-shape))
+           (dest-contig  (vt-contiguous-p dest))
+           (src-contig   (vt-contiguous-p src))
+           (same-shape   (equal dest-shape src-shape))
+           (same-dtype   (eq dest-dtype src-dtype)))
+      (declare (type fixnum size dest-off src-off rank))
       (cond
-        ;; 极速：连续 + 同形 + 同型 → 底层 replace
-        ((and (vt-contiguous-p dest)
-              (vt-contiguous-p src)
-              (equal dest-shape src-shape)
-              (equal dest-dtype src-dtype))
+        ;; 快路径 1：连续 + 同形 + 同 dtype → replace (memcpy)
+        ((and dest-contig src-contig same-shape same-dtype)
          (replace dest-data src-data
-                  :start1 (vt-offset dest) :end1 (+ (vt-offset dest) size)
-                  :start2 (vt-offset src)  :end2 (+ (vt-offset src)  size)))
+                  :start1 dest-off :end1 (+ dest-off size)
+                  :start2 src-off  :end2 (+ src-off size)))
 
-        ;; 中速：连续 + 同形 → 单层类型转换循环
-        ((and (vt-contiguous-p dest)
-              (vt-contiguous-p src)
-              (equal dest-shape src-shape))
-         (let ((d-off  (vt-offset dest))
-               (s-off  (vt-offset src))
-               (caster (vt-cast-fun dest-dtype)))
-           (declare (type fixnum d-off s-off)
-                    (type function caster))
+        ;; 快路径 2：连续 + 同形 + 需要类型转换
+        ((and dest-contig src-contig same-shape)
+         (let ((caster (vt-cast-fun dest-dtype)))
+           (declare (type function caster))
            (dotimes (i size)
-             (setf (aref dest-data (+ d-off i))
-                   (funcall caster (aref src-data (+ s-off i)))))))
+             (setf (aref dest-data (+ dest-off i))
+                   (funcall caster (aref src-data (+ src-off i)))))))
+        ;; 快路径 3：src 是标量或 size=1 → 广播填充
+        ((= (vt-size src) 1)
+         (vt-fill dest (aref src-data src-off)))
 
-        ;; 慢速：非连续 / 广播 → 通用 strided 迭代
+        ;; 通用路径：按秩专门化
         (t
-         (%copy-strided dest-data dest-dtype (vt-strides dest) (vt-offset dest)
-                        src-data src-dtype src-strides (vt-offset src)
-                        dest-shape size)))
-
+         (%copy-generic dest-data dest-dtype dest-strides dest-off
+                        src-data src-strides src-off
+                        dest-shape size rank same-dtype)))
       dest)))
-
-(defun %copy-strided (dest-data dest-dtype dest-strides dest-offset
-                      src-data src-dtype src-strides src-offset shape size)
-  "通用按步长/广播拷贝（里程表迭代，零动态分配）。
-
-优化：当 src-dtype 与 dest-dtype 相同时，跳过逐元素 vt-cast 的 ecase
-分派，直接原值拷贝；异型时在循环外用 vt-cast-fun 取出特化转换函数，
-避免每元素重复 ecase。"
-  (let* ((rank (length shape))
-         (dims (coerce shape 'simple-vector))
-         (d-strs (coerce dest-strides 'simple-vector))
-         (s-strs (coerce src-strides 'simple-vector))
-         (indices (make-array rank :element-type 'fixnum :initial-element 0))
-         (d-ptr dest-offset)
-         (s-ptr src-offset)
-         ;; 同型时为 nil（直接拷贝原值），异型时为转换函数
-         (caster (unless (equal dest-dtype src-dtype)
-                   (vt-cast-fun dest-dtype))))
-    (declare (type simple-vector dims d-strs s-strs)
-             (type (simple-array fixnum (*)) indices)
-             (type fixnum d-ptr s-ptr rank)
-             (type (or null function) caster))
-    (when (zerop size)
-      (return-from %copy-strided nil))
-    (loop
-      (setf (aref dest-data d-ptr)
-            (if caster
-                (funcall caster (aref src-data s-ptr))
-                (aref src-data s-ptr)))
-      (let ((depth (1- rank)))
-        (loop
-          (when (< depth 0)
-	    (return-from %copy-strided nil))
-          (incf (aref indices depth))
-          (if (< (aref indices depth) (svref dims depth))
-              (progn (incf d-ptr (svref d-strs depth))
-                     (incf s-ptr (svref s-strs depth))
-                     (return))
-              (progn (setf (aref indices depth) 0)
-                     (decf d-ptr (* (svref d-strs depth) (1- (svref dims depth))))
-                     (decf s-ptr (* (svref s-strs depth) (1- (svref dims depth))))
-                     (decf depth))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 填充
@@ -615,10 +711,11 @@
 (defun vt-fill (vt value)
   "用标量 value 原地填充张量 vt 的所有元素（支持视图）。返回 vt。
    广播视图（dim>1 且 stride=0 的维度）在语义上只读，写入会报错。"
-  (loop for d in (vt-shape vt)
-        for s in (vt-strides vt)
-        when (and (> d 1) (zerop s))
-          do (error "vt-fill: 目标视图是只读的广播视图（维度 ~a）" d))
+  (when (plusp (vt-size vt))
+    (loop for d in (vt-shape vt)
+          for s in (vt-strides vt)
+          when (and (> d 1) (zerop s))
+            do (error "vt-fill: 目标视图是只读的广播视图（维度 ~a）" d)))
   (let* ((data (vt-data vt))
          (cval (vt-cast value (vt-dtype vt)))
          (size (vt-size vt)))

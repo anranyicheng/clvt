@@ -248,6 +248,7 @@ main() {
 	    test-extensions
 	    simd-test
 	    test-overlap
+	    test-copy-into
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)
