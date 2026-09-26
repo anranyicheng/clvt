@@ -711,7 +711,7 @@
                        (blk (out-lt in-lt acc-lt op)
                          `(progn
                             (let ((ip in-off) (opos res-off)
-                                  (init-acc (acc-init ,acc-lt init-val)))
+					      (init-acc (acc-init ,acc-lt init-val)))
                               (declare (type fixnum ip opos)
                                        (type ,acc-lt init-acc))
                               (dotimes (o outer)
@@ -806,20 +806,20 @@
                      (loop for i from 0 below rank
                            if (member i axes) collect 0
                              else collect
-                             (let ((out-idx (if keepdims i
-                                                (count-if-not (lambda (x) (member x axes))
-                                                              (loop for j below i collect j)))))
-                               (nth out-idx res-strides)))))
+				  (let ((out-idx (if keepdims i
+                                                     (count-if-not (lambda (x) (member x axes))
+								   (loop for j below i collect j)))))
+				    (nth out-idx res-strides)))))
                (idx-strides-map
                  (if (or (not return-arg) global)
                      (make-list rank :initial-element 0)
                      (loop for i from 0 below rank
                            if (member i axes) collect 0
                              else collect
-                             (let ((out-idx (if keepdims i
-                                                (count-if-not (lambda (x) (member x axes))
-                                                              (loop for j below i collect j)))))
-                               (nth out-idx res-idx-strides)))))
+				  (let ((out-idx (if keepdims i
+                                                     (count-if-not (lambda (x) (member x axes))
+								   (loop for j below i collect j)))))
+				    (nth out-idx res-idx-strides)))))
                (arg-strides
                  (if return-arg
                      (if global
