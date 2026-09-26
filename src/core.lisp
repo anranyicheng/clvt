@@ -113,7 +113,7 @@
             (final (or dtype infer))
             (lisp-type (vt-dtype->lisp-type final)))
        (%make-vt :data (make-array 1 :element-type lisp-type
-                                     :initial-element (coerce obj lisp-type))
+                                     :initial-element (vt-cast obj final))
                  :shape nil :strides nil :offset 0 :dtype final)))
     (sequence (vt-from-sequence obj :dtype (or dtype :float64)))))
 
@@ -446,58 +446,114 @@
               (vt-copy-into new vt))
           new)
         (vt-astype vt target-dtype))))
+;;; ------------------------------------------------------------------
+;;; 别名检测辅助（放在 vt-copy-into 之前）
+;;; ------------------------------------------------------------------
+
+(defun %vt-views-overlap-p (a b)
+  "判断两个 vt 视图是否共享底层数组且物理访问区间可能重叠。
+   前提：库内不生成负步长；广播维度（dim>1 且 stride=0）只贡献 offset 本身。
+   绝大多数调用首先被 (eq (vt-data a) (vt-data b)) 短路，几乎零开销。"
+  (and (eq (vt-data a) (vt-data b))
+       (let ((a-lo (vt-offset a))
+	     (a-hi (vt-offset a))
+             (b-lo (vt-offset b))
+	     (b-hi (vt-offset b)))
+         (declare (type fixnum a-lo a-hi b-lo b-hi))
+         (loop for d of-type fixnum in (vt-shape a)
+               for s of-type fixnum in (vt-strides a)
+               when (> d 1)
+		 do (incf a-hi (the fixnum (* (1- d) s))))
+         (loop for d of-type fixnum in (vt-shape b)
+               for s of-type fixnum in (vt-strides b)
+               when (> d 1)
+		 do (incf b-hi (the fixnum (* (1- d) s))))
+         (and (<= a-lo b-hi) (<= b-lo a-hi)))))
+
+;;; ------------------------------------------------------------------
+;;; 拷贝入口
+;;; ------------------------------------------------------------------
 
 (defun vt-copy-into (dest src)
-  "将 src 拷贝到 dest（支持广播与类型转换）。返回 dest。"
+  "将 src 拷贝到 dest（支持广播与类型转换）。返回 dest。
+
+   语义契约：
+   1. dest 形状必须能容纳 src 广播后的形状，否则报错。
+   2. dest 中「dim>1 且 stride=0」的广播维度是只读的，写入会报错。
+   3. 当 dest 与 src 共享底层数组且物理区间重叠时，先对 src 做快照，
+      使拷贝具有 memmove 语义（等价于 numpy 对重叠视图的处理），
+      调用方无需关心 dest 与 src 是否别名。"
   (setf src (ensure-vt src))
   (let ((dest-shape (vt-shape dest))
-	(src-shape (vt-shape src)))
+        (src-shape  (vt-shape src)))
+    ;; ---- 1) dest 可写性检查 ----------------------------------------
     (loop for d in dest-shape
-	  for s in (vt-strides dest)
+          for s in (vt-strides dest)
           when (and (> d 1) (zerop s))
             do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d))
+    ;; ---- 2) 形状兼容性检查 ------------------------------------------
     (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
       (unless (equal final-shape dest-shape)
-        (error "vt-copy-into: dest 形状 ~a 无法容纳 src 广播后 ~a" dest-shape final-shape))
-      (let* ((dest-data (vt-data dest))
-             (src-data (vt-data src))
-             (dest-dtype (vt-dtype dest))
-             (src-dtype (vt-dtype src))
-             (src-strides (vt-broadcast-strides src-shape dest-shape (vt-strides src)))
-             (size (vt-shape-to-size dest-shape)))
-        (cond
-          ;; 极速：连续 + 同型 -> memcpy
-          ((and (vt-contiguous-p dest)
-		(vt-contiguous-p src)
-                (equal dest-shape src-shape)
-		(equal dest-dtype src-dtype))
-           (replace dest-data src-data
-                    :start1 (vt-offset dest) :end1 (+ (vt-offset dest) size)
-                    :start2 (vt-offset src) :end2 (+ (vt-offset src) size)))
-          ;; 中速：连续 + 同形 -> 单层类型转换循环
-          ((and (vt-contiguous-p dest)
-		(vt-contiguous-p src)
-                (equal dest-shape src-shape))
-           (let ((d-off (vt-offset dest))
-		 (s-off (vt-offset src)))
-             (declare (type fixnum d-off s-off size))
-             (if (equal dest-dtype src-dtype)
-                 ;; 同型：直接 replace，零转换开销
-                 (replace dest-data src-data
-                          :start1 d-off :end1 (+ d-off size)
-                          :start2 s-off :end2 (+ s-off size))
-                 ;; 异型：按目标 dtype 特化的转换循环
-                 (let ((caster (vt-cast-fun dest-dtype)))
-                   (declare (type function caster))
-                   (dotimes (i size)
-                     (setf (aref dest-data (+ d-off i))
-                           (funcall caster (aref src-data (+ s-off i)))))))))
-          ;; 慢速：非连续 / 广播 -> 通用 strided 迭代
-          (t
-           (%copy-strided dest-data dest-dtype (vt-strides dest) (vt-offset dest)
-                          src-data src-dtype src-strides (vt-offset src)
-                          dest-shape size)))
-        dest))))
+        (error "vt-copy-into: dest 形状 ~a 无法容纳 src 广播后 ~a"
+               dest-shape final-shape)))
+    ;; ---- 3) 别名保护：重叠 → 用 vt-do-each 快照 src ----------------
+    ;; 快照后 src 是独立连续的 vt，后续所有分支都不再与 dest 别名。
+    (when (%vt-views-overlap-p dest src)
+      (let* ((shape (vt-shape src))
+             (size  (vt-shape-to-size shape))
+             (data  (vt-data src))
+             (et    (array-element-type data))
+             (tmp   (make-array size :element-type et))
+             (i     0))
+        (declare (type fixnum i size))
+        (vt-do-each (p v src)
+          (declare (ignore p))
+          (setf (aref tmp i) v)
+          (incf i))
+        (setf src (%make-vt :data tmp
+                            :shape shape
+                            :strides (vt-compute-strides shape)
+                            :offset 0
+                            :dtype (vt-dtype src)))))
+    ;; ---- 4) 实际拷贝 -----------------------------------------------
+    (let* ((dest-data   (vt-data dest))
+           (src-data    (vt-data src))
+           (dest-dtype  (vt-dtype dest))
+           (src-dtype   (vt-dtype src))
+           (src-strides (vt-broadcast-strides src-shape dest-shape
+                                              (vt-strides src)))
+           (size        (vt-shape-to-size dest-shape)))
+      (declare (type fixnum size))
+      (cond
+        ;; 极速：连续 + 同形 + 同型 → 底层 replace
+        ((and (vt-contiguous-p dest)
+              (vt-contiguous-p src)
+              (equal dest-shape src-shape)
+              (equal dest-dtype src-dtype))
+         (replace dest-data src-data
+                  :start1 (vt-offset dest) :end1 (+ (vt-offset dest) size)
+                  :start2 (vt-offset src)  :end2 (+ (vt-offset src)  size)))
+
+        ;; 中速：连续 + 同形 → 单层类型转换循环
+        ((and (vt-contiguous-p dest)
+              (vt-contiguous-p src)
+              (equal dest-shape src-shape))
+         (let ((d-off  (vt-offset dest))
+               (s-off  (vt-offset src))
+               (caster (vt-cast-fun dest-dtype)))
+           (declare (type fixnum d-off s-off)
+                    (type function caster))
+           (dotimes (i size)
+             (setf (aref dest-data (+ d-off i))
+                   (funcall caster (aref src-data (+ s-off i)))))))
+
+        ;; 慢速：非连续 / 广播 → 通用 strided 迭代
+        (t
+         (%copy-strided dest-data dest-dtype (vt-strides dest) (vt-offset dest)
+                        src-data src-dtype src-strides (vt-offset src)
+                        dest-shape size)))
+
+      dest)))
 
 (defun %copy-strided (dest-data dest-dtype dest-strides dest-offset
                       src-data src-dtype src-strides src-offset shape size)

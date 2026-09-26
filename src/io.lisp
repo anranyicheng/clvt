@@ -160,7 +160,7 @@
         ;; 标量：0 维数组
         (make-array nil
 		    :initial-element
-		    (aref (vt-data vt) (vt-offset vt))
+		    (vt-cast (aref (vt-data vt) (vt-offset vt)) dtype)
 		    :element-type lisp-type)
         ;; 非标量
         (let* ((rank (length shape))
