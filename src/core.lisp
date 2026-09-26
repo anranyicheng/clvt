@@ -602,7 +602,12 @@
 ;;; ------------------------------------------------------------------
 
 (defun vt-fill (vt value)
-  "用标量 value 原地填充张量 vt 的所有元素（支持视图）。返回 vt。"
+  "用标量 value 原地填充张量 vt 的所有元素（支持视图）。返回 vt。
+   广播视图（dim>1 且 stride=0 的维度）在语义上只读，写入会报错。"
+  (loop for d in (vt-shape vt)
+        for s in (vt-strides vt)
+        when (and (> d 1) (zerop s))
+          do (error "vt-fill: 目标视图是只读的广播视图（维度 ~a）" d))
   (let* ((data (vt-data vt))
          (cval (vt-cast value (vt-dtype vt)))
          (size (vt-size vt)))
