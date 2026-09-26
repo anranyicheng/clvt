@@ -151,6 +151,10 @@
       (error "vt-moveaxis: source 与 destination 长度必须一致"))
     (setf src (mapcar (lambda (s) (vt-normalize-axis s rank)) src))
     (setf dst (mapcar (lambda (d) (vt-normalize-axis d rank)) dst))
+    (unless (= (length src) (length (remove-duplicates src)))
+      (error "vt-moveaxis: source 归一化后 ~a 存在重复轴" src))
+    (unless (= (length dst) (length (remove-duplicates dst)))
+      (error "vt-moveaxis: destination 归一化后 ~a 存在重复轴" dst))
     (let ((pairs '()))
       (loop for s in src
 	    for d in dst
@@ -447,46 +451,55 @@
 ;;; ------------------------------------------------------------------
 ;;; 重复与平铺
 ;;; ------------------------------------------------------------------
-
 (defun vt-repeat (vt repeats &key axis)
-  "重复元素。"
+  "重复元素。repeats 可为标量或列表；若为列表，其长度必须等于被重复轴的长度。"
   (if (null axis)
       (let* ((flat (vt-flatten vt))
 	     (size (vt-size flat))
 	     (reps (if (listp repeats)
-		       repeats (make-list size :initial-element repeats)))
-             (parts (loop for i from 0 below size
-			  for rep in reps
-                          when (> rep 0)
-                            collect
-			    (make-vt (list rep) (vt-ref flat i)
-				     :dtype (vt-dtype vt)))))
-        (if parts
-	    (apply #'vt-concatenate 0 parts)
-	    (vt-zeros '(0) :dtype (vt-dtype vt))))
+		       repeats (make-list size :initial-element repeats))))
+        ;; ---- 新增：长度校验 ----
+        (unless (= (length reps) size)
+          (error "vt-repeat: repeats 长度 ~a 与张量元素总数 ~a 不匹配"
+                 (length reps) size))
+        ;; ------------------------
+        (let ((parts (loop for i from 0 below size
+			   for rep in reps
+                           when (> rep 0)
+                             collect
+			     (make-vt (list rep) (vt-ref flat i)
+				      :dtype (vt-dtype vt)))))
+          (if parts
+	      (apply #'vt-concatenate 0 parts)
+	      (vt-zeros '(0) :dtype (vt-dtype vt)))))
       (let* ((sh (vt-shape vt))
 	     (ax (vt-normalize-axis axis (length sh)))
              (ax-size (nth ax sh))
              (reps (if (listp repeats)
 		       repeats
-		       (make-list ax-size :initial-element repeats)))
-             (slices
-	       (loop for i from 0 below ax-size
-		     for rep in reps
-                     for part = (apply #'vt-slice vt
-                                       (loop for d below (length sh)
-                                             collect (if (= d ax)
-							 (list i (1+ i))
-							 '(:all))))
-                     when (> rep 0)
-                       collect (if (= rep 1) part
-                                   (apply #'vt-concatenate
-					  ax (loop repeat rep
-						   collect part))))))
-        (if slices (apply #'vt-concatenate ax slices)
-            (let ((zero-shape (copy-list sh)))
-              (setf (nth ax zero-shape) 0)
-              (vt-zeros zero-shape :dtype (vt-dtype vt)))))))
+		       (make-list ax-size :initial-element repeats))))
+        ;; ---- 新增：长度校验 ----
+        (unless (= (length reps) ax-size)
+          (error "vt-repeat: repeats 长度 ~a 与轴 ~a 长度 ~a 不匹配"
+                 (length reps) ax ax-size))
+        ;; ------------------------
+        (let ((slices
+		(loop for i from 0 below ax-size
+		      for rep in reps
+                      for part = (apply #'vt-slice vt
+                                        (loop for d below (length sh)
+                                              collect (if (= d ax)
+							  (list i (1+ i))
+							  '(:all))))
+                      when (> rep 0)
+                        collect (if (= rep 1) part
+                                    (apply #'vt-concatenate
+					   ax (loop repeat rep
+						    collect part))))))
+          (if slices (apply #'vt-concatenate ax slices)
+              (let ((zero-shape (copy-list sh)))
+                (setf (nth ax zero-shape) 0)
+                (vt-zeros zero-shape :dtype (vt-dtype vt))))))))
 
 (defun vt-tile (vt reps)
   "平铺构造新数组（对标 numpy.tile）。"

@@ -449,26 +449,37 @@
 ;;; ------------------------------------------------------------------
 ;;; 别名检测辅助（放在 vt-copy-into 之前）
 ;;; ------------------------------------------------------------------
-
 (defun %vt-views-overlap-p (a b)
-  "判断两个 vt 视图是否共享底层数组且物理访问区间可能重叠。
-   前提：库内不生成负步长；广播维度（dim>1 且 stride=0）只贡献 offset 本身。
-   绝大多数调用首先被 (eq (vt-data a) (vt-data b)) 短路，几乎零开销。"
+  "判断两个 vt 视图是否共享底层物理数组，且其访问的物理索引区间存在交集。
+   目的：为 vt-copy-into 提供别名检测。当 dest 与 src 别名且区间重叠时，
+   必须先对 src 做快照，否则逐元素写入会破坏尚未读取的源数据
+   （即 memmove 语义的原地拷贝退化）。
+   返回：
+     T   —— a 与 b 共享同一底层数组，且物理访问区间相交；
+     NIL —— 其他情况（含：底层数组不同、区间不相交）。
+   前提与假设：
+     1. 同一轴上不会同时出现正负步长（库内由 vt-flip / vt-transpose 保证）。
+     2. 广播维度（dim>1 且 stride=0）不扩展区间，只贡献 offset 本身。
+     3. 标量视图（shape=nil）的区间退化为 [offset, offset]。"
   (and (eq (vt-data a) (vt-data b))
-       (let ((a-lo (vt-offset a))
-	     (a-hi (vt-offset a))
-             (b-lo (vt-offset b))
-	     (b-hi (vt-offset b)))
-         (declare (type fixnum a-lo a-hi b-lo b-hi))
-         (loop for d of-type fixnum in (vt-shape a)
-               for s of-type fixnum in (vt-strides a)
-               when (> d 1)
-		 do (incf a-hi (the fixnum (* (1- d) s))))
-         (loop for d of-type fixnum in (vt-shape b)
-               for s of-type fixnum in (vt-strides b)
-               when (> d 1)
-		 do (incf b-hi (the fixnum (* (1- d) s))))
-         (and (<= a-lo b-hi) (<= b-lo a-hi)))))
+       (flet ((span (v)
+                "返回视图 v 访问的物理索引闭区间 [lo, hi]。
+                 负步长把 lo 向低端扩展，正步长把 hi 向高端扩展，
+                 因此 lo/hi 对任意步长符号都给出正确的物理边界。
+                 stride=0 的维度（广播）对边界无贡献。"
+                (let ((lo (vt-offset v)) (hi (vt-offset v)))
+                  (declare (type fixnum lo hi))
+                  (loop for d of-type fixnum in (vt-shape v)
+                        for s of-type fixnum in (vt-strides v)
+                        when (> d 1)
+                          do (let ((end (* (1- d) s)))
+                               (if (minusp end)
+                                   (decf lo (- end))
+                                   (incf hi end))))
+                  (values lo hi))))
+         (multiple-value-bind (a-lo a-hi) (span a)
+           (multiple-value-bind (b-lo b-hi) (span b)
+             (and (<= a-lo b-hi) (<= b-lo a-hi)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 拷贝入口
