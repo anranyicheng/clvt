@@ -500,7 +500,8 @@
                                  `(and ,@(loop for tv in tvs
                                                collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
                                (simple-check
-                                 `(and ,@(loop for tv in tvs
+                                 `(and (vt-contiguous-p res)
+				       ,@(loop for tv in tvs
                                                collect `(and (vt-contiguous-p ,tv)
                                                              (equal (vt-shape ,tv) out-shape))))))
                           (cond
@@ -628,9 +629,11 @@
 			    (p in-off)
 			    (end (the fixnum (+ in-off size))))
                         (declare (type double-float acc) (type fixnum p end))
-                        (loop while (< p end) do
-                          (let ((v (aref d p))) (when (> v acc) (setf acc v)))
-                          (incf p))
+                        (loop while (< p end) do                      
+			  (let ((v (aref d p)))
+                            (cond ((%nan-p v) (setf acc v) (return))
+                                  ((> v acc) (setf acc v))))
+                          (incf p))			
                         (store-fast acc)))
                      ((= init-val +vt-dfloat-pos-inf+)
                       (let ((acc +vt-dfloat-pos-inf+)
@@ -638,7 +641,8 @@
 			    (end (the fixnum (+ in-off size))))
                         (declare (type double-float acc) (type fixnum p end))
                         (loop while (< p end) do
-                          (let ((v (aref d p))) (when (< v acc) (setf acc v)))
+                          (let ((v (aref d p)))
+			    (when (< v acc) (setf acc v)))
                           (incf p))
                         (store-fast acc))))))
                 ((equal in-et 'single-float)
@@ -716,11 +720,15 @@
                                   (dotimes (i inner)
                                     (let ((v (aref (the (simple-array ,in-lt (*)) in-data) ip)))
                                       ,(ecase op
-                                         (:sum `(incf acc v))
-                                         (:max `(when (> v acc)
-                                                  (setf acc (cast-to ,acc-lt v))))
-                                         (:min `(when (< v acc)
-                                                  (setf acc (cast-to ,acc-lt v))))))
+					 (:sum `(incf acc v))
+					 (:max `(cond ((%nan-p v)
+                                                       (setf acc (cast-to ,acc-lt v)))
+                                                      ((> v acc)
+                                                       (setf acc (cast-to ,acc-lt v)))))
+					 (:min `(cond ((%nan-p v)
+                                                       (setf acc (cast-to ,acc-lt v)))
+                                                      ((< v acc)
+                                                       (setf acc (cast-to ,acc-lt v)))))))
                                     (incf ip))
                                   (setf (aref (the (simple-array ,out-lt (*)) res-data) opos)
                                         (cast-to ,out-lt acc))
@@ -874,16 +882,28 @@
                               ,(ecase red-type
                                  (:sum `(setf (aref ,out-array out-ptr)
                                               (cast-to ,out-lt (+ raw-acc val))))
-                                 (:max `(when (> val raw-acc)
-                                          (setf (aref ,out-array out-ptr)
-                                                (cast-to ,out-lt val))
-                                          ,(when with-arg
-                                             `(setf (aref res-idx-data arg-ptr) arg-val))))
-                                 (:min `(when (< val raw-acc)
-                                          (setf (aref ,out-array out-ptr)
-                                                (cast-to ,out-lt val))
-                                          ,(when with-arg
-                                             `(setf (aref res-idx-data arg-ptr) arg-val))))
+				 (:max `(cond ((%nan-p val)
+                                               (setf (aref ,out-array out-ptr)
+                                                     (cast-to ,out-lt val))
+                                               ,(when with-arg
+                                                  `(setf (aref res-idx-data arg-ptr) arg-val)))
+                                              ((%nan-p raw-acc) nil)
+                                              ((> val raw-acc)
+                                               (setf (aref ,out-array out-ptr)
+                                                     (cast-to ,out-lt val))
+                                               ,(when with-arg
+                                                  `(setf (aref res-idx-data arg-ptr) arg-val)))))
+                                 (:min `(cond ((%nan-p val)
+                                               (setf (aref ,out-array out-ptr)
+                                                     (cast-to ,out-lt val))
+                                               ,(when with-arg
+                                                  `(setf (aref res-idx-data arg-ptr) arg-val)))
+                                              ((%nan-p raw-acc) nil)
+                                              ((< val raw-acc)
+                                               (setf (aref ,out-array out-ptr)
+                                                     (cast-to ,out-lt val))
+                                               ,(when with-arg
+                                                  `(setf (aref res-idx-data arg-ptr) arg-val)))))
                                  (:custom
                                   (if with-arg
                                       `(multiple-value-bind (new-acc do-update-arg)

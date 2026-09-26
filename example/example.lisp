@@ -6414,8 +6414,8 @@
   (let* ((a (vt-from-sequence '(1 2 3) :dtype :int64))
          (b (vt-from-sequence '(4 5 6) :dtype :int64))
          (res (vt-dstack a b))
-         (expected '(((1 4)) ((2 5)) ((3 6)))))
-    (assert (equal (vt-to-list res) expected))
+         (expected '(((1 4) (2 5) (3 6)))))
+    (assert (equalp (vt-to-list res) expected))
     (format t "  [1D->3D] 形状 ~a, 输出: ~a~%" (vt-shape res) (vt-to-list res)))
 
   ;; 测试 2: 2D 张量堆叠 (应重塑为 (M, N, 1) 后沿 axis=2 拼接)
@@ -6424,7 +6424,7 @@
          (c (vt-from-sequence '((9 10) (11 12)) :dtype :int64))
          (res (vt-dstack a b c))
          (expected '(((1 5 9) (2 6 10)) ((3 7 11) (4 8 12)))))
-    (assert (equal (vt-to-list res) expected))
+    (assert (equalp (vt-to-list res) expected))
     (format t "  [2D->3D] 形状 ~a, 输出: ~a~%" (vt-shape res) (vt-to-list res)))
 
   ;; 测试 3: 3D 张量堆叠 (直接沿 axis=2 拼接)
@@ -6432,7 +6432,7 @@
          (b (vt-from-sequence '(((9 10) (11 12)) ((13 14) (15 16))) :dtype :int64)) ; shape (2, 2, 2)
          (res (vt-dstack a b))
          (expected '(((1 2 9 10) (3 4 11 12)) ((5 6 13 14) (7 8 15 16)))))
-    (assert (equal (vt-to-list res) expected))
+    (assert (equalp (vt-to-list res) expected))
     (format t "  [3D->3D] 形状 ~a, 输出: ~a~%" (vt-shape res) (vt-to-list res)))
   
   (format t "vt-dstack 测试完成.~%"))

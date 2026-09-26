@@ -554,11 +554,12 @@
     (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor))))
 
 (defun vt-searchsorted (tensor values &key (side :left))
-  "在有序数组中查找插入点。"
+  "在有序数组中查找插入点。返回形状与 VALUES 相同的 int64 张量（NumPy 语义）。"
   (let* ((flat (vt-flatten tensor))
 	 (data (vt-data flat))
 	 (size (vt-size flat))
          (val-vt (ensure-vt values))
+         (out-shape (vt-shape val-vt))
 	 (v-flat (vt-flatten val-vt))
          (v-data (vt-data v-flat))
 	 (v-size (vt-size v-flat))
@@ -574,7 +575,9 @@
                        (setf hi mid)
 		       (setf lo (1+ mid)))))
                (setf (aref result i) lo)))
-    (%make-vt :data result :shape (list v-size) :strides '(1)
+    (%make-vt :data result
+              :shape out-shape
+              :strides (vt-compute-strides out-shape)
 	      :offset 0 :dtype :int64)))
 
 (defun vt-bincount (x &key (minlength 0))

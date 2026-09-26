@@ -134,6 +134,8 @@
         ((:int64 :int32 :int16 :int8 :uint8 :uint16)
          (loop for i fixnum below num
                do (setf (aref data i) (vt-cast (+ start (* i step)) dtype)))))
+      (when endpoint
+        (setf (aref data (1- num)) (vt-cast end dtype)))
       (%make-vt :data data :shape (list num) :strides '(1) :offset 0 :dtype dtype))))
 
 (defun vt-logspace (start stop num &key (base 10.0d0) (endpoint t) (dtype :float64))

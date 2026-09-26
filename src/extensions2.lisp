@@ -171,14 +171,17 @@
   "范德蒙德矩阵，对标 np.vander。
    - increasing = t : 第 j 列为 x^j
    - increasing = nil : 第 j 列为 x^(ncols-1-j)
-   实现用一行内 O(ncols) 递推，避免每个元素重复做幂运算。"
+   实现用一行内 O(ncols) 递推，避免每个元素重复做幂运算。
+   ★ 对整数类型，溢出时按 NumPy 语义回绕（wrap），不再因 bignum 写入报错。"
   (let* ((xv (vt-contiguous (vt-flatten x)))
          (len (vt-size xv))
          (ncols (or n len))
-         (result (vt-zeros (list len ncols) :dtype (vt-dtype xv)))
+         (dtype (vt-dtype xv))
+         (int-p (not (vt-float-dtype-p dtype)))
+         (result (vt-zeros (list len ncols) :dtype dtype))
          (xdata (vt-data xv))
          (rdata (vt-data result))
-         (one (vt-cast 1 (vt-dtype xv))))
+         (one (vt-cast 1 dtype)))
     (declare (fixnum len ncols))
     (dotimes (i len)
       (let* ((xi (aref xdata i))
@@ -188,11 +191,15 @@
         (if increasing
             (dotimes (j ncols)
               (setf (aref rdata (+ row-start j)) base)
-              (setf base (* base xi)))
+              (setf base (if int-p
+                             (vt-cast (* base xi) dtype)
+                             (* base xi))))
             ;; 递减：j=0 写入最高次幂 xi^(ncols-1)，j=ncols-1 写入 xi^0
             (dotimes (j ncols)
               (setf (aref rdata (+ row-start (- ncols 1 j))) base)
-              (setf base (* base xi))))))
+              (setf base (if int-p
+                             (vt-cast (* base xi) dtype)
+                             (* base xi)))))))
     result))
 
 ;;; ------------------------------------------------------------------

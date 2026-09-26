@@ -591,16 +591,24 @@
                    (out-strides-vec
                      (make-array rank :element-type 'fixnum)))
               (declare (type fixnum out-offset))
-              
-              (let ((acc 1))
-                (declare (fixnum acc))
-                (loop for i fixnum from (1- rank) downto 0
-                      for dim = (aref dims-vec i) do
-			(if (member (svref all-labels-vec i) output-subs)
-			    (progn
-                              (setf (aref out-strides-vec i) acc)
-                              (setf acc (the fixnum (* acc dim))))
-			    (setf (aref out-strides-vec i) 0))))
+              (if out      ; out 提供时使用其实际 strides，避免非连续 :out 写坏内存
+                  (let ((actual-strides (coerce (vt-strides output) 'simple-vector)))
+                    (loop for i fixnum from 0 below rank
+                          for lbl = (svref all-labels-vec i)
+                          for pos = (position lbl output-subs :test #'eql)
+                          do (setf (aref out-strides-vec i)
+                                   (if pos
+                                       (the fixnum (svref actual-strides pos))
+                                       0))))
+		  (let ((acc 1))
+                    (declare (fixnum acc))
+                    (loop for i fixnum from (1- rank) downto 0
+			  for dim = (aref dims-vec i) do
+			    (if (member (svref all-labels-vec i) output-subs)
+				(progn
+				  (setf (aref out-strides-vec i) acc)
+				  (setf acc (the fixnum (* acc dim))))
+				(setf (aref out-strides-vec i) 0)))))
               
               (when (or (zerop (vt-size output))
                         (some #'zerop out-shape)

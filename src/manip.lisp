@@ -112,7 +112,7 @@
                     :offset offset :dtype (vt-dtype vt)))
         (let ((ns '()) (nst '()))
           (loop for d in shape for s in strides
-                when (> d 1) do (push d ns) (push s nst))
+                when (/= d 1) do (push d ns) (push s nst))
           (%make-vt :data (vt-data vt) :shape (nreverse ns)
                     :strides (nreverse nst) :offset offset :dtype (vt-dtype vt))))))
 
@@ -231,9 +231,14 @@
                     :dtype (vt-dtype vt))))))
 
 (defun vt-roll (vt shift &key axis)
-  "滚动元素。shift/axis 可为整数或列表。"
+  "滚动元素。语义对标 NumPy：
+   - shift 为整数, axis 为整数   → 沿该轴滚动
+   - shift 为列表, axis 为列表   → 长度必须相同，逐轴滚动
+   - shift 为列表, axis 为 nil   → 累加所有 shift 后展平滚动
+   - shift 为整数, axis 为 nil   → 展平滚动"
   (let ((shift-list (if (listp shift) shift (list shift))))
     (cond
+      ;; axis 为列表：逐轴滚动
       ((and axis (listp axis))
        (let ((shifts (if (listp shift) shift
                          (make-list (length axis) :initial-element shift))))
@@ -243,7 +248,11 @@
                for s in shifts for ax in axis
                do (setf result (vt-roll result s :axis ax))
                finally (return result))))
+      ;; axis 为整数：只允许单个 shift
       (axis
+       (unless (= (length shift-list) 1)
+         (error "vt-roll: axis 为整数时 shift 必须为单个整数（或长度 1 的列表），收到 ~a"
+                shift-list))
        (let* ((sh (vt-shape vt)) (ax (vt-normalize-axis axis (length sh)))
 				 (n (nth ax sh)))
          (if (zerop n) vt
@@ -261,10 +270,11 @@
 					       (if (= i ax)
 						   (list 0 (- n s))
 						   '(:all))))))))))
+      ;; axis 为 nil：累加所有 shift 后展平滚动
       (t
        (let* ((flat (vt-flatten vt)) (n (vt-size flat)))
          (if (zerop n) (vt-reshape flat (vt-shape vt))
-             (let ((s (mod (car shift-list) n)))
+             (let ((s (mod (reduce #'+ shift-list) n)))
                (if (zerop s)
 		   (vt-reshape flat (vt-shape vt))
                    (vt-reshape (vt-concatenate

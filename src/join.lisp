@@ -57,7 +57,7 @@
   (let ((expanded
 	  (mapcar (lambda (vt)
                     (let ((rank (length (vt-shape vt))))
-                      (cond ((= rank 1) (vt-reshape vt (append (vt-shape vt) '(1 1))))
+                      (cond ((= rank 1) (vt-reshape vt (list 1 (first (vt-shape vt)) 1)))
                             ((= rank 2) (vt-reshape vt (append (vt-shape vt) '(1))))
                             (t vt))))
                   vts)))
