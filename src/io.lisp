@@ -153,7 +153,7 @@
   "将张量转换为原生多维数组。使用 vt-do-each 遍历，同时维护逻辑坐标。
    fast t 意味着直接使用 coerce 转换，可能报错
         nil 则用 vt-cast 安全转换 (默认)"
-  (when dtype (setf vt (vt-astype vt dtype)))
+  (unless dtype (setf dtype (vt-dtype vt)))
   (let ((shape (vt-shape vt))
 	(lisp-type (vt-dtype->lisp-type dtype)))
     (if (null shape)
