@@ -512,23 +512,42 @@
                 (vt-zeros zero-shape :dtype (vt-dtype vt))))))))
 
 (defun vt-tile (vt reps)
-  "平铺构造新数组（对标 numpy.tile）。"
+  "平铺构造新数组（对标 numpy.tile）。
+   REPS 可为整数或整数列表：
+     - 列表长度 < VT 秩：左侧补 1 后再逐轴相乘；
+     - 列表长度 > VT 秩：VT 左侧补 1 维后再逐轴相乘；
+     - REPS 中含 0：结果为空张量，形状对应维度为 0（对标 numpy）；
+     - REPS 中含负数：报错（numpy 同样报错）。
+   示例（对标 numpy）：
+     (vt-tile x 2)          ≡ np.tile(x, 2)
+     (vt-tile x '(2 3))     ≡ np.tile(x, (2, 3))
+     (vt-tile x '(0 2))     → 空张量 shape=(0 2*cols)（不报错）
+     (vt-tile x '(2 -1))    → 报错：reps 不能为负"
   (let* ((sh (vt-shape vt))
          (reps-list (if (listp reps) reps (list reps)))
          (ndim (max (length sh) (length reps-list)))
-         (padded-sh (append (make-list (- ndim (length sh))
-				       :initial-element 1) sh))
-         (padded-reps (append (make-list (- ndim (length reps-list))
-					 :initial-element 1) reps-list))
-         (result (vt-reshape vt padded-sh)))
-    (loop for axis from 0 below ndim
-	  for rep = (nth axis padded-reps)
-          when (> rep 1)
-            do (setf result (apply #'vt-concatenate
-				   axis
-				   (loop repeat rep collect result))))
-    (vt-view result (mapcar #'* padded-sh padded-reps))))
-
+         (padded-sh    (append (make-list (- ndim (length sh))
+                                          :initial-element 1)
+                               sh))
+         (padded-reps  (append (make-list (- ndim (length reps-list))
+                                          :initial-element 1)
+                               reps-list))
+         (final-shape  (mapcar #'* padded-sh padded-reps)))
+    (unless (every #'integerp padded-reps)
+      (error "vt-tile: reps 必须全为整数，收到 ~a" reps))
+    (when (some #'minusp padded-reps)
+      (error "vt-tile: reps 不能为负数，收到 ~a" reps))
+    (when (some #'zerop padded-reps)
+      (return-from vt-tile
+        (vt-zeros final-shape :dtype (vt-dtype vt))))
+    (let ((result (vt-reshape vt padded-sh)))
+      (loop for axis from 0 below ndim
+	    for rep = (nth axis padded-reps)
+            when (> rep 1)
+              do (setf result (apply #'vt-concatenate
+				     axis
+				     (loop repeat rep collect result))))
+      (vt-view result final-shape))))
 ;;; ------------------------------------------------------------------
 ;;; 填充
 ;;; ------------------------------------------------------------------

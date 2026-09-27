@@ -13,7 +13,15 @@
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
       (when (null tensors)
 	(error "vt-map 至少需要一个输入张量"))
-      (let* ((inputs (mapcar #'ensure-vt tensors))
+      (let* ((inputs-1 (mapcar #'ensure-vt tensors))
+	     (inputs
+               (if out
+		   (mapcar (lambda (in)
+			     (if (%vt-views-overlap-p out in)
+				 (vt-copy in)
+				 in))
+			   inputs-1)
+		   inputs-1))
              (out-shape (reduce #'vt-broadcast-shapes (mapcar #'vt-shape inputs)))
              (final-dtype (cond
                             ((and out dtype (not (eq (vt-dtype out) dtype)))
@@ -496,33 +504,37 @@
                          (unless (equal (vt-shape res) out-shape)
                            (error ":out 形状 ~a 与广播结果 ~a 不匹配"
                                   (vt-shape res) out-shape)))
-                       ,(let* ((dtype-check
-                                 `(and ,@(loop for tv in tvs
-                                               collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
-                               (simple-check
-                                 `(and (vt-contiguous-p res)
-				       ,@(loop for tv in tvs
-                                               collect `(and (vt-contiguous-p ,tv)
-                                                             (equal (vt-shape ,tv) out-shape))))))
-                          (cond
-                            ((= n 1)
-                             `(if ,dtype-check
-                                  (if ,simple-check
-                                      (%vt-inline1-fast ,op ,(first tvs) res)
-                                      (%vt-inline1-strided-fast ,op ,(first tvs) res))
-                                  (vt-map (function ,op) ,(first tvs) :out res)))
-                            ((= n 2)
-                             `(if ,dtype-check
-                                  (if ,simple-check
-                                      (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
-                                      (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res))
-                                  (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
-                            (t
-                             `(if ,dtype-check
-                                  (if ,simple-check
-                                      (%vt-inline3-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res)
-                                      (%vt-inline3-strided-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res))
-                                  (vt-map (function ,op) ,(first tvs) ,(second tvs) ,(third tvs) :out res)))))
+		       (if (and ,out
+                                (some (lambda (in) (%vt-views-overlap-p ,out in))
+                                      (list ,@tvs)))
+                           (vt-map (function ,op) ,@tvs :out ,out)
+			   ,(let* ((dtype-check
+                                     `(and ,@(loop for tv in tvs
+						   collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
+				   (simple-check
+                                     `(and (vt-contiguous-p res)
+					   ,@(loop for tv in tvs
+						   collect `(and (vt-contiguous-p ,tv)
+								 (equal (vt-shape ,tv) out-shape))))))
+                              (cond
+				((= n 1)
+				 `(if ,dtype-check
+                                      (if ,simple-check
+					  (%vt-inline1-fast ,op ,(first tvs) res)
+					  (%vt-inline1-strided-fast ,op ,(first tvs) res))
+                                      (vt-map (function ,op) ,(first tvs) :out res)))
+				((= n 2)
+				 `(if ,dtype-check
+                                      (if ,simple-check
+					  (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
+					  (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res))
+                                      (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
+				(t
+				 `(if ,dtype-check
+                                      (if ,simple-check
+					  (%vt-inline3-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res)
+					  (%vt-inline3-strided-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res))
+                                      (vt-map (function ,op) ,(first tvs) ,(second tvs) ,(third tvs) :out res))))))
                        res)))))))))
 
 ;;; ------------------------------------------------------------------
@@ -594,7 +606,7 @@
                             (dtype dtype)
                             ((and init-val (or (floatp init-val) (%inf-p init-val))) :float64)
                             (t (vt-dtype tensor))))
-             (res (or out (%make-vt-uninit out-shape final-dtype))))
+	     (res (or out (make-vt out-shape 0 :dtype final-dtype))))
 
         ;; ================================================================
         ;; 快路径 1：连续 + 全局归约（axis=nil, 不 keepdims, 无 arg）
@@ -635,16 +647,17 @@
                                   ((> v acc) (setf acc v))))
                           (incf p))			
                         (store-fast acc)))
-                     ((= init-val +vt-dfloat-pos-inf+)
-                      (let ((acc +vt-dfloat-pos-inf+)
+		     ((= init-val +vt-dfloat-pos-inf+)
+		      (let ((acc +vt-dfloat-pos-inf+)
 			    (p in-off)
 			    (end (the fixnum (+ in-off size))))
-                        (declare (type double-float acc) (type fixnum p end))
-                        (loop while (< p end) do
-                          (let ((v (aref d p)))
-			    (when (< v acc) (setf acc v)))
-                          (incf p))
-                        (store-fast acc))))))
+			(declare (type double-float acc) (type fixnum p end))
+			(loop while (< p end) do
+			  (let ((v (aref d p)))
+			    (cond ((%nan-p v) (setf acc v) (return))
+				  ((< v acc) (setf acc v))))
+			  (incf p))
+			(store-fast acc))))))
                 ((equal in-et 'single-float)
                  (let ((d (the (simple-array single-float (*)) in-data)))
                    (when (and (typep init-val 'single-float) (zerop init-val))

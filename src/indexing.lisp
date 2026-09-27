@@ -353,7 +353,7 @@
                (flat (vt-ravel tensor))
                (size (vt-size flat)))
           (if (null (vt-shape idx-vt))
-              (let* ((raw (truncate (aref (vt-data idx-vt) 0)))
+              (let* ((raw (truncate (aref (vt-data idx-vt) (vt-offset idx-vt))))
                      (idx (if (minusp raw) (+ raw size) raw)))
                 (unless (<= 0 idx (1- size)) (error "索引 ~d 越界" idx))
                 (make-vt nil (aref (vt-data flat) idx) :dtype (vt-dtype tensor)))
@@ -435,6 +435,7 @@
 				  collect (aref (vt-data flat) i))))))
          (n-values (length val-list)) (shape (vt-shape tensor))
          (strides (vt-strides tensor)) (offset (vt-offset tensor)) (data (vt-data tensor)))
+    (when (zerop n-values) (return-from vt-put tensor))
     (loop for raw in idx-list
 	  for vi from 0
           for val = (nth (mod vi n-values) val-list)
@@ -542,16 +543,36 @@
       result)))
 
 (defun vt-extract (condition tensor)
-  "根据条件提取元素。"
-  (let* ((flat-cond (vt-flatten condition))
-	 (flat-data (vt-flatten tensor))
-         (cond-data (vt-data flat-cond))
-	 (tensor-data (vt-data flat-data))
-         (size (vt-size flat-data)) (result '()))
-    (loop for i from 0 below size
-          when (/= (aref cond-data i) 0)
-            do (push (aref tensor-data i) result))
-    (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor))))
+  "根据条件提取元素（对标 numpy.extract）。
+   CONDITION 可为：
+     - 标量（number 或 0 维 vt）：非零 → 返回 TENSOR 全部元素（展平 1-D）；
+                                    为零 → 返回形状 (0) 的空张量。
+     - 与 TENSOR 同形的张量：逐元素判断，提取真值位置的元素（按行主序展平）。
+     - 可广播到 TENSOR 形状的张量：先广播到 TENSOR 形状，再逐元素判断。
+   TENSOR 可为任意形状张量或标量（number），内部统一经 ensure-vt 归一。
+   返回值：1-D 张量，dtype 与 TENSOR 相同，元素顺序为行主序。"
+  (setf tensor    (ensure-vt tensor))
+  (setf condition (ensure-vt condition))
+  (let ((cshape (vt-shape condition))
+        (tshape (vt-shape tensor)))
+    (cond
+      ((null cshape)
+       (if (/= (vt-item condition) 0)
+           (vt-flatten tensor)
+           (vt-zeros (list 0) :dtype (vt-dtype tensor))))
+      ((equal cshape tshape)
+       (let* ((flat-cond   (vt-flatten condition))
+              (flat-data   (vt-flatten tensor))
+              (cond-data   (vt-data flat-cond))
+              (tensor-data (vt-data flat-data))
+              (size        (vt-size flat-data))
+              (result      '()))
+         (loop for i from 0 below size
+               when (/= (aref cond-data i) 0)
+                 do (push (aref tensor-data i) result))
+         (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor))))
+      (t
+       (vt-extract (vt-broadcast-to condition tshape) tensor)))))
 
 (defun vt-searchsorted (tensor values &key (side :left))
   "在有序数组中查找插入点。返回形状与 VALUES 相同的 int64 张量（NumPy 语义）。"

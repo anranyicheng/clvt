@@ -99,6 +99,21 @@
               :offset 0
               :dtype dtype)))
 
+(defun %all-integer-sequence-p (seq)
+  "递归判断嵌套序列的所有叶子是否都是整数。
+   空序列返回 T（视作整数序列，与 numpy 的 np.array([]).dtype 对齐——
+   实际上 numpy 对空列表返回 float64，见下方说明，故本函数对空序列返回 NIL）。
+   仅用于 ensure-vt 的 dtype 推断。"
+  (cond
+    ;; 叶子：整数 → T
+    ((integerp seq) t)
+    ;; 嵌套：list 或 vector 递归
+    ((consp seq) (and (not (null seq))
+                      (every #'%all-integer-sequence-p seq)))
+    ((vectorp seq) (and (plusp (length seq))
+                        (every #'%all-integer-sequence-p seq)))
+    (t nil)))
+
 (defun ensure-vt (obj &key (dtype nil))
   "将标量/序列/张量统一转换为张量。标量 -> 0 维张量；序列 -> 一维以上张量。"
   (etypecase obj
@@ -115,7 +130,9 @@
        (%make-vt :data (make-array 1 :element-type lisp-type
                                      :initial-element (vt-cast obj final))
                  :shape nil :strides nil :offset 0 :dtype final)))
-    (sequence (vt-from-sequence obj :dtype (or dtype :float64)))))
+    (sequence
+     (let ((infer (if (%all-integer-sequence-p obj) :int64 :float64)))
+       (vt-from-sequence obj :dtype (or dtype infer))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 广播

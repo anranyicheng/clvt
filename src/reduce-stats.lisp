@@ -68,8 +68,11 @@
     (cond
       ((member (%op-base op) '(:all :any)) '(signed-byte 64))
       ((%op-arg-p op) lt)
+      ((and (member (%op-base op) '(:sum :prod))
+            (member lt '((signed-byte 32))))
+       '(signed-byte 64))
       (t (if (>= (%lt-rank lt) (%lt-rank res-lt)) lt res-lt))))
-
+  
   (defun %cast-form (lt form)
     (cond ((eq lt 'double-float) `(coerce ,form 'double-float))
           ((eq lt 'single-float) `(coerce ,form 'single-float))
@@ -104,11 +107,15 @@
                      ((equal acc-lt '(signed-byte 64)) 9223372036854775807)
                      ((equal acc-lt '(signed-byte 32)) 2147483647)
                      (t 0))))))
-
+  
   (defun %op-out-dtype (op in-dtype)
     (case op
       ((:all :any) :int64)
       ((:argmax :argmin :nanargmax :nanargmin) :int32)
+      ((:sum :prod :nansum :nanprod)
+       (case in-dtype
+	 ((:int8 :uint8 :int16 :uint16 :int32) :int64)
+	 (t in-dtype)))
       (t in-dtype)))
 
   ) ; end eval-when
@@ -730,7 +737,25 @@
       (:nearest (vt-cast (nth (if (<= frac 0.5d0) lower upper) sorted) :float64)))))
 
 (defun vt-percentile (tensor percentile &key axis (interpolation :linear))
+  "计算百分位数（对标 numpy.percentile）。
+   PERCENTILE 必须在 [0, 100] 内：
+     - 0   → 最小值
+     - 50  → 中位数
+     - 100 → 最大值
+     越界（<0 或 >100）报错；NaN 亦报错（NaN 不满足 <= 比较）。
+   INTERPOLATION 取值：:linear / :lower / :higher / :midpoint / :nearest，
+     对标 numpy.percentile 的 interpolation 参数。默认 :linear。
+   返回：0 维张量（当 axis=nil）或降维后的张量（当 axis 指定）。"
   (with-float-safe
+    (unless (realp percentile)
+      (error "vt-percentile: percentile 必须为实数，得到 ~a (type ~a)"
+             percentile (type-of percentile)))
+    (unless (<= 0 percentile 100)
+      (error "vt-percentile: percentile 必须在 [0, 100] 内，得到 ~a"
+             percentile))
+    (unless (member interpolation '(:linear :lower :higher :midpoint :nearest))
+      (error "vt-percentile: interpolation 必须是 :linear/:lower/:higher/:midpoint/:nearest 之一，得到 ~a"
+             interpolation))
     (let ((q (/ percentile 100.0d0)))
       (if axis
           (let* ((shape (vt-shape tensor))
@@ -766,6 +791,19 @@
 			       :dtype :float64)))))))))
 
 (defun vt-quantile (tensor q &key axis (interpolation :linear))
+  "计算分位数（对标 numpy.quantile）。
+   Q 必须在 [0, 1] 内：
+     - 0.0  → 最小值
+     - 0.5  → 中位数
+     - 1.0  → 最大值
+     越界（<0 或 >1）报错；NaN 亦报错（NaN 不满足 <= 比较）。
+   等价于 (vt-percentile tensor (* q 100) ...)。
+   INTERPOLATION 含义见 vt-percentile。"
+  (unless (realp q)
+    (error "vt-quantile: q 必须为实数，得到 ~a (type ~a)"
+           q (type-of q)))
+  (unless (<= 0 q 1)
+    (error "vt-quantile: q 必须在 [0, 1] 内，得到 ~a" q))
   (vt-percentile tensor (* q 100) :axis axis :interpolation interpolation))
 
 (defun vt-ptp (tensor &key axis)

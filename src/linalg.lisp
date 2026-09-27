@@ -519,6 +519,13 @@
            (type list output-subs input-subs vts)
 	   (optimize (speed 3)))
   (with-float-safe
+    (when out
+      (setf vts
+            (mapcar (lambda (tns)
+                      (if (eq (vt-data out) (vt-data tns))
+                          (vt-copy tns)
+                          tns))
+                    vts)))
     (let* ((rank (length all-labels-vec))
            (n-vts (length vts))
            (dims-vec (make-array rank :element-type 'fixnum)))

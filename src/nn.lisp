@@ -90,7 +90,8 @@
                   (dotimes (i size)
                     (setf (aref r (+ rop i)) (%relu-single (aref d (+ aop i)))))))
             res)
-          (vt-map (lambda (x) (max 0.0d0 x)) a :dtype dt :out res)))))
+	  (vt-map (if (eq dt :float64) #'%relu-double #'%relu-single)
+		  a :dtype dt :out res)))))
 
 (defun vt-leaky-relu (vt &key (alpha 0.01d0) dtype out)
   (vt-map (lambda (x) (if (> x 0.0d0)

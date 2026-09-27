@@ -49,7 +49,6 @@
 ;;; ------------------------------------------------------------------
 ;;; 3. geomspace — 等比数列（对标 np.geomspace）
 ;;; ------------------------------------------------------------------
-
 (defun vt-geomspace (start stop num &key (dtype :float64) (endpoint t))
   "等比数列（对数尺度等间距），对标 np.geomspace。
    前置条件（否则报错）：
@@ -57,15 +56,28 @@
    - start 和 stop 均非零
    - start 和 stop 同号
    符号处理：结果为全正或全负，符号取自 start（= stop 的符号）。
+   DTYPE 语义：
+   - 计算始终在 double-float 精度下进行；
+   - 计算完成后按 DTYPE 转换：
+       :float64 / :float32 → 浮点返回
+       整型（:int64/:int32/:int16/:int8/:uint8/:uint16）
+                          → 走 vt-astype，NumPy 截断/回绕语义
+
    示例：
-     (vt-geomspace 1 1000 4)    => [1, 10, 100, 1000]
-     (vt-geomspace -1 -1000 4)  => [-1, -10, -100, -1000]
-     (vt-geomspace 1 -100 5)    => error（异号）
-     (vt-geomspace 0 100 5)     => error（含零）"
+     (vt-geomspace 1 1000 4)               => [1.0, 10.0, 100.0, 1000.0] (float64)
+     (vt-geomspace 1 1000 4 :dtype :int64) => [1, 10, 100, 1000]        (int64)
+     (vt-geomspace 1 1000 4 :dtype :int32) => [1, 10, 100, 1000]        (int32)
+     (vt-geomspace -1 -1000 4)             => [-1.0, -10.0, -100.0, -1000.0]
+     (vt-geomspace 1 -100 5)               => error（异号）
+     (vt-geomspace 0 100 5)                => error（含零）"
   (declare (fixnum num))
   (when (< num 1)
     (error "vt-geomspace: num 必须 >= 1，当前为 ~a" num))
-
+  ;; dtype 合法性校验：整型或浮点，其他非法
+  (unless (member dtype '(:float64 :float32
+                          :int64 :int32 :int16 :int8
+                          :uint8 :uint16))
+    (error "vt-geomspace: 不支持的 dtype ~a" dtype))
   (let ((s (coerce start 'double-float))
         (e (coerce stop  'double-float)))
     ;; ---- 前置校验：与 NumPy 一致 ----
@@ -73,12 +85,10 @@
       (error "vt-geomspace: start (~a) 和 stop (~a) 均不能为零" start stop))
     (when (not (eql (minusp s) (minusp e)))
       (error "vt-geomspace: start (~a) 和 stop (~a) 必须同号" start stop))
-
     (when (= num 1)
       (return-from vt-geomspace
         (vt-full (list 1) s :dtype dtype)))
-
-    (let* ((log-s (log (abs s)))
+        (let* ((log-s (log (abs s)))
            (log-e (log (abs e)))
            (sign  (if (minusp s) -1d0 1d0))
            (div   (if endpoint (1- num) num))
@@ -92,7 +102,13 @@
                (lv (+ log-s (* frac (- log-e log-s))))
                (v  (* sign (exp lv))))
           (setf (aref rdata i) v)))
-      (if (eq dtype :float32) (vt-astype result :float32) result))))
+      (setf (aref rdata 0) s)
+      (when endpoint
+        (setf (aref rdata (1- num)) e))
+      (if (member dtype '(:int8 :int16 :int32 :int64 :uint8 :uint16))
+          (vt-astype (vt-round result) dtype)
+          (vt-astype result dtype)))))
+
 
 ;;; ------------------------------------------------------------------
 ;;; 4. ravel-multi-index

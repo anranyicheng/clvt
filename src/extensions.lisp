@@ -14,7 +14,10 @@
 
 (defun vt-clip-tensor (tensor vmin vmax &key out dtype)
   "将元素限制在 [vmin, vmax] 内，vmin/vmax 可为标量或张量。"
-  (vt-map (lambda (x lo hi) (min hi (max lo x)))
+  (vt-map (lambda (x lo hi)
+	    (if (> x hi)
+		hi
+		(if (< x lo) lo x)))
           (ensure-vt tensor)
 	  (ensure-vt vmin)
 	  (ensure-vt vmax)
