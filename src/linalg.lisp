@@ -999,7 +999,6 @@
       ((and (= ra 1) (= rb 2))
        (vt-einsum "i,ij->j" a b :dtype dtype :out out))
       ;; >2d @ >2d → 批量矩阵乘法
-      ;; >2d @ >2d → 批量矩阵乘法
       (t (or (and *simd-batched-matmul-fn*
 		  (funcall *simd-batched-matmul-fn* a b dtype out))
 	     (vt-einsum "...ij,...jk->...ik" a b :dtype dtype :out out))))))
