@@ -249,6 +249,7 @@ main() {
 	    simd-test
 	    test-overlap
 	    test-copy-into
+	    test-simd-batch-matmul
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)

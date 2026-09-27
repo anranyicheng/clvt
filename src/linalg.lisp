@@ -4,6 +4,10 @@
   "由 simd-matmul.lisp 注册的 SIMD 2D matmul 快速路径。
    返回 VT 表示成功，返回 NIL 表示 vt-matmul 回退到 einsum。")
 
+(defvar *simd-batched-matmul-fn* nil
+  "批量 matmul 的 SIMD 快速路径。在 vt-matmul 的 >2D 分支里尝试调用，
+   返回 VT 成功，NIL 回退到 vt-einsum。")
+
 (defvar *vt-einsum-parse-cache* (make-hash-table :test 'equal))
 
 (defvar *vt-einsum-cache-lock*
@@ -23,11 +27,11 @@
 
 (defmacro %with-einsum-cache-lock (&body body)
   `(sb-thread:with-mutex (*vt-einsum-cache-lock*) ,@body))
-  
+
 (declaim (inline get-parsed-subscripts))
 (defun get-parsed-subscripts (str)
   (declare (optimize (speed 3) (safety 0)) (simple-string str))
-   (%with-einsum-cache-lock
+  (%with-einsum-cache-lock
     (let ((cached (gethash str *vt-einsum-parse-cache*)))
       (if cached
           (values (the list (first cached))
@@ -995,7 +999,10 @@
       ((and (= ra 1) (= rb 2))
        (vt-einsum "i,ij->j" a b :dtype dtype :out out))
       ;; >2d @ >2d → 批量矩阵乘法
-      (t (vt-einsum "...ij,...jk->...ik" a b :dtype dtype :out out)))))
+      ;; >2d @ >2d → 批量矩阵乘法
+      (t (or (and *simd-batched-matmul-fn*
+		  (funcall *simd-batched-matmul-fn* a b dtype out))
+	     (vt-einsum "...ij,...jk->...ik" a b :dtype dtype :out out))))))
 
 (defun vt-@ (vt1 vt2 &key dtype out)
   (vt-matmul vt1 vt2 :dtype dtype :out out))
@@ -1094,7 +1101,7 @@
   "l1 范数"
   (with-float-safe
     (vt-sum (vt-abs vt) :axis axis :keepdims keepdims
-            :dtype dtype :out out)))
+			:dtype dtype :out out)))
 
 (defun vt-frobenius-norm (matrix &key axis keepdims dtype out)
   "frobenius 范数 (专用于矩阵)"
@@ -1133,7 +1140,7 @@
             do (loop for i from (1+ k) below m ;; 在当前列的下方行中寻找主元
                      for val = (abs (aref data (+ off (* i s0) (* k s1))))
                      when (> val max-val)
-                     do (setf max-val val max-row i))
+                       do (setf max-val val max-row i))
                ;; 使用小阈值而非 zerop，避免 denormalized float 导致数值不稳定
                (unless (< max-val 1d-300)
                  ;; 交换行
@@ -1232,61 +1239,61 @@
                       (* (max 1 n) double-float-epsilon
                          (max max-abs 1.0d0))))
                 (declare (double-float singular-threshold))
-          ;; 1. 应用行置换 pb
-            (loop for i from 0 below n do
-              (loop for j from 0 below nrhs do
-		(setf (aref b-data (+ b-off
-				      (* i b-s0)
-				      (* j b-s1)))
-                      (aref ob-data (+ ob-off
-				       (* (nth i piv) ob-s0)
-				       (* j ob-s1))))))          
-            ;; 2. 前代
-            (loop for k from 0 below n do
-              (loop for i from (1+ k) below n
-                    for mult = (aref lu-data (+ lu-off
-						(* i lu-s0)
-						(* k lu-s1)))
-                    do (loop for j from 0 below nrhs do
-                      (decf (aref b-data (+ b-off
-					    (* i b-s0)
-					    (* j b-s1)))
-                            (* mult (aref b-data (+ b-off
-						    (* k b-s0)
-						    (* j b-s1))))))))          
-            ;; 3. 回代
-            (loop for k from (1- n) downto 0 do
-              (let ((pivot (aref lu-data (+ lu-off
-					    (* k lu-s0)
-					    (* k lu-s1)))))
-		(when (or (zerop pivot)
-			  (< (abs pivot) singular-threshold))
-		  (error "LinAlgError: Singular matrix. Cannot solve or invert."))
-		(loop for j from 0 below nrhs do
-                  (setf (aref b-data (+ b-off
-					(* k b-s0)
-					(* j b-s1)))
-			(/ (aref b-data (+ b-off
-					   (* k b-s0)
-					   (* j b-s1)))
-			   pivot)))
-		(loop for i from 0 below k
-                      for factor = (aref lu-data (+ lu-off
+		;; 1. 应用行置换 pb
+		(loop for i from 0 below n do
+		  (loop for j from 0 below nrhs do
+		    (setf (aref b-data (+ b-off
+					  (* i b-s0)
+					  (* j b-s1)))
+			  (aref ob-data (+ ob-off
+					   (* (nth i piv) ob-s0)
+					   (* j ob-s1))))))          
+		;; 2. 前代
+		(loop for k from 0 below n do
+		  (loop for i from (1+ k) below n
+			for mult = (aref lu-data (+ lu-off
 						    (* i lu-s0)
 						    (* k lu-s1)))
-                      do (loop for j from 0 below nrhs do
-			(decf (aref b-data (+ b-off
-					      (* i b-s0)
-					      (* j b-s1)))
-                              (* factor (aref b-data (+ b-off
+			do (loop for j from 0 below nrhs do
+			  (decf (aref b-data (+ b-off
+						(* i b-s0)
+						(* j b-s1)))
+				(* mult (aref b-data (+ b-off
 							(* k b-s0)
-							(* j b-s1)))))))))
-	    (let ((res (if (= nrhs 1)
-                           (vt-reshape b-copy (list n))
-                           b-copy)))
-              (if out
-                  (vt-map #'identity res :out out)
-                  res))))))))))
+							(* j b-s1))))))))          
+		;; 3. 回代
+		(loop for k from (1- n) downto 0 do
+		  (let ((pivot (aref lu-data (+ lu-off
+						(* k lu-s0)
+						(* k lu-s1)))))
+		    (when (or (zerop pivot)
+			      (< (abs pivot) singular-threshold))
+		      (error "LinAlgError: Singular matrix. Cannot solve or invert."))
+		    (loop for j from 0 below nrhs do
+                      (setf (aref b-data (+ b-off
+					    (* k b-s0)
+					    (* j b-s1)))
+			    (/ (aref b-data (+ b-off
+					       (* k b-s0)
+					       (* j b-s1)))
+			       pivot)))
+		    (loop for i from 0 below k
+			  for factor = (aref lu-data (+ lu-off
+							(* i lu-s0)
+							(* k lu-s1)))
+			  do (loop for j from 0 below nrhs do
+			    (decf (aref b-data (+ b-off
+						  (* i b-s0)
+						  (* j b-s1)))
+				  (* factor (aref b-data (+ b-off
+							    (* k b-s0)
+							    (* j b-s1)))))))))
+		(let ((res (if (= nrhs 1)
+                               (vt-reshape b-copy (list n))
+                               b-copy)))
+		  (if out
+                      (vt-map #'identity res :out out)
+                      res))))))))))
 
 (defun vt-inv (matrix)
   "矩阵求逆。"
@@ -1439,48 +1446,48 @@
       ;; 从第一列到最后一列进行消元
       (loop for col from 0 below n
             while (< row m) do
-        ;; 1. 在当前列及以下的行中，寻找绝对值最大的主元 (部分选主元)
-        (let ((max-val 0.0d0)
-              (max-row row))
-          (loop for i from row below m
-                for val = (abs (aref a-data (+ a-offset
-					       (* i s0)
-					       (* col s1))))
-                when (> val max-val)
-                do (setf max-val val max-row i))
-          
-          ;; 2. 判断主元是否足够大 (大于容差 tol)
-          (if (> max-val tol)
-              (progn
-                (incf rank)
-                ;; 3. 如果最大主元不在当前行，则交换行
-                (unless (= max-row row)
-                  (loop for j from col below n
-                        for off1 = (+ a-offset (* row s0) (* j s1))
-                        for off2 = (+ a-offset (* max-row s0) (* j s1))
-                        do (rotatef (aref a-data off1) (aref a-data off2))))
-                ;; 4. 消元：将当前列下方的元素清零
-                (let ((pivot (aref a-data (+ a-offset
-					     (* row s0)
-					     (* col s1)))))
-                  (loop for i from (1+ row) below m
-                        for multiplier = (/ (aref a-data (+ a-offset (* i s0)
-							    (* col s1)))
-					    pivot)
-                        do (loop for j from (1+ col) below n
-                                 for off-target = (+ a-offset (* i s0) (* j s1))
-                                 for off-source = (+ a-offset (* row s0) (* j s1))
-                                 do (decf (aref a-data off-target)
-					  (* multiplier (aref a-data off-source)))))
-                  ;; 物理上将下方元素置零，保证数值干净
-                  (loop for i from (1+ row) below m
-                        do (setf (aref a-data (+ a-offset (* i s0)
-						 (* col s1)))
-				 0.0d0)))
-                ;; 5. 处理下一行
-                (incf row))
-              ;; 如果主元太小，说明该列线性相关，跳过该列，继续看下一列
-              nil)))
+              ;; 1. 在当前列及以下的行中，寻找绝对值最大的主元 (部分选主元)
+              (let ((max-val 0.0d0)
+		    (max-row row))
+		(loop for i from row below m
+                      for val = (abs (aref a-data (+ a-offset
+						     (* i s0)
+						     (* col s1))))
+                      when (> val max-val)
+			do (setf max-val val max-row i))
+		
+		;; 2. 判断主元是否足够大 (大于容差 tol)
+		(if (> max-val tol)
+		    (progn
+                      (incf rank)
+                      ;; 3. 如果最大主元不在当前行，则交换行
+                      (unless (= max-row row)
+			(loop for j from col below n
+                              for off1 = (+ a-offset (* row s0) (* j s1))
+                              for off2 = (+ a-offset (* max-row s0) (* j s1))
+                              do (rotatef (aref a-data off1) (aref a-data off2))))
+                      ;; 4. 消元：将当前列下方的元素清零
+                      (let ((pivot (aref a-data (+ a-offset
+						   (* row s0)
+						   (* col s1)))))
+			(loop for i from (1+ row) below m
+                              for multiplier = (/ (aref a-data (+ a-offset (* i s0)
+								  (* col s1)))
+						  pivot)
+                              do (loop for j from (1+ col) below n
+                                       for off-target = (+ a-offset (* i s0) (* j s1))
+                                       for off-source = (+ a-offset (* row s0) (* j s1))
+                                       do (decf (aref a-data off-target)
+						(* multiplier (aref a-data off-source)))))
+			;; 物理上将下方元素置零，保证数值干净
+			(loop for i from (1+ row) below m
+                              do (setf (aref a-data (+ a-offset (* i s0)
+						       (* col s1)))
+				       0.0d0)))
+                      ;; 5. 处理下一行
+                      (incf row))
+		    ;; 如果主元太小，说明该列线性相关，跳过该列，继续看下一列
+		    nil)))
       rank)))
 
 (defun extend-orthogonal-basis (u-econ &key (rng *vt-default-random-state*))
@@ -1569,7 +1576,7 @@
                         (setf changed t)
                         (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
                                (t-abs (/ 1.0d0 (+ (abs zeta)
-                                                 (sqrt (+ 1 (* zeta zeta))))))
+                                                  (sqrt (+ 1 (* zeta zeta))))))
                                (t-val (if (>= zeta 0) t-abs (- t-abs)))
                                (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
                                (s (* c t-val)))
@@ -1592,7 +1599,7 @@
                    (u-k (vt-zeros (list m k) :dtype :float64))
                    (pairs (stable-sort (loop for col from 0 below n
 					     collect (cons (sqrt (col-norm-sq col)) col))
-                                #'> :key #'car)))
+                                       #'> :key #'car)))
               (dotimes (new-i k)
                 (destructuring-bind (val . old-col) (nth new-i pairs)
                   (setf (aref s-vec new-i) val)
@@ -1749,7 +1756,7 @@
           (loop for ni fixnum from 0 below n
                 for oi = (cdr (nth ni pairs))
                 do (loop for r fixnum from 0 below n do
-                     (setf (vt-ref vec r ni) (vt-ref v r oi))))
+                  (setf (vt-ref vec r ni) (vt-ref v r oi))))
           (values vals vec))))))
 
 

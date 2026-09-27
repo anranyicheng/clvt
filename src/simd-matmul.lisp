@@ -226,3 +226,169 @@
 
 ;; *simd-matmul-2d-fn* 在 linalg.lisp 文件中定义，这里注册
 (setf *simd-matmul-2d-fn* #'%simd-matmul-2d)
+
+;;;; 批量矩阵乘法的 SIMD 快速路径
+;;;;
+;;;; 支持：
+;;;;   A: (..., M, K) @ B: (..., K, N) -> (..., M, N)     [批对齐]
+;;;;   A: (..., M, K) @ B: (K, N)     -> (..., M, N)     [B 广播]
+;;;;
+;;;; 只支持 f64 / f32（i32/i64 的批量场景少，且 s64.4-mul 是软件模拟）。
+;;;; 复用已定义的 %simd-matmul-{f64,f32}-rows 内核。
+;;; ============================================================
+;;; 核心：批量 SIMD matmul
+;;; ============================================================
+
+(defun %simd-batched-matmul-core
+    (a b dtype out expected-dtype rows-fn elem-size)
+  "批量矩阵乘法核心。
+   A: (..., M, K)，B: (..., K, N)。任一侧可缺批维度（numpy 广播）。
+   OUT: (..., M, N)。ELEM-SIZE: f64/i64=8，f32/i32=4。"
+  (declare (type vt a b)
+           (type (or null symbol) dtype)
+           (type (or null vt) out)
+           (type symbol expected-dtype)
+           (type function rows-fn)
+           (type fixnum elem-size))
+  (block core
+    (unless *simd-matmul-enabled*
+      (return-from core nil))
+    (let* ((ashape (vt-shape a))
+           (bshape (vt-shape b))
+           (arank  (length ashape))
+           (brank  (length bshape)))
+      (unless (and (>= arank 2) (>= brank 2))
+        (return-from core nil))
+      (unless (or (>= arank 3) (>= brank 3))
+        (return-from core nil))
+      (let* ((m  (the fixnum (nth (- arank 2) ashape)))
+             (k  (the fixnum (nth (1- arank) ashape)))
+             (k2 (the fixnum (nth (- brank 2) bshape)))
+             (n  (the fixnum (nth (1- brank) bshape))))
+        (declare (type fixnum m k k2 n))
+        (unless (= k k2)
+          (return-from core nil))
+        (let* ((a-batch     (subseq ashape 0 (- arank 2)))
+               (b-batch     (subseq bshape 0 (- brank 2)))
+               (a-broadcast (null a-batch))
+               (b-broadcast (null b-batch)))
+          (unless (or a-broadcast b-broadcast (equal a-batch b-batch))
+            (return-from core nil))
+          (let* ((batch-shape (cond (a-broadcast b-batch)
+                                    (b-broadcast a-batch)
+                                    (t           a-batch)))
+                 (batch-size  (reduce #'* batch-shape))
+                 (total-work  (* batch-size m k n))
+                 (out-shape   (append batch-shape (list m n))))
+            (declare (type fixnum batch-size total-work))
+            (assert (consp batch-shape) ()
+                    "SIMD 批量 matmul: batch-shape 异常 = ~a (a-batch=~a b-batch=~a)"
+                    batch-shape a-batch b-batch)
+            (assert (= (length out-shape) (+ (length batch-shape) 2)) ()
+                    "SIMD 批量 matmul: out-shape 长度错 = ~a" out-shape)
+            (unless (>= total-work *simd-matmul-threshold*)
+              (return-from core nil))
+            ;; 类型检查
+            (let ((final (cond (out (vt-dtype out))
+                               (dtype dtype)
+                               (t (vt-promote-type (vt-dtype a)
+                                                   (vt-dtype b))))))
+              (unless (eq final expected-dtype)
+                (return-from core nil)))
+            ;; OUT 形状检查
+            (when out
+              (unless (and (equal (vt-shape out) out-shape)
+                           (vt-contiguous-p out))
+                (return-from core nil)))
+            ;; 连续性 + 类型强制 + 创建 output
+            (let* ((a-c (if (and (eq (vt-dtype a) expected-dtype)
+                                 (vt-contiguous-p a))
+                            a
+                            (vt-contiguous (vt-astype a expected-dtype))))
+                   (b-c (if (and (eq (vt-dtype b) expected-dtype)
+                                 (vt-contiguous-p b))
+                            b
+                            (vt-contiguous (vt-astype b expected-dtype))))
+                   (output (or out
+                               (vt-zeros out-shape :dtype expected-dtype))))
+              (when out (vt-fill output 0))
+              (assert (equal (vt-shape output) out-shape) ()
+                      "SIMD 批量 matmul: output 形状 ~a ≠ 期望 ~a"
+                      (vt-shape output) out-shape)
+              (let ((a-data (vt-data a-c))
+                    (b-data (vt-data b-c))
+                    (out-data (vt-data output))
+                    (a-batch-stride   (if a-broadcast 0 (* m k)))
+                    (b-batch-stride   (if b-broadcast 0 (* k n)))
+                    (out-batch-stride (* m n))
+                    (a-off   (* (vt-offset a-c)     elem-size))
+                    (b-off   (* (vt-offset b-c)     elem-size))
+                    (out-off (* (vt-offset output)  elem-size)))
+                (declare (type fixnum a-batch-stride b-batch-stride
+                               out-batch-stride a-off b-off out-off))
+                (sb-sys:with-pinned-objects (a-data b-data out-data)
+                  (let ((a-sap   (sb-sys:sap+ (sb-sys:vector-sap a-data)  a-off))
+                        (b-sap   (sb-sys:sap+ (sb-sys:vector-sap b-data)  b-off))
+                        (out-sap (sb-sys:sap+ (sb-sys:vector-sap out-data) out-off)))
+                    (declare (type sb-sys:system-area-pointer a-sap b-sap out-sap))
+                    (flet ((run-one-batch (bi)
+                             "跑一个 batch 的 M×N 输出。A/B 广播时 stride=0，指针不变。"
+                             (funcall rows-fn
+                                      (sb-sys:sap+
+                                       a-sap (* bi a-batch-stride elem-size))
+                                      (sb-sys:sap+
+                                       b-sap (* bi b-batch-stride elem-size))
+                                      (sb-sys:sap+
+                                       out-sap (* bi out-batch-stride elem-size))
+                                      k n 0 m)))
+                      (declare (inline run-one-batch))
+                      (cond
+                        ;; 总工作量小 → 串行
+                        ((or (< batch-size 2)
+                             (< total-work *simd-matmul-thread-threshold*))
+                         (dotimes (bi batch-size)
+                           (run-one-batch bi)))
+                        ;; 总工作量大 → 批间并行
+                        (t
+                         (let* ((nthr (min *simd-matmul-thread-count*
+                                           batch-size))
+                                (batches-per (ceiling batch-size nthr))
+                                (threads '()))
+                           (declare (type fixnum nthr batches-per))
+                           (loop for tid of-type fixnum below nthr
+                                 do (let* ((b0 (* tid batches-per))
+                                           (b1 (min batch-size
+                                                    (+ b0 batches-per))))
+                                      (declare (type fixnum b0 b1))
+                                      (when (< b0 b1)
+                                        (push (sb-thread:make-thread
+                                               (lambda ()
+                                                 (loop for bi from b0 below b1
+                                                       do (run-one-batch bi))))
+                                              threads))))
+                           (dolist (th threads)
+                             (sb-thread:join-thread th)))))))))
+              output)))))))
+
+;;; ============================================================
+;;; 分派：f64 → f32，其余回退
+;;; ============================================================
+
+(defun %simd-batched-matmul-f64 (a b dtype out)
+  (with-float-safe
+    (%simd-batched-matmul-core a b dtype out :float64
+                               #'%simd-matmul-f64-rows 8)))
+
+(defun %simd-batched-matmul-f32 (a b dtype out)
+  (with-float-safe
+    (%simd-batched-matmul-core a b dtype out :float32
+                               #'%simd-matmul-f32-rows 4)))
+
+(defun %simd-batched-matmul-dispatch (a b dtype out)
+  "顶层分派。失败返回 NIL 让 vt-matmul 回退 einsum。"
+  (or (%simd-batched-matmul-f64 a b dtype out)
+      (%simd-batched-matmul-f32 a b dtype out)
+      nil))
+
+;; 注册到 vt-matmul
+(setf *simd-batched-matmul-fn* #'%simd-batched-matmul-dispatch)
