@@ -384,10 +384,22 @@
     (%simd-batched-matmul-core a b dtype out :float32
                                #'%simd-matmul-f32-rows 4)))
 
+(defun %simd-batched-matmul-i32 (a b dtype out)
+  (with-float-safe
+    (%simd-batched-matmul-core a b dtype out :int32
+                                #'%simd-matmul-i32-rows 4)))
+
+(defun %simd-batched-matmul-i64 (a b dtype out)
+  (with-float-safe
+    (%simd-batched-matmul-core a b dtype out :int64
+                                #'%simd-matmul-i64-rows 8)))
+
 (defun %simd-batched-matmul-dispatch (a b dtype out)
   "顶层分派。失败返回 NIL 让 vt-matmul 回退 einsum。"
   (or (%simd-batched-matmul-f64 a b dtype out)
       (%simd-batched-matmul-f32 a b dtype out)
+      (%simd-batched-matmul-i32 a b dtype out)
+      (%simd-batched-matmul-i64 a b dtype out)
       nil))
 
 ;; 注册到 vt-matmul
