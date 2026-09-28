@@ -133,8 +133,7 @@
     (test-assert "a+b" '(6 8 10 12) (vt-to-list (vt-+ a b)))
     (test-assert "b-a" '(4 4 4 4) (vt-to-list (vt-- b a)))
     (test-assert "a*b" '(5 12 21 32) (vt-to-list (vt-* a b)))
-    ;; CL integer division truncates: 7/3=2, 8/4=2. NumPy promotes to float. clvt keeps int.
-    (test-assert "b/a(int)" '(5 3 2 2) (vt-to-list (vt-/ b a)))
+    (test-assert "b/a(int)" '(5.0 3.0 2.3333333333333335 2.0) (vt-to-list (vt-/ b a)))
     (test-assert "a+10" '(11 12 13 14) (vt-to-list (vt-+ a 10)))
     (test-assert "a*2" '(2 4 6 8) (vt-to-list (vt-* a 2))))
 

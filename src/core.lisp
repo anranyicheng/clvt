@@ -86,24 +86,10 @@
               :offset 0
               :dtype dtype)))
 
-(defun %make-vt-uninit (shape dtype)
-  "创建一个内容未定义的张量；调用方必须完整写入所有 size 个元素。
-   用于逐元素映射等『先分配、后全覆盖』的场景，避免 make-array 的零填充。
-   与 make-vt 的唯一区别：不传 :initial-element，跳过全量写零。"
-  (let* ((size (vt-shape-to-size shape))
-         (lisp-type (vt-dtype->lisp-type dtype))
-         (data (make-array size :element-type lisp-type)))
-    (%make-vt :data data
-              :shape shape
-              :strides (vt-compute-strides shape)
-              :offset 0
-              :dtype dtype)))
-
 (defun %all-integer-sequence-p (seq)
   "递归判断嵌套序列的所有叶子是否都是整数。
-   空序列返回 T（视作整数序列，与 numpy 的 np.array([]).dtype 对齐——
-   实际上 numpy 对空列表返回 float64，见下方说明，故本函数对空序列返回 NIL）。
-   仅用于 ensure-vt 的 dtype 推断。"
+   空序列返回 NIL（numpy 对空列表 np.array([]).dtype 实际上是 float64，
+   本函数与 numpy 一致）。仅用于 ensure-vt 的 dtype 推断。"
   (cond
     ;; 叶子：整数 → T
     ((integerp seq) t)

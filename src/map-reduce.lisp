@@ -30,7 +30,7 @@
                             (out (vt-dtype out))
                             (dtype dtype)
                             (t (apply #'vt-promote-type (mapcar #'vt-dtype inputs)))))
-             (res (or out (%make-vt-uninit out-shape final-dtype))))
+             (res (or out (make-vt out-shape 0 :dtype final-dtype))))
 	(when out
           (unless (equal (vt-shape res) out-shape)
             (error "vt-map: :out 形状 ~a 与广播结果 ~a 不匹配" (vt-shape res) out-shape)))

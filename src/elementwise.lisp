@@ -49,18 +49,25 @@
 
 (defun vt-/ (vt &rest args)
   "一元：1 / vt（倒数）；二元及以上：vt / arg1 / arg2 / ...
-   VT 是第一个张量，其余从 ARGS 解析。"
+   VT 是第一个张量，其余从 ARGS 解析。
+   整型输入默认提升到 float64，与 numpy 对齐。"
   (with-float-safe
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
-      (let ((all (cons (ensure-vt vt) tensors)))
+      (let* ((all (cons (ensure-vt vt) tensors))
+             (effective-dtype
+               (cond (dtype dtype)
+                     (out   (vt-dtype out))
+                     ((every (lambda (x) (vt-int-dtype-p (vt-dtype x))) all)
+                      :float64)
+                     (t nil))))
         (case (length all)
           (1 (vt-fast-map #'/ (make-vt nil 1 :dtype (vt-dtype (first all)))
                               (first all)
-                              :dtype dtype :out out))
+                              :dtype effective-dtype :out out))
           (2 (vt-fast-map #'/ (first all) (second all)
-                              :dtype dtype :out out))
+                              :dtype effective-dtype :out out))
           (3 (vt-fast-map #'/ (first all) (second all) (third all)
-                              :dtype dtype :out out))
+                              :dtype effective-dtype :out out))
           (t (apply #'vt-map #'/ all)))))))
 
 (defun vt-add (a b &key dtype out)
@@ -198,7 +205,8 @@
   (vt-fast-map #'abs vt :out out :dtype dtype))
 
 (defun vt-signum (vt &key out dtype)
-  (vt-fast-map #'signum vt :out out :dtype dtype))
+  (vt-map (lambda (x) (if (%nan-p x) x (signum x)))
+          vt :out out :dtype dtype))
 
 (defun vt-positive-p (vt &key out (dtype :float64))
   (vt-map (lambda (v)

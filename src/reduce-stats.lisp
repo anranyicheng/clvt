@@ -1192,7 +1192,8 @@
 				   xp (vt-astype xp :float64))))
          (fp-vt (vt-contiguous(if (eq (vt-dtype fp) :float64)
 				  fp (vt-astype fp :float64))))
-         (x-vt (ensure-vt x :dtype :float64))
+         (x-vt (vt-contiguous
+		(vt-flatten (ensure-vt x :dtype :float64))))
          (xp-data (vt-data xp-vt))
 	 (fp-data (vt-data fp-vt))
 	 (n (vt-size xp-vt))

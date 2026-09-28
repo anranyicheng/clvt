@@ -144,6 +144,11 @@
   (declare (type list input-subs output-subs vts)
 	   (type boolean explicit-p) (optimize (speed 3)))
   (with-float-safe
+    (when (and explicit-p
+	       output-subs
+               (> (length output-subs)
+                  (length (remove-duplicates output-subs :test #'eql))))
+      (error "einsum: output subscript ~a repeats a label" output-subs))
     (let ((label-dims
 	    (make-array 266 :element-type 'fixnum :initial-element -1))
           (label-counts
@@ -630,6 +635,8 @@
               (when (and (= n-vts 2)
                          (equal (first input-subs) (second input-subs))
                          (equal (first input-subs) output-subs)
+			 (= (length (first input-subs))
+			    (length (remove-duplicates (first input-subs) :test #'eql)))
                          (or all-f64-p all-f32-p all-i64-p all-i32-p))
                 (return-from einsum-execute
                   (vt-map #'* (first vts) (second vts) :out output)))
@@ -639,6 +646,8 @@
                          (equal (first input-subs) (second input-subs))
                          (null output-subs)
                          (equal (vt-shape (first vts)) (vt-shape (second vts)))
+			 (= (length (first input-subs))
+			    (length (remove-duplicates (first input-subs) :test #'eql)))
                          (or all-f64-p all-f32-p all-i64-p all-i32-p))
                 (let* ((a-c (vt-contiguous (first vts)))
                        (b-c (vt-contiguous (second vts)))
