@@ -408,7 +408,7 @@
 (defparameter *vt-fun-list* nil
   "所有以 `vt-` 开头的导出符号列表。")
 
-(defun %refresh-vt-fun-list ()
+(defun refresh-vt-fun-list ()
   (setf *vt-fun-list* nil)
   (do-symbols (var :clvt)
     (when (and (> (length (symbol-name var)) 2)
@@ -417,5 +417,5 @@
   (setf *vt-fun-list* (nreverse *vt-fun-list*)))
 
 
-(%refresh-vt-fun-list)
+(refresh-vt-fun-list)
 

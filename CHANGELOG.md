@@ -114,8 +114,6 @@
 
 ### 规范性修正
 
-- `with-float-safe` 改为 `#+sbcl` / `#-sbcl` 可移植实现
-- `nan.lisp` 不再依赖 `sb-kernel::float-nan-p` 等 SBCL 内部符号，改用 IEEE 754 可移植判定
 - 补齐 `vt-float-nan` / `vt-float-pos-inf` / `vt-float-neg-inf` / `vt-compute-logical-strides` 等「已导出但未定义」的悬空符号
 - `package.lisp` 导出按功能分组，`*vt-fun-list*` 自动收集
 - 修复 `benchmark-copy.lisp` 中非法 FORMAT 指令 `~30-50x`

@@ -309,7 +309,7 @@
 ;;; 统一生成宏
 ;;; ============================================================
 
-(defmacro %def-vt-reduce (name op)
+(defmacro def-vt-reduce (name op)
   "为算子 op 生成函数 vt-<name>。对 in-et × res-lt 两级分派到类型特化内核。"
   (let ((fn-name (intern (format nil "VT-~a" name)))
         (arg-p   (%op-arg-p op)))
@@ -444,22 +444,22 @@
 ;;; 归约族定义
 ;;; ============================================================
 
-(%def-vt-reduce sum  :sum)
-(%def-vt-reduce prod :prod)
-(%def-vt-reduce amax :max)
-(%def-vt-reduce amin :min)
-(%def-vt-reduce all  :all)
-(%def-vt-reduce any  :any)
+(def-vt-reduce sum  :sum)
+(def-vt-reduce prod :prod)
+(def-vt-reduce amax :max)
+(def-vt-reduce amin :min)
+(def-vt-reduce all  :all)
+(def-vt-reduce any  :any)
 
-(%def-vt-reduce nansum  :nansum)
-(%def-vt-reduce nanprod :nanprod)
-(%def-vt-reduce nanmax  :nanmax)
-(%def-vt-reduce nanmin  :nanmin)
+(def-vt-reduce nansum  :nansum)
+(def-vt-reduce nanprod :nanprod)
+(def-vt-reduce nanmax  :nanmax)
+(def-vt-reduce nanmin  :nanmin)
 
-(%def-vt-reduce argmax    :argmax)
-(%def-vt-reduce argmin    :argmin)
-(%def-vt-reduce nanargmax :nanargmax)
-(%def-vt-reduce nanargmin :nanargmin)
+(def-vt-reduce argmax    :argmax)
+(def-vt-reduce argmin    :argmin)
+(def-vt-reduce nanargmax :nanargmax)
+(def-vt-reduce nanargmin :nanargmin)
 
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) out)

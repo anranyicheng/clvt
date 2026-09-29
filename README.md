@@ -1,20 +1,8 @@
 # clvt
 clvt (common lisp vector tensor) library.
-这是一个纯 common lisp 语言编写的张量库，是使用'智谱清言'AI(GLM5+)和'DeepSeek'(v4pro) AI共同编写，后续由 MiMo (Xiaomi AI) 进行了大量测试、bug 修复和功能扩展。目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。虽然 lisp 社区拥有 magicl 和 numcl 这两个比较流行的库，但是 magicl 缺乏对高维张量的支持以及缺少一些重要的函数，numcl 注重类型推理并且一些函数接口和CL语言标准重合。clvt 这库的核心基础是 vt-einsum，vt-map, vt-reduce 三个函数, 其余操作大多数都是基于这三个核心函数组合完成，易于理解，同时这个库有完美的打印输出功能。目前这个库已经实现了许多张量的基础操作，未来将进一步完善，目标是尽可能实现 numpy 众多功能, 部分函数功能向pytorch看齐。这个库的函数都是以 vt- 开头，配合 slime 一起使用非常方便，易于查看已经实现了哪些函数。目前在sbcl上完成了大部分的测试。
+这是一个纯 common lisp (sbcl) 语言编写的张量库，是使用'智谱清言'AI(GLM5+)和'DeepSeek'(v4+pro) AI等共同编写。目标就是为 common lisp 生态构建一个简洁而强大的张量计算库。clvt 这库的核心基础是 vt-einsum，vt-map 两个函数和 def-vt-reduce 宏, 其余操作大多数都是基于这三个核心功能组合完成，易于理解，同时这个库有完美的打印输出功能。目前这个库已经实现了许多张量的基础操作，未来将进一步完善，目标是尽可能实现 numpy 众多功能, 部分函数功能向pytorch看齐。这个库的函数都是以 vt- 开头，配合 slime 一起使用非常方便，易于查看已经实现了哪些函数。目前只在sbcl上运行和测试。
 
-This is a tensor library written entirely in Common Lisp, collaboratively developed by the AI 'Zhipu Qingyan' (GLM5+) and 'DeepSeek' (v4pro), with extensive testing, bug fixes, and feature extensions contributed by MiMo (Xiaomi AI). The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. Although the Lisp community already has two relatively popular libraries, magicl and numcl, magicl lacks support for high-dimensional tensors and some important functions, while numcl emphasizes type inference and has some function interfaces that overlap with standard CL functions. The core foundation of the clvt library consists of three functions: vt-einsum, vt-map, and vt-reduce. Most other operations are built by combining these three core functions, making them easy to understand. Additionally, this library features excellent pretty-printing capabilities. Currently, the library has already implemented many basic tensor operations, and further improvements will be made in the future, aiming to implement as many NumPy features as possible, with some functions modeled after PyTorch. Functions in this library are all prefixed with vt-, which, when used with Slime, makes it very convenient to see which functions have been implemented. The majority of tests have been completed on SBCL.
-
-## 架构重构（2026-08-15）
-
-源码已从原来职责混杂的顶层文件重组为 `src/` 下按职责分层的 20 个模块，保持全部 `vt-*` 公共 API 签名兼容，详见下文「架构」一节与 [CHANGELOG.md](CHANGELOG.md)。
-
-- **性能**：逐元素核心 `vt-map` 按元素类型特化（消除浮点装箱），并恢复 `vt-fast-map` 编译期内联；`vt-+` / `vt-*` / `vt-add` / `vt-mul` / `vt-sin` / `vt-exp` 等常用运算在连续内存上达到或超越重构前性能。
-- **可移植**：`with-float-safe` 与 NaN / Inf 判定不再依赖 SBCL 内部符号。
-- **测试**：新增 `numpy-compare-test`，运行时调用 `python3 + numpy + torch` 实时对比结果（69 项）。总计 **900 个测试用例**全部通过。
-
-## MiMo (Xiaomi AI) 贡献
-
-由 MiMo (Xiaomi AI) 进行了系统性的测试、bug 修复和功能扩展，详见 [CHANGELOG.md](CHANGELOG.md)。
+This is a tensor library written purely in Common Lisp (SBCL). It was co-written using "Zhipu Qingyan" AI (GLM5+) and "DeepSeek" AI (v4+pro), among others. The goal is to build a concise yet powerful tensor computation library for the Common Lisp ecosystem. The core foundation of the clvt library is the two functions vt-einsum and vt-map, plus the def-vt-reduce macro. Most of the other operations are built by combining these three core features, making them easy to understand. The library also has perfect print output functionality. At present, the library has already implemented many basic tensor operations. It will be further improved in the future, with the goal of implementing as many NumPy features as possible and aligning some function behavior with PyTorch. All functions in this library start with vt-, which makes them very convenient to use with SLIME and makes it easy to see which functions have already been implemented. Currently, it only runs and is tested on SBCL.
 
 clvt 举例:
 ``` common lisp
@@ -441,6 +429,20 @@ vt-random-choice
 vt-random-permutation
 vt-random-shuffle
 vt-random-multinomial
+;; SeedSequence
+#:vt-seed-sequence 
+#:make-seed-sequence 
+#:vt-seed-sequence-entropy
+#:seed-sequence-spawn 
+#:seed-sequence-generate-state
+;; Generator
+#:vt-generator 
+#:make-generator
+#:vt-generator-state
+#:generator-from-seed-sequence 
+#:spawn-generators
+;; 作用域宏
+#:with-seed #:with-generator
 
 ;; nan的相关
 vt-float-nan
@@ -501,7 +503,7 @@ bash test/run-tests.sh
 bash test/run-tests.sh --suite run_all_tests
 bash test/run-tests.sh --suite nested-test
 
-# 运行时调用 numpy/pytorch 实时对比结果 (需安装 python3 + numpy + torch)
+# 运行时调用 numpy 实时对比结果 (需安装 python3 + numpy)
 bash test/run-tests.sh --suite numpy-compare-test
 
 # 列出所有测试套件

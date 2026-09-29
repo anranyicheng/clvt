@@ -13,11 +13,10 @@
   "系统cpu核心数量")
 
 (defmacro with-float-safe (&body body)
-  "在 IEEE 754 陷阱被屏蔽的环境下执行 body，使 0/0、溢出等产生 nan/inf 而非报错。"
-  #+sbcl `(sb-int:with-float-traps-masked
-              (:invalid :divide-by-zero :overflow :underflow)
-            ,@body)
-  #-sbcl `(locally ,@body))
+  "屏蔽执行 body时，0/0、溢出等产生 nan/inf陷阱"
+  `(sb-int:with-float-traps-masked
+       (:invalid :divide-by-zero :overflow :underflow)
+     ,@body))  
 
 ;;; ------------------------------------------------------------------
 ;;; 关键字参数解析
