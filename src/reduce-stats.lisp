@@ -248,7 +248,7 @@
                      ,(%cast-form res-lt (if arg-p 'best-i 'acc))))))))))
 
 (defmacro %kernel-general (op lt res-lt)
-  "路径 3：通用回退。"
+  "路径 3：通用回退（支持非连续 :out）。"
   (let* ((acc-lt (%op-acc-lt op lt res-lt))
          (init   (%op-init   op lt res-lt))
          (arg-p  (%op-arg-p  op))
@@ -258,9 +258,11 @@
        (declare (type fixnum n-red n-non red-size non-size))
        (let ((non-idx (make-array (max n-non 1) :element-type 'fixnum :initial-element 0))
              (red-idx (make-array (max n-red 1) :element-type 'fixnum :initial-element 0))
-             (init-v  (the ,acc-lt ,init)))
-         (declare (type (simple-array fixnum (*)) non-idx red-idx))
-         (dotimes (out-pos non-size)
+             (init-v  (the ,acc-lt ,init))
+             (out-ptr res-off))
+         (declare (type (simple-array fixnum (*)) non-idx red-idx)
+                  (type fixnum out-ptr))
+         (dotimes (_ non-size)
            (let ((base in-off))
              (declare (type fixnum base))
              (dotimes (dd n-non)
@@ -293,15 +295,18 @@
                ,@(when nan-skip-arg
                    `((when (%nan-p acc)
                        (error "~a: All-NaN slice encountered" ',op))))
-               (setf (aref od (the fixnum (+ res-off out-pos)))
+               (setf (aref od out-ptr)
                      ,(%cast-form res-lt (if arg-p 'best-i 'acc))))
              (when (plusp n-non)
                (let ((dd (1- n-non)))
                  (declare (type fixnum dd))
                  (loop
                    (incf (aref non-idx dd))
+                   (incf out-ptr (svref out-non-strides dd))
                    (when (< (aref non-idx dd) (svref non-sizes dd)) (return))
                    (setf (aref non-idx dd) 0)
+                   (decf out-ptr (* (svref non-sizes dd)
+                                    (svref out-non-strides dd)))
                    (decf dd)
                    (when (< dd 0) (return)))))))))))
 
@@ -351,6 +356,12 @@
              (when (and out dtype (not (eq (vt-dtype out) dtype)))
                (error "vt-~a: :out dtype ~a conflicts with :dtype ~a"
                       ',name (vt-dtype out) dtype))
+	     (when out
+	       (loop for d in (vt-shape out)
+		     for s in (vt-strides out)
+		     when (and (> d 1) (zerop s))
+		       do (error "vt-~a: :out 不能是广播视图（维度 ~a 有 stride 0）"
+				 ',name d)))
              (let* ((axis-size (if axes
                                    (reduce #'* (mapcar (lambda (a) (nth a in-shape)) axes)
                                            :initial-value 1)
@@ -407,37 +418,48 @@
                          (inner (reduce #'* in-shape :start (1+ ax) :initial-value 1)))
                     (declare (fixnum ax outer red inner))
                     ,(dispatch '%kernel-single-axis)))
-                 ;; 路径 3：通用回退
-                 (t
-                  (when (and out (not (vt-contiguous-p res)))
-                    (error "vt-~a: :out must be contiguous in fallback path" ',name))
-                  (let* ((global-red  (null axes))
-                         (eff-red-axes (if global-red
-                                           (loop for i below rank collect i)
-                                           axes))
-                         (eff-non-axes (if global-red
-                                           nil
-                                           (loop for i below rank
-                                                 unless (member i axes) collect i)))
-                         (in-strides (vt-strides tensor))
-                         (in-shape-vec   (coerce in-shape 'simple-vector))
-                         (in-strides-vec (coerce in-strides 'simple-vector))
-                         (red-axes (coerce eff-red-axes 'simple-vector))
-                         (non-axes (coerce eff-non-axes 'simple-vector))
-                         (n-red (length eff-red-axes))
-                         (n-non (- rank n-red))
-                         (red-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
-                                         red-axes))
-                         (red-strides-v (map 'vector (lambda (a) (svref in-strides-vec a))
-                                             red-axes))
-                         (non-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
-                                         non-axes))
-                         (non-strides (map 'vector (lambda (a) (svref in-strides-vec a))
-                                           non-axes))
-                         (red-size (reduce #'* red-sizes :initial-value 1))
-                         (non-size (reduce #'* non-sizes :initial-value 1)))
-                    (declare (fixnum n-red n-non red-size non-size))
-                    ,(dispatch '%kernel-general))))
+
+		 ;; 路径 3：通用回退
+		 (t
+		  (let* ((global-red  (null axes))
+			 (eff-red-axes (if global-red
+					   (loop for i below rank collect i)
+					   axes))
+			 (eff-non-axes (if global-red
+					   nil
+					   (loop for i below rank
+						 unless (member i axes) collect i)))
+			 (in-strides  (vt-strides tensor))
+			 (out-strides (vt-strides res))         ; ★ 新增
+			 (in-shape-vec   (coerce in-shape 'simple-vector))
+			 (in-strides-vec (coerce in-strides 'simple-vector))
+			 (red-axes (coerce eff-red-axes 'simple-vector))
+			 (non-axes (coerce eff-non-axes 'simple-vector))
+			 (n-red (length eff-red-axes))
+			 (n-non (- rank n-red))
+			 (red-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
+					 red-axes))
+			 (red-strides-v (map 'vector (lambda (a) (svref in-strides-vec a))
+					     red-axes))
+			 (non-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
+					 non-axes))
+			 (non-strides (map 'vector (lambda (a) (svref in-strides-vec a))
+					   non-axes))
+			 (out-non-strides
+			   (coerce
+			    (unless global-red
+			      (if keepdims
+				  (loop for a in eff-non-axes
+					collect (nth a out-strides))
+				  (loop for a in eff-non-axes
+					for out-i = (loop for i below a
+							  count (not (member i axes)))
+					collect (nth out-i out-strides))))
+			    'simple-vector))
+			 (red-size (reduce #'* red-sizes :initial-value 1))
+			 (non-size (reduce #'* non-sizes :initial-value 1)))
+		    (declare (fixnum n-red n-non red-size non-size))
+		    ,(dispatch '%kernel-general))))
                res)))))))
 
 ;;; ============================================================
@@ -674,49 +696,69 @@
 ;;; ------------------------------------------------------------------
 ;;; 中位数 / 百分位 / 直方图
 ;;; ------------------------------------------------------------------
-
-(defun vt-median (tensor &key axis)
+(defun vt-median (tensor &key axis keepdims)
   (with-float-safe
     (if axis
-	(let* ((shape (vt-shape tensor))
-	       (rank (length shape))
-	       (ax (vt-normalize-axis axis rank))
-               (out-shape (loop for d in shape
-				for i from 0
-				unless (= i ax)
-				  collect d))
+        ;; ---- 轴归约 ----
+        (let* ((shape (vt-shape tensor))
+               (rank (length shape))
+               (ax (vt-normalize-axis axis rank))
+               (out-shape (if keepdims
+                              (loop for d in shape for i from 0
+                                    collect (if (= i ax) 1 d))
+                              (loop for d in shape for i from 0
+                                    unless (= i ax) collect d)))
                (result (vt-zeros out-shape :dtype :float64))
-	       (out-strides (vt-strides result)))
+               (out-strides (vt-strides result)))
           (vt-do-each (ptr val result)
             (declare (ignore val))
-            (let ((out-idx (vt-unravel-index ptr out-shape out-strides)))
-              (let* ((specs (loop for i from 0 below rank
-                                  if (= i ax) collect '(:all)
-                                    else collect (list (pop out-idx))))
-                     (fiber (apply #'vt-slice tensor specs)) (fs (vt-size fiber)))
-		(setf (aref (vt-data result) ptr)
-                      (if (zerop fs) (vt-get-nan :float64)
-                          (let ((vals (loop for i below fs collect (vt-ref fiber i))))
-                            (if (some #'%nan-p vals) (vt-get-nan :float64)
-				(let ((sv (vt-numpy-sort vals #'<)))
-                                  (if (oddp fs) (vt-cast (nth (floor fs 2) sv) :float64)
-                                      (/ (+ (vt-cast (nth (1- (floor fs 2)) sv) :float64)
-                                            (vt-cast (nth (floor fs 2) sv) :float64))
-					 2.0d0))))))))))
+            (let* ((out-idx (vt-unravel-index ptr out-shape out-strides))
+                   (specs
+                     (loop for i from 0 below rank
+                           for out-i = (cond ((= i ax) nil)
+                                             (keepdims i)
+                                             ((< i ax) i)
+                                             (t (1- i)))
+                           collect (if (null out-i)
+                                       '(:all)
+                                       (list (nth out-i out-idx)))))
+                   (fiber (apply #'vt-slice tensor specs))
+                   (fs (vt-size fiber)))
+              (setf (aref (vt-data result) ptr)
+                    (if (zerop fs)
+                        (vt-get-nan :float64)
+                        (let ((vals (loop for i below fs collect (vt-ref fiber i))))
+                          (if (some #'%nan-p vals)
+                              (vt-get-nan :float64)
+                              (let ((sv (vt-numpy-sort vals #'<)))
+                                (if (oddp fs)
+                                    (vt-cast (nth (floor fs 2) sv) :float64)
+                                    (/ (+ (vt-cast (nth (1- (floor fs 2)) sv) :float64)
+                                          (vt-cast (nth (floor fs 2) sv) :float64))
+                                       2.0d0)))))))))
           result)
-	(let* ((flat (vt-flatten tensor))
-	       (size (vt-size flat)))
+        ;; ---- 全局归约 ----
+        (let* ((in-shape (vt-shape tensor))
+               (rank (length in-shape))
+               (flat (vt-flatten tensor))
+               (size (vt-size flat))
+               (out-shape (if keepdims
+                              (make-list rank :initial-element 1)
+                              nil)))
           (if (zerop size)
-	      (make-vt nil (vt-get-nan :float64) :dtype :float64)
+              (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
               (let ((vals (loop for i below size collect (aref (vt-data flat) i))))
-		(if (some #'%nan-p vals)
-		    (make-vt nil (vt-get-nan :float64) :dtype :float64)
+                (if (some #'%nan-p vals)
+                    (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
                     (let ((sv (vt-numpy-sort vals #'<)))
                       (if (oddp size)
-			  (make-vt nil (vt-cast (nth (floor size 2) sv) :float64) :dtype :float64)
-                          (make-vt nil (/ (+ (vt-cast (nth (1- (floor size 2)) sv) :float64)
-                                             (vt-cast (nth (floor size 2) sv) :float64))
-					  2.0d0)
+                          (make-vt out-shape
+                                   (vt-cast (nth (floor size 2) sv) :float64)
+                                   :dtype :float64)
+                          (make-vt out-shape
+                                   (/ (+ (vt-cast (nth (1- (floor size 2)) sv) :float64)
+                                         (vt-cast (nth (floor size 2) sv) :float64))
+                                      2.0d0)
                                    :dtype :float64))))))))))
 
 (defun %percent-from-sorted (sorted q interpolation)
@@ -736,7 +778,7 @@
 		    2.0d0))
       (:nearest (vt-cast (nth (if (<= frac 0.5d0) lower upper) sorted) :float64)))))
 
-(defun vt-percentile (tensor percentile &key axis (interpolation :linear))
+(defun vt-percentile (tensor percentile &key axis keepdims (interpolation :linear))
   "计算百分位数（对标 numpy.percentile）。
    PERCENTILE 必须在 [0, 100] 内：
      - 0   → 最小值
@@ -745,7 +787,10 @@
      越界（<0 或 >100）报错；NaN 亦报错（NaN 不满足 <= 比较）。
    INTERPOLATION 取值：:linear / :lower / :higher / :midpoint / :nearest，
      对标 numpy.percentile 的 interpolation 参数。默认 :linear。
-   返回：0 维张量（当 axis=nil）或降维后的张量（当 axis 指定）。"
+   KEEPDIMS = t 时，轴归约保留归约轴为 1，全局归约返回 (1 1 ... 1)，
+     与 numpy 的 keepdims=True 一致。
+   返回：0 维张量（当 axis=nil 且 keepdims=nil）、形状 (1 1 ... 1)
+         的张量（当 axis=nil 且 keepdims=t）、或降维后的张量。"
   (with-float-safe
     (unless (realp percentile)
       (error "vt-percentile: percentile 必须为实数，得到 ~a (type ~a)"
@@ -758,39 +803,59 @@
              interpolation))
     (let ((q (/ percentile 100.0d0)))
       (if axis
+          ;; ---- 轴归约 ----
           (let* ((shape (vt-shape tensor))
-		 (rank (length shape))
-		 (ax (vt-normalize-axis axis rank))
-		 (out-shape (loop for d in shape
-				  for i from 0 unless (= i ax) collect d))
-		 (result (vt-zeros out-shape :dtype :float64))
-		 (out-strides (vt-strides result)))
+                 (rank (length shape))
+                 (ax (vt-normalize-axis axis rank))
+                 (out-shape (if keepdims
+                                (loop for d in shape for i from 0
+                                      collect (if (= i ax) 1 d))
+                                (loop for d in shape for i from 0
+                                      unless (= i ax) collect d)))
+                 (result (vt-zeros out-shape :dtype :float64))
+                 (out-strides (vt-strides result)))
             (vt-do-each (ptr val result)
               (declare (ignore val))
-              (let ((out-idx (vt-unravel-index ptr out-shape out-strides)))
-		(let* ((specs (loop for i from 0 below rank
-                                    if (= i ax) collect '(:all)
-                                      else collect (list (pop out-idx))))
-                       (fiber (apply #'vt-slice tensor specs)) (fs (vt-size fiber)))
-                  (setf (aref (vt-data result) ptr)
-			(if (zerop fs) (vt-get-nan :float64)
-                            (let ((raw (loop for i below fs collect (vt-ref fiber i))))
-                              (if (some #'%nan-p raw) (vt-get-nan :float64)
-                                  (%percent-from-sorted
-				   (vt-numpy-sort raw #'<) q interpolation))))))))
+              (let* ((out-idx (vt-unravel-index ptr out-shape out-strides))
+                     (specs
+                       (loop for i from 0 below rank
+                             for out-i = (cond ((= i ax) nil)
+                                               (keepdims i)
+                                               ((< i ax) i)
+                                               (t (1- i)))
+                             collect (if (null out-i)
+                                         '(:all)
+                                         (list (nth out-i out-idx)))))
+                     (fiber (apply #'vt-slice tensor specs))
+                     (fs (vt-size fiber)))
+                (setf (aref (vt-data result) ptr)
+                      (if (zerop fs)
+                          (vt-get-nan :float64)
+                          (let ((raw (loop for i below fs collect (vt-ref fiber i))))
+                            (if (some #'%nan-p raw)
+                                (vt-get-nan :float64)
+                                (%percent-from-sorted
+                                 (vt-numpy-sort raw #'<) q interpolation)))))))
             result)
-          (let* ((flat (vt-flatten tensor))
-		 (size (vt-size flat)))
+          ;; ---- 全局归约 ----
+          (let* ((in-shape (vt-shape tensor))
+                 (rank (length in-shape))
+                 (flat (vt-flatten tensor))
+                 (size (vt-size flat))
+                 (out-shape (if keepdims
+                                (make-list rank :initial-element 1)
+                                nil)))
             (if (zerop size)
-		(make-vt nil (vt-get-nan :float64) :dtype :float64)
-		(let ((raw (loop for i below size collect (aref (vt-data flat) i))))
+                (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
+                (let ((raw (loop for i below size collect (aref (vt-data flat) i))))
                   (if (some #'%nan-p raw)
-		      (make-vt nil (vt-get-nan :float64) :dtype :float64)
-                      (make-vt nil (%percent-from-sorted
-				    (vt-numpy-sort raw #'<) q interpolation)
-			       :dtype :float64)))))))))
+                      (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
+                      (make-vt out-shape
+                               (%percent-from-sorted
+                                (vt-numpy-sort raw #'<) q interpolation)
+                               :dtype :float64)))))))))
 
-(defun vt-quantile (tensor q &key axis (interpolation :linear))
+(defun vt-quantile (tensor q &key axis keepdims (interpolation :linear))
   "计算分位数（对标 numpy.quantile）。
    Q 必须在 [0, 1] 内：
      - 0.0  → 最小值
@@ -798,13 +863,16 @@
      - 1.0  → 最大值
      越界（<0 或 >1）报错；NaN 亦报错（NaN 不满足 <= 比较）。
    等价于 (vt-percentile tensor (* q 100) ...)。
-   INTERPOLATION 含义见 vt-percentile。"
+   INTERPOLATION 含义见 vt-percentile；KEEPDIMS 语义见 vt-percentile。"
   (unless (realp q)
     (error "vt-quantile: q 必须为实数，得到 ~a (type ~a)"
            q (type-of q)))
   (unless (<= 0 q 1)
     (error "vt-quantile: q 必须在 [0, 1] 内，得到 ~a" q))
-  (vt-percentile tensor (* q 100) :axis axis :interpolation interpolation))
+  (vt-percentile tensor (* q 100)
+                 :axis axis
+                 :keepdims keepdims
+		 :interpolation interpolation))
 
 (defun vt-ptp (tensor &key axis)
   (if axis (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
@@ -1036,72 +1104,95 @@
 
 (defun vt-nanmedian (tensor &key axis keepdims out)
   (with-float-safe
-    (if (member (vt-dtype tensor) '(:int32 :int64))
-	(vt-median tensor :axis axis)
-	(let* ((nan (vt-get-nan :float64))
-	       (in-data (vt-data tensor))
-               (in-strides (vt-strides tensor))
-	       (in-offset (vt-offset tensor))
-               (in-shape (vt-shape tensor))
-	       (rank (length in-shape)))
-          (if (null axis)
-              (let ((vals '()))
-		(vt-do-each (ptr val tensor)
-                  (declare (ignore ptr))
-                  (unless (%nan-p val) (push val vals)))
-		(setf vals (sort vals #'<))
-		(let ((result (cond ((null vals) nan)
-                                    ((oddp (length vals))
-				     (coerce (nth (floor (length vals) 2) vals) 'double-float))
-                                    (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
-					     (nth (/ (length vals) 2) vals))
-					  2.0d0)))))
-                  (if out (progn (vt-fill out result) out)
-		      (make-vt nil result :dtype :float64))))
-              (let* ((ax (vt-normalize-axis axis rank))
-		     (ax-size (nth ax in-shape))
-                     (ax-stride (nth ax in-strides))
-                     (out-shape (if keepdims
-                                    (loop for d in in-shape for i from 0
-					  collect (if (= i ax) 1 d))
-                                    (loop for d in in-shape for i from 0
-					  unless (= i ax) collect d)))
-                     (res (vt-zeros out-shape :dtype :float64))
-                     (res-data (vt-data res)) (res-offset (vt-offset res))
-                     (out-rank (length out-shape))
-                     (out-dims (coerce out-shape 'simple-vector))
-                     (out-strs (coerce (vt-strides res) 'simple-vector))
-                     (in-map (let ((m (make-array out-rank :element-type 'fixnum)) (k 0))
-                               (loop for i from 0 below rank unless (= i ax)
-                                     do (setf (aref m k) i) (incf k))
-                               m))
-                     (in-strs (coerce (loop for i below out-rank
-					    collect (nth (aref in-map i) in-strides))
-                                      'simple-vector)))
-		(labels ((compute (depth in-ptr out-ptr)
-                           (if (= depth out-rank)
-                               (let ((vals '()))
-				 (loop for i from 0 below ax-size
-                                       for ptr = in-ptr then (+ ptr ax-stride)
-                                       for v = (aref in-data ptr)
-                                       unless (%nan-p v)
-					 do (push (coerce v 'double-float) vals))
-				 (setf vals (nreverse vals))
-				 (setf (aref res-data out-ptr)
-                                       (cond ((null vals) nan)
-                                             ((oddp (length vals))
-					      (nth (floor (length vals) 2) vals))
-                                             (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
-						      (nth (/ (length vals) 2) vals))
-						   2.0d0)))))
-                               (let ((dim (svref out-dims depth))
-				     (out-str (svref out-strs depth))
-                                     (in-str (svref in-strs depth)))
-				 (loop for i from 0 below dim do
-                                   (compute (1+ depth) in-ptr out-ptr)
-                                   (incf in-ptr in-str) (incf out-ptr out-str))))))
-                  (compute 0 in-offset res-offset))
-		(if out (progn (vt-copy-into out res) out) res)))))))
+    (let* ((nan (vt-get-nan :float64))
+	   (in-data (vt-data tensor))
+           (in-strides (vt-strides tensor))
+	   (in-offset (vt-offset tensor))
+           (in-shape (vt-shape tensor))
+	   (rank (length in-shape)))
+      (if (null axis)
+          (let ((vals '()))
+	    (vt-do-each (ptr val tensor)
+              (declare (ignore ptr))
+              (unless (%nan-p val) (push val vals)))
+	    (setf vals (sort vals #'<))
+	    (let ((result (cond ((null vals) nan)
+                                ((oddp (length vals))
+				 (coerce (nth (floor (length vals) 2) vals) 'double-float))
+                                (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
+					 (nth (/ (length vals) 2) vals))
+				      2.0d0)))))
+              (if out 
+		  (progn
+		    (unless (or (null (vt-shape out))
+				(equal (vt-shape out) '(1))
+				(and keepdims
+				     (equal (vt-shape out)
+					    (make-list (length (vt-shape tensor))
+						       :initial-element 1))))
+		      (error "vt-nanmedian: :out 形状 ~a 与全局归约结果不兼容"
+			     (vt-shape out)))
+		    (vt-fill out result)
+		    out)
+		  (make-vt nil result :dtype :float64))))
+          (let* ((ax (vt-normalize-axis axis rank))
+		 (ax-size (nth ax in-shape))
+                 (ax-stride (nth ax in-strides))
+                 (out-shape (if keepdims
+                                (loop for d in in-shape for i from 0
+				      collect (if (= i ax) 1 d))
+                                (loop for d in in-shape for i from 0
+				      unless (= i ax) collect d)))
+                 (res (vt-zeros out-shape :dtype :float64))
+                 (res-data (vt-data res)) (res-offset (vt-offset res))
+                 (out-rank (length out-shape))
+                 (out-dims (coerce out-shape 'simple-vector))
+                 (out-strs (coerce (vt-strides res) 'simple-vector))
+		 (in-map (if keepdims
+			     (let ((m (make-array rank :element-type 'fixnum)))
+			       (dotimes (i rank)
+				 (setf (aref m i) i))
+			       m)
+			     (let ((m (make-array (1- rank)
+                                                  :element-type 'fixnum))
+                                   (k 0))
+			       (loop for i from 0 below rank unless (= i ax)
+				     do (setf (aref m k) i) (incf k))
+			       m)))
+                 (in-strs (coerce (loop for i below out-rank
+					collect (nth (aref in-map i) in-strides))
+                                  'simple-vector)))
+	    (labels ((compute (depth in-ptr out-ptr)
+                       (if (= depth out-rank)
+                           (let ((vals '()))
+			     (loop for i from 0 below ax-size
+                                   for ptr = in-ptr then (+ ptr ax-stride)
+                                   for v = (aref in-data ptr)
+                                   unless (%nan-p v)
+				     do (push (coerce v 'double-float) vals))
+			     (setf vals (sort vals #'<))
+			     (setf (aref res-data out-ptr)
+                                   (cond ((null vals) nan)
+                                         ((oddp (length vals))
+					  (nth (floor (length vals) 2) vals))
+                                         (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
+						  (nth (/ (length vals) 2) vals))
+					       2.0d0)))))
+                           (let ((dim (svref out-dims depth))
+				 (out-str (svref out-strs depth))
+                                 (in-str (svref in-strs depth)))
+			     (loop for i from 0 below dim do
+                               (compute (1+ depth) in-ptr out-ptr)
+                               (incf in-ptr in-str) (incf out-ptr out-str))))))
+              (compute 0 in-offset res-offset))
+	    (if out
+		(progn
+		  (unless (equal (vt-shape out) (vt-shape res))
+		    (error "vt-nanmedian: :out 形状 ~a 与期望 ~a 不匹配"
+			   (vt-shape out) (vt-shape res)))
+		  (vt-copy-into out res)
+		  out)
+		res))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 差分 / 积分 / 相关 / 卷积 / 插值 / 梯度
@@ -1188,46 +1279,77 @@
 		:mode (%normalize-mode-keyword mode)))
 
 (defun vt-interp (x xp fp &key (left nil) (right nil))
-  (let* ((xp-vt (vt-contiguous (if (eq (vt-dtype xp) :float64)
-				   xp (vt-astype xp :float64))))
-         (fp-vt (vt-contiguous(if (eq (vt-dtype fp) :float64)
-				  fp (vt-astype fp :float64))))
-         (x-vt (vt-contiguous
-		(vt-flatten (ensure-vt x :dtype :float64))))
-         (xp-data (vt-data xp-vt))
-	 (fp-data (vt-data fp-vt))
-	 (n (vt-size xp-vt))
-         (x-data (vt-data x-vt))
-	 (x-size (vt-size x-vt))
-         (out (vt-zeros (vt-shape x-vt) :dtype :float64))
-	 (out-data (vt-data out))
-         (xp0 (aref xp-data 0))
-	 (fp0 (aref fp-data 0))
-         (xp-end (aref xp-data (1- n)))
-	 (fp-end (aref fp-data (1- n)))
-         (left-val (if left (vt-cast left :float64) fp0))
-         (right-val (if right (vt-cast right :float64) fp-end)))
-    (loop for i from 0 below x-size
-	  for xi = (aref x-data i) do
-	    (setf (aref out-data i)
-		  (cond ((<= xi xp0) left-val)
-			((>= xi xp-end) right-val)
-			(t (let ((lo 0) (hi (- n 2)))
-			     (loop while (< lo hi) do
-                               (let ((mid (ash (+ lo hi 1) -1)))
-				 (if (<= (aref xp-data mid) xi)
-				     (setf lo mid)
-				     (setf hi (1- mid)))))
-			     (let* ((xl (aref xp-data lo))
-				    (xr (aref xp-data (1+ lo)))
-				    (yl (aref fp-data lo))
-				    (yr (aref fp-data (1+ lo)))
-				    (denom (- xr xl)))
-                               (if (zerop denom)
-				   yl
-				   (+ yl (* (- yr yl)
-					    (/ (- xi xl) denom))))))))))
-    out))
+  "一维线性插值（对标 numpy.interp）。
+   在样本点 (xp[i], fp[i]) 上对查询点 x 做线性插值。
+   参数：
+     x       查询点，任意形状（输出恒展平为 1D）。
+     xp      样本点横坐标，1D，**必须严格递增**。
+     fp      样本点纵坐标，1D，长度必须等于 xp。
+     :left   x < xp[0] 时的返回值，默认 fp[0]。
+     :right  x > xp[last] 时的返回值，默认 fp[last]。
+   返回：1D float64 张量，长度 = |x|。
+   与 numpy 差异：
+     · 输出总是 1D（numpy 保留 x 的形状）。
+     · 无 period 参数。
+     · xp 含 NaN 时行为未定义。
+   示例：
+     (vt-interp 2.5d0 #(1d0 3d0) #(10d0 30d0))  => 25.0d0
+     (vt-interp #(0d0 5d0) #(1d0 3d0) #(10d0 30d0) :left -1d0 :right -2d0)
+       => #(-1.0d0 -2.0d0)"
+  (with-float-safe
+    (let* ((xp-vt (vt-contiguous
+                   (if (eq (vt-dtype (ensure-vt xp)) :float64)
+                       (ensure-vt xp)
+                       (vt-astype (ensure-vt xp) :float64))))
+           (fp-vt (vt-contiguous
+                   (if (eq (vt-dtype (ensure-vt fp)) :float64)
+                       (ensure-vt fp)
+                       (vt-astype (ensure-vt fp) :float64))))
+           (n (vt-size xp-vt)))
+      ;; ---- 前置校验 ----
+      (when (zerop n)
+        (error "vt-interp: xp 不能为空"))
+      (unless (= n (vt-size fp-vt))
+        (error "vt-interp: xp 长度 ~a ≠ fp 长度 ~a" n (vt-size fp-vt)))
+      (loop for i from 1 below n
+            when (< (vt-ref xp-vt i) (vt-ref xp-vt (1- i)))
+              do (error "vt-interp: xp 必须在第 ~a 个位置递增（~a -> ~a 下降）"
+                        i (vt-ref xp-vt (1- i)) (vt-ref xp-vt i)))
+      (let* ((x-vt (vt-contiguous
+                    (vt-flatten (ensure-vt x :dtype :float64))))
+             (xp-data (vt-data xp-vt))
+             (fp-data (vt-data fp-vt))
+             (x-data (vt-data x-vt))
+             (x-size (vt-size x-vt))
+             (out (vt-zeros (list x-size) :dtype :float64))
+             (out-data (vt-data out))
+             (xp0 (aref xp-data 0))
+             (fp0 (aref fp-data 0))
+             (xp-end (aref xp-data (1- n)))
+             (fp-end (aref fp-data (1- n)))
+             (left-val (if left (vt-cast left :float64) fp0))
+             (right-val (if right (vt-cast right :float64) fp-end)))
+        (loop for i from 0 below x-size
+              for xi = (aref x-data i) do
+                (setf (aref out-data i)
+                      (cond ((<= xi xp0) left-val)
+                            ((>= xi xp-end) right-val)
+                            (t (let ((lo 0) (hi (- n 2)))
+                                 (loop while (< lo hi) do
+                                   (let ((mid (ash (+ lo hi 1) -1)))
+                                     (if (<= (aref xp-data mid) xi)
+                                         (setf lo mid)
+                                         (setf hi (1- mid)))))
+                                 (let* ((xl (aref xp-data lo))
+                                        (xr (aref xp-data (1+ lo)))
+                                        (yl (aref fp-data lo))
+                                        (yr (aref fp-data (1+ lo)))
+                                        (denom (- xr xl)))
+                                   (if (zerop denom)
+                                       yl
+                                       (+ yl (* (- yr yl)
+                                                (/ (- xi xl) denom))))))))))
+        out))))
 
 (defun vt-gradient (tensor &key (spacing 1.0d0) axis)
   (let* ((shape (vt-shape tensor))

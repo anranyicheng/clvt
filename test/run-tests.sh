@@ -252,6 +252,7 @@ main() {
 	    test-simd-batch-matmul
 	    test-bug0
 	    memsafety-tests
+	    out-contig-tests
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)
