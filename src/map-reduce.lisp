@@ -1,4 +1,11 @@
 ;;;; map-reduce.lisp — 逐元素映射与归约核心
+;;;
+;;; 执行层选路规则（对每个核心操作提供至少两条路径）：
+;;;   快路径   输入/输出连续、dtype 匹配、形状对齐 → 编译期内联循环/SIMD/并行
+;;;   通用路径 strides 遍历（%inline*-strided 系列，支持任意 strides）→ 正确性兜底
+;;;   vt-map   任意 dtype/形状组合 → funcall 闭包，语义基准
+;;; 三条路径的输出必须逐位相同；路径选择基于运行时检查，不基于编译期假设。
+;;; 连续性只影响性能，绝不影响正确性。
 
 (in-package :clvt)
 
@@ -269,7 +276,9 @@
 ;;; ------------------------------------------------------------------
 
 (defmacro %inline1-strided (lt op a res)
-  "一元 strides 遍历（内联 op）。RES 必须连续。"
+  "一元 strides 遍历（内联 op）。支持任意 strides：输入按广播规则取 stride（长度 1 的轴 stride=0 虚拟重复读），
+  结果张量 RES 按其自身 strides 逐元素写入——连续与非连续 RES 均正确，连续 RES 仅因访存局部性而更快。
+  优化路径与通用路径（vt-map）的输出必须逐位相同；连续性只影响选路，绝不影响正确性。"
   `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
           (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
           (rs (coerce (vt-strides ,res) 'simple-vector))
@@ -304,7 +313,9 @@
                      (when (< d 0) (return-from outer)))))))))))
 
 (defmacro %inline2-strided (lt op a b res)
-  "二元 strides 遍历（内联 op）。RES 必须连续。"
+  "二元 strides 遍历（内联 op）。支持任意 strides：两个输入按广播规则取 stride（长度 1 的轴 stride=0），
+  结果张量 RES 按其自身 strides 逐元素写入——连续与非连续 RES 均正确，连续 RES 仅因访存局部性而更快。
+  优化路径与通用路径（vt-map）的输出必须逐位相同；连续性只影响选路，绝不影响正确性。"
   `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
           (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
           (d1 (the (simple-array ,lt (*)) (vt-data ,b)))
@@ -364,6 +375,7 @@
        (incf op) (incf p0 s0) (incf p1 s1) (incf p2 s2))))
 
 (defmacro %inline3-strided (lt op a b c res)
+  ;; 三元 strides 遍历：同 %inline1/2-strided，支持任意 strides（含非连续 RES）。
   "三元 strides 遍历。"
   `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
           (d0 (the (simple-array ,lt (*)) (vt-data ,a)))

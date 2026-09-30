@@ -381,14 +381,41 @@
                (declare (fixnum rank axis-size in-size))
                (unless res-lt
                  (error "vt-~a: unsupported output dtype ~a" ',name final-out-dtype))
-               ;; ---- 空输入 ----
+               ;; ---- 空归约语义（设计约定：空归约按"是否有单位元"分类）----
+               ;; 有单位元的操作返回单位元：sum/nansum→0、prod/nanprod→1、
+               ;;   all→1、any→0（内部整型编码）。
+               ;; max/min 族无单位元：空归约填充 NaN 作为错误信号；
+               ;;   整数结果 dtype 无法表示 NaN，按约定提升为 float64。
+               ;; argmax/argmin/nanargmax/nanargmin 无单位元且无哨兵值，必须报错。
                (when (or (zerop axis-size) (zerop in-size))
-                 ,@(when (and arg-p (%op-nan-skip-p op))
-                     `((error "~a: empty slice encountered" ',name)))
-                 ,(if arg-p
-                      `(progn (vt-fill res 0)
-                              (return-from ,fn-name res))
+                 ,@(when arg-p
+                     `((error "vt-~a: 空张量（或空轴）上不存在最大/最小元素，arg 归约无定义"
+                              ',name)))
+                 ,(if (member (%op-base op) '(:max :min))
                       `(progn
+                         (cond
+                           ;; 显式整数 :dtype 与 NaN 结果冲突：硬契约报错（§8.2）
+                           ((and dtype (member dtype '(:int64 :int32 :int16 :int8 :uint8 :uint16)))
+                            (error "vt-~a: 空张量上的 max/min 归约结果为 NaN，与显式 :dtype ~a 冲突"
+                                   ',name dtype))
+                           ;; 派生的整数结果 dtype 无法表示 NaN：按约定提升为 float64；
+                           ;; 调用方显式提供整数 :out 时违反 out 契约，必须报错。
+                           ((member final-out-dtype
+                                    '(:int64 :int32 :int16 :int8 :uint8 :uint16))
+                            (if out
+                                (error "vt-~a: 空张量上的 max/min 归约结果为 NaN，无法写入整数 :out (dtype ~a)"
+                                       ',name final-out-dtype)
+                                (progn
+                                  (setf final-out-dtype :float64)
+                                  (setf res (make-vt out-shape 0 :dtype :float64))
+                                  (vt-fill res (vt-get-nan :float64))
+                                  (return-from ,fn-name res))))
+                           ;; 浮点结果：直接填充 NaN 作为"空归约"错误信号
+                           (t
+                            (vt-fill res (vt-get-nan final-out-dtype))
+                            (return-from ,fn-name res))))
+                      `(progn
+                         ;; 有单位元：返回单位元（%op-init 提供编译期常量）
                          (let ((lt (%et->lt in-et)))
                            (vt-fill res
                                     (cond

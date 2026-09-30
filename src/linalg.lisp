@@ -596,10 +596,14 @@
           
           (let* ((output (or out (vt-zeros out-shape :dtype out-dtype))))
             (when out
-              (assert (equal (vt-shape output) out-shape)
-                      (output) "out 形状不匹配!")
-              (assert (eq (vt-dtype output) out-dtype)
-                      (output) "out 类型不匹配!")
+              ;; out 硬契约（设计约定）：违反必报错，不使用 assert
+              ;; （assert 可能被 (safety 0) 编译剔除，硬契约必须保证触发）。
+              (unless (equal (vt-shape output) out-shape)
+                (error "vt-einsum: :out 形状 ~a 与逻辑结果形状 ~a 不匹配"
+                       (vt-shape output) out-shape))
+              (unless (eq (vt-dtype output) out-dtype)
+                (error "vt-einsum: :out dtype ~a 与结果 dtype ~a 不匹配"
+                       (vt-dtype output) out-dtype))
               (vt-fill output 0))
             
             (let* ((out-offset (vt-offset output))

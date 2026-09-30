@@ -7,7 +7,16 @@
 ;;; ------------------------------------------------------------------
 
 (defstruct (vt (:constructor %make-vt))
-  "N 维张量。data 为一维物理数组，shape/strides 描述逻辑视图，offset 支持零拷贝切片。"
+  "N 维张量 = 扁平缓冲区上的视图（strided view）。
+  物理层四要素 + dtype：
+    data    一维物理缓冲区（内存是一维的，(3,4) 张量存 12 个数）
+    shape   逻辑形状
+    strides 每维元素步长：沿第 d 轴前进 1，物理下标加 strides[d]；
+            长度为 1 的轴 stride=0 即广播视图（虚拟重复读，语义只读）
+    offset  视图起点（支持零拷贝切片）
+    dtype   元素类型（同时决定物理数组的元素类型）
+  逻辑层（shape/dtype/广播/归约语义）与执行层（快/慢路径选路）
+  均建立在本物理描述之上；连续性只影响性能，不影响正确性。"
   (data (make-array 0) :type (simple-array *))
   (shape nil :type list)
   (strides nil :type list)

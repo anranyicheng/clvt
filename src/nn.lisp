@@ -137,6 +137,9 @@
     (vt-clip scaled 0.0d0 1.0d0 :dtype dtype :out out)))
 
 (defun vt-softmax (vt &key (axis -1) dtype out)
+  "softmax（沿 axis，默认最后一维）。数值稳定化：先减去该轴最大值再 exp。
+  注意（对标 PyTorch）：若某行全为 -Inf，则 max = -Inf，exp(-Inf - (-Inf)) = NaN，
+  即全 -Inf 行的 softmax 结果为 NaN——这是 IEEE 754 下减去最大值稳定化的固有语义。"
   (let* ((max-val (vt-amax vt :axis axis :keepdims t :dtype dtype))
          (exp-vt (vt-exp (vt-- vt max-val :dtype dtype) :dtype dtype))
          (sum-exp (vt-sum exp-vt :axis axis :keepdims t :dtype dtype)))
