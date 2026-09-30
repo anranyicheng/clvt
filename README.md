@@ -595,5 +595,16 @@ clvt 遵循"逻辑层 / 物理层 / 执行层"三层分离架构，所有公开 
 - **einsum 路由**：纯逐元素模式 → `vt-map`；全收缩内积 → 专用累加内核；
   批量矩阵乘法 → 分块 GEMM（SIMD + 多线程）；其余 → 通用循环。
 
+### v0.3.1 增补约定
+
+- **mod/rem 零除**：`vt-mod` / `vt-rem` 除数为 0 时返回 0（对标 `np.mod`），不再依赖实现抛错。
+- **even-p/odd-p 非有限值**：NaN/±Inf 一律判定为不成立（返回 0）。
+- **hypot 特殊值**：任一参数为 ±Inf 时返回 +Inf（即便另一参数为 NaN，对标 IEEE/NumPy）；NaN 单独出现时传播。
+- **arange 整型溢出**：int64/int32 路径与 int16/int8/uint 一致采用回绕语义（%wrap-*）。
+- **linspace 精度**：float32 输出以 double 精度计算后舍入存储（对标 NumPy，避免累积漂移）。
+- **随机数边界**：`vt-random-uniform` 要求 low/high 为有限实数，low=high 合法（常量数组）；`vt-random-normal` 要求 std 为非负有限实数（std=0 返回 mean 填充）。
+- **vt-det out 契约**：:out 必须为 0 维张量，违反即报错。
+- **out dtype 权威约定**：所有接受 :out 的函数以 out 的 dtype 为准并按转换语义写入（与其他逐元素 API 一致）。
+
 ## License
 MIT

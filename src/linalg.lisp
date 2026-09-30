@@ -1192,6 +1192,12 @@
       (unless (and (= (length shape) 2)
                    (= (first shape) (second shape)))
         (error "vt-det: 行列式仅支持方阵，收到形状 ~a" shape)))
+    ;; :out 硬契约（§8.2）：det 结果为 0 维标量，:out 必须是 0 维张量，
+    ;; 否则 vt-fill 会静默填满任意形状的 out
+    (when out
+      (unless (null (vt-shape out))
+        (error "vt-det: :out 必须为 0 维张量（det 结果为标量），收到形状 ~a"
+               (vt-shape out))))
     (multiple-value-bind (lu piv sign)
         (vt-lu matrix)
       (declare (ignore piv))

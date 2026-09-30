@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-10-01 — v0.3.1 数据类型统一 / NaN·Inf 补全 / out 契约加固
+
+在 v0.3.0 三层架构文档化基础上，针对三个遗留问题域做第二轮重构。
+
+### 方向 1：数据类型统一（dtype.lisp 单一事实来源）
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| `vt-cast-fun` 对 int8/uint8 走 `%wrap-*`，int16/int32 走 `%coerce-*`，风格分裂 | 统一为 `%coerce-*`（语义一致，含 typep 快速路径） | dtype.lisp |
+| `vt-arange` int64/int32 溢出直接存储（触发数组元素类型错误），int16/int8/uint 却回绕 | int64/int32 统一 `%wrap-*` 回绕（§8.5） | creation.lisp |
+| `vt-linspace` float32 用 float32 累加，长序列漂移 | 以 double 精度计算、存储时舍入（对标 NumPy） | creation.lisp |
+| `vt-bits->unsigned-dtype` 返回 `:uint32/:uint64`（非存储类型） | 文档标注保留符号状态 | dtype.lisp |
+
+### 方向 2：NaN / Inf 特殊值补全
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| `vt-mod`/`vt-rem` 除 0：整数路径硬报错、浮点路径实现定义（NumPy 返回 0） | 除 0 返回 0 | elementwise.lisp |
+| `vt-even-p`/`vt-odd-p` 对 NaN/±Inf 触发 `evenp`/`floor` 类型错误 | 非有限值判定为不成立（返回 0） | elementwise.lisp |
+| `vt-hypot(NaN, ±Inf)` 结果依赖 SBCL `max` 的实现定义 | 任一 ±Inf → +Inf；NaN 单独出现时传播 | elementwise.lisp |
+| `vt-random-uniform`：`assert(< low high)` 拒绝 low=high（NumPy 允许），NaN 边界报错误导 | 显式校验有限性；low=high → 常量数组 | random.lisp |
+| `vt-random-normal`：负/NaN std 静默产生镜像分布 | 校验非负有限；std=0 → mean 填充（对标 NumPy scale=0） | random.lisp |
+
+### 方向 3：:out 内存布局契约加固
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| `vt-det` 接受任意形状 :out 并被 `vt-fill` 静默填满 | :out 必须为 0 维张量，违反即报错（§8.2） | linalg.lisp |
+
+审计确认已正确、无需改动的部分：`vt-map`/`vt-fast-map` 非连续 out 的 strides 写入与重叠快照保护；`def-vt-reduce` 家族（out-contig-tests 回归覆盖）；einsum 的 out strides 与重叠拷贝；`vt-where`/`vt-take`/`vt-pad`/`vt-triu`/`vt-tril`；`vt-sigmoid`/`vt-relu` 快路径连续性守卫；`log`/`sqrt`/`asin`/`acos`/`atanh`/`pow` 的复数域守卫与 NaN 返回；`maximum`/`minimum`/`fmax`/`fmin` 的 NaN 语义；median/percentile 的 NaN 传播。
+
+---
+
+
 ## 2026-10-01 — v0.3.0 架构重构：三层分离语义契约落地
 
 按《高性能张量库设计约定》完成整体重构审查，源码语义与文档对齐三层架构

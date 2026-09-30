@@ -115,3 +115,43 @@ strides 遍历写入（`rs` 向量），天然支持非连续 RES 与广播输�
 4. 确认测试套件无依赖旧空归约行为的用例。
 
 建议在 SBCL 环境执行 `bash test/run-tests.sh` 做最终回归确认。
+
+
+---
+
+# 第二轮重构（v0.3.1）—— 数据类型统一 / NaN·Inf 补全 / out 契约加固
+
+上游已合入第一轮补丁（66a090f、95baf94）。本轮针对三个遗留问题域：
+
+## 一、数据类型混乱 → 统一走 dtype.lisp 单一事实来源
+
+| 问题 | 修复 | 原则 |
+|------|------|------|
+| vt-cast-fun 对 int8/uint8 走 %wrap-* 慢路径，int16/int32 走 %coerce-* 快路径，风格分裂 | 统一为 %coerce-*（语义一致，含 typep 快速路径） | §8.5 |
+| vt-arange int64/int32 溢出直接存储（会触发 SBCL 类型错误），int16/int8/uint 却回绕 | int64/int32 统一 %wrap-* 回绕 | §8.5 回绕 |
+| vt-linspace float32 用 float32 累加产生漂移 | 以 double 计算、存储时舍入（对标 NumPy） | 一、路径等价 |
+| vt-bits->unsigned-dtype 返回 :uint32/:uint64（非存储类型） | 文档标注保留符号状态 | 二、单一事实来源 |
+
+## 二、NaN/Inf 处理补全
+
+按 §5.2 分层语义逐项核对：传播层（算术/maximum/minimum/median）、
+跳过层（nan-* 族）、错误层（空 arg 归约、全 NaN 片段）。本轮修复
+mod/rem 零除、even-p/odd-p 非有限值、hypot 混合特殊值、随机数边界校验四处。
+
+## 三、:out 连续/非连续内存处理
+
+逐一核对了 117 个接受 :out 的函数的写入路径：
+- 已正确（strides 写入/契约拒绝）：vt-map、vt-fast-map（含 %inline*-strided）、
+  def-vt-reduce 家族、einsum、vt-where、vt-take（内部 out）、vt-pad、
+  vt-triu/vt-tril（fresh copy + strided 写）、vt-sigmoid/vt-relu（连续守卫 + 回退）
+- 本轮修复：vt-det 的 :out 形状硬契约（此前任意形状被静默填满）
+
+## 验证方式
+
+环境无 SBCL，采用静态验证：
+1. Lisp 感知括号平衡检查全部通过（22 源文件 + asd）；
+2. 全部修改经唯一匹配 patch 脚本落盘（scripts/apply_round2.py + apply_completion.py）；
+3. 确认测试套件无依赖旧行为的用例（random-uniform 的 low<high assert 除外——
+   现有测试若使用 low=high 用例将获得新的合法行为）。
+
+建议在 SBCL 环境执行 `bash test/run-tests.sh` 做最终回归确认。
