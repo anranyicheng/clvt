@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-10-01 — v0.3.0 架构重构：三层分离语义契约落地
+
+按《高性能张量库设计约定》完成整体重构审查，源码语义与文档对齐三层架构
+（逻辑层 / 物理层 / 执行层）。全部修改不影响既有公开 API 签名。
+
+### 修正
+
+1. **`%inline1-strided` / `%inline2-strided` 误导性文档（关键修复）**
+   两个宏自实现起就遍历结果张量自身 strides，一直支持任意 strides（含非连续 RES、
+   广播输入），但文档错误标注"RES 必须连续"，差点误导执行层选路架构。
+   已重写文档并显式声明"优化路径与通用路径输出必须逐位相同"。
+
+2. **空归约语义（reduce-stats.lisp def-vt-reduce）**
+   旧行为：空张量/空轴上 max/min 返回 ±Inf 哨兵、argmax/argmin 填 0。
+   新行为按设计约定 §6.2：
+   - 有单位元的操作返回单位元：`sum→0`、`prod→1`、`all→1`、`any→0`、
+     `nansum→0`、`nanprod→1`；
+   - `max/min/nanmax/nanmin` 无单位元：填充 NaN；整数结果 dtype 提升为
+     float64 承载 NaN；显式整数 `:dtype`/整数 `:out` 与 NaN 结果冲突时报错；
+   - `argmax/argmin/nanargmax/nanargmin` 无单位元且无哨兵值：一律报错。
+
+3. **einsum `:out` 硬契约（linalg.lisp）**
+   形状/dtype 校验由 `assert` 改为显式 `error`：assert 可能被
+   `(safety 0)` 编译剔除，硬契约必须保证触发。
+
+### 文档
+
+- `package.lisp` 增加三层架构总纲（各层职责、失败模式与核心原则）。
+- `core.lisp` vt 结构文档补全物理层四要素与 stride-0 广播只读语义。
+- `map-reduce.lisp` 模块头写入执行层三条路径（快路径/strides 通用路径/vt-map）
+  的选路规则与逐位等价承诺。
+- `nn.lisp` `vt-softmax` 补充数值稳定化文档（全 -Inf 行 → NaN，对标 PyTorch）。
+- `README.md` 新增"设计约定（三层架构语义契约）"章节：
+  内存模型、视图/拷贝表、广播、类型提升、NaN 语义、归约、别名安全、
+  out 契约、einsum 路由。
+
+---
+
 ## 2026-09-05 — 测试体系重构与性能优化
 
 ### 测试体系重构：静态 JSON → 实时 NumPy 参考生成
