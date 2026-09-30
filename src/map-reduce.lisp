@@ -571,6 +571,7 @@
   (declare (type vt tensor)
            (type (or null fixnum list) axis)
            (type function reducer-fn))
+  (setf tensor (ensure-vt tensor))
   (with-float-safe
     (let* ((in-shape (vt-shape tensor))
            (rank (length in-shape))

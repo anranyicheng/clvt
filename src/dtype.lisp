@@ -227,7 +227,7 @@
     (:float32 (lambda (val) (coerce val 'single-float)))
     (:int64   #'%coerce-int64)
     (:int32   #'%coerce-int32)
-    (:int16   #'%wrap-int16)
+    (:int16   #'%coerce-int16)
     (:int8    #'%wrap-int8)
     (:uint8   #'%wrap-uint8)
     (:uint16  #'%wrap-uint16)))

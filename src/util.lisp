@@ -34,12 +34,13 @@
           for arg = (pop iter)
           do (cond
                ((keywordp arg)
-                (unless (member arg allowed-keys)
-                  (error "参数解析错误: 未知关键字参数 ~S。允许: ~S。" arg allowed-keys))
-                (when (member arg seen-keys)
-                  (error "参数解析错误: 关键字参数 ~S 重复出现。" arg))
-                (unless iter
-                  (error "参数解析错误: 关键字参数 ~S 缺少对应的值。" arg))
+		(unless (member arg allowed-keys)
+		  (error "参数解析错误（完整参数: ~S）: 未知关键字参数 ~S。允许: ~S。"
+			 args arg allowed-keys))
+		(when (member arg seen-keys)
+		  (error "参数解析错误（完整参数: ~S）: 关键字参数 ~S 重复出现。" args arg))
+		(unless iter
+		  (error "参数解析错误（完整参数: ~S）: 关键字参数 ~S 缺少对应的值。" args arg))
                 (push (cons arg (pop iter)) kw-alist)
                 (push arg seen-keys))
                (t (push arg tensors))))
@@ -54,20 +55,20 @@
 ;;; ------------------------------------------------------------------
 ;;; NaN 感知排序（严格对标 numpy）
 ;;; ------------------------------------------------------------------
-
 (defun vt-numpy-sort (sequence &optional (predicate #'<))
-  "对实数序列排序（默认升序）。nan 处理语义对标 numpy：
-   - 升序: 有限数升序，nan 放末尾。
-   - 降序: 等价于 numpy 的 np.sort(arr)[::-1]，nan 出现在开头。"
+  "对实数序列排序（默认升序）。语义严格对标 numpy：
+   升序 = np.sort(arr)（有限数升序，nan 按原相对顺序排在末尾）；
+   降序 = np.sort(arr)[::-1]（nan 在开头，且 nan 间相对顺序为升序的逆序）。"
   (declare (type (or list vector) sequence))
-  (assert (or (eq predicate #'<) (eq predicate '<)
-              (eq predicate #'>) (eq predicate '>)))
+  (assert (or (eq predicate #'<)
+	      (eq predicate '<)
+	      (eq predicate #'>)
+	      (eq predicate '>)))
   (with-float-safe
-    (let ((sequence (coerce sequence 'list)) non-nans nans)
-      (dolist (x sequence)
-        (if (%nan-p x) (push x nans) (push x non-nans)))
-      (setf non-nans (stable-sort (nreverse non-nans) predicate)
-            nans (nreverse nans))
+    (let* ((seq (coerce sequence 'list))
+           (non-nans (loop for x in seq unless (%nan-p x) collect x))
+           (nans     (loop for x in seq when   (%nan-p x) collect x))
+           (asc (append (stable-sort non-nans #'<) nans)))
       (if (or (eq predicate #'<) (eq predicate '<))
-          (append non-nans nans)
-          (append nans non-nans)))))
+          asc
+          (nreverse asc)))))

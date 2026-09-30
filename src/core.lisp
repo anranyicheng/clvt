@@ -77,9 +77,7 @@
          (lisp-type (vt-dtype->lisp-type dtype))
          (data (make-array size :element-type lisp-type
                                 :initial-element
-				(if initial-element
-				    (coerce initial-element lisp-type)
-				    (coerce 0 lisp-type)))))
+				(vt-cast initial-element dtype))))
     (%make-vt :data data
               :shape shape
               :strides (vt-compute-strides shape)
@@ -649,63 +647,64 @@
    2. dest 中「dim>1 且 stride=0」的广播维度是只读的，写入会报错。
    3. 当 dest 与 src 共享底层数组且物理区间重叠时，先对 src 做快照。"
   (setf src (ensure-vt src))
-  (let ((dest-shape (vt-shape dest))
-        (src-shape  (vt-shape src)))
-    ;; ---- 1) 可写性检查 ------------------------------------------------
-    (when (plusp (vt-size dest))
-      (loop for d in dest-shape
-            for s in (vt-strides dest)
-            when (and (> d 1) (zerop s))
-              do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d)))
-    ;; ---- 2) 形状兼容性 ------------------------------------------------
-    (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
-      (unless (equal final-shape dest-shape)
-        (error "vt-copy-into: dest 形状 ~a 无法容纳 src 广播后 ~a"
-               dest-shape final-shape)))
-    ;; ---- 3) 别名保护：重叠 → 深拷贝 src 作快照 ------------------------
-    (when (%vt-views-overlap-p dest src)
-      (setf src (vt-copy src)))
-    ;; ---- 4) 参数预计算 ------------------------------------------------
-    (let* ((dest-data    (vt-data dest))
-           (src-data     (vt-data src))
-           (dest-dtype   (vt-dtype dest))
-           (src-dtype    (vt-dtype src))
-           (dest-strides (vt-strides dest))
-           (src-strides  (vt-broadcast-strides
-                          src-shape dest-shape (vt-strides src)))
-           (dest-off     (vt-offset dest))
-           (src-off      (vt-offset src))
-           (size         (vt-shape-to-size dest-shape))
-           (rank         (length dest-shape))
-           (dest-contig  (vt-contiguous-p dest))
-           (src-contig   (vt-contiguous-p src))
-           (same-shape   (equal dest-shape src-shape))
-           (same-dtype   (eq dest-dtype src-dtype)))
-      (declare (type fixnum size dest-off src-off rank))
-      (cond
-        ;; 快路径 1：连续 + 同形 + 同 dtype → replace (memcpy)
-        ((and dest-contig src-contig same-shape same-dtype)
-         (replace dest-data src-data
-                  :start1 dest-off :end1 (+ dest-off size)
-                  :start2 src-off  :end2 (+ src-off size)))
+  (with-float-safe
+    (let ((dest-shape (vt-shape dest))
+          (src-shape  (vt-shape src)))
+      ;; ---- 1) 可写性检查 ------------------------------------------------
+      (when (plusp (vt-size dest))
+	(loop for d in dest-shape
+              for s in (vt-strides dest)
+              when (and (> d 1) (zerop s))
+		do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d)))
+      ;; ---- 2) 形状兼容性 ------------------------------------------------
+      (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
+	(unless (equal final-shape dest-shape)
+          (error "vt-copy-into: dest 形状 ~a 无法容纳 src 广播后 ~a"
+		 dest-shape final-shape)))
+      ;; ---- 3) 别名保护：重叠 → 深拷贝 src 作快照 ------------------------
+      (when (%vt-views-overlap-p dest src)
+	(setf src (vt-copy src)))
+      ;; ---- 4) 参数预计算 ------------------------------------------------
+      (let* ((dest-data    (vt-data dest))
+             (src-data     (vt-data src))
+             (dest-dtype   (vt-dtype dest))
+             (src-dtype    (vt-dtype src))
+             (dest-strides (vt-strides dest))
+             (src-strides  (vt-broadcast-strides
+                            src-shape dest-shape (vt-strides src)))
+             (dest-off     (vt-offset dest))
+             (src-off      (vt-offset src))
+             (size         (vt-shape-to-size dest-shape))
+             (rank         (length dest-shape))
+             (dest-contig  (vt-contiguous-p dest))
+             (src-contig   (vt-contiguous-p src))
+             (same-shape   (equal dest-shape src-shape))
+             (same-dtype   (eq dest-dtype src-dtype)))
+	(declare (type fixnum size dest-off src-off rank))
+	(cond
+          ;; 快路径 1：连续 + 同形 + 同 dtype → replace (memcpy)
+          ((and dest-contig src-contig same-shape same-dtype)
+           (replace dest-data src-data
+                    :start1 dest-off :end1 (+ dest-off size)
+                    :start2 src-off  :end2 (+ src-off size)))
 
-        ;; 快路径 2：连续 + 同形 + 需要类型转换
-        ((and dest-contig src-contig same-shape)
-         (let ((caster (vt-cast-fun dest-dtype)))
-           (declare (type function caster))
-           (dotimes (i size)
-             (setf (aref dest-data (+ dest-off i))
-                   (funcall caster (aref src-data (+ src-off i)))))))
-        ;; 快路径 3：src 是标量或 size=1 → 广播填充
-        ((= (vt-size src) 1)
-         (vt-fill dest (aref src-data src-off)))
+          ;; 快路径 2：连续 + 同形 + 需要类型转换
+          ((and dest-contig src-contig same-shape)
+           (let ((caster (vt-cast-fun dest-dtype)))
+             (declare (type function caster))
+             (dotimes (i size)
+               (setf (aref dest-data (+ dest-off i))
+                     (funcall caster (aref src-data (+ src-off i)))))))
+          ;; 快路径 3：src 是标量或 size=1 → 广播填充
+          ((= (vt-size src) 1)
+           (vt-fill dest (aref src-data src-off)))
 
-        ;; 通用路径：按秩专门化
-        (t
-         (%copy-generic dest-data dest-dtype dest-strides dest-off
-                        src-data src-strides src-off
-                        dest-shape size rank same-dtype)))
-      dest)))
+          ;; 通用路径：按秩专门化
+          (t
+           (%copy-generic dest-data dest-dtype dest-strides dest-off
+                          src-data src-strides src-off
+                          dest-shape size rank same-dtype)))
+	dest))))
 
 ;;; ------------------------------------------------------------------
 ;;; 填充
