@@ -194,25 +194,41 @@
 
 (defun vt-random-uniform
     (shape &key (low 0.0d0) (high 1.0d0) (dtype :float64) (rng nil))
+  "均匀分布采样。low/high 必须为有限实数（NaN/±Inf 会静默产生无意义样本）；
+   low = high 合法，返回常量数组（对标 numpy.random.uniform）。"
   (declare (list shape))
-  (assert (< low high) (low high))
+  (unless (and (numberp low) (numberp high))
+    (error "vt-random-uniform: low/high 必须为实数，得到 ~a / ~a" low high))
+  (unless (and (not (%nan-p low)) (not (%inf-p low))
+               (not (%nan-p high)) (not (%inf-p high)))
+    (error "vt-random-uniform: low/high 必须有限，得到 ~a / ~a" low high))
+  (unless (<= low high)
+    (error "vt-random-uniform: 要求 low <= high，得到 low=~a high=~a" low high))
   (setf rng (%ensure-random-state rng))
-  (let ((range (- high low)))
-    (vt-map (lambda (x)
-              (declare (ignore x))
-              (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
-            (vt-zeros shape :dtype dtype))))
+  (if (= low high)
+      (vt-full shape low :dtype dtype)
+      (let ((range (- high low)))
+        (vt-map (lambda (x)
+                  (declare (ignore x))
+                  (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
+                (vt-zeros shape :dtype dtype)))))
 
 (defun vt-random-normal
     (shape &key (mean 0.0d0) (std 1.0d0) (dtype :float64) (rng nil))
+  "正态分布采样。std 必须为非负有限实数（负 std 会静默产生镜像分布，
+   对标 numpy 对 scale < 0 的报错）；std = 0 返回 mean 填充。"
   (declare (list shape))
+  (unless (and (numberp std) (not (%nan-p std)) (>= std 0))
+    (error "vt-random-normal: std 必须为非负有限实数，得到 ~a" std))
   (setf rng (%ensure-random-state rng))
-  (let ((res (vt-zeros shape :dtype dtype)))
-    (vt-do-each (ptr val res)
-      (declare (ignore val))
-      (setf (aref (vt-data res) ptr)
-            (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
-    res))
+  (if (zerop std)
+      (vt-full shape mean :dtype dtype)
+      (let ((res (vt-zeros shape :dtype dtype)))
+        (vt-do-each (ptr val res)
+          (declare (ignore val))
+          (setf (aref (vt-data res) ptr)
+                (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
+        res)))
 
 (defun vt-random-int
     (low high &key (size nil) (dtype :int64) (rng nil))
@@ -290,7 +306,7 @@
            (sample-uniform-no-replace-batch (k)
              (let ((idx (make-array n :element-type 'fixnum
                                       :initial-contents
-				      (loop for i below n collect i))))
+                                      (loop for i below n collect i))))
                (loop for i from 0 below k do
                  (let ((j (+ i (random (- n i) rng))))
                    (rotatef (aref idx i) (aref idx j))))
@@ -299,7 +315,7 @@
 
            (sample-weighted-no-replace-batch (k)
              (let* ((weights
-		      (coerce (or p (make-list n :initial-element 1.0d0))
+                      (coerce (or p (make-list n :initial-element 1.0d0))
                               'vector))
                     (result (make-array k)))
                (dotimes (slot k)
@@ -366,7 +382,7 @@
             (rotatef (aref data i) (aref data j))))
         arr)
       (let* ((tensor (ensure-vt n))
-	     (result (vt-copy tensor))
+             (result (vt-copy tensor))
              (first-dim (first (vt-shape result))))
         (loop for i from (1- first-dim) downto 1 do
           (let* ((j (random (1+ i) rng))
@@ -391,8 +407,8 @@
                         (loop for d below (length (vt-shape tensor))
                               collect (if (= d ax) (list j) '(:all))))))
         (let ((tmp (vt-copy si)))
-	  (vt-copy-into si sj)
-	  (vt-copy-into sj tmp))))
+          (vt-copy-into si sj)
+          (vt-copy-into sj tmp))))
     tensor))
 
 (defun vt-random-multinomial (n pvals &key (size nil) (rng nil))
@@ -404,7 +420,7 @@
     (let ((total (reduce #'+ probs)))
       (assert (> total 0) ())
       (let ((cdf (make-array k :element-type 'double-float
-			       :initial-element 0.0d0)))
+                               :initial-element 0.0d0)))
         (let ((cum 0.0d0))
           (loop for i from 0 below k
                 for p in probs
@@ -420,11 +436,11 @@
                (res-data (vt-data result))
                (total-trials (if size
                                  (reduce #'* (if (listp size)
-						 size (list size)))
+                                                 size (list size)))
                                  1)))
           (dotimes (trial total-trials)
             (let ((counts (make-array k :element-type '(signed-byte 64)
-					:initial-element 0)))
+                                        :initial-element 0)))
               (dotimes (_ n)
                 (let ((r (random 1.0d0 rng)))
                   (let ((idx (binary-search-cdf cdf r)))

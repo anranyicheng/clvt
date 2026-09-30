@@ -230,19 +230,29 @@
 
 (defun vt-even-p (vt &key out (dtype :float64))
   (vt-map (lambda (v)
-	    (if (evenp (floor v)) 1.0d0 0.0d0))
+	    (if (or (%nan-p v) (%inf-p v)) 0.0d0 (if (evenp (floor v)) 1.0d0 0.0d0)))
 	  vt :out out :dtype dtype))
 
 (defun vt-odd-p (vt &key out (dtype :float64))
   (vt-map (lambda (v)
-	    (if (oddp (floor v)) 1.0d0 0.0d0))
+	    (if (or (%nan-p v) (%inf-p v)) 0.0d0 (if (oddp (floor v)) 1.0d0 0.0d0)))
 	  vt :out out :dtype dtype))
 
 (defun vt-mod (vt divisor &key out dtype)
-  (vt-map (lambda (x) (mod x divisor)) vt :out out :dtype dtype))
+  "逐元素取模。除数为 0 时返回 0（对标 numpy.mod 的零除语义）。"
+  (vt-map (lambda (x)
+            (if (and (numberp divisor) (zerop divisor))
+                0
+                (mod x divisor)))
+          vt :out out :dtype dtype))
 
 (defun vt-rem (vt divisor &key out dtype)
-  (vt-map (lambda (x) (rem x divisor)) vt :out out :dtype dtype))
+  "逐元素余数。除数为 0 时返回 0（对标 numpy.remainder 的零除语义）。"
+  (vt-map (lambda (x)
+            (if (and (numberp divisor) (zerop divisor))
+                0
+                (rem x divisor)))
+          vt :out out :dtype dtype))
 
 (defun vt-atan2 (vty vtx &key out dtype)
   (vt-fast-map #'atan vty vtx :out out :dtype dtype))
@@ -430,7 +440,12 @@
          (one (if (eq dt :float32) 1.0s0 1.0d0)))
     (vt-map (lambda (a b)
               (let ((abs-a (abs a)) (abs-b (abs b)))
-                (cond ((zerop abs-a) abs-b)
+                (cond ((or (%inf-p abs-a) (%inf-p abs-b))
+                       ;; NumPy hypot：任一参数 ±Inf → +Inf（即便另一参数为 NaN）
+                       (vt-get-pos-inf dt))
+                      ((%nan-p abs-a) abs-a)
+                      ((%nan-p abs-b) abs-b)
+                      ((zerop abs-a) abs-b)
                       ((zerop abs-b) abs-a)
                       (t (let* ((mx (max abs-a abs-b))
                                 (mn (min abs-a abs-b))

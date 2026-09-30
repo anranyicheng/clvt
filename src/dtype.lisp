@@ -80,6 +80,9 @@
     (64 :int64)))
 
 (defun vt-bits->unsigned-dtype (bits)
+  "返回 bits 位宽对应的无符号 dtype。
+   注意：:uint32/:uint64 为保留符号——当前尚不属于 *vt-storage-dtypes*，
+   仅在未来扩展 uint32/uint64 存储类型时可达（与 vt-unsigned-dtype-p 成员表一致）。"
   (declare (optimize (speed 3) (safety 0))
 	   (fixnum bits))
   (ecase bits
@@ -228,8 +231,9 @@
     (:int64   #'%coerce-int64)
     (:int32   #'%coerce-int32)
     (:int16   #'%coerce-int16)
-    (:int8    #'%wrap-int8)
-    (:uint8   #'%wrap-uint8)
+    ;; int8/uint8 与 int16/int32 统一走 %coerce-*（范围检查 + 回绕，语义一致）
+    (:int8    #'%coerce-int8)
+    (:uint8   #'%coerce-uint8)
     (:uint16  #'%wrap-uint16)))
 
 (defun vt-dtype-default-value (dtype)

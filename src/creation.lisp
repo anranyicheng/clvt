@@ -82,8 +82,13 @@
       ((:int64 :int32)
        (let ((s (truncate start)) (d (truncate step)))
          (declare (fixnum s d))
+         ;; 与 int16/int8/uint 路径一致：溢出按 NumPy 语义回绕（§8.5），
+         ;; 避免大参数下 (setf aref) 触发数组元素类型错误
          (loop for i fixnum below total-num
-               do (setf (aref data i) (+ s (* i d))))))
+               do (setf (aref data i)
+                        (if (eq dtype :int64)
+                            (%wrap-int64 (+ s (* i d)))
+                            (%wrap-int32 (+ s (* i d))))))))
       (:int16
        (let ((s (truncate start)) (d (truncate step)))
          (declare (fixnum s d))
@@ -126,11 +131,15 @@
            (loop for i fixnum below num
                  do (setf (aref data i) (+ s (* d (coerce i 'double-float)))))))
         (:float32
-         (let ((s (coerce start 'single-float))
-	       (d (coerce step 'single-float)))
-           (declare (single-float s d))
+         ;; 与 NumPy 一致：float32 linspace 以 double 精度计算后舍入存储，
+         ;; 避免长序列的 float32 累积漂移
+         (let ((s (coerce start 'double-float))
+	       (d (coerce step 'double-float)))
+           (declare (double-float s d))
            (loop for i fixnum below num
-                 do (setf (aref data i) (+ s (* d (coerce i 'single-float)))))))
+                 do (setf (aref data i)
+                          (coerce (+ s (* d (coerce i 'double-float)))
+                                  'single-float)))))
         ((:int64 :int32 :int16 :int8 :uint8 :uint16)
          (loop for i fixnum below num
                do (setf (aref data i) (vt-cast (+ start (* i step)) dtype)))))
