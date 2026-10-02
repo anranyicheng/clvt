@@ -294,7 +294,8 @@
               (type fixnum rank p0 op))
      (if (= rank 0)
          (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0))))
-         (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
+         (unless (= (the fixnum (vt-size ,res)) 0) ; 0-size 结果（如 (0) op (1) 广播）直接跳过，禁止先读后进
+           (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
            (declare (type (simple-array fixnum (*)) idx))
            (block outer
              (loop
@@ -310,7 +311,7 @@
                      (decf op (* dim (svref rs d)))
                      (setf (aref idx d) 0)
                      (decf d)
-                     (when (< d 0) (return-from outer)))))))))))
+                     (when (< d 0) (return-from outer))))))))))))
 
 (defmacro %inline2-strided (lt op a b res)
   "二元 strides 遍历（内联 op）。支持任意 strides：两个输入按广播规则取 stride（长度 1 的轴 stride=0），
@@ -335,7 +336,8 @@
               (type fixnum rank p0 p1 op))
      (if (= rank 0)
          (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1))))
-         (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
+         (unless (= (the fixnum (vt-size ,res)) 0) ; 0-size 结果（如 (0) op (1) 广播）直接跳过
+           (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
            (declare (type (simple-array fixnum (*)) idx))
            (block outer
              (loop
@@ -354,7 +356,7 @@
                      (decf op (* dim (svref rs d)))
                      (setf (aref idx d) 0)
                      (decf d)
-                     (when (< d 0) (return-from outer)))))))))))
+                     (when (< d 0) (return-from outer))))))))))))
 
 (defmacro %inline3-loop (lt op a b c res)
   "三元连续内联循环。"
@@ -401,7 +403,8 @@
      (if (= rank 0)
          (setf (aref od op)
                (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1) (aref d2 p2))))
-         (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
+         (unless (= (the fixnum (vt-size ,res)) 0) ; 0-size 结果直接跳过
+           (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
            (declare (type (simple-array fixnum (*)) idx))
            (block outer
              (loop
@@ -422,7 +425,7 @@
                      (decf op (* dim (svref rs d)))
                      (setf (aref idx d) 0)
                      (decf d)
-                     (when (< d 0) (return-from outer)))))))))))
+                     (when (< d 0) (return-from outer))))))))))))
 
 (defmacro %vt-inline1-strided-fast (op a res)
   "一元非连续/广播快路径。"

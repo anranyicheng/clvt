@@ -1018,6 +1018,14 @@
       ;; 1d @ 2d → 1d（向量乘矩阵）
       ((and (= ra 1) (= rb 2))
        (vt-einsum "i,ij->j" a b :dtype dtype :out out))
+      ;; (N≥2)d @ 1d → 末轴收缩后去掉尾维（numpy 1-D 提升语义）
+      ((and (>= ra 2) (= rb 1))
+       (let ((r (vt-einsum "...ij,j->...i" a b :dtype dtype)))
+         (if out (progn (vt-copy-into out r) out) r)))
+      ;; 1d @ (N≥2)d → 倒数第二轴收缩后去掉首维（numpy 1-D 提升语义）
+      ((and (= ra 1) (>= rb 2))
+       (let ((r (vt-einsum "j,...jk->...k" a b :dtype dtype)))
+         (if out (progn (vt-copy-into out r) out) r)))
       ;; >2d @ >2d → 批量矩阵乘法
       (t (or (and *simd-batched-matmul-fn*
 		  (funcall *simd-batched-matmul-fn* a b dtype out))

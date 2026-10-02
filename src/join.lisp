@@ -45,7 +45,17 @@
             do (error "张量形状不匹配"))
     (apply #'vt-concatenate axis (mapcar (lambda (vt) (vt-expand-dims vt axis)) vts))))
 
-(defun vt-vstack (&rest vts) (apply #'vt-concatenate 0 vts))
+(defun vt-vstack (&rest vts)
+  "垂直堆叠（对标 torch.vstack/np.vstack）：1-D 先提升为 (1,n)，0-d 提升为 (1,1)，
+再沿轴 0 连接。"
+  (when (null vts) (error "vt-vstack 至少需要一个张量"))
+  (apply #'vt-concatenate 0
+         (mapcar (lambda (vt)
+                   (let ((rank (length (vt-shape vt))))
+                     (cond ((= rank 0) (vt-reshape vt '(1 1)))
+                           ((= rank 1) (vt-reshape vt (list 1 (first (vt-shape vt)))))
+                           (t vt))))
+                 vts)))
 
 (defun vt-hstack (&rest vts)
   (if (= (length (vt-shape (car vts))) 1)
@@ -57,7 +67,8 @@
   (let ((expanded
 	  (mapcar (lambda (vt)
                     (let ((rank (length (vt-shape vt))))
-                      (cond ((= rank 1) (vt-reshape vt (list 1 (first (vt-shape vt)) 1)))
+                      (cond ((= rank 0) (vt-reshape vt '(1 1 1))) ; numpy: 0-d → (1,1,1)
+                            ((= rank 1) (vt-reshape vt (list 1 (first (vt-shape vt)) 1)))
                             ((= rank 2) (vt-reshape vt (append (vt-shape vt) '(1))))
                             (t vt))))
                   vts)))

@@ -158,9 +158,15 @@
 	   :dtype dtype :out out))
 
 (defun vt-binary-cross-entropy (y-true y-pred &key (eps 1.0d-7) dtype out)
+  ;; NaN 语义对标 torch.BCELoss：p 含 NaN 时损失必须为 NaN，
+  ;; 裁剪前显式判断（min/max 在 NaN 上比较恒 nil 会把 NaN 静默替换为 1-eps）。
   (vt-mean (vt-map (lambda (y p)
-                     (let* ((pc (max eps (min (- 1.0d0 eps) p)))
-                            (omp (max eps (- 1.0d0 pc))))
+                     (let* ((pc (if (and (floatp p) (not (= p p)))
+                                    p
+                                    (max eps (min (- 1.0d0 eps) p))))
+                            (omp (if (and (floatp pc) (not (= pc pc)))
+                                     pc
+                                     (max eps (- 1.0d0 pc)))))
                        (- (+ (* y (log pc)) (* (- 1.0d0 y) (log omp))))))
                    y-true y-pred :dtype dtype)
            :dtype dtype :out out))

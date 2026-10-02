@@ -43,6 +43,7 @@ SUITES[test-overlap]="6 重叠拷贝回归测试"
 SUITES[test-copy-into]="35 vt-copy-into 正确性测试"
 SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
 SUITES[test-bug0]="37 已知 bug 回归测试"
+SUITES[test-ai-edge-cases]="40 AI 主流函数语义回归测试 (matmul 1-D/广播 0-size/BCE NaN/vstack)"
 SUITES[memsafety-tests]="6 :out 快路径内存安全测试"
 SUITES[out-contig-tests]="23 out 连续/非连续写入测试"
 # 排除列表 (默认跳过)
@@ -261,6 +262,7 @@ main() {
             test-copy-into
             test-simd-batch-matmul
             test-bug0
+            test-ai-edge-cases
             memsafety-tests
             out-contig-tests
         )
