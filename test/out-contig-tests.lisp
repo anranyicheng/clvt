@@ -12,7 +12,9 @@
 ;;;;     --load scripts/out-contig-tests.lisp \
 ;;;;     --eval '(sb-ext:exit :code (if (clvt-outtest:run) 0 1))'
 
-(ql:quickload :clvt)
+(require :asdf)
+#+quicklisp (ql:quickload :clvt)
+(asdf:load-system :clvt)
 (in-package :clvt)
 ;;; ------------------------------------------------------------------
 ;;; 断言辅助

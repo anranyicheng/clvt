@@ -5,11 +5,11 @@
 (defun vt-unravel-index (offset shape strides)
   "将物理偏移还原为逻辑坐标列表。"
   (loop with rem = offset
-	for dim in shape
-	for stride in strides
+        for dim in shape
+        for stride in strides
         collect (multiple-value-bind (idx r)
-		    (floor rem stride)
-		  (setf rem r) idx)))
+                    (floor rem stride)
+                  (setf rem r) idx)))
 
 ;;; ============================================================
 ;;; 编译期算子描述
@@ -19,7 +19,25 @@
 
   (defparameter +kernel-lts+
     '(double-float single-float (signed-byte 64) (signed-byte 32))
-    "内核支持的 Lisp 元素类型。")
+    "类型特化内核支持的 Lisp 元素类型（即 4 种存储级物理 dtype，
+     与 *vt-storage-dtypes* 一一对应：执行层只对存储级类型生成特化内核。")
+
+  (defparameter +small-int-lts+
+    '((signed-byte 16) (signed-byte 8) (unsigned-byte 8) (unsigned-byte 16))
+    "小整型逻辑 dtype 对应的元素类型（非存储级）。
+
+     三层分离约定：逻辑层声明的 8 种 dtype 都必须可用（单一事实来源），
+     但执行层只为 4 种存储级类型生成 in-lt × res-lt 特化内核——
+     小整型输入统一路由到 %kernel-small-general 通用内核，
+     保证正确性（连续性/特化只影响性能）。")
+
+  (defparameter +all-lts+ (append +kernel-lts+ +small-int-lts+)
+    "全部 8 种元素类型（= 8 种逻辑 dtype）。用于空归约单位元等
+     需要覆盖全部逻辑 dtype 的编译期展开。")
+
+  (defparameter +small-int-ets+
+    '((signed-byte 16) (signed-byte 8) (unsigned-byte 8) (unsigned-byte 16))
+    "小整型的运行时 array-element-type 形态（= +small-int-lts+，别名以示用途）。")
 
   (defun %op-arg-p (op)
     "是否为 arg 类归约（输出索引）。"
@@ -46,6 +64,10 @@
       (:float32 'single-float)
       (:int64   '(signed-byte 64))
       (:int32   '(signed-byte 32))
+      (:int16   '(signed-byte 16))
+      (:int8    '(signed-byte 8))
+      (:uint8   '(unsigned-byte 8))
+      (:uint16  '(unsigned-byte 16))
       (t nil)))
 
   (defun %et->lt (in-et)
@@ -53,6 +75,10 @@
           ((equal in-et 'single-float)     'single-float)
           ((equal in-et '(signed-byte 64)) '(signed-byte 64))
           ((equal in-et '(signed-byte 32)) '(signed-byte 32))
+          ((equal in-et '(signed-byte 16)) '(signed-byte 16))
+          ((equal in-et '(signed-byte 8))  '(signed-byte 8))
+          ((equal in-et '(unsigned-byte 8))  '(unsigned-byte 8))
+          ((equal in-et '(unsigned-byte 16)) '(unsigned-byte 16))
           (t nil)))
 
   (defun %lt-rank (lt)
@@ -60,24 +86,47 @@
           ((eq lt 'single-float) 4)
           ((equal lt '(signed-byte 64)) 3)
           ((equal lt '(signed-byte 32)) 2)
+          ((equal lt '(signed-byte 16)) 1)
+          ((equal lt '(unsigned-byte 16)) 1)
+          ((equal lt '(signed-byte 8)) 0)
+          ((equal lt '(unsigned-byte 8)) 0)
           (t -1)))
 
+  (defun %small-int-lt-p (lt)
+    (member lt '((signed-byte 16) (signed-byte 8)
+                 (unsigned-byte 8) (unsigned-byte 16))))
+
   (defun %op-acc-lt (op lt res-lt)
-    "累加器 Lisp 类型：sum/prod 提升到 lt/res-lt 中较宽者；
+    "累加器 Lisp 类型：sum/prod 提升到 lt/res-lt 中较宽者（小整型按
+     numpy 语义提升到 int64 累加，避免中途回绕）；
      max/min/arg 用 lt；all/any 用 int64。"
     (cond
       ((member (%op-base op) '(:all :any)) '(signed-byte 64))
       ((%op-arg-p op) lt)
       ((and (member (%op-base op) '(:sum :prod))
-            (member lt '((signed-byte 32))))
+            (or (equal lt '(signed-byte 32))
+                (%small-int-lt-p lt)))
        '(signed-byte 64))
       (t (if (>= (%lt-rank lt) (%lt-rank res-lt)) lt res-lt))))
-  
+
+  (defun %small-int-extreme (dtype which)
+    "小整型 dtype 的可表示极值（which=:min 取最小值，:max 取最大值）。
+     运行时辅助，供 %kernel-small-general 的 max/min 初始化使用。"
+    (ecase dtype
+      (:int8   (if (eq which :min) -128  127))
+      (:int16  (if (eq which :min) -32768 32767))
+      (:uint8  (if (eq which :min) 0     255))
+      (:uint16 (if (eq which :min) 0     65535))))
+
   (defun %cast-form (lt form)
     (cond ((eq lt 'double-float) `(coerce ,form 'double-float))
           ((eq lt 'single-float) `(coerce ,form 'single-float))
           ((equal lt '(signed-byte 64)) `(%coerce-int64 ,form))
-	  ((equal lt '(signed-byte 32)) `(%coerce-int32 ,form))
+          ((equal lt '(signed-byte 32)) `(%coerce-int32 ,form))
+          ((equal lt '(signed-byte 16)) `(%coerce-int16 ,form))
+          ((equal lt '(signed-byte 8))  `(%coerce-int8 ,form))
+          ((equal lt '(unsigned-byte 8))  `(%coerce-uint8 ,form))
+          ((equal lt '(unsigned-byte 16)) `(%wrap-uint16 ,form))
           (t form)))
 
   (defun %op-init (op lt res-lt)
@@ -99,6 +148,10 @@
                      ((eq acc-lt 'single-float) '+vt-sfloat-neg-inf+)
                      ((equal acc-lt '(signed-byte 64)) -9223372036854775808)
                      ((equal acc-lt '(signed-byte 32)) -2147483648)
+                     ((equal acc-lt '(signed-byte 16)) -32768)
+                     ((equal acc-lt '(signed-byte 8)) -128)
+                     ((equal acc-lt '(unsigned-byte 8)) 0)
+                     ((equal acc-lt '(unsigned-byte 16)) 0)
                      (t 0)))
         (:min  (cond ((and skip (eq acc-lt 'double-float)) '(vt-get-nan :float64))
                      ((and skip (eq acc-lt 'single-float)) '(vt-get-nan :float32))
@@ -106,6 +159,10 @@
                      ((eq acc-lt 'single-float) '+vt-sfloat-pos-inf+)
                      ((equal acc-lt '(signed-byte 64)) 9223372036854775807)
                      ((equal acc-lt '(signed-byte 32)) 2147483647)
+                     ((equal acc-lt '(signed-byte 16)) 32767)
+                     ((equal acc-lt '(signed-byte 8)) 127)
+                     ((equal acc-lt '(unsigned-byte 8)) 255)
+                     ((equal acc-lt '(unsigned-byte 16)) 65535)
                      (t 0))))))
   
   (defun %op-out-dtype (op in-dtype)
@@ -114,8 +171,8 @@
       ((:argmax :argmin :nanargmax :nanargmin) :int32)
       ((:sum :prod :nansum :nanprod)
        (case in-dtype
-	 ((:int8 :uint8 :int16 :uint16 :int32) :int64)
-	 (t in-dtype)))
+         ((:int8 :uint8 :int16 :uint16 :int32) :int64)
+         (t in-dtype)))
       (t in-dtype)))
 
   ) ; end eval-when
@@ -310,16 +367,104 @@
                    (decf dd)
                    (when (< dd 0) (return)))))))))))
 
+(defmacro %kernel-small-general (op)
+  "路径 3 内的小整型通用内核（不按 in-lt × res-lt 特化，每算子仅展开一份）。
+
+   三层分离约定：类型特化内核只服务 4 种存储级 dtype；int16/int8/uint8/uint16
+   属逻辑级 dtype，读取经通用 aref（无 the 特化）、累加器按算子语义
+   （sum/prod 提升至 int64，max/min 用输入 dtype 极值初始化），
+   写出经 vt-cast 按结果 dtype 转换。正确性由本内核兜底，
+   与特化内核遵循同一算子语义；连续性/特化只影响性能。"
+  (let* ((arg-p (%op-arg-p op))
+         (base  (%op-base op))
+         (init-v
+           (ecase base
+             (:sum  0)
+             (:prod 1)
+             (:all  1)
+             (:any  0)
+             (:max  `(%small-int-extreme (vt-dtype tensor) :min))
+             (:min  `(%small-int-extreme (vt-dtype tensor) :max)))))
+    `(let ((d  in-data)
+           (od res-data))
+       (declare (type fixnum n-red n-non red-size non-size))
+       (let ((non-idx (make-array (max n-non 1) :element-type 'fixnum :initial-element 0))
+             (red-idx (make-array (max n-red 1) :element-type 'fixnum :initial-element 0))
+             (init-v  ,init-v)
+             (out-ptr res-off))
+         (declare (type (simple-array fixnum (*)) non-idx red-idx)
+                  (type fixnum out-ptr))
+         (dotimes (_ non-size)
+           (let ((base-idx in-off))
+             (declare (type fixnum base-idx))
+             (dotimes (dd n-non)
+               (incf base-idx (* (aref non-idx dd) (svref non-strides dd))))
+             (fill red-idx 0)
+             (let ((acc init-v)
+                   ,@(when arg-p `((best-i 0))))
+               (declare ,@(when arg-p '((type fixnum best-i))))
+               (dotimes (r red-size)
+                 (let ((offset 0) (linear 0) (mult 1))
+                   (declare (type fixnum offset linear mult))
+                   (loop for dd fixnum from (1- n-red) downto 0 do
+                     (incf offset (* (aref red-idx dd) (svref red-strides-v dd)))
+                     (incf linear (* (aref red-idx dd) mult))
+                     (setf mult (* mult (svref red-sizes dd))))
+                   (let ((v (aref d (the fixnum (+ base-idx offset)))))
+                     ,(ecase base
+                        (:sum  `(incf acc v))
+                        (:prod `(setf acc (* acc v)))
+                        (:all  `(when (zerop v) (setf acc 0)))
+                        (:any  `(when (/= v 0) (setf acc 1)))
+                        (:max  (if arg-p
+                                   `(when (> v acc) (setf acc v best-i linear))
+                                   `(when (> v acc) (setf acc v))))
+                        (:min  (if arg-p
+                                   `(when (< v acc) (setf acc v best-i linear))
+                                   `(when (< v acc) (setf acc v)))))))
+                 ;; red-idx 进位（dotimes(r) 每轮执行）
+                 (when (plusp n-red)
+                   (let ((dd (1- n-red)))
+                     (declare (type fixnum dd))
+                     (loop
+                       (incf (aref red-idx dd))
+                       (when (< (aref red-idx dd) (svref red-sizes dd)) (return))
+                       (setf (aref red-idx dd) 0)
+                       (decf dd)
+                       (when (< dd 0) (return))))))
+               ;; 本输出元素写回（在 acc 作用域内）
+               (setf (aref od out-ptr)
+                     ,(if arg-p
+                          `(vt-cast best-i final-out-dtype)
+                          `(vt-cast acc final-out-dtype))))
+             ;; non-idx 进位
+             (when (plusp n-non)
+               (let ((dd (1- n-non)))
+                 (declare (type fixnum dd))
+                 (loop
+                   (incf (aref non-idx dd))
+                   (incf out-ptr (svref out-non-strides dd))
+                   (when (< (aref non-idx dd) (svref non-sizes dd)) (return))
+                   (setf (aref non-idx dd) 0)
+                   (decf out-ptr (* (svref non-sizes dd)
+                                    (svref out-non-strides dd)))
+                   (decf dd)
+                   (when (< dd 0) (return)))))))))))
 ;;; ============================================================
 ;;; 统一生成宏
 ;;; ============================================================
-
 (defmacro def-vt-reduce (name op)
-  "为算子 op 生成函数 vt-<name>。对 in-et × res-lt 两级分派到类型特化内核。"
+  "为算子 op 生成函数 vt-<name>。
+   执行层选路：存储级 dtype（4 种）→ in-et × res-lt 类型特化内核；
+   小整型逻辑 dtype（4 种）→ %kernel-small-general 通用内核（路径 3 结构）。
+   路径 1/2/3 的输出对同一语义必须一致；连续性只影响性能。"
   (let ((fn-name (intern (format nil "VT-~a" name)))
         (arg-p   (%op-arg-p op)))
-    (flet ((dispatch (kernel-macro)
+    (flet ((dispatch (kernel-macro &key small-int-p)
              `(cond
+                ,@(when small-int-p
+                    `(((member in-et +small-int-ets+ :test #'equal)
+                       (%kernel-small-general ,op))))
                 ,@(loop for lt in +kernel-lts+
                         collect
                         `((equal in-et ',lt)
@@ -356,12 +501,12 @@
              (when (and out dtype (not (eq (vt-dtype out) dtype)))
                (error "vt-~a: :out dtype ~a conflicts with :dtype ~a"
                       ',name (vt-dtype out) dtype))
-	     (when out
-	       (loop for d in (vt-shape out)
-		     for s in (vt-strides out)
-		     when (and (> d 1) (zerop s))
-		       do (error "vt-~a: :out 不能是广播视图（维度 ~a 有 stride 0）"
-				 ',name d)))
+             (when out
+               (loop for d in (vt-shape out)
+                     for s in (vt-strides out)
+                     when (and (> d 1) (zerop s))
+                       do (error "vt-~a: :out 不能是广播视图（维度 ~a 有 stride 0）"
+                                 ',name d)))
              (let* ((axis-size (if axes
                                    (reduce #'* (mapcar (lambda (a) (nth a in-shape)) axes)
                                            :initial-value 1)
@@ -423,7 +568,7 @@
                                               collect
                                               `((equal res-lt ',rlt)
                                                 (cond
-                                                  ,@(loop for l in +kernel-lts+
+                                                  ,@(loop for l in +all-lts+
                                                           collect
                                                           `((equal lt ',l)
                                                             ,(%op-init op l rlt)))
@@ -431,14 +576,18 @@
                                       (t 0))))
                          (return-from ,fn-name res))))
                ;; ---- 主分派 ----
+               ;; 小整型（逻辑级 dtype）不进入类型特化内核：路径 1/2 以
+               ;; wide-et 守卫排除，统一由路径 3 的 %kernel-small-general 兜底。
                (cond
-                 ;; 路径 1：连续 + 全局
-                 ((and global (vt-contiguous-p tensor))
+                 ;; 路径 1：连续 + 全局 + 存储级 dtype
+                 ((and global (vt-contiguous-p tensor)
+                       (not (member in-et +small-int-ets+ :test #'equal)))
                   ,(dispatch '%kernel-global))
-                 ;; 路径 2：连续 + 单轴
+                 ;; 路径 2：连续 + 单轴 + 存储级 dtype
                  ((and single-axis-p
                        (vt-contiguous-p tensor)
-                       (vt-contiguous-p res))
+                       (vt-contiguous-p res)
+                       (not (member in-et +small-int-ets+ :test #'equal)))
                   (let* ((ax (first axes))
                          (outer (reduce #'* in-shape :end ax :initial-value 1))
                          (red   (nth ax in-shape))
@@ -446,47 +595,47 @@
                     (declare (fixnum ax outer red inner))
                     ,(dispatch '%kernel-single-axis)))
 
-		 ;; 路径 3：通用回退
-		 (t
-		  (let* ((global-red  (null axes))
-			 (eff-red-axes (if global-red
-					   (loop for i below rank collect i)
-					   axes))
-			 (eff-non-axes (if global-red
-					   nil
-					   (loop for i below rank
-						 unless (member i axes) collect i)))
-			 (in-strides  (vt-strides tensor))
-			 (out-strides (vt-strides res))         ; ★ 新增
-			 (in-shape-vec   (coerce in-shape 'simple-vector))
-			 (in-strides-vec (coerce in-strides 'simple-vector))
-			 (red-axes (coerce eff-red-axes 'simple-vector))
-			 (non-axes (coerce eff-non-axes 'simple-vector))
-			 (n-red (length eff-red-axes))
-			 (n-non (- rank n-red))
-			 (red-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
-					 red-axes))
-			 (red-strides-v (map 'vector (lambda (a) (svref in-strides-vec a))
-					     red-axes))
-			 (non-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
-					 non-axes))
-			 (non-strides (map 'vector (lambda (a) (svref in-strides-vec a))
-					   non-axes))
-			 (out-non-strides
-			   (coerce
-			    (unless global-red
-			      (if keepdims
-				  (loop for a in eff-non-axes
-					collect (nth a out-strides))
-				  (loop for a in eff-non-axes
-					for out-i = (loop for i below a
-							  count (not (member i axes)))
-					collect (nth out-i out-strides))))
-			    'simple-vector))
-			 (red-size (reduce #'* red-sizes :initial-value 1))
-			 (non-size (reduce #'* non-sizes :initial-value 1)))
-		    (declare (fixnum n-red n-non red-size non-size))
-		    ,(dispatch '%kernel-general))))
+                 ;; 路径 3：通用回退（含小整型 %kernel-small-general）
+                 (t
+                  (let* ((global-red  (null axes))
+                         (eff-red-axes (if global-red
+                                           (loop for i below rank collect i)
+                                           axes))
+                         (eff-non-axes (if global-red
+                                           nil
+                                           (loop for i below rank
+                                                 unless (member i axes) collect i)))
+                         (in-strides  (vt-strides tensor))
+                         (out-strides (vt-strides res))         ; ★ 新增
+                         (in-shape-vec   (coerce in-shape 'simple-vector))
+                         (in-strides-vec (coerce in-strides 'simple-vector))
+                         (red-axes (coerce eff-red-axes 'simple-vector))
+                         (non-axes (coerce eff-non-axes 'simple-vector))
+                         (n-red (length eff-red-axes))
+                         (n-non (- rank n-red))
+                         (red-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
+                                         red-axes))
+                         (red-strides-v (map 'vector (lambda (a) (svref in-strides-vec a))
+                                             red-axes))
+                         (non-sizes (map 'vector (lambda (a) (svref in-shape-vec a))
+                                         non-axes))
+                         (non-strides (map 'vector (lambda (a) (svref in-strides-vec a))
+                                           non-axes))
+                         (out-non-strides
+                           (coerce
+                            (unless global-red
+                              (if keepdims
+                                  (loop for a in eff-non-axes
+                                        collect (nth a out-strides))
+                                  (loop for a in eff-non-axes
+                                        for out-i = (loop for i below a
+                                                          count (not (member i axes)))
+                                        collect (nth out-i out-strides))))
+                            'simple-vector))
+                         (red-size (reduce #'* red-sizes :initial-value 1))
+                         (non-size (reduce #'* non-sizes :initial-value 1)))
+                    (declare (fixnum n-red n-non red-size non-size))
+                    ,(dispatch '%kernel-general :small-int-p t))))
                res)))))))
 
 ;;; ============================================================
@@ -516,8 +665,8 @@
             (cond ((or (%nan-p a) (%nan-p b)) 0.0d0)
                   ((or (%inf-p a) (%inf-p b)) (if (= a b) 1.0d0 0.0d0))
                   (t (if (<= (abs (- a b))
-			     (+ atol (* rtol (max (abs a) (abs b)))))
-			 1.0d0 0.0d0))))
+                             (+ atol (* rtol (max (abs a) (abs b)))))
+                         1.0d0 0.0d0))))
           t1 t2 :dtype :float64 :out out))
 
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
@@ -540,105 +689,105 @@
 (defun %get-axes-count (axis rank shape)
   (let* ((axes (vt-normalize-axes axis rank))
          (count (if axes (reduce #'* (mapcar (lambda (a)
-					       (nth a shape))
-					     axes)
-				 :initial-value 1)
+                                               (nth a shape))
+                                             axes)
+                                 :initial-value 1)
                     (reduce #'* shape :initial-value 1))))
     (values axes count)))
 
 (defun vt-average (tensor weights &key axis keepdims dtype out)
   (with-float-safe
     (let ((a-shape (vt-shape tensor))
-	  (w-shape (vt-shape weights))
+          (w-shape (vt-shape weights))
           (eff weights))
       (cond (axis (let* ((rank (length a-shape))
-			 (ax (vt-normalize-axis axis rank))
-			 (ax-size (nth ax a-shape)))
+                         (ax (vt-normalize-axis axis rank))
+                         (ax-size (nth ax a-shape)))
                     (unless (and (= (length w-shape) 1)
-				 (= (first w-shape) ax-size))
+                                 (= (first w-shape) ax-size))
                       (error "1D weights expected when axis is specified"))
                     (setf eff (vt-reshape weights (loop for i below rank
-							collect (if (= i ax) ax-size 1))))))
+                                                        collect (if (= i ax) ax-size 1))))))
             (t (unless (equal w-shape a-shape)
-		 (error "weights must have same shape as a when axis is nil"))))
+                 (error "weights must have same shape as a when axis is nil"))))
       (let* ((prod (vt-map #'* tensor eff))
              (weighted-sum (vt-sum prod :axis axis :keepdims keepdims))
              (sum-weights (vt-item (vt-sum weights)))
              (in-dtype (vt-dtype weighted-sum))
              (need-promote (member in-dtype '(:int32 :int64 :int16 :int8 :uint8 :uint16)))
              (exec-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-				(error "vt-average: :out 与 :dtype 冲突"))
+                                (error "vt-average: :out 与 :dtype 冲突"))
                                (out (vt-dtype out)) (dtype dtype)
                                (need-promote :float64) (t in-dtype)))
              (nan-val (vt-get-nan exec-dtype))
              (scalar-divisor (coerce sum-weights (if (eq exec-dtype :float32)
-						     'single-float 'double-float)))
+                                                     'single-float 'double-float)))
              (map-dtype (cond (out nil) (dtype dtype) (need-promote :float64) (t nil))))
-	(cond ((%nan-p sum-weights)
+        (cond ((%nan-p sum-weights)
                (if out (progn (vt-map (lambda (x)
-					(declare (ignore x))
-					nan-val)
-				      weighted-sum :out out :dtype dtype)
-			      out)
+                                        (declare (ignore x))
+                                        nan-val)
+                                      weighted-sum :out out :dtype dtype)
+                              out)
                    (vt-full (vt-shape weighted-sum) nan-val :dtype exec-dtype)))
               ((zerop sum-weights) (error "Weights sum to zero"))
               (t (vt-map (lambda (s)
-			   (/ s scalar-divisor))
-			 weighted-sum :dtype map-dtype :out out)))))))
+                           (/ s scalar-divisor))
+                         weighted-sum :dtype map-dtype :out out)))))))
 
 (defun vt-mean (tensor &key axis keepdims dtype out)
   (let* ((shape (vt-shape tensor))
-	 (rank (length shape)))
+         (rank (length shape)))
     (multiple-value-bind (axes count) (%get-axes-count axis rank shape)
       (let* ((final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                                  (error "vt-mean: :out 与 :dtype 冲突"))
                                 (out (vt-dtype out)) (dtype dtype)
                                 (t (if (eq (vt-dtype tensor) :float32)
-				       :float32 :float64)))))
+                                       :float32 :float64)))))
         (when (= count 0)
           (let ((nan (vt-get-nan final-dtype))
                 (out-shape (if keepdims
                                (loop for d in shape
-				     for i below rank
+                                     for i below rank
                                      collect (if (or (null axes) (member i axes)) 1 d))
                                (loop for d in shape
-				     for i below rank
+                                     for i below rank
                                      unless (or (null axes) (member i axes))
-				       collect d))))
+                                       collect d))))
             (return-from vt-mean
               (if out (progn (vt-map (lambda (x)
-				       (declare (ignore x)) nan)
-				     out :dtype final-dtype :out out)
-			     out)
+                                       (declare (ignore x)) nan)
+                                     out :dtype final-dtype :out out)
+                             out)
                   (vt-full out-shape nan :dtype final-dtype)))))
         (let* ((sum-result (vt-sum tensor :axis axes :keepdims keepdims
-					  :dtype final-dtype :out out))
+                                          :dtype final-dtype :out out))
                (div (coerce count (if (eq final-dtype :float32)
-				      'single-float 'double-float))))
+                                      'single-float 'double-float))))
           (vt-map (lambda (s) (/ s div))
-		  sum-result :dtype final-dtype :out sum-result))))))
+                  sum-result :dtype final-dtype :out sum-result))))))
 
 (defun vt-var (tensor &key axis keepdims (ddof 0) dtype out)
   (let* ((shape (vt-shape tensor))
-	 (rank (length shape)))
+         (rank (length shape)))
     (multiple-value-bind (axes n) (%get-axes-count axis rank shape)
       (let* ((divisor (- n ddof))
              (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                                  (error "vt-var: :out 与 :dtype 冲突"))
                                 (out (vt-dtype out)) (dtype dtype)
                                 (t (if (eq (vt-dtype tensor) :float32)
-				       :float32 :float64)))))
+                                       :float32 :float64)))))
         (if (<= divisor 0)
             (vt-map (lambda (s)
-		      (declare (ignore s))
-		      (vt-get-nan final-dtype))
+                      (declare (ignore s))
+                      (vt-get-nan final-dtype))
                     (vt-sum tensor :axis axes :keepdims keepdims)
-		    :dtype final-dtype :out out)
+                    :dtype final-dtype :out out)
             (let* ((mean-val (vt-mean tensor :axis axes :keepdims t :dtype final-dtype))
                    (sq-diff (vt-square (vt-- tensor mean-val :dtype final-dtype)
-				       :dtype final-dtype))
+                                       :dtype final-dtype))
                    (sum-sq (vt-sum sq-diff :axis axes :keepdims keepdims
-					   :dtype final-dtype :out out)))
+                                           :dtype final-dtype :out out)))
               (vt-/ sum-sq divisor :dtype final-dtype :out sum-sq)))))))
 
 (defun vt-std (tensor &key axis keepdims (ddof 0) dtype out)
@@ -646,9 +795,9 @@
                              (error "vt-std: :out 与 :dtype 冲突"))
                             (out (vt-dtype out)) (dtype dtype)
                             (t (if (eq (vt-dtype tensor) :float32)
-				   :float32 :float64)))))
+                                   :float32 :float64)))))
     (let ((variance (vt-var tensor :axis axis :keepdims keepdims :ddof ddof
-				   :dtype final-dtype :out out)))
+                                   :dtype final-dtype :out out)))
       (vt-sqrt variance :dtype final-dtype :out variance))))
 
 ;;; ------------------------------------------------------------------
@@ -657,7 +806,7 @@
 
 (defun vt-cumulative (tensor op init-val &key axis dtype out)
   (let* ((shape (vt-shape tensor))
-	 (rank (length shape))
+         (rank (length shape))
          (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                              (error "类型冲突: :out (~a) vs :dtype (~a)" (vt-dtype out) dtype))
                             (dtype dtype) (out (vt-dtype out)) (t (vt-dtype tensor))))
@@ -668,9 +817,9 @@
          (out-strides (vt-strides result)) (out-offset (vt-offset result)))
     (if axis
         (let* ((ax (vt-normalize-axis axis rank))
-	       (ax-dim (nth ax shape))
+               (ax-dim (nth ax shape))
                (indices (make-array rank :element-type '(signed-byte 64)
-					 :initial-element 0)))
+                                         :initial-element 0)))
           (labels ((advance ()
                      (loop for d from (1- rank) downto 0
                            when (/= d ax)
@@ -682,21 +831,21 @@
               (let ((in-ptr in-offset) (out-ptr out-offset))
                 (loop for d from 0 below rank do
                   (incf in-ptr (* (aref indices d)
-				  (nth d in-strides)))
+                                  (nth d in-strides)))
                   (incf out-ptr (* (aref indices d)
-				   (nth d out-strides))))
+                                   (nth d out-strides))))
                 (let ((in-stride (nth ax in-strides))
-		      (out-stride (nth ax out-strides))
+                      (out-stride (nth ax out-strides))
                       (cum (coerce init-val lisp-type)))
                   (loop for i from 0 below ax-dim do
                     (setf cum (funcall op cum (aref in-data (+ in-ptr (* i in-stride)))))
                     (setf (aref out-data (+ out-ptr (* i out-stride)))
-			  (vt-cast cum final-dtype)))))
+                          (vt-cast cum final-dtype)))))
               (unless (advance) (return)))))
         (let* ((flat (vt-ravel tensor))
-	       (flat-in (vt-data flat))
+               (flat-in (vt-data flat))
                (flat-offset (vt-offset flat))
-	       (cum (coerce init-val lisp-type))
+               (cum (coerce init-val lisp-type))
                (out-shape-vec (coerce (vt-shape result) 'simple-vector))
                (out-strs-vec (coerce out-strides 'simple-vector))
                (out-rank (length out-shape-vec)))
@@ -704,10 +853,10 @@
                      (if (= depth out-rank)
                          (progn (setf cum (funcall op cum (aref flat-in (+ flat-offset flat-idx))))
                                 (setf (aref out-data out-ptr)
-				      (vt-cast cum final-dtype))
+                                      (vt-cast cum final-dtype))
                                 (1+ flat-idx))
                          (let ((dim (svref out-shape-vec depth))
-			       (stride (svref out-strs-vec depth)))
+                               (stride (svref out-strs-vec depth)))
                            (loop for i from 0 below dim
                                  for cur = out-ptr then (+ cur stride)
                                  do (setf flat-idx (recurse (1+ depth) cur flat-idx)))))))
@@ -790,10 +939,10 @@
 
 (defun %percent-from-sorted (sorted q interpolation)
   (let* ((n (length sorted))
-	 (idx (* q (1- n)))
+         (idx (* q (1- n)))
          (lower (floor idx))
-	 (upper (min (ceiling idx) (1- n)))
-	 (frac (- idx lower)))
+         (upper (min (ceiling idx) (1- n)))
+         (frac (- idx lower)))
     (case interpolation
       (:linear (if (= lower upper) (vt-cast (nth lower sorted) :float64)
                    (+ (* (- 1 frac) (vt-cast (nth lower sorted) :float64))
@@ -801,8 +950,8 @@
       (:lower (vt-cast (nth lower sorted) :float64))
       (:higher (vt-cast (nth upper sorted) :float64))
       (:midpoint (/ (+ (vt-cast (nth lower sorted) :float64)
-		       (vt-cast (nth upper sorted) :float64))
-		    2.0d0))
+                       (vt-cast (nth upper sorted) :float64))
+                    2.0d0))
       (:nearest (vt-cast (nth (if (<= frac 0.5d0) lower upper) sorted) :float64)))))
 
 (defun vt-percentile (tensor percentile &key axis keepdims (interpolation :linear))
@@ -899,7 +1048,7 @@
   (vt-percentile tensor (* q 100)
                  :axis axis
                  :keepdims keepdims
-		 :interpolation interpolation))
+                 :interpolation interpolation))
 
 (defun vt-ptp (tensor &key axis)
   (if axis (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
@@ -908,11 +1057,11 @@
 (defun vt-histogram (tensor &key bins range density)
   (with-float-safe
     (let* ((flat (vt-flatten tensor))
-	   (data (vt-data flat))
-	   (size (vt-size flat))
+           (data (vt-data flat))
+           (size (vt-size flat))
            (bins (or bins 10))
-	   (data-min nil)
-	   (data-max nil))
+           (data-min nil)
+           (data-max nil))
       (unless (and (integerp bins) (plusp bins))
         (error "vt-histogram: bins (~a) 必须为正整数" bins))
 
@@ -938,25 +1087,25 @@
              (hist (make-array bins :initial-element 0))
              (edges (make-array (1+ bins) :element-type t)))
         (loop for i from 0 to bins do
-	  (setf (aref edges i) (+ data-min (* i bin-width))))
+          (setf (aref edges i) (+ data-min (* i bin-width))))
         (loop for i from 0 below size
-	      for val = (aref data i)
+              for val = (aref data i)
               when (and (>= val data-min) (<= val data-max))
                 do (let ((bi (if (= val data-max)
-				 (1- bins)
-				 (floor (- val data-min) bin-width))))
+                                 (1- bins)
+                                 (floor (- val data-min) bin-width))))
                      (incf (aref hist bi))))
         (when density
           (let ((total (reduce #'+ hist)))
             (if (zerop total)
                 (loop for i from 0 below bins do
-		  (setf (aref hist i) 0.0d0))
+                  (setf (aref hist i) 0.0d0))
                 (loop for i from 0 below bins do
-		  (setf (aref hist i)
-			(/ (aref hist i)
-			   (* total bin-width)))))))
+                  (setf (aref hist i)
+                        (/ (aref hist i)
+                           (* total bin-width)))))))
         (values (vt-from-sequence hist :dtype :float64)
-		(vt-from-sequence edges :dtype :float64))))))
+                (vt-from-sequence edges :dtype :float64))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 排序
@@ -965,34 +1114,34 @@
 (defun vt-sort (tensor &key (axis -1))
   (if axis
       (let* ((shape (vt-shape tensor))
-	     (rank (length shape))
-	     (ax (vt-normalize-axis axis rank))
+             (rank (length shape))
+             (ax (vt-normalize-axis axis rank))
              (ax-dim (nth ax shape))
-	     (in-strides (vt-strides tensor))
+             (in-strides (vt-strides tensor))
              (in-offset (vt-offset tensor))
-	     (in-data (vt-data tensor))
+             (in-data (vt-data tensor))
              (result (vt-copy tensor))
-	     (out-strides (vt-strides result))
-	     (out-data (vt-data result)))
+             (out-strides (vt-strides result))
+             (out-data (vt-data result)))
         (labels ((recurse (depth in-ptr out-ptr)
                    (cond ((= depth ax)
                           (let* ((in-stride (nth ax in-strides))
-				 (out-stride (nth ax out-strides))
+                                 (out-stride (nth ax out-strides))
                                  (vals (loop for i from 0 below ax-dim
                                              for off = (+ in-ptr (* i in-stride))
                                              collect (aref in-data off)))
                                  (sv (vt-numpy-sort vals #'<)))
                             (loop for val in sv
-				  for off = out-ptr then (+ off out-stride)
+                                  for off = out-ptr then (+ off out-stride)
                                   do (setf (aref out-data off) val))))
                          ((< depth rank)
                           (let ((dim (nth depth shape))
-				(in-stride (nth depth in-strides))
+                                (in-stride (nth depth in-strides))
                                 (out-stride (nth depth out-strides)))
                             (loop for i from 0 below dim do
                               (recurse (1+ depth)
-				       (+ in-ptr (* i in-stride))
-				       (+ out-ptr (* i out-stride))))))
+                                       (+ in-ptr (* i in-stride))
+                                       (+ out-ptr (* i out-stride))))))
                          (t nil))))
           (recurse 0 in-offset 0))
         result)
@@ -1003,65 +1152,65 @@
 (defun vt-argsort (tensor &key (axis -1))
   (with-float-safe
     (if (null axis)
-	(let* ((flat (vt-ravel tensor))
-	       (n (vt-size flat))
-	       (in-data (vt-data flat))
+        (let* ((flat (vt-ravel tensor))
+               (n (vt-size flat))
+               (in-data (vt-data flat))
                (pairs (loop for i from 0 below n
-			    collect (cons (aref in-data i) i)))
+                            collect (cons (aref in-data i) i)))
                (non-nans '())
-	       (nans '()))
+               (nans '()))
           (dolist (p pairs) (if (%nan-p (car p)) (push p nans) (push p non-nans)))
           (setf non-nans (stable-sort (nreverse non-nans) #'< :key #'car)
-		nans (nreverse nans))
+                nans (nreverse nans))
           (%make-vt :data (make-array n :element-type '(signed-byte 64)
-					:initial-contents (mapcar #'cdr (append non-nans nans)))
+                                        :initial-contents (mapcar #'cdr (append non-nans nans)))
                     :shape (list n) :strides '(1) :offset 0 :dtype :int64))
-	(let* ((shape (vt-shape tensor))
-	       (rank (length shape))
-	       (ax (vt-normalize-axis axis rank))
+        (let* ((shape (vt-shape tensor))
+               (rank (length shape))
+               (ax (vt-normalize-axis axis rank))
                (ax-dim (nth ax shape))
-	       (in-strides (vt-strides tensor))
+               (in-strides (vt-strides tensor))
                (in-offset (vt-offset tensor))
-	       (in-data (vt-data tensor))
+               (in-data (vt-data tensor))
                (result (vt-zeros shape :dtype :int64))
-	       (out-strides (vt-strides result))
+               (out-strides (vt-strides result))
                (out-data (vt-data result)))
           (labels
-	      ((recurse (depth in-ptr out-ptr)
+              ((recurse (depth in-ptr out-ptr)
                  (cond ((< depth ax)
                         (let ((dim (nth depth shape))
-			      (in-stride (nth depth in-strides))
+                              (in-stride (nth depth in-strides))
                               (out-stride (nth depth out-strides)))
                           (dotimes (i dim)
-			    (recurse (1+ depth)
-				     (+ in-ptr (* i in-stride))
-				     (+ out-ptr (* i out-stride))))))
+                            (recurse (1+ depth)
+                                     (+ in-ptr (* i in-stride))
+                                     (+ out-ptr (* i out-stride))))))
                        ((= depth ax)
                         (let* ((in-stride (nth ax in-strides))
-			       (out-stride (nth ax out-strides))
+                               (out-stride (nth ax out-strides))
                                (tail-dims (subseq shape (1+ ax)))
                                (tail-size (reduce #'* tail-dims :initial-value 1))
                                (tail-in-strides (subseq in-strides (1+ ax)))
                                (tail-out-strides (subseq out-strides (1+ ax))))
                           (dotimes (tail-i tail-size)
-			    (let ((extra-in 0)
-				  (extra-out 0)
-				  (rem tail-i))
+                            (let ((extra-in 0)
+                                  (extra-out 0)
+                                  (rem tail-i))
                               (loop for idx from (1- (length tail-dims)) downto 0
-				    for dim = (nth idx tail-dims)
-				    for is = (nth idx tail-in-strides)
-				    for os = (nth idx tail-out-strides)
-				    do (multiple-value-bind (q r) (floor rem dim)
+                                    for dim = (nth idx tail-dims)
+                                    for is = (nth idx tail-in-strides)
+                                    for os = (nth idx tail-out-strides)
+                                    do (multiple-value-bind (q r) (floor rem dim)
                                          (incf extra-in (* r is))
-					 (incf extra-out (* r os)) (setf rem q)))
+                                         (incf extra-out (* r os)) (setf rem q)))
                               (let ((pairs (loop for pos from 0 below ax-dim
                                                  for off = (+ in-ptr (* pos in-stride) extra-in)
                                                  collect (cons (aref in-data off) pos)))
-				    (non-nans '()) (nans '()))
+                                    (non-nans '()) (nans '()))
                                 (dolist (p pairs)
-				  (if (%nan-p (car p))
-				      (push p nans)
-				      (push p non-nans)))
+                                  (if (%nan-p (car p))
+                                      (push p nans)
+                                      (push p non-nans)))
                                 (setf non-nans (stable-sort (nreverse non-nans) #'< :key #'car)
                                       nans (nreverse nans))
                                 (loop for (val . pos) in (append non-nans nans)
@@ -1077,9 +1226,9 @@
 
 (defun vt-nanmean (tensor &key axis keepdims dtype out)
   (let* ((mask (vt-isnan tensor))
-	 (not-nan (vt-logical-not mask))
+         (not-nan (vt-logical-not mask))
          (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-			     (error "vt-nanmean: :out 与 :dtype 冲突"))
+                             (error "vt-nanmean: :out 与 :dtype 冲突"))
                             (out (vt-dtype out)) (dtype dtype)
                             (t (if (eq (vt-dtype tensor) :float32) :float32 :float64))))
          (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
@@ -1089,137 +1238,137 @@
          (nan (vt-get-nan final-dtype))
          (sum (vt-sum clean :axis axis :keepdims keepdims :dtype final-dtype :out out)))
     (vt-map (lambda (s c)
-	      (if (<= c zero) nan (/ s c)))
-	    sum count :dtype final-dtype :out sum)))
+              (if (<= c zero) nan (/ s c)))
+            sum count :dtype final-dtype :out sum)))
 
 (defun vt-nanvar (tensor &key axis keepdims (ddof 0) dtype out)
   (let* ((mask (vt-isnan tensor))
-	 (not-nan (vt-logical-not mask))
-	 (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-			     (error "vt-nanvar: :out 与 :dtype 冲突"))
+         (not-nan (vt-logical-not mask))
+         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
+                             (error "vt-nanvar: :out 与 :dtype 冲突"))
                             (out (vt-dtype out)) (dtype dtype)
                             (t (if (eq (vt-dtype tensor) :float32) :float32 :float64))))
          (nan (vt-get-nan final-dtype))
-	 (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
+         (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
          (clean (vt-where mask zero tensor :dtype final-dtype))
          ;; count 使用浮点dtype
          (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
          (mean (vt-nanmean tensor :axis axis :keepdims t :dtype final-dtype))
          (sq-diff (vt-* (vt-map (lambda (c m)
-				  (* (- c m) (- c m)))
-				clean mean :dtype final-dtype)
+                                  (* (- c m) (- c m)))
+                                clean mean :dtype final-dtype)
                         not-nan :dtype final-dtype))
          (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims :dtype final-dtype :out out))
          ;; divisor 使用浮点dtype
          (ddof-f (coerce ddof (vt-dtype->lisp-type final-dtype)))
          (divisor (vt-map (lambda (c)
-			    (if (< c ddof-f) zero (- c ddof-f)))
-			  count :dtype final-dtype)))
+                            (if (< c ddof-f) zero (- c ddof-f)))
+                          count :dtype final-dtype)))
     (vt-map (lambda (s d)
-	      (if (<= d zero) nan (/ s d)))
-	    sum2 divisor :dtype final-dtype :out sum2)))
+              (if (<= d zero) nan (/ s d)))
+            sum2 divisor :dtype final-dtype :out sum2)))
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
   (let* ((final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-			     (error "vt-nanstd: :out 与 :dtype 冲突"))
+                             (error "vt-nanstd: :out 与 :dtype 冲突"))
                             (out (vt-dtype out)) (dtype dtype)
                             (t (if (eq (vt-dtype tensor) :float32)
-				   :float32 :float64))))
+                                   :float32 :float64))))
          (var (vt-nanvar tensor :axis axis :keepdims keepdims :ddof ddof
-				:dtype final-dtype :out out)))
+                                :dtype final-dtype :out out)))
     (vt-sqrt var :dtype final-dtype :out var)))
 
 (defun vt-nanmedian (tensor &key axis keepdims out)
   (with-float-safe
     (let* ((nan (vt-get-nan :float64))
-	   (in-data (vt-data tensor))
+           (in-data (vt-data tensor))
            (in-strides (vt-strides tensor))
-	   (in-offset (vt-offset tensor))
+           (in-offset (vt-offset tensor))
            (in-shape (vt-shape tensor))
-	   (rank (length in-shape)))
+           (rank (length in-shape)))
       (if (null axis)
           (let ((vals '()))
-	    (vt-do-each (ptr val tensor)
+            (vt-do-each (ptr val tensor)
               (declare (ignore ptr))
               (unless (%nan-p val) (push val vals)))
-	    (setf vals (sort vals #'<))
-	    (let ((result (cond ((null vals) nan)
+            (setf vals (sort vals #'<))
+            (let ((result (cond ((null vals) nan)
                                 ((oddp (length vals))
-				 (coerce (nth (floor (length vals) 2) vals) 'double-float))
+                                 (coerce (nth (floor (length vals) 2) vals) 'double-float))
                                 (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
-					 (nth (/ (length vals) 2) vals))
-				      2.0d0)))))
+                                         (nth (/ (length vals) 2) vals))
+                                      2.0d0)))))
               (if out 
-		  (progn
-		    (unless (or (null (vt-shape out))
-				(equal (vt-shape out) '(1))
-				(and keepdims
-				     (equal (vt-shape out)
-					    (make-list (length (vt-shape tensor))
-						       :initial-element 1))))
-		      (error "vt-nanmedian: :out 形状 ~a 与全局归约结果不兼容"
-			     (vt-shape out)))
-		    (vt-fill out result)
-		    out)
-		  (make-vt nil result :dtype :float64))))
+                  (progn
+                    (unless (or (null (vt-shape out))
+                                (equal (vt-shape out) '(1))
+                                (and keepdims
+                                     (equal (vt-shape out)
+                                            (make-list (length (vt-shape tensor))
+                                                       :initial-element 1))))
+                      (error "vt-nanmedian: :out 形状 ~a 与全局归约结果不兼容"
+                             (vt-shape out)))
+                    (vt-fill out result)
+                    out)
+                  (make-vt nil result :dtype :float64))))
           (let* ((ax (vt-normalize-axis axis rank))
-		 (ax-size (nth ax in-shape))
+                 (ax-size (nth ax in-shape))
                  (ax-stride (nth ax in-strides))
                  (out-shape (if keepdims
                                 (loop for d in in-shape for i from 0
-				      collect (if (= i ax) 1 d))
+                                      collect (if (= i ax) 1 d))
                                 (loop for d in in-shape for i from 0
-				      unless (= i ax) collect d)))
+                                      unless (= i ax) collect d)))
                  (res (vt-zeros out-shape :dtype :float64))
                  (res-data (vt-data res)) (res-offset (vt-offset res))
                  (out-rank (length out-shape))
                  (out-dims (coerce out-shape 'simple-vector))
                  (out-strs (coerce (vt-strides res) 'simple-vector))
-		 (in-map (if keepdims
-			     (let ((m (make-array rank :element-type 'fixnum)))
-			       (dotimes (i rank)
-				 (setf (aref m i) i))
-			       m)
-			     (let ((m (make-array (1- rank)
+                 (in-map (if keepdims
+                             (let ((m (make-array rank :element-type 'fixnum)))
+                               (dotimes (i rank)
+                                 (setf (aref m i) i))
+                               m)
+                             (let ((m (make-array (1- rank)
                                                   :element-type 'fixnum))
                                    (k 0))
-			       (loop for i from 0 below rank unless (= i ax)
-				     do (setf (aref m k) i) (incf k))
-			       m)))
+                               (loop for i from 0 below rank unless (= i ax)
+                                     do (setf (aref m k) i) (incf k))
+                               m)))
                  (in-strs (coerce (loop for i below out-rank
-					collect (nth (aref in-map i) in-strides))
+                                        collect (nth (aref in-map i) in-strides))
                                   'simple-vector)))
-	    (labels ((compute (depth in-ptr out-ptr)
+            (labels ((compute (depth in-ptr out-ptr)
                        (if (= depth out-rank)
                            (let ((vals '()))
-			     (loop for i from 0 below ax-size
+                             (loop for i from 0 below ax-size
                                    for ptr = in-ptr then (+ ptr ax-stride)
                                    for v = (aref in-data ptr)
                                    unless (%nan-p v)
-				     do (push (coerce v 'double-float) vals))
-			     (setf vals (sort vals #'<))
-			     (setf (aref res-data out-ptr)
+                                     do (push (coerce v 'double-float) vals))
+                             (setf vals (sort vals #'<))
+                             (setf (aref res-data out-ptr)
                                    (cond ((null vals) nan)
                                          ((oddp (length vals))
-					  (nth (floor (length vals) 2) vals))
+                                          (nth (floor (length vals) 2) vals))
                                          (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
-						  (nth (/ (length vals) 2) vals))
-					       2.0d0)))))
+                                                  (nth (/ (length vals) 2) vals))
+                                               2.0d0)))))
                            (let ((dim (svref out-dims depth))
-				 (out-str (svref out-strs depth))
+                                 (out-str (svref out-strs depth))
                                  (in-str (svref in-strs depth)))
-			     (loop for i from 0 below dim do
+                             (loop for i from 0 below dim do
                                (compute (1+ depth) in-ptr out-ptr)
                                (incf in-ptr in-str) (incf out-ptr out-str))))))
               (compute 0 in-offset res-offset))
-	    (if out
-		(progn
-		  (unless (equal (vt-shape out) (vt-shape res))
-		    (error "vt-nanmedian: :out 形状 ~a 与期望 ~a 不匹配"
-			   (vt-shape out) (vt-shape res)))
-		  (vt-copy-into out res)
-		  out)
-		res))))))
+            (if out
+                (progn
+                  (unless (equal (vt-shape out) (vt-shape res))
+                    (error "vt-nanmedian: :out 形状 ~a 与期望 ~a 不匹配"
+                           (vt-shape out) (vt-shape res)))
+                  (vt-copy-into out res)
+                  out)
+                res))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 差分 / 积分 / 相关 / 卷积 / 插值 / 梯度
@@ -1229,32 +1378,32 @@
   (let ((result vt))
     (loop repeat n do
       (let* ((sh (vt-shape result))
-	     (ax (vt-normalize-axis axis (length sh)))
-	     (len (nth ax sh)))
+             (ax (vt-normalize-axis axis (length sh)))
+             (len (nth ax sh)))
         (when (< len 2)
           (return-from vt-diff
-	    (vt-zeros (append (subseq sh 0 ax) '(0) (subseq sh (1+ ax)))
+            (vt-zeros (append (subseq sh 0 ax) '(0) (subseq sh (1+ ax)))
                       :dtype (vt-dtype result))))
         (setf result (vt-- (vt-narrow result ax 1 len) (vt-narrow result ax 0 (1- len)))))
-	  finally (return result))))
+          finally (return result))))
 
 (defun vt-trapz (y &key (x nil) (dx 1.0d0) (axis -1))
   (let* ((sh (vt-shape y))
-	 (ax (vt-normalize-axis axis (length sh)))
-	 (n (nth ax sh)))
+         (ax (vt-normalize-axis axis (length sh)))
+         (n (nth ax sh)))
     (when (< n 2)
       (return-from vt-trapz
-	(vt-zeros (append (subseq sh 0 ax) (subseq sh (1+ ax))) :dtype (vt-dtype y))))
+        (vt-zeros (append (subseq sh 0 ax) (subseq sh (1+ ax))) :dtype (vt-dtype y))))
     (let ((h (if x
-		 (vt-diff (ensure-vt x))
-		 (make-vt (list (1- n)) dx :dtype (vt-dtype y)))))
+                 (vt-diff (ensure-vt x))
+                 (make-vt (list (1- n)) dx :dtype (vt-dtype y)))))
       (setf h (vt-reshape h (append (make-list ax :initial-element 1) (list (1- n))
                                     (make-list (- (length sh) ax 1) :initial-element 1))))
       (let* ((left (vt-narrow y ax 0 (1- n)))
-	     (right (vt-narrow y ax 1 n))
-	     (integrand (vt-map (lambda (l r hh)
-				  (* 0.5d0 (+ l r) hh))
-				left right h)))
+             (right (vt-narrow y ax 1 n))
+             (integrand (vt-map (lambda (l r hh)
+                                  (* 0.5d0 (+ l r) hh))
+                                left right h)))
         (vt-sum integrand :axis ax)))))
 
 (defun %normalize-mode-keyword (mode)
@@ -1267,43 +1416,43 @@
   "1D 互相关，对标 np.correlate。mode 支持关键字(:full/:valid/:same)或字符串。"
   (let* ((mode-kw (%normalize-mode-keyword mode))
          (a-flat (vt-contiguous (vt-flatten a)))
-	 (v-flat (vt-contiguous (vt-flatten v)))
+         (v-flat (vt-contiguous (vt-flatten v)))
          (n (vt-size a-flat))
-	 (m (vt-size v-flat))
+         (m (vt-size v-flat))
          (a-data (vt-data a-flat))
-	 (v-data (vt-data v-flat)))
+         (v-data (vt-data v-flat)))
     (flet ((compute (k)
              (let ((sum 0.0d0))
                (loop for j from (max 0 (- k)) below (min m (- n k))
                      do (incf sum (* (aref a-data (+ j k)) (aref v-data j))))
                sum)))
       (let* ((full-len (+ n m -1))
-	     (offset (1- m))
-	     (full (make-array full-len :element-type 'double-float)))
+             (offset (1- m))
+             (full (make-array full-len :element-type 'double-float)))
         (loop for k from (- offset) below n for i from 0
               do (setf (aref full i) (compute k)))
         (ecase mode-kw
           (:full (%make-vt :data full :shape (list full-len) :strides '(1)
-			   :offset 0 :dtype :float64))
+                           :offset 0 :dtype :float64))
           (:valid (let* ((len (max 0 (1+ (- n m)))) (start offset)
-						    (data (make-array len :element-type 'double-float)))
+                                                    (data (make-array len :element-type 'double-float)))
                     (loop for i from 0 below len do
-		      (setf (aref data i) (aref full (+ start i))))
+                      (setf (aref data i) (aref full (+ start i))))
                     (%make-vt :data data :shape (list len) :strides '(1)
-			      :offset 0 :dtype :float64)))
+                              :offset 0 :dtype :float64)))
           (:same (let* ((out-len (max n m))
-			(start (floor (- full-len out-len) 2))
+                        (start (floor (- full-len out-len) 2))
                         (data (make-array out-len :element-type 'double-float)))
                    (loop for i from 0 below out-len do
-		     (setf (aref data i) (aref full (+ start i))))
+                     (setf (aref data i) (aref full (+ start i))))
                    (%make-vt :data data :shape (list out-len) :strides '(1)
-			     :offset 0 :dtype :float64))))))))
+                             :offset 0 :dtype :float64))))))))
 
 (defun vt-convolve (a v &key (mode :full))
   "1D 卷积，对标 np.convolve。mode 支持关键字(:full/:valid/:same)或字符串。"
   (vt-correlate (vt-contiguous a)
-		(vt-contiguous (vt-flip v))
-		:mode (%normalize-mode-keyword mode)))
+                (vt-contiguous (vt-flip v))
+                :mode (%normalize-mode-keyword mode)))
 
 (defun vt-interp (x xp fp &key (left nil) (right nil))
   "一维线性插值（对标 numpy.interp）。
@@ -1380,9 +1529,9 @@
 
 (defun vt-gradient (tensor &key (spacing 1.0d0) axis)
   (let* ((shape (vt-shape tensor))
-	 (rank (length shape))
+         (rank (length shape))
          (axes (cond ((null axis)
-		      (loop for i below rank collect i))
+                      (loop for i below rank collect i))
                      ((integerp axis) (list (vt-normalize-axis axis rank)))
                      ((listp axis) (mapcar (lambda (a) (vt-normalize-axis a rank)) axis))
                      (t (error "axis 必须是 nil、整数或整数列表"))))
@@ -1392,7 +1541,7 @@
                          (t (error "spacing 必须是数字、列表或 1d 张量")))))
     (labels ((slice-specs (ax s e)
                (loop for d from 0 below rank
-		     collect (if (= d ax) (list s e) '(:all))))
+                     collect (if (= d ax) (list s e) '(:all))))
              (grad-along (ax sp)
                (let ((n (nth ax shape)))
                  (when (< n 2) (error "轴 ~a 长度 ~a 太小" ax n))
@@ -1400,17 +1549,17 @@
                      (if (= n 2)
                          (let ((edge (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax 1 2))
                                                  (apply #'vt-slice tensor (slice-specs ax 0 1)))
-					   sp)))
+                                           sp)))
                            (vt-concatenate ax edge edge))
                          (let ((left (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax 1 2))
                                                  (apply #'vt-slice tensor (slice-specs ax 0 1)))
-					   sp))
+                                           sp))
                                (inner (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax 2 n))
                                                   (apply #'vt-slice tensor (slice-specs ax 0 (- n 2))))
-					    (* 2.0d0 sp)))
+                                            (* 2.0d0 sp)))
                                (right (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax (1- n) n))
                                                   (apply #'vt-slice tensor (slice-specs ax (- n 2) (1- n))))
-					    sp)))
+                                            sp)))
                            (vt-concatenate ax left inner right)))
                      (let* ((h (ensure-vt sp)) (nh (vt-size h)))
                        (assert (= n nh) (sp) "spacing 数组长度必须与轴一致")
@@ -1431,8 +1580,8 @@
                                            (apply #'vt-slice tensor (slice-specs ax 0 (- n 2))))))
                              (vt-concatenate ax (vt-/ dl hl) (vt-/ di hi) (vt-/ dr hr)))))))))
       (let ((results (loop for ax in axes for sp in spacings
-			   collect (grad-along ax sp))))
+                           collect (grad-along ax sp))))
         (if (and (or (null axis) (integerp axis))
-		 (null (cdr results)))
-	    (car results) results)))))
+                 (null (cdr results)))
+            (car results) results)))))
 

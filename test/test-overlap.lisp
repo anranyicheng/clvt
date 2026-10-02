@@ -1,7 +1,9 @@
 ;;;; test-overlap.lisp — 重叠拷贝回归测试
 ;;;; 加载：在 clvt 包已加载后 (load "test-overlap.lisp")
 ;;;; 运行：(test-overlap-all)  → t 通过 / nil 失败
-(ql:quickload :clvt)
+(require :asdf)
+#+quicklisp (ql:quickload :clvt)
+(asdf:load-system :clvt)
 (in-package :clvt)
 
 ;;; ------------------------------------------------------------------

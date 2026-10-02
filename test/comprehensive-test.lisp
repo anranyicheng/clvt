@@ -133,7 +133,10 @@
     (test-assert "a+b" '(6 8 10 12) (vt-to-list (vt-+ a b)))
     (test-assert "b-a" '(4 4 4 4) (vt-to-list (vt-- b a)))
     (test-assert "a*b" '(5 12 21 32) (vt-to-list (vt-* a b)))
-    (test-assert "b/a(int)" '(5.0 3.0 2.3333333333333335 2.0) (vt-to-list (vt-/ b a)))
+    ;; 期望值必须用双精度字面量（d0）：无 d0 的 2.3333333333333335 会被
+    ;; reader 读成单精度 2.3333333s0，与 vt-/ 的 float64 正确输出相差
+    ;; ~1.6e-7 > 1e-10 容差（此前 b/a(int) 假失败的根因）。
+    (test-assert "b/a(int)" '(5.0d0 3.0d0 2.3333333333333335d0 2.0d0) (vt-to-list (vt-/ b a)))
     (test-assert "a+10" '(11 12 13 14) (vt-to-list (vt-+ a 10)))
     (test-assert "a*2" '(2 4 6 8) (vt-to-list (vt-* a 2))))
 

@@ -1,5 +1,7 @@
 ;;;; vt-sigmoid / vt-relu :out 快路径内存安全验证
-(ql:quickload :clvt)
+(require :asdf)
+#+quicklisp (ql:quickload :clvt)
+(asdf:load-system :clvt)
 (defpackage :clvt-memtest
   (:use :cl :clvt)
   (:export #:run))

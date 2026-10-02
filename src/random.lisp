@@ -185,7 +185,14 @@
 
 
 (defun vt-random (shape &key (dtype :float64) (rng nil))
+  "U[0,1) 均匀采样。仅支持浮点 dtype：
+   整型 dtype 下 truncate(U[0,1)) 恒为 0（静默全 0 陷阱），
+   因此显式报错——整型随机整数请用 vt-random-int / vt-random-integers，
+   或带边界的 vt-random-uniform（其整型输出为区间截断语义）。"
   (declare (list shape))
+  (unless (member dtype '(:float64 :float32))
+    (error "vt-random: dtype 必须为 :float64/:float32（整型输入会因截断静默全 0），得到 ~a；~
+            整型随机数请使用 vt-random-int / vt-random-integers" dtype))
   (setf rng (%ensure-random-state rng))
   (vt-map (lambda (x)
             (declare (ignore x))

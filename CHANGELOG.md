@@ -4,6 +4,60 @@
 
 ---
 
+## 2026-10-02 — v0.3.2 首次 SBCL 实测回归 / reduce 小整型内核补全
+
+v0.3.0/v0.3.1 两轮重构均为静态验证（无 SBCL 环境）。本轮在 SBCL 2.6.8 +
+Quicklisp + sb-simd 真实环境下首次全量加载与回归，修复实测暴露的问题，
+并补全三层分离在执行层的最后一处 dtype 契约缺口。
+
+### 方向 1：reduce 家族小整型 dtype 补全（执行层选路规则落地）
+
+`def-vt-reduce` 生成的类型特化内核此前只覆盖 4 种存储级元素类型
+（double/single/int64/int32），导致 `vt-sum`/`vt-amax` 等对
+int16/int8/uint8/uint16 张量直接抛 "unsupported input/output dtype"——
+违背 dtype.lisp 声明的 8 种逻辑 dtype 单一事实来源（test-bug0 用例 5 暴露）。
+
+修复（reduce-stats.lisp）：
+
+| 项目 | 设计 |
+|------|------|
+| 特化内核范围 | 保持 4 种存储级类型不变（对应 `*vt-storage-dtypes*`），避免内核全展开（8×8 组合实测在 1GB 堆下编译器耗尽） |
+| 小整型路径 | 新增 `%kernel-small-general`：每算子仅展开一份的通用内核（路径 3 结构），读取经通用 aref，sum/prod 按 numpy 语义提升 int64 累加，max/min 以输入 dtype 极值初始化，写出经 vt-cast 按结果 dtype 转换 |
+| 选路守卫 | 路径 1（连续+全局）/路径 2（连续+单轴）增加存储级 dtype 守卫，小整型统一由路径 3 兜底——连续性/特化只影响性能，不影响正确性 |
+| dtype 映射 | `%dtype->lt`/`%et->lt`/`%lt-rank`/`%cast-form` 补全 8 种类型；`%op-acc-lt` 小整型 sum/prod 提升 int64；`%op-init` 补全小整型 max/min 极值初始化 |
+| 空归约 | 单位元填充的编译期表覆盖全部 8 种输入类型（此前 prod 空小整型会错误返回 0） |
+
+语义对齐 numpy：`sum(int8)→int64`、`amax(int8)→int8`（保 dtype）、
+`amax(uint16)→65535` 无回绕。
+
+### 方向 2：随机数静默陷阱显式化
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| `vt-random` 整型 dtype 下 truncate(U[0,1)) 恒为 0（静默全 0 陷阱，test-bug0 用例 17 标注） | 显式报错并指引 `vt-random-int` / `vt-random-integers`；仅接受 :float64/:float32 | random.lisp |
+
+### 方向 3：测试基础设施修复（实测暴露）
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| 7 个测试文件开头 `(ql:quickload :clvt)`，而 run-tests.sh 只经 ASDF 加载系统、不加载 Quicklisp，导致 7 个套件必崩 | 改为 `(require :asdf)` + `#+quicklisp (ql:quickload ...)` + `(asdf:load-system :clvt)`，Quicklisp 存在与否均可运行 | test/*.lisp |
+| `set -u` 下失败汇总 `${SUITES[$name]}` 对未注册套件报 unbound variable，吞掉失败清单 | 补默认值 `:-未知测试`；补齐 7 个套件的 SUITES 注册 | test/run-tests.sh |
+| comprehensive-test "b/a(int)" 假失败：期望值 `2.3333333333333335` 缺 `d0` 被读成单精度，与正确的 float64 输出差 ~1.6e-7 > 1e-10 容差 | 期望值改双精度字面量 | test/comprehensive-test.lisp |
+| test-bug0 以 `(and (= *checks* 28) (= *failures* 2))` 固化 2 个已知失败 | 修复后扩充为 37 项检查、0 失败，新增 9 项小整型归约回归（含 axis 归约与转置视图） | test/test-bug0.lisp |
+
+### 验证
+
+- 环境：SBCL 2.6.8（x86-64-linux binary）+ ASDF 3.3.1 + Quicklisp + sb-simd
+- `bash test/run-tests.sh`：**19/19 套件全部通过**（run_all_tests 143、
+  run_param_tests 155、robustness 194、coverage-gap 97、comprehensive 119、
+  auto-compare 63、numpy-compare 69、test-bug0 37 等约 1100+ 断言）
+- 冒烟覆盖：int8/uint8/int16/uint16 的 sum/amax/amin/argmax/prod/nansum/
+  nanmax/all/any、axis 归约、转置视图、:out 写入、:dtype 覆盖、空轴归约
+- einsum 小整型输入经通用路径提升 float64 验证通过（显式 :dtype/:out 仍限
+  存储级类型并显式报错——已文档化的边界，不属静默错误）
+
+---
+
 ## 2026-10-01 — v0.3.1 数据类型统一 / NaN·Inf 补全 / out 契约加固
 
 在 v0.3.0 三层架构文档化基础上，针对三个遗留问题域做第二轮重构。

@@ -4,7 +4,9 @@
 ;;;;   (in-package :clvt)
 ;;;;   (load "test-copy-into.lisp")
 ;;;;   (run-copy-into-tests)
-(ql:quickload :clvt)
+(require :asdf)
+#+quicklisp (ql:quickload :clvt)
+(asdf:load-system :clvt)
 (in-package :clvt)
 
 ;;; ==================================================================

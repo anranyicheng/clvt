@@ -1,4 +1,6 @@
-(ql:quickload :clvt)
+(require :asdf)
+#+quicklisp (ql:quickload :clvt)
+(asdf:load-system :clvt)
 (in-package :clvt)
 
 (defparameter *failures* 0)
@@ -98,6 +100,27 @@
   (error (e)
     (incf *checks*) (incf *failures*)
     (format t "FAIL: vt-amax uint8 抛错: ~a~%" e)))
+
+;; ---- 小整型归约回归（v0.3.2：int16/int8/uint8/uint16 全面可用，
+;;      sum/prod 按 numpy 语义提升 int64 累加，max/min 保 dtype）----
+(let* ((s16 (vt-from-sequence '(-1 2 -3) :dtype :int16))
+       (u16 (vt-from-sequence '(1 65535 3) :dtype :uint16))
+       (v8  (vt-from-sequence '(1 2 3) :dtype :int8))
+       (u8  (vt-from-sequence '(1 2 3) :dtype :uint8))
+       (m8  (vt-from-sequence '((1 2 3) (2 3 2)) :dtype :int8)))
+  (check "vt-sum int16 → -2" -2 (vt-item (vt-sum s16)) :test #'=)
+  (check "vt-sum int8 → int64 (numpy 提升语义)" :int64 (vt-dtype (vt-sum v8)))
+  (check "vt-amax uint16 → 65535" 65535 (vt-item (vt-amax u16)) :test #'=)
+  (check "vt-amin int8 → 1" 1 (vt-item (vt-amin v8)) :test #'=)
+  (check "vt-prod uint8 → 6" 6 (vt-item (vt-prod u8)) :test #'=)
+  (check "vt-argmax uint16 → 1" 1 (vt-item (vt-argmax u16)) :test #'=)
+  (check "vt-all/vt-any int8 → (t t)"
+         '(t t) (list (plusp (vt-item (vt-all v8)))
+                      (plusp (vt-item (vt-any v8)))))
+  (check "vt-sum int8 axis=1 → (6 7)" '(6 7)
+         (map 'list #'identity (vt-to-list (vt-sum m8 :axis 1))))
+  (check "vt-amax int8 转置(3x2)视图 axis=0 → (3 3)" '(3 3)
+         (map 'list #'identity (vt-to-list (vt-amax (vt-transpose m8) :axis 0)))))
 
 (format t "~%===== 6. int32 求和溢出提升到 int64 =====~%")
 (let ((v (vt-from-sequence '(2000000000 2000000000) :dtype :int32)))
@@ -212,11 +235,15 @@
       (format t "  NOTE(非致命): vt-roll 0 返回原对象别名~%")
       (format t "PASS: 返回拷贝~%")))
 
-(format t "~%===== 17. vt-random int dtype =====~%")
-(let ((r (vt-random '(5) :dtype :int64)))
-  (format t "  vt-random dtype :int64 → ~s (静默全 0 陷阱)~%"
-          (vt-to-list r))
-  (incf *checks*))
+(format t "~%===== 17. vt-random int dtype（静默全 0 陷阱已改为显式报错） =====~%")
+(handler-case
+    (progn
+      (vt-random '(5) :dtype :int64)
+      (incf *checks*) (incf *failures*)
+      (format t "  FAIL: vt-random :int64 未报错（截断恒 0 的静默陷阱仍在）~%"))
+  (error (e)
+    (incf *checks*)
+    (format t "  PASS: vt-random :int64 显式报错: ~a~%" e)))
 
 (format t "~%===== 18. :out 为广播视图 =====~%")
 (handler-case
@@ -234,5 +261,5 @@
 (format t "~%~%========= 总结: ~a 项检查, ~a 项失败 =========~%"
         *checks* *failures*)
 
-(and (= *checks* 28)
-     (= *failures* 2))
+(and (= *checks* 37)
+     (= *failures* 0))

@@ -35,6 +35,16 @@ SUITES[auto-compare-test]="63 JSON 自动对比测试"
 SUITES[benchmark-copy]="性能基准测试"
 SUITES[numpy-compare-test]="69 numpy/pytorch 实时对比测试"
 SUITES[extensions2-test]="37 新增函数测试 (fliplr/geomspace/one-hot/layer-norm等)"
+SUITES[nan-random-test]="89 NaN 随机数测试"
+SUITES[property-test]="性质测试"
+SUITES[test-extensions]="19 扩展函数回归测试"
+SUITES[simd-test]="SIMD 路径测试"
+SUITES[test-overlap]="6 重叠拷贝回归测试"
+SUITES[test-copy-into]="35 vt-copy-into 正确性测试"
+SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
+SUITES[test-bug0]="37 已知 bug 回归测试"
+SUITES[memsafety-tests]="6 :out 快路径内存安全测试"
+SUITES[out-contig-tests]="23 out 连续/非连续写入测试"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -242,17 +252,17 @@ main() {
             comprehensive-test
             auto-compare-test
             numpy-compare-test
-	    extensions2-test
-	    nan-random-test
-	    property-test
-	    test-extensions
-	    simd-test
-	    test-overlap
-	    test-copy-into
-	    test-simd-batch-matmul
-	    test-bug0
-	    memsafety-tests
-	    out-contig-tests
+            extensions2-test
+            nan-random-test
+            property-test
+            test-extensions
+            simd-test
+            test-overlap
+            test-copy-into
+            test-simd-batch-matmul
+            test-bug0
+            memsafety-tests
+            out-contig-tests
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)
@@ -306,7 +316,8 @@ main() {
     if [[ $failed_suites -gt 0 ]]; then
         fail "失败的套件:"
         for name in "${failed_names[@]}"; do
-            echo -e "  ${RED}✗${NC} $name — ${SUITES[$name]}"
+            # 注意: set -u 下对不存在的 key 取值会报 unbound variable，必须给默认值
+            echo -e "  ${RED}✗${NC} $name — ${SUITES[$name]:-未知测试}"
         done
         echo ""
         exit 1
