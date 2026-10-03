@@ -180,3 +180,29 @@ v0.3.2 条目，此处只记录与三层分离约定的对照结论：
 
 回归结果：`bash test/run-tests.sh` 19/19 套件全部通过。
 
+
+---
+
+## v0.3.5 三层分离复审（2026-10-04）
+
+v0.3.2–v0.3.4 三轮之后，本轮在 SBCL 2.6.8 + Quicklisp 下逐文件复审全部
+src/ 代码（约 11k 行），以运行时探针对表 numpy 实测语义。修复清单见
+CHANGELOG.md v0.3.5 条目，此处记录与三层分离约定的对照结论：
+
+| 约定 | 实测结论 | 本轮落点 |
+|------|----------|----------|
+| 逻辑层负责语义，非法输入确定性报错 | 违反：floor 族/mod/rem 对 NaN/±Inf 泄漏 SBCL 底层 FLOATING-POINT-INVALID-OPERATION（合法浮点输入崩溃，L1/L2） | elementwise.lisp `%floor-family-body` 显式拦截，numpy 语义传播 NaN/±Inf |
+| 逻辑层负责校验，物理层只拿到已验证的形状 | 违反：`vt-solve` 不校验 b 行数，消元循环按 n 行读写底层缓冲区（越界尝试） | linalg.lisp 显式校验 b 行数 = 矩阵阶数 |
+| 逻辑层 dtype 单一事实来源 | 违反：`vt-from-array` 对小整型 CL 数组静默提升 :int32；`vt-cast-fun :uint16` 风格分裂 | creation.lisp 窄类型优先精确推断；dtype.lisp 统一 `%coerce-*` |
+| 广播语义统一（numpy 对齐） | 缺口：`vt-mod`/`vt-rem` 不支持张量除数；`vt-inner` 0 维报内部错误；`vt-tensordot` 负轴错位 | elementwise.lisp / extensions.lisp 逐项对齐 numpy |
+| numpy 语义逐位对齐（分歧处文档化） | 违反：`vt-insert` 重复索引值逆序、负索引按演化尺寸解析 | join.lisp 统一为 numpy 算法（归一化→升序稳定→累进插入） |
+| 执行层选路只影响性能不影响正确性 | 复审确认：vt-fast-map 三路分派守卫完备（dtype 匹配→连续→strided→vt-map 兜底），本轮无需改动 | — |
+| 物理层别名安全 | 复审确认：vt-map/vt-einsum 的重叠快照保护、out 广播只读检查完备，本轮无需改动 | — |
+
+环境差异的新认识：SBCL 对非有限浮点调用 floor/round/ceiling/truncate 会
+signal FLOATING-POINT-INVALID-OPERATION，`with-float-traps-masked` 无法屏蔽
+（这是 CL 函数语义而非 FP 陷阱）——凡走 CL 取整原语的内核必须显式拦截
+非有限值，"屏蔽陷阱即可安全处理 NaN"的假设不成立。
+
+回归结果：新增 test/refactor-bugfix-tests.lisp（53 条断言，numpy 实测对照），
+`bash test/run-tests.sh` 24/24 套件全部通过。

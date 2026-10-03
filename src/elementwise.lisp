@@ -238,53 +238,93 @@
 	    (if (or (%nan-p v) (%inf-p v)) 0.0d0 (if (oddp (floor v)) 1.0d0 0.0d0)))
 	  vt :out out :dtype dtype))
 
+(defun %mod-nan-or-inf-p (x)
+  "取模语境下的非有限值判定（需已屏蔽浮点陷阱）。"
+  (and (floatp x) (%nan-or-inf-p x)))
+
+(declaim (inline %mod-float-nan))
+(defun %mod-float-nan (x)
+  "取模遇 NaN 时的返回值。写入按输出 dtype 转换，恒返 double NaN 即可。"
+  (declare (ignore x))
+  +vt-dfloat-nan+)
+
 (defun vt-mod (vt divisor &key out dtype)
-  "逐元素取模。除数为 0 时返回 0（对标 numpy.mod 的零除语义）。"
+  "逐元素取模。DIVISOR 可为标量或张量（自动广播）。
+   语义对标 numpy.remainder：结果与除数同号；
+   除数为 0 时返回 0（库约定，对标 np.mod 的整型零除）；
+   NaN 任一侧出现 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
+  (if (numberp divisor)
   (vt-map (lambda (x)
-            (if (and (numberp divisor) (zerop divisor))
-                0
-                (mod x divisor)))
-          vt :out out :dtype dtype))
+                (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
+                      ((%mod-nan-or-inf-p divisor) (%mod-float-nan x))
+                      ((and (numberp divisor) (zerop divisor)) 0)
+                      ((and (floatp divisor) (%inf-p divisor)) x)
+                      (t (mod x divisor))))
+              vt :out out :dtype dtype)
+      (vt-map (lambda (x y)
+                (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
+                      ((%mod-nan-or-inf-p y) (%mod-float-nan x))
+                      ((zerop y) 0)
+                      ((and (floatp y) (%inf-p y)) x)
+                      (t (mod x y))))
+              vt divisor :out out :dtype dtype)))
 
 (defun vt-rem (vt divisor &key out dtype)
-  "逐元素余数。除数为 0 时返回 0（对标 numpy.remainder 的零除语义）。"
+  "逐元素余数。DIVISOR 可为标量或张量（自动广播）。
+   CL:rem 为截断除法余数（与被除数同号），对标 numpy.fmod
+   （docstring 曾误标 numpy.remainder，现已更正）。
+   除数为 0 时返回 0（库约定）；NaN 任一侧 → NaN；
+   被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
+  (if (numberp divisor)
   (vt-map (lambda (x)
-            (if (and (numberp divisor) (zerop divisor))
-                0
-                (rem x divisor)))
-          vt :out out :dtype dtype))
+                (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
+                      ((%mod-nan-or-inf-p divisor) (%mod-float-nan x))
+                      ((zerop divisor) 0)
+                      ((and (floatp divisor) (%inf-p divisor)) x)
+                      (t (rem x divisor))))
+              vt :out out :dtype dtype)
+      (vt-map (lambda (x y)
+                (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
+                      ((%mod-nan-or-inf-p y) (%mod-float-nan x))
+                      ((zerop y) 0)
+                      ((and (floatp y) (%inf-p y)) x)
+                      (t (rem x y))))
+              vt divisor :out out :dtype dtype)))
 
 (defun vt-atan2 (vty vtx &key out dtype)
   (vt-fast-map #'atan vty vtx :out out :dtype dtype))
 
+;; floor 族对 NaN/±Inf 统一传播本身（对标 numpy：floor/ceil/trunc/round(nan)=nan，
+;; floor(±inf)=±inf）。SBCL 对非有限值直接调用 floor/round 会 signal
+;; FLOATING-POINT-INVALID-OPERATION（trap 屏蔽也无法避免），必须显式拦截。
+(defmacro %floor-family-body (x op)
+  `(if (and (floatp ,x) (%nan-or-inf-p ,x))
+       ,x
+       (let ((res (nth-value 0 (,op ,x divisor))))
+         (if (floatp ,x) (float res ,x) res))))
+
 (defun vt-floor (vt &key (divisor 1) out dtype)
-  (vt-map (lambda (x)
-	    (let ((res (nth-value 0 (floor x divisor))))
-              (if (floatp x) (float res x) res)))
+  (vt-map (lambda (x) (%floor-family-body x floor))
 	  vt :out out :dtype dtype))
 
 (defun vt-ceiling (vt &key (divisor 1) out dtype)
-  (vt-map (lambda (x)
-	    (let ((res (nth-value 0 (ceiling x divisor))))
-              (if (floatp x) (float res x) res)))
+  (vt-map (lambda (x) (%floor-family-body x ceiling))
 	  vt :out out :dtype dtype))
 
 (defun vt-round (vt &key (divisor 1) out dtype)
-  (vt-map (lambda (x)
-	    (let ((res (nth-value 0 (round x divisor))))
-              (if (floatp x) (float res x) res)))
+  (vt-map (lambda (x) (%floor-family-body x round))
 	  vt :out out :dtype dtype))
 
 (defun vt-truncate (vt &key (divisor 1) out dtype)
-  (vt-map (lambda (x)
-	    (let ((res (nth-value 0 (truncate x divisor))))
-              (if (floatp x) (float res x) res)))
+  (vt-map (lambda (x) (%floor-family-body x truncate))
 	  vt :out out :dtype dtype))
 
 (defun vt-rint (vt &key out dtype)
   (vt-map (lambda (x)
+            (if (and (floatp x) (%nan-or-inf-p x))
+                x
 	    (let ((res (nth-value 0 (round x))))
-              (if (floatp x) (float res x) res)))
+                  (if (floatp x) (float res x) res))))
 	  vt :out out :dtype dtype))
 
 (declaim (inline %op-eq %op-ne %op-lt %op-le %op-gt %op-ge))

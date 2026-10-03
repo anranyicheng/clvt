@@ -49,6 +49,7 @@ SUITES[out-contig-tests]="23 out 连续/非连续写入测试"
 SUITES[shape-degenerate-tests]="70 空形状/退化形状表驱动测试 (C1/C2 类目, 见 TEST-PLAN.md)"
 SUITES[property-strided-tests]="67 选路不变量/代数恒等式测试 (C8 类目, strided≡contiguous)"
 SUITES[error-contract-tests]="19 错误路径契约测试 (C7 类目, L2 底线)"
+SUITES[refactor-bugfix-tests]="55 v0.3.5 重构回归测试 (floor族NaN/insert numpy语义/solve校验/tensordot负轴等)"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -271,6 +272,7 @@ main() {
 	    shape-degenerate-tests
 	    property-strided-tests
 	    error-contract-tests
+            refactor-bugfix-tests
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)

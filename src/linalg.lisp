@@ -1236,8 +1236,15 @@
       (let* ((a (ensure-contiguous-2d-vt a))
              (b-vt (ensure-vt b))
              (n (first (vt-shape a)))
-             (b-shape (vt-shape b-vt))
-             (nrhs (if (> (length b-shape) 1) (second b-shape) 1))
+             (b-shape (vt-shape b-vt)))
+        ;; 逻辑层契约：b 的行数必须与系数矩阵阶数一致。
+        ;; 缺失此校验时，消元循环按 n 行读写 b 的底层缓冲区，
+        ;; 行数不足会越界写入（内存安全 L1/L2 违规）。
+        (unless (and (>= (length b-shape) 1)
+                     (= (first b-shape) n))
+          (error "vt-solve: b 的行数 ~a 与系数矩阵阶数 ~a 不匹配（b 形状 ~a）"
+                 (if b-shape (first b-shape) 0) n b-shape))
+        (let* ((nrhs (if (> (length b-shape) 1) (second b-shape) 1))
              (b-copy (if (= nrhs 1)
 			 (vt-reshape (vt-astype (vt-copy b-vt) :float64)
 				     (list n 1))
@@ -1326,7 +1333,7 @@
                                b-copy)))
 		  (if out
                       (vt-map #'identity res :out out)
-                      res))))))))))
+                      res)))))))))))
 
 (defun vt-inv (matrix)
   "矩阵求逆。"

@@ -98,6 +98,7 @@
 
 (defun vt-inner (a b &key dtype out)
   "内积（对标 numpy.inner）。
+   - 0d × 任意：广播逐元素乘（numpy.inner 对 0 维输入按乘法处理）。
    - 1D × 1D：标量内积。
    - ND × MD：a 的最后一维与 b 的最后一维收缩，
      输出形状 = a.shape[:-1] ++ b.shape[:-1]。"
@@ -106,6 +107,9 @@
          (ar (length (vt-shape a-vt)))
          (br (length (vt-shape b-vt))))
     (cond
+      ((or (zerop ar) (zerop br))
+       ;; 0 维输入无收缩轴：直接广播相乘（对标 numpy.inner）
+       (vt-* a-vt b-vt :dtype dtype :out out))
       ((and (= ar 1) (= br 1))
        (vt-einsum "i,i->" a-vt b-vt :dtype dtype :out out))
       (t
@@ -124,15 +128,26 @@
 (defun vt-tensordot (a b &key (axes 2))
   "张量缩并（对标 numpy.tensordot）。
    axes 为整数 n：a 的最后 n 维与 b 的前 n 维收缩。
-   axes 为 (a-axes b-axes)：按指定轴列表收缩（两列表长度必须相等）。"
+   axes 为 (a-axes b-axes)：按指定轴列表收缩（两列表长度必须相等，
+   支持负轴，按各自秩归一化——v0.3.5 修复：旧实现不归一化负轴，
+   负轴被当作自由轴处理，产生错误结果或内部错误）。"
   (let* ((a-vt (ensure-vt a))
          (b-vt (ensure-vt b))
          (ar (length (vt-shape a-vt)))
          (br (length (vt-shape b-vt))))
+    (flet ((norm-axes (axes rank which)
+             (loop for x in axes
+                   collect (let ((ax (if (minusp x) (+ x rank) x)))
+                             (unless (and (>= ax 0) (< ax rank))
+                               (error "vt-tensordot: ~a 的轴 ~a 越界（秩 ~a）"
+                                      which x rank))
+                             ax))))
     (cond
       ((integerp axes)
-       (let* ((n axes)
-              (af (- ar n))                      
+         (let ((n axes))
+           (unless (and (>= n 0) (<= n ar) (<= n br))
+             (error "vt-tensordot: axes ~a 超出可收缩范围（a 秩 ~a，b 秩 ~a）" n ar br))
+           (let* ((af (- ar n))
               (bf (- br n))                      
               (all      (%vt-einsum-labels (+ af n bf)))
               (a-free   (subseq all 0 af))       
@@ -142,10 +157,14 @@
                     (list (append a-free contract)
                           (append contract b-free))
                     (append a-free b-free))))
-         (vt-einsum sub a-vt b-vt)))
+             (vt-einsum sub a-vt b-vt))))
       ((and (listp axes) (= (length axes) 2))
-       (let* ((a-axes (if (listp (first axes))  (first axes)  (list (first axes))))
-              (b-axes (if (listp (second axes)) (second axes) (list (second axes))))
+         (let* ((a-axes (norm-axes
+                         (if (listp (first axes)) (first axes) (list (first axes)))
+                         ar 'a))
+                (b-axes (norm-axes
+                         (if (listp (second axes)) (second axes) (list (second axes)))
+                         br 'b))
               (n (length a-axes)))
          (unless (= n (length b-axes))
            (error "axes 子列表长度必须一致"))
@@ -176,7 +195,8 @@
                 (sub (%vt-einsum-string (list a-sub b-sub)
                                         (append a-free b-free))))
            (vt-einsum sub a-vt b-vt))))
-      (t (error "axes 必须是整数或两个整数列表")))))
+        (t (error "axes 必须是整数或两个整数列表"))))))
+
 
 (defun %gather-along-axis (source indices axis)
   "沿 axis 用 indices 中的整数作为索引从 source 中取值（PyTorch gather 语义）。

@@ -231,10 +231,11 @@
     (:int64   #'%coerce-int64)
     (:int32   #'%coerce-int32)
     (:int16   #'%coerce-int16)
-    ;; int8/uint8 与 int16/int32 统一走 %coerce-*（范围检查 + 回绕，语义一致）
+    ;; 所有整型统一走 %coerce-*（范围检查 + 回绕，语义一致）。
+    ;; v0.3.5 修复：:uint16 误用 %wrap-uint16，与 v0.3.2 的统一政策不一致。
     (:int8    #'%coerce-int8)
     (:uint8   #'%coerce-uint8)
-    (:uint16  #'%wrap-uint16)))
+    (:uint16  #'%coerce-uint16)))
 
 (defun vt-dtype-default-value (dtype)
   "返回 dtype 对应的零值。"

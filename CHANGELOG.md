@@ -4,6 +4,61 @@
 
 ---
 
+## 2026-10-04 — v0.3.5 三层分离复审：非有限值传播 / numpy 语义修复 / 内存安全校验
+
+在 SBCL 2.6.8 + Quicklisp 环境下按三层分离约定逐文件复审全部源码，
+以运行时探针逐项对表 numpy 实测语义，确认并修复 8 类 bug。
+新增回归套件 test/refactor-bugfix-tests.lisp（53 条断言），全部通过。
+
+### 方向 1：非有限值（NaN/±Inf）传播（执行层泄漏底层陷阱 → 逻辑层显式处理）
+
+`vt-floor`/`vt-ceiling`/`vt-truncate`/`vt-round`/`vt-rint`/`vt-mod`/`vt-rem`
+对 NaN/±Inf 输入直接泄漏 `FLOATING-POINT-INVALID-OPERATION`（SBCL 对非有限值
+调用 floor/round 会 signal，浮点陷阱屏蔽无法避免），而 numpy 语义为传播：
+floor(nan)=nan、floor(±inf)=±inf、mod 含 NaN → NaN、mod(±Inf, 有限) → NaN、
+mod(有限, ±Inf) → 被除数本身。
+修复（elementwise.lisp）：`%floor-family-body` 宏统一在进入 CL 取整前拦截
+非有限值并返回原值；mod/rem 增加同一约定（除 0 返 0 的库约定保持不变）。
+
+### 方向 2：vt-insert 对齐 numpy.insert（逻辑层语义修复）
+
+旧实现降序插入且负索引按"演化中尺寸"解析，与 numpy 相比有两处偏差：
+重复索引处值逆序（`insert([0,1,2],[1,1],[10,20])` 旧 `[0,20,10,1,2]`
+→ numpy `[0,10,20,1,2]`）；混合正负索引错位。
+修复（join.lisp）：flat/axis 两模式统一为 numpy 算法——
+先按原尺寸归一化负索引并越界检查，再升序稳定排序（值跟随索引、
+同位置按 values 顺序），插入位置 = 归一化位置 + 已插入个数。
+
+### 方向 3：内存安全与输入校验（L1/L2 底线）
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| `vt-solve` 不校验 b 行数：b 行数 < n 时消元循环按 n 行读写底层缓冲区（实测 SBCL 报 "Invalid index 2 for (SIMPLE-ARRAY DOUBLE-FLOAT (2))"，越界尝试） | 逻辑层显式校验 b 行数 = 系数矩阵阶数，违反报可定位错误 | linalg.lisp |
+| `vt-tensordot` 负轴不归一化：被当自由轴处理，产生错误结果或 "%vt-einsum-string" 内部错误 | 负轴按各自秩归一化 + 越界显式报错；整数 axes 超出可收缩范围报错 | extensions.lisp |
+| `vt-inner` 0 维输入报 subseq 内部错误 | 0 维输入（任一侧）走广播逐元素乘（对标 numpy.inner） | extensions.lisp |
+| `vt-mod`/`vt-rem` 仅接受标量除数，张量除数报类型错误 | 除数可为张量，广播逐元素取模（语义同标量路径） | elementwise.lisp |
+
+### 方向 4：dtype 单一事实来源补全（逻辑层）
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| `vt-from-array` 对 (signed-byte 16/8)、(unsigned-byte 8/16) CL 数组一律静默推断 :int32（subtypep 宽类型命中） | 按窄类型优先精确推断 :int8/:int16/:uint8/:uint16/:int32/:int64/:float32/:float64，显式 :dtype 仍可覆盖 | creation.lisp |
+| `vt-cast-fun :uint16` 走 `%wrap-uint16`（v0.3.1 统一政策的遗漏项） | 统一为 `%coerce-uint16` | dtype.lisp |
+| package.lisp 5 个 core.lisp 辅助函数重复导出 3 处 | 归并到「张量结构访问器」区唯一导出 | package.lisp |
+| `vt-rem` docstring 误标 numpy.remainder（CL:rem 为截断除法余数 = numpy.fmod） | 更正为 numpy.fmod | elementwise.lisp |
+
+### 测试
+
+- 新增 test/refactor-bugfix-tests.lisp：53 条断言覆盖上述全部修复
+  （floor 族 NaN/Inf ×6、mod/rem 张量除数与非有限值 ×6、insert numpy 语义
+  ×8、solve 校验 ×3、inner 0 维 ×3、tensordot 负轴 ×5、from-array 推断
+  ×7、cast-fun ×2 及相关回归），已注册 run-tests.sh
+- numpy 实测对照：np.insert / np.mod / np.inner / np.tensordot 逐例验证
+- 全量回归 `bash test/run-tests.sh`：24/24 套件全部通过（含既有
+  shape-degenerate 70 / property-strided 67 / error-contract 19 等套件）
+
+---
+
 ## 2026-10-03 — v0.3.4 测试规划落地 / vt-copy-into 零尺寸写入修复
 
 按 TEST-PLAN.md（新增，test/TEST-PLAN.md）建立"类别矩阵 > 函数覆盖 > 断言数量"

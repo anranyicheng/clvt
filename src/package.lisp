@@ -49,6 +49,9 @@
    #:vt-shape-to-size
    #:vt-compute-strides
    #:vt-compute-logical-strides
+   #:vt-broadcast-shapes
+   #:vt-broadcast-strides
+   #:vt-normalize-axis
 
    ;; ------------------------------------------------------------------
    ;; 张量创建 (creation.lisp)
@@ -104,8 +107,6 @@
    #:vt-tile
    #:vt-pad
    #:vt-broadcast-to
-   #:vt-broadcast-shapes
-   #:vt-broadcast-strides
    #:vt-contiguous
    #:vt-flip
    #:vt-roll
@@ -134,7 +135,6 @@
    #:vt-searchsorted
    #:vt-digitize
    #:vt-bincount
-   #:vt-normalize-axis
 
    ;; ------------------------------------------------------------------
    ;; 算术与数学 (elementwise.lisp)
@@ -378,12 +378,10 @@
 
    ;; ------------------------------------------------------------------
    ;; 通用辅助与宏
+   ;; （vt-normalize-axis / vt-broadcast-shapes / vt-broadcast-strides /
+   ;;  vt-compute-strides / vt-compute-logical-strides 均定义于 core.lisp，
+   ;;  已归并到「张量结构访问器」区，避免重复导出）
    ;; ------------------------------------------------------------------
-   #:vt-normalize-axis
-   #:vt-broadcast-shapes
-   #:vt-broadcast-strides
-   #:vt-compute-strides
-   #:vt-compute-logical-strides
    #:with-float-safe
 
    ;; ------------------------------------------------------------------

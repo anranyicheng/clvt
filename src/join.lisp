@@ -91,7 +91,17 @@
           (vt-concatenate ax arr-vt val-vt)))))
 
 (defun vt-insert (arr obj values &key (axis nil))
-  "对标 numpy.insert 插入值。"
+  "对标 numpy.insert 插入值。
+   多索引语义与 numpy 一致：
+   - 所有索引先按原数组尺寸归一化（负索引）并越界检查；
+   - 按位置升序稳定排序后依次插入，同位置多个值按 values 顺序
+     依次排布（v0.3.5 修复：旧实现降序插入导致同位置值逆序，
+     且负索引按演化中的尺寸解析，均与 numpy 不符）。"
+  (labels ((norm-pos (raw size)
+             (let ((pos (if (minusp raw) (+ size raw) raw)))
+               (when (or (< pos 0) (> pos size))
+                 (error "索引 ~a 越界（轴大小 ~a）" raw size))
+               pos)))
   (let* ((arr-vt (ensure-vt arr))
          (values-vt (ensure-vt values :dtype (vt-dtype arr-vt))))
     (if (null axis)
@@ -99,8 +109,7 @@
 					  (val-size (vt-size flat-val)))
           (if (integerp obj)
               (let* ((size (vt-size flat))
-                     (pos (if (minusp obj) (+ size obj) obj)))
-                (when (or (< pos 0) (> pos size)) (error "索引 ~a 越界" obj))
+                       (pos (norm-pos obj size)))
                 (if (zerop val-size) flat
                     (let ((left (if (> pos 0)
 				    (vt-slice flat (list 0 pos))
@@ -112,28 +121,28 @@
               (let ((num (length obj)))
                 (unless (or (= val-size num) (= val-size 1))
                   (error "flat mode: values 大小 ~a ≠ 索引数 ~a" val-size num))
-                (let ((pairs (stable-sort
+                  (let* ((size (vt-size flat))
+                         ;; 先按原尺寸归一化（负索引），再升序稳定排序：
+                         ;; 值跟随其索引，同位置按 values 顺序排布（numpy 语义）
+                         (pairs (stable-sort
                               (if (= val-size 1)
                                   (loop for idx in obj
-					collect (cons idx flat-val))
+                                           collect (cons (norm-pos idx size) flat-val))
                                   (loop for idx in obj
 					for i from 0 below val-size
-                                        collect (cons idx (vt-narrow flat-val 0 i (1+ i)))))
-                              #'> :key #'car)))
+                                           collect (cons (norm-pos idx size)
+                                                         (vt-narrow flat-val 0 i (1+ i)))))
+                                 #'< :key #'car)))
                   (loop with result = flat
-                        for (raw-pos . val) in pairs
-                        for size = (vt-size result)
-                        for pos = (if (minusp raw-pos)
-				      (+ size raw-pos)
-				      raw-pos)
-                        do (when (or (< pos 0)
-				     (> pos size))
-			     (error "索引 ~a 越界" raw-pos))
-                           (let ((left (if (> pos 0)
+                          for j from 0
+                          for (norm-pos . val) in pairs
+                          ;; j 为此前已插入的个数，累进插入位置
+                          for pos = (+ norm-pos j)
+                          do (let ((left (if (> pos 0)
 					   (vt-slice result (list 0 pos))
 					   (vt-zeros '(0) :dtype (vt-dtype result))))
-                                 (right (if (< pos size)
-					    (vt-slice result (list pos size))
+                                   (right (if (< pos (vt-size result))
+                                              (vt-slice result (list pos (vt-size result)))
 					    (vt-zeros '(0) :dtype (vt-dtype result)))))
                              (setf result (vt-concatenate 0 left val right)))
                         finally (return result))))))
@@ -159,17 +168,19 @@
 		     (list values-reshaped)
 		     (loop for i from 0 below num
 			   collect (vt-narrow values-reshaped ax i (1+ i)))))
-	       (pairs (stable-sort (loop for pos in obj-list
+                 ;; 先归一化再排序（同 flat 模式，numpy 语义）
+                 (pairs (stable-sort (loop for raw-pos in obj-list
 					 for b in value-blocks
-					 collect (cons pos b))
-				   #'> :key #'car)))
+                                           collect (cons (norm-pos raw-pos ax-size) b))
+                                     #'< :key #'car)))
           (loop with slices = (copy-list arr-slices)
-                for (raw-pos . block) in pairs
-                for size = (length slices)
-                for pos = (if (minusp raw-pos) (+ size raw-pos) raw-pos)
-                do (when (or (< pos 0) (> pos size)) (error "索引 ~a 越界" raw-pos))
-                   (setf slices (append (subseq slices 0 pos) (list block) (subseq slices pos)))
-                finally (return (apply #'vt-concatenate ax slices)))))))
+                  for j from 0
+                  for (norm-pos . block) in pairs
+                  for pos = (+ norm-pos j)
+                  do (setf slices (append (subseq slices 0 pos)
+                                          (list block)
+                                          (subseq slices pos)))
+                  finally (return (apply #'vt-concatenate ax slices))))))))
 
 (defun vt-delete (arr obj &key (axis nil))
   "对标 numpy.delete 删除元素。"

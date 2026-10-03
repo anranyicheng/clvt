@@ -155,12 +155,24 @@
 (defun vt-from-array (arr &key (dtype nil) (fast nil))
   "从标准 CL 多维数组创建张量（保持维度）。
    fast t 意味着直接使用 coerce 转换，可能报错
-        nil 则用 vt-cast 安全转换(默认)"
+        nil 则用 vt-cast 安全转换(默认)
+   未显式指定 :dtype 时按数组元素类型精确推断（覆盖逻辑层 dtype 全集）：
+   v0.3.5 修复——旧实现对 (signed-byte 16/8) 与 (unsigned-byte 8/16)
+   数组一律静默提升为 :int32/:float64，违背 dtype 单一事实来源原则，
+   现按最小精确类型推断（值域严格包含数组元素类型时才选用）。"
   (let* ((shape (array-dimensions arr))
          (size (vt-shape-to-size shape))
          (cl-etype (array-element-type arr))
-         (infer (cond ((subtypep cl-etype 'double-float) :float64)
+         (infer (cond
+                  ;; 窄类型优先：signed-byte 8 ⊂ 16 ⊂ 32 ⊂ 64，
+                  ;; subtypep 判定"数组元素类型是某 dtype 值域的子集"，
+                  ;; 最先匹配者即最小精确 dtype。
+                  ((subtypep cl-etype 'double-float) :float64)
                       ((subtypep cl-etype 'single-float) :float32)
+                  ((subtypep cl-etype '(signed-byte 8))   :int8)
+                  ((subtypep cl-etype '(unsigned-byte 8))  :uint8)
+                  ((subtypep cl-etype '(signed-byte 16))  :int16)
+                  ((subtypep cl-etype '(unsigned-byte 16)) :uint16)
                       ((subtypep cl-etype '(signed-byte 32)) :int32)
                       ((subtypep cl-etype '(signed-byte 64)) :int64)
                       ((subtypep cl-etype 'fixnum) :int64)
