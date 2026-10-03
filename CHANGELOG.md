@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-10-03 — v0.3.4 测试规划落地 / vt-copy-into 零尺寸写入修复
+
+按 TEST-PLAN.md（新增，test/TEST-PLAN.md）建立"类别矩阵 > 函数覆盖 > 断言数量"
+的覆盖策略，并以探针实测（tmp/probe-edge.lisp 方法）逐项对表 numpy 语义。
+
+### 方向 1：vt-copy-into 零尺寸写入早退（bug 回归：stack axis=1 堆叠空 1D）
+
+`(vt-stack 1 (vt-zeros '(0)) (vt-zeros '(0)))` 泄漏 CL 底层序列错误
+"bounding indices 1 and 1 are bad for a sequence of length 0"：
+vt-concatenate 向 (0 2) 结果的 [:, 1:2] 空视图写入时 offset=1、底层
+存储长度=0，快路径按 (offset+size) 计算平坦边界触发 replace 越界。
+修复（core.lisp）：vt-copy-into 在形状兼容性检查后、快路径前增加
+零尺寸早退（v0.3.3 空 strided 问题的写入侧）。零元素写入是 no-op，
+但非法形状仍照常报错——只跳过平坦边界计算，不放宽契约。
+
+### 方向 2：三个新套件（156 条断言，全部通过）
+
+| 套件 | 类目 | 断言 | 内容 |
+|------|------|------|------|
+| test/shape-degenerate-tests.lisp | C1/C2 | 70 | 全 op 家族 × 空形状/退化形状表驱动：创建、元素级、归约（sum/prod 单位元、mean/amax NaN 约定、argmax 报错约定）、matmul/dot/outer/trace、变形、索引、nn、集合运算；含 bug-stack-empty-ax1 回归 |
+| test/property-strided-tests.lisp | C8 | 67 | strided≡contiguous 选路不变量（8 随机形状 × 元素级/归约/转置/argmax/matmul，固定种子确定性）；flip/transpose/reshape 往返、concat 可逆、sum 拆解、sort≡take(argsort) 等 12 项代数恒等式 |
+| test/error-contract-tests.lisp | C7 | 19 | 形状/秩/内维/perm/越界/切片步长/one-hot/einsum/uniform 参数域/整除 0/广播 out 只读等契约错误逐项断言 |
+
+三个套件均已登记 test/run-tests.sh。回归确认无副作用：
+test-copy-into 35、out-contig-tests 23、test-overlap 6、
+test-ai-edge-cases 40、memsafety-tests 6 全部通过。
+
+### 已知分歧与缺口（TEST-PLAN.md §5/§6 记录，不阻塞）
+
+- mean/median/amax/amin 空归约填 NaN、argmax 空输入报错：文档化设计约定，
+  与 numpy（ValueError/空输出）不同；
+- reduce 族 `:out` dtype 决定计算精度（float64 输入 + int32 out 按
+  int32 累加）：契约缺口，需专项决策（对齐 numpy 提升语义或文档化）；
+- vt-random-uniform NaN 参数报 FP 异常而非参数校验错误：L2 达标，
+  错误类型欠佳。
+
+---
+
 ## 2026-10-02 — v0.3.2 首次 SBCL 实测回归 / reduce 小整型内核补全
 
 v0.3.0/v0.3.1 两轮重构均为静态验证（无 SBCL 环境）。本轮在 SBCL 2.6.8 +

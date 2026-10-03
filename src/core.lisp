@@ -24,7 +24,7 @@
   (dtype :float64 :type symbol))
 
 (declaim (inline vt-shape vt-strides vt-offset vt-data vt-dtype vt-p
-		 vt-order vt-size))
+                 vt-order vt-size))
 
 ;;; ------------------------------------------------------------------
 ;;; 访问器与尺寸
@@ -65,7 +65,7 @@
   (if (null shape)
       nil
       (let ((result nil)
-	    (stride 1))
+            (stride 1))
         (declare (type fixnum stride))
         (do ((tail (reverse shape) (cdr tail)))
             ((null tail) result)
@@ -86,7 +86,7 @@
          (lisp-type (vt-dtype->lisp-type dtype))
          (data (make-array size :element-type lisp-type
                                 :initial-element
-				(vt-cast initial-element dtype))))
+                                (vt-cast initial-element dtype))))
     (%make-vt :data data
               :shape shape
               :strides (vt-compute-strides shape)
@@ -136,7 +136,7 @@
 (defun vt-broadcast-shapes (shape1 shape2)
   "计算广播后的结果形状，严格对标 NumPy（右对齐，短形状左侧补 1）。"
   (declare (list shape1 shape2)
-	   (optimize (speed 3) (safety 0)))
+           (optimize (speed 3) (safety 0)))
   (let* ((len1 (length shape1))
          (len2 (length shape2))
          (max-len (max len1 len2))
@@ -171,12 +171,12 @@
     (when (minusp rank-diff)
       (error "vt-broadcast-strides: 原始形状 ~a 的秩大于目标形状 ~a" orig-shape target-shape))
     (let ((t-tail result)
-	  (t-shp target-shape))
+          (t-shp target-shape))
       (dotimes (i rank-diff)
         (declare (type fixnum i))
         (setf (car t-tail) 0)
-	(setf t-tail (cdr t-tail))
-	(setf t-shp (cdr t-shp)))
+        (setf t-tail (cdr t-tail))
+        (setf t-shp (cdr t-shp)))
       (do ((o-shp orig-shape (cdr o-shp))
            (o-str orig-strides (cdr o-str)))
           ((null o-shp) result)
@@ -185,9 +185,9 @@
           (unless (or (= o-dim t-dim) (= o-dim 1))
             (error "vt-broadcast-strides: 形状不匹配! ~a vs ~a" o-dim t-dim))
           (setf (car t-tail)
-		(if (= o-dim 1)
-		    0
-		    (the fixnum (car o-str))))
+                (if (= o-dim 1)
+                    0
+                    (the fixnum (car o-str))))
           (setf t-tail (cdr t-tail))
           (setf t-shp (cdr t-shp)))))))
 
@@ -209,9 +209,9 @@
       nil
       (let* ((axes (if (listp axis) axis (list axis)))
              (sorted (sort (mapcar (lambda (a)
-				     (vt-normalize-axis a rank))
-				   axes)
-			   #'<)))
+                                     (vt-normalize-axis a rank))
+                                   axes)
+                           #'<)))
         (loop for (a b) on sorted
               when (and b (= a b))
                 do (error "vt-normalize-axes: 轴 ~a 重复" a))
@@ -224,9 +224,9 @@
 (defun vt-contiguous-p (vt)
   "判断张量是否为 C 连续（可安全重塑）。对标 numpy 的 c_contiguous 判定。"
   (let ((shape (vt-shape vt))
-	(strides (vt-strides vt)))
+        (strides (vt-strides vt)))
     (if (or (null shape)
-	    (some #'zerop shape))
+            (some #'zerop shape))
         t
         (let ((expected 1) (contiguous t))
           (declare (type fixnum expected))
@@ -291,7 +291,7 @@
         ((vt-contiguous-p tensor)
          (let ((in-et (array-element-type in-data)))
            (macrolet
-	       ((spec (in-lt out-lt)
+               ((spec (in-lt out-lt)
                   (let ((expr (%astype-cast-form out-lt '(aref src p))))
                     `(let ((src (the (simple-array ,in-lt (*)) in-data))
                            (dst (the (simple-array ,out-lt (*)) new-data))
@@ -661,18 +661,25 @@
           (src-shape  (vt-shape src)))
       ;; ---- 1) 可写性检查 ------------------------------------------------
       (when (plusp (vt-size dest))
-	(loop for d in dest-shape
+        (loop for d in dest-shape
               for s in (vt-strides dest)
               when (and (> d 1) (zerop s))
-		do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d)))
+                do (error "vt-copy-into: 目标视图是只读的广播视图（维度 ~a）" d)))
       ;; ---- 2) 形状兼容性 ------------------------------------------------
       (let ((final-shape (vt-broadcast-shapes dest-shape src-shape)))
-	(unless (equal final-shape dest-shape)
+        (unless (equal final-shape dest-shape)
           (error "vt-copy-into: dest 形状 ~a 无法容纳 src 广播后 ~a"
-		 dest-shape final-shape)))
+                 dest-shape final-shape)))
+      ;; ---- 2.5) 零尺寸写入是 no-op（早退）------------------------------
+      ;; 下方快路径按 (offset+size) 计算平坦边界；零尺寸视图的 offset
+      ;; 可能超过底层存储长度（例如 concatenate 向 (0 2) 结果的
+      ;; [:, 1:2] 空切片写入时 offset=1、存储长度=0），先返回，
+      ;; 避免 replace/aref 触发序列越界（v0.3.3 空 strided 问题的写入侧）。
+      (when (zerop (vt-shape-to-size dest-shape))
+        (return-from vt-copy-into dest))
       ;; ---- 3) 别名保护：重叠 → 深拷贝 src 作快照 ------------------------
       (when (%vt-views-overlap-p dest src)
-	(setf src (vt-copy src)))
+        (setf src (vt-copy src)))
       ;; ---- 4) 参数预计算 ------------------------------------------------
       (let* ((dest-data    (vt-data dest))
              (src-data     (vt-data src))
@@ -689,8 +696,8 @@
              (src-contig   (vt-contiguous-p src))
              (same-shape   (equal dest-shape src-shape))
              (same-dtype   (eq dest-dtype src-dtype)))
-	(declare (type fixnum size dest-off src-off rank))
-	(cond
+        (declare (type fixnum size dest-off src-off rank))
+        (cond
           ;; 快路径 1：连续 + 同形 + 同 dtype → replace (memcpy)
           ((and dest-contig src-contig same-shape same-dtype)
            (replace dest-data src-data
@@ -713,7 +720,7 @@
            (%copy-generic dest-data dest-dtype dest-strides dest-off
                           src-data src-strides src-off
                           dest-shape size rank same-dtype)))
-	dest))))
+        dest))))
 
 ;;; ------------------------------------------------------------------
 ;;; 填充

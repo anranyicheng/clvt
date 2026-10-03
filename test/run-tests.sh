@@ -46,6 +46,9 @@ SUITES[test-bug0]="37 已知 bug 回归测试"
 SUITES[test-ai-edge-cases]="40 AI 主流函数语义回归测试 (matmul 1-D/广播 0-size/BCE NaN/vstack)"
 SUITES[memsafety-tests]="6 :out 快路径内存安全测试"
 SUITES[out-contig-tests]="23 out 连续/非连续写入测试"
+SUITES[shape-degenerate-tests]="70 空形状/退化形状表驱动测试 (C1/C2 类目, 见 TEST-PLAN.md)"
+SUITES[property-strided-tests]="67 选路不变量/代数恒等式测试 (C8 类目, strided≡contiguous)"
+SUITES[error-contract-tests]="19 错误路径契约测试 (C7 类目, L2 底线)"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -265,6 +268,9 @@ main() {
             test-ai-edge-cases
             memsafety-tests
             out-contig-tests
+	    shape-degenerate-tests
+	    property-strided-tests
+	    error-contract-tests
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)
