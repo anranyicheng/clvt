@@ -71,9 +71,9 @@ strides 遍历写入（`rs` 向量），天然支持非连续 RES 与广播输�
 |------|----------|------|
 | axis=nil 全局 / 单轴 / 多轴 / keepdims | vt-normalize-axes + def-vt-reduce | 已符合 |
 | int32 累加器提升 int64；float32 保持 float32 | %op-acc-lt / %op-out-dtype | 已符合 |
-| 空归约：有单位元返回单位元 | def-vt-reduce 空分支 | **语义修正**（原 sum/prod/all/any 正确） |
-| 空归约：max/min 族返回 NaN（int 结果提升 float64） | def-vt-reduce 空分支 | **语义修正**（原返回 ±Inf 哨兵） |
-| 空归约：arg 族报错 | def-vt-reduce 空分支 | **语义修正**（原 argmax/argmin 填 0） |
+| 空归约：有单位元（sum/prod/all/any/nan*）返回单位元 | def-vt-reduce 空分支 | 已符合（v0.3.6 复核保留） |
+| 空归约：输出为空（如 `(3 0)` axis=0）→ 所有算子返回空结果 | def-vt-reduce 空分支 | **v0.3.6 修正**（原 max/min 族 NaN 填充、arg 族报错） |
+| 空归约：输出非空且归约区空 → max/min 族与 arg 族 ValueError（消息对齐 numpy） | def-vt-reduce 空分支 | **v0.3.6 修正**（原 max/min 族 NaN 填充） |
 
 ## 七、内存布局与别名
 
@@ -206,3 +206,42 @@ signal FLOATING-POINT-INVALID-OPERATION，`with-float-traps-masked` 无法屏蔽
 
 回归结果：新增 test/refactor-bugfix-tests.lisp（53 条断言，numpy 实测对照），
 `bash test/run-tests.sh` 24/24 套件全部通过。
+
+---
+
+## v0.3.6 numpy 2.1.3 语义对齐（2026-10-05）
+
+本轮以 numpy 2.1.3 实测为基准（逐项运行时探针对表），修正 v0.3.5
+分歧表中三处"设计约定"与 numpy 实际行为的偏差，并收敛 TEST-PLAN §6
+两项契约缺口（#2 :out 精度解耦、#4 random 校验）。修复清单见
+CHANGELOG.md v0.3.6 条目，此处记录与三层分离约定的对照结论：
+
+| 约定 | 实测结论 | 本轮落点 |
+|------|----------|----------|
+| 逻辑层归约语义对齐 numpy | 违反：空归约按自定 NaN 填充约定（max/min 族 NaN、arg 族报错），numpy 实测为"输出空→空结果 / 输出非空且归约区空→ValueError"三分类 | reduce-stats.lisp `def-vt-reduce` 空归约分支重写，14 个生成函数统一生效 |
+| :out 只影响写入目标、不影响计算精度 | 违反：`:out` dtype 决定计算精度（float64 输入 + int32 out 按 int32 累加，静默错值） | def-vt-reduce decoupled 预路径（compute-dtype 临时缓冲 + 尾部 vt-copy-into）+ mean/var/std/nanmean/nanvar/nanstd 三段式解耦；显式 `:dtype` 按 numpy 语义直接计算，不变 |
+| 浮点零除走 IEEE 语义（陷阱屏蔽下） | 违反：vt-mod/vt-rem 零除一律返回 0；vt-/ 整数除零报 CL division-by-zero、整数/整数整型截断；标量除数直接类型崩溃 | elementwise.lisp：mod/rem 按除数 dtype 语义（浮点→NaN、整型→0）；vt-/ 先提升 float64 再除，零除得 ±Inf/NaN |
+| 逻辑层负责校验，非法输入确定性报错 | 缺口：vt-random-normal 的 mean 完全无校验、std 非负检查放过 +Inf；NaN/Inf 判定在陷阱屏蔽外触发 FP-INVALID-OPERATION | random.lisp uniform/normal 校验前移进 with-float-safe，报干净参数错误 |
+| 执行层选路只影响性能不影响正确性 | 落实：decoupled 临时缓冲路径与无 :out 直算路径逐位一致（numpy-convention-tests F6a-g 锁定） | — |
+| 物理层别名安全 | 复审确认：decoupled 尾部写入复用既有 vt-copy-into 跨 dtype 路径，`:out` 广播视图只读契约保留 | — |
+
+过程中的工程教训（补记）：本轮 patch 期间 `def-vt-reduce` 宏体引入
+两处括号错位，全文件括号净差恰好为 0 未被平衡检查发现，实际效果是
+14 个 `(def-vt-reduce xxx)` 调用形式被吞入宏体、新代码从未生效（表现
+为运行时 `The variable IN-ET is unbound`，而 *macroexpand-hook* 捕获
+的编译期展开完全正确）。教训：Lisp 源文件的括号检查不能只看全文件
+净差，必须验证顶层形式边界（宏调用处于深度 0、主绑定作用域覆盖全部
+分派代码）——最终以 sb-cltl2:macroexpand-all 全展开 + 深度曲线定位。
+
+级联影响：空归约语义变化传导至上游组合函数——vt-softmax 对空向量
+输入改为报 ValueError（scipy.special.softmax 实测同款行为，报错源自
+内部 amax 的空归约）。全量回归后同步更新 4 个既有套件的 5 处旧语义
+断言（softmax (0)/BUG-2b 改期望报错、mod 零除两断言改 NaN 期望、
+整数除零 IEEE 断言改 0-d 输入并自屏蔽 FP 陷阱）。另确认测试侧不应
+裸调库内部辅助 `%nan-p`——其 `(= x x)` 实现在陷阱未屏蔽上下文对 NaN
+触发 FLOATING-POINT-INVALID-OPERATION，属"屏蔽陷阱即可安全比较 NaN"
+假设的又一反例（v0.3.5 教训在测试层的重演）。
+
+回归结果：新增 test/numpy-convention-tests.lisp（46 条断言，numpy 2.1.3
+实测对照），级联更新 4 个既有套件 5 处断言后，
+`bash test/run-tests.sh` 25/25 套件全部通过。

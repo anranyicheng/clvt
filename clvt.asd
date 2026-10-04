@@ -4,7 +4,7 @@
   :description "common lisp vector tensor library"
   :author "xizang123321@gmail.com"
   :license  "MIT"
-  :version "0.3.5"
+  :version "0.3.6"
   :serial t
   :depends-on (#+sbcl #:sb-simd)
   :components ((:file "src/package")

@@ -4,6 +4,76 @@
 
 ---
 
+## 2026-10-05 — v0.3.6 numpy 2.1.3 语义对齐：空归约重校准 / :out 精度解耦 / true_divide / random 校验
+
+以 numpy 2.1.3 实测为基准（逐项探针对表），修正 v0.3.5 分歧表中三处
+"设计约定"与 numpy 的偏差，并收敛 TEST-PLAN §6 两项契约缺口。
+新增回归套件 test/numpy-convention-tests.lisp（46 条断言），全部通过。
+
+### 方向 1：空归约语义重校准（reduce-stats.lisp，def-vt-reduce 统一生成）
+
+| 场景 | v0.3.5（NaN 填充约定） | v0.3.6（numpy 对齐） |
+|------|------------------------|----------------------|
+| 输出为空（`(3 0)` axis=0 等） | NaN 填充 / arg 报错 | **所有算子返回空结果**（含 argmax/argmin） |
+| max/min 族输出非空且归约区空 | NaN 填充（整数提升 float64） | **ValueError**（zero-size array to reduction operation ... which has no identity） |
+| arg 族输出非空且归约区空 | 报错 | **ValueError**（attempt to get argmax of an empty sequence，消息对齐 numpy） |
+| 单位元族（sum/prod/all/any/nan*） | 填单位元 | 不变 |
+| mean 空归约 | NaN | NaN（numpy 同款，保留） |
+
+### 方向 2：`:out` 精度解耦（TEST-PLAN §6 #2 收敛）
+
+旧行为：`:out` dtype 决定**计算精度**（float64 输入 + int32 out 按 int32
+累加，静默错值）。新行为：**按输入提升计算**（compute-dtype，与无 :out
+调用逐位一致），最后一步 cast 写入 `:out`（decoupled 预路径）。
+
+- `def-vt-reduce`（sum/prod/amax/amin/all/any/nan*/arg* 共 14 函数）：
+  三条内核路径统一——decoupled 时结果先写入 compute-dtype 临时缓冲，
+  尾部 `vt-copy-into` 跨 dtype 写入 out
+- `vt-mean`/`vt-var`/`vt-std`/`vt-nanmean`/`vt-nanvar`/`vt-nanstd`：
+  compute-dtype / exec-dtype / write-out 三段式解耦（显式 `:dtype` 仍按
+  numpy 语义直接以该 dtype 计算）
+- `:out` 与 `:dtype` 冲突显式报错；`:out` 广播视图（dim>1 且 stride=0）
+  拒绝写入（既有契约保留）
+
+### 方向 3：vt-mod/vt-rem 零除 dtype 语义（elementwise.lisp）
+
+旧行为：零除一律返回 0（库约定）。新行为：**按除数 dtype 语义**——
+浮点语境（除数为浮点标量或张量）→ NaN（numpy mod/fmod 同款），
+整型语境 → 0。混合输入按被除数语境判定。
+
+### 方向 4：vt-/ true_divide 语义（elementwise.lisp）
+
+旧行为：整数除零报 CL division-by-zero；整数/整数返回整型截断。
+新行为（numpy true_divide 同款）：**整数输入先提升 float64 再除**，
+零除按 IEEE 得 ±Inf/NaN（`(vt-/ 5 0)` → +Inf、`(vt-/ 0 0)` → NaN），
+`(vt-/ 5 2)` → 2.5d0（float64）；显式 `:dtype`/`:out` 浮点目标一致处理；
+标量除数不再触发类型崩溃。
+
+### 方向 5：random NaN/Inf 参数校验前移（random.lisp，TEST-PLAN §6 #4 收敛）
+
+`vt-random-uniform`/`vt-random-normal`：`numberp` 检查在最外层，
+NaN/Inf 判定（`%nan-p`/`%inf-p`）前移进 `with-float-safe`（屏蔽
+FP-INVALID-OPERATION）——保证报出干净的参数错误而非 FP 异常。
+本轮补齐 `vt-random-normal` 缺口：mean 有限性校验（此前完全缺失）、
+std 非负**且有限**校验（此前 `>= 0` 放过 +Inf）。
+
+### 测试
+
+- 新增 test/numpy-convention-tests.lisp：46 条断言（空归约三分类 ×17、
+  `:out` 精度解耦 ×8、mod/rem 零除 ×6、true_divide ×6、random 校验 ×9），
+  已注册 run-tests.sh
+- 更新 shape-degenerate-tests.lisp（amax/argmax 空 (3 0) 断言改 numpy 语义、
+  softmax (0) 改期望报错——scipy.special.softmax 实测对空数组抛同款
+  ValueError）、error-contract-tests.lisp（整数除零改 IEEE 断言：0-d 输入
+  + 测试侧 FP 陷阱屏蔽的 NaN 检测）、refactor-bugfix-tests.lisp（mod 零除
+  两断言改 NaN 期望）、test-ai-edge-cases.lisp（BUG-2b softmax 空向量改
+  期望报错）
+- 修复 def-vt-reduce 宏体两处括号错位（patch 期间引入：空归约块提前闭合
+  主 let* 导致 14 个生成函数缺失/旧代码残留，表现为运行时 IN-ET unbound）
+- 清理 vt-var 冗余 write-out 绑定（emit 统一出口后遗留）
+
+---
+
 ## 2026-10-04 — v0.3.5 三层分离复审：非有限值传播 / numpy 语义修复 / 内存安全校验
 
 在 SBCL 2.6.8 + Quicklisp 环境下按三层分离约定逐文件复审全部源码，

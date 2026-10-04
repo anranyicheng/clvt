@@ -202,40 +202,52 @@
 (defun vt-random-uniform
     (shape &key (low 0.0d0) (high 1.0d0) (dtype :float64) (rng nil))
   "均匀分布采样。low/high 必须为有限实数（NaN/±Inf 会静默产生无意义样本）；
-   low = high 合法，返回常量数组（对标 numpy.random.uniform）。"
+   low = high 合法，返回常量数组（对标 numpy.random.uniform）。
+   参数校验前移（v0.3.6，TEST-PLAN §6 #4）：在任何浮点求值之前完成，
+   且 NaN/Inf 判定本身在屏蔽 FP 陷阱的上下文中进行——否则 NaN 参数会
+   在校验阶段先触发 FP-INVALID-OPERATION，报出错误类型而非干净的参数错误。"
   (declare (list shape))
   (unless (and (numberp low) (numberp high))
     (error "vt-random-uniform: low/high 必须为实数，得到 ~a / ~a" low high))
-  (unless (and (not (%nan-p low)) (not (%inf-p low))
-               (not (%nan-p high)) (not (%inf-p high)))
-    (error "vt-random-uniform: low/high 必须有限，得到 ~a / ~a" low high))
-  (unless (<= low high)
-    (error "vt-random-uniform: 要求 low <= high，得到 low=~a high=~a" low high))
-  (setf rng (%ensure-random-state rng))
-  (if (= low high)
-      (vt-full shape low :dtype dtype)
-      (let ((range (- high low)))
-        (vt-map (lambda (x)
-                  (declare (ignore x))
-                  (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
-                (vt-zeros shape :dtype dtype)))))
+  (with-float-safe
+    (unless (and (not (%nan-p low)) (not (%inf-p low))
+                 (not (%nan-p high)) (not (%inf-p high)))
+      (error "vt-random-uniform: low/high 必须有限，得到 ~a / ~a" low high))
+    (unless (<= low high)
+      (error "vt-random-uniform: 要求 low <= high，得到 low=~a high=~a" low high))
+    (setf rng (%ensure-random-state rng))
+    (if (= low high)
+        (vt-full shape low :dtype dtype)
+        (let ((range (- high low)))
+          (vt-map (lambda (x)
+                    (declare (ignore x))
+                    (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
+                  (vt-zeros shape :dtype dtype))))))
 
 (defun vt-random-normal
     (shape &key (mean 0.0d0) (std 1.0d0) (dtype :float64) (rng nil))
-  "正态分布采样。std 必须为非负有限实数（负 std 会静默产生镜像分布，
-   对标 numpy 对 scale < 0 的报错）；std = 0 返回 mean 填充。"
+  "正态分布采样。mean/std 必须为有限实数（NaN/±Inf 会静默产生无意义样本，
+   对标 uniform 的对称校验）；std 另须非负（负 std 会静默产生镜像分布，
+   对标 numpy 对 scale < 0 的报错）；std = 0 返回 mean 填充。
+   参数校验前移并屏蔽 FP 陷阱（v0.3.6，同 vt-random-uniform）——
+   NaN/Inf 判定本身在屏蔽 FP 陷阱的上下文中进行，保证报出干净的参数错误。"
   (declare (list shape))
-  (unless (and (numberp std) (not (%nan-p std)) (>= std 0))
-    (error "vt-random-normal: std 必须为非负有限实数，得到 ~a" std))
-  (setf rng (%ensure-random-state rng))
-  (if (zerop std)
-      (vt-full shape mean :dtype dtype)
-      (let ((res (vt-zeros shape :dtype dtype)))
-        (vt-do-each (ptr val res)
-          (declare (ignore val))
-          (setf (aref (vt-data res) ptr)
-                (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
-        res)))
+  (unless (and (numberp mean) (numberp std))
+    (error "vt-random-normal: mean/std 必须为实数，得到 ~a / ~a" mean std))
+  (with-float-safe
+    (unless (and (not (%nan-p mean)) (not (%inf-p mean)))
+      (error "vt-random-normal: mean 必须有限，得到 ~a" mean))
+    (unless (and (not (%nan-p std)) (not (%inf-p std)) (>= std 0))
+      (error "vt-random-normal: std 必须为非负有限实数，得到 ~a" std))
+    (setf rng (%ensure-random-state rng))
+    (if (zerop std)
+        (vt-full shape mean :dtype dtype)
+        (let ((res (vt-zeros shape :dtype dtype)))
+          (vt-do-each (ptr val res)
+            (declare (ignore val))
+            (setf (aref (vt-data res) ptr)
+                  (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
+          res))))
 
 (defun vt-random-int
     (low high &key (size nil) (dtype :int64) (rng nil))

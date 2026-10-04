@@ -44,6 +44,12 @@
 | `test/property-strided-tests.lisp` | C8 C10 C3 | 性质测试：固定种子随机形状上断言 `strided≡contiguous`；代数对合恒等式 |
 | `test/error-contract-tests.lisp` | C7 | 每条已文档化契约错误一个 `check-error`；期望与探针实测一致 |
 
+**v0.3.6 新增：**
+
+| 套件 | 类目 | 方法 |
+|------|------|------|
+| `test/numpy-convention-tests.lisp` | C1 C5 C7 | numpy 2.1.3 对齐语义专项：空归约三分类、`:out` 精度解耦、mod/rem 零除 dtype 语义、true_divide IEEE、random 参数校验（46 断言） |
+
 **既有套件职责（不变）：** run_all_tests（全函数基础值）、run_param_tests
 （3D+ 参数化）、nested-test（组合）、robustness-test（C1/C6 部分形态）、
 coverage-gap-test、comprehensive-test、auto-compare/numpy-compare（差异化
@@ -59,27 +65,36 @@ coverage-gap-test、comprehensive-test、auto-compare/numpy-compare（差异化
    仅作参考，不作为完成度指标。
 4. 任何套件失败即整体失败（run-tests.sh 以退出码聚合）。
 
-## 5. 与 numpy 的已知分歧（本轮探针实测登记）
+## 5. 与 numpy 的已知分歧（探针实测登记）
 
-以下均为**有源码注释的设计约定**，测试按 clvt 当前契约编码；
-是否向 numpy 收敛留给维护者决策：
+**v0.3.6 重校准**：下表旧版中标记"设计约定"的三行已于 v0.3.6 全部向
+numpy 2.1.3 收敛（实测基准：numpy 2.1.3 探针逐项对表），语义回归由
+**numpy-convention-tests** 套件固化：
+
+| 场景 | v0.3.5 行为 | numpy 2.1.3 实测 | v0.3.6 状态 |
+|------|-------------|------------------|-------------|
+| `mean` 空张量（全局或空轴） | NaN | NaN（+warning） | ✅ 一致（NaN 保留） |
+| `amax/amin` 空张量 | NaN 填充（整数提升 float64） | **ValueError**（zero-size → no identity） | ✅ **改为 ValueError** |
+| `amax/amin` 输出为空（如 `(3 0)` axis=0） | NaN 填充 | **空结果 shape (0)** | ✅ **改为返回空结果** |
+| `argmax/argmin` 输出非空且归约区空（`(0)`、`(3 0)` axis=1） | 报错 | **ValueError**（attempt to get argmax of an empty sequence） | ✅ 一致（保留报错） |
+| `argmax/argmin` 输出为空（`(3 0)` axis=0） | 一律报错 | **空结果 shape (0)** | ✅ **改为返回空结果** |
+| 整数除以 0 | CL `division-by-zero` 错误 | 提升浮点，IEEE ±Inf/NaN | ✅ **改为 true_divide 语义**（IEEE，不再报错） |
+| `vt-random-uniform` NaN low/high | FP-INVALID-OPERATION | — | ✅ **改为干净参数错误**（校验前移 + 屏蔽 FP 陷阱） |
+
+**v0.3.6 仍保留的分歧（决策：保留）：**
 
 | 场景 | clvt 行为 | numpy 行为 | 状态 |
 |------|-----------|------------|------|
-| `mean/median` 空张量（全局或空轴） | 返回 NaN | ValueError（+warning） | 设计约定：NaN 作为空归约错误信号 |
-| `amax/amin` 空张量（全局或空轴） | NaN 填充（整数提升 float64） | ValueError | 同上 |
-| `argmax/argmin` 输入含空（即使输出为空，如 `(3 0)` axis=0） | 一律报错 | 仅归约轴为空时报错；`(3 0)` axis=0 返回 `(0)` | 设计约定：arg 归约空输入无定义 |
-| 整数除以 0 | CL `division-by-zero` 错误 | 返回 0（+warning） | 更严格，可接受 |
-| `vt-random-uniform` NaN low/high | FP-INVALID-OPERATION（非契约错误类型） | — | 报错达标，错误类型欠佳（§6 #4） |
+| `mod/rem` 零除 | 浮点语境 NaN / 整型语境 0（按 dtype 语义） | fmod/mod 混合规则 | ✅ 与 numpy 逐 dtype 对齐后一致 |
 
-## 6. 契约缺口清单（探针发现，待处理）
+## 6. 契约缺口清单（探针发现）
 
-| # | 缺口 | 现状 | 建议 |
+| # | 缺口 | 现状 | 说明 |
 |---|------|------|------|
-| 1 | `stack` axis=1 堆叠空 1D 崩溃，泄漏 CL 序列错误 | **本轮已修**（`vt-copy-into` 零尺寸写入早退，v0.3.3 同类写入侧） | 回归用例在 shape-degenerate-tests |
-| 2 | `sum` 等 reduce：`:out` dtype 决定计算精度（float64 输入 + int32 out 按 int32 累加） | 静默，未报错 | 与 reduce 精度模型耦合，需专项决策：对齐 numpy（计算按输入提升，写入 cast 校验）或文档化 |
-| 3 | `nonzero` 返回结构（单 (0) 张量的 list）与 numpy tuple 形态一致，但文档未写明 | 行为正确 | docstring 补返回结构说明 |
-| 4 | `vt-random-uniform` NaN 参数报 FP 异常而非参数校验错误 | 仍是报错（L2 达标） | 把参数校验前移到任何浮点求值之前 |
+| 1 | `stack` axis=1 堆叠空 1D 崩溃，泄漏 CL 序列错误 | **已修**（v0.3.5，`vt-copy-into` 零尺寸写入早退） | 回归用例在 shape-degenerate-tests |
+| 2 | reduce 族 `:out` dtype 决定计算精度（float64 输入 + int32 out 按 int32 累加） | **已修**（v0.3.6）：按输入提升计算（compute-dtype），最后一步 cast 写入 `:out`；`def-vt-reduce` 三条内核路径统一 decoupled 预路径，mean/var/std/nanmean/nanvar/nanstd 同款解耦 | 与无 `:out` 结果逐位一致，numpy-convention-tests §2 固化 |
+| 3 | `nonzero` 返回结构与 numpy tuple 形态一致，但文档未写明 | 行为正确 | docstring 补返回结构说明 |
+| 4 | `vt-random-uniform/normal` NaN 参数报 FP 异常而非参数校验错误 | **已修**（v0.3.6）：`numberp` 检查在最外层，NaN/Inf 判定前移进 `with-float-safe`（屏蔽 FP-INVALID）；normal 补齐 mean 有限性 + std 非负有限校验 | error-contract-tests + numpy-convention-tests §5 固化 |
 
 ## 7. 运行方式
 

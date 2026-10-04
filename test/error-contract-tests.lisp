@@ -17,6 +17,12 @@
 (defparameter *pass* 0)
 (defparameter *fail* 0)
 
+(defun check (label cond)
+  (if cond
+      (progn (incf *pass*) (format t "  ok  ~a~%" label))
+      (progn (incf *fail*) (format t "  FAIL ~a~%" label)))
+  (finish-output))
+
 (defun check-error (label thunk)
   (declare (optimize (speed 0)))
   (handler-case
@@ -74,17 +80,30 @@
   ;; —— 随机数参数校验（文档化契约）——
   (check-error "uniform low > high"
                (lambda () (vt-random-uniform '(3) :low 2d0 :high 1d0)))
-  (check-error "uniform NaN low（契约达成，错误类型欠佳：FP 异常，见 TEST-PLAN §6 #4）"
+  (check-error "uniform NaN low（v0.3.6：校验前移 + 屏蔽 FP 陷阱，干净参数错误）"
                (lambda () (vt-random-uniform '(3) :low +vt-float-nan+)))
+  (check-error "normal NaN mean（v0.3.6：mean/std 有限性校验）"
+               (lambda () (vt-random-normal '(3) :mean +vt-float-nan+)))
+  (check-error "normal +Inf std（v0.3.6：std 非负且有限）"
+               (lambda () (vt-random-normal '(3) :std (vt-float-pos-inf))))
 
   ;; —— 已文档化的空归约约定（与 numpy 的分歧见 TEST-PLAN §5）——
-  (check-error "argmax 空输入（约定：arg 归约无定义）"
+  (check-error "argmax 空输入（numpy 语义：输出非空且归约区空）"
                (lambda () (vt-argmax (vt-zeros '(0)))))
 
   ;; —— 算术 ——
-  (check-error "整数除以 0（比 numpy 更严格：报错而非回 0）"
-               (lambda () (vt-item (vt-/ (vt-const '(1) 3 :dtype :int64)
-                                         (vt-const '(1) 0 :dtype :int64)))))
+  ;; v0.3.6：整数输入先提升 float64 再除（numpy true_divide 语义），
+  ;; 零除按 IEEE 得 ±Inf / NaN，不再报错。
+  ;; 用 0-d 输入（vt-item 仅对 0-d 返回标量）；NaN 检测须自屏蔽 FP 陷阱
+  ;; （%nan-p 是库内部辅助函数，假定调用方已处于 with-float-safe 上下文）
+  (check "整数 3/0 → +Inf（IEEE，不再报错）"
+         (= (vt-item (vt-/ (vt-const '() 3 :dtype :int64)
+                           (vt-const '() 0 :dtype :int64)))
+            (vt-float-pos-inf)))
+  (check "整数 0/0 → NaN（IEEE）"
+         (let ((x (vt-item (vt-/ (vt-const '() 0 :dtype :int64)
+                                 (vt-const '() 0 :dtype :int64)))))
+           (with-float-safe (not (= x x)))))
 
   (format t "~%通过 ~a / 失败 ~a~%" *pass* *fail*)
   (finish-output)

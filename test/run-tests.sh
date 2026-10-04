@@ -50,6 +50,7 @@ SUITES[shape-degenerate-tests]="70 空形状/退化形状表驱动测试 (C1/C2 
 SUITES[property-strided-tests]="67 选路不变量/代数恒等式测试 (C8 类目, strided≡contiguous)"
 SUITES[error-contract-tests]="19 错误路径契约测试 (C7 类目, L2 底线)"
 SUITES[refactor-bugfix-tests]="55 v0.3.5 重构回归测试 (floor族NaN/insert numpy语义/solve校验/tensordot负轴等)"
+SUITES[numpy-convention-tests]="37 numpy 2.1.3 对齐语义测试 (v0.3.6: 空归约/:out解耦/mod零除/true_divide/random校验)"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -273,6 +274,7 @@ main() {
 	    property-strided-tests
 	    error-contract-tests
             refactor-bugfix-tests
+            numpy-convention-tests
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)

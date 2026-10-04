@@ -120,15 +120,17 @@
   (run-case "prod (0)=1"         '(:ok :scalar 1.0d0)            (lambda () (vt-item (vt-prod (vt-zeros '(0))))))
   (run-case "prod (3 0) ax1=1"   '(:ok :value (1.0d0 1.0d0 1.0d0)) (lambda () (vt-prod (vt-zeros '(3 0)) :axis 1)))
   (run-case "nansum (0)=0"       '(:ok :scalar 0.0d0)            (lambda () (vt-item (vt-nansum (vt-zeros '(0))))))
-  ;; 设计约定（TEST-PLAN §5）：max/mean 族空归约 → NaN 信号
+  ;; numpy 语义（v0.3.6，TEST-PLAN §5 重校准）：mean 空归约 → NaN；
+  ;;   max/min 族输出非空且归约区空 → ValueError（取代旧 NaN 填充约定）；
+  ;;   输出为空 → 一律返回空结果
   (run-case "mean (0)=NaN约定"   '(:ok :scalar nan)             (lambda () (vt-item (vt-mean (vt-zeros '(0))))))
-  (run-case "amax (0)=NaN约定"   '(:ok :scalar nan)             (lambda () (vt-item (vt-amax (vt-zeros '(0))))))
-  (run-case "amax (3 0) ax1 NaN约定" '(:ok :nan (3))             (lambda () (vt-amax (vt-zeros '(3 0)) :axis 1)))
+  (run-case "amax (0) numpy报错" '(:error)                       (lambda () (vt-item (vt-amax (vt-zeros '(0))))))
+  (run-case "amax (3 0) ax1 numpy报错" '(:error)                (lambda () (vt-amax (vt-zeros '(3 0)) :axis 1)))
   (run-case "amax (3 0) ax0"     '(:ok :shape (0))               (lambda () (vt-amax (vt-zeros '(3 0)) :axis 0)))
-  ;; 设计约定（TEST-PLAN §5）：arg 归约空输入一律报错
+  ;; numpy 语义（v0.3.6）：arg 归约输出为空 → 空结果；输出非空且归约区空 → 报错
   (run-case "argmax (0) 报错约定"    '(:error) (lambda () (vt-argmax (vt-zeros '(0)))))
   (run-case "argmax (3 0) ax1 报错约定" '(:error) (lambda () (vt-argmax (vt-zeros '(3 0)) :axis 1)))
-  (run-case "argmax (3 0) ax0 报错约定" '(:error) (lambda () (vt-argmax (vt-zeros '(3 0)) :axis 0)))
+  (run-case "argmax (3 0) ax0 输出空" '(:ok :shape (0)) (lambda () (vt-argmax (vt-zeros '(3 0)) :axis 0)))
   (run-case "all (0)=T"   '(:ok :scalar 1) (lambda () (vt-item (vt-all (vt-zeros '(0))))))
   (run-case "any (0)=NIL" '(:ok :scalar 0) (lambda () (vt-item (vt-any (vt-zeros '(0))))))
   (run-case "cumsum (0)"  '(:ok :shape (0)) (lambda () (vt-cumsum (vt-zeros '(0)))))
@@ -197,7 +199,8 @@
   (run-case "relu (0 2)"          '(:ok :shape (0 2)) (lambda () (vt-relu (vt-zeros '(0 2)))))
   (run-case "sigmoid (0)"         '(:ok :shape (0))   (lambda () (vt-sigmoid (vt-zeros '(0)))))
   (run-case "softmax (0 2) ax1"   '(:ok :shape (0 2)) (lambda () (vt-softmax (vt-zeros '(0 2)) :axis 1)))
-  (run-case "softmax (0)"         '(:ok :shape (0))   (lambda () (vt-softmax (vt-zeros '(0)))))
+  (run-case "softmax (0) numpy报错（scipy 对齐：内部 amax 空归约）" '(:error)
+            (lambda () (vt-softmax (vt-zeros '(0)))))
   (run-case "unique (0)"          '(:ok :shape (0))   (lambda () (vt-unique (vt-zeros '(0)))))
   (run-case "union1d (0)+(2,2,2)" '(:ok :value (2.0d0))
             (lambda () (vt-union1d (vt-zeros '(0)) (vt-const '(3) 2d0))))

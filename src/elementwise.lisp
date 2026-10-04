@@ -50,16 +50,45 @@
 (defun vt-/ (vt &rest args)
   "一元：1 / vt（倒数）；二元及以上：vt / arg1 / arg2 / ...
    VT 是第一个张量，其余从 ARGS 解析。
-   整型输入默认提升到 float64，与 numpy 对齐。"
+   语义对标 numpy.true_divide（v0.3.6 起）：
+   除法恒以浮点语义计算——整型输入先提升为浮点再除，
+   零除按 IEEE 754 返回 ±Inf/NaN（CL 的整数除零错误不再出现）；
+   显式整型 :dtype 除外（保持截断语义，零除确定性报错）。"
   (with-float-safe
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
-      (let* ((all (cons (ensure-vt vt) tensors))
+      (let* ((all (mapcar #'ensure-vt (cons vt tensors)))
+             (float-target
+               (cond ((and dtype (member dtype '(:float64 :float32))) dtype)
+                     ((and (null dtype) out
+                           (member (vt-dtype out) '(:float64 :float32)))
+                      (vt-dtype out))
+                     ((and (null dtype) (null out)
+                           (every (lambda (x) (vt-int-dtype-p (vt-dtype x))) all))
+                      :float64)
+                     ((and (null dtype) (null out)
+                           (some (lambda (x) (vt-int-dtype-p (vt-dtype x))) all))
+                      (if (every (lambda (x)
+                                   (or (eq (vt-dtype x) :float32)
+                                       (vt-int-dtype-p (vt-dtype x))))
+                                 all)
+                          :float32
+                          :float64))))
              (effective-dtype
                (cond (dtype dtype)
                      (out   (vt-dtype out))
-                     ((every (lambda (x) (vt-int-dtype-p (vt-dtype x))) all)
-                      :float64)
-                     (t nil))))
+                     (t float-target))))
+        ;; 计算前把整型输入预转换为浮点（numpy true_divide 语义）：
+        ;; 避免 CL 整数除零信号 division-by-zero（numpy 为 ±Inf），
+        ;; 也避免 (/ int 0) 混合类型除法在浮点目标下的类型错误。
+        ;; 顺带修复：标量除数（如 (vt-/ t 0)）先经 ensure-vt 转为 0 维张量，
+        ;; 不再因 vt-dtype 作用于数字而直接类型崩溃。
+        (when (and float-target
+                   (some (lambda (x) (vt-int-dtype-p (vt-dtype x))) all))
+          (setf all (mapcar (lambda (x)
+                              (if (vt-int-dtype-p (vt-dtype x))
+                                  (vt-astype x float-target)
+                                  x))
+                            all)))
         (case (length all)
           (1 (vt-fast-map #'/ (make-vt nil 1 :dtype (vt-dtype (first all)))
                               (first all)
@@ -251,45 +280,53 @@
 (defun vt-mod (vt divisor &key out dtype)
   "逐元素取模。DIVISOR 可为标量或张量（自动广播）。
    语义对标 numpy.remainder：结果与除数同号；
-   除数为 0 时返回 0（库约定，对标 np.mod 的整型零除）；
+   除数为 0 时按 numpy dtype 语义（v0.3.6 起）：
+   浮点语境（任一操作数为浮点）→ NaN；整型语境 → 0；
    NaN 任一侧出现 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
-  (if (numberp divisor)
+  (flet ((zero-div (x)
+           ;; numpy 语义：浮点语境零除 → NaN，整型语境 → 0
+           (if (floatp x) (%mod-float-nan x) 0)))
+    (if (numberp divisor)
   (vt-map (lambda (x)
                 (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
                       ((%mod-nan-or-inf-p divisor) (%mod-float-nan x))
-                      ((and (numberp divisor) (zerop divisor)) 0)
+                      ((and (numberp divisor) (zerop divisor)) (zero-div x))
                       ((and (floatp divisor) (%inf-p divisor)) x)
                       (t (mod x divisor))))
               vt :out out :dtype dtype)
       (vt-map (lambda (x y)
                 (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
                       ((%mod-nan-or-inf-p y) (%mod-float-nan x))
-                      ((zerop y) 0)
+                      ((zerop y) (zero-div x))
                       ((and (floatp y) (%inf-p y)) x)
                       (t (mod x y))))
-              vt divisor :out out :dtype dtype)))
+              vt divisor :out out :dtype dtype))))
 
 (defun vt-rem (vt divisor &key out dtype)
   "逐元素余数。DIVISOR 可为标量或张量（自动广播）。
    CL:rem 为截断除法余数（与被除数同号），对标 numpy.fmod
    （docstring 曾误标 numpy.remainder，现已更正）。
-   除数为 0 时返回 0（库约定）；NaN 任一侧 → NaN；
-   被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
-  (if (numberp divisor)
+   除数为 0 时按 numpy dtype 语义（v0.3.6 起）：
+   浮点语境（任一操作数为浮点）→ NaN；整型语境 → 0；
+   NaN 任一侧 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
+  (flet ((zero-div (x)
+           ;; numpy 语义：浮点语境零除 → NaN，整型语境 → 0
+           (if (floatp x) (%mod-float-nan x) 0)))
+    (if (numberp divisor)
   (vt-map (lambda (x)
                 (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
                       ((%mod-nan-or-inf-p divisor) (%mod-float-nan x))
-                      ((zerop divisor) 0)
+                      ((zerop divisor) (zero-div x))
                       ((and (floatp divisor) (%inf-p divisor)) x)
                       (t (rem x divisor))))
               vt :out out :dtype dtype)
       (vt-map (lambda (x y)
                 (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
                       ((%mod-nan-or-inf-p y) (%mod-float-nan x))
-                      ((zerop y) 0)
+                      ((zerop y) (zero-div x))
                       ((and (floatp y) (%inf-p y)) x)
                       (t (rem x y))))
-              vt divisor :out out :dtype dtype)))
+              vt divisor :out out :dtype dtype))))
 
 (defun vt-atan2 (vty vtx &key out dtype)
   (vt-fast-map #'atan vty vtx :out out :dtype dtype))

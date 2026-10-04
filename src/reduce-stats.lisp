@@ -515,66 +515,71 @@
                     (in-off  (vt-offset tensor))
                     (in-et   (array-element-type in-data))
                     (in-size (vt-size tensor))
+                    ;; ---- 计算 dtype 与结果 dtype 解耦（numpy :out 语义，§6 #2）----
+                    ;; compute-dtype 是「按输入提升后的自然结果 dtype」：
+                    ;; 计算始终用它进行（与无 :out 调用逐位一致）；
+                    ;; 当 :out 的 dtype 与之不同且未显式给 :dtype 时，
+                    ;; 先计算进临时缓冲，最后一步再 cast 写入 :out
+                    ;; （numpy 语义：按输入提升计算、最后 cast 写入 out）。
+                    (compute-dtype (%op-out-dtype ,op (vt-dtype tensor)))
                     (final-out-dtype
-                      (or dtype
-                          (and out (vt-dtype out))
-                          (%op-out-dtype ,op (vt-dtype tensor))))
-                    (res-lt (%dtype->lt final-out-dtype))
-                    (res (or out (make-vt out-shape 0 :dtype final-out-dtype)))
+                      (cond (dtype dtype)
+                            (out (vt-dtype out))
+                            (t compute-dtype)))
+                    (decoupled (and out (null dtype)
+                                    (not (eq final-out-dtype compute-dtype))))
+                    (res-lt (%dtype->lt (if decoupled compute-dtype final-out-dtype)))
+                    (res (cond (decoupled (make-vt out-shape 0 :dtype compute-dtype))
+                               (out out)
+                               (t (make-vt out-shape 0 :dtype final-out-dtype))))
                     (res-data (vt-data res))
                     (res-off  (vt-offset res)))
                (declare (fixnum rank axis-size in-size))
                (unless res-lt
                  (error "vt-~a: unsupported output dtype ~a" ',name final-out-dtype))
-               ;; ---- 空归约语义（设计约定：空归约按"是否有单位元"分类）----
-               ;; 有单位元的操作返回单位元：sum/nansum→0、prod/nanprod→1、
-               ;;   all→1、any→0（内部整型编码）。
-               ;; max/min 族无单位元：空归约填充 NaN 作为错误信号；
-               ;;   整数结果 dtype 无法表示 NaN，按约定提升为 float64。
-               ;; argmax/argmin/nanargmax/nanargmin 无单位元且无哨兵值，必须报错。
+               ;; ---- 空归约语义（numpy 对齐，v0.3.6 起）----
+               ;; numpy 2.1.3 实测（修正旧 §5 表中 mean/amax 行的误记）：
+               ;;   * 输出为空（size=0，如 (3,0) axis=0）→ 所有算子直接返回空结果；
+               ;;   * 输出非空且归约区为空：
+               ;;     - max/min/nanmax/nanmin → ValueError（zero-size array to
+               ;;       reduction operation ... which has no identity），
+               ;;       取代 v0.3.5 的 NaN 填充约定；
+               ;;     - argmax/argmin/nanargmax/nanargmin → ValueError（attempt
+               ;;       to get argmax of an empty sequence）——仅在输出非空时报；
+               ;;     - sum/prod/all/any（含 nan 变体）有单位元 → 填充单位元
+               ;;       （sum→0、prod→1、all→1、any→0）。
                (when (or (zerop axis-size) (zerop in-size))
-                 ,@(when arg-p
-                     `((error "vt-~a: 空张量（或空轴）上不存在最大/最小元素，arg 归约无定义"
-                              ',name)))
-                 ,(if (member (%op-base op) '(:max :min))
-                      `(progn
-                         (cond
-                           ;; 显式整数 :dtype 与 NaN 结果冲突：硬契约报错（§8.2）
-                           ((and dtype (member dtype '(:int64 :int32 :int16 :int8 :uint8 :uint16)))
-                            (error "vt-~a: 空张量上的 max/min 归约结果为 NaN，与显式 :dtype ~a 冲突"
-                                   ',name dtype))
-                           ;; 派生的整数结果 dtype 无法表示 NaN：按约定提升为 float64；
-                           ;; 调用方显式提供整数 :out 时违反 out 契约，必须报错。
-                           ((member final-out-dtype
-                                    '(:int64 :int32 :int16 :int8 :uint8 :uint16))
-                            (if out
-                                (error "vt-~a: 空张量上的 max/min 归约结果为 NaN，无法写入整数 :out (dtype ~a)"
-                                       ',name final-out-dtype)
-                                (progn
-                                  (setf final-out-dtype :float64)
-                                  (setf res (make-vt out-shape 0 :dtype :float64))
-                                  (vt-fill res (vt-get-nan :float64))
-                                  (return-from ,fn-name res))))
-                           ;; 浮点结果：直接填充 NaN 作为"空归约"错误信号
-                           (t
-                            (vt-fill res (vt-get-nan final-out-dtype))
-                            (return-from ,fn-name res))))
-                      `(progn
-                         ;; 有单位元：返回单位元（%op-init 提供编译期常量）
-                         (let ((lt (%et->lt in-et)))
-                           (vt-fill res
-                                    (cond
-                                      ,@(loop for rlt in +kernel-lts+
-                                              collect
-                                              `((equal res-lt ',rlt)
-                                                (cond
-                                                  ,@(loop for l in +all-lts+
-                                                          collect
-                                                          `((equal lt ',l)
-                                                            ,(%op-init op l rlt)))
-                                                  (t 0))))
-                                      (t 0))))
-                         (return-from ,fn-name res))))
+                 (cond
+                   ;; 1) 输出为空：直接返回空结果
+                   ((zerop (vt-shape-to-size out-shape))
+                    (return-from ,fn-name (if decoupled out res)))
+                   ;; 2) arg 族：输出非空 → 报错（numpy 语义）
+                   ,@(when arg-p
+                       `((t (error "vt-~a: attempt to get arg~a of an empty sequence（numpy 语义：输出非空且归约区为空）"
+                                   ',name ,(if (member op '(:argmin :nanargmin))
+                                               "min" "max")))))
+                   ;; 3) max/min 族：输出非空 → 报错（numpy 语义，取代旧 NaN 填充约定）
+                   ,@(when (member (%op-base op) '(:max :min))
+                       `((t (error "vt-~a: zero-size array to reduction operation ~a which has no identity（numpy 语义：输出非空且归约区为空）"
+                                   ',name ,(if (eq (%op-base op) :max)
+                                               "maximum" "minimum")))))
+                   ;; 4) 单位元族：填充单位元（%op-init 提供编译期常量）
+                   (t
+                    (let ((lt (%et->lt in-et)))
+                      (vt-fill res
+                               (cond
+                                 ,@(loop for rlt in +kernel-lts+
+                                         collect
+                                         `((equal res-lt ',rlt)
+                                           (cond
+                                             ,@(loop for l in +all-lts+
+                                                     collect
+                                                     `((equal lt ',l)
+                                                       ,(%op-init op l rlt)))
+                                             (t 0))))
+                                 (t 0)))
+                      (return-from ,fn-name
+                        (if decoupled (progn (vt-copy-into out res) out) res))))))
                ;; ---- 主分派 ----
                ;; 小整型（逻辑级 dtype）不进入类型特化内核：路径 1/2 以
                ;; wide-et 守卫排除，统一由路径 3 的 %kernel-small-general 兜底。
@@ -636,7 +641,9 @@
                          (non-size (reduce #'* non-sizes :initial-value 1)))
                     (declare (fixnum n-red n-non red-size non-size))
                     ,(dispatch '%kernel-general :small-int-p t))))
-               res)))))))
+               ;; decoupled：计算结果在临时缓冲（compute-dtype），
+               ;; 最后一步 cast 写入 :out（vt-copy-into 支持跨 dtype 与视图写入）
+               (if decoupled (progn (vt-copy-into out res) out) res))))))))
 
 ;;; ============================================================
 ;;; 归约族定义
@@ -739,13 +746,22 @@
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (multiple-value-bind (axes count) (%get-axes-count axis rank shape)
-      (let* ((final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
+      (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
+             (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                                  (error "vt-mean: :out 与 :dtype 冲突"))
-                                (out (vt-dtype out)) (dtype dtype)
-                                (t (if (eq (vt-dtype tensor) :float32)
-                                       :float32 :float64)))))
+                                (dtype dtype)
+                                (out (vt-dtype out))
+                                (t compute-dtype)))
+             ;; ---- :out 精度解耦（numpy 语义）----
+             ;; 均值计算始终按输入提升的浮点精度（compute-dtype）进行，
+             ;; 与无 :out 调用逐位一致，最后一步才 cast 写入 :out；
+             ;; 显式 :dtype 仍按 numpy 语义直接以该 dtype 计算。
+             (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
+                             compute-dtype
+                             final-dtype))
+             (write-out (and out (not (eq exec-dtype (vt-dtype out))))))
         (when (= count 0)
-          (let ((nan (vt-get-nan final-dtype))
+          (let ((nan (vt-get-nan exec-dtype))
                 (out-shape (if keepdims
                                (loop for d in shape
                                      for i below rank
@@ -755,50 +771,85 @@
                                      unless (or (null axes) (member i axes))
                                        collect d))))
             (return-from vt-mean
-              (if out (progn (vt-map (lambda (x)
-                                       (declare (ignore x)) nan)
-                                     out :dtype final-dtype :out out)
-                             out)
-                  (vt-full out-shape nan :dtype final-dtype)))))
+              (cond (write-out
+                     (let ((tmp (vt-full out-shape nan :dtype exec-dtype)))
+                       (vt-copy-into out tmp)
+                       out))
+                    (out (vt-fill out nan) out)
+                    (t (vt-full out-shape nan :dtype exec-dtype))))))
         (let* ((sum-result (vt-sum tensor :axis axes :keepdims keepdims
-                                          :dtype final-dtype :out out))
-               (div (coerce count (if (eq final-dtype :float32)
+                                   :dtype exec-dtype
+                                   :out (and out (not write-out) out)))
+               (div (coerce count (if (eq exec-dtype :float32)
                                       'single-float 'double-float))))
-          (vt-map (lambda (s) (/ s div))
-                  sum-result :dtype final-dtype :out sum-result))))))
+          (cond (write-out
+                 (let ((tmp (vt-map (lambda (s) (/ s div))
+                                    sum-result :dtype exec-dtype)))
+                   (vt-copy-into out tmp)
+                   out))
+                (t (vt-map (lambda (s) (/ s div))
+                           sum-result :dtype exec-dtype :out sum-result))))))))
 
 (defun vt-var (tensor &key axis keepdims (ddof 0) dtype out)
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (multiple-value-bind (axes n) (%get-axes-count axis rank shape)
-      (let* ((divisor (- n ddof))
+      (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
              (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                                  (error "vt-var: :out 与 :dtype 冲突"))
-                                (out (vt-dtype out)) (dtype dtype)
-                                (t (if (eq (vt-dtype tensor) :float32)
-                                       :float32 :float64)))))
-        (if (<= divisor 0)
-            (vt-map (lambda (s)
-                      (declare (ignore s))
-                      (vt-get-nan final-dtype))
-                    (vt-sum tensor :axis axes :keepdims keepdims)
-                    :dtype final-dtype :out out)
-            (let* ((mean-val (vt-mean tensor :axis axes :keepdims t :dtype final-dtype))
-                   (sq-diff (vt-square (vt-- tensor mean-val :dtype final-dtype)
-                                       :dtype final-dtype))
-                   (sum-sq (vt-sum sq-diff :axis axes :keepdims keepdims
-                                           :dtype final-dtype :out out)))
-              (vt-/ sum-sq divisor :dtype final-dtype :out sum-sq)))))))
+                                (dtype dtype)
+                                (out (vt-dtype out))
+                                (t compute-dtype)))
+             ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
+             (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
+                             compute-dtype
+                             final-dtype))
+             (divisor (- n ddof))
+             (out-shape (if keepdims
+                            (loop for d in shape for i below rank
+                                  collect (if (or (null axes) (member i axes)) 1 d))
+                            (loop for d in shape for i below rank
+                                  unless (or (null axes) (member i axes)) collect d)))
+             (emit (lambda (result-vt)
+                     ;; 统一出口：cast/写入 :out（write-out 时经 vt-copy-into 跨 dtype）
+                     (if out
+                         (progn (unless (eq result-vt out)
+                                  (vt-copy-into out result-vt))
+                                out)
+                         result-vt))))
+        (cond
+          ((<= divisor 0)
+           ;; ddof ≥ 归约区元素数：方差无定义 → NaN（numpy 语义）
+           (funcall emit (vt-full out-shape (vt-get-nan exec-dtype)
+                                  :dtype exec-dtype)))
+          (t
+           (let* ((mean-val (vt-mean tensor :axis axes :keepdims t
+                                     :dtype exec-dtype))
+                  (sq-diff (vt-square (vt-- tensor mean-val :dtype exec-dtype)
+                                      :dtype exec-dtype))
+                  (sum-sq (vt-sum sq-diff :axis axes :keepdims keepdims
+                                  :dtype exec-dtype))
+                  (res (vt-/ sum-sq divisor :dtype exec-dtype)))
+             (funcall emit res))))))))
 
 (defun vt-std (tensor &key axis keepdims (ddof 0) dtype out)
-  (let* ((final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
+  (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
+         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                              (error "vt-std: :out 与 :dtype 冲突"))
-                            (out (vt-dtype out)) (dtype dtype)
-                            (t (if (eq (vt-dtype tensor) :float32)
-                                   :float32 :float64)))))
+                            (dtype dtype)
+                            (out (vt-dtype out))
+                            (t compute-dtype)))
+         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean/vt-var）----
+         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
+                         compute-dtype
+                         final-dtype)))
     (let ((variance (vt-var tensor :axis axis :keepdims keepdims :ddof ddof
-                                   :dtype final-dtype :out out)))
-      (vt-sqrt variance :dtype final-dtype :out variance))))
+                            :dtype exec-dtype
+                            :out (and out (eq exec-dtype (vt-dtype out)) out))))
+      (setf variance (vt-sqrt variance :dtype exec-dtype))
+      (cond ((null out) variance)
+            ((eq variance out) out)
+            (t (vt-copy-into out variance) out)))))
 
 ;;; ------------------------------------------------------------------
 ;;; 累积
@@ -1227,56 +1278,95 @@
 (defun vt-nanmean (tensor &key axis keepdims dtype out)
   (let* ((mask (vt-isnan tensor))
          (not-nan (vt-logical-not mask))
+         (compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
          (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                              (error "vt-nanmean: :out 与 :dtype 冲突"))
-                            (out (vt-dtype out)) (dtype dtype)
-                            (t (if (eq (vt-dtype tensor) :float32) :float32 :float64))))
-         (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
-         (clean (vt-where mask zero tensor :dtype final-dtype))
-         ;; count 使用与最终结果相同的浮点dtype，避免float->int强制转换错误
-         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
-         (nan (vt-get-nan final-dtype))
-         (sum (vt-sum clean :axis axis :keepdims keepdims :dtype final-dtype :out out)))
-    (vt-map (lambda (s c)
-              (if (<= c zero) nan (/ s c)))
-            sum count :dtype final-dtype :out sum)))
+                            (dtype dtype)
+                            (out (vt-dtype out))
+                            (t compute-dtype)))
+         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
+         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
+                         compute-dtype
+                         final-dtype))
+         (write-out (and out (not (eq exec-dtype (vt-dtype out)))))
+         (zero (if (eq exec-dtype :float32) 0.0s0 0.0d0))
+         (clean (vt-where mask zero tensor :dtype exec-dtype))
+         ;; count 使用与计算相同的浮点dtype，避免float->int强制转换错误
+         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype exec-dtype))
+         (nan (vt-get-nan exec-dtype))
+         (sum (vt-sum clean :axis axis :keepdims keepdims
+                      :dtype exec-dtype
+                      :out (and out (not write-out) out))))
+    (cond (write-out
+           (let ((tmp (vt-map (lambda (s c)
+                                (if (<= c zero) nan (/ s c)))
+                              sum count :dtype exec-dtype)))
+             (vt-copy-into out tmp)
+             out))
+          (t (vt-map (lambda (s c)
+                       (if (<= c zero) nan (/ s c)))
+                     sum count :dtype exec-dtype :out sum)))))
 
 (defun vt-nanvar (tensor &key axis keepdims (ddof 0) dtype out)
   (let* ((mask (vt-isnan tensor))
          (not-nan (vt-logical-not mask))
+         (compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
          (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                              (error "vt-nanvar: :out 与 :dtype 冲突"))
-                            (out (vt-dtype out)) (dtype dtype)
-                            (t (if (eq (vt-dtype tensor) :float32) :float32 :float64))))
-         (nan (vt-get-nan final-dtype))
-         (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
-         (clean (vt-where mask zero tensor :dtype final-dtype))
+                            (dtype dtype)
+                            (out (vt-dtype out))
+                            (t compute-dtype)))
+         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
+         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
+                         compute-dtype
+                         final-dtype))
+         (write-out (and out (not (eq exec-dtype (vt-dtype out)))))
+         (nan (vt-get-nan exec-dtype))
+         (zero (if (eq exec-dtype :float32) 0.0s0 0.0d0))
+         (clean (vt-where mask zero tensor :dtype exec-dtype))
          ;; count 使用浮点dtype
-         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
-         (mean (vt-nanmean tensor :axis axis :keepdims t :dtype final-dtype))
+         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype exec-dtype))
+         (mean (vt-nanmean tensor :axis axis :keepdims t :dtype exec-dtype))
          (sq-diff (vt-* (vt-map (lambda (c m)
                                   (* (- c m) (- c m)))
-                                clean mean :dtype final-dtype)
-                        not-nan :dtype final-dtype))
-         (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims :dtype final-dtype :out out))
+                                clean mean :dtype exec-dtype)
+                        not-nan :dtype exec-dtype))
+         (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims
+                       :dtype exec-dtype
+                       :out (and out (not write-out) out)))
          ;; divisor 使用浮点dtype
-         (ddof-f (coerce ddof (vt-dtype->lisp-type final-dtype)))
+         (ddof-f (coerce ddof (vt-dtype->lisp-type exec-dtype)))
          (divisor (vt-map (lambda (c)
                             (if (< c ddof-f) zero (- c ddof-f)))
-                          count :dtype final-dtype)))
-    (vt-map (lambda (s d)
-              (if (<= d zero) nan (/ s d)))
-            sum2 divisor :dtype final-dtype :out sum2)))
+                          count :dtype exec-dtype)))
+    (cond (write-out
+           (let ((tmp (vt-map (lambda (s d)
+                                (if (<= d zero) nan (/ s d)))
+                              sum2 divisor :dtype exec-dtype)))
+             (vt-copy-into out tmp)
+             out))
+          (t (vt-map (lambda (s d)
+                       (if (<= d zero) nan (/ s d)))
+                     sum2 divisor :dtype exec-dtype :out sum2)))))
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
-  (let* ((final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
+  (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
+         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
                              (error "vt-nanstd: :out 与 :dtype 冲突"))
-                            (out (vt-dtype out)) (dtype dtype)
-                            (t (if (eq (vt-dtype tensor) :float32)
-                                   :float32 :float64))))
-         (var (vt-nanvar tensor :axis axis :keepdims keepdims :ddof ddof
-                                :dtype final-dtype :out out)))
-    (vt-sqrt var :dtype final-dtype :out var)))
+                            (dtype dtype)
+                            (out (vt-dtype out))
+                            (t compute-dtype)))
+         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
+         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
+                         compute-dtype
+                         final-dtype)))
+    (let ((var (vt-nanvar tensor :axis axis :keepdims keepdims :ddof ddof
+                          :dtype exec-dtype
+                          :out (and out (eq exec-dtype (vt-dtype out)) out))))
+      (setf var (vt-sqrt var :dtype exec-dtype))
+      (cond ((null out) var)
+            ((eq var out) out)
+            (t (vt-copy-into out var) out)))))
 
 (defun vt-nanmedian (tensor &key axis keepdims out)
   (with-float-safe

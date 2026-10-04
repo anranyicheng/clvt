@@ -109,10 +109,10 @@
   (check "BUG-2a (0)-(1) 广播 → shape (0)" '(0)
          (if (eq r :crash) :crash (vt-shape r))))
 (let ((s (handler-case
-             (vt-softmax (vt-from-sequence '() :dtype :float64))
+             (progn (vt-softmax (vt-from-sequence '() :dtype :float64)) :ok)
            (error (e) (format t "  crash: ~a~%" e) :crash))))
-  (check "BUG-2b softmax 空向量 → shape (0)" '(0)
-         (if (eq s :crash) :crash (vt-shape s))))
+  (check "BUG-2b softmax 空向量 → ValueError（v0.3.6：scipy 对齐，内部 amax 空归约）"
+         t (eq s :crash)))
 ;; (2,0) op (2,1) 同类广播（strided 路径）
 (let ((r (handler-case
              (vt-- (vt-reshape (vt-from-sequence '() :dtype :float64) '(2 0))

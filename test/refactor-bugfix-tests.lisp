@@ -95,13 +95,15 @@
 (check "rem(-5,3) = -2（与被除数同号，numpy.fmod）" '(-2.0d0)
        (coerce (vt-data (vt-rem (vt-from-sequence '(-5)) 3)) 'list)
        :test (=* 1e-12))
-(check "mod(x,0) = 0（库约定）" '(0.0d0 0.0d0)
+(check "mod([5,7],0) = [nan,nan]（v0.3.6：浮点被除数语境 IEEE 零除）"
+       (list +nan+ +nan+)
        (coerce (vt-data (vt-mod (vt-from-sequence '(5 7)) 0)) 'list)
        :test (=* 1e-12))
 (check "mod(5,nan) = nan" t (vt-item (vt-mod (vt-const '() 5.0d0) +nan+)) :test (v1= +nan+))
 (check "mod(nan,3) = nan" t (vt-item (vt-mod (vt-const '() +nan+) 3)) :test (v1= +nan+))
 (check "rem(5,nan) = nan" t (vt-item (vt-rem (vt-const '() 5.0d0) +nan+)) :test (v1= +nan+))
-(check "mod(5,tensor[0]) 逐元素零除 = [0,0]" '(0.0d0 0.0d0)
+(check "mod(5,tensor[0]) 逐元素零除 = [nan,nan]（v0.3.6：浮点除数语境）"
+       (list +nan+ +nan+)
        (coerce (vt-data (vt-mod (vt-from-sequence '(5 7))
                                 (vt-from-sequence '(0 0)))) 'list)
        :test (=* 1e-12))
