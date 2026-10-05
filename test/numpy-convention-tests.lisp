@@ -190,6 +190,65 @@
   (check "uniform low=high → 常量填充"
          (= (vt-item (vt-random-uniform nil :low 2.5d0 :high 2.5d0)) 2.5d0))
 
+  ;; ================================================================
+  ;; 6. clip / where 对齐 numpy 2.x 签名（本轮新增）
+  ;; ================================================================
+  (format t "~%[6] clip / where numpy 2.x 签名对齐~%")
+  (let ((a (vt-from-sequence '(1.0d0 2.0d0 3.0d0))))
+    ;; clip 无边界 → 返回原值（numpy: np.clip(a) == a）
+    (check "clip 无边 → 原值"
+           (equal (vt-to-list (vt-clip a)) '(1.0d0 2.0d0 3.0d0)))
+    (check "clip(nil,nil) → 原值"
+           (equal (vt-to-list (vt-clip a nil nil)) '(1.0d0 2.0d0 3.0d0)))
+    ;; clip 只给 max（min=nil）→ numpy: np.clip(a,None,2) == [1,2,2]
+    (check "clip(nil,2) 只上限"
+           (equal (vt-to-list (vt-clip a nil 2.0d0)) '(1.0d0 2.0d0 2.0d0)))
+    ;; clip 只给 min（max=nil）→ numpy: np.clip(a,2,None) == [2,2,3]
+    (check "clip(2,nil) 只下限"
+           (equal (vt-to-list (vt-clip a 2.0d0 nil)) '(2.0d0 2.0d0 3.0d0)))
+    ;; clip 双侧
+    (check "clip(1.5,2.5) 双侧"
+           (equal (vt-to-list (vt-clip a 1.5d0 2.5d0)) '(1.5d0 2.0d0 2.5d0)))
+    ;; clip min>max → 全为 max（numpy: np.clip(a,2,2) == [2,2,2]）
+    (check "clip(2,2) min>max → 全 max"
+           (equal (vt-to-list (vt-clip a 2.0d0 2.0d0)) '(2.0d0 2.0d0 2.0d0)))
+    ;; clip 只给 min 不给 max → 报错（numpy TypeError）
+    (check-error "clip(2) 只给 min → 报错"
+                 (lambda () (vt-clip a 2.0d0)))
+    ;; clip 整型 dtype 保持
+    (let ((ai (vt-from-sequence '(1 2 3) :dtype :int64)))
+      (check "clip int 无边 dtype 保持"
+             (eq :int64 (vt-dtype (vt-clip ai))))
+      (check "clip int(nil,2) 保 dtype 且截断"
+             (and (eq :int64 (vt-dtype (vt-clip ai nil 2)))
+                  (equal (vt-to-list (vt-clip ai nil 2)) '(1 2 2))))))
+
+  ;; where 单参 → 返回 (n,rank) 坐标（对齐 np.where(cond)）
+  (check "where 单参 1d → (n,1) 坐标"
+         (equal (vt-to-list (vt-where (vt-from-sequence '(1 0 1)))) '((0) (2))))
+  (check "where 单参 2d → (n,2) 坐标"
+         (equal (vt-to-list (vt-where (vt-from-sequence '((1 0) (0 1)))))
+                '((0 0) (1 1))))
+  (check "where 单参与 argwhere 一致"
+         (equal (vt-to-list (vt-where (vt-from-sequence '(1 0 1))))
+                (vt-to-list (vt-argwhere (vt-from-sequence '(1 0 1))))))
+  ;; where 三元形式回归
+  (check "where 三元正常"
+         (equal (vt-to-list (vt-where (vt-from-sequence '(1 0 1)) 10 20)) '(10 20 10)))
+  ;; where 只给 x → 报错
+  (check-error "where 只给 x → 报错"
+               (lambda () (vt-where (vt-from-sequence '(1 0 1)) 5)))
+
+  ;; vt-div 整数零除 → 0（对标 np.floor_divide）
+  (check "div int 7/0 → 0（不报错）"
+         (equal (vt-to-list (vt-div (vt-from-sequence '(7) :dtype :int64) 0)) '(0)))
+  (check "div int 7/0 dtype 保持 INT64"
+         (eq :int64 (vt-dtype (vt-div (vt-from-sequence '(7) :dtype :int64) 0))))
+  (check "div int 7/2 → 3（截断）"
+         (equal (vt-to-list (vt-div (vt-from-sequence '(7) :dtype :int64) 2)) '(3)))
+  (check "div int -7/3 → -2（截断非 floor）"
+         (equal (vt-to-list (vt-div (vt-from-sequence '(-7) :dtype :int64) 3)) '(-2)))
+
   (format t "~%通过 ~a / 失败 ~a~%" *pass* *fail*)
   (finish-output)
   (zerop *fail*))

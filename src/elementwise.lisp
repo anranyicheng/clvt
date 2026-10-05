@@ -148,10 +148,17 @@
   (vt-fast-map #'* a b :dtype dtype :out out))
 
 (defun vt-div (a b &key dtype out)
-  "逐元素除法（二元特化入口），等价于 (vt-/ a b)。
-      注意：此入口不套用 vite_divide 的整型→浮点提升，
-      结果为 CL 原生 / 语义；需要 numpy true_divide 语义请用 vt-/。"
-  (vt-fast-map #'/ a b :dtype dtype :out out))
+  "逐元素整除（二元特化入口）。整数输入按截断除法（对标 numpy.floor_divide
+      的整数语义）；浮点输入按 IEEE 真除。
+      整数除数为 0 时返回 0（对标 numpy：floor_divide(int, 0) → 0，不报错）；
+      浮点除数为 0 时按 IEEE 得 ±Inf/NaN。
+      需要 numpy true_divide 语义（整型提升 float64）请用 vt-/。"
+  (vt-map (lambda (x y)
+            (cond ((and (integerp x) (integerp y) (zerop y)) 0)
+                  ((and (integerp x) (integerp y)) (truncate x y))
+                  (t (/ x y))))
+          (ensure-vt a) (ensure-vt b)
+          :dtype dtype :out out))
 
 (defun vt-scale (a b &key out dtype)
   "按标量缩放（等价 vt-* a b），NaN/Inf 按 IEEE 754 正常传播。
@@ -644,10 +651,41 @@
   (let ((x (if (> x maxv) maxv x)))
     (if (< x minv) minv x)))
 
-(defun vt-clip (vt min-val max-val &key out dtype)
-  "逐元素裁剪。MIN-VAL / MAX-VAL 是标量（不是张量）。
-   语义：clip(x, min, max) = min(max, max(min, x))"
-  (vt-fast-map #'%op-clip vt min-val max-val :dtype dtype :out out))
+(defun vt-clip (vt &optional (min-val nil min-p) (max-val nil max-p)
+                   &key out dtype)
+  "逐元素裁剪，完全对标 numpy.clip 的签名与边界语义。
+
+  签名对齐 numpy 2.3.5 的 `clip(a, a_min=None, a_max=None)`：
+    - `(vt-clip a)`              两个边界均省略 → 返回 a 的副本（不裁剪）；
+    - `(vt-clip a nil max)`      仅给上限（MIN-VAL 传 nil）→ min(x, max)；
+    - `(vt-clip a min nil)`      仅给下限（MAX-VAL 传 nil）→ max(x, min)；
+    - `(vt-clip a min max)`      双侧裁剪 → min(max, max(min, x))；
+    - `(vt-clip a min)`          仅给 MIN-VAL 而没有 MAX-VAL → **报错**
+      （对齐 numpy 的 `TypeError: clip() missing 1 required
+      positional argument: 'a_max'`；numpy 不允许只给下限）。
+
+  MIN-VAL / MAX-VAL 是标量，不是张量。:dtype / :out 契契约同 vt-map
+  （结果 dtype 由输入提升或显式 :dtype 决定，out 必须精确匹配）。"
+  (when (and min-p (not max-p))
+    (error "vt-clip: 只提供 MIN-VAL 而未提供 MAX-VAL（numpy 语义：clip() \
+missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
+  (cond
+    ;; 不裁剪（两边界均省略）：直接返回副本，保持 dtype/形状不变
+    ((and (null min-val) (null max-val))
+     (let ((r (if out
+                  (vt-check-out out (vt-shape vt) (or dtype (vt-dtype vt))
+                                :op-name "vt-clip")
+                  (vt-zeros (vt-shape vt) :dtype (or dtype (vt-dtype vt))))))
+       (vt-copy-into r vt)
+       r))
+    ;; 仅上限：min(x, max)
+    ((null min-val)
+     (vt-map (lambda (x) (min x max-val)) vt :dtype dtype :out out))
+    ;; 仅下限：max(x, min)
+    ((null max-val)
+     (vt-map (lambda (x) (max x min-val)) vt :dtype dtype :out out))
+    ;; 双侧：min(max, max(min, x))，与 %op-clip 同义
+    (t (vt-fast-map #'%op-clip vt min-val max-val :dtype dtype :out out))))
 
 (defun vt-lerp (start end weight &key out dtype)
   "逐元素线性插值 start + (end - start) * weight，
@@ -659,15 +697,14 @@
           :dtype dtype :out out))
 
 (defun vt-cbrt (vt &key out dtype)
-  "逐元素立方根。"
+  "逐元素立方根。定义为 signum(x)*|x|^(1/3)，因此负数返回实数值
+      （对标 numpy.cbrt，不返回 NaN）。整数输入输出 float64。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (third (if (eq dt :float32)
 		    (/ 3.0s0)
 		    (/ 3.0d0))))
     (vt-map (lambda (x) (* (signum x) (expt (abs x) third)))
             vt :out out :dtype dt)))
-  "逐元素立方根。定义为 signum(x)*|x|^(1/3)，因此负数返回实数值
-      （对标 numpy.cbrt，不返回 NaN）。整数输入输出 float64。"
 
 (defun vt-hypot (t1 t2 &key out dtype)
   "逐元素直角三角斜边 sqrt(x² + y²)（对标 numpy.hypot）。任一输入为 ±Inf → 结果 +Inf；NaN 传播。"

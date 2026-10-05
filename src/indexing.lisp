@@ -206,26 +206,46 @@
           (setf (vt-ref target-view) scalar))
         (vt-copy-into target-view value))))
 
-(defun vt-where (condition x y &key out dtype)
-  "三元条件选择（对标 torch.where / np.where(cond, x, y)）。
+(defun vt-where (condition &optional (x nil x-p) (y nil y-p) &key out dtype)
+  "条件选择，完全对标 numpy.where 的两种形式。
 
-  dtype 语义（§4.2 H3「严格相等」）：
-    结果 dtype = 显式 :dtype，否则为 (promote x y) —— **不由 out 决定**。
-    out 的 dtype/形状必须精确匹配结果，否则报错（错误信息以 \"vt-where\" 开头）。"
-  (setf condition (ensure-vt condition)
-	x (ensure-vt x)
-	y (ensure-vt y))
-  (let* ((target-shape (vt-broadcast-shapes
-			(vt-shape condition)
-                        (vt-broadcast-shapes (vt-shape x) (vt-shape y))))
-         (promoted (vt-promote-type (vt-dtype x) (vt-dtype y)))
-         (final-dtype (or dtype promoted))
-         ;; 统一硬契约（H1–H4）：形状/dtype 严格相等/可写
-         (result (if out
-                     (vt-check-out out target-shape final-dtype :op-name "vt-where")
-                     (vt-zeros target-shape :dtype final-dtype))))
-    (vt-map (lambda (c a b) (if (/= c 0) a b))
-            condition x y :out result :dtype final-dtype)))
+  两种用法：
+    1. `(vt-where cond x y ...)` —— 三元选择（对标 np.where(cond, x, y)）：
+       条件非零处取 X，否则取 Y，三者均支持广播。
+       dtype 语义（§4.2 H3「严格相等」）：
+         结果 dtype = 显式 :dtype，否则为 (promote x y) —— **不由 out 决定**。
+         out 的 dtype/形状必须精确匹配结果，否则报错（错误信息以 \"vt-where\"
+         开头）。
+    2. `(vt-where cond)` —— 单参数形式（对标 np.where(cond)）：
+       返回条件中非零元素的坐标，形状 (n, rank)（int64），等价于
+       `(vt-argwhere cond)`。
+
+  只给 X 或只给 Y（参数不配对）时报错，对齐 numpy 的必填参数语义。"
+  (let ((x-p x-p) (y-p y-p))
+    (cond
+      ;; 单参数形式：返回坐标 (n, rank)
+      ((and (not x-p) (not y-p))
+       (vt-argwhere (ensure-vt condition)))
+      ;; 参数不配对 → 报错
+      ((not y-p)
+       (error "vt-where: 单参数形式只接受 (vt-where cond)；\
+若要三元选择必须同时提供 X 与 Y（当前缺少 Y）"))
+      (t
+       (setf condition (ensure-vt condition)
+             x (ensure-vt x)
+             y (ensure-vt y))
+       (let* ((target-shape (vt-broadcast-shapes
+                             (vt-shape condition)
+                             (vt-broadcast-shapes (vt-shape x) (vt-shape y))))
+              (promoted (vt-promote-type (vt-dtype x) (vt-dtype y)))
+              (final-dtype (or dtype promoted))
+              ;; 统一硬契约（H1–H4）：形状/dtype 严格相等/可写
+              (result (if out
+                          (vt-check-out out target-shape final-dtype
+                                        :op-name "vt-where")
+                          (vt-zeros target-shape :dtype final-dtype))))
+         (vt-map (lambda (c a b) (if (/= c 0) a b))
+                 condition x y :out result :dtype final-dtype))))))
 
 (defun vt-argwhere (condition &key (dtype :int64))
   "返回非零元素坐标，形状 (n, rank)。"

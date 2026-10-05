@@ -292,7 +292,7 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 ```
 这三个名字（`float` 泛指）**实际指代 double**，是误导来源。用户要求删除。
 
-**裁决：⚠️ 需重构 —— 删除这三个常量。**
+**裁决：✅ 已删除这三个常量**（重构完成）。
 
 | 删除 | 替代 |
 |---|---|
@@ -361,15 +361,19 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 
 | 运算 | NumPy 行为（实测） | 裁决 |
 |---|---|---|
-| `floor_divide(int, 0)` | `0`（不报错！） | ⚠️ 需对齐 |
-| `mod(int, 0)` | `0` | ⚠️ 需对齐 |
+| `floor_divide(int, 0)` | `0`（不报错！） | ✅ 已对齐（`vt-div`） |
+| `mod(int, 0)` | `0`（dtype 保持整型） | ✅ 已对齐 |
 | `mod(float, 0)` | `nan` | ✅ |
-| `floor_divide(float, 0)` | `inf` | ✅ |
+| `floor_divide(float, 0)` | `inf` / `nan`（IEEE） | ✅ |
 | `mod(-7, 3)` | `2`（符号跟随除数） | ✅ |
 | `floor_divide(-7, 3)` | `-3` | ✅ |
 | `nan → int` cast | `INT_MIN` 或 `0`（实现定义，本库已约定 **0**） | 保留本库约定（NumPy 未定义，属自由区） |
 
-> **注意**：本库 `vt-mod`/`vt-rem` 的"零除 dtype 语义 + `zero-div`"设计**与 NumPy 不符**：NumPy 整数零除返回 0 而非报错。裁决：**跟随 NumPy（返回 0）**。
+> **注意**：clvt 的对应关系——`vt-div` 对标 `np.floor_divide`（整数截断除法，
+> 零除返回 `0`）；`vt-/` 对标 `np.true_divide`（整型提升浮点，零除按 IEEE 得
+> ±Inf/NaN）。`vt-mod`（余数符号跟随除数）对标 `np.remainder`；`vt-rem`
+> （余数符号跟随被除数）对标 `np.fmod`。四者整数零除均返回 `0`、**dtype 保持
+> 整型**（不再提升 float64），与 numpy 实测一致。
 
 **奇偶判定**：`vt-even-p` / `vt-odd-p` 对**非有限值**（NaN / ±Inf）一律判定为**不成立**（返回 `0`），不报错、不进入取整路径（避免 §7.1 的 SBCL 浮点陷阱）。
 
@@ -536,12 +540,13 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 
 | 函数族 | 关键对齐点 | 状态 |
 |---|---|---|
-| `vt-+ - * /` | varargs；`vt-/` 整型输入预提升 float64（NumPy true_divide） | ✅（`:`out` dtype 校验缺失 → D2） |
-| `vt-mod/rem` | 零除返回 0（整数）/ nan（浮点）；符号跟随除数 | ⚠️ 需改 |
+| `vt-+ - * /` | varargs；`vt-/` 整型输入预提升 float64（NumPy true_divide） | ✅ 已对齐（D2 已修） |
+| `vt-mod/rem` | 零除返回 0（整数，dtype 保持）/ nan（浮点）；符号跟随除数 | ✅ 已对齐 |
+| `vt-div` | 对标 `np.floor_divide`：整数截断除法，整数零除返回 0（不报错）；浮点按 IEEE | ✅ 已对齐（本轮） |
 | `vt-maximum/minimum/fmax/fmin` | NaN 传播 vs 忽略 | ✅ 正面样板（D10） |
-| `vt-clip` | `a_min`/`a_max` 至少给一个；`a_min > a_max` 时结果全为 `a_max` | ⚠️ 需改（D5） |
-| `vt-hypot` | 任一 Inf → `+Inf`（即使另一为 NaN） | ⚠️ 需改（D4） |
-| `vt-reciprocal` | 整数输入 → NumPy 返回 0（整型倒数恒 0） | ⚠️ 需改（D9） |
+| `vt-clip` | 对齐 numpy 2.3.5 `clip(a, a_min=None, a_max=None)`：两边界均可省（返回原值）；只给 max 合法；**只给 min 报错**；`a_min > a_max` → 全为 `a_max` | ✅ 已对齐（本轮） |
+| `vt-hypot` | 任一 Inf → `+Inf`（即使另一为 NaN） | ✅ 已对齐（D4） |
+| `vt-reciprocal` | 整数输入 → NumPy 返回 0（整型倒数恒 0） | ✅ 已对齐（D9） |
 | `vt-signum` | `sign(0) → 0`；`sign(nan) → nan` | ✅ |
 | `vt-sum/prod` | 整数 → int64；float32 → float32 | ✅ 正面样板（D12） |
 | `vt-mean/var/std` | 整数 → float64；`ddof` 已支持（默认 0） | ✅（**缺 docstring** → 任务5） |
@@ -564,8 +569,8 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | `vt-arange` | 整型溢出与 `int16/int8/uint*` 一致采用**回绕**语义（`%wrap-*`），不报错（见 §9.1） | ✅ |
 | `vt-linspace` | float32 输出**以 double 精度计算后舍入存储**（对标 NumPy，避免累积漂移） | ✅ |
 | `vt-random-uniform` / `vt-random-normal` | `uniform` 要求 `low`/`high` 为有限实数，`low = high` 合法（返回常量数组）；`normal` 要求 `std` 为非负有限实数，`std = 0` 返回 `mean` 填充 | ✅ |
-| `vt-slice` | spec 语法须与文档统一（**无 `:range`** → D1） | ⚠️ 仅需补文档 |
-| `vt-where` | 支持单参数形式返回索引（→ D6） | ⚠️ 需改 |
+| `vt-slice` | spec 语法须与文档统一（**无 `:range`** → D1） | ✅ 实现正确，仅需补文档 |
+| `vt-where` | 单参数形式 `(vt-where cond)` 返回 (n,rank) 坐标（对标 `np.where(cond)`）；三元形式同 `np.where(cond,x,y)` | ✅ 已对齐（本轮，D6） |
 | 空归约 | 三分类语义 | ✅ 正面样板（D11） |
 | 比较运算 | 返回 `:int8` 承载布尔（0/1） | ✅（文档需写明） |
 | 三角/反三角 | `asin/acos/atan` 命名（非 arc*），越界返回 NaN | ✅（命名见 §3.1.1） |
@@ -699,7 +704,9 @@ C1 形状/秩 · C2 dtype · C3 广播 · C4 归约轴 · C5 NaN/Inf · C6 空�
 ```
 
 结果 dtype (`float64`) 与 out dtype (`float32`) 不一致却静默通过。
-**裁决**：⚠️ 必须报错（见 §4.2 H3）。这是**静默数据损坏**风险：用户以为拿到 float64，实得被截断的 float32。
+**裁决**：✅ **已修复**（本轮验证）——现报错 `vt-fast-map: :out dtype FLOAT32
+与结果 dtype FLOAT64 不匹配`。这是**静默数据损坏**风险：用户以为拿到
+float64，实得被截断的 float32。
 
 ### D3 — `vt-floor` 家族对非有限值**行为正确**，但需补测试
 
@@ -725,23 +732,34 @@ C1 形状/秩 · C2 dtype · C3 广播 · C4 归约轴 · C5 NaN/Inf · C6 空�
 `most-positive-double-float` 是 CL 内置的**有限最大值**（≈1.8e308），语义**完全不同于** Inf。
 **裁决**：⚠️ 库内**一律**使用 `+vt-dfloat-pos-inf+` 表示 Inf；文档、测试、注释中不得混用。这是 D4 误判的根因，须在任务5 中全库排查。
 
-### D5 — `vt-clip` 无默认边界参数（违反 NumPy 签名）
+### D5 — `vt-clip` 签名已对齐 numpy 2.3.5
 
 ```lisp
-(vt-clip (vt-from-sequence '(1.0 2.0 3.0)))
-;; => ERROR: invalid number of arguments: 1
+(vt-clip a)          ; → 返回 a 的副本（不裁剪），对齐 np.clip(a)
+(vt-clip a nil 2.0)  ; → 仅上限，对齐 np.clip(a, None, 2)
+(vt-clip a 2.0 nil)  ; → 仅下限，对齐 np.clip(a, 2, None)
+(vt-clip a 2.0)      ; → 报错（对齐 numpy TypeError: missing a_max）
+(vt-clip a 2.0 2.0)  ; → 全为 2.0，对齐 np.clip(a, 2, 2)
 ```
-NumPy `np.clip(a, a_min=None, a_max=None)` 允许只给一个边界。
-**裁决**：⚠️ 改为 `(vt-clip vt &optional min-val max-val ...)`，允许 `nil` 表示不限。同时需支持 `a_min > a_max` 时结果为 `a_max`（NumPy 实测 `np.clip([1,2,3],2,2) → [2,2,2]`）。
 
-### D6 — `vt-where` 不支持单参数形式（违反 NumPy）
+NumPy 2.3.5 实测：`clip(a, a_min=None, a_max=None)`——两边界**均可省略**，
+但**不允许只给 `a_min`**（缺 `a_max` 抛 TypeError）。
+**裁决**：✅ **已按 numpy 2.3.5 对齐**（本轮修复）。签名改为
+`(vt-clip vt &optional min-val max-val &key out dtype)`；`min-val` 传 `nil`
+表示不设下限、`max-val` 传 `nil` 表示不设上限；只给 `min-val` 而省略
+`max-val` 时报错。
+
+### D6 — `vt-where` 单参数形式已对齐 numpy
 
 ```lisp
 (vt-where (vt-from-sequence '(1 0 1)))
-;; => ERROR: invalid number of arguments: 1
+;; => shape (2 1) 坐标 ((0) (2))   ✅ 对齐 np.where(cond)
 ```
-NumPy：`np.where(cond)` 返回 `(array_of_true_indices,)`。
-**裁决**：⚠️ 增加单参数重载，等价 `vt-argwhere` 的多返回值形式。
+
+`np.where(cond)` 返回非零元素坐标。clvt 采用 **(n, rank)** 坐标张量
+（int64），与 `vt-argwhere` 一致（CL 无元组，故不返回索引元组）。
+三元形式 `(vt-where cond x y)` 不变。
+**裁决**：✅ **已增加单参数重载**（本轮修复）。
 
 ### D7 — `vt-var` / `vt-std` **已有** `ddof`，但**缺 docstring**
 
@@ -753,13 +771,15 @@ NumPy：`np.where(cond)` 返回 `(array_of_true_indices,)`。
 
 **裁决**：✅ `ddof` **无需新增**（原判断有误，已撤销）。⚠️ 但 `vt-var`/`vt-std` 等函数**缺 docstring**，属任务5 范围。
 
-### D8 — `vt-arange` 无参调用报错信息不可读
+### D8 — `vt-arange` 无参调用报错信息（**豁免项，保持现状**）
 
 ```lisp
 (vt-arange)
 ;; => ERROR: invalid number of arguments: 0
 ```
-**裁决**：⚠️ 改为 `vt-arange: 缺少必需参数 total-num（元素个数，非 stop 值）`。
+**裁决**：`vt-arange` 是**唯一不以 numpy 为准的例外**（用户明确豁免，见 §9.1），
+其签名 `(vt-arange total-num &key start step dtype)` 与 `np.arange` 语义不同，
+**保持现状不做对齐**。报错信息维持 CL 原生即可。
 
 ### D9 — `vt-reciprocal` 对整数输入返回浮点（违反 NumPy）
 
@@ -767,8 +787,9 @@ NumPy：`np.where(cond)` 返回 `(array_of_true_indices,)`。
 (vt-reciprocal (vt-astype (vt-const '(3) 2) :int32))  ;; => (0.5d0 0.5d0 0.5d0)
 ```
 NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数恒 0，因整数除法）。
-**裁决**：⚠️ 或对齐 NumPy 返回整数 0，或在 docstring 明确标注差异。
-**建议**：跟随 NumPy 返回整数 0（用户显式要求除 `vt-arange` 外全部对齐）。
+**裁决**：✅ **已对齐 NumPy**（本轮验证）——clvt `vt-reciprocal` 对 int32 输入
+返回 `(0 0 0)` dtype INT32，与 numpy 一致。
+**说明**：`vt-/` 保持 true_divide 语义（整型提升 float64），二者分工明确。
 
 ### D10 — `vt-maximum`/`vt-fmax` 的 NaN 语义已正确（**正面样板**）
 
@@ -819,6 +840,18 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 ### D15 — `vt-astype` 的 `most-positive-double-float` 别名
 
 `vt-hypot` 测试中我用到 `most-positive-double-float`；库内应使用 `+vt-dfloat-pos-inf+`（Inf）而非 `most-positive-double-float`（有限最大值）。二者语义**完全不同**，文档与测试中必须区分。
+
+### D16 — `vt-div` 整数零除抛错（违反 NumPy）
+
+```lisp
+(vt-div (vt-from-sequence '(7) :dtype :int64) 0)
+;; => ERROR: arithmetic error DIVISION-BY-ZERO signalled   （改前）
+```
+
+`vt-div` 对标 `np.floor_divide`（整数截断除法）。NumPy 实测
+`np.floor_divide(np.array([7]), 0)` → `[0]`（**不报错**，返回 0，dtype 保持 int64）。
+**裁决**：✅ **已修复**（本轮）——整数零除返回 `0`，dtype 保持整型；
+浮点零除按 IEEE 得 ±Inf/NaN。实现改用 `vt-map` + 显式零除守卫。
 
 ---
 
@@ -928,15 +961,15 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | `:out` dtype 校验（严格相等） | 全部带 `:out` 的函数（D2） | — |
 | `:out` 非连续写入 | 全部（§4.6 机制 B） | — |
 | `:out` 别名快照 | `vt-map` / SIMD matmul / einsum 统一用物理区间重叠判定 | — |
-| 零除（整数） | mod/floor-div | — |
-| `vt-clip` 参数 | 已按 numpy 语义 | — |
-| `vt-where` 单参 | 已对齐 | — |
-| `vt-arange` 报错 | 已对齐（唯一不以 numpy 为准的例外） | — |
-| `vt-reciprocal` 整数 | 已按 numpy 整数语义 | — |
+| 零除（整数） | `mod` / `rem` / `div`（floor_divide）均返回 0、dtype 保持（D16） | — |
+| `vt-clip` 参数 | 已按 numpy 2.3.5 语义：无边/只 max 合法，只 min 报错（D5） | — |
+| `vt-where` 单参 | 已对齐：`(vt-where cond)` → (n,rank) 坐标（D6） | — |
+| `vt-arange` 报错 | **唯一例外**，保持现状不对齐（D8，用户豁免） | — |
+| `vt-reciprocal` 整数 | 已按 numpy 整数语义（D9） | — |
 | docstring 覆盖 | 公开 `vt-*` 基本齐全（余 4 个 defstruct 访问器） | — |
 | `most-positive-double-float` 误用 | 已排查（D4b） | — |
 | nan/inf 常量精简 | 三个 `+vt-float-*+` 已删除（§5.1） | — |
-| 测试/example 审计 | `run-all-tests` + 25 套件全绿（任务6） | — |
+| 测试/example 审计 | `run-all-tests` + 27 套件全绿（任务6） | — |
 
 ---
 
