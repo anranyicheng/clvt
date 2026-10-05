@@ -53,7 +53,11 @@ SUITES[refactor-bugfix-tests]="55 v0.3.5 重构回归测试 (floor族NaN/insert 
 SUITES[numpy-convention-tests]="63 numpy 对齐语义测试 (空归约/:out解耦/mod零除/true_divide/random校验/clip·where 签名)"
 SUITES[out-contract-v2-test]="56 :out 契约 v2 严格相等测试 (形状/dtype/可写/别名/非连续 out)"
 SUITES[nan-broadcast-test]="31 NaN/Inf 广播对齐 numpy 测试 (算术/极值/比较/归约/dtype 提升)"
+<<<<<<< ours
 SUITES[uncovered-coverage-test]="136 覆盖缺口测试 (此前无任何测试/example 调用的公开函数 + identity/vander/atanh 回归)"
+=======
+SUITES[extensions3-test]="184 补充 NumPy 缺失函数测试 (extensions3: asarray/tri/rollaxis/block/take-along-axis/sign/nan*/cov/cross/vdot/eigvals/matrix-power/isin 等)"
+>>>>>>> theirs
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -296,6 +300,7 @@ main() {
             out-contract-v2-test
             nan-broadcast-test
             uncovered-coverage-test
+            extensions3-test
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)

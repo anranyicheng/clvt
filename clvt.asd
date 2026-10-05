@@ -29,4 +29,5 @@
                (:file "src/nn")
                (:file "src/rotate")
                (:file "src/extensions")
-               (:file "src/extensions2")))
+               (:file "src/extensions2")
+               (:file "src/extensions3")))

@@ -506,7 +506,7 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 
 ### 8.2 源文件加载顺序（`:serial t`）
 
-`package → util → iterator → nan → dtype → core → map-reduce → io → creation → manip → indexing → join → elementwise → reduce-stats → setops → random → linalg → simd-matmul → nn → rotate → extensions → extensions2`
+`package → util → iterator → nan → dtype → core → map-reduce → io → creation → manip → indexing → join → elementwise → reduce-stats → setops → random → linalg → simd-matmul → nn → rotate → extensions → extensions2 → extensions3`
 
 **约定**：新增源文件必须插入到正确位置，且**不得**引入前向依赖（除通过 `defvar` 声明的回调钩子，如 `*simd-matmul-2d-fn*`）。
 
@@ -900,7 +900,7 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | SIMD 矩阵乘 | `simd-matmul.lisp` | 2d/batched 两条快路径：结果 dtype 不取 out + 别名改重叠判定 + 可写性检查 | ✅ |
 | 索引 | `indexing.lisp` | `vt-where` 结果 dtype = `(or :dtype promote)` + 统一 `vt-check-out` | ✅ |
 | 神经网络 | `nn.lisp` | `vt-sigmoid`/`vt-relu` 前置 `vt-check-out`（非连续 out 自动回落通用路径） | ✅ |
-| 扩展 | `extensions.lisp` / `extensions2.lisp` | 全部透传下游原语，已自动获得统一契约 | ✅ |
+| 扩展 | `extensions.lisp` / `extensions2.lisp` / `extensions3.lisp` | 全部透传下游原语，已自动获得统一契约（比较/逻辑类返回 `:int8`） | ✅ |
 | creation / manip / join / setops / rotate / random | 同上 | 这些函数**本无 `:out` 参数**（与 numpy 一致，如 `concatenate`/`reshape` 无 `out=`） | N/A |
 
 **关键实现要点**（易错，已在测试中固化）：

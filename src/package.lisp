@@ -436,7 +436,77 @@
    #:vt-one-hot
    #:vt-standardize
    #:vt-layer-norm
-   #:vt-apply-along-axis))
+   #:vt-apply-along-axis
+
+   ;; extensions3.lisp —— 补充 NumPy 重要缺失函数（第三批）
+
+   ;; 创建类
+   #:vt-asarray
+   #:vt-fromiter
+   #:vt-tri
+   #:vt-diagflat
+   #:vt-trim-zeros
+
+   ;; 形状操作类
+   #:vt-rollaxis
+   #:vt-column-stack
+   #:vt-block
+   #:vt-broadcast-arrays
+   #:vt-resize
+
+   ;; 索引类
+   #:vt-take-along-axis
+   #:vt-put-along-axis
+   #:vt-compress
+   #:vt-indices
+   #:vt-fill-diagonal
+
+   ;; 数学类
+   #:vt-absolute
+   #:vt-sign
+   #:vt-positive
+   #:vt-expm1
+   #:vt-log1p
+   #:vt-logaddexp
+   #:vt-float-power
+   #:vt-copysign
+   #:vt-signbit
+   #:vt-nextafter
+   #:vt-spacing
+   #:vt-gcd
+   #:vt-lcm
+   #:vt-divmod
+   #:vt-nan-to-num
+   #:vt-real
+   #:vt-imag
+   #:vt-conj
+   #:vt-angle
+
+   ;; 统计类
+   #:vt-nancumsum
+   #:vt-nancumprod
+   #:vt-nanpercentile
+   #:vt-nanquantile
+   #:vt-cov
+   #:vt-corrcoef
+   #:vt-cross
+
+   ;; 线性代数类
+   #:vt-vdot
+   #:vt-eigvals
+   #:vt-eigvalsh
+   #:vt-matrix-power
+   #:vt-cond
+   #:vt-multi-dot
+
+   ;; 逻辑类
+   #:vt-array-equal
+   #:vt-array-equiv
+   #:vt-isposinf
+   #:vt-isneginf
+
+   ;; 集合类
+   #:vt-isin))
 
 (in-package :clvt)
 

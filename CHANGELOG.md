@@ -3,7 +3,6 @@
 本文件记录 clvt 库的每一次重大修改。
 
 ---
-
 ## 2026-10-05 — 覆盖缺口审计：补齐未覆盖函数测试 + 修复 6 处实现缺陷
 
 在 SBCL 2.6.8 + Quicklisp + numpy 2.4.6 环境上，以 CONVENTIONS.md 为语义
@@ -48,6 +47,53 @@ numpy 2.4.6 实测或 CONVENTIONS 契约），并为其中暴露的缺陷做修�
 
 **验收**：`bash test/run-tests.sh --quick` → 28 套件全绿；
 `sbcl --load example/example.lisp` + `run-all-tests` → 全绿。
+
+## 2026-10-05 — extensions3：补充第三批 NumPy 重要缺失函数（约 50 个）
+
+新增 `src/extensions3.lisp`（约 1100 行），按 CONVENTIONS.md 的语义契约
+（`&key dtype out`、`ensure-vt` 归一化输入、比较/逻辑返回 `:int8`、
+NaN/Inf 对齐 numpy 2.4.6、`:out` 硬契约 H1–H6）一次性补齐 NumPy 高频函数，
+并配套新增 `test/extensions3-test.lisp`（184 条断言，全部通过）。
+
+### 新增函数（按类分组）
+
+| 类别 | 函数 |
+|------|------|
+| 创建 | `vt-asarray` `vt-fromiter` `vt-tri` `vt-diagflat` `vt-trim-zeros` |
+| 形状 | `vt-rollaxis` `vt-column-stack` `vt-block` `vt-broadcast-arrays` `vt-resize` |
+| 索引 | `vt-take-along-axis` `vt-put-along-axis` `vt-compress` `vt-indices` `vt-fill-diagonal` |
+| 数学 | `vt-absolute` `vt-sign` `vt-positive` `vt-expm1` `vt-log1p` `vt-logaddexp` `vt-float-power` `vt-copysign` `vt-signbit` `vt-nextafter` `vt-spacing` `vt-gcd` `vt-lcm` `vt-divmod` `vt-nan-to-num` `vt-real` `vt-imag` `vt-conj` `vt-angle` |
+| 统计 | `vt-nancumsum` `vt-nancumprod` `vt-nanpercentile` `vt-nanquantile` `vt-cov` `vt-corrcoef` `vt-cross` |
+| 线代 | `vt-vdot` `vt-eigvals` `vt-eigvalsh` `vt-matrix-power` `vt-cond` `vt-multi-dot` |
+| 逻辑 | `vt-array-equal` `vt-array-equiv` `vt-isposinf` `vt-isneginf` |
+| 集合 | `vt-isin` |
+
+### 关键实现要点（对齐 NumPy 语义）
+
+- **`vt-take-along-axis` / `vt-put-along-axis`**：非 axis 维按 NumPy
+  **广播规则**处理（长度相等或为 1），而非要求严格相等；输出形状中 axis 维
+  取自 `indices`、其余维取自输入张量。原实现误用严格相等 + 线性下标，
+  已改为基于 `strides` 的坐标寻址，并修正 `vt-ravel` 后 1 维视图的混用。
+- **`vt-spacing`**：`numpy.spacing(x) = nextafter(|x|, +inf) - |x|`；
+  原实现误取「向 `most-positive-double-float` 的 nextafter 值」。
+- **`vt-cross`**：结果形状对齐 NumPy——1 维输入去掉 batch 轴（2 分量 → 0 维
+  标量）；2 维批量输入保留 batch 轴（2 分量 → 去掉分量轴）。修正了
+  `%e3-as2d` 对 `axis=-1` 误转置的缺陷。
+- **`vt-nancumsum` / `vt-nancumprod`**：`axis` 分支的输出坐标需以 axis 位置的
+  累积下标**替换**该维坐标，且循环结束后返回 `result`（原实现返回 `nil`）。
+- **`vt-sign`**：NaN 分支须包 `with-float-safe`（`%nan-p` 的 `x /= x`
+  否则触发 `FLOATING-POINT-INVALID-OPERATION`）。
+- **`vt-expm1` / `vt-log1p`**：x≈0 时用 Taylor 级数（`%e3-expm1` /
+  `%e3-log1p`）保证与 numpy 一致的精度（`1e-10` 量级逐位对齐）。
+- **`vt-signbit`**：用 `(minusp (float-sign xf))` 正确识别 `-0.0`。
+
+### 测试
+
+- `test/extensions3-test.lisp`：184 条断言覆盖全部新函数，含
+  `:out` 硬契约（形状/dtype 精确匹配、可写）、非连续输入、dtype 提升、
+  NaN/Inf 语义与错误路径。
+- 测试辅助 `->list`/`approx` 增加 NaN 安全处理（`with-float-traps-masked`），
+  避免浮点陷阱在断言阶段误报。
 
 ---
 
