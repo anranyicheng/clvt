@@ -129,9 +129,11 @@
               :offset (vt-offset vt) :dtype (vt-dtype vt))))
 
 (defun vt-unsqueeze (vt axis)
+  "在 AXIS 处插入长度为 1 的轴（对标 torch.unsqueeze / numpy.expand_dims）。"
   (vt-expand-dims vt axis))
 
 (defun vt-swapaxes (vt axis1 axis2)
+  "交换两个轴（对标 numpy.swapaxes）。返回视图（共享底层内存）。"
   (let* ((rank (length (vt-shape vt)))
          (ax1 (vt-normalize-axis axis1 rank))
          (ax2 (vt-normalize-axis axis2 rank)))
@@ -329,14 +331,17 @@
       (t (error "indices-or-sections 必须是整数或整数列表")))))
 
 (defun vt-vsplit (vt indices-or-sections)
+  "垂直均分（对标 numpy.vsplit）。等价 split 沿轴 0。"
   (vt-split vt indices-or-sections :axis 0))
 
 (defun vt-hsplit (vt indices-or-sections)
+  "水平均分（对标 numpy.hsplit）。1D 时等价 split 沿轴 0，否则沿轴 1。"
   (if (<= (length (vt-shape vt)) 1)
       (vt-split vt indices-or-sections :axis 0)
       (vt-split vt indices-or-sections :axis 1)))
 
 (defun vt-dsplit (vt indices-or-sections)
+  "深度均分（对标 numpy.dsplit）。沿轴 2 均分。"
   (vt-split vt indices-or-sections :axis 2))
 
 ;;; ------------------------------------------------------------------

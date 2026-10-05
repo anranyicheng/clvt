@@ -183,9 +183,9 @@
       (T! "a>b" (funcall E "gt") (vt-to-list (vt-> a b))))
     (T! "all(true)" (funcall E "all_true") (vt-item (vt-all (vt-from-sequence '(1.0 1.0 1.0)))))
     (T! "any(true)" (funcall E "any_true") (vt-item (vt-any (vt-from-sequence '(0.0 0.0 1.0)))))
-    (T! "isfinite" (funcall E "isfinite") (vt-to-list (vt-isfinite (vt-from-sequence (list 1.0d0 +vt-float-nan+ +vt-float-pos-inf+ +vt-float-neg-inf+ 0.0d0)))))
-    (T! "isnan" (funcall E "isnan") (vt-to-list (vt-isnan (vt-from-sequence (list 1.0d0 +vt-float-nan+ +vt-float-pos-inf+ 0.0d0)))))
-    (T! "isinf" (funcall E "isinf") (vt-to-list (vt-isinf (vt-from-sequence (list 1.0d0 +vt-float-nan+ +vt-float-pos-inf+ +vt-float-neg-inf+ 0.0d0)))))
+    (T! "isfinite" (funcall E "isfinite") (vt-to-list (vt-isfinite (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+ 0.0d0)))))
+    (T! "isnan" (funcall E "isnan") (vt-to-list (vt-isnan (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ 0.0d0)))))
+    (T! "isinf" (funcall E "isinf") (vt-to-list (vt-isinf (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+ 0.0d0)))))
 
     ;; 7. 归约
     (format t "~%--- 7. Reduction ---~%")
@@ -265,7 +265,7 @@
 
     ;; 13. nan
     (format t "~%--- 13. nan ---~%")
-    (let ((a (vt-from-sequence (list 1.0d0 +vt-float-nan+ 3.0d0 4.0d0) :dtype :float64)))
+    (let ((a (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ 3.0d0 4.0d0) :dtype :float64)))
       (T! "nanmean" (funcall E "nanmean") (vt-item (vt-nanmean a)))
       (T! "nansum" (funcall E "nansum") (vt-item (vt-nansum a)))
       (T! "nanmax" (funcall E "nanmax") (vt-item (vt-nanmax a)))

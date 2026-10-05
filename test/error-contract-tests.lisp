@@ -81,9 +81,9 @@
   (check-error "uniform low > high"
                (lambda () (vt-random-uniform '(3) :low 2d0 :high 1d0)))
   (check-error "uniform NaN low（v0.3.6：校验前移 + 屏蔽 FP 陷阱，干净参数错误）"
-               (lambda () (vt-random-uniform '(3) :low +vt-float-nan+)))
+               (lambda () (vt-random-uniform '(3) :low +vt-dfloat-nan+)))
   (check-error "normal NaN mean（v0.3.6：mean/std 有限性校验）"
-               (lambda () (vt-random-normal '(3) :mean +vt-float-nan+)))
+               (lambda () (vt-random-normal '(3) :mean +vt-dfloat-nan+)))
   (check-error "normal +Inf std（v0.3.6：std 非负且有限）"
                (lambda () (vt-random-normal '(3) :std (vt-float-pos-inf))))
 

@@ -66,6 +66,7 @@
               uniq-vt))))))
 
 (defun vt-intersect1d (t1 t2)
+  "求两个 1D 张量的交集，结果升序去重（对标 numpy.intersect1d）。"
   (let* ((u1 (vt-unique t1))
 	 (u2 (vt-unique t2))
          (u2-set (coerce (vt-data u2) 'list))
@@ -77,9 +78,11 @@
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
 (defun vt-union1d (t1 t2)
+  "求两个 1D 张量的并集，结果升序去重（对标 numpy.union1d）。"
   (vt-unique (vt-concatenate 0 (vt-unique t1) (vt-unique t2))))
 
 (defun vt-setdiff1d (t1 t2)
+  "求差集 t1 \ t2（在 t1 中但不在 t2），结果升序去重（对标 numpy.setdiff1d）。"
   (let* ((u1 (vt-unique t1))
 	 (u2 (vt-unique t2))
          (u2-set (coerce (vt-data u2) 'list))
@@ -91,6 +94,7 @@
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
 (defun vt-setxor1d (t1 t2)
+  "求对称差（仅出现在其中一个集合中），结果升序去重（对标 numpy.setxor1d）。"
   (let* ((u1 (vt-unique t1))
 	 (u2 (vt-unique t2))
 	 (u1-set (coerce (vt-data u1) 'list))
@@ -107,6 +111,7 @@
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
 (defun vt-in1d (t1 t2)
+  "逐元素判定是否属于 TEST（对标 numpy.in1d）。返回与元素形状相同的布尔张量。"
   (let ((t2-set (coerce (vt-data (vt-unique t2)) 'list)))
     (vt-map (lambda (x)
 	      (if (member x t2-set :test #'vt-float-nan-inf-=) 1.0d0 0.0d0))

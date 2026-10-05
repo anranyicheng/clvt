@@ -40,30 +40,37 @@
     (:uint16  2)))
 
 (defun vt-dtype-p (x)
+  "判定 X 是否为合法逻辑 dtype（见 *vt-dtypes*，共 8 种）。"
   (declare (optimize (speed 3) (safety 0)))
   (not (null (member x *vt-dtypes*))))
 
 (defun vt-storage-dtype-p (x)
+  "判定 X 是否为物理存储 dtype（见 *vt-storage-dtypes*，共 4 种：float64/float32/int64/int32）。"
   (declare (optimize (speed 3) (safety 0)))
   (not (null (member x *vt-storage-dtypes*))))
 
 (defun vt-float-dtype-p (dtype)
+  "判定 DTYPE 是否为浮点类型（:float32 / :float64）。"
   (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:float32 :float64)))
 
 (defun vt-int-dtype-p (dtype)
+  "判定 DTYPE 是否为有符号整数类型（:int8/:int16/:int32/:int64）。"
   (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:int8 :int16 :int32 :int64)))
 
 (defun vt-signed-dtype-p (dtype)
+  "判定 DTYPE 是否为有符号类型（当前与 vt-int-dtype-p 一致）。"
   (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:int8 :int16 :int32 :int64)))
 
 (defun vt-unsigned-dtype-p (dtype)
+  "判定 DTYPE 是否为无符号类型（:uint8 / :uint16）。"
   (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:uint8 :uint16))) ; 以后扩展 uint32/uint64 时在这里加
 
 (defun vt-int-bits (dtype)
+  "返回整数 dtype 的位宽（:int8 → 8 … :int64 → 64）。非整数 dtype 报错。"
   (ecase dtype
     ((:int8 :uint8)   8)
     ((:int16 :uint16) 16)
@@ -71,6 +78,7 @@
     (:int64           64)))
 
 (defun vt-bits->signed-dtype (bits)
+  "把位宽映射为对应的有符号 dtype（8→:int8, 16→:int16, 32→:int32, 64→:int64）。"
   (declare (optimize (speed 3) (safety 0))
 	   (fixnum bits))
   (ecase bits
@@ -102,6 +110,7 @@
     (64 nil)))
 
 (defun vt-promote-type (&rest dtypes)
+  "按 numpy 类型提升规则对若干 dtype 求公共结果 dtype（64 格已与 numpy 2.3 实测一致）。"
   (declare (optimize (speed 3) (safety 0)))
   (let ((has-f64 nil)
         (has-f32 nil)

@@ -87,40 +87,40 @@
 
   ;; === 1. nan/inf predicates ===
   (format t "~%--- 1. nan/inf predicates ---~%")
-  (test-assert "nan-p on nan" t (vt-float-nan-p +vt-float-nan+))
+  (test-assert "nan-p on nan" t (vt-float-nan-p +vt-dfloat-nan+))
   (test-assert "nan-p on 1.0" nil (vt-float-nan-p 1.0d0))
-  (test-assert "nan-p on pos-inf" nil (vt-float-nan-p +vt-float-pos-inf+))
-  (test-assert "nan-p on neg-inf" nil (vt-float-nan-p +vt-float-neg-inf+))
-  (test-assert "pos-inf-p on pos-inf" t (vt-float-pos-inf-p +vt-float-pos-inf+))
-  (test-assert "pos-inf-p on neg-inf" nil (vt-float-pos-inf-p +vt-float-neg-inf+))
-  (test-assert "pos-inf-p on nan" nil (vt-float-pos-inf-p +vt-float-nan+))
+  (test-assert "nan-p on pos-inf" nil (vt-float-nan-p +vt-dfloat-pos-inf+))
+  (test-assert "nan-p on neg-inf" nil (vt-float-nan-p +vt-dfloat-neg-inf+))
+  (test-assert "pos-inf-p on pos-inf" t (vt-float-pos-inf-p +vt-dfloat-pos-inf+))
+  (test-assert "pos-inf-p on neg-inf" nil (vt-float-pos-inf-p +vt-dfloat-neg-inf+))
+  (test-assert "pos-inf-p on nan" nil (vt-float-pos-inf-p +vt-dfloat-nan+))
   (test-assert "pos-inf-p on 1.0" nil (vt-float-pos-inf-p 1.0d0))
-  (test-assert "neg-inf-p on neg-inf" t (vt-float-neg-inf-p +vt-float-neg-inf+))
-  (test-assert "neg-inf-p on pos-inf" nil (vt-float-neg-inf-p +vt-float-pos-inf+))
-  (test-assert "neg-inf-p on nan" nil (vt-float-neg-inf-p +vt-float-nan+))
+  (test-assert "neg-inf-p on neg-inf" t (vt-float-neg-inf-p +vt-dfloat-neg-inf+))
+  (test-assert "neg-inf-p on pos-inf" nil (vt-float-neg-inf-p +vt-dfloat-pos-inf+))
+  (test-assert "neg-inf-p on nan" nil (vt-float-neg-inf-p +vt-dfloat-nan+))
   (test-assert "neg-inf-p on -1.0" nil (vt-float-neg-inf-p -1.0d0))
   (test-assert "sfloat-nan-p" t (vt-float-nan-p +vt-sfloat-nan+))
   (test-assert "sfloat-pos-inf-p" t (vt-float-pos-inf-p +vt-sfloat-pos-inf+))
   (test-assert "sfloat-neg-inf-p" t (vt-float-neg-inf-p +vt-sfloat-neg-inf+))
 
   ;; vt-isnan on tensor
-  (let ((a (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0 +vt-float-nan+) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-nan+ 3.0 +vt-dfloat-nan+) :dtype :float64)))
     (test-assert "isnan tensor" '(0.0 1.0 0.0 1.0) (vt-to-list (vt-isnan a))))
 
-  (let ((a (vt-from-sequence (list 1.0 +vt-float-pos-inf+ +vt-float-neg-inf+ 3.0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+ 3.0) :dtype :float64)))
     (test-assert "isinf tensor" '(0.0 1.0 1.0 0.0) (vt-to-list (vt-isinf a))))
 
-  (let ((a (vt-from-sequence (list 1.0 +vt-float-nan+ +vt-float-pos-inf+ 3.0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ 3.0) :dtype :float64)))
     (test-assert "isfinite tensor" '(1.0 0.0 0.0 1.0) (vt-to-list (vt-isfinite a))))
 
   ;; === 2. vt-nanargmax / vt-nanargmin ===
   (format t "~%--- 2. vt-nanargmax / vt-nanargmin ---~%")
 
-  (let ((a (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0 2.0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-nan+ 3.0 2.0) :dtype :float64)))
     (test-assert "nanargmax global" 2 (vt-item (vt-nanargmax a)))
     (test-assert "nanargmin global" 0 (vt-item (vt-nanargmin a))))
 
-  (let ((a (vt-from-sequence (list (list 1.0 +vt-float-nan+ 3.0) (list 2.0 5.0 +vt-float-nan+)) :dtype :float64)))
+  (let ((a (vt-from-sequence (list (list 1.0 +vt-dfloat-nan+ 3.0) (list 2.0 5.0 +vt-dfloat-nan+)) :dtype :float64)))
     (test-assert "nanargmax axis=1" '(2 1) (vt-to-list (vt-nanargmax a :axis 1)))
     (test-assert "nanargmin axis=1" '(0 0) (vt-to-list (vt-nanargmin a :axis 1)))
     (test-assert "nanargmax axis=0" '(1 1 0) (vt-to-list (vt-nanargmax a :axis 0)))
@@ -129,36 +129,36 @@
   ;; === 3. vt-nanprod ===
   (format t "~%--- 3. vt-nanprod ---~%")
 
-  (let ((a (vt-from-sequence (list 2.0 +vt-float-nan+ 3.0 4.0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 2.0 +vt-dfloat-nan+ 3.0 4.0) :dtype :float64)))
     (test-assert-float "nanprod global" 24.0 (vt-item (vt-nanprod a))))
 
-  (let ((a (vt-from-sequence (list (list 2.0 +vt-float-nan+) (list 3.0 4.0)) :dtype :float64)))
+  (let ((a (vt-from-sequence (list (list 2.0 +vt-dfloat-nan+) (list 3.0 4.0)) :dtype :float64)))
     (test-assert-float "nanprod axis=0" '(6.0 4.0) (vt-to-list (vt-nanprod a :axis 0)))
     (test-assert-float "nanprod axis=1" '(2.0 12.0) (vt-to-list (vt-nanprod a :axis 1))))
 
-  (let ((a (vt-from-sequence (list +vt-float-nan+ +vt-float-nan+) :dtype :float64)))
+  (let ((a (vt-from-sequence (list +vt-dfloat-nan+ +vt-dfloat-nan+) :dtype :float64)))
     (test-assert "nanprod all-nan" 1.0 (vt-item (vt-nanprod a))))
 
   ;; === 4. vt-nanmedian ===
   (format t "~%--- 4. vt-nanmedian ---~%")
 
-  (let ((a (vt-from-sequence (list 1.0 2.0 +vt-float-nan+ 3.0 4.0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0 2.0 +vt-dfloat-nan+ 3.0 4.0) :dtype :float64)))
     (test-assert-float "nanmedian global" 2.5 (vt-item (vt-nanmedian a))))
 
-  (let ((a (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-nan+ 3.0) :dtype :float64)))
     (test-assert-float "nanmedian odd" 2.0 (vt-item (vt-nanmedian a))))
 
-  (let ((a (vt-from-sequence (list +vt-float-nan+ +vt-float-nan+) :dtype :float64)))
+  (let ((a (vt-from-sequence (list +vt-dfloat-nan+ +vt-dfloat-nan+) :dtype :float64)))
     (test-assert "nanmedian all-nan" t (vt-float-nan-p (vt-item (vt-nanmedian a)))))
 
-  (let ((a (vt-from-sequence (list (list 1.0 +vt-float-nan+ 3.0) (list 2.0 5.0 +vt-float-nan+)) :dtype :float64)))
+  (let ((a (vt-from-sequence (list (list 1.0 +vt-dfloat-nan+ 3.0) (list 2.0 5.0 +vt-dfloat-nan+)) :dtype :float64)))
     (test-assert-float "nanmedian axis=1" '(2.0 3.5) (vt-to-list (vt-nanmedian a :axis 1)))
     (test-assert-float "nanmedian axis=0" '(1.5 5.0 3.0) (vt-to-list (vt-nanmedian a :axis 0))))
 
   ;; === 5. existing nan stats (verify) ===
   (format t "~%--- 5. existing nan stats (verify) ---~%")
 
-  (let ((a (vt-from-sequence (list 1.0 +vt-float-nan+ 3.0 4.0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-nan+ 3.0 4.0) :dtype :float64)))
     (test-assert-float "nanmean" 2.6666666666666665 (vt-item (vt-nanmean a)))
     (test-assert-float "nansum" 8.0 (vt-item (vt-nansum a)))
     (test-assert-float "nanmax" 4.0 (vt-item (vt-nanmax a)))
@@ -307,10 +307,10 @@
   (test-assert "sfloat neg-inf-p on pos" nil (vt-float-neg-inf-p +vt-sfloat-pos-inf+))
 
   ;; float-inf-= edge cases
-  (test-assert "inf-= two pos-inf" t (vt-float-inf-= +vt-float-pos-inf+ +vt-float-pos-inf+))
-  (test-assert "inf-= pos vs neg" nil (vt-float-inf-= +vt-float-pos-inf+ +vt-float-neg-inf+))
-  (test-assert "inf-= nan vs inf" nil (vt-float-inf-= +vt-float-nan+ +vt-float-pos-inf+))
-  (test-assert "inf-= nan vs nan" nil (vt-float-inf-= +vt-float-nan+ +vt-float-nan+))
+  (test-assert "inf-= two pos-inf" t (vt-float-inf-= +vt-dfloat-pos-inf+ +vt-dfloat-pos-inf+))
+  (test-assert "inf-= pos vs neg" nil (vt-float-inf-= +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+))
+  (test-assert "inf-= nan vs inf" nil (vt-float-inf-= +vt-dfloat-nan+ +vt-dfloat-pos-inf+))
+  (test-assert "inf-= nan vs nan" nil (vt-float-inf-= +vt-dfloat-nan+ +vt-dfloat-nan+))
 
   ;; === 15. Random validation tests ===
   (format t "~%--- 15. Random validation ---~%")

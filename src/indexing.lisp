@@ -207,7 +207,11 @@
         (vt-copy-into target-view value))))
 
 (defun vt-where (condition x y &key out dtype)
-  "三元条件选择（对标 torch.where / np.where(cond, x, y)）。"
+  "三元条件选择（对标 torch.where / np.where(cond, x, y)）。
+
+  dtype 语义（§4.2 H3「严格相等」）：
+    结果 dtype = 显式 :dtype，否则为 (promote x y) —— **不由 out 决定**。
+    out 的 dtype/形状必须精确匹配结果，否则报错（错误信息以 \"vt-where\" 开头）。"
   (setf condition (ensure-vt condition)
 	x (ensure-vt x)
 	y (ensure-vt y))
@@ -215,17 +219,10 @@
 			(vt-shape condition)
                         (vt-broadcast-shapes (vt-shape x) (vt-shape y))))
          (promoted (vt-promote-type (vt-dtype x) (vt-dtype y)))
-         (final-dtype (cond ((and out dtype)
-                             (unless (eq (vt-dtype out) dtype)
-                               (error "vt-where: :out (~a) 与 :dtype (~a) 冲突"
-				      (vt-dtype out) dtype))
-                             (vt-dtype out))
-                            (out (vt-dtype out))
-                            (dtype dtype)
-                            (t promoted)))
-         (result (if out (progn (unless (equal (vt-shape out) target-shape)
-                                  (error "vt-where: :out 形状不匹配"))
-                               out)
+         (final-dtype (or dtype promoted))
+         ;; 统一硬契约（H1–H4）：形状/dtype 严格相等/可写
+         (result (if out
+                     (vt-check-out out target-shape final-dtype :op-name "vt-where")
                      (vt-zeros target-shape :dtype final-dtype))))
     (vt-map (lambda (c a b) (if (/= c 0) a b))
             condition x y :out result :dtype final-dtype)))

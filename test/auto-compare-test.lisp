@@ -260,7 +260,7 @@
 
       ;; ========== 12. nan ==========
       (format t "~%--- 12. nan handling ---~%")
-      (let ((a (vt-from-sequence (list 1.0d0 +vt-float-nan+ 3.0d0 4.0d0) :dtype :float64)))
+      (let ((a (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ 3.0d0 4.0d0) :dtype :float64)))
         (run-test "nanmean" (E "nanmean_1nan34") (vt-item (vt-nanmean a)) 1e-5)
         (run-test "nansum"  (E "nansum_1nan34")  (vt-item (vt-nansum a)) 1e-5)
         (run-test "nanmax"  (E "nanmax_1nan34")  (vt-item (vt-nanmax a)) 1e-5))

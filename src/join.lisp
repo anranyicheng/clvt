@@ -34,6 +34,7 @@
         result))))
 
 (defun vt-concat (axis &rest vts)
+  "沿既有轴连接多个张量（对标 numpy.concatenate / torch.cat）。"
   (apply #'vt-concatenate axis vts))
 
 (defun vt-stack (axis &rest vts)
@@ -58,11 +59,13 @@
                  vts)))
 
 (defun vt-hstack (&rest vts)
+  "水平堆叠（对标 numpy.hstack）。1D 时沿轴 0 拼接，高维沿轴 1。"
   (if (= (length (vt-shape (car vts))) 1)
       (apply #'vt-concatenate 0 vts)
       (apply #'vt-concatenate 1 vts)))
 
 (defun vt-dstack (&rest vts)
+  "深度堆叠（对标 numpy.dstack）。1D 视为 (1,n,1)，2D 视为 (m,n,1)。"
   (when (null vts) (error "vt-dstack 至少需要一个张量"))
   (let ((expanded
 	  (mapcar (lambda (vt)

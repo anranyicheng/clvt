@@ -14,33 +14,38 @@
 ;;; ------------------------------------------------------------------
 
 (defun vt-map (fn &rest args)
-  "高效逐元素映射：支持标量/列表/张量混合输入并自动广播。"
+  "高效逐元素映射：支持标量/列表/张量混合输入并自动广播。
+
+   参数契约（§4）：
+     fn       逐元素函数，接收 n 个标量、返回一个标量（语义基准路径）
+     其余参数  任意个张量/标量/嵌套序列 + 可选 :dtype / :out
+     :dtype   结果 dtype；缺省按输入提升规则
+     :out     输出张量。硬契约：形状与广播结果**精确相等**、
+              dtype 与结果**精确相等**、必须可写（非 stride-0 广播视图）。
+              违反立即报错，不静默截断。
+   别名语义：out 与任一输入共享底层存储且物理区间重叠时，
+     先对重叠输入做快照，保证读-写顺序与 numpy 一致（如 x+x->x 与
+     滑窗重叠场景）。"
   (declare (function fn) (optimize (speed 3) (safety 0)))
   (with-float-safe
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
       (when (null tensors)
 	(error "vt-map 至少需要一个输入张量"))
+      ;; H5：:dtype 与 :out 同时给出时先查一致性
+      (vt-check-out-dtype-consistency "vt-map" dtype out)
       (let* ((inputs-1 (mapcar #'ensure-vt tensors))
-	     (inputs
-               (if out
-		   (mapcar (lambda (in)
-			     (if (%vt-views-overlap-p out in)
-				 (vt-copy in)
-				 in))
-			   inputs-1)
-		   inputs-1))
+             ;; 别名保护：重叠输入统一先快照（快路径与通用路径共用）
+             (inputs (vt-out-snapshot out inputs-1))
              (out-shape (reduce #'vt-broadcast-shapes (mapcar #'vt-shape inputs)))
-             (final-dtype (cond
-                            ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "vt-map: :out 类型 (~a) 与 :dtype (~a) 冲突"
-                                    (vt-dtype out) dtype))
-                            (out (vt-dtype out))
-                            (dtype dtype)
-                            (t (apply #'vt-promote-type (mapcar #'vt-dtype inputs)))))
-             (res (or out (make-vt out-shape 0 :dtype final-dtype))))
-	(when out
-          (unless (equal (vt-shape res) out-shape)
-            (error "vt-map: :out 形状 ~a 与广播结果 ~a 不匹配" (vt-shape res) out-shape)))
+             ;; 结果 dtype 由「输入提升 + 显式 :dtype」决定，**不由 out 决定**；
+             ;; out 的 dtype 必须与之精确相等（§4.2 H3 严格相等契约）。
+             (final-dtype (or dtype
+                              (apply #'vt-promote-type
+                                     (mapcar #'vt-dtype inputs))))
+             ;; 硬契约：形状 + dtype + 可写（含只读广播视图）
+             (res (if out
+                      (vt-check-out out out-shape final-dtype :op-name "vt-map")
+                      (make-vt out-shape 0 :dtype final-dtype))))
 	(%vt-map-run fn inputs res out-shape)
 	res))))
 
@@ -486,7 +491,11 @@
 (defmacro vt-fast-map (fn &rest args)
   "编译期内联已知算子的逐元素映射（一元/二元/三元）。
    优先走内联路径，任何维度/连续性组合都有对应快路径；
-   仅在 dtype 不匹配或参数个数 > 3 时回退到 vt-map。"
+   仅在 dtype 不匹配或参数个数 > 3 时回退到 vt-map。
+
+   参数契约：与 vt-map 完全一致（§4），校验逻辑统一委托给
+   vt-check-out / vt-out-snapshot / vt-check-out-dtype-consistency，
+   本宏内**不再**自行拼装检查（避免多份实现漂移）。"
   (declare (optimize (speed 3) (safety 0)))
   (let ((op (and (consp fn)
                  (eq (car fn) 'function)
@@ -504,25 +513,28 @@
                 `(with-float-safe                                 
                    (let (,@(loop for tv in tvs for tf in tensors
                                  collect `(,tv (ensure-vt ,tf))))
+                     ;; H5：:dtype 与 :out 冲突（统一入口）
+                     (vt-check-out-dtype-consistency "vt-fast-map" ,dtype ,out)
                      (let* ((out-shape (reduce #'vt-broadcast-shapes
                                                (mapcar #'vt-shape (list ,@tvs))))
-                            (final-dtype (cond ((and ,out ,dtype
-                                                     (not (eq (vt-dtype ,out) ,dtype)))
-                                                (error "类型冲突: :out (~a) vs :dtype (~a)"
-                                                       (vt-dtype ,out) ,dtype))
-                                               (,out (vt-dtype ,out))
-                                               (,dtype ,dtype)
-                                               (t (apply #'vt-promote-type
-                                                         (mapcar #'vt-dtype (list ,@tvs))))))
-                            (res (or ,out (make-vt out-shape 0 :dtype final-dtype))))
-                       (when ,out
-                         (unless (equal (vt-shape res) out-shape)
-                           (error ":out 形状 ~a 与广播结果 ~a 不匹配"
-                                  (vt-shape res) out-shape)))
+                            ;; 结果 dtype 一律由「输入提升 + 显式 :dtype」决定，
+                            ;; **不由 out 决定**。这样 out 的 dtype 必须精确匹配，
+                            ;; 杜绝 float64 结果静默降精度写入 float32 out
+                            ;; （§4.2 H3「严格相等」契约）。
+                            (final-dtype (or ,dtype
+                                             (apply #'vt-promote-type
+                                                    (mapcar #'vt-dtype
+                                                            (list ,@tvs)))))
+                            ;; 硬契约 H1–H4：形状/dtype/可写（统一入口）
+                            (res (if ,out
+                                     (vt-check-out ,out out-shape final-dtype
+                                                   :op-name "vt-fast-map")
+                                     (make-vt out-shape 0 :dtype final-dtype))))
+                       ;; 别名保护统一走 vt-out-snapshot；重叠时退回 vt-map 全局快照路径
 		       (if (and ,out
                                 (some (lambda (in) (%vt-views-overlap-p ,out in))
                                       (list ,@tvs)))
-                           (vt-map (function ,op) ,@tvs :out ,out)
+                           (vt-map (function ,op) ,@tvs :out ,out :dtype final-dtype)
 			   ,(let* ((dtype-check
                                      `(and ,@(loop for tv in tvs
 						   collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
@@ -537,19 +549,19 @@
                                       (if ,simple-check
 					  (%vt-inline1-fast ,op ,(first tvs) res)
 					  (%vt-inline1-strided-fast ,op ,(first tvs) res))
-                                      (vt-map (function ,op) ,(first tvs) :out res)))
+                                      (vt-map (function ,op) ,(first tvs) :out res :dtype final-dtype)))
 				((= n 2)
 				 `(if ,dtype-check
                                       (if ,simple-check
 					  (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
 					  (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res))
-                                      (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res)))
+                                      (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res :dtype final-dtype)))
 				(t
 				 `(if ,dtype-check
                                       (if ,simple-check
 					  (%vt-inline3-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res)
 					  (%vt-inline3-strided-fast ,op ,(first tvs) ,(second tvs) ,(third tvs) res))
-                                      (vt-map (function ,op) ,(first tvs) ,(second tvs) ,(third tvs) :out res))))))
+                                      (vt-map (function ,op) ,(first tvs) ,(second tvs) ,(third tvs) :out res :dtype final-dtype))))))
                        res)))))))))
 
 ;;; ------------------------------------------------------------------
@@ -583,10 +595,30 @@
                 (t 0)))))
 
 (defun vt-reduce (tensor axis init-val reducer-fn &key out dtype keepdims return-arg)
+  "沿 AXIS 归约的核心原语（内部入口，语义基准）。
+
+   参数个数与默认值（任务3 §6）：
+     tensor      必需，张量/标量/序列，经 ensure-vt 归一
+     axis        必需，nil=全局归约；整数或整数列表；负值按 numpy 规则折算
+     init-val    必需，累加初值（必须与 reducer-fn 的语义匹配，如 sum→0，
+                 max→-Inf/-most-negative，min→+Inf/+most-positive）
+     reducer-fn  必需，二元归约函数；返回 (values acc update-arg-p)
+     :out        可选。**硬契约**：形状必须精确等于归约结果形状（含
+                 keepdims 后的形状）、dtype 必须精确等于结果 dtype、
+                 必须可写。非连续 out 由本函数按真实 strides 写入。
+     :dtype      可选。结果 dtype；与 :out 同时给出时必须一致（H5）。
+     :keepdims   可选，保留被归约轴为长度 1。
+     :return-arg 可选，同时返回 argmax/argmin 索引张量（dtype int32）。
+
+   结果 dtype 由「输入 dtype + 显式 :dtype + init-val 类型」决定，
+   **不由 out 决定**（§4.2 H3 严格相等契约）。"
   (declare (type vt tensor)
            (type (or null fixnum list) axis)
            (type function reducer-fn))
   (setf tensor (ensure-vt tensor))
+  ;; H5：:dtype 与 :out 同时给出时必须一致；此处提前拦截，
+  ;;     避免后续各分支重复实现（原实现仅在通用路径里检查一次）。
+  (vt-check-out-dtype-consistency "vt-reduce" dtype out)
   (with-float-safe
     (let* ((in-shape (vt-shape tensor))
            (rank (length in-shape))
@@ -607,22 +639,32 @@
                           (reduce #'* in-shape :initial-value 1))))
       (declare (fixnum rank axis-size))
 
-      ;; 空输入
+      ;; 空输入：整个归约退化为「用 init-val 填充结果」。
+      ;; 此处同样必须尊重 :out 契约（形状/dtype/可写），否则空输入会成为
+      ;; 绕过硬契约的后门（原实现直接 make-vt、静默丢弃用户传入的 out）。
       (when (or (zerop axis-size) (zerop (vt-size tensor)))
-        (let ((empty-dtype (or dtype (and out (vt-dtype out)) (vt-dtype tensor))))
+        (let* ((empty-dtype (or dtype (vt-dtype tensor)))
+               (empty-res (cond ((null out)
+                                 (make-vt out-shape (or init-val 0) :dtype empty-dtype))
+                                ;; out 已给出：校验后原地填充（支持非连续视图）
+                                (t (vt-check-out out out-shape empty-dtype
+                                                 :op-name "vt-reduce")
+                                    (vt-fill out (or init-val 0))
+                                    out))))
           (return-from vt-reduce
-            (values (make-vt out-shape (or init-val 0) :dtype empty-dtype)
+            (values empty-res
                     (when return-arg (make-vt out-shape 0 :dtype :int32))))))
 
       (let* ((final-dtype (cond
-                            ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "vt-reduce: :out type (~a) 与 :dtype (~a) 冲突"
-                                    (vt-dtype out) dtype))
-                            (out (vt-dtype out))
                             (dtype dtype)
-                            ((and init-val (or (floatp init-val) (%inf-p init-val))) :float64)
+                            ((and init-val (or (floatp init-val) (%inf-p init-val)))
+                             :float64)
                             (t (vt-dtype tensor))))
-	     (res (or out (make-vt out-shape 0 :dtype final-dtype))))
+	     ;; 硬契约：形状/dtype/可写统一由 vt-check-out 把关，
+	     ;; 不再在此处散落 (error "vt-reduce: ...") 检查。
+	     (res (if out
+	              (vt-check-out out out-shape final-dtype :op-name "vt-reduce")
+	              (make-vt out-shape 0 :dtype final-dtype))))
 
         ;; ================================================================
         ;; 快路径 1：连续 + 全局归约（axis=nil, 不 keepdims, 无 arg）

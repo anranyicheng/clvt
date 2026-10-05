@@ -391,3 +391,12 @@
                              (vt-ref ov k)))))))
              result))
           (t (error "vt-apply-along-axis: func must return scalar or 1D VT")))))))
+
+;;; ==================================================================
+;;; 加载期自检：参数契约基础设施
+;;; ==================================================================
+;;; parcontract.lisp 的 %parcontract-self-check 依赖 vt-slice / vt-ref /
+;;; vt-from-sequence / vt-copy 等，故放在所有组件加载完毕后执行。
+;;; 失败将中断加载（这是刻意的：基础设施失效比功能失效更危险）。
+(eval-when (:load-toplevel :execute)
+  (%parcontract-self-check))

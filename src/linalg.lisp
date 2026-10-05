@@ -525,9 +525,15 @@
 	   (optimize (speed 3)))
   (with-float-safe
     (when out
+      ;; 别名保护（§4.3）：通用累加内核用 `incf`，要求输出缓冲区初始为 0
+      ;; （见下方 `(vt-fill output 0)`）。若 out 与某输入**物理区间重叠**，
+      ;; 清零会先破坏输入 → 结果错误。故先快照重叠的输入。
+      ;; v0.3.6 修复：原实现只比较 `(vt-data out)` 与 `(vt-data tns)` 指针，
+      ;; 漏掉「同一 data 但 offset/strides 不同」的重叠视图（如 a = base[0:64]、
+      ;; out = base[32:96]），改用物理区间重叠判定。
       (setf vts
             (mapcar (lambda (tns)
-                      (if (eq (vt-data out) (vt-data tns))
+                      (if (%vt-views-overlap-p out tns)
                           (vt-copy tns)
                           tns))
                     vts)))
@@ -604,6 +610,7 @@
               (unless (eq (vt-dtype output) out-dtype)
                 (error "vt-einsum: :out dtype ~a 与结果 dtype ~a 不匹配"
                        (vt-dtype output) out-dtype))
+              ;; 通用累加内核依赖零初始值（见下方 BMM fallback 的 incf / 累加循环）。
               (vt-fill output 0))
             
             (let* ((out-offset (vt-offset output))
@@ -969,22 +976,23 @@
         (error "vt-einsum: 不支持的 out 张量类型 (~a)。允许: ~a。"
 	       (vt-dtype out-arg) supported-types))
       ;; 类型推导与统一 ===
-      (let* ((final-dtype 
-               (cond 
-                 ;; 冲突检测：out 与 dtype 不一致时报错
-                 ((and out-arg dtype-arg)
-                  (unless (eq (vt-dtype out-arg) dtype-arg)
-                    (error "vt-einsum: 类型冲突！:dtype (~a) 与 :out (~a) 不一致。"
-                           dtype-arg (vt-dtype out-arg)))
-                  (vt-dtype out-arg))
-                 (out-arg  (vt-dtype out-arg))
+      (let* ((final-dtype
+               (cond
                  (dtype-arg dtype-arg)
-                 (t (apply #'vt-promote-type (mapcar #'vt-dtype clean-tensors)))))             
+                 (t (apply #'vt-promote-type
+                           (mapcar #'vt-dtype clean-tensors)))))
              ;; 类型转换 (零拷贝优化)
              (cast-tensors 
                (if (every #'(lambda (vt) (eq (vt-dtype vt) final-dtype)) clean-tensors)
                    clean-tensors
                    (mapcar #'(lambda (vt) (vt-astype vt final-dtype)) clean-tensors))))        
+        ;; :out dtype 契约（§4.2 H3「严格相等」）：结果 dtype 由「输入提升 +
+        ;; 显式 :dtype」决定，**不由 out 决定**。einsum-execute 内部还会对
+        ;; 形状（H2）做精确校验；此处提前给出带 "vt-einsum" 前缀的清晰报错。
+        (when out-arg
+          (unless (eq (vt-dtype out-arg) final-dtype)
+            (error "vt-einsum: :out dtype ~a 与结果 dtype ~a 不匹配"
+                   (vt-dtype out-arg) final-dtype)))
         (multiple-value-bind (raw-inputs raw-output explicit-p)
             (get-parsed-subscripts subscripts)          
           (unless (= (length raw-inputs) (length cast-tensors))
@@ -1032,6 +1040,7 @@
 	     (vt-einsum "...ij,...jk->...ik" a b :dtype dtype :out out))))))
 
 (defun vt-@ (vt1 vt2 &key dtype out)
+  "矩阵乘法运算符别名（对标 numpy 的 @ 运算符）。等价 (vt-matmul vt1 vt2)。"
   (vt-matmul vt1 vt2 :dtype dtype :out out))
 
 (defun vt-dot (a b &key dtype out) 
@@ -1200,12 +1209,10 @@
       (unless (and (= (length shape) 2)
                    (= (first shape) (second shape)))
         (error "vt-det: 行列式仅支持方阵，收到形状 ~a" shape)))
-    ;; :out 硬契约（§8.2）：det 结果为 0 维标量，:out 必须是 0 维张量，
-    ;; 否则 vt-fill 会静默填满任意形状的 out
+    ;; :out 硬契约（§4.2）：det 结果为 0 维 float64 标量，:out 必须形状为 NIL、
+    ;; dtype 为 :float64，否则 vt-fill 会静默填满任意形状 / 静默降精度写入。
     (when out
-      (unless (null (vt-shape out))
-        (error "vt-det: :out 必须为 0 维张量（det 结果为标量），收到形状 ~a"
-               (vt-shape out))))
+      (vt-check-out out nil :float64 :op-name "vt-det"))
     (multiple-value-bind (lu piv sign)
         (vt-lu matrix)
       (declare (ignore piv))

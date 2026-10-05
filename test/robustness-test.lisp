@@ -351,26 +351,26 @@
   (format t "~%--- 9. NaN/Inf 传播 ---~%")
 
   ;; NaN 传播
-  (let ((a (vt-from-sequence (list 1.0d0 +vt-float-nan+ 3.0d0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ 3.0d0) :dtype :float64)))
     (T! "isnan" '(0.0d0 1.0d0 0.0d0) (vt-to-list (vt-isnan a)))
     (T! "isfinite" '(1.0d0 0.0d0 1.0d0) (vt-to-list (vt-isfinite a))))
 
   ;; Inf
-  (let ((a (vt-from-sequence (list 1.0d0 +vt-float-pos-inf+ +vt-float-neg-inf+) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0d0 +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+) :dtype :float64)))
     (T! "isinf" '(0.0d0 1.0d0 1.0d0) (vt-to-list (vt-isinf a)))
     (T! "isfinite(inf)" '(1.0d0 0.0d0 0.0d0) (vt-to-list (vt-isfinite a))))
 
   ;; nan-aware 统计
-  (let ((a (vt-from-sequence (list 1.0d0 +vt-float-nan+ 3.0d0 4.0d0) :dtype :float64)))
+  (let ((a (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ 3.0d0 4.0d0) :dtype :float64)))
     (T! "nanmean" 2.6666666666666665d0 (vt-item (vt-nanmean a)) 1e-6)
     (T! "nansum" 8.0d0 (vt-item (vt-nansum a)))
     (T! "nanmax" 4.0d0 (vt-item (vt-nanmax a)))
     (T! "nanmin" 1.0d0 (vt-item (vt-nanmin a))))
 
   ;; NaN 在比较中
-  (let ((a (make-vt nil +vt-float-nan+ :dtype :float64))
+  (let ((a (make-vt nil +vt-dfloat-nan+ :dtype :float64))
         (b (make-vt nil 1.0d0 :dtype :float64)))
-    (T! "nan == nan" 0.0d0 (vt-item (vt-= a (make-vt nil +vt-float-nan+ :dtype :float64))))
+    (T! "nan == nan" 0.0d0 (vt-item (vt-= a (make-vt nil +vt-dfloat-nan+ :dtype :float64))))
     (T! "nan < 1" 0.0d0 (vt-item (vt-< a b))))
 
   ;; 9.2 数学函数 NaN 返回 (SBCL 修复验证)
@@ -395,8 +395,8 @@
   (T! "sinc(0)=1" 1.0d0 (vt-ref (vt-sinc (vt-from-sequence '(0.0))) 0))
 
   ;; 9.3 Inf 算术
-  (let ((inf +vt-float-pos-inf+)
-        (neginf +vt-float-neg-inf+))
+  (let ((inf +vt-dfloat-pos-inf+)
+        (neginf +vt-dfloat-neg-inf+))
     (with-float-safe
       (T! "inf+inf=inf" t (vt-float-inf-p (+ inf inf)))
       (T! "inf-inf=NaN" t (vt-float-nan-p (- inf inf)))

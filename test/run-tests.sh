@@ -51,6 +51,8 @@ SUITES[property-strided-tests]="67 选路不变量/代数恒等式测试 (C8 类
 SUITES[error-contract-tests]="19 错误路径契约测试 (C7 类目, L2 底线)"
 SUITES[refactor-bugfix-tests]="55 v0.3.5 重构回归测试 (floor族NaN/insert numpy语义/solve校验/tensordot负轴等)"
 SUITES[numpy-convention-tests]="37 numpy 2.1.3 对齐语义测试 (v0.3.6: 空归约/:out解耦/mod零除/true_divide/random校验)"
+SUITES[out-contract-v2-test]="56 :out 契约 v2 严格相等测试 (形状/dtype/可写/别名/非连续 out)"
+SUITES[nan-broadcast-test]="31 NaN/Inf 广播对齐 numpy 测试 (算术/极值/比较/归约/dtype 提升)"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -155,10 +157,25 @@ run_suite() {
     local duration=$((end_time - start_time))
 
     # 提取测试结果
+    # 兼容多种输出格式：
+    #   1) Total: N / Pass: N / Fail: N   (大多数套件)
+    #   2) 通过: N  失败: M               (out-contract-v2-test)
+    #   3) 汇总：通过 N / 失败 M          (nan-broadcast-test)
     local total pass fail_count skip
     total=$(echo "$output" | grep -oP 'Total:\s*\K[0-9]+' | tail -1 || echo "?")
     pass=$(echo "$output" | grep -oP 'Pass:\s*\K[0-9]+' | tail -1 || echo "?")
     fail_count=$(echo "$output" | grep -oP 'Fail:\s*\K[0-9]+' | tail -1 || echo "?")
+    # 格式 2/3 兜底：通过 N（可带全角冒号） / 失败 M
+    if [[ "$pass" == "?" ]]; then
+        pass=$(echo "$output" | grep -oP '通过[：:]?\s*\K[0-9]+' | tail -1 || echo "?")
+    fi
+    if [[ "$fail_count" == "?" ]]; then
+        fail_count=$(echo "$output" | grep -oP '失败[：:]?\s*\K[0-9]+' | tail -1 || echo "?")
+    fi
+    # 由 pass/fail 反推 total
+    if [[ "$total" == "?" && "$pass" != "?" && "$fail_count" != "?" ]]; then
+        total=$((pass + fail_count))
+    fi
     skip=$(echo "$output" | grep -oP 'Skip:\s*\K[0-9]+' | tail -1 || echo "0")
 
     # 判断结果
@@ -275,6 +292,8 @@ main() {
 	    error-contract-tests
             refactor-bugfix-tests
             numpy-convention-tests
+            out-contract-v2-test
+            nan-broadcast-test
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)

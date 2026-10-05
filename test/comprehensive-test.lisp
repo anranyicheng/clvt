@@ -492,7 +492,7 @@
   ;; ============================================================
   (format t "~%--- 19. nan handling ---~%")
 
-  (let ((a (vt-from-sequence `(1.0 ,+vt-float-nan+ 3.0 4.0) :dtype :float64)))
+  (let ((a (vt-from-sequence `(1.0 ,+vt-dfloat-nan+ 3.0 4.0) :dtype :float64)))
     (test-assert-float "nanmean" 2.6666666666666665 (vt-item (vt-nanmean a)))
     (test-assert-float "nansum" 8.0 (vt-item (vt-nansum a)))
     (test-assert-float "nanmax" 4.0 (vt-item (vt-nanmax a))))

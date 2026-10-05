@@ -3,33 +3,43 @@
 (in-package :clvt)
 
 (defun vt-zeros (shape &key (dtype :float64))
+  "创建全 0 张量。SHAPE 为维度列表（NIL 表示 0 维标量）。"
   (make-vt shape 0 :dtype dtype))
 
 (defun vt-ones (shape &key (dtype :float64))
+  "创建全 1 张量。SHAPE 为维度列表（NIL 表示 0 维标量）。"
   (make-vt shape 1 :dtype dtype))
 
 (defun vt-const (shape value &key (dtype :float64))
+  "创建以 VALUE 填充的张量。等价 numpy.full(shape, value)。"
   (make-vt shape value :dtype dtype))
 
 (defun vt-full (shape fill-value &key (dtype :float64))
+  "创建以 FILL-VALUE 填充的张量（对标 numpy.full）。"
   (make-vt shape fill-value :dtype dtype))
 
 (defun vt-empty (shape &key (dtype :float64))
+  "创建「未初始化」张量（对标 numpy.empty）。本库以 0 填充，故与 vt-zeros 等价。"
   (vt-zeros shape :dtype dtype))
 
 (defun vt-zeros-like (vt &key dtype)
+  "创建与 VT 形状/（缺省）dtype 相同的全 0 张量（对标 numpy.zeros_like）。"
   (vt-zeros (vt-shape vt) :dtype (or dtype (vt-dtype vt))))
 
 (defun vt-ones-like (vt &key dtype)
+  "创建与 VT 形状/（缺省）dtype 相同的全 1 张量（对标 numpy.ones_like）。"
   (vt-ones (vt-shape vt) :dtype (or dtype (vt-dtype vt))))
 
 (defun vt-full-like (vt fill-value &key dtype)
+  "创建与 VT 形状/（缺省）dtype 相同、以 FILL-VALUE 填充的张量（对标 numpy.full_like）。"
   (vt-full (vt-shape vt) fill-value :dtype (or dtype (vt-dtype vt))))
 
 (defun vt-empty-like (vt &key dtype)
+  "创建与 VT 形状/（缺省）dtype 相同的未初始化张量（本库以 0 填充）。"
   (vt-empty (vt-shape vt) :dtype (or dtype (vt-dtype vt))))
 
 (defun vt-identity (n &key dtype)
+  "创建 N×N 单位阵（对标 numpy.identity）。等价 (vt-eye n :dtype dtype)。"
   (vt-eye n :dtype dtype))
 
 (defun vt-eye (rows &key (cols rows) (k 0) (value 1) (dtype :float64))

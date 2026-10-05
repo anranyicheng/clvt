@@ -309,10 +309,12 @@
            (print-vt-recursive obj 0 nil 2 max-width element-type stream)))))))
 
 (defun vt-set-print-options (&key threshold precision indent-step)
+  "设置张量打印选项（对标 numpy.set_printoptions + torch.set_printoptions）。"
   (when threshold (setf *vt-print-threshold* threshold))
   (when precision (setf *vt-print-precision* precision))
   (when indent-step (setf *vt-indent-step* indent-step))
   (values))
 
 (defun vt-get-print-options ()
+  "返回当前打印选项的副本（便于临时保存/恢复）。"
   (list *vt-print-threshold* *vt-print-precision* *vt-indent-step*))

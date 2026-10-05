@@ -154,6 +154,7 @@ vt-const
 vt-arange
 vt-linspace
 vt-logspace
+vt-geomspace
 vt-eye
 vt-diag
 vt-identity
@@ -195,6 +196,8 @@ vt-broadcast-shapes
 vt-broadcast-strides
 vt-contiguous
 vt-flip
+vt-fliplr
+vt-flipud
 vt-roll
 vt-triu
 vt-tril
@@ -262,6 +265,8 @@ vt-hypot
 vt-sinc
 vt-deg2rad
 vt-rad2deg
+vt-clamp
+vt-vander
 
 ;; 反双曲函数 (新增)
 vt-asinh
@@ -341,6 +346,10 @@ vt-argsort
 vt-maximum
 vt-minimum
 
+;; 标准化与差分扩展
+vt-standardize
+vt-ediff1d
+
 ;; nan 感知统计 (新增)
 vt-nansum
 vt-nanmean
@@ -399,6 +408,10 @@ vt-mean-squared-error
 vt-binary-cross-entropy
 vt-cross-entropy
 
+;; 神经网络扩展
+vt-one-hot
+vt-layer-norm
+
 ;; 集合操作
 vt-unique
 vt-intersect1d
@@ -454,9 +467,6 @@ vt-float-pos-inf-p
 vt-float-neg-inf-p
 vt-float-inf-=
 vt-float-nan-inf-=
-+vt-float-nan+
-+vt-float-pos-inf+
-+vt-float-neg-inf+
 
 ;; 核心迭代与映射
 vt-map
@@ -473,6 +483,14 @@ vt-compute-strides
 vt-compute-logical-strides
 with-float-safe
 
+;; 参数契约基础设施 (parcontract.lisp)
+vt-check-out          ;; :out 硬契约校验（形状/dtype/可写）
+vt-out-writable-p     ;; out 是否可写（非广播视图）
+vt-out-contig-p       ;; out 是否连续（仅影响选路）
+vt-out-snapshot       ;; 别名场景下的输入快照
+vt-check-out-dtype-consistency ;; :dtype 与 :out 一致性 (H5)
+vt-reduce-dtypes      ;; 归约结果 dtype 推导
+
 ;; 扩展功能 (extensions.lisp)
 vt-count-nonzero    ;; 统计非零元素个数 (对标 numpy.count_nonzero)
 vt-count            ;; 统计等于指定值的元素个数
@@ -485,6 +503,15 @@ vt-clip-tensor      ;; 支持张量作为边界的裁剪
 vt-set-print-options ;; 设置打印选项
 vt-get-print-options ;; 获取打印选项
 
+;; 扩展功能2 (extensions2.lisp)
+vt-fliplr           ;; 左右翻转 (对标 numpy.fliplr)
+vt-flipud           ;; 上下翻转 (对标 numpy.flipud)
+vt-geomspace        ;; 几何级数空间 (对标 numpy.geomspace)
+vt-one-hot          ;; 独热编码 (对标 torch.nn.functional.one_hot)
+vt-layer-norm       ;; 层归一化 (对标 torch.nn.LayerNorm)
+vt-apply-along-axis ;; 沿轴应用函数 (对标 numpy.apply_along_axis)
+vt-vander           ;; 范德蒙德矩阵 (对标 numpy.vander)
+
 ```
 测试在 example/example.lisp 文件中。
 ``` common lisp
@@ -494,9 +521,9 @@ vt-get-print-options ;; 获取打印选项
 (run-all-tests)
 ```
 
-自动化测试:
+自动化测试（27 个测试套件，共 1500+ 用例）:
 ```bash
-# 运行所有测试 (900 个测试用例)
+# 运行所有测试
 bash test/run-tests.sh
 
 # 运行指定测试套件
@@ -510,6 +537,37 @@ bash test/run-tests.sh --suite numpy-compare-test
 bash test/run-tests.sh --list
 ```
 
+主要测试套件：
+
+| 套件 | 用例数 | 内容 |
+|------|-------:|------|
+| `run_all_tests` | 143 | 基础函数测试 |
+| `run_param_tests` | 155 | 3D+ 参数化测试 |
+| `robustness-test` | 194 | 鲁棒性边界测试 |
+| `comprehensive-test` | 119 | 综合功能测试 |
+| `coverage-gap-test` | 97 | numpy/pytorch 覆盖差距测试 |
+| `nan-random-test` | 89 | NaN 随机数测试 |
+| `shape-degenerate-tests` | 70 | 空形状/退化形状表驱动测试 |
+| `numpy-compare-test` | 69 | numpy/pytorch 实时对比测试 |
+| `property-strided-tests` | 67 | 选路不变量/代数恒等式测试（strided ≡ contiguous） |
+| `auto-compare-test` | 63 | JSON 自动对比测试 |
+| `nested-test` | 60 | AI/ML 函数组合测试 |
+| `out-contract-v2-test` | 56 | `:out` 契约严格相等测试（形状/dtype/可写/别名/非连续 out） |
+| `refactor-bugfix-tests` | 53 | 重构回归测试 |
+| `numpy-convention-tests` | 49 | numpy 对齐语义测试 |
+| `test-ai-edge-cases` | 40 | AI 主流函数语义回归测试 |
+| `extensions2-test` | 37 | 第二批扩展函数测试 |
+| `nan-broadcast-test` | 31 | NaN/Inf 广播对齐 numpy 测试 |
+| `out-contig-tests` | 23 | `:out` 连续/非连续写入测试 |
+| `error-contract-tests` | 22 | 错误路径契约测试 |
+| `test-copy-into` | 35 | `vt-copy-into` 正确性测试 |
+| `test-bug0` | 37 | 已知 bug 回归测试 |
+| `test-extensions` | 19 | 扩展函数回归测试 |
+| `memsafety-tests` | 6 | `:out` 快路径内存安全测试 |
+| `test-overlap` | 6 | 重叠拷贝回归测试 |
+| `test-simd-batch-matmul` | 5 | SIMD 批量矩阵乘测试 |
+| `property-test` / `simd-test` | — | 性质测试 / SIMD 路径测试 |
+
 ## 架构
 
 源码按职责分层组织在 `src/` 目录下：
@@ -521,8 +579,9 @@ bash test/run-tests.sh --list
 | `util.lisp` | 浮点陷阱屏蔽、关键字参数解析、NaN 感知排序 |
 | `nan.lisp` | NaN / Inf 常量与判定（可移植，不依赖实现内部符号） |
 | `core.lisp` | 张量结构、步长、广播、连续判定、拷贝、填充 |
+| `parcontract.lisp` | 参数契约基础设施（`vt-check-out` 硬校验 / `vt-out-snapshot` 别名快照 / 统一 `:out` 语义） |
 | `iterator.lisp` | 统一迭代原语 |
-| `map-reduce.lisp` | `vt-map` / `vt-reduce` 逐元素映射与归约核心 |
+| `map-reduce.lisp` | `vt-map` / `vt-fast-map` / `vt-reduce` 逐元素映射与归约核心 |
 | `io.lisp` | 序列/数组互转与打印 |
 | `creation.lisp` | 张量创建 |
 | `manip.lisp` | 形状/视图/翻转/三角/填充 |
@@ -533,9 +592,11 @@ bash test/run-tests.sh --list
 | `setops.lisp` | 集合操作 |
 | `random.lisp` | 随机数生成 |
 | `linalg.lisp` | 线性代数（含 einsum） |
+| `simd-matmul.lisp` | SIMD 分块矩阵乘法快路径（2D 与批量） |
 | `nn.lisp` | 激活 / 损失 / softmax |
 | `rotate.lisp` | 图像旋转（对标 scipy.ndimage.rotate） |
 | `extensions.lisp` | 扩展功能 |
+| `extensions2.lisp` | 第二批扩展功能（fliplr/geomspace/one-hot/layer-norm 等） |
 
 ## 设计约定（三层架构语义契约）
 
@@ -604,7 +665,7 @@ clvt 遵循"逻辑层 / 物理层 / 执行层"三层分离架构，所有公开 
 - **linspace 精度**：float32 输出以 double 精度计算后舍入存储（对标 NumPy，避免累积漂移）。
 - **随机数边界**：`vt-random-uniform` 要求 low/high 为有限实数，low=high 合法（常量数组）；`vt-random-normal` 要求 std 为非负有限实数（std=0 返回 mean 填充）。
 - **vt-det out 契约**：:out 必须为 0 维张量，违反即报错。
-- **out dtype 权威约定**：所有接受 :out 的函数以 out 的 dtype 为准并按转换语义写入（与其他逐元素 API 一致）。
+- **out dtype 权威约定（严格相等）**：结果 dtype 由「输入提升 + 显式 `:dtype`」决定，**不由 out 决定**。`out` 必须精确等于结果 dtype，否则报错（H3），杜绝 float64 结果静默降精度写入 float32 缓冲区。若需 float32 输出，须显式传 `:dtype :float32`，此时 out 也必须为 float32。全部接受 `:out` 的函数统一遵守该契约，硬校验由 `vt-check-out` 完成，别名安全由 `vt-out-snapshot` 保证。
 
 ## License
 MIT

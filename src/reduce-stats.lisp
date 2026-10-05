@@ -476,6 +476,19 @@
                             (t (error "unsupported output dtype ~a" res-lt)))))
                 (t (error "unsupported input dtype ~a" in-et)))))
       `(defun ,fn-name (tensor &key axis keepdims dtype out)
+         ,(format nil "沿 AXIS 归约（~a 算子）；AXIS 为 NIL 时归约全部元素。
+  dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 显式 :dtype，否则按输入提升
+  （含 init-val 类型影响）；**不由 out 决定**，out 必须精确匹配结果 shape/dtype。
+  空归约区返回该算子的单位元（sum→0 / prod→1 / all→t / any→nil …）。
+  实现在存储级 dtype 上做类型特化，连续性只影响性能、不影响语义。"
+                   (case op (:sum "求和") (:prod "求积") (:max "最大值")
+                         (:min "最小值") (:all "逻辑与") (:any "逻辑或")
+                         (:nansum "忽略 NaN 求和") (:nanprod "忽略 NaN 求积")
+                         (:nanmax "忽略 NaN 最大值") (:nanmin "忽略 NaN 最小值")
+                         (:argmax "最大值的下标") (:argmin "最小值的下标")
+                         (:nanargmax "忽略 NaN 的最大值下标")
+                         (:nanargmin "忽略 NaN 的最小值下标")
+                         (t (string-downcase op))))
          (declare (type vt tensor)
                   (type (or null fixnum list) axis)
                   (type (or null vt) out))
@@ -493,20 +506,11 @@
                                  unless (member i axes) collect d))
                           (t (loop for d in in-shape for i fixnum from 0
                                    collect (if (member i axes) 1 d))))))
-             ;; ---- :out 形状校验 ----
-             (when (and out (not (equal (vt-shape out) out-shape)))
-               (error "vt-~a: :out shape ~a does not match expected ~a"
-                      ',name (vt-shape out) out-shape))
-             ;; ---- :out 与 :dtype 冲突校验 ----
-             (when (and out dtype (not (eq (vt-dtype out) dtype)))
-               (error "vt-~a: :out dtype ~a conflicts with :dtype ~a"
-                      ',name (vt-dtype out) dtype))
-             (when out
-               (loop for d in (vt-shape out)
-                     for s in (vt-strides out)
-                     when (and (> d 1) (zerop s))
-                       do (error "vt-~a: :out 不能是广播视图（维度 ~a 有 stride 0）"
-                                 ',name d)))
+             ;; ---- :out 硬契约（统一原语，§4.2）----
+             ;; H5（:dtype 与 :out 冲突）→ H1–H4（类型/形状/可写）。
+             ;; 与 vt-map / vt-einsum 共用同一实现，杜绝多份检查漂移。
+             (vt-check-out-dtype-consistency
+              (format nil "vt-~a" ',name) dtype out)
              (let* ((axis-size (if axes
                                    (reduce #'* (mapcar (lambda (a) (nth a in-shape)) axes)
                                            :initial-value 1)
@@ -515,22 +519,22 @@
                     (in-off  (vt-offset tensor))
                     (in-et   (array-element-type in-data))
                     (in-size (vt-size tensor))
-                    ;; ---- 计算 dtype 与结果 dtype 解耦（numpy :out 语义，§6 #2）----
-                    ;; compute-dtype 是「按输入提升后的自然结果 dtype」：
-                    ;; 计算始终用它进行（与无 :out 调用逐位一致）；
-                    ;; 当 :out 的 dtype 与之不同且未显式给 :dtype 时，
-                    ;; 先计算进临时缓冲，最后一步再 cast 写入 :out
-                    ;; （numpy 语义：按输入提升计算、最后 cast 写入 out）。
+                    ;; ---- 结果 dtype 三段式（§4.4 精度解耦）----
+                    ;; compute-dtype 是「按输入提升后的自然结果 dtype」，
+                    ;; **不由 out 决定**；final-out-dtype 同值（显式 :dtype 优先）。
                     (compute-dtype (%op-out-dtype ,op (vt-dtype tensor)))
-                    (final-out-dtype
-                      (cond (dtype dtype)
-                            (out (vt-dtype out))
-                            (t compute-dtype)))
-                    (decoupled (and out (null dtype)
-                                    (not (eq final-out-dtype compute-dtype))))
+                    (final-out-dtype (or dtype compute-dtype))
+                    ;; 用户裁决（§4.2 H3「严格相等」）：out 的 dtype 必须精确
+                    ;; 等于结果 dtype，否则报错。旧有的「先算到临时缓冲再 cast
+                    ;; 写入 out」解耦路径因此被禁用（恒为 nil）；
+                    ;; 所有 out 一律经 vt-check-out 严格校验（见下方 res）。
+                    (decoupled nil)
                     (res-lt (%dtype->lt (if decoupled compute-dtype final-out-dtype)))
+                    ;; out 给出时统一入口校验（含 dtype 严格相等与可写性）；
+                    ;; 未给出时新建。
                     (res (cond (decoupled (make-vt out-shape 0 :dtype compute-dtype))
-                               (out out)
+                               (out (vt-check-out out out-shape final-out-dtype
+                                                  :op-name (format nil "vt-~a" ',name)))
                                (t (make-vt out-shape 0 :dtype final-out-dtype))))
                     (res-data (vt-data res))
                     (res-off  (vt-offset res)))
@@ -668,6 +672,7 @@
 
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) out)
+  "逐元素判断 |t1 - t2| <= atol + rtol*|t2|（对标 numpy.isclose），返回布尔张量。RTOL/ATOL 缺省 1e-5 / 1e-8。"
   (vt-map (lambda (a b)
             (cond ((or (%nan-p a) (%nan-p b)) 0.0d0)
                   ((or (%inf-p a) (%inf-p b)) (if (= a b) 1.0d0 0.0d0))
@@ -677,16 +682,20 @@
           t1 t2 :dtype :float64 :out out))
 
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
+  "判断两个张量在 RTOL/ATOL 容差下是否全部相等（对标 numpy.allclose），返回布尔。"
   (= (vt-item (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol))) 1.0d0))
 
 (defun vt-isfinite (vt &key out)
+  "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回布尔张量。"
   (vt-map (lambda (x) (if (and (not (%nan-p x)) (not (%inf-p x))) 1.0d0 0.0d0))
           vt :dtype :float64 :out out))
 
 (defun vt-isinf (vt &key out)
+  "逐元素判断是否为 ±Inf，返回布尔张量。"
   (vt-map (lambda (x) (if (%inf-p x) 1.0d0 0.0d0)) vt :dtype :float64 :out out))
 
 (defun vt-isnan (vt &key out)
+  "逐元素判断是否为 NaN，返回布尔张量。"
   (vt-map (lambda (x) (if (%nan-p x) 1.0d0 0.0d0)) vt :dtype :float64 :out out))
 
 ;;; ------------------------------------------------------------------
@@ -703,6 +712,12 @@
     (values axes count)))
 
 (defun vt-average (tensor weights &key axis keepdims dtype out)
+  "加权平均：sum(tensor * weights) / sum(weights)。对标 numpy.average。
+
+  dtype 语义（§4.2 H3「严格相等」）：
+    结果 dtype 由「输入提升 + 显式 :dtype」决定，**不由 out 决定**。
+    out 的 dtype 必须精确等于结果 dtype，否则报错。
+    numpy 的 average 对整型输入会提升到 float64（本库一致）。"
   (with-float-safe
     (let ((a-shape (vt-shape tensor))
           (w-shape (vt-shape weights))
@@ -722,44 +737,52 @@
              (sum-weights (vt-item (vt-sum weights)))
              (in-dtype (vt-dtype weighted-sum))
              (need-promote (member in-dtype '(:int32 :int64 :int16 :int8 :uint8 :uint16)))
-             (exec-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                                (error "vt-average: :out 与 :dtype 冲突"))
-                               (out (vt-dtype out)) (dtype dtype)
-                               (need-promote :float64) (t in-dtype)))
-             (nan-val (vt-get-nan exec-dtype))
-             (scalar-divisor (coerce sum-weights (if (eq exec-dtype :float32)
-                                                     'single-float 'double-float)))
-             (map-dtype (cond (out nil) (dtype dtype) (need-promote :float64) (t nil))))
+             ;; ---- 结果 dtype：输入提升 + 显式 :dtype，不由 out 决定 ----
+             (final-dtype (cond (dtype dtype)
+                                (need-promote :float64)
+                                (t in-dtype)))
+             ;; out 硬契约：在计算开始前一次性校验（形状/dtype 严格相等/可写），
+             ;; 之后 out 仅作写入目标，绝不下传给内部中间结果（避免 H5 误报）。
+             (out-shape (vt-shape weighted-sum))
+             (nan-val (vt-get-nan final-dtype))
+             (scalar-divisor (coerce sum-weights (if (eq final-dtype :float32)
+                                                     'single-float 'double-float))))
+        (when out
+          (vt-check-out out out-shape final-dtype :op-name "vt-average"))
         (cond ((%nan-p sum-weights)
-               (if out (progn (vt-map (lambda (x)
-                                        (declare (ignore x))
-                                        nan-val)
-                                      weighted-sum :out out :dtype dtype)
-                              out)
-                   (vt-full (vt-shape weighted-sum) nan-val :dtype exec-dtype)))
+               (cond (out (vt-fill out nan-val) out)
+                     (t (vt-full out-shape nan-val :dtype final-dtype))))
               ((zerop sum-weights) (error "Weights sum to zero"))
-              (t (vt-map (lambda (s)
-                           (/ s scalar-divisor))
-                         weighted-sum :dtype map-dtype :out out)))))))
+              (t (vt-map (lambda (s) (/ s scalar-divisor))
+                         weighted-sum :dtype final-dtype :out out)))))))
 
 (defun vt-mean (tensor &key axis keepdims dtype out)
+  "算术平均（对标 numpy.mean）。
+  dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 显式 :dtype，否则按输入提升
+  （:float32 → :float32，其余 → :float64，均值恒为浮点）。**不由 out 决定**；
+  out 必须精确匹配结果 shape/dtype。空归约区结果为 NaN。"
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (multiple-value-bind (axes count) (%get-axes-count axis rank shape)
       (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
-             (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                                 (error "vt-mean: :out 与 :dtype 冲突"))
-                                (dtype dtype)
-                                (out (vt-dtype out))
-                                (t compute-dtype)))
-             ;; ---- :out 精度解耦（numpy 语义）----
-             ;; 均值计算始终按输入提升的浮点精度（compute-dtype）进行，
-             ;; 与无 :out 调用逐位一致，最后一步才 cast 写入 :out；
-             ;; 显式 :dtype 仍按 numpy 语义直接以该 dtype 计算。
-             (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
-                             compute-dtype
-                             final-dtype))
-             (write-out (and out (not (eq exec-dtype (vt-dtype out))))))
+             ;; ---- 结果 dtype：输入提升 + 显式 :dtype，**不由 out 决定** ----
+             ;; 用户裁决（§4.2 H3「严格相等」）：out 的 dtype 必须精确等于
+             ;; 结果 dtype。旧有的「按输入提升计算、最后 cast 写入 out」解耦
+             ;; 路径已弃用（exec-dtype 恒等于 final-dtype，write-out 恒为假）。
+             (final-dtype (or dtype compute-dtype))
+             (exec-dtype final-dtype))
+        ;; 用户 out 的硬契约在此处校验一次（H1–H4：形状/可写/dtype 严格相等），
+        ;; 之后 out 只作为「写入目标」使用，绝不再作为内部中间结果的容器下传，
+        ;; 否则 vt-sum 的 H5（:dtype 与 :out 一致性）会先于本函数的 H3 触发，
+        ;; 报出令人困惑的 "vt-SUM: ..." 错误信息。
+        (when out
+          (vt-check-out out
+                        (if keepdims
+                            (loop for d in shape for i below rank
+                                  collect (if (or (null axes) (member i axes)) 1 d))
+                            (loop for d in shape for i below rank
+                                  unless (or (null axes) (member i axes)) collect d))
+                        final-dtype :op-name "vt-mean"))
         (when (= count 0)
           (let ((nan (vt-get-nan exec-dtype))
                 (out-shape (if keepdims
@@ -771,39 +794,27 @@
                                      unless (or (null axes) (member i axes))
                                        collect d))))
             (return-from vt-mean
-              (cond (write-out
-                     (let ((tmp (vt-full out-shape nan :dtype exec-dtype)))
-                       (vt-copy-into out tmp)
-                       out))
-                    (out (vt-fill out nan) out)
+              (cond (out (vt-fill out nan) out)
                     (t (vt-full out-shape nan :dtype exec-dtype))))))
         (let* ((sum-result (vt-sum tensor :axis axes :keepdims keepdims
-                                   :dtype exec-dtype
-                                   :out (and out (not write-out) out)))
+                                   :dtype exec-dtype))
                (div (coerce count (if (eq exec-dtype :float32)
                                       'single-float 'double-float))))
-          (cond (write-out
-                 (let ((tmp (vt-map (lambda (s) (/ s div))
-                                    sum-result :dtype exec-dtype)))
-                   (vt-copy-into out tmp)
-                   out))
-                (t (vt-map (lambda (s) (/ s div))
-                           sum-result :dtype exec-dtype :out sum-result))))))))
+          (vt-map (lambda (s) (/ s div))
+                  sum-result :dtype exec-dtype :out out))))))
 
 (defun vt-var (tensor &key axis keepdims (ddof 0) dtype out)
+  "方差（对标 numpy.var）。
+  dtype 语义同 vt-mean（§4.2 H3「严格相等」）。DDOF 为自由度增量（缺省 0，
+  即总体方差）。有效样本数 ≤ ddof 时结果为 NaN。"
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (multiple-value-bind (axes n) (%get-axes-count axis rank shape)
       (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
-             (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                                 (error "vt-var: :out 与 :dtype 冲突"))
-                                (dtype dtype)
-                                (out (vt-dtype out))
-                                (t compute-dtype)))
-             ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
-             (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
-                             compute-dtype
-                             final-dtype))
+             ;; 结果 dtype 由「输入提升 + 显式 :dtype」决定，不由 out 决定
+             ;; （§4.2 H3「严格相等」）。
+             (final-dtype (or dtype compute-dtype))
+             (exec-dtype final-dtype)
              (divisor (- n ddof))
              (out-shape (if keepdims
                             (loop for d in shape for i below rank
@@ -811,12 +822,16 @@
                             (loop for d in shape for i below rank
                                   unless (or (null axes) (member i axes)) collect d)))
              (emit (lambda (result-vt)
-                     ;; 统一出口：cast/写入 :out（write-out 时经 vt-copy-into 跨 dtype）
+                     ;; 统一出口：out 已在外层经 vt-check-out 校验过形状/dtype，
+                     ;; 这里只做写入（dtype 必然一致，直接用 vt-copy-into）
                      (if out
                          (progn (unless (eq result-vt out)
                                   (vt-copy-into out result-vt))
                                 out)
                          result-vt))))
+        ;; out 硬契约：在计算开始前校验（H3 dtype 严格相等）
+        (when out
+          (vt-check-out out out-shape final-dtype :op-name "vt-var"))
         (cond
           ((<= divisor 0)
            ;; ddof ≥ 归约区元素数：方差无定义 → NaN（numpy 语义）
@@ -833,19 +848,27 @@
              (funcall emit res))))))))
 
 (defun vt-std (tensor &key axis keepdims (ddof 0) dtype out)
+  "标准差 sqrt(vt-var)（对标 numpy.std）。dtype 语义同 vt-var。"
   (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
-         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "vt-std: :out 与 :dtype 冲突"))
-                            (dtype dtype)
-                            (out (vt-dtype out))
-                            (t compute-dtype)))
-         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean/vt-var）----
-         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
-                         compute-dtype
-                         final-dtype)))
+         ;; 结果 dtype 同 vt-mean/vt-var：输入提升 + 显式 :dtype，不由 out 决定。
+         (final-dtype (or dtype compute-dtype))
+         (exec-dtype final-dtype))
+    ;; 先做一次 out 硬契约校验（形状/dtype 严格相等/可写），让错误信息以
+    ;; "vt-std" 开头，而不是透出内部 vt-var 的报错。
+    (when out
+      (let* ((shape (vt-shape tensor))
+             (rank (length shape)))
+        (multiple-value-bind (axes count) (%get-axes-count axis rank shape)
+          (declare (ignore count))
+          (vt-check-out out
+                        (if keepdims
+                            (loop for d in shape for i below rank
+                                  collect (if (or (null axes) (member i axes)) 1 d))
+                            (loop for d in shape for i below rank
+                                  unless (or (null axes) (member i axes)) collect d))
+                        final-dtype :op-name "vt-std"))))
     (let ((variance (vt-var tensor :axis axis :keepdims keepdims :ddof ddof
-                            :dtype exec-dtype
-                            :out (and out (eq exec-dtype (vt-dtype out)) out))))
+                            :dtype exec-dtype)))
       (setf variance (vt-sqrt variance :dtype exec-dtype))
       (cond ((null out) variance)
             ((eq variance out) out)
@@ -856,13 +879,17 @@
 ;;; ------------------------------------------------------------------
 
 (defun vt-cumulative (tensor op init-val &key axis dtype out)
+  "累积归约核心原语：沿 AXIS 依次累积 OP（#\+ / #\*），以 INIT-VAL 起始。
+  dtype 语义（§4.2 H3）：结果 dtype = 显式 :dtype，否则为输入 dtype；out 必须精确匹配。"
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
-         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "类型冲突: :out (~a) vs :dtype (~a)" (vt-dtype out) dtype))
-                            (dtype dtype) (out (vt-dtype out)) (t (vt-dtype tensor))))
+         ;; 结果 dtype 由「输入 dtype + 显式 :dtype」决定，不由 out 决定。
+         (final-dtype (or dtype (vt-dtype tensor)))
          (lisp-type (vt-dtype->lisp-type final-dtype))
-         (result (or out (vt-zeros shape :dtype final-dtype)))
+         ;; out 给出时统一入口校验（形状/dtype 严格相等/可写性）
+         (result (if out
+                     (vt-check-out out shape final-dtype :op-name "vt-cumulative")
+                     (vt-zeros shape :dtype final-dtype)))
          (in-data (vt-data tensor)) (out-data (vt-data result))
          (in-strides (vt-strides tensor)) (in-offset (vt-offset tensor))
          (out-strides (vt-strides result)) (out-offset (vt-offset result)))
@@ -915,15 +942,18 @@
     result))
 
 (defun vt-cumsum (tensor &key axis dtype out)
+  "沿 AXIS 的累积和（axis 缺省全展平）。等价 (vt-cumulative tensor #\+ 0 :axis axis)。"
   (vt-cumulative tensor #'+ 0 :axis axis :dtype dtype :out out))
 
 (defun vt-cumprod (tensor &key axis dtype out)
+  "沿 AXIS 的累积积（axis 缺省全展平）。等价 (vt-cumulative tensor #\* 1 :axis axis)。"
   (vt-cumulative tensor #'* 1 :axis axis :dtype dtype :out out))
 
 ;;; ------------------------------------------------------------------
 ;;; 中位数 / 百分位 / 直方图
 ;;; ------------------------------------------------------------------
 (defun vt-median (tensor &key axis keepdims)
+  "中位数（对标 numpy.median）。偶数个元素取中间两数平均。"
   (with-float-safe
     (if axis
         ;; ---- 轴归约 ----
@@ -1102,10 +1132,12 @@
                  :interpolation interpolation))
 
 (defun vt-ptp (tensor &key axis)
+  "峰谷差 max - min（对标 numpy.ptp）。"
   (if axis (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
       (- (vt-item (vt-amax tensor)) (vt-item (vt-amin tensor)))))
 
 (defun vt-histogram (tensor &key bins range density)
+  "直方图统计（对标 numpy.histogram）。返回 (values counts edges)。"
   (with-float-safe
     (let* ((flat (vt-flatten tensor))
            (data (vt-data flat))
@@ -1163,6 +1195,7 @@
 ;;; ------------------------------------------------------------------
 
 (defun vt-sort (tensor &key (axis -1))
+  "升序排序（对标 numpy.sort）。AXIS 缺省 -1；NaN 排在末尾。"
   (if axis
       (let* ((shape (vt-shape tensor))
              (rank (length shape))
@@ -1201,6 +1234,7 @@
         (vt-from-sequence (vt-numpy-sort data #'<) :dtype (vt-dtype tensor)))))
 
 (defun vt-argsort (tensor &key (axis -1))
+  "返回升序排序后的下标（对标 numpy.argsort）。AXIS 缺省 -1。"
   (with-float-safe
     (if (null axis)
         (let* ((flat (vt-ravel tensor))
@@ -1276,99 +1310,67 @@
 ;;; ------------------------------------------------------------------
 
 (defun vt-nanmean (tensor &key axis keepdims dtype out)
+  "忽略 NaN 的算术平均。全为 NaN 的归约区结果为 NaN。
+
+  dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 输入浮点提升 + 显式 :dtype，
+  **不由 out 决定**；out 的 dtype 必须精确等于结果 dtype。"
   (let* ((mask (vt-isnan tensor))
          (not-nan (vt-logical-not mask))
          (compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
-         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "vt-nanmean: :out 与 :dtype 冲突"))
-                            (dtype dtype)
-                            (out (vt-dtype out))
-                            (t compute-dtype)))
-         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
-         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
-                         compute-dtype
-                         final-dtype))
-         (write-out (and out (not (eq exec-dtype (vt-dtype out)))))
-         (zero (if (eq exec-dtype :float32) 0.0s0 0.0d0))
-         (clean (vt-where mask zero tensor :dtype exec-dtype))
-         ;; count 使用与计算相同的浮点dtype，避免float->int强制转换错误
-         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype exec-dtype))
-         (nan (vt-get-nan exec-dtype))
-         (sum (vt-sum clean :axis axis :keepdims keepdims
-                      :dtype exec-dtype
-                      :out (and out (not write-out) out))))
-    (cond (write-out
-           (let ((tmp (vt-map (lambda (s c)
-                                (if (<= c zero) nan (/ s c)))
-                              sum count :dtype exec-dtype)))
-             (vt-copy-into out tmp)
-             out))
-          (t (vt-map (lambda (s c)
-                       (if (<= c zero) nan (/ s c)))
-                     sum count :dtype exec-dtype :out sum)))))
+         ;; 结果 dtype：输入提升 + 显式 :dtype（nan 族恒为浮点）
+         (final-dtype (or dtype compute-dtype))
+         (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
+         (nan (vt-get-nan final-dtype))
+         (clean (vt-where mask zero tensor :dtype final-dtype))
+         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
+         (sum (vt-sum clean :axis axis :keepdims keepdims :dtype final-dtype)))
+    ;; out 硬契约校验前置：错误信息以 "vt-nanmean" 开头
+    (when out
+      (vt-check-out out (vt-shape sum) final-dtype :op-name "vt-nanmean"))
+    (vt-map (lambda (s c) (if (<= c zero) nan (/ s c)))
+            sum count :dtype final-dtype :out out)))
 
 (defun vt-nanvar (tensor &key axis keepdims (ddof 0) dtype out)
+  "忽略 NaN 的方差。有效样本数 ≤ ddof 时结果为 NaN。
+
+  dtype 语义同 vt-nanmean（§4.2 H3「严格相等」）。"
   (let* ((mask (vt-isnan tensor))
          (not-nan (vt-logical-not mask))
          (compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
-         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "vt-nanvar: :out 与 :dtype 冲突"))
-                            (dtype dtype)
-                            (out (vt-dtype out))
-                            (t compute-dtype)))
-         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
-         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
-                         compute-dtype
-                         final-dtype))
-         (write-out (and out (not (eq exec-dtype (vt-dtype out)))))
-         (nan (vt-get-nan exec-dtype))
-         (zero (if (eq exec-dtype :float32) 0.0s0 0.0d0))
-         (clean (vt-where mask zero tensor :dtype exec-dtype))
-         ;; count 使用浮点dtype
-         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype exec-dtype))
-         (mean (vt-nanmean tensor :axis axis :keepdims t :dtype exec-dtype))
-         (sq-diff (vt-* (vt-map (lambda (c m)
-                                  (* (- c m) (- c m)))
-                                clean mean :dtype exec-dtype)
-                        not-nan :dtype exec-dtype))
-         (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims
-                       :dtype exec-dtype
-                       :out (and out (not write-out) out)))
-         ;; divisor 使用浮点dtype
-         (ddof-f (coerce ddof (vt-dtype->lisp-type exec-dtype)))
-         (divisor (vt-map (lambda (c)
-                            (if (< c ddof-f) zero (- c ddof-f)))
-                          count :dtype exec-dtype)))
-    (cond (write-out
-           (let ((tmp (vt-map (lambda (s d)
-                                (if (<= d zero) nan (/ s d)))
-                              sum2 divisor :dtype exec-dtype)))
-             (vt-copy-into out tmp)
-             out))
-          (t (vt-map (lambda (s d)
-                       (if (<= d zero) nan (/ s d)))
-                     sum2 divisor :dtype exec-dtype :out sum2)))))
+         (final-dtype (or dtype compute-dtype))
+         (nan (vt-get-nan final-dtype))
+         (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
+         (clean (vt-where mask zero tensor :dtype final-dtype))
+         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
+         (mean (vt-nanmean tensor :axis axis :keepdims t :dtype final-dtype))
+         (sq-diff (vt-* (vt-map (lambda (c m) (* (- c m) (- c m)))
+                                clean mean :dtype final-dtype)
+                        not-nan :dtype final-dtype))
+         (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims :dtype final-dtype))
+         (ddof-f (coerce ddof (vt-dtype->lisp-type final-dtype)))
+         (divisor (vt-map (lambda (c) (if (< c ddof-f) zero (- c ddof-f)))
+                          count :dtype final-dtype)))
+    (when out
+      (vt-check-out out (vt-shape sum2) final-dtype :op-name "vt-nanvar"))
+    (vt-map (lambda (s d) (if (<= d zero) nan (/ s d)))
+            sum2 divisor :dtype final-dtype :out out)))
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
+  "忽略 NaN 的标准差（sqrt(vt-nanvar)）。dtype 语义同 vt-nanvar。"
   (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
-         (final-dtype (cond ((and out dtype (not (eq (vt-dtype out) dtype)))
-                             (error "vt-nanstd: :out 与 :dtype 冲突"))
-                            (dtype dtype)
-                            (out (vt-dtype out))
-                            (t compute-dtype)))
-         ;; ---- :out 精度解耦（numpy 语义，同 vt-mean）----
-         (exec-dtype (if (and out (null dtype) (not (eq final-dtype compute-dtype)))
-                         compute-dtype
-                         final-dtype)))
+         (final-dtype (or dtype compute-dtype)))
     (let ((var (vt-nanvar tensor :axis axis :keepdims keepdims :ddof ddof
-                          :dtype exec-dtype
-                          :out (and out (eq exec-dtype (vt-dtype out)) out))))
-      (setf var (vt-sqrt var :dtype exec-dtype))
+                          :dtype final-dtype)))
+      (setf var (vt-sqrt var :dtype final-dtype))
       (cond ((null out) var)
             ((eq var out) out)
-            (t (vt-copy-into out var) out)))))
+            (t (vt-check-out out (vt-shape var) final-dtype :op-name "vt-nanstd")
+               (vt-copy-into out var)
+               out)))))
 
 (defun vt-nanmedian (tensor &key axis keepdims out)
+  "忽略 NaN 的中位数（对标 numpy.nanmedian）。全为 NaN 的归约区结果为 NaN。
+  结果 dtype 恒为 :float64；out 必须形状/dtype 精确匹配。"
   (with-float-safe
     (let* ((nan (vt-get-nan :float64))
            (in-data (vt-data tensor))
@@ -1388,16 +1390,26 @@
                                 (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
                                          (nth (/ (length vals) 2) vals))
                                       2.0d0)))))
-              (if out 
+              (if out
                   (progn
-                    (unless (or (null (vt-shape out))
-                                (equal (vt-shape out) '(1))
-                                (and keepdims
-                                     (equal (vt-shape out)
-                                            (make-list (length (vt-shape tensor))
-                                                       :initial-element 1))))
-                      (error "vt-nanmedian: :out 形状 ~a 与全局归约结果不兼容"
-                             (vt-shape out)))
+                    ;; 全局归约（axis=nil）：结果形状为 NIL（标量）。
+                    ;; keepdims 时为全 1 形状。历史实现还容许 '(1)，保留兼容。
+                    (let ((want (if keepdims
+                                    (make-list (length (vt-shape tensor))
+                                               :initial-element 1)
+                                    nil)))
+                      (unless (or (equal (vt-shape out) want)
+                                  (equal (vt-shape out) '(1)))
+                        (%vt-out-error "vt-nanmedian"
+                                       ":out 形状 ~a 与全局归约结果 ~a 不兼容"
+                                       (vt-shape out) want))
+                      (unless (eq (vt-dtype out) :float64)
+                        (%vt-out-error "vt-nanmedian"
+                                       ":out dtype ~a 与结果 dtype FLOAT64 不匹配"
+                                       (vt-dtype out)))
+                      (unless (vt-out-writable-p out)
+                        (%vt-out-error "vt-nanmedian"
+                                       ":out 是只读的广播视图（存在 dim>1 且 stride=0 的轴）")))
                     (vt-fill out result)
                     out)
                   (make-vt nil result :dtype :float64))))
@@ -1453,9 +1465,8 @@
               (compute 0 in-offset res-offset))
             (if out
                 (progn
-                  (unless (equal (vt-shape out) (vt-shape res))
-                    (error "vt-nanmedian: :out 形状 ~a 与期望 ~a 不匹配"
-                           (vt-shape out) (vt-shape res)))
+                  ;; 统一硬契约（§4.2 H2/H3）：形状与 dtype 必须精确匹配
+                  (vt-check-out out (vt-shape res) :float64 :op-name "vt-nanmedian")
                   (vt-copy-into out res)
                   out)
                 res))))))
@@ -1465,6 +1476,7 @@
 ;;; ------------------------------------------------------------------
 
 (defun vt-diff (vt &key (axis -1) (n 1))
+  "沿 AXIS 计算 N 阶离散差分（对标 numpy.diff）。"
   (let ((result vt))
     (loop repeat n do
       (let* ((sh (vt-shape result))
@@ -1478,6 +1490,7 @@
           finally (return result))))
 
 (defun vt-trapz (y &key (x nil) (dx 1.0d0) (axis -1))
+  "梯形法则数值积分（对标 numpy.trapz）。X 给定则用非均匀间距，否则用 DX。"
   (let* ((sh (vt-shape y))
          (ax (vt-normalize-axis axis (length sh)))
          (n (nth ax sh)))
@@ -1618,6 +1631,7 @@
         out))))
 
 (defun vt-gradient (tensor &key (spacing 1.0d0) axis)
+  "数值梯度（对标 numpy.gradient）。SPACING 为标量或每轴的间距；AXIS 限定求梯度的轴。"
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
          (axes (cond ((null axis)

@@ -3,8 +3,9 @@
 ;;;; 覆盖 v0.3.6 修复的五大 numpy 对齐项（TEST-PLAN §5 重校准 / §6 缺口收敛）：
 ;;;;   1. 空归约语义：输出空 → 空结果；max/min/arg 族输出非空且归约区空 →
 ;;;;      ValueError（取代 v0.3.5 的 NaN 填充约定）；单位元族填单位元。
-;;;;   2. :out 精度解耦：按输入提升计算、最后 cast 写入 out，与无 :out
-;;;;      的结果逐位一致（sum/prod/mean/var/std/nan* 全族）。
+;;;;   2. :out dtype 契约（v0.3.6 起）：结果 dtype 由「输入提升 + 显式
+;;;;      :dtype」决定，**不由 out 决定**；out 的 dtype 必须严格相等，
+;;;;      否则报错（用户裁决，取代 numpy 原生 out= 的静默 cast 语义）。
 ;;;;   3. mod/rem 零除 dtype 语义：浮点语境 → NaN，整型语境 → 0。
 ;;;;   4. vt-/ true_divide 语义：整数输入提升 float64，零除按 IEEE
 ;;;;      得 ±Inf/NaN（不再报错）。
@@ -82,32 +83,55 @@
   (check "mean (0) = NaN" (%nan (vt-item (vt-mean (vt-zeros '(0))))))
 
   ;; ================================================================
-  ;; 2. :out 精度解耦
+  ;; 2. :out dtype 契约（v0.3.6 起改为「严格相等」）
   ;; ================================================================
-  (format t "~%[2] :out 精度解耦（按输入提升计算，最后 cast 写入）~%")
-  (let ((o (make-vt '() 0 :dtype :int32)))
+  ;; 旧行为（已弃用）：numpy 原生 out= 语义——按输入提升计算，最后一步
+  ;;   cast 写入 out，因此 `:out int32` 配 float64 输入会静默截断。
+  ;; 新行为（用户裁决）：结果 dtype 由「输入提升 + 显式 :dtype」决定，
+  ;;   **不由 out 决定**；out 的 dtype 必须精确等于结果 dtype，否则报错。
+  ;;   需要低精度输出时，显式传 :dtype（并且 out 也用同一 dtype）。
+  (format t "~%[2] :out dtype 严格相等契约（v0.3.6）~%")
+  ;; 2a) 违反契约 → 必须报错（下面四个 case 覆盖 4 类典型误用）
+  (flet ((must-error (label thunk)
+           (check label
+                  (handler-case (progn (funcall thunk) nil)
+                    (error () t)))))
+    (must-error "sum f64 → :out int32 报错（禁止静默截断）"
+                (lambda () (vt-sum (vt-from-sequence '(0.9d0 0.9d0))
+                                   :out (make-vt '() 0 :dtype :int32))))
+    (must-error "sum int64 → :out float32 报错（结果 dtype 为 int64）"
+                (lambda () (vt-sum (vt-from-sequence '(16777217 1) :dtype :int64)
+                                   :out (make-vt '() 0 :dtype :float32))))
+    (must-error "sum int64 → :out int8 报错（结果 dtype 为 int64）"
+                (lambda () (vt-sum (vt-arange 5 :dtype :int64)
+                                   :out (make-vt '() 0 :dtype :int8))))
+    (must-error "mean int64 → :out int32 报错（mean 恒为浮点）"
+                (lambda () (vt-mean (vt-from-sequence '(1 2))
+                                    :out (make-vt '() 0 :dtype :int32)))))
+  ;; 2b) 契约满足 → 正确写入（含非连续 out）
+  (let ((o (make-vt '() 0 :dtype :float64)))
     (vt-sum (vt-from-sequence '(0.9d0 0.9d0)) :out o)
-    (check "sum (0.9 0.9) :out int32 = 1" (= (vt-item o) 1)))
-  (let ((o (make-vt '() 0 :dtype :float32)))
-    (vt-sum (vt-from-sequence '(16777217 1) :dtype :int64) :out o)
-    (check "sum (2^24+1 1) :out f32 = 16777218（int64 提升后计算）"
-           (= (vt-item o) 1.6777218e7)))
-  (let ((o (make-vt '() 0 :dtype :int32)))
+    (check "sum (0.9 0.9) :out f64 = 1.8" (< (abs (- (vt-item o) 1.8d0)) 1d-12)))
+  (let ((o (make-vt '() 0 :dtype :float64)))
     (vt-mean (vt-from-sequence '(1 2)) :out o)
-    (check "mean (1 2) :out int32 = 1" (= (vt-item o) 1)))
+    (check "mean (1 2) :out f64 = 1.5" (= (vt-item o) 1.5d0)))
   (let ((o (make-vt '() 0 :dtype :float32)))
-    (vt-mean (vt-from-sequence '(1 2)) :out o)
-    (check "mean (1 2) :out f32 = 1.5" (= (vt-item o) 1.5)))
+    ;; 想得到 float32 结果，必须显式传 :dtype :float32（此时 out 也必须是 float32）。
+    ;; 只传 f32 的 out 而不给 :dtype 会因「严格相等」契约报错——这正是 2a) 的语义。
+    (check "mean f64 输入 + 显式 :dtype :float32 → out f32 = 1.5"
+           (= (vt-item (vt-mean (vt-from-sequence '(1.0d0 2.0d0))
+                                :dtype :float32 :out o))
+              1.5)))
+  (let ((o (make-vt '() 0 :dtype :int64)))
+    (vt-sum (vt-arange 5 :dtype :int64) :out o)
+    (check "sum arange(5) :out int64 = 10" (= (vt-item o) 10)))
   (let ((o (make-vt '() 0 :dtype :float64)))
     (vt-var (vt-from-sequence '(1 2 3)) :out o)
     (check "var (1 2 3) :out f64 = 2/3"
            (< (abs (- (vt-item o) #.(coerce 2/3 'double-float))) 1e-12)))
   (let ((o (make-vt '() 0 :dtype :float64)))
-    (vt-nanmean (vt-from-sequence (list 1.0d0 +vt-float-nan+ 3.0d0)) :out o)
+    (vt-nanmean (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ 3.0d0)) :out o)
     (check "nanmean out f64 = 2.0" (= (vt-item o) 2.0d0)))
-  (let ((o (make-vt '() 0 :dtype :int8)))
-    (vt-sum (vt-arange 5 :dtype :int64) :out o)
-    (check "sum arange(5) :out int8 = 10（int64 累加后 cast）" (= (vt-item o) 10)))
   ;; 与无 :out 结果逐位一致
   (let ((direct (vt-item (vt-mean (vt-from-sequence '(1 2 3 4)))))
         (into (make-vt '() 0 :dtype :float64)))
@@ -154,13 +178,13 @@
   ;; 5. random NaN/Inf 参数校验前移
   ;; ================================================================
   (format t "~%[5] random 参数校验（干净参数错误）~%")
-  (check-error "uniform NaN low"  (lambda () (vt-random-uniform '(2) :low +vt-float-nan+)))
-  (check-error "uniform NaN high" (lambda () (vt-random-uniform '(2) :high +vt-float-nan+)))
+  (check-error "uniform NaN low"  (lambda () (vt-random-uniform '(2) :low +vt-dfloat-nan+)))
+  (check-error "uniform NaN high" (lambda () (vt-random-uniform '(2) :high +vt-dfloat-nan+)))
   (check-error "uniform inf low"  (lambda () (vt-random-uniform '(2) :low (vt-float-pos-inf))))
-  (check-error "normal NaN mean"  (lambda () (vt-random-normal '(2) :mean +vt-float-nan+)))
+  (check-error "normal NaN mean"  (lambda () (vt-random-normal '(2) :mean +vt-dfloat-nan+)))
   (check-error "normal inf std"   (lambda () (vt-random-normal '(2) :std (vt-float-pos-inf))))
   (check-error "normal -inf std"  (lambda () (vt-random-normal '(2) :std (vt-float-neg-inf))))
-  (check-error "normal NaN std"   (lambda () (vt-random-normal '(2) :std +vt-float-nan+)))
+  (check-error "normal NaN std"   (lambda () (vt-random-normal '(2) :std +vt-dfloat-nan+)))
   (check "normal std=0 → mean 填充"
          (= (vt-item (vt-random-normal nil :mean 5.0d0 :std 0.0d0)) 5.0d0))
   (check "uniform low=high → 常量填充"

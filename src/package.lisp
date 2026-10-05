@@ -363,9 +363,10 @@
    #:vt-float-neg-inf-p
    #:vt-float-inf-=
    #:vt-float-nan-inf-=
-   #:+vt-float-nan+
-   #:+vt-float-pos-inf+
-   #:+vt-float-neg-inf+
+   ;; v0.3.6：删除 #:+vt-float-nan+ / #:+vt-float-pos-inf+ / #:+vt-float-neg-inf+
+   ;; 三个「默认 double」别名常量。请改用按 dtype 取值的
+   ;; (vt-get-nan dtype) / (vt-get-pos-inf dtype) / (vt-get-neg-inf dtype)，
+   ;; 或精确的 +vt-dfloat-*+ / +vt-sfloat-*+ 常量。
 
    ;; ------------------------------------------------------------------
    ;; 核心迭代与映射 (map-reduce.lisp)
@@ -375,6 +376,19 @@
    #:vt-reduce
    #:vt-copy-into
    #:vt-copy
+
+   ;; ------------------------------------------------------------------
+   ;; 参数契约基础设施 (parcontract.lisp)
+   ;; :out / :dtype 的统一校验、strides 驱动寻址、别名快照
+   ;; ------------------------------------------------------------------
+   #:vt-check-out
+   #:vt-check-out-dtype-consistency
+   #:vt-out-writable-p
+   #:vt-out-contig-p
+   #:vt-out-snapshot
+   #:vt-write-1
+   #:vt-reduce-dtypes
+   #:vt-params-audit
 
    ;; ------------------------------------------------------------------
    ;; 通用辅助与宏

@@ -251,6 +251,7 @@
 
 (defun vt-random-int
     (low high &key (size nil) (dtype :int64) (rng nil))
+  "生成 [low, high) 区间的随机整数张量（对标 numpy.random.randint）。"
   (setf rng (%ensure-random-state rng))
   (let ((range (- high low)))
     (assert (>= range 0) (high low))
@@ -268,6 +269,7 @@
 
 (defun vt-random-integers
     (low high &key (size nil) (dtype :int64) (rng nil))
+  "同 vt-random-int，返回区间 [low, high) 的整数样本（对标 numpy.random.randint/integers）。"
   (setf rng (%ensure-random-state rng))
   (vt-random-int low high :size size :dtype dtype :rng rng))
 
@@ -389,6 +391,7 @@
              result)))))))
 
 (defun vt-random-permutation (n &key (rng nil))
+  "返回 0..n-1 的随机排列，或打乱给定张量（对标 numpy.random.permutation）。"
   (setf rng (%ensure-random-state rng))
   (when (and (integerp n) (<= n 1))
     (return-from vt-random-permutation
@@ -413,6 +416,7 @@
         result)))
 
 (defun vt-random-shuffle (tensor &key (axis 0) (rng nil))
+  "原地打乱张量（对标 numpy.random.shuffle），返回被打乱的张量。"
   (setf rng (%ensure-random-state rng))
   (let* ((ax (vt-normalize-axis axis (length (vt-shape tensor))))
          (dim (nth ax (vt-shape tensor))))
@@ -431,6 +435,7 @@
     tensor))
 
 (defun vt-random-multinomial (n pvals &key (size nil) (rng nil))
+  "多项式分布采样（对标 numpy.random.multinomial）。"
   (setf rng (%ensure-random-state rng))
   (let* ((probs (if (vt-p pvals) (vt-to-list pvals) (coerce pvals 'list)))
          (k (length probs)))

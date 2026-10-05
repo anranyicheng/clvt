@@ -176,15 +176,20 @@
       (unless (>= (* m k n) *simd-matmul-threshold*)
         (return-from %simd-matmul-2d-generic nil))
 
-      (let ((final (cond (out (vt-dtype out))
-                         (dtype dtype)
-                         (t (vt-promote-type (vt-dtype a) (vt-dtype b))))))
+      ;; 结果 dtype 由「输入提升 + 显式 :dtype」决定，**不由 out 决定**（§4.2 H3）。
+      ;; 先算出自然结果 dtype，与调用方期望比较；out 的 dtype 若与之不符，
+      ;; 直接拒绝快路径（返回 nil 交回 vt-einsum，由它给出带 "vt-einsum" 前缀
+      ;; 的清晰报错），绝不能把 out 的 dtype 当作结果 dtype 接受。
+      (let ((final (or dtype (vt-promote-type (vt-dtype a) (vt-dtype b)))))
         (unless (eq final expected-dtype)
+          (return-from %simd-matmul-2d-generic nil))
+        (when (and out (not (eq (vt-dtype out) final)))
           (return-from %simd-matmul-2d-generic nil)))
 
       (when out
         (unless (and (equal (vt-shape out) (list m n))
-                     (vt-contiguous-p out))
+                     (vt-contiguous-p out)
+                     (vt-out-writable-p out))
           (return-from %simd-matmul-2d-generic nil)))
 
       (let* ((a-c1 (if (and (eq (vt-dtype a) expected-dtype)
@@ -193,9 +198,11 @@
              (b-c1 (if (and (eq (vt-dtype b) expected-dtype)
                            (vt-contiguous-p b))
                       b (vt-contiguous (vt-astype b expected-dtype))))
-	     (a-c (if (and out (eq (vt-data out) (vt-data a-c1)))
+             ;; 别名保护：物理区间重叠判定（不能只比 vt-data 指针，
+             ;; 否则漏掉「同 data 异 offset」的重叠视图）。
+             (a-c (if (and out (%vt-views-overlap-p out a-c1))
                       (vt-copy a-c1) a-c1))
-             (b-c (if (and out (eq (vt-data out) (vt-data b-c1)))
+             (b-c (if (and out (%vt-views-overlap-p out b-c1))
                       (vt-copy b-c1) b-c1))
              (output (or out (vt-zeros (list m n) :dtype expected-dtype)))
              (a-data (vt-data a-c))
@@ -293,15 +300,21 @@
             (unless (>= total-work *simd-matmul-threshold*)
               (return-from core nil))
             ;; 类型检查
-            (let ((final (cond (out (vt-dtype out))
-                               (dtype dtype)
-                               (t (vt-promote-type (vt-dtype a)
-                                                   (vt-dtype b))))))
+            ;; 结果 dtype 由「输入提升 + 显式 :dtype」决定，**不由 out 决定**
+            ;; （§4.2 H3 严格相等契约）。out 的 dtype 必须精确匹配，
+            ;; 否则返回 nil 让上层走通用路径（那里会给出规范错误）。
+            (let ((final (or dtype
+                             (vt-promote-type (vt-dtype a) (vt-dtype b)))))
               (unless (eq final expected-dtype)
+                (return-from core nil))
+              (when (and out (not (eq (vt-dtype out) final)))
                 (return-from core nil)))
-            ;; OUT 形状检查
+            ;; OUT 形状检查：形状必须精确等于批量 matmul 结果形状。
+            ;; 非连续 out 不在此拦截 —— 本 SIMD 内核要求连续存储，
+            ;; 非连续 out 返回 nil 交给 einsum 通用路径（同样正确，只是慢）。
             (when out
               (unless (and (equal (vt-shape out) out-shape)
+                           (vt-out-writable-p out)
                            (vt-contiguous-p out))
                 (return-from core nil)))
             ;; 连续性 + 类型强制 + 创建 output
@@ -313,9 +326,15 @@
                                  (vt-contiguous-p b))
                             b
                             (vt-contiguous (vt-astype b expected-dtype))))
-		   (a-c (if (and out (eq (vt-data out) (vt-data a-c1)))
+                   ;; 别名保护：out 与 a/b 共享底层存储且**物理区间重叠**时，
+                   ;; 必须先快照。原实现只比较 (vt-data ...) 指针，
+                   ;; 会漏掉「同一底层数组但 offset 不同」的重叠
+                   ;; （如 out = base[2:], a = base[:4]），
+                   ;; 导致结果被就地覆盖而静默出错。改用统一原语
+                   ;; %vt-views-overlap-p，它比较实际访问区间。
+                   (a-c (if (and out (%vt-views-overlap-p out a-c1))
                             (vt-copy a-c1) a-c1))
-                   (b-c (if (and out (eq (vt-data out) (vt-data b-c1)))
+                   (b-c (if (and out (%vt-views-overlap-p out b-c1))
                             (vt-copy b-c1) b-c1))
                    (output (or out
                                (vt-zeros out-shape :dtype expected-dtype))))
