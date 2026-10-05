@@ -511,6 +511,81 @@ vt-one-hot          ;; 独热编码 (对标 torch.nn.functional.one_hot)
 vt-layer-norm       ;; 层归一化 (对标 torch.nn.LayerNorm)
 vt-apply-along-axis ;; 沿轴应用函数 (对标 numpy.apply_along_axis)
 vt-vander           ;; 范德蒙德矩阵 (对标 numpy.vander)
+vt-one-hot
+vt-standardize
+vt-layer-norm
+vt-apply-along-axis
+
+;; 扩展功能3 (extensions3.lisp)
+;;   —— 第三批 NumPy 重要缺失函数
+
+;; 创建类
+vt-asarray          ;; 转为张量，已是张量则原样返回 (对标 numpy.asarray)
+vt-fromiter         ;; 从迭代器构造一维张量 (对标 numpy.fromiter)
+vt-tri              ;; 下三角矩阵 (对标 numpy.tri)
+vt-diagflat         ;; 展平后构造对角矩阵 (对标 numpy.diagflat)
+vt-trim-zeros       ;; 去除首尾零元素 (对标 numpy.trim_zeros)
+
+;; 形状操作类
+vt-rollaxis         ;; 滚动轴到指定位置 (对标 numpy.rollaxis)
+vt-column-stack     ;; 按列堆叠 (对标 numpy.column_stack)
+vt-block            ;; 分块拼接 (对标 numpy.block)
+vt-broadcast-arrays ;; 将多个张量广播到公共形状 (对标 numpy.broadcast_arrays)
+vt-resize           ;; 改变形状（可重复/截断源数据）(对标 numpy.resize)
+
+;; 索引类
+vt-take-along-axis  ;; 沿轴按索引取值（支持广播）(对标 numpy.take_along_axis)
+vt-put-along-axis   ;; 沿轴按索引写入（支持广播）(对标 numpy.put_along_axis)
+vt-compress         ;; 沿轴按布尔条件选取切片 (对标 numpy.compress)
+vt-indices          ;; 网格索引张量（可返回稀疏列表）(对标 numpy.indices)
+vt-fill-diagonal    ;; 原地填充对角线 (对标 numpy.fill_diagonal)
+
+;; 数学类
+vt-absolute         ;; 逐元素绝对值 (对标 numpy.absolute)
+vt-sign             ;; 逐元素符号函数 (对标 numpy.sign)
+vt-positive         ;; 逐元素取正（一元 +）(对标 numpy.positive)
+vt-expm1            ;; exp(x)-1，x≈0 时高精度 (对标 numpy.expm1)
+vt-log1p            ;; log(1+x)，x≈0 时高精度 (对标 numpy.log1p)
+vt-logaddexp        ;; log(exp(x)+exp(y)) (对标 numpy.logaddexp)
+vt-float-power      ;; 以 float64 计算的幂 (对标 numpy.float_power)
+vt-copysign         ;; 按符号位取模 (对标 numpy.copysign)
+vt-signbit          ;; 符号位（含 -0.0 判定）(对标 numpy.signbit)
+vt-nextafter        ;; 朝指定方向的相邻浮点数 (对标 numpy.nextafter)
+vt-spacing          ;; 相邻浮点数间距 (对标 numpy.spacing)
+vt-gcd              ;; 最大公约数 (对标 numpy.gcd)
+vt-lcm              ;; 最小公倍数 (对标 numpy.lcm)
+vt-divmod           ;; 同时返回商与余数（floor 语义）(对标 numpy.divmod)
+vt-nan-to-num       ;; NaN/Inf 替换为有限值 (对标 numpy.nan_to_num)
+vt-real             ;; 取实部 (对标 numpy.real)
+vt-imag             ;; 取虚部（本库恒为 0）(对标 numpy.imag)
+vt-conj             ;; 共轭（本库恒等映射）(对标 numpy.conj)
+vt-angle            ;; 相位角 (对标 numpy.angle)
+
+;; 统计类
+vt-nancumsum        ;; 累计和（NaN 视为 0）(对标 numpy.nancumsum)
+vt-nancumprod       ;; 累计积（NaN 视为 1）(对标 numpy.nancumprod)
+vt-nanpercentile    ;; 忽略 NaN 的百分位 (对标 numpy.nanpercentile)
+vt-nanquantile      ;; 忽略 NaN 的分位数 (对标 numpy.nanquantile)
+vt-cov              ;; 协方差矩阵 (对标 numpy.cov)
+vt-corrcoef         ;; 相关系数矩阵 (对标 numpy.corrcoef)
+vt-cross            ;; 向量叉积 (对标 numpy.cross)
+
+;; 线性代数类
+vt-vdot             ;; 展平后点积 (对标 numpy.vdot)
+vt-eigvals          ;; 特征值（一般矩阵）(对标 numpy.linalg.eigvals)
+vt-eigvalsh         ;; 特征值（对称/Hermitian）(对标 numpy.linalg.eigvalsh)
+vt-matrix-power     ;; 矩阵幂 (对标 numpy.linalg.matrix_power)
+vt-cond             ;; 条件数 (对标 numpy.linalg.cond)
+vt-multi-dot        ;; 链式矩阵乘（自动选序）(对标 numpy.linalg.multi_dot)
+
+;; 逻辑类
+vt-array-equal      ;; 形状与元素完全相等判定 (对标 numpy.array_equal)
+vt-array-equiv      ;; 形状弱一致 + 元素相等判定 (对标 numpy.array_equiv)
+vt-isposinf         ;; 正无穷判定 (对标 numpy.isposinf)
+vt-isneginf         ;; 负无穷判定 (对标 numpy.isneginf)
+
+;; 集合类
+vt-isin             ;; 元素是否在给定集合中 (对标 numpy.isin)
 
 ```
 测试在 example/example.lisp 文件中。
@@ -521,7 +596,7 @@ vt-vander           ;; 范德蒙德矩阵 (对标 numpy.vander)
 (run-all-tests)
 ```
 
-自动化测试（27 个测试套件，共 1500+ 用例）:
+自动化测试（28 个测试套件，共 1600+ 用例）:
 ```bash
 # 运行所有测试
 bash test/run-tests.sh
@@ -557,6 +632,7 @@ bash test/run-tests.sh --list
 | `numpy-convention-tests` | 49 | numpy 对齐语义测试 |
 | `test-ai-edge-cases` | 40 | AI 主流函数语义回归测试 |
 | `extensions2-test` | 37 | 第二批扩展函数测试 |
+| `extensions3-test` | 184 | 第三批扩展函数测试（extensions3：asarray/tri/rollaxis/take-along-axis/sign/nan*/cov/cross/vdot/eigvals/matrix-power/isin 等） |
 | `nan-broadcast-test` | 31 | NaN/Inf 广播对齐 numpy 测试 |
 | `out-contig-tests` | 23 | `:out` 连续/非连续写入测试 |
 | `error-contract-tests` | 22 | 错误路径契约测试 |
@@ -597,6 +673,7 @@ bash test/run-tests.sh --list
 | `rotate.lisp` | 图像旋转（对标 scipy.ndimage.rotate） |
 | `extensions.lisp` | 扩展功能 |
 | `extensions2.lisp` | 第二批扩展功能（fliplr/geomspace/one-hot/layer-norm 等） |
+| `extensions3.lisp` | 第三批扩展功能（asarray/tri/rollaxis/block/take-along-axis/sign/nan*/cov/cross/vdot/eigvals/matrix-power/isin 等） |
 
 ## 设计约定
 
