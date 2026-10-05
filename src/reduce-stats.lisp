@@ -519,23 +519,20 @@
                     (in-off  (vt-offset tensor))
                     (in-et   (array-element-type in-data))
                     (in-size (vt-size tensor))
-                    ;; ---- 结果 dtype 三段式（§4.4 精度解耦）----
-                    ;; compute-dtype 是「按输入提升后的自然结果 dtype」，
-                    ;; **不由 out 决定**；final-out-dtype 同值（显式 :dtype 优先）。
+                    ;; ---- 结果 dtype（§4.2 H3「严格相等」）----
+                    ;; compute-dtype 是「按输入提升后的自然结果 dtype」，**不由 out 决定**；
+                    ;; final-out-dtype = 显式 :dtype 优先，否则取 compute-dtype。
+                    ;; out 的 dtype 必须精确等于 final-out-dtype，否则 vt-check-out 报错
+                    ;; —— 「算到临时缓冲再 cast 写入 out」的解耦路径已被该裁决废弃。
                     (compute-dtype (%op-out-dtype ,op (vt-dtype tensor)))
                     (final-out-dtype (or dtype compute-dtype))
-                    ;; 用户裁决（§4.2 H3「严格相等」）：out 的 dtype 必须精确
-                    ;; 等于结果 dtype，否则报错。旧有的「先算到临时缓冲再 cast
-                    ;; 写入 out」解耦路径因此被禁用（恒为 nil）；
-                    ;; 所有 out 一律经 vt-check-out 严格校验（见下方 res）。
-                    (decoupled nil)
-                    (res-lt (%dtype->lt (if decoupled compute-dtype final-out-dtype)))
+                    (res-lt (%dtype->lt final-out-dtype))
                     ;; out 给出时统一入口校验（含 dtype 严格相等与可写性）；
                     ;; 未给出时新建。
-                    (res (cond (decoupled (make-vt out-shape 0 :dtype compute-dtype))
-                               (out (vt-check-out out out-shape final-out-dtype
-                                                  :op-name (format nil "vt-~a" ',name)))
-                               (t (make-vt out-shape 0 :dtype final-out-dtype))))
+                    (res (if out
+                             (vt-check-out out out-shape final-out-dtype
+                                           :op-name (format nil "vt-~a" ',name))
+                             (make-vt out-shape 0 :dtype final-out-dtype)))
                     (res-data (vt-data res))
                     (res-off  (vt-offset res)))
                (declare (fixnum rank axis-size in-size))
@@ -556,7 +553,7 @@
                  (cond
                    ;; 1) 输出为空：直接返回空结果
                    ((zerop (vt-shape-to-size out-shape))
-                    (return-from ,fn-name (if decoupled out res)))
+                    (return-from ,fn-name res))
                    ;; 2) arg 族：输出非空 → 报错（numpy 语义）
                    ,@(when arg-p
                        `((t (error "vt-~a: attempt to get arg~a of an empty sequence（numpy 语义：输出非空且归约区为空）"
@@ -582,8 +579,7 @@
                                                        ,(%op-init op l rlt)))
                                              (t 0))))
                                  (t 0)))
-                      (return-from ,fn-name
-                        (if decoupled (progn (vt-copy-into out res) out) res))))))
+                      (return-from ,fn-name res)))))
                ;; ---- 主分派 ----
                ;; 小整型（逻辑级 dtype）不进入类型特化内核：路径 1/2 以
                ;; wide-et 守卫排除，统一由路径 3 的 %kernel-small-general 兜底。
@@ -645,9 +641,8 @@
                          (non-size (reduce #'* non-sizes :initial-value 1)))
                     (declare (fixnum n-red n-non red-size non-size))
                     ,(dispatch '%kernel-general :small-int-p t))))
-               ;; decoupled：计算结果在临时缓冲（compute-dtype），
-               ;; 最后一步 cast 写入 :out（vt-copy-into 支持跨 dtype 与视图写入）
-               (if decoupled (progn (vt-copy-into out res) out) res))))))))
+               ;; 主分派结束：res 即最终结果（out 存在时已就地写入并返回同一对象）
+               res)))))))
 
 ;;; ============================================================
 ;;; 归约族定义

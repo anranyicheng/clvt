@@ -171,6 +171,8 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 
 > **H3 说明**（与 NumPy 的唯一口子）：NumPy 允许 float64→float32 的 out。clvt **不放开**，理由：clvt 无 `casting=` 参数，放开后无法表达"拒绝 float64→int32"这一半；且放开会与"精度解耦"（§4.4）语义纠缠。**要求 `vt-dtype out` 精确等于结果 dtype**，这比 NumPy 更严格，属"更安全的子集"，不构成冲突。
 
+> **函数级附加约束**：个别函数可在 H1–H6 之上追加更严的形状要求，函数自身的契约更高。例：`vt-det` 要求 `:out` **必须是 0 维张量**，违反即报错。
+
 #### 软门控 —— 只影响选路，不影响结果
 
 | 门控 | 行为 |
@@ -265,6 +267,17 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 
 **所有**带 `:out` 的函数必须经由这两个原语，杜绝各函数自行拼装检查逻辑（MECE：一个检查点，一处修改）。
 
+#### 机制 E：einsum 路由
+
+`vt-einsum` 按收缩模式选路，**所有路径结果必须逐位一致**（铁律 1、2 的实例）：
+
+| 模式 | 路由 |
+|---|---|
+| 纯逐元素 | `vt-map` |
+| 全收缩内积 | 专用累加内核 |
+| 批量矩阵乘法 | 分块 GEMM（SIMD + 多线程） |
+| 其余 | 通用循环 |
+
 ---
 
 ## 5. NaN / Inf 约定（**任务4 核心**）
@@ -357,6 +370,8 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 | `nan → int` cast | `INT_MIN` 或 `0`（实现定义，本库已约定 **0**） | 保留本库约定（NumPy 未定义，属自由区） |
 
 > **注意**：本库 `vt-mod`/`vt-rem` 的"零除 dtype 语义 + `zero-div`"设计**与 NumPy 不符**：NumPy 整数零除返回 0 而非报错。裁决：**跟随 NumPy（返回 0）**。
+
+**奇偶判定**：`vt-even-p` / `vt-odd-p` 对**非有限值**（NaN / ±Inf）一律判定为**不成立**（返回 `0`），不报错、不进入取整路径（避免 §7.1 的 SBCL 浮点陷阱）。
 
 ### 5.6 排序
 
@@ -546,6 +561,9 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | `vt-einsum` | out dtype 硬校验（当前已实现，**保留为样板**） | ✅ |
 | `vt-matmul` | 1d 提升语义；`out` 走 `vt-copy-into` | ✅ |
 | `vt-isclose` | `rtol=1e-5, atol=1e-8` | ✅ 实测默认宽松（1e-6 内判等），需在文档写明 |
+| `vt-arange` | 整型溢出与 `int16/int8/uint*` 一致采用**回绕**语义（`%wrap-*`），不报错（见 §9.1） | ✅ |
+| `vt-linspace` | float32 输出**以 double 精度计算后舍入存储**（对标 NumPy，避免累积漂移） | ✅ |
+| `vt-random-uniform` / `vt-random-normal` | `uniform` 要求 `low`/`high` 为有限实数，`low = high` 合法（返回常量数组）；`normal` 要求 `std` 为非负有限实数，`std = 0` 返回 `mean` 填充 | ✅ |
 | `vt-slice` | spec 语法须与文档统一（**无 `:range`** → D1） | ⚠️ 仅需补文档 |
 | `vt-where` | 支持单参数形式返回索引（→ D6） | ⚠️ 需改 |
 | 空归约 | 三分类语义 | ✅ 正面样板（D11） |

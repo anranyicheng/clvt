@@ -598,74 +598,17 @@ bash test/run-tests.sh --list
 | `extensions.lisp` | 扩展功能 |
 | `extensions2.lisp` | 第二批扩展功能（fliplr/geomspace/one-hot/layer-norm 等） |
 
-## 设计约定（三层架构语义契约）
+## 设计约定
 
-clvt 遵循"逻辑层 / 物理层 / 执行层"三层分离架构，所有公开 API 遵守以下契约：
+clvt 遵循「逻辑层 / 物理层 / 执行层」三层分离架构。全部语义契约——三层职责与铁律、
+Strided View 内存模型、dtype 与类型提升、`:out` 参数契约、NaN/Inf 语义、参数与
+默认值约定、SBCL 平台陷阱、逐函数对齐要点、测试与文档约定、验收标准——
+统一以**单一事实来源**为准，详见：
 
-| 层次 | 职责 | 失败模式 |
-|------|------|----------|
-| 逻辑层 | shape、dtype、广播规则、归约语义 | 形状不匹配、dtype 不支持 |
-| 物理层 | strides、offset、连续性、内存布局 | 越界访问、别名冲突 |
-| 执行层 | 快路径 vs 通用路径、SIMD、并行调度 | 性能退化（但不应导致错误结果） |
+> **[`CONVENTIONS.md`](CONVENTIONS.md)** —— clvt 统一约定（Conventions）
 
-**核心原则：任何优化路径必须与通用路径在语义上完全等价。** 连续性只影响性能，
-绝不影响正确性——连续视图走内联/SIMD 快路径，非连续视图走 strides 遍历，
-两条路径的输出必须逐位相同。路径选择基于运行时检查，不基于编译期假设。
-
-### 内存模型：Strided View
-
-张量是扁平缓冲区上的视图，由 data pointer、shape、stride、dtype（外加 device）描述。
-内存是一维的；一个 (3, 4) 的张量在扁平缓冲区中存储 12 个数，stride (4, 1) 表示
-沿行前进跳 4 个元素、沿列前进跳 1 个。广播的物理实现是长度为 1 的轴 stride = 0。
-
-| 操作 | 是否拷贝 | 条件 |
-|------|----------|------|
-| `transpose` / `permute` | 否 | 仅交换 shape 和 stride |
-| `reshape` | 否（若可） | stride 兼容则视图，否则拷贝 |
-| `view` | 否 | 要求连续性，非连续时报错 |
-| 基础切片 `x[1:, ::2]` | 否 | 调整 base offset 和 strides |
-| 高级索引 `x[[0,2]]` | 是 | 无法表达为 stride 模式 |
-| `flatten` | 是 | 总是拷贝 |
-| `ravel` | 否（若可） | 尽可能返回视图 |
-| `contiguous` | 可能 | 已连续则返回自身（no-op） |
-
-### 语义保证
-
-- **广播**：右对齐、维数不足左补 1；原地操作不允许广播改变形状；
-  广播视图（dim > 1 且 stride = 0）语义上只读，写入报错。
-- **类型提升**：boolean < integral < floating；浮点不降级；
-  int32 与 float32 混合提升为 float64（24 位尾数规则）；整数溢出回绕；
-  浮点转整数截断，NaN/Inf 转整数返回 0。
-- **NaN/Inf**：算术传播、比较恒假；`maximum/minimum` NaN 传播，
-  `fmax/fmin` 忽略 NaN；`sum/prod` NaN 传播，`nansum/nanprod` 跳过；
-  `amax/amin` 首个 NaN 立即胜出，`argmax/argmin` 遇 NaN 立即返回该位置；
-  排序 NaN 稳定排在末尾；集合语义（unique 等）NaN 视为相等；
-  softmax 减最大值稳定化（全 -Inf 行 → NaN，对标 PyTorch）。
-- **归约**：`axis = nil` 全局归约；`keepdims` 保留归约轴为 1；
-  int32 累加器提升为 int64，float32 保持 float32。
-  空归约按"是否有单位元"分类：`sum→0`、`prod→1`、`all→T`、`any→NIL`
-  返回单位元；`max/min` 族无单位元，空归约返回 NaN（整数结果 dtype
-  提升为 float64 承载 NaN）；`argmax/argmin` 族空归约报错。
-- **别名安全**：输出 `:out` 与任一输入共享底层存储且物理区间重叠时，
-  先快照输入再写入；广播视图（stride = 0）与自重叠视图只读。
-  重叠检测按维扩展：dim > 1 时区间向 stride 方向扩展 (dim-1)*|stride|，
-  广播维不扩展区间。
-- **out 契约**：硬契约（违反必报错）——形状必须等于逻辑结果形状、
-  必须可写（非广播视图）、与显式 `:dtype` 冲突报错；
-  软门控（只影响选路）——连续性决定快慢路径，非连续 out 必须能被正确写入。
-- **einsum 路由**：纯逐元素模式 → `vt-map`；全收缩内积 → 专用累加内核；
-  批量矩阵乘法 → 分块 GEMM（SIMD + 多线程）；其余 → 通用循环。
-
-### v0.3.1 增补约定
-
-- **mod/rem 零除**：`vt-mod` / `vt-rem` 除数为 0 时返回 0（对标 `np.mod`），不再依赖实现抛错。
-- **even-p/odd-p 非有限值**：NaN/±Inf 一律判定为不成立（返回 0）。
-- **hypot 特殊值**：任一参数为 ±Inf 时返回 +Inf（即便另一参数为 NaN，对标 IEEE/NumPy）；NaN 单独出现时传播。
-- **arange 整型溢出**：int64/int32 路径与 int16/int8/uint 一致采用回绕语义（%wrap-*）。
-- **linspace 精度**：float32 输出以 double 精度计算后舍入存储（对标 NumPy，避免累积漂移）。
-- **随机数边界**：`vt-random-uniform` 要求 low/high 为有限实数，low=high 合法（常量数组）；`vt-random-normal` 要求 std 为非负有限实数（std=0 返回 mean 填充）。
-- **vt-det out 契约**：:out 必须为 0 维张量，违反即报错。
-- **out dtype 权威约定（严格相等）**：结果 dtype 由「输入提升 + 显式 `:dtype`」决定，**不由 out 决定**。`out` 必须精确等于结果 dtype，否则报错（H3），杜绝 float64 结果静默降精度写入 float32 缓冲区。若需 float32 输出，须显式传 `:dtype :float32`，此时 out 也必须为 float32。全部接受 `:out` 的函数统一遵守该契约，硬校验由 `vt-check-out` 完成，别名安全由 `vt-out-snapshot` 保证。
+该文件以 NumPy 2.3.5 实测为基准；凡冲突以 NumPy 为准，唯一例外为 `vt-arange`。
+README 不再重复其内容。
 
 ## License
 MIT
