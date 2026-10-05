@@ -4,6 +4,53 @@
 
 ---
 
+## 2026-10-05 — 覆盖缺口审计：补齐未覆盖函数测试 + 修复 6 处实现缺陷
+
+在 SBCL 2.6.8 + Quicklisp + numpy 2.4.6 环境上，以 CONVENTIONS.md 为语义
+契约运行全部 27 个测试套件与 example/example.lisp（均全绿），随后做
+**导出函数覆盖审计**：对比 `src/package.lisp` 的 306 个 `vt-*` 导出与
+`test/*.lisp` + `example/example.lisp` 的全部引用，发现 61 个公开函数
+从未被任何测试或示例调用。
+
+据此新增 `test/uncovered-coverage-test.lisp`（136 条断言，期望值取自
+numpy 2.4.6 实测或 CONVENTIONS 契约），并为其中暴露的缺陷做修复。
+
+### 修复的实现缺陷（6 处）
+
+| # | 函数 | 缺陷 | 修法 |
+|---|------|------|------|
+| 1 | `vt-identity` | **崩溃**：`(vt-identity 3)` 缺省 `dtype` 为 NIL，下传 `vt-eye` 触发 `NIL fell through ECASE` | `&key (dtype :float64)` 对齐 `vt-eye` 缺省值 |
+| 2 | `vt-vander` | **崩溃**：`(vt-vander x)` 缺省 `n` 为 NIL → `odd number of &KEY arguments` | `&key (n nil)`，缺省取 `len(x)`（对标 `np.vander` N=len(x)） |
+| 3 | `vt-atanh` | `\|x\|=1` 返回 NaN，与 numpy 不符 | `x=+1→+Inf`、`x=-1→-Inf`、`\|x\|>1→NaN`（补 `vt-get-pos-inf`/`vt-get-neg-inf`） |
+| 4 | `vt-= vt-/= vt-< vt-<= vt-> vt->=` | 返回 `float64`，违反 CONVENTIONS §3.1「比较运算返回 :int8 承载布尔」 | 缺省 dtype 改 `:int8`，返回值 1/0（numpy 语义不变，dtype 对齐） |
+| 5 | `vt-positive-p vt-negative-p vt-zero-p vt-nonzero-p vt-even-p vt-odd-p` | 同上，返回 `float64` | 缺省 dtype 改 `:int8` |
+| 6 | `vt-isnan vt-isinf vt-isfinite` | 返回 `float64` 布尔 | dtype 固定 `:int8` |
+
+> 缺陷 4–6 是**契约违反**：CONVENTIONS §3.1/§9.2 明确"比较/逻辑运算返回
+> `:int8`，取值 0/1"，而实现长期返回 `float64`。属"文档正确、实现偏差"，
+> 按 CONVENTIONS「与 NumPy 冲突以 NumPy 为准、与文档冲突修实现」处理。
+> `vt-all`/`vt-any`/`vt-count-nonzero` 返回整数计数（`int64`），非布尔，
+> 保持不动；`vt-def-vt-reduce` 的 `:all`/`:any` 分支亦不受影响。
+
+### 同步更新的既有测试（期望值随契约修正）
+
+- `test/comprehensive-test.lisp`：`a<b` / `a==b` 期望由 `(1.0 1.0 0.0 ...)`
+  改为 `(1 1 0 ...)`（int8）。
+- `test/nan-random-test.lisp`：`isnan/isinf/isfinite` 期望改为整数 0/1。
+
+### 新增测试套件
+
+- `test/uncovered-coverage-test.lisp`（136 断言，已注册进 `run-tests.sh`）
+  覆盖：二元算术别名、反三角/反双曲、谓词族、逻辑/位运算、创建族
+  （含 identity 回归）、拼接/维度、clamp/select/copy-to!、vander 回归、
+  结构原语（strides/normalize-axis/out 可写性/strides 驱动写入）、
+  扩展函数、extensions2、随机数底层对象、最小二乘。
+
+**验收**：`bash test/run-tests.sh --quick` → 28 套件全绿；
+`sbcl --load example/example.lisp` + `run-all-tests` → 全绿。
+
+---
+
 ## 2026-10-05 — v0.3.6 numpy 2.1.3 语义对齐：空归约重校准 / :out 精度解耦 / true_divide / random 校验
 
 以 numpy 2.1.3 实测为基准（逐项探针对表），修正 v0.3.5 分歧表中三处

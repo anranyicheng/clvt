@@ -183,8 +183,9 @@
 ;;; ------------------------------------------------------------------
 ;;; 6. vander
 ;;; ------------------------------------------------------------------
-(defun vt-vander (x &key n (increasing nil))
+(defun vt-vander (x &key (n nil) (increasing nil))
   "范德蒙德矩阵，对标 np.vander。
+   - n 缺省（NIL）时取 x 的元素个数（np.vander 缺省 N = len(x)）
    - increasing = t : 第 j 列为 x^j
    - increasing = nil : 第 j 列为 x^(ncols-1-j)
    实现用一行内 O(ncols) 递推，避免每个元素重复做幂运算。

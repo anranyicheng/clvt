@@ -681,17 +681,18 @@
   (= (vt-item (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol))) 1.0d0))
 
 (defun vt-isfinite (vt &key out)
-  "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回布尔张量。"
-  (vt-map (lambda (x) (if (and (not (%nan-p x)) (not (%inf-p x))) 1.0d0 0.0d0))
-          vt :dtype :float64 :out out))
+  "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回 int8 布尔张量（1/0）。
+      dtype 固定 :int8（承载布尔语义，CONVENTIONS §3.1）。"
+  (vt-map (lambda (x) (if (and (not (%nan-p x)) (not (%inf-p x))) 1 0))
+          vt :dtype :int8 :out out))
 
 (defun vt-isinf (vt &key out)
-  "逐元素判断是否为 ±Inf，返回布尔张量。"
-  (vt-map (lambda (x) (if (%inf-p x) 1.0d0 0.0d0)) vt :dtype :float64 :out out))
+  "逐元素判断是否为 ±Inf，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
+  (vt-map (lambda (x) (if (%inf-p x) 1 0)) vt :dtype :int8 :out out))
 
 (defun vt-isnan (vt &key out)
-  "逐元素判断是否为 NaN，返回布尔张量。"
-  (vt-map (lambda (x) (if (%nan-p x) 1.0d0 0.0d0)) vt :dtype :float64 :out out))
+  "逐元素判断是否为 NaN，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
+  (vt-map (lambda (x) (if (%nan-p x) 1 0)) vt :dtype :int8 :out out))
 
 ;;; ------------------------------------------------------------------
 ;;; 均值 / 方差 / 标准差

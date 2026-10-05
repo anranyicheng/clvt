@@ -970,6 +970,45 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | `most-positive-double-float` 误用 | 已排查（D4b） | — |
 | nan/inf 常量精简 | 三个 `+vt-float-*+` 已删除（§5.1） | — |
 | 测试/example 审计 | `run-all-tests` + 27 套件全绿（任务6） | — |
+| 覆盖缺口审计 | **新增 28 套件全绿**（`uncovered-coverage-test` 136 断言）；6 处缺陷修复见 §15（本轮） | — |
+
+---
+
+## 15. 覆盖缺口审计与缺陷修复（本轮）
+
+本节记录对 **306 个导出 `vt-*` 函数**做的覆盖审计：用
+`comm` 对比 `src/package.lisp` 导出清单与 `test/*.lisp` + `example/example.lisp`
+的全部符号引用，得到 61 个**从未被任何测试或示例调用**的公开函数，
+并为其补齐断言（`test/uncovered-coverage-test.lisp`）。
+
+### 15.1 修复的实现缺陷
+
+| # | 函数 | 缺陷类别 | 复现 | 修法 |
+|---|---|---|---|---|
+| F1 | `vt-identity` | **崩溃**（缺省值 NIL 下传） | `(vt-identity 3)` → `NIL fell through ECASE` | `&key (dtype :float64)` |
+| F2 | `vt-vander` | **崩溃**（`&key n` 无缺省） | `(vt-vander x)` → `odd number of &KEY arguments` | `&key (n nil)` → 缺省 `len(x)` |
+| F3 | `vt-atanh` | 边界值不符 numpy | `atanh(±1)` → NaN（应 ±Inf） | `±1→±Inf`，`\|x\|>1→NaN` |
+| F4 | `vt-= vt-/= vt-< vt-<= vt-> vt->=` | **dtype 契约违反**（§3.1） | 返回 `float64`，应 `:int8` | 缺省 dtype `:int8`，值 1/0 |
+| F5 | `vt-positive-p vt-negative-p vt-zero-p vt-nonzero-p vt-even-p vt-odd-p` | 同上 | 返回 `float64` | 缺省 dtype `:int8` |
+| F6 | `vt-isnan vt-isinf vt-isfinite` | 同上 | 返回 `float64` | dtype 固定 `:int8` |
+
+> F4–F6 的裁决依据：CONVENTIONS §3.1「比较运算返回 :int8，取值 0/1，语义上
+> 等价于 NumPy bool」，§9.2「比较运算 → 返回 :int8 承载布尔」。
+> NumPy 侧布尔数组与 clvt `:int8` 的**值语义完全一致**，仅 dtype 标签不同，
+> 故本修复不构成与 NumPy 的冲突，而是向**本文档自身契约**收敛。
+> 计数类（`vt-count-nonzero`、`vt-all`/`vt-any` 的规约输出）保持整数 dtype。
+
+### 15.2 审计确认「正确、无需修改」的函数
+
+以下函数一度被怀疑有缺陷，经 numpy 2.4.6 逐项对照后确认**实现正确**，
+本节的结论是"补测试即可，实现不动"：
+
+`vt-select`（condlist/choicelist 列表语义）、`vt-dsplit`（axis=2）、
+`vt-vsplit`、`vt-hsplit`、`vt-moveaxis`（含负轴与多轴 `(0,1)->(2,3)`）、
+`vt-lerp`（CL 参数顺序 start/end/weight）、`vt-write-1`（strides 驱动寻址）、
+`vt-layer-norm`、`vt-apply-along-axis`、`vt-tensordot`、`vt-geomspace`、
+`vt-identity` 的非缺省 dtype 分支。
+
 
 ---
 

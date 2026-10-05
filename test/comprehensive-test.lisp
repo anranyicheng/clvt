@@ -332,8 +332,9 @@
 
   (let ((a (vt-from-sequence '(1.0 2.0 3.0 4.0 5.0) :dtype :float64))
         (b (vt-from-sequence '(5.0 4.0 3.0 2.0 1.0) :dtype :float64)))
-    (test-assert-float "a<b" '(1.0 1.0 0.0 0.0 0.0) (vt-to-list (vt-< a b)))
-    (test-assert-float "a==b" '(0.0 0.0 1.0 0.0 0.0) (vt-to-list (vt-= a b))))
+    ;; 比较运算返回 int8 布尔（CONVENTIONS §3.1），故期望为整数 1/0。
+    (test-assert "a<b (int8)" '(1 1 0 0 0) (vt-to-list (vt-< a b)))
+    (test-assert "a==b (int8)" '(0 0 1 0 0) (vt-to-list (vt-= a b))))
 
   ;; ============================================================
   ;; 9. Slicing

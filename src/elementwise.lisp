@@ -236,12 +236,18 @@
 	    vt :out out :dtype dt)))
 
 (defun vt-atanh (vt &key out dtype)
-  "逐元素反双曲正切。|x|>=1 返回 NaN（对标 numpy）。
+  "逐元素反双曲正切，对标 numpy.arctanh。
+      |x|>1 返回 NaN；x=+1 返回 +Inf、x=-1 返回 -Inf（IEEE 极限，非 NaN）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
-	 (nan (vt-get-nan dt)))
+	 (nan (vt-get-nan dt))
+	 (pos-inf (vt-get-pos-inf dt))
+	 (neg-inf (vt-get-neg-inf dt)))
     (vt-map (lambda (x)
-	      (if (>= (abs x) 1.0d0) nan (atanh x)))
+	      (cond ((> (abs x) 1.0d0) nan)
+		    ((= x 1.0d0) pos-inf)
+		    ((= x -1.0d0) neg-inf)
+		    (t (atanh x))))
 	    vt :out out :dtype dt)))
 
 (defun vt-exp (vt &key out dtype)
@@ -335,45 +341,46 @@
   (vt-map (lambda (x) (if (%nan-p x) x (signum x)))
           vt :out out :dtype dtype))
 
-(defun vt-positive-p (vt &key out (dtype :float64))
-  "逐元素正数判定，返回 1.0/0.0（dtype 默认 float64）。
-      对标 numpy.positive 的**符号过滤**语义（不是 numpy 的
-      elementwise_ispos 类型判定）。NaN 比较恒假 → 0.0。"
+(defun vt-positive-p (vt &key out (dtype :int8))
+  "逐元素正数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      对标 numpy 的符号过滤语义（>0）。NaN 比较恒假 → 0。:out 契约同 vt-=。"
   (vt-map (lambda (v)
-	    (if (> v 0.0d0) 1.0d0 0.0d0))
+	    (if (> v 0.0d0) 1 0))
 	  vt :out out :dtype dtype))
 
-(defun vt-negative-p (vt &key out (dtype :float64))
-  "逐元素负数判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN 比较恒假 → 0.0。"
+(defun vt-negative-p (vt &key out (dtype :int8))
+  "逐元素负数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN 比较恒假 → 0。:out 契约同 vt-=。"
   (vt-map (lambda (v)
-	    (if (< v 0.0d0) 1.0d0 0.0d0))
+	    (if (< v 0.0d0) 1 0))
 	  vt :out out :dtype dtype))
 
-(defun vt-zero-p (vt &key out (dtype :float64))
-  "逐元素零判定，返回 1.0/0.0（dtype 默认 float64）。"
+(defun vt-zero-p (vt &key out (dtype :int8))
+  "逐元素零判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      :out 契约同 vt-=。"
   (vt-map (lambda (v)
-	    (if (zerop v) 1.0d0 0.0d0))
+	    (if (zerop v) 1 0))
 	  vt :out out :dtype dtype))
 
-(defun vt-nonzero-p (vt &key out (dtype :float64))
-  "逐元素非零判定，返回 1.0/0.0（dtype 默认 float64）。"
+(defun vt-nonzero-p (vt &key out (dtype :int8))
+  "逐元素非零判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      :out 契约同 vt-=。"
   (vt-map (lambda (v)
-	    (if (zerop v) 0.0d0 1.0d0))
+	    (if (zerop v) 0 1))
 	  vt :out out :dtype dtype))
 
-(defun vt-even-p (vt &key out (dtype :float64))
-  "逐元素偶数判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN/±Inf 视为非偶数 → 0.0（对标 numpy）。"
+(defun vt-even-p (vt &key out (dtype :int8))
+  "逐元素偶数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN/±Inf 视为非偶数 → 0（对标 numpy）。:out 契约同 vt-=。"
   (vt-map (lambda (v)
-	    (if (or (%nan-p v) (%inf-p v)) 0.0d0 (if (evenp (floor v)) 1.0d0 0.0d0)))
+	    (if (or (%nan-p v) (%inf-p v)) 0 (if (evenp (floor v)) 1 0)))
 	  vt :out out :dtype dtype))
 
-(defun vt-odd-p (vt &key out (dtype :float64))
-  "逐元素奇数判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN/±Inf 视为非奇数 → 0.0（对标 numpy）。"
+(defun vt-odd-p (vt &key out (dtype :int8))
+  "逐元素奇数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN/±Inf 视为非奇数 → 0（对标 numpy）。:out 契约同 vt-=。"
   (vt-map (lambda (v)
-	    (if (or (%nan-p v) (%inf-p v)) 0.0d0 (if (oddp (floor v)) 1.0d0 0.0d0)))
+	    (if (or (%nan-p v) (%inf-p v)) 0 (if (oddp (floor v)) 1 0)))
 	  vt :out out :dtype dtype))
 
 (defun %mod-nan-or-inf-p (x)
@@ -502,39 +509,40 @@
 
 (defun %op-ge (a b) (if (>= a b) 1.0d0 0.0d0))
 
-(defun vt-= (t1 t2 &key (dtype :float64) out)
-  "逐元素相等判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN 与任何值比较恒假 → 0.0（含 NaN == NaN）。"
+(defun vt-= (t1 t2 &key (dtype :int8) out)
+  "逐元素相等判定，返回值 1/0，dtype 默认 :int8（承载布尔语义，CONVENTIONS §3.1）。
+      NaN 与任何值比较恒假 → 0（含 NaN == NaN）。
+      :out dtype 必须精确等于结果 dtype（§4.2 H3，默认 :int8）。"
   (vt-fast-map #'%op-eq (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-/= (t1 t2 &key (dtype :float64) out)
-  "逐元素不等判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN 与任何值比较恒真 → 1.0（含 NaN != NaN）。"
+(defun vt-/= (t1 t2 &key (dtype :int8) out)
+  "逐元素不等判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN 与任何值比较恒真 → 1（含 NaN != NaN）。:out 契约同 vt-=。"
   (vt-fast-map #'%op-ne (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-< (t1 t2 &key (dtype :float64) out)
-  "逐元素小于判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN 参与的比较恒假 → 0.0。"
+(defun vt-< (t1 t2 &key (dtype :int8) out)
+  "逐元素小于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
   (vt-fast-map #'%op-lt (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-<= (t1 t2 &key (dtype :float64) out)
-  "逐元素小于等于判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN 参与的比较恒假 → 0.0。"
+(defun vt-<= (t1 t2 &key (dtype :int8) out)
+  "逐元素小于等于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
   (vt-fast-map #'%op-le (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-> (t1 t2 &key (dtype :float64) out)
-  "逐元素大于判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN 参与的比较恒假 → 0.0。"
+(defun vt-> (t1 t2 &key (dtype :int8) out)
+  "逐元素大于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
   (vt-fast-map #'%op-gt (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt->= (t1 t2 &key (dtype :float64) out)
-  "逐元素大于等于判定，返回 1.0/0.0（dtype 默认 float64）。
-      NaN 参与的比较恒假 → 0.0。"
+(defun vt->= (t1 t2 &key (dtype :int8) out)
+  "逐元素大于等于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
+      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
   (vt-fast-map #'%op-ge (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 

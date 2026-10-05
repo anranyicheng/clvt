@@ -38,8 +38,12 @@
   "创建与 VT 形状/（缺省）dtype 相同的未初始化张量（本库以 0 填充）。"
   (vt-empty (vt-shape vt) :dtype (or dtype (vt-dtype vt))))
 
-(defun vt-identity (n &key dtype)
-  "创建 N×N 单位阵（对标 numpy.identity）。等价 (vt-eye n :dtype dtype)。"
+(defun vt-identity (n &key (dtype :float64))
+  "创建 N×N 单位阵（对标 numpy.identity）。等价 (vt-eye n :dtype dtype)。
+
+缺省 dtype 为 :float64；若显式传入，则必须是合法 dtype 符号。
+修复：原先 `&key dtype` 未给缺省值时 dtype 为 NIL，直接下传 vt-eye 会
+触发 `NIL fell through ECASE expression`，故此处对齐 vt-eye 的缺省值。"
   (vt-eye n :dtype dtype))
 
 (defun vt-eye (rows &key (cols rows) (k 0) (value 1) (dtype :float64))

@@ -105,13 +105,13 @@
 
   ;; vt-isnan on tensor
   (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-nan+ 3.0 +vt-dfloat-nan+) :dtype :float64)))
-    (test-assert "isnan tensor" '(0.0 1.0 0.0 1.0) (vt-to-list (vt-isnan a))))
+    (test-assert "isnan tensor (int8)" '(0 1 0 1) (vt-to-list (vt-isnan a))))
 
   (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+ 3.0) :dtype :float64)))
-    (test-assert "isinf tensor" '(0.0 1.0 1.0 0.0) (vt-to-list (vt-isinf a))))
+    (test-assert "isinf tensor (int8)" '(0 1 1 0) (vt-to-list (vt-isinf a))))
 
   (let ((a (vt-from-sequence (list 1.0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ 3.0) :dtype :float64)))
-    (test-assert "isfinite tensor" '(1.0 0.0 0.0 1.0) (vt-to-list (vt-isfinite a))))
+    (test-assert "isfinite tensor (int8)" '(1 0 0 1) (vt-to-list (vt-isfinite a))))
 
   ;; === 2. vt-nanargmax / vt-nanargmin ===
   (format t "~%--- 2. vt-nanargmax / vt-nanargmin ---~%")
