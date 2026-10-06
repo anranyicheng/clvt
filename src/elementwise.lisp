@@ -180,52 +180,105 @@
    造成 dtype 标称 float64 但数值仅 float32 精度的静默精度损失。"
   (if (eq (vt-dtype vt) dt) vt (vt-astype vt dt)))
 
+(defmacro %float-map (fn vt out dt)
+  "逐元素数学函数的统一入口：**内联快路径 + dtype 提升** 二者兼得。
+
+   背景（性能契约）：`vt-fast-map` 是宏，编译期把字面算子（如 #'sin）
+   内联成特化循环（`%vt-inline1-fast` 等），比运行时经 `funcall` 的
+   `vt-map` 快约 1.6–1.8×。而 P1-1 精度修复要求「整数输入必须提升到
+   浮点再算」，这个提升只能在运行时判断（输入 dtype 编译期未知）。
+
+   若写成普通函数并委托 `vt-map`（此前 `%float-map-fn` 的做法），
+   所有调用——**包括本就无需提升的连续 float64/float32 输入**——
+   都会被拖到慢路径上，造成 vt-sin/vt-exp 等常见用例约 2× 的
+   性能回归。本宏把 dtype 判断外提为运行时分枝，但**两条分支都在
+   编译期展开为 `vt-fast-map` 内联循环**：
+
+     (if (eq (vt-dtype in) <dt>)          ; 已是目标浮点：零拷贝直通
+         (vt-fast-map #'op in  :out out :dtype <dt>)
+         (vt-fast-map #'op (%coerce-float-input in <dt>) :out out :dtype <dt>))
+
+   快路径（本库绝大多数调用）与改动前完全等价，只有整数输入多付
+   一次 astype——这正是精度修复的必要代价。
+
+   FN 必须是 `(function <symbol>)` 形式的字面算子（`#'sin` / `#'asinh`
+   / 本文件内定义的一元算子如 `#'%op-eq`）。`vt-fast-map` 只对
+   `(function <symbol>)` 做内联；**lambda 算子无法内联**，请改用
+   `%float-map-fn`。"
+  (check-type fn cons)
+  (unless (and (eq (car fn) 'function) (symbolp (cadr fn)))
+    (error "%%float-map: FN 必须是 (function <symbol>) 字面算子（如 #'sin）；\
+lambda 算子请使用 %%float-map-fn"))
+  `(let* ((%in (ensure-vt ,vt))
+          (%dt ,dt))
+     (if (eq (vt-dtype %in) %dt)
+         (vt-fast-map (function ,(cadr fn)) %in :out ,out :dtype %dt)
+         (vt-fast-map (function ,(cadr fn))
+                      (%coerce-float-input %in %dt)
+                      :out ,out :dtype %dt))))
+
 (defun %float-map-fn (fn vt out dt)
-  "数学函数通用路径：先把输入提升到 DT 再映射（vt-map，非内联宏）。
-   用于输入为整数等「需先提升」的场景；已连续浮点输入的快路径由
-   各函数自行保留 vt-fast-map 分支。"
+  "数学函数的**兜底**慢路径：接受任意 FN（含 lambda），内部走 `vt-map`。
+   仅用于「无法在编译期内联算子」的场景（本库为 vt-asin/vt-acos/
+   vt-sqrt 等需按元素返回 NaN 的 lambda 分支）。能在编译期拿到字面
+   算子的一律用 `%float-map` 宏走内联快路径。"
   (vt-map fn (%coerce-float-input (ensure-vt vt) dt) :out out :dtype dt))
+
+(defmacro %float-map-lambda (fn vt out dt)
+  "lambda 算子的数学函数入口：与 `%float-map` 同构（含 dtype 提升
+   运行时分枝），同样保证「整数输入先提升再计算」的 P1-1 精度契约。
+
+   与 `%float-map` 的唯一区别在快路径：`vt-fast-map` 只内联
+   `(function <symbol>)` 字面算子，**无法内联 lambda**，故这里两条
+   分支都走 `vt-map`。好处是：(1) 避免 `%float-map-fn` 那种「调用方
+   自己先 astype、再交给 vt-map」在整数输入上少走一次提升的漏洞；
+   (2) 已浮点输入零拷贝直通，不做多余 astype。"
+  `(let* ((%in (ensure-vt ,vt))
+          (%dt ,dt))
+     (if (eq (vt-dtype %in) %dt)
+         (vt-map ,fn %in :out ,out :dtype %dt)
+         (vt-map ,fn (%coerce-float-input %in %dt) :out ,out :dtype %dt))))
 
 (defun vt-sin (vt &key out dtype)
   "逐元素正弦。整数输入输出按 :dtype 或 float64（对标 numpy，
       整数进 float64 出）；float32 进 float32 出。:out 契约同 vt-+。"
-  (%float-map-fn #'sin vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'sin vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-cos (vt &key out dtype)
   "逐元素余弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'cos vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'cos vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-tan (vt &key out dtype)
   "逐元素正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'tan vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'tan vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-atan (vt &key out dtype)
   "逐元素反正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'atan vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'atan vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-sinh (vt &key out dtype)
   "逐元素双曲正弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'sinh vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'sinh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-cosh (vt &key out dtype)
   "逐元素双曲余弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'cosh vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'cosh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-tanh (vt &key out dtype)
   "逐元素双曲正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'tanh vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'tanh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-asin (vt &key out dtype)
@@ -233,23 +286,23 @@
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (%float-map-fn (lambda (x)
-                         (if (> (abs x) 1.0d0) nan (asin x)))
-                       vt out dt)))
+    (%float-map-lambda (lambda (x)
+                            (if (> (abs x) 1.0d0) nan (asin x)))
+                          vt out dt)))
 
 (defun vt-acos (vt &key out dtype)
   "逐元素反余弦。|x|>1 返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (%float-map-fn (lambda (x)
-                         (if (> (abs x) 1.0d0) nan (acos x)))
-                       vt out dt)))
+    (%float-map-lambda (lambda (x)
+                            (if (> (abs x) 1.0d0) nan (acos x)))
+                          vt out dt)))
 
 (defun vt-asinh (vt &key out dtype)
   "逐元素反双曲正弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'asinh vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'asinh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-acosh (vt &key out dtype)
@@ -257,9 +310,9 @@
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (%float-map-fn (lambda (x)
-                         (if (< x 1.0d0) nan (acosh x)))
-                       vt out dt)))
+    (%float-map-lambda (lambda (x)
+                            (if (< x 1.0d0) nan (acosh x)))
+                          vt out dt)))
 
 (defun vt-atanh (vt &key out dtype)
   "逐元素反双曲正切，对标 numpy.arctanh。
@@ -269,7 +322,7 @@
          (nan (vt-get-nan dt))
          (pos-inf (vt-get-pos-inf dt))
          (neg-inf (vt-get-neg-inf dt)))
-    (%float-map-fn (lambda (x)
+    (%float-map-lambda (lambda (x)
                          (cond ((> (abs x) 1.0d0) nan)
                                ((= x 1.0d0) pos-inf)
                                ((= x -1.0d0) neg-inf)
@@ -279,7 +332,7 @@
 (defun vt-exp (vt &key out dtype)
   "逐元素指数。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (%float-map-fn #'exp vt out (%infer-float-dtype vt dtype)))
+  (%float-map #'exp vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-pow (vt power &key out dtype)
@@ -330,7 +383,7 @@ vt-fast-map #'expt 或对应的二元接口"))
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (%float-map-fn (lambda (x) (if (minusp x) nan (sqrt x))) vt out dt)))
+    (%float-map-lambda (lambda (x) (if (minusp x) nan (sqrt x))) vt out dt)))
 
 (defun vt-log (vt &key base out dtype)
   "逐元素自然对数；:base 给定时为换底对数。

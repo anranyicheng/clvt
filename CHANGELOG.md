@@ -3,7 +3,64 @@
 本文件记录 clvt 库的每一次重大修改。
 
 ---
-## 2026-10-06 — 第三方审查报告核实：修复 6 类真实缺陷 + 澄清 4 项报告误报
+
+## 2026-10-06（二）— 修复 P1-1 精度修复引入的性能回归：`%float-map` 宏化，恢复 `vt-fast-map` 内联快路径
+
+上一轮为修复 P1-1（整数输入仅 float32 精度）引入了函数 `%float-map-fn`，
+它无条件把输入交给 `vt-map`。**这是一个性能回归**：`vt-fast-map` 是宏，
+编译期把字面算子（`#'sin`）内联成特化循环；而 `vt-map` 经 `funcall` 调用，
+单元素迭代器慢约 **1.6–1.8×**。结果是连**本就无需提升的连续 float64/float32
+输入**也被拖到慢路径上。
+
+实测（100k 元素 × 1000 次，SBCL 2.6.8）：
+
+| 调用 | 回归态（`%float-map-fn`） | 修复后（`%float-map` 宏） | 原始基线 |
+|---|---:|---:|---:|
+| `vt-sin` float64 | 2804 ms | **1182 ms** | 1206 ms |
+| `vt-exp` float64 | 1216 ms | **623 ms** | 614 ms |
+| `vt-sin` int64 | 2514 ms | **1287 ms** | — |
+| `vt-fast-map #'sin` 裸调用参考 | — | 1205 ms | — |
+| `vt-map #'sin` 裸调用参考 | — | 2207 ms | — |
+
+### 修法
+
+把 `%float-map-fn` 拆分/替换为两个宏，**dtype 判定外提为运行时分枝，
+但两条分支都在编译期展开为快路径**：
+
+| 新入口 | 适用算子 | 展开后的快路径 |
+|---|---|---|
+| `%float-map` | `(function <symbol>)` 字面算子（`#'sin`/`#'cos`/`#'asinh`/`#'exp`/`#'%e3-expm1`/`#'%e3-log1p` 等） | **`vt-fast-map` 内联循环**（已是目标浮点 → 零拷贝直通；整数 → 先 astype 再内联） |
+| `%float-map-lambda` | lambda 算子（`vt-asin`/`vt-acos`/`vt-acosh`/`vt-atanh`/`vt-sqrt` 需逐元素判 NaN） | `vt-map`（`vt-fast-map` 无法内联 lambda）+ 同样的 dtype 提升分支 |
+| `%float-map-fn`（保留为兜底） | 任意运行时 FN | `vt-map` |
+
+两宏展开形如：
+
+```lisp
+(let* ((%in (ensure-vt vt)) (%dt dt))
+  (if (eq (vt-dtype %in) %dt)        ; 已浮点：直通，不做多余 astype
+      (vt-fast-map #'op %in :out out :dtype %dt)
+      (vt-fast-map #'op (%coerce-float-input %in %dt) :out out :dtype %dt)))
+```
+
+改动点：
+
+- `src/elementwise.lisp`：新增 `%float-map`（宏，带 `(function <symbol>)`
+  入参校验）、`%float-map-lambda`（宏）；`%float-map-fn` 降级为文档化的
+  兜底入口。9 个字面算子调用点（sin/cos/tan/atan/sinh/cosh/tanh/asinh/exp）
+  改用 `%float-map`，5 个 lambda 调用点（asin/acos/acosh/atanh/sqrt）改用
+  `%float-map-lambda`。
+- `src/extensions3.lisp`：`vt-expm1` / `vt-log1p` 由手写
+  `vt-map + 预 astype` 改为 `%float-map #'%e3-expm1 / #'%e3-log1p`，
+  同样拿到内联快路径，并消除「调用方重复 astype」的多余拷贝。
+
+### 正确性
+
+P1-1 精度契约完好：`(vt-sin (vt-asarray '(1 2 3 4)))` 第 0 元素
+`0.8414709848078965d0`（float64 全精度）；`vt-expm1`/`vt-log1p`
+整数输入仍返回 `:float64`。全量测试 **30/30 套件通过，0 失败**。
+
+---
+## 2026-10-06（一）— 第三方审查报告核实：修复 6 类真实缺陷 + 澄清 4 项报告误报
 
 对 `clvt-review-report.md`（对照 numpy 2.5.3 / SBCL 2.6.8）逐条复核。
 报告称 2 个 P0、2 类 P1、一批 P2；经在当前 `master` 上以 numpy 2.4.6

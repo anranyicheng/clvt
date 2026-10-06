@@ -524,8 +524,7 @@
    小量下保留精度（1e-10 → 1.00000000005e-10）；整数输入输出 float64。
    :out 契约同 vt-abs。"
   (let ((v (ensure-vt tensor)))
-    (vt-map #'%e3-expm1 (if (eq (vt-dtype v) :float32) v (vt-astype v :float64))
-            :out out :dtype (%e3-float-prefer-dtype dtype (vt-dtype v)))))
+    (%float-map #'%e3-expm1 v out (%e3-float-prefer-dtype dtype (vt-dtype v)))))
 
 (defun %e3-log1p (x)
   "数值稳定的 log(1 + x)（对标 numpy.log1p）。|x| 小时用 log1p 级数避免精度损失。"
@@ -550,8 +549,7 @@
    x = -1 → -Inf；x < -1 → NaN；小量下保留精度（1e-10 → 9.999999999500001e-11）。
    整数输入输出 float64。:out 契约同 vt-abs。"
   (let ((v (ensure-vt tensor)))
-    (vt-map #'%e3-log1p (if (eq (vt-dtype v) :float32) v (vt-astype v :float64))
-            :out out :dtype (%e3-float-prefer-dtype dtype (vt-dtype v)))))
+    (%float-map #'%e3-log1p v out (%e3-float-prefer-dtype dtype (vt-dtype v)))))
 
 (defun vt-logaddexp (x y &key out dtype)
   "逐元素 log(exp(x) + exp(y))，数值稳定（对标 numpy.logaddexp）。
