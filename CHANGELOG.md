@@ -3,6 +3,59 @@
 本文件记录 clvt 库的每一次重大修改。
 
 ---
+## 2026-10-06 — 第三方审查报告核实：修复 6 类真实缺陷 + 澄清 4 项报告误报
+
+对 `clvt-review-report.md`（对照 numpy 2.5.3 / SBCL 2.6.8）逐条复核。
+报告称 2 个 P0、2 类 P1、一批 P2；经在当前 `master` 上以 numpy 2.4.6
+实测复现，**确认其中 6 类为真实缺陷并修复，另有 4 项经核实为报告误报
+或已在 v0.4.0 修复**。
+
+### 真实缺陷（已修复）
+
+| # | 位置 | 缺陷 | 修法 |
+|---|------|------|------|
+| P0-1 | `vt-relu` | **段错误**：整数输入走通用路径，把 int64 元素喂给声明 `(double-float x)(safety 0)` 的 `%relu-double`，fixnum 被当 boxed double 解引用非法地址，SBCL 镜像崩溃 | 通用路径改为无类型假设的 `lambda` + 先 `vt-astype` 提升到目标浮点 dtype |
+| P1-1 | `vt-sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/exp/log/sqrt` | 整数输入数值仅 **float32 精度**：CL 对整数参数 `(sin 1)` 只返回 single-float（0.84147096），却被写入标称 float64 的结果 | 新增 `%coerce-float-input` / `%float-map-fn`，映射前把整数输入提升到目标浮点 dtype（float32 输入仍保持 float32） |
+| P1-2 | `vt-expm1` / `vt-log1p` | 整数输入**不提升**，返回被截断的 int64（`expm1([1,2,3])` → `(1 6 19)`） | `%e3-float-prefer-dtype` 缺省不再返回 NIL，改为按输入推导（float32→float32，其余→float64） |
+| P2-1 | `vt-argmax/argmin/nanargmax/nanargmin` | 返回 `:int32`，numpy 返回 `intp`(int64) | `%op-out-dtype` 改 `:int64` |
+| P2-2 | `vt-logical-and/or/not/xor` | 默认返回 `:float64`，违反 CONVENTIONS §3.1「比较/逻辑返回 `:int8`」 | 缺省 dtype 改 `:int8`，返回 1/0 |
+| P2-3 | `vt-cov` | `ddof` 语义与 numpy 不符：numpy 的 `ddof` **缺省为 1**（`np.cov(a)` 除以 N-1，`np.cov(a, ddof=0)` 除以 N），原实现恒用 N-1-ddof | 用 `ddof-p` 哨兵区分「未传」与「显式 0」，分母统一为 `N - ddof`（缺省 ddof=1） |
+| P2-4 | `vt-histogram` | counts 返回 `:float64`，numpy 返回 int64 | counts 改 `:int64`（density=t 仍为 float64） |
+| P2-6 | `vt-pow` | 整数基 + 正整数指数返回 float64（numpy 返回 int64）；传张量指数**静默返回 NaN** | 整数基 + 正整数指数保持整数 dtype；显式拒绝张量指数并给出清晰错误 |
+
+> P0-1 是本轮最严重缺陷：非崩溃代码路径在正常输入（int 张量）下即触发
+> 内存越界并杀死进程。已在独立子进程复现（`Memory fault ... in
+> CLVT::%RELU-DOUBLE`），修复后 int/int8/int32/uint8 全部正常。
+
+### 经核实为「报告误报」或「上游已修复」（未改动）
+
+| 报告条目 | 报告结论 | 实际核实 |
+|---|---|---|
+| P0-2 `:out` 非连续视图写入丢失 | 称 base 仍全 0 | **误报**：当前 master 上 `vt-add(m,m,:out=v)` 正确落到底层 base，与 numpy 逐位一致（已有 `out-contig-tests` 23 条守护） |
+| P2#5 `vt-trace` 整数输入返回 float64 | 称应返回 int64 | **误报**：实测 int64→int64、float32→float32、int8→int64，与 numpy 完全一致 |
+| P2#8 `vt-eigvalsh` 未升序 | 称应升序 | **上游已修复**（v0.4.0）：现 `vt-eigvalsh` 升序、`vt-eigvals` 降序，均已符合各自 numpy 约定 |
+| P2#3 描述「除以 n-ddof-1」 | 描述 | 描述本身正确，但报告未指出 numpy 的 **`ddof` 缺省值为 1** 这一关键点；已按 numpy 真实语义修复（见上表 P2-3） |
+
+### 未处理（API 缺口，非缺陷）
+
+报告 P2 表中另有约 12 项属**功能缺口或有意设计**，非缺陷，本次不改：
+`vt-percentile` 不支持数组分位数、`vt-det` 不支持批量、`vt-bincount` 无
+`:weights`、`vt-norm` 无 `ord`、`vt-sort` 无降序开关、`vt-array-equal`/
+`vt-allclose` 无 `equal-nan`、`vt-repeat` 不支持逐元素 repeats、`vt-delete`/
+`vt-ravel-multi-index`/`vt-random-choice :p` 不接受 VT（要求 list）、
+`vt-lstsq :rcond nil`、布尔掩码写入 API 缺失、`vt-layer-norm` 为 torch 风格。
+这些是"尚未实现"而非"实现错误"，建议列入后续路线图而非缺陷修复。
+
+### 测试
+
+- `test/extensions3-test.lisp`：新增 38 条「审查修复回归」断言
+  （P0-1×6、P1-1×8、P1-2×4、P2-1×5、P2-2×5、P2-3×5、P2-6×5），
+  套件由 184 → **222** 条全绿。
+- `test/out-contig-tests.lisp`：argmax 的 `:out` 由 int32 改 int64（随 P2-1 契约更新）。
+- `test/coverage-gap-test.lisp`：histogram counts 期望值改整数（随 P2-4）。
+- 全量 **30/30 套件通过，0 失败**；`example/example.lisp` 打印 `all test passed`。
+
+---
 ## 2026-10-05 — 覆盖缺口审计：补齐未覆盖函数测试 + 修复 6 处实现缺陷
 
 在 SBCL 2.6.8 + Quicklisp + numpy 2.4.6 环境上，以 CONVENTIONS.md 为语义

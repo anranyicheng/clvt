@@ -459,7 +459,8 @@
   ;; 9.1 基础直方图
   (let ((data (vt-from-sequence '(1.0 1.0 2.0 2.0 2.0 3.0 3.0 3.0 3.0))))
     (multiple-value-bind (hist edges) (vt-histogram data :bins 3)
-      (T! "histogram counts" '(2.0d0 3.0d0 4.0d0) (vt-to-list hist))
+      ;; counts 为整数（对标 numpy 的 int64）
+      (T! "histogram counts" '(2 3 4) (vt-to-list hist))
       (T! "histogram edges len" 4 (length (vt-to-list edges)))))
 
   ;; 9.2 大数据集统计

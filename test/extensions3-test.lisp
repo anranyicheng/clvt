@@ -426,4 +426,105 @@
 (check-error "fill-diagonal 1d" (lambda () (vt-fill-diagonal (vt-zeros '(3)) 1)))
 
 ;;; ============================================================
+;;; 审查修复回归测试（clvt-review-report.md）
+;;; ============================================================
+(format t "~%--- 审查修复回归 ---~%")
+
+;; [P0-1] vt-relu 整数输入曾触发段错误（%relu-double 类型声明被违背）。
+;;       现要求整数输入正常提升为 float64，且数值与 numpy 一致。
+(check "P0-1 relu int64"  '(1d0 2d0 3d0 4d0)
+       (vt-relu (vt-asarray '(1 2 3 4) :dtype :int64)))
+(check "P0-1 relu int64 负数截断" '(0d0 0d0 3d0)
+       (vt-relu (vt-asarray '(-1 -2 3) :dtype :int64)))
+(check-true "P0-1 relu int64 dtype"
+            (eq :float64 (vt-dtype (vt-relu (vt-asarray '(1 2 3) :dtype :int64)))))
+(check "P0-1 relu int32 2d" '((1d0 0d0) (0d0 4d0))
+       (vt-relu (vt-from-array #2A((1 -2)(-3 4)) :dtype :int32)))
+(check "P0-1 relu float32 保持" '(1.0 2.0 0.0)
+       (vt-relu (vt-asarray '(1.0 2.0 -3.0) :dtype :float32)))
+(check-true "P0-1 relu float32 dtype"
+            (eq :float32 (vt-dtype (vt-relu (vt-asarray '(1.0 -1.0) :dtype :float32)))))
+
+;; [P1-1] 整数输入的数学函数曾按 float32 精度计算（SBCL (sin 1) 只给 single-float）。
+;;        现要求 float64 输入走完整 double 精度（与 numpy 逐位一致）。
+(check "P1-1 sin int64 精度" '(0.8414709848078965d0 0.9092974268256817d0 0.1411200080598672d0)
+       (vt-sin (vt-asarray '(1 2 3) :dtype :int64)))
+(check "P1-1 cos int64 精度" '(0.5403023058681398d0 -0.4161468365471424d0 -0.9899924966004454d0)
+       (vt-cos (vt-asarray '(1 2 3) :dtype :int64)))
+(check "P1-1 exp int64 精度" '(2.718281828459045d0 7.38905609893065d0 20.085536923187668d0)
+       (vt-exp (vt-asarray '(1 2 3) :dtype :int64)))
+(check "P1-1 log int64 精度" '(0.0d0 0.6931471805599453d0 1.0986122886681098d0)
+       (vt-log (vt-asarray '(1 2 3) :dtype :int64)))
+(check "P1-1 sqrt int64" '(1d0 2d0 3d0)
+       (vt-sqrt (vt-asarray '(1 4 9) :dtype :int64)))
+(check-true "P1-1 sin int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-sin (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "P1-1 sin float32 保持 float32"
+            (eq :float32 (vt-dtype (vt-sin (vt-asarray '(1.0 2.0) :dtype :float32)))))
+(check "P1-1 sin float32 值" '(0.8414709568023682 0.9092974066734314)
+       (vt-sin (vt-asarray '(1.0 2.0) :dtype :float32)))
+
+;; [P1-2] vt-expm1 / vt-log1p 对整数输入曾不提升（返回被截断的 int64）。
+(check "P1-2 expm1 int64" '(1.718281828459045d0 6.38905609893065d0 19.085536923187668d0)
+       (vt-expm1 (vt-asarray '(1 2 3) :dtype :int64)))
+(check "P1-2 log1p int64" '(0.6931471805599453d0 1.0986122886681098d0 1.3862943611198906d0)
+       (vt-log1p (vt-asarray '(1 2 3) :dtype :int64)))
+(check-true "P1-2 expm1 int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-expm1 (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "P1-2 log1p int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-log1p (vt-asarray '(1 2 3) :dtype :int64)))))
+
+;; [P2#1] argmax/argmin/nanargmax/nanargmin 曾返回 int32；numpy 返回 intp(int64)。
+(check-true "P2-1 argmax dtype int64"
+            (eq :int64 (vt-dtype (vt-argmax (vt-asarray '(1 3 2) :dtype :int64)))))
+(check-true "P2-1 argmin dtype int64"
+            (eq :int64 (vt-dtype (vt-argmin (vt-asarray '(1 3 2) :dtype :int64)))))
+(check-true "P2-1 nanargmax dtype int64"
+            (eq :int64 (vt-dtype (vt-nanargmax (vt-asarray '(1.0d0 3.0d0 2.0d0) :dtype :float64)))))
+(check-true "P2-1 nanargmin dtype int64"
+            (eq :int64 (vt-dtype (vt-nanargmin (vt-asarray '(1.0d0 3.0d0 2.0d0) :dtype :float64)))))
+(check "P2-1 argmax 值" 1 (vt-argmax (vt-asarray '(1 3 2) :dtype :int64)))
+
+;; [P2#3] vt-cov 归一化分母须与 numpy 一致：缺省 ddof 等价 numpy 缺省（N-1），
+;;        显式 ddof=0 → N，ddof=1 → N-1，bias=True → N。
+(check "P2-3 cov 缺省=N-1" '((1d0 1d0) (1d0 1d0))
+       (vt-cov (mk '((1d0 2d0 3d0) (4d0 5d0 6d0)))))
+(check "P2-3 cov ddof=0" '((0.6666666666666666d0 0.6666666666666666d0)
+                           (0.6666666666666666d0 0.6666666666666666d0))
+       (vt-cov (mk '((1d0 2d0 3d0) (4d0 5d0 6d0))) :ddof 0))
+(check "P2-3 cov ddof=1" '((1d0 1d0) (1d0 1d0))
+       (vt-cov (mk '((1d0 2d0 3d0) (4d0 5d0 6d0))) :ddof 1))
+(check "P2-3 cov bias" '((0.6666666666666666d0 0.6666666666666666d0)
+                         (0.6666666666666666d0 0.6666666666666666d0))
+       (vt-cov (mk '((1d0 2d0 3d0) (4d0 5d0 6d0))) :bias t))
+(check "P2-3 cov 1d 缺省" 1d0 (vt-cov (mk '(1d0 2d0 3d0))))
+
+;; [P2#6] vt-pow：整数基 + 正整数指数应保持整数 dtype（对标 numpy）；
+;;        非整数指数 → float64；传张量指数须明确报错（曾静默返回 NaN）。
+(check "P2-6 pow int**2" '(4 9) (vt-pow (vt-asarray '(2 3) :dtype :int64) 2))
+(check-true "P2-6 pow int**2 dtype int64"
+            (eq :int64 (vt-dtype (vt-pow (vt-asarray '(2 3) :dtype :int64) 2))))
+(check "P2-6 pow int**0.5" '(2d0 3d0) (vt-pow (vt-asarray '(4 9) :dtype :int64) 0.5d0))
+(check-true "P2-6 pow int**0.5 dtype float64"
+            (eq :float64 (vt-dtype (vt-pow (vt-asarray '(4 9) :dtype :int64) 0.5d0))))
+(check-error "P2-6 pow 张量指数报错"
+             (lambda () (vt-pow (vt-asarray '(2 3) :dtype :int64)
+                                (vt-asarray '(2 2) :dtype :int64))))
+
+;; [P2#2] vt-logical-* 曾默认返回 :float64，违反 §3.1「比较/逻辑返回 :int8」。
+(check-true "P2-2 logical-and dtype int8"
+            (eq :int8 (vt-dtype (vt-logical-and (vt-asarray '(1 0) :dtype :int64)
+                                                (vt-asarray '(1 1) :dtype :int64)))))
+(check-true "P2-2 logical-or dtype int8"
+            (eq :int8 (vt-dtype (vt-logical-or (vt-asarray '(1 0) :dtype :int64)
+                                               (vt-asarray '(0 0) :dtype :int64)))))
+(check-true "P2-2 logical-not dtype int8"
+            (eq :int8 (vt-dtype (vt-logical-not (vt-asarray '(1 0) :dtype :int64)))))
+(check-true "P2-2 logical-xor dtype int8"
+            (eq :int8 (vt-dtype (vt-logical-xor (vt-asarray '(1 0) :dtype :int64)
+                                                (vt-asarray '(1 1) :dtype :int64)))))
+(check "P2-2 logical-and 值" '(1 0)
+       (vt-logical-and (vt-asarray '(1 0) :dtype :int64) (vt-asarray '(1 1) :dtype :int64)))
+
+;;; ============================================================
 (summary)

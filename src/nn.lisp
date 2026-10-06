@@ -106,8 +106,16 @@
                   (dotimes (i size)
                     (setf (aref r (+ rop i)) (%relu-single (aref d (+ aop i)))))))
             res)
-	  (vt-map (if (eq dt :float64) #'%relu-double #'%relu-single)
-		  a :dtype dt :out res)))))
+	  ;; 通用路径：先把输入规范为目标浮点 dtype，再调用带 (double-float x)
+	  ;; (safety 0) 声明的内联核函数。
+	  ;; 若把 int64 等非浮点元素直接交给 %relu-double，其类型声明会被违背，
+	  ;; 在 (safety 0) 下 fixnum 被当作 boxed double 解引用非法地址 → 段错误。
+	  ;; 用无类型假设的 lambda 包裹（与 vt-sigmoid 通用路径同构）即可安全提升。
+	  (let ((af (if (eq (vt-dtype a) dt) a (vt-astype a dt))))
+	    (vt-map (if (eq dt :float64)
+			(lambda (x) (%relu-double (coerce x 'double-float)))
+			(lambda (x) (%relu-single (coerce x 'single-float))))
+		    af :dtype dt :out res))))))
 
 (defun vt-leaky-relu (vt &key (alpha 0.01d0) dtype out)
   "Leaky ReLU 激活：x > 0 时为 x，否则为 alpha * x（ALPHA 缺省 0.01）。"

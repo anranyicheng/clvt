@@ -168,74 +168,98 @@
   (vt-fast-map #'* a b :out out :dtype dtype))
 
 (defun %infer-float-dtype (vt dtype)
+  "推导逐元素数学函数的结果 dtype（对标 numpy「整型进 float64 出、
+   float32 进 float32 出」）。"
   (or dtype (if (eq (vt-dtype vt) :float32) :float32 :float64)))
+
+(defun %coerce-float-input (vt dt)
+  "若 VT 已是指定浮点 dtype 则原样返回，否则转换为 DT。
+   整数/无符号输入必须经过此步，否则 SBCL 会把 fixnum 元素交给
+   `(sin 1)` 这类 CL 数学函数——对整数参数 CL 只返回 **single-float**
+   精度（如 (sin 1) = 0.84147096，而 (sin 1d0) = 0.8414709848078965d0），
+   造成 dtype 标称 float64 但数值仅 float32 精度的静默精度损失。"
+  (if (eq (vt-dtype vt) dt) vt (vt-astype vt dt)))
+
+(defun %float-map-fn (fn vt out dt)
+  "数学函数通用路径：先把输入提升到 DT 再映射（vt-map，非内联宏）。
+   用于输入为整数等「需先提升」的场景；已连续浮点输入的快路径由
+   各函数自行保留 vt-fast-map 分支。"
+  (vt-map fn (%coerce-float-input (ensure-vt vt) dt) :out out :dtype dt))
 
 (defun vt-sin (vt &key out dtype)
   "逐元素正弦。整数输入输出按 :dtype 或 float64（对标 numpy，
       整数进 float64 出）；float32 进 float32 出。:out 契约同 vt-+。"
-  (vt-fast-map #'sin vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'sin vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-cos (vt &key out dtype)
   "逐元素余弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'cos vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'cos vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-tan (vt &key out dtype)
   "逐元素正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'tan vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'tan vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-atan (vt &key out dtype)
   "逐元素反正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'atan vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'atan vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-sinh (vt &key out dtype)
   "逐元素双曲正弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'sinh vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'sinh vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-cosh (vt &key out dtype)
   "逐元素双曲余弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'cosh vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'cosh vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-tanh (vt &key out dtype)
   "逐元素双曲正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'tanh vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'tanh vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-asin (vt &key out dtype)
   "逐元素反正弦。|x|>1 返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (vt-map (lambda (x)
-              (if (> (abs x) 1.0d0) nan (asin x)))
-            vt :out out :dtype dt)))
+    (%float-map-fn (lambda (x)
+                         (if (> (abs x) 1.0d0) nan (asin x)))
+                       vt out dt)))
 
 (defun vt-acos (vt &key out dtype)
   "逐元素反余弦。|x|>1 返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (vt-map (lambda (x)
-              (if (> (abs x) 1.0d0) nan (acos x)))
-            vt :out out :dtype dt)))
+    (%float-map-fn (lambda (x)
+                         (if (> (abs x) 1.0d0) nan (acos x)))
+                       vt out dt)))
 
 (defun vt-asinh (vt &key out dtype)
   "逐元素反双曲正弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'asinh vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'asinh vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-acosh (vt &key out dtype)
   "逐元素反双曲余弦。x<1 返回 NaN（对标 numpy）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (vt-map (lambda (x)
-              (if (< x 1.0d0) nan (acosh x)))
-            vt :out out :dtype dt)))
+    (%float-map-fn (lambda (x)
+                         (if (< x 1.0d0) nan (acosh x)))
+                       vt out dt)))
 
 (defun vt-atanh (vt &key out dtype)
   "逐元素反双曲正切，对标 numpy.arctanh。
@@ -245,34 +269,51 @@
          (nan (vt-get-nan dt))
          (pos-inf (vt-get-pos-inf dt))
          (neg-inf (vt-get-neg-inf dt)))
-    (vt-map (lambda (x)
-              (cond ((> (abs x) 1.0d0) nan)
-                    ((= x 1.0d0) pos-inf)
-                    ((= x -1.0d0) neg-inf)
-                    (t (atanh x))))
-            vt :out out :dtype dt)))
+    (%float-map-fn (lambda (x)
+                         (cond ((> (abs x) 1.0d0) nan)
+                               ((= x 1.0d0) pos-inf)
+                               ((= x -1.0d0) neg-inf)
+                               (t (atanh x))))
+                       vt out dt)))
 
 (defun vt-exp (vt &key out dtype)
   "逐元素指数。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
-  (vt-fast-map #'exp vt :out out :dtype (%infer-float-dtype vt dtype)))
+  (%float-map-fn #'exp vt out (%infer-float-dtype vt dtype)))
+
 
 (defun vt-pow (vt power &key out dtype)
-  "逐元素幂 VT**POWER。POWER 为标量指数。
-      整数 + 正指数走精确整数幂；其余（负指数/非整数/浮点）
-      走浮点幂并对非实数结果返回 NaN（对标 numpy.power）。
-      :out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt)))
+  "逐元素幂 VT**POWER。POWER 为**标量**指数（整数或浮点）。
+      整数 + 正指数走精确整数幂，结果保持整数 dtype（对标 numpy：
+      int**正int → int；int**负int/非整数 → float64）。
+      其余（负指数/非整数/浮点）走浮点幂并对非实数结果返回 NaN
+      （对标 numpy.power）。:out 契约同 vt-+。
+      注：POWER 必须是标量；传入张量会报错（numpy 的 elementwise
+      power 需用 vt-* 系列，本库 vt-pow 不承担二元张量语义）。"
+  (when (vt-p power)
+    (error "vt-pow: POWER 必须为标量指数，得到一个张量；逐元素张量幂请使用 \
+vt-fast-map #'expt 或对应的二元接口"))
+  (let* ((in-dt (vt-dtype (ensure-vt vt)))
+         (int-pow-p (and (integerp power) (plusp power)))
+         ;; 整数基 + 正整数指数 → 保持整数 dtype（对标 numpy）；
+         ;; 其余一律浮点（float32 进 float32 出，整数→float64）。
+         (dt (cond (dtype dtype)
+                   ((and int-pow-p (member in-dt '(:int8 :int16 :int32 :int64
+                                                   :uint8 :uint16)))
+                    in-dt)
+                   ((eq in-dt :float32) :float32)
+                   (t :float64)))
+         (nan (vt-get-nan (if (member dt '(:float64 :float32)) dt :float64))))
     (cond
-      ((and (integerp power) (plusp power))
+      (int-pow-p
        (vt-map (lambda (x) (expt x power)) vt :out out :dtype dt))
       (t
-       (vt-map (lambda (x)
-                 (let ((result (handler-case (expt x power)
-                                 (error () nan))))
-                   (if (realp result) result nan)))
-               vt :out out :dtype dt)))))
+       (let ((vf (if (member dt '(:float64 :float32)) vt (vt-astype (ensure-vt vt) dt))))
+         (vt-map (lambda (x)
+                   (let ((result (handler-case (expt x power)
+                                   (error () nan))))
+                     (if (realp result) result nan)))
+                 vf :out out :dtype dt))))))
 
 (defun vt-expt (vt power &key out dtype)
   "vt-pow 的别名（CL 习惯命名）。语义与参数契约见 vt-pow。"
@@ -289,8 +330,7 @@
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (nan (vt-get-nan dt)))
-    (vt-map (lambda (x) (if (minusp x) nan (sqrt x)))
-            vt :out out :dtype dt)))
+    (%float-map-fn (lambda (x) (if (minusp x) nan (sqrt x))) vt out dt)))
 
 (defun vt-log (vt &key base out dtype)
   "逐元素自然对数；:base 给定时为换底对数。
@@ -301,26 +341,27 @@
          (nan (vt-get-nan dt))
          (neginf (vt-get-neg-inf dt))
          (posinf (vt-get-pos-inf dt)))
-    (cond
-      ((and base (or (<= base 0) (= base 1)))
-       (vt-map (lambda (x)
-                 (declare (ignore x)) nan)
-               vt :out out :dtype dt))
-      ((null base)
-       (vt-map (lambda (x)
-                 (if (> x 0)
-                     (log x)
-                     (if (zerop x)
-                         neginf nan)))
-               vt :out out :dtype dt))
-      (t
-       (let ((zero-result (if (plusp (log base)) neginf posinf)))
+    (let ((af (%coerce-float-input (ensure-vt vt) dt)))
+      (cond
+        ((and base (or (<= base 0) (= base 1)))
+         (vt-map (lambda (x)
+                   (declare (ignore x)) nan)
+                 af :out out :dtype dt))
+        ((null base)
          (vt-map (lambda (x)
                    (if (> x 0)
-                       (log x base)
+                       (log x)
                        (if (zerop x)
-                           zero-result nan)))
-                 vt :out out :dtype dt))))))
+                           neginf nan)))
+                 af :out out :dtype dt))
+        (t
+         (let ((zero-result (if (plusp (log base)) neginf posinf)))
+           (vt-map (lambda (x)
+                     (if (> x 0)
+                         (log x base)
+                         (if (zerop x)
+                             zero-result nan)))
+                   af :out out :dtype dt)))))))
 
 (defun vt-log10 (vt &key out dtype)
   "逐元素常用对数（底 10）。语义等价 (vt-log vt :base 10)。
@@ -599,31 +640,30 @@
                   (t (min a b))))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
-(defun vt-logical-and (t1 t2 &key out (dtype :float64))
-  "逐元素逻辑与（非零视为真），返回 1.0/0.0（dtype 默认 float64）。"
+(defun vt-logical-and (t1 t2 &key out (dtype :int8))
+  "逐元素逻辑与（非零视为真），返回 1/0。
+   dtype 默认 :int8——与 §3.1「比较/逻辑运算返回 :int8」一致，
+   语义等价 numpy 的 bool（本库不引入独立 :bool dtype）。"
   (vt-map (lambda (a b)
-            (if (and (not (zerop a)) (not (zerop b)))
-                1.0d0 0.0d0))
+            (if (and (not (zerop a)) (not (zerop b))) 1 0))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
-(defun vt-logical-or (t1 t2 &key out (dtype :float64))
-  "逐元素逻辑或（非零视为真），返回 1.0/0.0（dtype 默认 float64）。"
+(defun vt-logical-or (t1 t2 &key out (dtype :int8))
+  "逐元素逻辑或（非零视为真），返回 1/0。dtype 默认 :int8（同 §3.1）。"
   (vt-map (lambda (a b)
-            (if (or (not (zerop a)) (not (zerop b)))
-                1.0d0 0.0d0))
+            (if (or (not (zerop a)) (not (zerop b))) 1 0))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
-(defun vt-logical-not (vt &key out (dtype :float64))
-  "逐元素逻辑非，返回 1.0/0.0（dtype 默认 float64）。"
+(defun vt-logical-not (vt &key out (dtype :int8))
+  "逐元素逻辑非，返回 1/0。dtype 默认 :int8（同 §3.1）。"
   (vt-map (lambda (v)
-            (if (zerop v) 1.0d0 0.0d0))
+            (if (zerop v) 1 0))
           vt :dtype dtype :out out))
 
-(defun vt-logical-xor (t1 t2 &key out (dtype :float64))
-  "逐元素逻辑异或，返回 1.0/0.0（dtype 默认 float64）。"
+(defun vt-logical-xor (t1 t2 &key out (dtype :int8))
+  "逐元素逻辑异或，返回 1/0。dtype 默认 :int8（同 §3.1）。"
   (vt-map (lambda (a b)
-            (if (not (eq (not (zerop a)) (not (zerop b))))
-                1.0d0 0.0d0))
+            (if (not (eq (not (zerop a)) (not (zerop b)))) 1 0))
           (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-and (t1 t2 &key out dtype)

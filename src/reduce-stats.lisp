@@ -168,7 +168,9 @@
   (defun %op-out-dtype (op in-dtype)
     (case op
       ((:all :any) :int64)
-      ((:argmax :argmin :nanargmax :nanargmin) :int32)
+      ;; numpy 的 argmax/argmin 返回 intp（64 位平台为 int64）；
+      ;; 修正（审查 P2#1）：原实现返回 :int32，与 numpy 不符。
+      ((:argmax :argmin :nanargmax :nanargmin) :int64)
       ((:sum :prod :nansum :nanprod)
        (case in-dtype
          ((:int8 :uint8 :int16 :uint16 :int32) :int64)
@@ -1183,7 +1185,10 @@
                   (setf (aref hist i)
                         (/ (aref hist i)
                            (* total bin-width)))))))
-        (values (vt-from-sequence hist :dtype :float64)
+        (values (vt-from-sequence hist
+                                  ;; 对标 numpy：counts 为整数（int64）；
+                                  ;; density=t 时为归一化密度（float64）。
+                                  :dtype (if density :float64 :int64))
                 (vt-from-sequence edges :dtype :float64))))))
 
 ;;; ------------------------------------------------------------------

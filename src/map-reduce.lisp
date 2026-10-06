@@ -608,7 +608,7 @@
                  必须可写。非连续 out 由本函数按真实 strides 写入。
      :dtype      可选。结果 dtype；与 :out 同时给出时必须一致（H5）。
      :keepdims   可选，保留被归约轴为长度 1。
-     :return-arg 可选，同时返回 argmax/argmin 索引张量（dtype int32）。
+     :return-arg 可选，同时返回 argmax/argmin 索引张量（dtype int32，本内部参数专用）。
 
    结果 dtype 由「输入 dtype + 显式 :dtype + init-val 类型」决定，
    **不由 out 决定**（§4.2 H3 严格相等契约）。"

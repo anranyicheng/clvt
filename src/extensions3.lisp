@@ -34,10 +34,14 @@
   "本库 6 种整型 dtype（含 int8/uint8/uint16 小整型）判定。"
   (member dtype '(:int64 :int32 :int16 :int8 :uint8 :uint16)))
 
-(defun %e3-float-prefer-dtype (dtype)
+(defun %e3-float-prefer-dtype (dtype in-dtype)
   "数学函数结果 dtype 推导（对齐 numpy 的「整型进 float64 出、float32 进 float32 出」）。
-   显式 :dtype 已在调用点优先处理，本函数仅处理缺省情形。"
-  (cond ((null dtype) nil)
+   显式 :dtype 已在调用点优先处理；缺省时按输入 dtype 决定：
+     float32 输入 → :float32；其余（含整数）→ :float64。
+   注意：缺省**不能**返回 nil——否则 vt-map 会退回 vt-promote-type，
+   整数输入将得到整数结果（expm1/log1p 会把值截断为整数），
+   与 numpy 的「整型进 float64 出」相悖。"
+  (cond ((null dtype) (if (eq in-dtype :float32) :float32 :float64))
         ((eq dtype :float32) :float32)
         ((eq dtype :float64) :float64)
         (t dtype)))                            ; 显式整型目标原样返回
@@ -519,7 +523,9 @@
   "逐元素 exp(x) - 1（对标 numpy.expm1）。
    小量下保留精度（1e-10 → 1.00000000005e-10）；整数输入输出 float64。
    :out 契约同 vt-abs。"
-  (vt-map #'%e3-expm1 (ensure-vt tensor) :out out :dtype (%e3-float-prefer-dtype dtype)))
+  (let ((v (ensure-vt tensor)))
+    (vt-map #'%e3-expm1 (if (eq (vt-dtype v) :float32) v (vt-astype v :float64))
+            :out out :dtype (%e3-float-prefer-dtype dtype (vt-dtype v)))))
 
 (defun %e3-log1p (x)
   "数值稳定的 log(1 + x)（对标 numpy.log1p）。|x| 小时用 log1p 级数避免精度损失。"
@@ -543,7 +549,9 @@
   "逐元素 log(1 + x)（对标 numpy.log1p）。
    x = -1 → -Inf；x < -1 → NaN；小量下保留精度（1e-10 → 9.999999999500001e-11）。
    整数输入输出 float64。:out 契约同 vt-abs。"
-  (vt-map #'%e3-log1p (ensure-vt tensor) :out out :dtype (%e3-float-prefer-dtype dtype)))
+  (let ((v (ensure-vt tensor)))
+    (vt-map #'%e3-log1p (if (eq (vt-dtype v) :float32) v (vt-astype v :float64))
+            :out out :dtype (%e3-float-prefer-dtype dtype (vt-dtype v)))))
 
 (defun vt-logaddexp (x y &key out dtype)
   "逐元素 log(exp(x) + exp(y))，数值稳定（对标 numpy.logaddexp）。
@@ -559,7 +567,7 @@
                       (t (let ((m (max af bf)))
                            (+ m (log (+ 1.0d0 (exp (- (min af bf) m))))))))))))
     (vt-map fn (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
-            :out out :dtype (%e3-float-prefer-dtype dtype))))
+            :out out :dtype (%e3-float-prefer-dtype dtype :float64))))
 
 (defun vt-float-power (x y &key out dtype)
   "逐元素幂运算，结果恒为浮点（对标 numpy.float_power）。
@@ -572,7 +580,7 @@
                     ((and (minusp af) (/= bf (floor bf))) (vt-get-nan :float64))
                     (t (expt af bf)))))
           (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
-          :out out :dtype (%e3-float-prefer-dtype dtype)))
+          :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
 (defun vt-copysign (x y &key out dtype)
   "逐元素赋予 X 的绝对值与 Y 的符号（对标 numpy.copysign）。
@@ -584,7 +592,7 @@
                   (- (abs af))
                   (abs af))))
           (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
-          :out out :dtype (%e3-float-prefer-dtype dtype)))
+          :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
 (defun vt-signbit (tensor &key out)
   "逐元素符号位判定，返回 1/0，dtype 为 :int8（对标 numpy.signbit）。
@@ -618,7 +626,7 @@
    示例：(vt-nextafter 1.0 2.0) => 1.0000000000000002"
   (vt-map (lambda (a b) (%e3-nextafter a b))
           (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
-          :out out :dtype (%e3-float-prefer-dtype dtype)))
+          :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
 (defun vt-spacing (tensor &key out dtype)
   "逐元素返回与该值相邻浮点数之间的距离（对标 numpy.spacing）。
@@ -632,7 +640,7 @@
                       ((%pos-inf-p xf) xf)
                       ;; numpy.spacing(x) = nextafter(|x|, +inf) - |x|
                       (t (- (%e3-nextafter xf most-positive-double-float) xf))))))
-          (ensure-vt tensor :dtype :float64) :out out :dtype (%e3-float-prefer-dtype dtype)))
+          (ensure-vt tensor :dtype :float64) :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
 ;;; 整型范围回绕工具：（供 gcd/lcm 复用）
 (defun %e3-gcd2 (a b)
@@ -706,7 +714,7 @@
                       ((%pos-inf-p xf) (coerce (or posinf maxf) 'double-float))
                       ((%neg-inf-p xf) (coerce (or neginf minf) 'double-float))
                       (t xf))))
-            v :out out :dtype (%e3-float-prefer-dtype dt))))
+            v :out out :dtype (%e3-float-prefer-dtype dt :float64))))
 
 (defun vt-real (tensor &key out dtype)
   "逐元素实部（对标 numpy.real）。本库无复数 dtype，恒返回输入本身（数值不变）。
@@ -732,7 +740,7 @@
               (cond ((%nan-p xf) xf)
                     ((minusp xf) (if deg 180.0d0 pi))
                     (t 0.0d0))))
-          (ensure-vt tensor :dtype :float64) :out out :dtype (%e3-float-prefer-dtype dtype)))
+          (ensure-vt tensor :dtype :float64) :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
 ;;; ==================================================================
 ;;; 5. 统计类（Statistics）
@@ -878,22 +886,27 @@
                       :axis axis :keepdims keepdims
                       :interpolation interpolation :op-name "vt-nanquantile"))
 
-(defun vt-cov (m &key (y nil y-p) (rowvar t) (ddof 0) (bias nil))
+(defun vt-cov (m &key (y nil y-p) (rowvar t) (ddof nil ddof-p) (bias nil))
   "协方差矩阵（对标 numpy.cov）。
    默认 ROWVAR=t：每行为一个变量，每列一次观测。
    Y 给定时先与 M 拼接（vertically stack）后计算。
-   归一化：默认除以 (N - DDOF)（无偏估计，DDof=0 → N-1）；
-   BIAS=t 时除以 N。
+   归一化分母 = (N - DDOF)，与 numpy 完全一致：
+     · DDOF **缺省**时（未传该关键字）等价 numpy 的缺省行为 → 分母 N-1；
+     · 显式 DDOF=0 → 分母 N；显式 DDOF=1 → 分母 N-1；以此类推；
+     · BIAS=t 等价 DDOF=N（分母 N），与 numpy 一致。
    输入按 float64 计算。返回 2 维协方差矩阵（标量变量时返回 0 维）。
    示例：(vt-cov (vt-from-array #2A((1 2 3)(4 5 6)))) => [[1 1][1 1]]"
   (declare (ignore y-p))
-  (let* ((mm (%e3-as-1d-float-transform m rowvar))
-         (xx (if y (%e3-as-1d-float-transform y rowvar) nil)))
-    (let* ((stacked (if xx (vt-concatenate 0 mm xx) mm))
-           (n-var (first (vt-shape stacked)))
-           (n-obs (second (vt-shape stacked)))
-           (denom (- (if bias n-obs (- n-obs 1)) (if bias 0 ddof)))
-           (denom (if (zerop denom) n-obs denom)))
+  ;; numpy 的 ddof 缺省值为 1（不是 0）：np.cov(a) 除以 N-1，
+  ;; 而 np.cov(a, ddof=0) 除以 N。用 DDOF-P 区分「未传」与「显式 0」。
+  (let ((ddof (if ddof-p ddof 1)))
+    (let* ((mm (%e3-as-1d-float-transform m rowvar))
+           (xx (if y (%e3-as-1d-float-transform y rowvar) nil)))
+      (let* ((stacked (if xx (vt-concatenate 0 mm xx) mm))
+             (n-var (first (vt-shape stacked)))
+             (n-obs (second (vt-shape stacked)))
+             (denom (if bias n-obs (- n-obs ddof)))
+             (denom (if (<= denom 0) n-obs denom)))
       (when (= n-var 1)
         ;; 单变量 → 标量方差
         (let ((row (vt-slice stacked '(0)))
@@ -912,7 +925,7 @@
                    (acc 0.0d0))
               (dotimes (k n-obs)
                 (incf acc (* (- (vt-ref ri k) mi) (- (vt-ref rj k) mj))))
-              (setf (vt-ref res i j) (/ acc denom)))))))))
+              (setf (vt-ref res i j) (/ acc denom))))))))))
 
 (defun %e3-as-1d-float-transform (m rowvar)
   "把输入规范为 2 维（n-var × n-obs）float64 矩阵（对标 numpy.cov 的 rowvar 处理）。"

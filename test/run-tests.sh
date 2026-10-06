@@ -54,7 +54,7 @@ SUITES[numpy-convention-tests]="63 numpy 对齐语义测试 (空归约/:out解�
 SUITES[out-contract-v2-test]="56 :out 契约 v2 严格相等测试 (形状/dtype/可写/别名/非连续 out)"
 SUITES[nan-broadcast-test]="31 NaN/Inf 广播对齐 numpy 测试 (算术/极值/比较/归约/dtype 提升)"
 SUITES[uncovered-coverage-test]="136 覆盖缺口测试 (此前无任何测试/example 调用的公开函数 + identity/vander/atanh 回归)"
-SUITES[extensions3-test]="184 补充 NumPy 缺失函数测试 (extensions3: asarray/tri/rollaxis/block/take-along-axis/sign/nan*/cov/cross/vdot/eigvals/matrix-power/isin 等)"
+SUITES[extensions3-test]="222 补充 NumPy 缺失函数测试 + 审查修复回归 (extensions3 + 审查报告 P0/P1/P2 修复验证)"
 SUITES[test-all]="绝大多数函数的测试"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"

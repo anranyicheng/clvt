@@ -108,13 +108,13 @@
                      '(((0 1) 0d0) ((0 3) 0d0))))
 
   ;; ================================================================
-  ;; 4. argmax 走同一路径（int32 out）
+  ;; 4. argmax 走同一路径（int64 out，对标 numpy intp）
   ;; ================================================================
   ;; x = ((1 5) (3 4)), axis=0
   ;;   第 0 列：1 vs 3 → max 在 row 1 → idx=1
   ;;   第 1 列：5 vs 4 → max 在 row 0 → idx=0
   (let* ((x (vt-from-sequence '((1d0 5d0) (3d0 4d0))))
-         (base (vt-zeros '(4) :dtype :int32))
+         (base (vt-zeros '(4) :dtype :int64))
          (view (vt-slice base '(nil nil 2))))
     (vt-argmax x :axis 0 :out view)
     (check-ref-equal "4  argmax 非连续 out" base
