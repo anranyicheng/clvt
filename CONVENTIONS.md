@@ -139,6 +139,76 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 
 > **重构要点**：以上 6 条必须以**表驱动 + 单一函数**实现，不得散落在各函数里。
 
+### 3.4 神经网络的浮点语义（`nn.lisp` 专项约定）
+
+神经网络层的输出**在数学上必然是实数**，因此 `nn.lisp` 中的激活函数与损失函数
+**不得**走 §3.3 的通用提升规则（那会让「整数进 → 整数出」，把浮点结果静默截断）。
+
+**统一规则（所有 nn 激活/损失函数必须遵守）**：
+
+| 输入 dtype | 缺省输出 dtype | 说明 |
+|---|---|---|
+| `:float32` | `:float32` | 保持精度，不走 double |
+| 其余（含全部整数、`:float64`） | `:float64` | 整数一律提升到 `:float64` 计算 |
+
+> **根因（教训）**：通用路径把 lambda 直接交给 `vt-map` 且 `dtype=nil` 时，
+> `vt-map` 走 `vt-promote-type` → **整数进整数出**，lambda 内算出的浮点值被写回
+> 整数存储而**静默截断**。实测：`softplus([0])→0`（应 `0.693…`）、
+> `gelu([1,2,3])→(0 1 2)`（应 `(0.841 1.955 2.996)`）、
+> `leaky-relu([-2,3,-4])→(0 3 0)`（应 `(-0.02 3.0 -0.04)`）。
+> 这是 P1-1（elementwise 数学函数整数精度）在 `nn.lisp` 的同类漏网。
+
+**实现要求**：
+
+1. 每个 nn 函数**必须**先经 `%nn-float-dtype` 推导结果 dtype
+   （接收输入张量或标量 + 显式 `dtype` 覆盖），再用 `%nn-as-float` 把输入规范到该 dtype；
+2. **不得**依赖 `vt-map` 的 `dtype=nil` 缺省推导；
+3. 显式传 `:dtype` 时以显式值为准（仍须是浮点 dtype）；
+4. `:out` 契约不变——若函数参数含浮点输出（如 `vt-leaky-relu` 的 `alpha`），
+   `:out` 的 dtype 必须与推导结果 dtype 一致，否则报错。
+
+**已核对符合本约定的函数**（守护断言见 `test/extensions3-test.lisp`）：
+`vt-sigmoid` / `vt-relu` / `vt-leaky-relu` / `vt-swish` / `vt-softplus` / `vt-gelu` /
+`vt-mish` / `vt-hard-tanh` / `vt-hard-sigmoid` / `vt-binary-cross-entropy` /
+`vt-cross-entropy` / `vt-cross-entropy-logits`。
+
+---
+
+### 3.5 两种交叉熵语义（**不可混用**）
+
+本库有两个交叉熵函数，语义**根本不同**，文档与调用方必须区分：
+
+| 函数 | 输入 | 内部处理 | 对标 |
+|---|---|---|---|
+| `vt-cross-entropy` | **概率** `y-true`（one-hot）+ `y-pred`（通常 `vt-softmax` 之后） | `-Σ y·log(p)`，对 p 做 `[eps, 1-eps]` 裁剪 | 无（库内约定的概率式） |
+| `vt-cross-entropy-logits` | **raw logits** + **整数类别索引** | log-softmax（减轴最大值 + log-sum-exp），**不裁剪** | `torch.nn.CrossEntropyLoss` |
+
+> **⚠️ 易错点**：把未归一化的 logits 传给 `vt-cross-entropy` 会因形状不可广播而报错
+> （`(2 3)` 与 `(2)` 不兼容），或对负 logits 做出无意义的 `[eps,1-eps]` 裁剪。
+> 需要 torch 语义时**必须**用 `vt-cross-entropy-logits`。
+
+**`vt-cross-entropy-logits` 契约**：
+
+| 参数 | 说明 |
+|---|---|
+| `logits` | 未归一化得分，沿 `axis` 为类别维 |
+| `labels` | **整数**类别索引，形状 = logits 去掉类别轴（`(N,C)`+`(N,)`；任意秩 `(N1,…,C)`+`(N1,…)`；无批次 `(C,)`+标量/长度 1） |
+| `axis` | 类别轴，缺省 `-1` |
+| `reduction` | `:mean`（缺省）/ `:sum` / `:none` |
+
+- 浮点 `labels` **显式报错**（对标 torch 的 int64 labels）；
+- 类别索引越界（含负数）**显式报错**，不静默取值；
+- 数值稳定：`logits=(1e4,0,0)` 仍精确得 `0.0d0`；
+- dtype 缺省按 logits 提升（float32→float32，其余→float64），与 §3.4 一致。
+
+示例（与 `torch.nn.CrossEntropyLoss` 逐位一致）：
+
+```lisp
+(vt-cross-entropy-logits (vt-asarray '((1.0d0 2.0d0 3.0d0) (2.0d0 0.0d0 1.0d0)))
+                         (vt-asarray '(0 1) :dtype :int64))
+;; => 2.4076059644443806d0
+```
+
 ---
 
 ## 4. `:out` 参数契约（**任务3 核心**）
@@ -575,6 +645,9 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | 比较运算 | 返回 `:int8` 承载布尔（0/1） | ✅（文档需写明） |
 | 三角/反三角 | `asin/acos/atan` 命名（非 arc*），越界返回 NaN | ✅（命名见 §3.1.1） |
 | **docstring 覆盖** | 每个公开函数须有文档 | ⚠️ `vt-var` 等为 NIL，需全量审计（任务5） |
+| 激活函数族 | `vt-sigmoid`/`vt-relu`/`vt-leaky-relu`/`vt-swish`/`vt-softplus`/`vt-gelu`/`vt-mish`/`vt-hard-tanh`/`vt-hard-sigmoid`：输出**恒为浮点**，整数输入提升 `:float64`，float32 保持 float32（见 §3.4） | ✅ 已对齐（本轮修 softplus/gelu/leaky-relu） |
+| `vt-cross-entropy` | **概率/one-hot** 语义（`-Σ y·log(p)`，p 裁剪 `[eps,1-eps]`）；**不是** torch 语义 | ✅ 语义已明确（见 §3.5） |
+| `vt-cross-entropy-logits` | **raw logits + 整数类别索引**，对标 `torch.nn.CrossEntropyLoss`（log-softmax，不裁剪）；浮点 labels / 越界索引报错 | ✅ 新增（见 §3.5） |
 
 ---
 

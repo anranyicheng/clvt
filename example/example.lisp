@@ -4574,6 +4574,18 @@
     (assert (> loss 0.0d0))
     (assert (< loss 5.0d0)))
 
+  ;; vt-cross-entropy-logits (raw logits + 整数类别索引)
+  ;; 对标 torch.nn.CrossEntropyLoss：直接吃 logits，无需先 softmax。
+  ;; 数值上更稳定（内部 log-softmax，不减最大值会溢出）。
+  (let* ((logits (vt-from-sequence '((2.0 1.0 0.1) (0.5 2.5 0.3))
+				   :dtype :float64))
+	 (labels (vt-from-sequence '(1 1) :dtype :int64))
+	 (loss (vt-item (vt-cross-entropy-logits logits labels))))
+    ;; logits=[2,1,0.1] 取类别 1 → -log_softmax[1] ≈ 0.874；
+    ;; logits=[0.5,2.5,0.3] 取类别 1 → -log_softmax[1] ≈ 0.148；均值 ≈ 0.511
+    (assert (> loss 0.0d0))
+    (assert (< loss 5.0d0)))
+
   ;; vt-binary-cross-entropy
   ;; y_true=[1,0,1], y_pred=[0.9,0.1,0.8]
   ;; bce = -[1*log(0.9)+0*log(0.1)+1*log(0.8)] / 3

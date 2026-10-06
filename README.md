@@ -406,7 +406,8 @@ vt-softmax
 vt-log-softmax
 vt-mean-squared-error
 vt-binary-cross-entropy
-vt-cross-entropy
+vt-cross-entropy           ; 概率/one-hot 输入（-Σ y·log(p)，对标 torch.nn.CrossEntropyLoss 请用下者）
+vt-cross-entropy-logits    ; raw logits + 整数类别索引（对标 torch.nn.CrossEntropyLoss）
 
 ;; 神经网络扩展
 vt-one-hot

@@ -4,6 +4,124 @@
 
 ---
 
+## 2026-10-06（四）— 新增 `vt-cross-entropy-logits`：真正的 torch.nn.CrossEntropyLoss 语义
+
+### 问题
+
+`vt-cross-entropy` 的文档字符串声称「对标 torch.nn.CrossEntropyLoss」，
+但实现是**概率/one-hot 输入**语义（`-Σ y·log(p)`，且对 p 做
+`[eps, 1-eps]` 裁剪）。两者并不一致：
+
+- torch 的 `CrossEntropyLoss` 收 **raw logits + 整数类别索引**，
+  内部做 log-softmax；
+- 该函数收 **概率 + one-hot**，且 `vt-clip(p, eps, 1-eps)` 对 logits
+  完全不适用（logits 可为负、可远大于 1）。
+
+以「对标 torch.nn.CrossEntropyLoss」的写法调用会因形状不可广播而
+报错，例如：
+
+```lisp
+(vt-cross-entropy (vt-asarray '((1.0d0 2.0d0 3.0d0) (2.0d0 0.0d0 1.0d0)))
+                  (vt-asarray '(0 1) :dtype :int64))
+;; => error: 形状 (2 3) 和 (2) 无法广播：维度 3 与 2 不兼容
+```
+
+### 修复
+
+**新增 `vt-cross-entropy-logits`**（`src/nn.lisp`，已导出），真正对标
+`torch.nn.CrossEntropyLoss`：
+
+| 参数 | 说明 |
+|---|---|
+| `logits` | 未归一化得分，沿 `axis` 为类别维（缺省 -1） |
+| `labels` | **整数**类别索引，形状 = logits 去掉类别轴（`(N,C)` 配 `(N,)`；支持任意秩 `(N1,N2,...,C)` 配 `(N1,N2,...)`；也支持无批次 `(C,)` 配标量/长度 1） |
+| `axis` | 类别轴，缺省 -1 |
+| `reduction` | `:mean`（缺省）/ `:sum` / `:none` |
+
+关键设计：
+
+- **数值稳定**：内部用 log-softmax（减该轴最大值 + log-sum-exp），
+  大 logits 不溢出（`logits=(1e4,0,0)` 仍精确得 `0.0d0`）；
+- **不做 `[eps, 1-eps]` 裁剪**——logits 语义下裁剪会破坏数值；
+- **类别索引越界即报错**（含负数索引），非静默取值；
+- 浮点 `labels` 明确报错（要求整型，对标 torch 的 int64 labels）；
+- dtype 缺省按 logits 提升：float32 → float32，其余 → float64。
+
+示例（与 `torch.nn.CrossEntropyLoss` 逐位一致）：
+
+```lisp
+(vt-cross-entropy-logits (vt-asarray '((1.0d0 2.0d0 3.0d0) (2.0d0 0.0d0 1.0d0)))
+                         (vt-asarray '(0 1) :dtype :int64))
+;; => 2.4076059644443806d0
+```
+
+**`vt-cross-entropy` 语义保持不变**（现有 5 处调用依赖其概率语义，
+含 `example/example.lisp` 的 one-hot 用法），仅**修正文档字符串**，
+明确它是概率输入并指向新函数，消除「对标」与实现不一致的误导。
+
+### 测试
+
+- `test/extensions3-test.lisp`：新增 18 条 `CE-LOGITS` 断言
+  （用户原文调用、reduction 三态、任意秩、axis、数值稳定、
+  与 softmax+log 对照、dtype、`:out`、5 条错误路径、
+  旧接口未受影响），套件 243 → **261** 条全绿。
+- `example/example.lisp`：`test-activation-loss` 补 `vt-cross-entropy-logits` 用例。
+- 全量 **31/31 套件通过，0 失败**。
+
+### 约定文档同步（避免后人重踩）
+
+- `CONVENTIONS.md` **新增 §3.4「神经网络的浮点语义」**：明确 nn 激活/损失函数
+  **不得**走通用提升规则（整数进整数出会静默截断），统一规则为
+  float32→float32、其余（含整数）→float64，并记录根因与实现要求
+  （必须经 `%nn-float-dtype`/`%nn-as-float`，不得依赖 `vt-map` 的 `dtype=nil`）。
+- `CONVENTIONS.md` **新增 §3.5「两种交叉熵语义（不可混用）」**：并列
+  `vt-cross-entropy`（概率/one-hot）与 `vt-cross-entropy-logits`（raw logits，
+  对标 torch），标注易错点与 `vt-cross-entropy-logits` 的完整契约。
+- `CONVENTIONS.md` §9.2 核对清单补「激活函数族 / `vt-cross-entropy` /
+  `vt-cross-entropy-logits`」三行。
+- `README.md` 损失函数清单补 `vt-cross-entropy-logits` 并注明两者语义差异。
+
+---
+## 2026-10-06（三）— 第二轮审查核实：修复 nn.lisp 整数提升链（softplus/gelu/leaky-relu）+ 澄清 R-1/R-2
+
+对第二轮审查报告逐条在最新 `master`（`471d005`）上实测复核。
+
+### 真实缺陷（已修复）
+
+| # | 位置 | 缺陷 | 修法 |
+|---|------|------|------|
+| R-3 | `vt-softplus` | 整数输入返回**整数** dtype 且数值被静默截断。`softplus([0])` → `0`（应 `0.693…`）；`softplus([-1])` → `0`（应 `0.313…`）；`softplus([-5,0,5,25])` → `(0 0 5 25)`（应 `(0.007 0.693 5.007 25.0)`）；配 `:out float64` 直接报 dtype 不匹配 | `%nn-float-dtype` 推导浮点结果 dtype（float32→float32，其余含整数→float64），`%nn-as-float` 先把输入提升再映射 |
+| R-3b | `vt-gelu` | **报告未提及**。整数输入同样返回整数 dtype 且数值截断：`gelu([1,2,3])` → `(0 1 2)`（应 `(0.841 1.955 2.996)`） | 同上 |
+| R-3c | `vt-leaky-relu` | **报告未提及**。整数输入负值被截断：`leaky-relu([-2,3,-4])` → `(0 3 0)`（应 `(-0.02 3.0 -0.04)`） | 同上 |
+
+> 三个函数同属一条「整数提升缺失链」：通用路径把 lambda 直接交给
+> `vt-map` 且 `dtype=nil`，`vt-map` 走 `vt-promote-type` → 整数进整数出，
+> lambda 内算出的浮点值被写回整数存储而静默截断。
+> 这是 P1-1（elementwise 数学函数）在 `nn.lisp` 的**同类漏网**。
+
+已排查并**确认无此问题**的同族函数（补断言守护）：
+`vt-sigmoid` / `vt-swish` / `vt-mish` / `vt-hard-tanh` / `vt-hard-sigmoid` /
+`vt-binary-cross-entropy`（均正确返回 float64）。
+
+### 经核实为「误报」或「已修复」（未改动）
+
+| 报告条目 | 报告结论 | 实际核实 |
+|---|---|---|
+| P0-1 `vt-relu` 整数段错误 | 仍存在，段错误崩溃 | **已修复**（`471d005`）：实测 `(vt-relu (vt-asarray '(1 2 3 4)))` → `(:FLOAT64 (1.0 2.0 3.0 4.0))`，int8/int32/uint8/负值/float32 全部正常 |
+| P1-1 整数数学函数 float32 精度 | 15 项失败 | **已修复**（`471d005`）：`sin int64 → 0.8414709848078965d0`，与 numpy 逐位一致 |
+| P1-2 `vt-expm1`/`vt-log1p` 不提升 | 返回 int64 | **已修复**（`471d005`）：两者整数输入均返回 `:FLOAT64` |
+| **R-1** 非连续 `:out` 写入不落盘 | 维持原判，称「上游测试只验证通过 out 读回，没验证通过 base 读回」 | **误报，且报告对上游测试的描述与事实相反**。实测：`(vt-add m23 m23 :out view)` 后 **`base` 正确落盘**为 `((0 0 2 0 4 0) (6 0 8 0 10 0))`。`test/out-contig-tests.lisp` 中 `"2b base 偶数位被写入"`、`"2c base 奇数位保持 0"`、`"3c 写入位置正确"`、`"3d 未写位置保持 0"` 等断言**全部作用在 `base` 上**，正是报告声称「缺失」的那类验证 |
+| **R-2** `vt-cross-entropy` 不支持分类调用 | P1 新发现，且「传 3 元素 labels 静默给出错误数值 56.41（正确 4.815）」 | **非缺陷，属设计取向**。该函数文档与测试均明确为**概率输入**（`test/test-all.lisp`：`"vt-cross-entropy 同 bce（概率输入）"`），与 `vt-softmax` 配套使用。报告要求的 raw-logits 语义属**功能诉求**（可考虑新增 `vt-cross-entropy-logits`），非「实现错误」。另：报告给出的数值 `4.815`/`56.41` 用 one-hot 语义（`1.4076`）与广播语义（`0.4076`）**均无法复现**，数值来源不可信 |
+
+### 测试
+
+- `test/extensions3-test.lisp`：新增 21 条「R-3 整数提升回归」断言
+  （softplus dtype×3 + 数值×5 + `:out`×1；gelu dtype×3 + 数值×1；
+  leaky-relu dtype×1 + 负值不截断×1 + float32 保持×1；同族守护×5），
+  套件由 222 → **243** 条全绿。
+- 全量 **31/31 套件通过，0 失败**（含 `fastmap-invariant-test`）。
+
+---
 ## 2026-10-06（二）— 修复 P1-1 精度修复引入的性能回归：`%float-map` 宏化，恢复 `vt-fast-map` 内联快路径
 
 上一轮为修复 P1-1（整数输入仅 float32 精度）引入了函数 `%float-map-fn`，

@@ -318,6 +318,7 @@
    #:vt-mean-squared-error
    #:vt-binary-cross-entropy
    #:vt-cross-entropy
+   #:vt-cross-entropy-logits
 
    ;; ------------------------------------------------------------------
    ;; 集合操作 (setops.lisp)

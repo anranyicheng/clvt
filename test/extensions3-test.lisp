@@ -527,4 +527,148 @@
        (vt-logical-and (vt-asarray '(1 0) :dtype :int64) (vt-asarray '(1 1) :dtype :int64)))
 
 ;;; ============================================================
+;;; [R-3] 整数输入激活函数提升回归
+;;;   vt-softplus / vt-gelu 缺省 dtype 时，lambda 交给 vt-map 会走
+;;;   vt-promote-type → 整数输入得到整数结果 dtype，浮点值被静默截断。
+;;;   例：(vt-softplus (vt-asarray '(0))) → 0（应 0.693…）；
+;;;       (vt-gelu (vt-asarray '(1 2 3))) → (0 1 2)（应 0.841/1.955/2.996）。
+;;;   对标 numpy：整型进 float64 出、float32 进 float32 出。
+;;; ============================================================
+;; softplus：dtype 提升
+(check-true "R-3 softplus int64 dtype → float64"
+            (eq :float64 (vt-dtype (vt-softplus (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "R-3 softplus int8 dtype → float64"
+            (eq :float64 (vt-dtype (vt-softplus (vt-asarray '(1 2 3) :dtype :int8)))))
+(check-true "R-3 softplus float32 保持 float32"
+            (eq :float32 (vt-dtype (vt-softplus (vt-asarray '(1.0f0 2.0f0) :dtype :float32)))))
+;; softplus：数值不再被截断（numpy 参考值）
+(check "R-3 softplus([0])=ln2" '(0.6931471805599453d0)
+       (vt-softplus (vt-asarray '(0) :dtype :int64)))
+(check "R-3 softplus([-1])" '(0.31326168751822286d0)
+       (vt-softplus (vt-asarray '(-1) :dtype :int64)))
+(check "R-3 softplus([3])" '(3.048587351573742d0)
+       (vt-softplus (vt-asarray '(3) :dtype :int64)))
+(check "R-3 softplus([1,2,3])"
+       '(1.3132616875182228d0 2.1269280110429727d0 3.048587351573742d0)
+       (vt-softplus (vt-asarray '(1 2 3) :dtype :int64)))
+(check "R-3 softplus([-5,0,5,25])"
+       '(0.006715348489118068d0 0.6931471805599453d0 5.006715348489118d0 25.0d0)
+       (vt-softplus (vt-asarray '(-5 0 5 25) :dtype :int64)))
+;; gelu：dtype 提升 + 数值
+(check-true "R-3 gelu int64 dtype → float64"
+            (eq :float64 (vt-dtype (vt-gelu (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "R-3 gelu int8 dtype → float64"
+            (eq :float64 (vt-dtype (vt-gelu (vt-asarray '(1 2 3) :dtype :int8)))))
+(check-true "R-3 gelu float32 保持 float32"
+            (eq :float32 (vt-dtype (vt-gelu (vt-asarray '(1.0f0 2.0f0) :dtype :float32)))))
+(check "R-3 gelu([1,2,3])"
+       '(0.8411919906082768d0 1.954597694087775d0 2.996362607918227d0)
+       (vt-gelu (vt-asarray '(1 2 3) :dtype :int64)) 1d-12)
+;; 整数输入 + :out float64 现在可用（修复前因结果 dtype 为 int64 而报错）
+(check "R-3 softplus int64 + :out float64"
+       '(1.3132616875182228d0 2.1269280110429727d0 3.048587351573742d0)
+       (let ((o (vt-zeros '(3) :dtype :float64)))
+         (vt-softplus (vt-asarray '(1 2 3) :dtype :int64) :out o)
+         o))
+;; 其余激活函数本已正确（守护，防止将来退化）
+(check-true "R-3 sigmoid int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-sigmoid (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "R-3 swish int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-swish (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "R-3 mish int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-mish (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "R-3 hard-tanh int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-hard-tanh (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "R-3 hard-sigmoid int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-hard-sigmoid (vt-asarray '(1 2 3) :dtype :int64)))))
+(check-true "R-3 leaky-relu int64 dtype float64"
+            (eq :float64 (vt-dtype (vt-leaky-relu (vt-asarray '(1 2 3) :dtype :int64)))))
+;; leaky-relu 负值本会被 int64 存储截断成 0（(-2 3 -4) → (0 3 0)）；
+;; 提升后应按 alpha=0.01 保留小数（对标 torch F.leaky_relu(0.01)）。
+(check "R-3 leaky-relu int64 负值不截断"
+       '(-0.02d0 3.0d0 -0.04d0)
+       (vt-leaky-relu (vt-asarray '(-2 3 -4) :dtype :int64)) 1d-12)
+(check-true "R-3 leaky-relu float32 保持 float32"
+            (eq :float32 (vt-dtype (vt-leaky-relu (vt-asarray '(1.0f0 -2.0f0)
+                                                             :dtype :float32)))))
+
+;;; ============================================================
+;;; [CE-LOGITS] vt-cross-entropy-logits：raw logits + 整数类别索引
+;;;   对标 torch.nn.CrossEntropyLoss 的标准用法。
+;;;   原 vt-cross-entropy 文档写「对标 torch.nn.CrossEntropyLoss」，
+;;;   但实现是概率/one-hot 输入，二者不一致（见 nn.lisp 文档修正）。
+;;; ============================================================
+(defparameter *ce-z* (vt-asarray '((1.0d0 2.0d0 3.0d0) (2.0d0 0.0d0 1.0d0))))
+(defparameter *ce-lab* (vt-asarray '(0 1) :dtype :int64))
+;; 基准值：torch.nn.CrossEntropyLoss(logits, labels) = 2.4076059644443806
+(check "CE-LOGITS 用户原文调用 (2,3)+(2,)int64" 2.4076059644443806d0
+       (vt-item (vt-cross-entropy-logits *ce-z* *ce-lab*)) 1d-12)
+(check "CE-LOGITS reduction :sum" 4.815211928888761d0
+       (vt-item (vt-cross-entropy-logits *ce-z* *ce-lab* :reduction :sum)) 1d-12)
+(check "CE-LOGITS reduction :none"
+       '(2.4076059644443806d0 2.4076059644443806d0)
+       (vt-to-list (vt-cross-entropy-logits *ce-z* *ce-lab* :reduction :none)) 1d-12)
+;; 无批次 (C,) + 长度 1 labels
+(check "CE-LOGITS 无批次 (3,)+(1,)" 2.4076059644443806d0
+       (vt-item (vt-cross-entropy-logits (vt-asarray '(1.0d0 2.0d0 3.0d0))
+                                         (vt-asarray '(0) :dtype :int64))) 1d-12)
+;; 任意秩 (2,2,3) + (2,2)
+(check "CE-LOGITS 3D (2,2,3)+(2,2)" 2.4076059644443806d0
+       (vt-item (vt-cross-entropy-logits
+                 (vt-asarray '(((1.0d0 2.0d0 3.0d0) (1.0d0 2.0d0 3.0d0))
+                               ((2.0d0 0.0d0 1.0d0) (2.0d0 0.0d0 1.0d0))))
+                 (vt-asarray '((0 0) (1 1)) :dtype :int64))) 1d-12)
+;; axis 参数
+(check "CE-LOGITS axis=0" 2.4076059644443806d0
+       (vt-item (vt-cross-entropy-logits
+                 (vt-asarray '((1.0d0 2.0d0) (2.0d0 0.0d0) (3.0d0 1.0d0)))
+                 (vt-asarray '(0 1) :dtype :int64) :axis 0)) 1d-12)
+;; 数值稳定：大 logits（log-softmax 不减最大值会溢出）
+(check "CE-LOGITS 大 logits 数值稳定" 0.0d0
+       (vt-item (vt-cross-entropy-logits (vt-asarray '((1.0d4 0.0d0 0.0d0)))
+                                         (vt-asarray '(0) :dtype :int64))))
+(check "CE-LOGITS 完美预测=0" 0.0d0
+       (vt-item (vt-cross-entropy-logits (vt-asarray '((100.0d0 -100.0d0)))
+                                         (vt-asarray '(0) :dtype :int64))))
+;; 与 softmax+log 路径一致（logits=[1,2,3] 取类别 2 → -log_softmax[2] = 0.4076…）
+(check "CE-LOGITS 与 softmax+log 一致" 0.4076059644443804d0
+       (vt-item (vt-cross-entropy-logits (vt-asarray '((1.0d0 2.0d0 3.0d0)))
+                                         (vt-asarray '(2) :dtype :int64))) 1d-12)
+;; dtype
+(check-true "CE-LOGITS float32 保持 float32"
+            (eq :float32 (vt-dtype (vt-cross-entropy-logits
+                                    (vt-asarray '((1.0f0 2.0f0 3.0f0)) :dtype :float32)
+                                    (vt-asarray '(0) :dtype :int64)))))
+(check-true "CE-LOGITS float64 logits → float64"
+            (eq :float64 (vt-dtype (vt-cross-entropy-logits
+                                    (vt-asarray '((1.0d0 2.0d0 3.0d0)))
+                                    (vt-asarray '(0) :dtype :int64)))))
+;; :out
+(check "CE-LOGITS :out 标量" 2.4076059644443806d0
+       (let ((o (vt-zeros nil :dtype :float64)))
+         (vt-cross-entropy-logits *ce-z* *ce-lab* :out o)
+         (vt-item o)) 1d-12)
+;; 错误路径
+(check-error "CE-LOGITS labels 形状不符报错"
+             (lambda () (vt-cross-entropy-logits *ce-z*
+                                                 (vt-asarray '(0 1 2) :dtype :int64))))
+(check-error "CE-LOGITS 索引越界报错"
+             (lambda () (vt-cross-entropy-logits (vt-asarray '((1.0d0 2.0d0 3.0d0)))
+                                                 (vt-asarray '(5) :dtype :int64))))
+(check-error "CE-LOGITS 负数索引报错"
+             (lambda () (vt-cross-entropy-logits (vt-asarray '((1.0d0 2.0d0 3.0d0)))
+                                                 (vt-asarray '(-1) :dtype :int64))))
+(check-error "CE-LOGITS 浮点 labels 报错"
+             (lambda () (vt-cross-entropy-logits (vt-asarray '((1.0d0 2.0d0 3.0d0)))
+                                                 (vt-asarray '(0.0d0)))))
+(check-error "CE-LOGITS 未知 reduction 报错"
+             (lambda () (vt-cross-entropy-logits (vt-asarray '((1.0d0 2.0d0 3.0d0)))
+                                                 (vt-asarray '(0) :dtype :int64)
+                                                 :reduction :bogus)))
+;; 旧接口语义未受影响（仍为概率输入）
+(check "CE 旧接口 概率输入仍工作" (- (log 0.9d0))
+       (vt-item (vt-cross-entropy (vt-from-sequence '(1.0d0 0.0d0))
+                                  (vt-from-sequence '(0.9d0 0.1d0)))) 1d-6)
+
+;;; ============================================================
 (summary)
