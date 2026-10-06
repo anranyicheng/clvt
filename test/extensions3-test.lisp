@@ -306,7 +306,8 @@
 (check "vdot 2d 展平" 70 (vt-vdot (mki '((1 2) (3 4))) (mki '((5 6) (7 8)))))
 
 (check "eigvals 对角" '(3d0 2d0) (vt-eigvals (mk '((2d0 0d0) (0d0 3d0)))))
-(check "eigvalsh 对称" '(3d0 1d0) (vt-eigvalsh (mk '((2d0 1d0) (1d0 2d0)))))
+;; v0.4.0：eigvalsh 已按 numpy.linalg.eigvalsh 约定升序排列
+(check "eigvalsh 对称" '(1d0 3d0) (vt-eigvalsh (mk '((2d0 1d0) (1d0 2d0)))))
 
 (check "matrix-power 2" '((7 10) (15 22)) (vt-matrix-power (mki '((1 2) (3 4))) 2))
 (check "matrix-power 0" '((1 0) (0 1)) (vt-matrix-power (mki '((1 2) (3 4))) 0))

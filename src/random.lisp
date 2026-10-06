@@ -206,23 +206,25 @@
    参数校验前移（v0.3.6，TEST-PLAN §6 #4）：在任何浮点求值之前完成，
    且 NaN/Inf 判定本身在屏蔽 FP 陷阱的上下文中进行——否则 NaN 参数会
    在校验阶段先触发 FP-INVALID-OPERATION，报出错误类型而非干净的参数错误。"
-  (declare (list shape))
   (unless (and (numberp low) (numberp high))
     (error "vt-random-uniform: low/high 必须为实数，得到 ~a / ~a" low high))
-  (with-float-safe
-    (unless (and (not (%nan-p low)) (not (%inf-p low))
-                 (not (%nan-p high)) (not (%inf-p high)))
-      (error "vt-random-uniform: low/high 必须有限，得到 ~a / ~a" low high))
-    (unless (<= low high)
-      (error "vt-random-uniform: 要求 low <= high，得到 low=~a high=~a" low high))
-    (setf rng (%ensure-random-state rng))
-    (if (= low high)
-        (vt-full shape low :dtype dtype)
-        (let ((range (- high low)))
-          (vt-map (lambda (x)
-                    (declare (ignore x))
-                    (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
-                  (vt-zeros shape :dtype dtype))))))
+  ;; v0.4.0 修复：对标 numpy.random.uniform，整数 shape 等价一维长度
+  (let ((shape (if (integerp shape) (list shape) shape)))
+    (declare (list shape))
+    (with-float-safe
+      (unless (and (not (%nan-p low)) (not (%inf-p low))
+                   (not (%nan-p high)) (not (%inf-p high)))
+        (error "vt-random-uniform: low/high 必须有限，得到 ~a / ~a" low high))
+      (unless (<= low high)
+        (error "vt-random-uniform: 要求 low <= high，得到 low=~a high=~a" low high))
+      (setf rng (%ensure-random-state rng))
+      (if (= low high)
+          (vt-full shape low :dtype dtype)
+          (let ((range (- high low)))
+            (vt-map (lambda (x)
+                      (declare (ignore x))
+                      (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
+                    (vt-zeros shape :dtype dtype)))))))
 
 (defun vt-random-normal
     (shape &key (mean 0.0d0) (std 1.0d0) (dtype :float64) (rng nil))
@@ -231,29 +233,34 @@
    对标 numpy 对 scale < 0 的报错）；std = 0 返回 mean 填充。
    参数校验前移并屏蔽 FP 陷阱（v0.3.6，同 vt-random-uniform）——
    NaN/Inf 判定本身在屏蔽 FP 陷阱的上下文中进行，保证报出干净的参数错误。"
-  (declare (list shape))
   (unless (and (numberp mean) (numberp std))
     (error "vt-random-normal: mean/std 必须为实数，得到 ~a / ~a" mean std))
-  (with-float-safe
-    (unless (and (not (%nan-p mean)) (not (%inf-p mean)))
-      (error "vt-random-normal: mean 必须有限，得到 ~a" mean))
-    (unless (and (not (%nan-p std)) (not (%inf-p std)) (>= std 0))
-      (error "vt-random-normal: std 必须为非负有限实数，得到 ~a" std))
-    (setf rng (%ensure-random-state rng))
-    (if (zerop std)
-        (vt-full shape mean :dtype dtype)
-        (let ((res (vt-zeros shape :dtype dtype)))
-          (vt-do-each (ptr val res)
-            (declare (ignore val))
-            (setf (aref (vt-data res) ptr)
-                  (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
-          res))))
+  ;; v0.4.0 修复：对标 numpy.random.normal，整数 shape 等价一维长度
+  (let ((shape (if (integerp shape) (list shape) shape)))
+    (declare (list shape))
+    (with-float-safe
+      (unless (and (not (%nan-p mean)) (not (%inf-p mean)))
+        (error "vt-random-normal: mean 必须有限，得到 ~a" mean))
+      (unless (and (not (%nan-p std)) (not (%inf-p std)) (>= std 0))
+        (error "vt-random-normal: std 必须为非负有限实数，得到 ~a" std))
+      (setf rng (%ensure-random-state rng))
+      (if (zerop std)
+          (vt-full shape mean :dtype dtype)
+          (let ((res (vt-zeros shape :dtype dtype)))
+            (vt-do-each (ptr val res)
+              (declare (ignore val))
+              (setf (aref (vt-data res) ptr)
+                    (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
+            res)))))
 
 (defun vt-random-int
     (low high &key (size nil) (dtype :int64) (rng nil))
-  "生成 [low, high) 区间的随机整数张量（对标 numpy.random.randint）。"
+  "生成 [low, high) 区间的随机整数张量（对标 numpy.random.randint）。
+   SIZE 可为 list（多维形状）、整数（等价一维长度，v0.4.0 修复：
+   原实现未归一化整数 size 导致类型声明错误）或 NIL（返回 0 维标量）。"
   (setf rng (%ensure-random-state rng))
-  (let ((range (- high low)))
+  (let ((size (if (integerp size) (list size) size))
+        (range (- high low)))
     (assert (>= range 0) (high low))
     (if (zerop range)
         (if size

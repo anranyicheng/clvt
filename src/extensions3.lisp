@@ -290,7 +290,10 @@
                                                     (/= (nth d ishape) 1))
                                                 (nth d ocoords)
                                                 0)))
-                     (ilinear (lin icoords ishape (make-list rank :initial-element 1)))
+                     ;; v0.4.0 修复：idx 已按行主序 ravel，平面下标必须用
+                     ;; 行主序 strides（vt-compute-strides）计算；原实现传全 1
+                     ;; 步长等价于按列主序展开，导致第 r 行索引整体偏移 +r。
+                     (ilinear (lin icoords ishape (vt-compute-strides ishape)))
                      (sel (vt-ref idx ilinear))
                      (src-coords (copy-list ocoords)))
                 (setf sel (if (minusp sel) (+ sel ax-dim) sel))
@@ -1026,9 +1029,12 @@
 
 (defun vt-eigvalsh (matrix &key (max-iter 200) (tol 1e-10))
   "对称（Hermitian）方阵特征值（对标 numpy.linalg.eigvalsh）。
-   与 vt-eigvals 等价（本库特征分解即为实对称 Jacobi）。
-   示例：(vt-eigvalsh (vt-from-array #2A((2.0 1.0)(1.0 2.0)))) => [3.0 1.0]"
-  (vt-eigvals matrix :max-iter max-iter :tol tol))
+   与 numpy 一致：返回**升序**排列的特征值。
+   （v0.4.0 修复：原实现直接透传 vt-eigvals 的非排序结果，
+   不满足 numpy.linalg.eigvalsh 的升序约定。）
+   示例：(vt-eigvalsh (vt-from-array #2A((2.0 1.0)(1.0 2.0)))) => [1.0 3.0]"
+  (let ((w (vt-eigvals matrix :max-iter max-iter :tol tol)))
+    (vt-sort w :axis -1)))
 
 (defun vt-matrix-power (matrix n)
   "整数幂的方阵（对标 numpy.linalg.matrix_power）。

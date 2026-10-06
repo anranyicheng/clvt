@@ -224,7 +224,16 @@
    用 vt-check-out 与本函数返回的 compute-dtype 比对（H3）。"
   (let ((compute
           (or requested-dtype
-              (funcall promote (mapcar #'vt-dtype inputs)))))
+              (let ((promoted (apply promote (mapcar #'vt-dtype inputs))))
+                ;; v0.4.0 修复两处：
+                ;; 1) promote 为 &rest 函数，原 funcall 把 dtype 列表当成
+                ;;    单个实参传入，导致所有输入都落到兜底分支 :float64；
+                ;; 2) 按 §4.4 / numpy 实测，纯整数输入的 sum/prod 归约
+                ;;    一律提升到 int64（int8 → int64），不能保持原宽度。
+                (if (and (not (vt-float-dtype-p promoted))
+                         (not (eq promoted :int64)))
+                    :int64
+                    promoted)))))
     (values compute compute)))
 
 ;;; ==================================================================

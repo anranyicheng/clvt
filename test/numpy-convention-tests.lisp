@@ -246,8 +246,8 @@
          (eq :int64 (vt-dtype (vt-div (vt-from-sequence '(7) :dtype :int64) 0))))
   (check "div int 7/2 → 3（截断）"
          (equal (vt-to-list (vt-div (vt-from-sequence '(7) :dtype :int64) 2)) '(3)))
-  (check "div int -7/3 → -2（截断非 floor）"
-         (equal (vt-to-list (vt-div (vt-from-sequence '(-7) :dtype :int64) 3)) '(-2)))
+  (check "div int -7/3 → -3（floor，对标 np.floor_divide，与 vt-divmod 一致）"
+         (equal (vt-to-list (vt-div (vt-from-sequence '(-7) :dtype :int64) 3)) '(-3)))
 
   (format t "~%通过 ~a / 失败 ~a~%" *pass* *fail*)
   (finish-output)

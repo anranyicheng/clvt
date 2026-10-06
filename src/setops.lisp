@@ -6,30 +6,34 @@
   "返回展平后唯一元素（升序，nan 视为同一值）。"
   (with-float-safe
     (let* ((flat (vt-flatten tensor))
-	   (n (vt-size flat))
+           (n (vt-size flat))
            (src-data (vt-data flat))
-	   (dtype (vt-dtype flat))
+           (dtype (vt-dtype flat))
            (elem-type (vt-element-type flat))
            (sorted-idx (make-array n :element-type '(signed-byte 64)
                                      :initial-contents
-				     (loop for i below n collect i))))
-      (setf sorted-idx (sort sorted-idx
+                                     (loop for i below n collect i))))
+      ;; v0.4.0 修复：sort 不稳定，相同值的多处出现顺序不定，
+      ;; 导致 return-index 取到的可能不是「首次出现」下标。
+      ;; NumPy 语义：return-index 必须返回每个唯一值的**首次出现**位置，
+      ;; 故改用 stable-sort 保持原相对顺序（首个出现的下标先被访问）。
+      (setf sorted-idx (stable-sort sorted-idx
                              (lambda (a b)
                                (let ((va (aref src-data a))
-				     (vb (aref src-data b)))
+                                     (vb (aref src-data b)))
                                  (cond ((%nan-p va) nil)
-				       ((%nan-p vb) t)
+                                       ((%nan-p vb) t)
                                        (t (< va vb)))))))
       (let ((unique-vals
-	      (make-array 0 :element-type elem-type :adjustable t
-			    :fill-pointer t))
+              (make-array 0 :element-type elem-type :adjustable t
+                            :fill-pointer t))
             (first-idx
-	      (make-array 0 :element-type '(signed-byte 64)
-			    :adjustable t :fill-pointer t))
+              (make-array 0 :element-type '(signed-byte 64)
+                            :adjustable t :fill-pointer t))
             (cnts (make-array 0 :element-type '(signed-byte 64)
-				:adjustable t :fill-pointer t))
+                                :adjustable t :fill-pointer t))
             (inverse (make-array n :element-type '(signed-byte 64)
-				   :initial-element 0)))
+                                   :initial-element 0)))
         (loop with pos = 0
               while (< pos n)
               for uniq-num from 0
@@ -40,12 +44,12 @@
                  (vector-push-extend idx0 first-idx)
                  (if (%nan-p val)
                      (loop while (and (< pos n)
-				      (%nan-p (aref src-data (aref sorted-idx pos))))
+                                      (%nan-p (aref src-data (aref sorted-idx pos))))
                            for orig = (aref sorted-idx pos)
                            do (setf (aref inverse orig) uniq-num)
-			      (incf pos))
+                              (incf pos))
                      (loop while (and (< pos n)
-				      (= val (aref src-data (aref sorted-idx pos))))
+                                      (= val (aref src-data (aref sorted-idx pos))))
                            for orig = (aref sorted-idx pos)
                            do (setf (aref inverse orig) uniq-num) (incf pos)))
                  (vector-push-extend (- pos start) cnts))
@@ -54,27 +58,27 @@
               (inv-vt (when return-inverse
                         (let ((v (make-array n :element-type '(signed-byte 64))))
                           (dotimes (i n)
-			    (setf (aref v i) (aref inverse i)))
+                            (setf (aref v i) (aref inverse i)))
                           (%make-vt :data v :shape (list n) :strides '(1)
-				    :offset 0 :dtype :int64))))
+                                    :offset 0 :dtype :int64))))
               (cnt-vt (when return-counts (vt-from-sequence cnts :dtype :int64))))
           (if (or return-index return-inverse return-counts)
               (values uniq-vt
-		      (when return-index idx-vt)
-		      (when return-inverse inv-vt)
+                      (when return-index idx-vt)
+                      (when return-inverse inv-vt)
                       (when return-counts cnt-vt))
               uniq-vt))))))
 
 (defun vt-intersect1d (t1 t2)
   "求两个 1D 张量的交集，结果升序去重（对标 numpy.intersect1d）。"
   (let* ((u1 (vt-unique t1))
-	 (u2 (vt-unique t2))
+         (u2 (vt-unique t2))
          (u2-set (coerce (vt-data u2) 'list))
-	 (result '()))
+         (result '()))
     (vt-do-each (ptr val u1)
       (declare (ignore ptr))
       (when (member val u2-set :test #'vt-float-nan-inf-=)
-	(push val result)))
+        (push val result)))
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
 (defun vt-union1d (t1 t2)
@@ -84,35 +88,35 @@
 (defun vt-setdiff1d (t1 t2)
   "求差集 t1 \ t2（在 t1 中但不在 t2），结果升序去重（对标 numpy.setdiff1d）。"
   (let* ((u1 (vt-unique t1))
-	 (u2 (vt-unique t2))
+         (u2 (vt-unique t2))
          (u2-set (coerce (vt-data u2) 'list))
-	 (result '()))
+         (result '()))
     (vt-do-each (ptr val u1)
       (declare (ignore ptr))
       (unless (member val u2-set :test #'vt-float-nan-inf-=)
-	(push val result)))
+        (push val result)))
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
 (defun vt-setxor1d (t1 t2)
   "求对称差（仅出现在其中一个集合中），结果升序去重（对标 numpy.setxor1d）。"
   (let* ((u1 (vt-unique t1))
-	 (u2 (vt-unique t2))
-	 (u1-set (coerce (vt-data u1) 'list))
-	 (u2-set (coerce (vt-data u2) 'list))
+         (u2 (vt-unique t2))
+         (u1-set (coerce (vt-data u1) 'list))
+         (u2-set (coerce (vt-data u2) 'list))
          (result '()))
     (vt-do-each (ptr val u1)
       (declare (ignore ptr))
       (unless (member val u2-set :test #'vt-float-nan-inf-=)
-	(push val result)))
+        (push val result)))
     (vt-do-each (ptr val u2)
       (declare (ignore ptr))
       (unless (member val u1-set :test #'vt-float-nan-inf-=)
-	(push val result)))
+        (push val result)))
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
 (defun vt-in1d (t1 t2)
   "逐元素判定是否属于 TEST（对标 numpy.in1d）。返回与元素形状相同的布尔张量。"
   (let ((t2-set (coerce (vt-data (vt-unique t2)) 'list)))
     (vt-map (lambda (x)
-	      (if (member x t2-set :test #'vt-float-nan-inf-=) 1.0d0 0.0d0))
-	    t1 :dtype :float64)))
+              (if (member x t2-set :test #'vt-float-nan-inf-=) 1.0d0 0.0d0))
+            t1 :dtype :float64)))
