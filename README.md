@@ -589,7 +589,7 @@ vt-isneginf         ;; 负无穷判定 (对标 numpy.isneginf)
 vt-isin             ;; 元素是否在给定集合中 (对标 numpy.isin)
 
 ```
-测试在 example/example.lisp 文件中。
+例子在 example/example.lisp 文件中。
 ``` common lisp
 (ql:quickload :clvt)
 (in-package :clvt)
@@ -613,7 +613,7 @@ bash test/run-tests.sh --suite numpy-compare-test
 bash test/run-tests.sh --list
 ```
 
-主要测试套件：(具体请看 test 文件)
+主要测试套件：(具体请看 test/ 文件夹目录中)
 
 | 套件 | 用例数 | 内容 |
 |------|-------:|------|
