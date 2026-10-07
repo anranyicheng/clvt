@@ -47,7 +47,6 @@
   "逐元素减法（一元取负 / 二元 / N 元左结合）。
    一元：-vt；二元及以上：vt - arg1 - arg2 - ...
    VT 是第一个张量，其余从 ARGS 解析。
-
    参数契约同 vt-+：:dtype 决定结果 dtype（缺省按提升规则），
    :out 必须精确匹配结果形状与 dtype 且可写。"
   (with-float-safe

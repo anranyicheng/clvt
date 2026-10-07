@@ -50,7 +50,8 @@
 	res))))
 
 (defun %vt-map-run (fn inputs res out-shape)
-  (declare (list inputs out-shape))
+  (declare (list inputs out-shape)
+	   (optimize (speed 3)))
   (let* ((n (length inputs))
          (res-data (vt-data res))
          (res-dtype (vt-dtype res))

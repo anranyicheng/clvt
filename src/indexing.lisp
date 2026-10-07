@@ -4,19 +4,24 @@
 
 (defun vt-ref (vt &rest indices)
   "获取指定位置元素（支持负索引，带边界检查）。"
+  (declare (optimize (speed 3)))
   (let* ((shape (vt-shape vt))
          (rank (length shape)))
+    (declare (list shape))
     (when (some #'zerop shape) (error "cannot index into an empty tensor"))
     (unless (= (length indices) rank)
       (error "索引数量 ~a 与维度数 ~a 不匹配" (length indices) rank))
-    (let ((data (vt-data vt)) (ptr (vt-offset vt)))
-      (loop for idx in indices
-	    for dim in shape
-	    for stride in (vt-strides vt)
+    (let ((data (vt-data vt))
+	  (ptr (vt-offset vt)))
+      (declare (fixnum ptr)
+	       (simple-array data))
+      (loop for idx fixnum in indices
+	    for dim fixnum in shape
+	    for stride fixnum in (vt-strides vt)
             do (let ((i (if (minusp idx) (+ idx dim) idx)))
                  (unless (and (>= i 0) (< i dim))
                    (error "索引 ~a 越界（轴大小 ~a）" idx dim))
-                 (incf ptr (* i stride))))
+                 (incf ptr (the fixnum (* i stride)))))
       (macrolet ((ref (lt)
 		   `(aref (the (simple-array ,lt (*)) data) ptr)))
         (cond ((equal (array-element-type data) 'double-float) (ref double-float))
@@ -27,19 +32,23 @@
 
 (defun (setf vt-ref) (value vt &rest indices)
   "设置指定位置元素（支持负索引，带边界检查）。"
+  (declare (optimize (speed 3)))
   (let* ((shape (vt-shape vt))
          (rank (length shape)))
     (when (some #'zerop shape) (error "cannot index into an empty tensor"))
     (unless (= (length indices) rank)
       (error "索引数量 ~a 与维度数 ~a 不匹配" (length indices) rank))
-    (let ((data (vt-data vt)) (ptr (vt-offset vt)))
-      (loop for idx in indices
-	    for dim in shape
-	    for stride in (vt-strides vt)
+    (let ((data (vt-data vt))
+	  (ptr (vt-offset vt)))
+      (declare (fixnum ptr)
+	       (simple-array data))
+      (loop for idx fixnum in indices
+	    for dim fixnum in shape
+	    for stride fixnum in (vt-strides vt)
             do (let ((i (if (minusp idx) (+ idx dim) idx)))
                  (unless (and (>= i 0) (< i dim))
                    (error "索引 ~a 越界（轴大小 ~a）" idx dim))
-                 (incf ptr (* i stride))))
+                 (incf ptr (the fixnum (* i stride)))))
       (let ((cval (coerce value (vt-element-type vt))))
         (macrolet ((set-ref (lt)
 		     `(setf (aref (the (simple-array ,lt (*)) data) ptr) cval)))
