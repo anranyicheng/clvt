@@ -351,26 +351,6 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 ---
 
 ## 5. NaN / Inf 约定（**任务4 核心**）
-
-### 5.1 常量体系重构（删除三个 double 常量）
-
-**现状问题**：`nan.lisp` 定义了
-```lisp
-(defconstant +vt-float-nan+     +vt-dfloat-nan+)     ; 默认 double
-(defconstant +vt-float-pos-inf+ +vt-dfloat-pos-inf+) ; 默认 double
-(defconstant +vt-float-neg-inf+ +vt-dfloat-neg-inf+) ; 默认 double
-```
-这三个名字（`float` 泛指）**实际指代 double**，是误导来源。用户要求删除。
-
-**裁决：✅ 已删除这三个常量**（重构完成）。
-
-| 删除 | 替代 |
-|---|---|
-| `+vt-float-nan+` | `(vt-get-nan dtype)` / `(vt-float-nan &optional dtype)` |
-| `+vt-float-pos-inf+` | `(vt-get-pos-inf dtype)` |
-| `+vt-float-neg-inf+` | `(vt-get-neg-inf dtype)` |
-
-**保留**（名字已明确精度，无歧义）：
 ```lisp
 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+
 +vt-sfloat-nan+ +vt-sfloat-pos-inf+ +vt-sfloat-neg-inf+
@@ -711,7 +691,6 @@ C1 形状/秩 · C2 dtype · C3 广播 · C4 归约轴 · C5 NaN/Inf · C6 空�
 | 类型 | 处理 |
 |---|---|
 | 描述与现约定不符的注释（如"int8 加 int32 返回 int8"） | 改为正确描述 |
-| 引用已删除常量（`+vt-float-nan+` 等）的注释 | 删除或改引用 |
 | 复制的样板注释（多函数重复同一段） | 提取为文件级注释 |
 | 过时版本号引用（v0.3.x） | 更新或删除 |
 | 注释掉的死代码 | 删除（git 有历史） |
@@ -1041,7 +1020,6 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | `vt-reciprocal` 整数 | 已按 numpy 整数语义（D9） | — |
 | docstring 覆盖 | 公开 `vt-*` 基本齐全（余 4 个 defstruct 访问器） | — |
 | `most-positive-double-float` 误用 | 已排查（D4b） | — |
-| nan/inf 常量精简 | 三个 `+vt-float-*+` 已删除（§5.1） | — |
 | 测试/example 审计 | `run-all-tests` + 27 套件全绿（任务6） | — |
 | 覆盖缺口审计 | **新增 28 套件全绿**（`uncovered-coverage-test` 136 断言）；6 处缺陷修复见 §15（本轮） | — |
 

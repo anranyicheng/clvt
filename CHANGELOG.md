@@ -724,7 +724,7 @@ int16/int8/uint8/uint16 张量直接抛 "unsupported input/output dtype"——
 
 ### 规范性修正
 
-- 补齐 `vt-float-nan` / `vt-float-pos-inf` / `vt-float-neg-inf` / `vt-compute-logical-strides` 等「已导出但未定义」的悬空符号
+- 补齐 `vt-compute-logical-strides` 等「已导出但未定义」的悬空符号
 - `package.lisp` 导出按功能分组，`*vt-fun-list*` 自动收集
 - 修复 `benchmark-copy.lisp` 中非法 FORMAT 指令 `~30-50x`
 
