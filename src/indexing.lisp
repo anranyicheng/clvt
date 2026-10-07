@@ -4,7 +4,6 @@
 
 (defun vt-ref (vt &rest indices)
   "获取指定位置元素（支持负索引，带边界检查）。"
-  (declare (optimize (speed 3) (safety 0)))
   (let* ((shape (vt-shape vt))
          (rank (length shape)))
     (when (some #'zerop shape) (error "cannot index into an empty tensor"))
@@ -28,7 +27,6 @@
 
 (defun (setf vt-ref) (value vt &rest indices)
   "设置指定位置元素（支持负索引，带边界检查）。"
-  (declare (optimize (speed 3) (safety 0)))
   (let* ((shape (vt-shape vt))
          (rank (length shape)))
     (when (some #'zerop shape) (error "cannot index into an empty tensor"))

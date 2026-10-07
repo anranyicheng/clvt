@@ -265,7 +265,6 @@
 
 (defun vt-astype (tensor new-dtype)
   "将张量转换为新类型（浮点转整数截断）。返回连续的新张量。"
-  (declare (optimize (speed 3) (safety 0)))
   (with-float-safe
     (let* ((shape (vt-shape tensor))
            (rank (length shape))
@@ -500,8 +499,7 @@
    - 内层循环用局部变量缓存 indices/dims/stride
    - 同 dtype 时直接拷贝，异 dtype 时循环外取 caster"
   (declare (type fixnum size dest-off src-off)
-           (type list shape dest-strides src-strides)
-           (optimize (speed 3) (safety 0)))
+           (type list shape dest-strides src-strides))
   (when (zerop size) (return-from %copy-strided-hi nil))
   (let* ((rank   (length shape))
          (dims   (coerce shape 'simple-vector))
@@ -550,8 +548,7 @@
   "通用拷贝：rank 0/1/2/3 走专门化嵌套循环；rank ≥ 4 退回里程计。
    所有路径单遍遍历，无中间缓冲。"
   (declare (type fixnum size dest-off src-off rank)
-           (type list shape dest-strides src-strides)
-           (optimize (speed 3) (safety 0)))
+           (type list shape dest-strides src-strides))
   (when (zerop size) (return-from %copy-generic nil))
   (let ((caster (unless same-dtype (vt-cast-fun dest-dtype))))
     (declare (type (or null function) caster))

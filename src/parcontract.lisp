@@ -195,8 +195,7 @@
 (defun vt-read-strided (src indices strides-vec)
   "按 indices（fixnum 数组）与给定 strides 从 src 读取一个元素。
    供归约/einsum 类内核遍历使用。"
-  (declare (type (simple-array fixnum (*)) indices strides-vec)
-           (optimize (speed 3) (safety 0)))
+  (declare (type (simple-array fixnum (*)) indices strides-vec))
   (let ((p (vt-offset src)))
     (declare (type fixnum p))
     (loop for d of-type fixnum from 0 below (length indices)

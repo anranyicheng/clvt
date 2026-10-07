@@ -71,8 +71,7 @@
 (defun %vt-einsum-labels (n &optional (start 0))
   "从标签池的第 start 个位置开始取 n 个唯一标签。
    若 n + start 超过池容量则报错。返回字符列表。"
-  (declare (type fixnum n start)
-           (optimize (speed 3) (safety 1)))
+  (declare (type fixnum n start))
   (let* ((pool *vt-einsum-label-pool*)
          (size (length pool))
          (end  (+ start n)))

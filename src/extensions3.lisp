@@ -267,7 +267,6 @@
                            collect (if (= d ax) (nth d ishape) (nth d shape))))
              (out (vt-zeros oshape :dtype (vt-dtype tensor)))
              (idx (vt-ravel (vt-astype indices :int64)))
-             (isize (vt-size indices))
              (strides (vt-strides tensor))
              (src-data (vt-data tensor))
              (src-off (vt-offset tensor))
@@ -757,7 +756,7 @@
                      (vt-zeros shape :dtype final-dtype)))
          (work (vt-astype input :float64))
          (op-fn (if (eq op :sum) #'+ #'*))
-         (op-init (if (eq op :sum) 0.0d0 1.0d0)))
+         (op-init (or init-val (if (eq op :sum) 0.0d0 1.0d0))))
     (flet ((cumstep (acc x)
              (if (%nan-p x) acc (funcall op-fn acc x))))
       (if axis
@@ -813,6 +812,7 @@
 (defun %e3-nan-percentile (tensor q &key axis keepdims interpolation op-name)
   "NaN 感知的百分位/分位核心：沿 AXIS（或全局）忽略 NaN 后取分位 Q ∈ [0,1]。
    全 NaN/空切片 → NaN。返回 float64 张量。"
+  (declare (ignorable op-name))
   (with-float-safe
     (let* ((tensor (ensure-vt tensor))
            (shape (vt-shape tensor))
@@ -958,15 +958,16 @@
                           (if (= i j) 1.0d0 0.0d0)
                           (/ (vt-ref c i j) (sqrt (* cii cjj))))))))))))
 
-(defun vt-cross (a b &key (axis nil) (axisa -1) (axisb -1) (axisc -1) dtype out)
+(defun vt-cross (a b &key (axis nil) (axisa -1) (axisb -1) (axisc -1) dtype)
   "向量叉积（对标 numpy.cross）。
    支持 2 分量（标量 z 分量输出）与 3 分量向量；沿 AXISA/AXISB 轴取向量，
    结果沿 AXISC 轴放置。AXIS 给定时等价 axisa=axisb=axisc=axis。
-   :out 契约：结果形状/dtype 精确匹配（复用 vt-concatenate 的连续输出）。
    示例：(vt-cross '(1 2 3) '(4 5 6)) => [-3 6 -3]
         (vt-cross '(1 2) '(4 5))     => -3"
   (let* ((av (ensure-vt a)) (bv (ensure-vt b)))
-    (when axis (setf axisa axis axisb axis axisc axis))
+    (when axis (setf axisa axis
+		     axisb axis
+		     axisc axis))
     ;; 统一到 2 维便于处理（1 维视为单向量）；默认轴 -1 表示最后一维
     (let* ((a2 (%e3-as2d av axisa))
            (b2 (%e3-as2d bv axisb)))
@@ -1060,7 +1061,7 @@
        (let ((result (vt-eye nrow :dtype (vt-dtype matrix)))
              (base (vt-copy matrix)))
          (dotimes (i n result)
-           (declare (ignore i))
+           (declare (ignorable i))
            (setf result (vt-matmul result base)))))
       (t
        (let ((inv (vt-inv matrix)))

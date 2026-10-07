@@ -215,8 +215,7 @@
   "把 m 行切成若干份，每份一个 worker 线程执行 rows-fn。
    rows-fn 签名: (a-data b-data c-data k n a-off b-off c-off i-start i-end)。"
   (declare (type function rows-fn)
-           (type fixnum m k n a-off b-off c-off)
-           (optimize (speed 3) (safety 0) (debug 0)))
+           (type fixnum m k n a-off b-off c-off))
   (cond
     ((or (not *enable-parallel-matmul*)
          (< m 64)
@@ -521,8 +520,7 @@
     (all-labels-vec label-dims-vec output-subs input-subs vts &key out)
   (declare (type simple-vector all-labels-vec)
            (type (simple-array fixnum (*)) label-dims-vec)
-           (type list output-subs input-subs vts)
-	   (optimize (speed 3)))
+           (type list output-subs input-subs vts))
   (with-float-safe
     (when out
       ;; 别名保护（§4.3）：通用累加内核用 `incf`，要求输出缓冲区初始为 0

@@ -16,8 +16,7 @@
          例如 shape=(0 -1)、total=0 → (0 0)）；
        * known = 0 且 total-size ≠ 0：报错（无法确定未定维度）。"
   (declare (list new-shape)
-           (type integer total-size)
-           (optimize (speed 3) (safety 1)))
+           (type integer total-size))
   (let ((n-neg (count -1 new-shape)))
     (cond
       ((zerop n-neg)

@@ -31,8 +31,7 @@
      (declaim (inline ,fn-name))
      (defun ,fn-name (pa pb pc k n i-start i-end)
        (declare (type sb-sys:system-area-pointer pa pb pc)
-                (type fixnum k n i-start i-end)
-                (optimize (speed 3) (safety 0) (debug 0)))
+                (type fixnum k n i-start i-end))
        (let ((ii 64) (jj 256) (kk 256))
          (declare (type fixnum ii jj kk))
          (loop for ii0 of-type fixnum from i-start below i-end by ii do
