@@ -597,7 +597,7 @@ vt-isin             ;; 元素是否在给定集合中 (对标 numpy.isin)
 (run-all-tests)
 ```
 
-自动化测试（28 个测试套件，共 1600+ 用例）:
+自动化测试（28 个测试套件，共 2200+ 用例）:
 ```bash
 # 运行所有测试
 bash test/run-tests.sh
@@ -644,6 +644,7 @@ bash test/run-tests.sh --list
 | `test-overlap` | 6 | 重叠拷贝回归测试 |
 | `test-simd-batch-matmul` | 5 | SIMD 批量矩阵乘测试 |
 | `property-test` / `simd-test` | — | 性质测试 / SIMD 路径测试 |
+| `test-all` | 641 | 一般性测试 |
 
 ## 架构
 
