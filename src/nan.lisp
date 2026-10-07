@@ -79,19 +79,6 @@
 
 (defconstant +vt-sfloat-neg-inf+ (load-time-value (%make-neg-inf 'single-float)))
 
-;;; 注（v0.3.6）：原 +vt-float-nan+ / +vt-float-pos-inf+ / +vt-float-neg-inf+
-;;; 三个"默认 double"的别名常量已**删除**。原因：
-;;;   1) 名字里的 float 未指明精度，在混合精度代码里极易误用
-;;;      —— 把 double NaN 写进 float32 张量会静默变宽再截断；
-;;;   2) 与 numpy 的 dtype 显式化原则冲突（numpy 没有"默认 float 常量"）。
-;;; 迁移办法：
-;;;   常量              → 函数形式（按 dtype 取正确精度的值）
-;;;   +vt-float-nan+    → (vt-get-nan dtype)     或 (vt-float-nan dtype)
-;;;   +vt-float-pos-inf+→ (vt-get-pos-inf dtype) 或 (vt-float-pos-inf dtype)
-;;;   +vt-float-neg-inf+→ (vt-get-neg-inf dtype) 或 (vt-float-neg-inf dtype)
-;;; 需要 double 常量时直接用 +vt-dfloat-nan+ / +vt-dfloat-pos-inf+ /
-;;; +vt-dfloat-neg-inf+（名字已含精度，不会误用）。
-
 ;;; ------------------------------------------------------------------
 ;;; 按 dtype 取常量的统一入口
 ;;; ------------------------------------------------------------------
@@ -110,7 +97,6 @@
   "返回指定浮点 dtype 的负无穷常量（:float32 → single-float，其余 → double-float）。"
   (if (eq dtype :float32) +vt-sfloat-neg-inf+ +vt-dfloat-neg-inf+))
 
-;;; 公开的 getter 函数（对标 README 中 vt-float-nan / vt-float-pos-inf / vt-float-neg-inf）
 (defun vt-float-nan (&optional (dtype :float64))
   "按 dtype 取 NaN 的公开入口（DTYPE 缺省 :float64）。等价 (vt-get-nan dtype)。"
   (vt-get-nan dtype))

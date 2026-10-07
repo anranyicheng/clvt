@@ -344,11 +344,17 @@
    #:vt-random-shuffle
    #:vt-random-multinomial
    ;; SeedSequence
-   #:vt-seed-sequence #:make-seed-sequence #:vt-seed-sequence-entropy
-   #:seed-sequence-spawn #:seed-sequence-generate-state
+   #:vt-seed-sequence
+   #:make-seed-sequence
+   #:vt-seed-sequence-entropy
+   #:seed-sequence-spawn
+   #:seed-sequence-generate-state
    ;; Generator
-   #:vt-generator #:make-generator #:vt-generator-state
-   #:generator-from-seed-sequence #:spawn-generators
+   #:vt-generator
+   #:make-generator
+   #:vt-generator-state
+   #:generator-from-seed-sequence
+   #:spawn-generators
    ;; 作用域宏
    #:with-seed #:with-generator
 
@@ -364,10 +370,6 @@
    #:vt-float-neg-inf-p
    #:vt-float-inf-=
    #:vt-float-nan-inf-=
-   ;; v0.3.6：删除 #:+vt-float-nan+ / #:+vt-float-pos-inf+ / #:+vt-float-neg-inf+
-   ;; 三个「默认 double」别名常量。请改用按 dtype 取值的
-   ;; (vt-get-nan dtype) / (vt-get-pos-inf dtype) / (vt-get-neg-inf dtype)，
-   ;; 或精确的 +vt-dfloat-*+ / +vt-sfloat-*+ 常量。
 
    ;; ------------------------------------------------------------------
    ;; 核心迭代与映射 (map-reduce.lisp)
