@@ -167,7 +167,9 @@
   
   (defun %op-out-dtype (op in-dtype)
     (case op
-      ((:all :any) :int64)
+      ;; numpy 逻辑归约返回 bool → 承载为 :int8（F4 契约）。
+      ;; v0.4.x 修复：原返回 :int64 违反 F4（全量归约路径已为 :int8）。
+      ((:all :any) :int8)
       ;; numpy 的 argmax/argmin 返回 intp（64 位平台为 int64）；
       ;; 修正（审查 P2#1）：原实现返回 :int32，与 numpy 不符。
       ((:argmax :argmin :nanargmax :nanargmin) :int64)
@@ -475,6 +477,14 @@
                                     collect
                                     `((equal res-lt ',rlt)
                                       (,kernel-macro ,op ,lt ,rlt)))
+                            ;; v0.4.x：逻辑归约（all/any）结果为 :int8（F4 契约，
+                            ;; 原 :int64 违反「比较/逻辑返回 int8」约定）。
+                            ;; all/any 的累加器恒为 0/1，int8 不会溢出；内核宏
+                            ;; 对 res-lt 全参数化，按 int8 字面量生成实例即可
+                            ;; （sum/prod 等需要大累加域的算子不开放此路径）。
+                            ((and (member ',op '(:all :any))
+                                  (member res-lt +small-int-lts+ :test #'equal))
+                             (,kernel-macro ,op ,lt (signed-byte 8)))
                             (t (error "unsupported output dtype ~a" res-lt)))))
                 (t (error "unsupported input dtype ~a" in-et)))))
       `(defun ,fn-name (tensor &key axis keepdims dtype out)
@@ -580,6 +590,16 @@
                                                      `((equal lt ',l)
                                                        ,(%op-init op l rlt)))
                                              (t 0))))
+                                 ;; v0.4.x：all/any 小整型输出（:int8）——
+                                 ;; 单位元与 int64 相同（all→1 / any→0）
+                                 ((and (member ',op '(:all :any))
+                                       (member res-lt +small-int-lts+ :test #'equal))
+                                  (cond
+                                    ,@(loop for l in +all-lts+
+                                            collect
+                                            `((equal lt ',l)
+                                              ,(%op-init op l '(signed-byte 64))))
+                                    (t 0)))
                                  (t 0)))
                       (return-from ,fn-name res)))))
                ;; ---- 主分派 ----
@@ -669,14 +689,20 @@
 
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) out)
-  "逐元素判断 |t1 - t2| <= atol + rtol*|t2|（对标 numpy.isclose），返回布尔张量。RTOL/ATOL 缺省 1e-5 / 1e-8。"
+  "逐元素判断 |a - b| <= atol + rtol*|b|，返回 :int8 布尔张量（1/0）。
+   v0.4.x 修复两点：
+     1) 公式原用 max(|a|,|b|)，与 numpy.isclose 的 |b| 不一致，已对齐；
+     2) 结果 dtype 原误为 :float64，违反 F4（比较返回 :int8），已修正。
+   NaN 恒不接近（numpy 默认 equal_nan=False）；±Inf 仅与相等的 ±Inf 接近。
+   RTOL/ATOL 缺省 1e-5 / 1e-8（float64 计算精度，对标 numpy 内部实现）。"
   (vt-map (lambda (a b)
-            (cond ((or (%nan-p a) (%nan-p b)) 0.0d0)
-                  ((or (%inf-p a) (%inf-p b)) (if (= a b) 1.0d0 0.0d0))
-                  (t (if (<= (abs (- a b))
-                             (+ atol (* rtol (max (abs a) (abs b)))))
-                         1.0d0 0.0d0))))
-          t1 t2 :dtype :float64 :out out))
+            (let ((fa (vt-cast a :float64)) (fb (vt-cast b :float64)))
+              (cond ((or (%nan-p fa) (%nan-p fb)) 0)
+                    ((or (%inf-p fa) (%inf-p fb)) (if (= fa fb) 1 0))
+                    (t (if (<= (abs (- fa fb))
+                               (+ atol (* rtol (abs fb))))
+                           1 0)))))
+          t1 t2 :dtype :int8 :out out))
 
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个张量在 RTOL/ATOL 容差下是否全部相等（对标 numpy.allclose），返回布尔。"
@@ -882,7 +908,14 @@
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
          ;; 结果 dtype 由「输入 dtype + 显式 :dtype」决定，不由 out 决定。
-         (final-dtype (or dtype (vt-dtype tensor)))
+         ;; v0.4.x 修复：numpy cumsum/cumprod 对精度低于平台整型的整型
+         ;; 输入提升为 int64（np.cumsum(int8) → int64），原实现保持 int8
+         ;; 导致 100+100 溢出回绕为 -56。提升表与 %op-out-dtype 的
+         ;; sum/prod 一致。
+         (final-dtype (or dtype
+                          (case (vt-dtype tensor)
+                            ((:int8 :uint8 :int16 :uint16 :int32) :int64)
+                            (t (vt-dtype tensor)))))
          (lisp-type (vt-dtype->lisp-type final-dtype))
          ;; out 给出时统一入口校验（形状/dtype 严格相等/可写性）
          (result (if out

@@ -12,18 +12,18 @@
     (unless (= (length indices) rank)
       (error "索引数量 ~a 与维度数 ~a 不匹配" (length indices) rank))
     (let ((data (vt-data vt))
-	  (ptr (vt-offset vt)))
+          (ptr (vt-offset vt)))
       (declare (fixnum ptr)
-	       (simple-array data))
+               (simple-array data))
       (loop for idx fixnum in indices
-	    for dim fixnum in shape
-	    for stride fixnum in (vt-strides vt)
+            for dim fixnum in shape
+            for stride fixnum in (vt-strides vt)
             do (let ((i (if (minusp idx) (+ idx dim) idx)))
                  (unless (and (>= i 0) (< i dim))
                    (error "索引 ~a 越界（轴大小 ~a）" idx dim))
                  (incf ptr (the fixnum (* i stride)))))
       (macrolet ((ref (lt)
-		   `(aref (the (simple-array ,lt (*)) data) ptr)))
+                   `(aref (the (simple-array ,lt (*)) data) ptr)))
         (cond ((equal (array-element-type data) 'double-float) (ref double-float))
               ((equal (array-element-type data) 'single-float) (ref single-float))
               ((equal (array-element-type data) '(signed-byte 64)) (ref (signed-byte 64)))
@@ -39,19 +39,19 @@
     (unless (= (length indices) rank)
       (error "索引数量 ~a 与维度数 ~a 不匹配" (length indices) rank))
     (let ((data (vt-data vt))
-	  (ptr (vt-offset vt)))
+          (ptr (vt-offset vt)))
       (declare (fixnum ptr)
-	       (simple-array data))
+               (simple-array data))
       (loop for idx fixnum in indices
-	    for dim fixnum in shape
-	    for stride fixnum in (vt-strides vt)
+            for dim fixnum in shape
+            for stride fixnum in (vt-strides vt)
             do (let ((i (if (minusp idx) (+ idx dim) idx)))
                  (unless (and (>= i 0) (< i dim))
                    (error "索引 ~a 越界（轴大小 ~a）" idx dim))
                  (incf ptr (the fixnum (* i stride)))))
       (let ((cval (coerce value (vt-element-type vt))))
         (macrolet ((set-ref (lt)
-		     `(setf (aref (the (simple-array ,lt (*)) data) ptr) cval)))
+                     `(setf (aref (the (simple-array ,lt (*)) data) ptr) cval)))
           (cond ((equal (array-element-type data) 'double-float) (set-ref double-float))
                 ((equal (array-element-type data) 'single-float) (set-ref single-float))
                 ((equal (array-element-type data) '(signed-byte 64)) (set-ref (signed-byte 64)))
@@ -59,8 +59,16 @@
                 (t (setf (aref data ptr) cval))))))))
 
 (defun vt-item (x)
-  "0 维张量解包为原生数字，其余原样返回。"
-  (if (and (vt-p x) (null (vt-shape x))) (vt-ref x) x))
+  "单元素张量解包为原生数字（对标 numpy 的 .item()：任意秩、size=1）。
+   v0.4.x 修复：原实现仅解包 0 维张量，(1,1) 等二维单元素张量被原样
+   返回而非标量；现按 data[offset] 直取（零索引元素物理位置即 offset）。
+   多元素张量报错（numpy.item 同样拒绝）；非张量原样返回。"
+  (cond ((and (vt-p x) (null (vt-shape x))) (vt-ref x))
+        ((vt-p x)
+         (unless (= (vt-size x) 1)
+           (error "vt-item: 张量含 ~d 个元素，仅 size=1 可解包" (vt-size x)))
+         (aref (vt-data x) (vt-offset x)))
+        (t x)))
 
 (defun vt-slice (vt &rest specs)
   "统一切片接口。每个 spec 为列表：
@@ -206,9 +214,9 @@
         (let ((scalar (cond ((numberp value) value)
                             ((vt-p value)
                              (if (null (vt-shape value))
-				 (aref (vt-data value) (vt-offset value))
+                                 (aref (vt-data value) (vt-offset value))
                                  (error "cannot assign tensor ~a to scalar slice"
-					(vt-shape value))))
+                                        (vt-shape value))))
                             (t (error "invalid value ~a for scalar slice" value)))))
           (setf (vt-ref target-view) scalar))
         (vt-copy-into target-view value))))
@@ -259,13 +267,13 @@
   (let* ((final (if (member dtype '(:int32 :int64)) dtype :int64))
          (lisp-type (if (eq final :int32) '(signed-byte 32) '(signed-byte 64)))
          (shape (vt-shape condition))
-	 (rank (length shape))
+         (rank (length shape))
          (data (vt-data condition))
-	 (offset (vt-offset condition))
+         (offset (vt-offset condition))
          (shape-vec (coerce shape 'simple-vector))
          (strides-vec (coerce (vt-strides condition) 'simple-vector))
          (result (make-array 64 :element-type '(signed-byte 64)
-				:fill-pointer 0 :adjustable t))
+                                :fill-pointer 0 :adjustable t))
          (coord (make-array rank :element-type '(signed-byte 64))))
     (labels ((recurse (depth ptr)
                (if (= depth rank)
@@ -273,9 +281,9 @@
                      (if (zerop rank)
                          (vector-push-extend 0 result)
                          (loop for c across coord
-			       do (vector-push-extend c result))))
+                               do (vector-push-extend c result))))
                    (let ((dim (svref shape-vec depth))
-			 (stride (svref strides-vec depth)))
+                         (stride (svref strides-vec depth)))
                      (loop for i from 0 below dim do
                        (setf (aref coord depth) i)
                        (recurse (1+ depth) (+ ptr (* i stride))))))))
@@ -283,11 +291,11 @@
     (let* ((total (length result))
            (count (if (zerop rank) total (floor total rank))))
       (cond ((zerop count)
-	     (vt-zeros (list 0 rank) :dtype final))
+             (vt-zeros (list 0 rank) :dtype final))
             ((> rank 0)
              (let ((final-data (make-array total :element-type lisp-type)))
                (loop for i from 0 below total
-		     for idx across result
+                     for idx across result
                      do (setf (aref final-data i) idx))
                (%make-vt :data final-data :shape (list count rank) :strides (list rank 1)
                          :offset 0 :dtype final)))
@@ -449,30 +457,37 @@
          (idx-list (if (numberp indices) (list (round indices))
                        (let ((flat (vt-flatten (ensure-vt indices))))
                          (loop for i below (vt-size flat)
-			       collect (truncate (aref (vt-data flat) i))))))
+                               collect (truncate (aref (vt-data flat) i))))))
          (val-list (cond ((numberp values) (list values))
                          ((or (listp values) (arrayp values))
-			  (vt-flatten-sequence values))
+                          (vt-flatten-sequence values))
                          ((vt-p values)
-			  (let ((flat (vt-flatten (ensure-vt values))))
+                          (let ((flat (vt-flatten (ensure-vt values))))
                             (loop for i below (vt-size flat)
-				  collect (aref (vt-data flat) i))))))
+                                  collect (aref (vt-data flat) i))))))
          (n-values (length val-list)) (shape (vt-shape tensor))
          (strides (vt-strides tensor)) (offset (vt-offset tensor)) (data (vt-data tensor)))
+    ;; H4 写入契约（v0.4.x 修复）：stride-0 广播视图禁止就地写入，
+    ;; 否则一个逻辑位置会经零步长复制污染整片共享底层数据。
+    (when (some #'zerop strides)
+      (error "vt-put: 目标包含 stride-0 广播维度，禁止写入（H4 契约）"))
     (when (zerop n-values) (return-from vt-put tensor))
     (loop for raw in idx-list
-	  for vi from 0
+          for vi from 0
           for val = (nth (mod vi n-values) val-list)
           do (let ((idx raw))
-               (when (and (minusp idx) (>= idx (- total)))
-		 (incf idx total))
+               ;; v0.4.x 修复：负数折算（-1 → n-1）仅适用于 :raise 语义；
+               ;; 原实现对所有模式先折算，导致 :clip 的 -1 被 wrap 到
+               ;; n-1 而非裁剪到 0（numpy.put(clip): 负索引裁剪到 0）。
+               ;; :wrap 的 (mod idx total) 对负数与折算结果一致。
                (cond ((and (>= idx 0) (< idx total)) nil)
                      ((eq mode :clip) (setq idx (max 0 (min idx (1- total)))))
                      ((eq mode :wrap) (setq idx (mod idx total)))
+                     ((and (minusp idx) (>= idx (- total))) (incf idx total))
                      (t (error "索引 ~d 超出范围 [0, ~d)" raw total)))
                (let ((rem idx) (phys offset))
                  (loop for dim in (reverse shape)
-		       for stride in (reverse strides)
+                       for stride in (reverse strides)
                        do (multiple-value-bind (q r) (floor rem dim)
                             (incf phys (* r stride)) (setf rem q)))
                  (setf (aref data phys) (vt-cast val (vt-dtype tensor))))))
@@ -601,47 +616,47 @@
 (defun vt-searchsorted (tensor values &key (side :left))
   "在有序数组中查找插入点。返回形状与 VALUES 相同的 int64 张量（NumPy 语义）。"
   (let* ((flat (vt-flatten tensor))
-	 (data (vt-data flat))
-	 (size (vt-size flat))
+         (data (vt-data flat))
+         (size (vt-size flat))
          (val-vt (ensure-vt values))
          (out-shape (vt-shape val-vt))
-	 (v-flat (vt-flatten val-vt))
+         (v-flat (vt-flatten val-vt))
          (v-data (vt-data v-flat))
-	 (v-size (vt-size v-flat))
+         (v-size (vt-size v-flat))
          (result (make-array v-size :element-type '(signed-byte 64))))
     (loop for i from 0 below v-size
-	  for val = (aref v-data i)
+          for val = (aref v-data i)
           do (let ((lo 0) (hi size))
                (loop while (< lo hi) do
                  (let ((mid (ash (+ lo hi) -1)))
                    (if (if (eq side :right)
-			   (> (aref data mid) val)
-			   (>= (aref data mid) val))
+                           (> (aref data mid) val)
+                           (>= (aref data mid) val))
                        (setf hi mid)
-		       (setf lo (1+ mid)))))
+                       (setf lo (1+ mid)))))
                (setf (aref result i) lo)))
     (%make-vt :data result
               :shape out-shape
               :strides (vt-compute-strides out-shape)
-	      :offset 0 :dtype :int64)))
+              :offset 0 :dtype :int64)))
 
 (defun vt-bincount (x &key (minlength 0))
   "统计非负整数出现次数。"
   (let* ((flat (vt-flatten x))
          (maxval (if (zerop (vt-size flat))
-		     -1
-		     (vt-item (vt-amax flat))))
+                     -1
+                     (vt-item (vt-amax flat))))
          (size (max (1+ maxval) minlength))
          (result (make-array size :element-type '(signed-byte 64)
-				  :initial-element 0)))
+                                  :initial-element 0)))
     (vt-do-each (ptr val flat)
       (declare (ignore ptr))
       (let ((idx (truncate val)))
         (when (or (minusp idx) (>= idx size))
-	  (error "vt-bincount: 索引 ~a 越界" idx))
+          (error "vt-bincount: 索引 ~a 越界" idx))
         (incf (aref result idx))))
     (%make-vt :data result :shape (list size) :strides '(1)
-	      :offset 0 :dtype :int64)))
+              :offset 0 :dtype :int64)))
 
 (defun vt-digitize (x bins &key (right nil))
   "返回输入值在 bins 中的索引。"
@@ -652,8 +667,8 @@
       (setf (aref result ptr)
             (loop for i from 0 below nbins
                   until (if right
-			    (<= val (aref bin-data i))
-			    (< val (aref bin-data i)))
+                            (<= val (aref bin-data i))
+                            (< val (aref bin-data i)))
                   finally (return i))))
     (%make-vt :data result :shape (vt-shape flat-x) :strides '(1)
-	      :offset 0 :dtype :int64)))
+              :offset 0 :dtype :int64)))

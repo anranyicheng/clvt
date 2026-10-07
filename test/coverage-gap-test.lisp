@@ -215,7 +215,9 @@
   (let* ((logits (vt-from-sequence '(10000.0 10001.0 10002.0)))
          (probs (vt-softmax logits)))
     (T! "softmax large: sum=1" 1.0d0 (vt-item (vt-sum probs)) 1e-5)
-    (T! "softmax large: no NaN" t (not (vt-float-nan-p (vt-item probs)))))
+    (T! "softmax large: no NaN"
+	'(0.09003057317038046 0.24472847105479764 0.6652409557748218)
+	(vt-to-list probs)))
 
   ;; 4.6 sigmoid 极端值
   (let* ((x (vt-from-sequence '(-1000.0 -100.0 0.0 100.0 1000.0)))

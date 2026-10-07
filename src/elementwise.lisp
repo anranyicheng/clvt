@@ -83,37 +83,43 @@
              ;; :dtype 时才生效。这里只算出 promote 会得出的结果 dtype，
              ;; 绝不读 out 的 dtype 来决定结果（§4.2 H3 严格相等契约：
              ;; 结果 dtype 由输入提升 + 显式 :dtype 决定，不由 out 决定）。
+             ;; 整型族判定（v0.4.x 修复 BUG：vt-int-dtype-p 不含无符号类型，
+             ;; 导致 uint8/uint 等真除法落入整数除法分支返回整型结果）。
+             (int-family-p
+               (lambda (x)
+                 (or (vt-int-dtype-p (vt-dtype x))
+                     (member (vt-dtype x) '(:uint8 :uint16)))))
+             (dts (mapcar #'vt-dtype all))
              (float-target
                (cond (dtype
                       ;; 显式整型目标：保持截断语义，零除确定性报错
                       nil)
-                     ((and (null out)
-                           (every (lambda (x) (vt-int-dtype-p (vt-dtype x))) all))
+                     ((every int-family-p all)
+                      ;; 整型（含无符号）→ float64（true_divide 恒浮点）
                       :float64)
-                     ((and (null out)
-                           (some (lambda (x) (vt-int-dtype-p (vt-dtype x))) all))
-                      (if (every (lambda (x)
-                                   (or (eq (vt-dtype x) :float32)
-                                       (vt-int-dtype-p (vt-dtype x))))
-                                 all)
+                     ((some int-family-p all)
+                      ;; numpy promote：int8/int16/uint8/uint16 与 float32 混合
+                      ;; → float32；int32/int64 或 float64 参与 → float64
+                      ;; （v0.4.x 修复：原实现对 int32/int64+float32 误返 float32）
+                      (if (every (lambda (dt)
+                                   (member dt '(:float32 :int8 :int16
+                                                :uint8 :uint16)))
+                                 dts)
                           :float32
                           :float64))
-                     ((and (null out)
-                           (some (lambda (x) (eq (vt-dtype x) :float32)) all)
-                           (every (lambda (x)
-                                    (member (vt-dtype x) '(:float32 :float64)))
-                                  all))
-                      :float32)))
+                     ;; 纯浮点混合：自然提升（float64 优先于 float32，对齐
+                     ;; numpy promote(float32,float64)=float64。v0.4.x 修复：
+                     ;; 原实现强行取 float32，精度被降级）
+                     (t nil)))
              (effective-dtype (or dtype float-target)))
         ;; 计算前把整型输入预转换为浮点（numpy true_divide 语义）：
         ;; 避免 CL 整数除零信号 division-by-zero（numpy 为 ±Inf），
         ;; 也避免 (/ int 0) 混合类型除法在浮点目标下的类型错误。
         ;; 顺带修复：标量除数（如 (vt-/ t 0)）先经 ensure-vt 转为 0 维张量，
         ;; 不再因 vt-dtype 作用于数字而直接类型崩溃。
-        (when (and float-target
-                   (some (lambda (x) (vt-int-dtype-p (vt-dtype x))) all))
+        (when (and float-target (some int-family-p all))
           (setf all (mapcar (lambda (x)
-                              (if (vt-int-dtype-p (vt-dtype x))
+                              (if (funcall int-family-p x)
                                   (vt-astype x float-target)
                                   x))
                             all)))
@@ -146,25 +152,68 @@
       :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。"
   (vt-fast-map #'* a b :dtype dtype :out out))
 
+(defun %floor-div-op (x y)
+  "floor_divide 的单元素语义（对标 numpy.floor_divide）。
+   v0.4.x 修复：原实现浮点分支误用真除 (/ x y)，未做 floor（0.864/0.15
+   返回 5.76 而非 5.0）。现统一 floor 语义，并按 IEEE 补齐非有限值处理：
+   NaN 传播；±Inf/有限 → ±Inf；有限/±Inf → ±0.0；有限/±0.0 → 与商
+   同号的 ±Inf；±0.0/±0.0 → NaN（均与 numpy 一致）。"
+  (cond ((and (integerp x) (integerp y) (zerop y)) 0)
+        ((and (integerp x) (integerp y)) (floor x y))
+        ((and (floatp x) (%nan-p x)) x)
+        ((and (floatp y) (%nan-p y)) y)
+        ((and (floatp x) (%inf-p x)) x)
+        ((and (floatp y) (%inf-p y)) (nth-value 0 (floor x y)))
+        ((and (numberp y) (zerop y))
+         (if (zerop x) +vt-dfloat-nan+
+             (if (or (and (plusp x) (plusp y))
+                     (and (minusp x) (minusp y)))
+                 (vt-get-pos-inf :float64)
+                 (- (vt-get-pos-inf :float64)))))
+        (t (nth-value 0 (floor x y)))))
+
 (defun vt-div (a b &key dtype out)
-  "逐元素整除（二元特化入口）。整数输入按 floor 除法（对标 numpy.floor_divide）；
-      浮点输入按 IEEE 真除。
-      整数除数为 0 时返回 0（对标 numpy：floor_divide(int, 0) → 0，不报错）；
-      浮点除数为 0 时按 IEEE 得 ±Inf/NaN。
-      需要 numpy true_divide 语义（整型提升 float64）请用 vt-/。
-      v0.4.0 修复：整数除法原用 truncate（向零截断），负数商与
-      numpy.floor_divide 及 vt-divmod（floor 语义）不一致，改用 floor。"
-  (vt-map (lambda (x y)
-            (cond ((and (integerp x) (integerp y) (zerop y)) 0)
-                  ((and (integerp x) (integerp y)) (floor x y))
-                  (t (/ x y))))
+  "逐元素整除（二元特化入口），floor 除法（对标 numpy.floor_divide）。
+      整数输入 floor 除，除数为 0 时返回 0（对标 numpy：静默返回 0）；
+      浮点输入同样做 floor（v0.4.x 修复：原实现误用真除，未 floor），
+      除数 ±0.0 按 IEEE 得 ±Inf/NaN。
+      需要 numpy true_divide 语义（恒浮点、不 floor）请用 vt-/。"
+  (vt-map #'%floor-div-op
           (ensure-vt a) (ensure-vt b)
           :dtype dtype :out out))
 
+(defun %int-fit-p (dt n)
+  "整数 n 是否能被整型 dtype 精确容纳（弱标量语义判定用）。"
+  (case dt
+    (:int8   (<= -128 n 127))
+    (:uint8  (typep n '(unsigned-byte 8)))
+    (:int16  (<= -32768 n 32767))
+    (:uint16 (typep n '(unsigned-byte 16)))
+    (:int32  (typep n '(signed-byte 32)))
+    (:int64  (typep n '(signed-byte 64)))
+    (t nil)))
+
 (defun vt-scale (a b &key out dtype)
   "按标量缩放（等价 vt-* a b），NaN/Inf 按 IEEE 754 正常传播。
-      :dtype 决定结果 dtype，:out 契约同 vt-+。"
-  (vt-fast-map #'* a b :out out :dtype dtype))
+      标量遵循 numpy 2.x 弱标量（NEP 50）语义（v0.4.x 修复：
+      原实现 float32 数组×标量误升级为 float64、整型数组×标量误升级
+      为 int64 且不回绕）：
+        浮点数组 × 标量        → 保持数组 dtype（float32 不升级）；
+        整型数组 × 可容纳整数  → 保持整型 dtype（C 语义回绕，
+                                  uint8 249×3 → 235，与 numpy 一致）；
+        整型数组 × 浮点标量    → float64；
+        整数超出整型范围       → 退回自然提升（int64）。
+      B 亦可传入张量（此时按 vt-* 广播提升语义）。
+      :dtype 显式给出则完全以其为准；:out 契约同 vt-+。"
+  (if (and (null dtype) (numberp b))
+      (let ((dt (vt-dtype (ensure-vt a))))
+        (vt-fast-map #'* a b :dtype
+                     (cond ((member dt '(:float32 :float64)) dt)
+                           ((and (integerp b) (%int-fit-p dt b)) dt)
+                           ((floatp b) :float64)
+                           (t nil))
+                     :out out))
+      (vt-fast-map #'* a b :out out :dtype dtype)))
 
 (defun %infer-float-dtype (vt dtype)
   "推导逐元素数学函数的结果 dtype（对标 numpy「整型进 float64 出、
@@ -432,8 +481,13 @@ vt-fast-map #'expt 或对应的二元接口"))
 
 (defun vt-signum (vt &key out dtype)
   "逐元素符号函数（-1 / 0 / +1）。整数保持整数 dtype，
-      NaN 原样传播。:out 契约同 vt-+。"
-  (vt-map (lambda (x) (if (%nan-p x) x (signum x)))
+      NaN 原样传播。:out 契约同 vt-+。
+      v0.4.x 修复：signum(-0.0) 原 CL 语义返回 -0.0，现对浮点零
+      统一返回 +0.0（对标 numpy.sign：sign(-0.0)=0.0）。"
+  (vt-map (lambda (x)
+            (cond ((%nan-p x) x)
+                  ((and (floatp x) (zerop x)) 0.0d0)
+                  (t (signum x))))
           vt :out out :dtype dtype))
 
 (defun vt-positive-p (vt &key out (dtype :int8))
@@ -488,6 +542,52 @@ vt-fast-map #'expt 或对应的二元接口"))
   (declare (ignore x))
   +vt-dfloat-nan+)
 
+(defun %float-exact-rational (x)
+  "浮点的精确有理数值（integer-decode-float）。
+   注意不能用 rationalize：它取区间内最简分数而非精确值。"
+  (multiple-value-bind (sig exp sign) (integer-decode-float x)
+    (* sig (expt 2 exp) sign)))
+
+(defun %float-fmod-exact (x y)
+  "精确 fmod（IEEE 754：fmod 结果必然可被输入格式精确表示，coerce 无舍入）。
+   返回与 x 同号。仅用于 float32 语境（任一操作数为 single-float）；
+   float64 语境的 (mod double double) 误差 ≤ 1ulp，走容差路径。"
+  (let ((rx (%float-exact-rational x)) (ry (%float-exact-rational y)))
+    (multiple-value-bind (q r) (truncate rx ry)
+      (declare (ignore q))
+      (coerce r (if (or (typep x 'double-float) (typep y 'double-float))
+                    'double-float 'single-float)))))
+
+(defun %exact-float-mod (x y)
+  "浮点 mod（结果与除数同号，对标 numpy.remainder）。
+   v0.4.x 修复：实测 SBCL 的 (mod single single) 存在数十 ulp 舍入误差，
+   且 numpy 的 float32 remainder 并非精确 fmod——其算法为：
+     r = fmod(a, b)（精确）
+     若 r ≠ 0 且 sign(r) ≠ sign(b)：r = r + b（float32 算术，含一次舍入）
+     修正后若符号仍与 b 不符（加法进位所致）→ 0
+   本函数逐算法复刻该语义；float64 语境沿用 (mod double double)
+   （误差 ≤ 1ulp，通过容差比对）。混合整型操作数沿用 CL 语义。"
+  (if (and (floatp x) (floatp y)
+           (or (typep x 'single-float) (typep y 'single-float)))
+      (let ((r (%float-fmod-exact x y)))
+        (cond ((= r 0.0f0) r)
+              ((or (and (plusp r) (minusp y))
+                   (and (minusp r) (plusp y)))
+               (let ((r2 (+ r y)))
+                 (if (or (and (plusp r2) (minusp y))
+                         (and (minusp r2) (plusp y)))
+                     0.0f0
+                     r2)))
+              (t r)))
+      (mod x y)))
+
+(defun %exact-float-rem (x y)
+  "浮点 rem（结果与被除数同号，对标 numpy.fmod = C fmodf，精确）。"
+  (if (and (floatp x) (floatp y)
+           (or (typep x 'single-float) (typep y 'single-float)))
+      (%float-fmod-exact x y)
+      (rem x y)))
+
 (defun vt-mod (vt divisor &key out dtype)
   "逐元素取模。DIVISOR 可为标量或张量（自动广播）。
    语义对标 numpy.remainder：结果与除数同号；
@@ -503,14 +603,14 @@ vt-fast-map #'expt 或对应的二元接口"))
                       ((%mod-nan-or-inf-p divisor) (%mod-float-nan x))
                       ((and (numberp divisor) (zerop divisor)) (zero-div x))
                       ((and (floatp divisor) (%inf-p divisor)) x)
-                      (t (mod x divisor))))
+                      (t (%exact-float-mod x divisor))))
               vt :out out :dtype dtype)
       (vt-map (lambda (x y)
                 (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
                       ((%mod-nan-or-inf-p y) (%mod-float-nan x))
                       ((zerop y) (zero-div x))
                       ((and (floatp y) (%inf-p y)) x)
-                      (t (mod x y))))
+                      (t (%exact-float-mod x y))))
               vt divisor :out out :dtype dtype))))
 
 (defun vt-rem (vt divisor &key out dtype)
@@ -529,14 +629,14 @@ vt-fast-map #'expt 或对应的二元接口"))
                       ((%mod-nan-or-inf-p divisor) (%mod-float-nan x))
                       ((zerop divisor) (zero-div x))
                       ((and (floatp divisor) (%inf-p divisor)) x)
-                      (t (rem x divisor))))
+                      (t (%exact-float-rem x divisor))))
               vt :out out :dtype dtype)
       (vt-map (lambda (x y)
                 (cond ((%mod-nan-or-inf-p x) (%mod-float-nan x))
                       ((%mod-nan-or-inf-p y) (%mod-float-nan x))
                       ((zerop y) (zero-div x))
                       ((and (floatp y) (%inf-p y)) x)
-                      (t (rem x y))))
+                      (t (%exact-float-rem x y))))
               vt divisor :out out :dtype dtype))))
 
 (defun vt-atan2 (vty vtx &key out dtype)
@@ -801,12 +901,17 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 
 (defun vt-cbrt (vt &key out dtype)
   "逐元素立方根。定义为 signum(x)*|x|^(1/3)，因此负数返回实数值
-      （对标 numpy.cbrt，不返回 NaN）。整数输入输出 float64。"
+      （对标 numpy.cbrt，不返回 NaN）。整数输入输出 float64。
+      v0.4.x 修复：cbrt(NaN) 原经 (expt NaN 1/3) 泄漏复数 NaN 导致
+      类型错误，现显式拦截：NaN → NaN、±Inf → ±Inf（numpy 对齐）。"
   (let* ((dt (%infer-float-dtype vt dtype))
          (third (if (eq dt :float32)
                     (/ 3.0s0)
                     (/ 3.0d0))))
-    (vt-map (lambda (x) (* (signum x) (expt (abs x) third)))
+    (vt-map (lambda (x)
+              (cond ((%nan-p x) x)
+                    ((%inf-p x) x)
+                    (t (* (signum x) (expt (abs x) third)))))
             vt :out out :dtype dt)))
 
 (defun vt-hypot (t1 t2 &key out dtype)
