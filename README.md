@@ -597,7 +597,7 @@ vt-isin             ;; 元素是否在给定集合中 (对标 numpy.isin)
 (run-all-tests)
 ```
 
-自动化测试（28 个测试套件，共 2200+ 用例）:
+自动化测试（32 个测试套件，共 2200+ 用例）:
 ```bash
 # 运行所有测试
 bash test/run-tests.sh
@@ -613,7 +613,7 @@ bash test/run-tests.sh --suite numpy-compare-test
 bash test/run-tests.sh --list
 ```
 
-主要测试套件：
+主要测试套件：(具体请看 test 文件)
 
 | 套件 | 用例数 | 内容 |
 |------|-------:|------|
