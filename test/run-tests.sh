@@ -57,6 +57,8 @@ SUITES[uncovered-coverage-test]="136 覆盖缺口测试 (此前无任何测试/e
 SUITES[extensions3-test]="261 补充 NumPy 缺失函数测试 + 审查修复回归 (extensions3 + 审查报告 P0/P1/P2 + R-3 整数提升回归)"
 SUITES[fastmap-invariant-test]="24 数学函数快路径不变量测试 (宏展开结构 + 计时上界, 防 vt-fast-map→vt-map 性能回归)"
 SUITES[test-all]="641 绝大多数函数的测试"
+SUITES[core-test]="282 基础契约回归 (1 结构/199 函数语义/返回值形状/错误契约, 参照 CONVENTIONS)"
+SUITES[differential-probes-test]="496 差分探针 vs numpy (期望内嵌逐项判定, 覆盖算术/超越/归约/索引/操纵/随机/错误路径)"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -176,6 +178,13 @@ run_suite() {
     if [[ "$fail_count" == "?" ]]; then
         fail_count=$(echo "$output" | grep -oP '失败[：:]?\s*\K[0-9]+' | tail -1 || echo "?")
     fi
+    # 格式 4：PASS=N / FAIL=M（core-test 测试汇总 / differential-probes-test 差分探针汇总）
+    if [[ "$pass" == "?" ]]; then
+        pass=$(echo "$output" | grep -oP 'PASS=\K[0-9]+' | tail -1 || echo "?")
+    fi
+    if [[ "$fail_count" == "?" ]]; then
+        fail_count=$(echo "$output" | grep -oP 'FAIL=\K[0-9]+' | tail -1 || echo "?")
+    fi
     # 由 pass/fail 反推 total
     if [[ "$total" == "?" && "$pass" != "?" && "$fail_count" != "?" ]]; then
         total=$((pass + fail_count))
@@ -271,6 +280,7 @@ main() {
     else
         # 按顺序运行所有测试
         suites_to_run=(
+            core-test
             run_all_tests
             run_param_tests
             nested-test
@@ -291,9 +301,9 @@ main() {
             test-ai-edge-cases
             memsafety-tests
             out-contig-tests
-	    shape-degenerate-tests
-	    property-strided-tests
-	    error-contract-tests
+            shape-degenerate-tests
+            property-strided-tests
+            error-contract-tests
             refactor-bugfix-tests
             numpy-convention-tests
             out-contract-v2-test
@@ -301,7 +311,8 @@ main() {
             uncovered-coverage-test
             extensions3-test
             fastmap-invariant-test
-	    test-all
+            differential-probes-test
+            test-all
         )
         if [[ "$skip_benchmark" == false ]]; then
             suites_to_run+=(benchmark-copy)

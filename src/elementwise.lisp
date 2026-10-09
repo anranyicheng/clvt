@@ -582,16 +582,22 @@ lambda 算子请使用 %%float-map-fn"))
 
 (defun vt-even-p (vt &key out (dtype :int8))
   "逐元素偶数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN/±Inf 视为非偶数 → 0（对标 numpy）。:out 契约同 vt-=。"
+      NaN/±Inf 视为非偶数 → 0；非整数值视为非偶数 → 0
+      （对标模拟基准 v%2==0）。:out 契约同 vt-=。"
   (vt-map (lambda (v)
-            (if (or (%nan-p v) (%inf-p v)) 0 (if (evenp (floor v)) 1 0)))
+            (cond ((or (%nan-p v) (%inf-p v)) 0)
+                  ((and (floatp v) (/= v (floor v))) 0)
+                  (t (if (evenp (floor v)) 1 0))))
           vt :out out :dtype dtype))
 
 (defun vt-odd-p (vt &key out (dtype :int8))
   "逐元素奇数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN/±Inf 视为非奇数 → 0（对标 numpy）。:out 契约同 vt-=。"
+      NaN/±Inf 视为非奇数 → 0；非整数值视为非奇数 → 0
+      （对标模拟基准 v%2==1）。:out 契约同 vt-=。"
   (vt-map (lambda (v)
-            (if (or (%nan-p v) (%inf-p v)) 0 (if (oddp (floor v)) 1 0)))
+            (cond ((or (%nan-p v) (%inf-p v)) 0)
+                  ((and (floatp v) (/= v (floor v))) 0)
+                  (t (if (oddp (floor v)) 1 0))))
           vt :out out :dtype dtype))
 
 (defun %mod-nan-or-inf-p (x)
@@ -710,10 +716,17 @@ lambda 算子请使用 %%float-map-fn"))
 ;; floor(±inf)=±inf）。SBCL 对非有限值直接调用 floor/round 会 signal
 ;; FLOATING-POINT-INVALID-OPERATION（trap 屏蔽也无法避免），必须显式拦截。
 (defmacro %floor-family-body (x op)
+  ;; 对标 numpy：结果为 ±0 时符号跟随输入（floor/trunc(-0.5)=-0.0，
+  ;; ceil(-0.5)=-0.0）；CL floor 族对 (-0.5,0) 区间返回泛化整数 0（恒 +0），
+  ;; 需显式恢复负零符号。
   `(if (and (floatp ,x) (%nan-or-inf-p ,x))
        ,x
        (let ((res (nth-value 0 (,op ,x divisor))))
-         (if (floatp ,x) (float res ,x) res))))
+         (if (floatp ,x)
+             (if (and (zerop res) (minusp (float-sign ,x)))
+                 (- (float 0.0 ,x))
+                 (float res ,x))
+             res))))
 
 (defun vt-floor (vt &key (divisor 1) out dtype)
   "逐元素向下取整（可除 DIVISOR）。
@@ -749,8 +762,12 @@ lambda 算子请使用 %%float-map-fn"))
   (vt-map (lambda (x)
             (if (and (floatp x) (%nan-or-inf-p x))
                 x
-            (let ((res (nth-value 0 (round x))))
-                  (if (floatp x) (float res x) res))))
+                (let ((res (nth-value 0 (round x))))
+                  (if (floatp x)
+                      (if (and (zerop res) (minusp (float-sign x)))
+                          (- (float 0.0 x))
+                          (float res x))
+                      res))))
           vt :out out :dtype dtype))
 
 (declaim (inline %op-eq %op-ne %op-lt %op-le %op-gt %op-ge))
