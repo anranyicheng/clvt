@@ -59,6 +59,7 @@ SUITES[fastmap-invariant-test]="24 数学函数快路径不变量测试 (宏展�
 SUITES[test-all]="641 绝大多数函数的测试"
 SUITES[core-test]="282 基础契约回归 (1 结构/199 函数语义/返回值形状/错误契约, 参照 CONVENTIONS)"
 SUITES[differential-probes-test]="496 差分探针 vs numpy (期望内嵌逐项判定, 覆盖算术/超越/归约/索引/操纵/随机/错误路径)"
+SUITES[differential-probes-test2]="405 第2阶段差分探针 vs numpy (导出符号 #200-#377: NaN统计/linalg分解/NN/随机/契约, 期望内嵌逐项判定)"
 # 排除列表 (默认跳过)
 SKIP_BY_DEFAULT="benchmark-copy"
 
@@ -312,6 +313,7 @@ main() {
             extensions3-test
             fastmap-invariant-test
             differential-probes-test
+            differential-probes-test2
             test-all
         )
         if [[ "$skip_benchmark" == false ]]; then

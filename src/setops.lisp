@@ -115,8 +115,10 @@
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
 (defun vt-in1d (t1 t2)
-  "逐元素判定是否属于 TEST（对标 numpy.in1d）。返回与元素形状相同的布尔张量。"
+  "逐元素判定是否属于 TEST（对标 numpy.in1d）。返回与元素形状相同的布尔张量。
+   dtype 为 :int8（F4：比较/逻辑结果一律 :int8）。
+   v0.4.1 修复（差分测试 R7）：此前返回 :float64。"
   (let ((t2-set (coerce (vt-data (vt-unique t2)) 'list)))
     (vt-map (lambda (x)
-              (if (member x t2-set :test #'vt-float-nan-inf-=) 1.0d0 0.0d0))
-            t1 :dtype :float64)))
+              (if (member x t2-set :test #'vt-float-nan-inf-=) 1 0))
+            t1 :dtype :int8)))

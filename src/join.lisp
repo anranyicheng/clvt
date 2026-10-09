@@ -115,14 +115,16 @@
                        (loop for i below (vt-size flat)
                              collect (truncate (aref (vt-data flat) i)))))
                     ((integerp obj)
-                     ;; 重复次数：flat 模式 = values 展平后元素数；
-                     ;; axis 模式 = values 沿插入轴的大小（numpy 语义，
-                     ;; 修复：原先用总元素数，导致 axis 插入 (1,2) 块被误广播）
+                     ;; v0.4.2 修复（numpy 对齐，example.lisp 回归发现）：
+                     ;; flat 模式重复索引次数 = values 元素数（与 numpy
+                     ;; 单块结果等价）；axis 模式保持**单索引** —— numpy
+                     ;; scalar-obj 语义是对 values 做 moveaxis(0→axis) 后
+                     ;; **单块**插入（np.insert(a,1,[[99,100]],axis=1) =>
+                     ;; [[1,99,2],[3,100,4]]），原先广播为
+                     ;; values.shape[axis] 次插入会在 (1,2) 块上试图
+                     ;; reshape (1,2)→(2,2) 而报错。
                      (let ((n (if axis
-                                  (let ((vs (vt-shape values-vt)))
-                                    (if vs
-                                        (nth (vt-normalize-axis axis (length vs)) vs)
-                                        1))
+                                  1
                                   (vt-size (vt-flatten values-vt)))))
                        (if (> n 1)
                            (make-list n :initial-element obj)
@@ -177,14 +179,39 @@
 	       (ax-size (nth ax shape))
 	       (obj-list (if (listp obj) obj (list obj)))
 	       (num (length obj-list))
+	       (values-nd (vt-shape values-vt))
+	       ;; v0.4.2（numpy 对齐）：单索引块插入时 numnew 取自
+	       ;; ndmin(values) 第 0 轴（numpy: moveaxis(values,0,axis)
+	       ;; 后取 values.shape[axis]）；moveaxis 是零拷贝视图，
+	       ;; 故块 = values 数据的线性重排（vt-reshape）即可等价。
+	       ;; 标量 values 广播填满；多索引路径要求 values.shape[axis]=num。
+	       (adj-shape (if (and values-nd (= num 1) (< (length values-nd) rank))
+			      (append (make-list (- rank (length values-nd))
+						 :initial-element 1)
+				      values-nd)
+			      values-nd))
+	       (numnew (cond ((null values-nd) 1)
+                             ((= num 1) (first adj-shape))
+                             (t num)))
 	       (target-shape
 		 (loop for i below rank
-		       collect (if (= i ax) num (nth i shape))))
+		       collect (if (= i ax) numnew (nth i shape))))
 	       (values-vt
-		 (if (null (vt-shape values-vt))
-		     (vt-full target-shape (vt-ref values-vt) :dtype (vt-dtype values-vt))
-		     values-vt))
-	       (values-reshaped (vt-reshape values-vt target-shape))
+		 (cond ((null values-nd)
+			(vt-full target-shape (vt-ref values-vt) :dtype (vt-dtype values-vt)))
+		       ((and (= num 1) (< (length values-nd) rank))
+			;; ndmin 前置补 1 轴（numpy ndmin=arr.ndim）
+			(vt-reshape values-vt adj-shape))
+		       (t values-vt)))
+	       (values-reshaped
+		 (if (and (= num 1) values-nd)
+		     (cond ((= (vt-size values-vt) (reduce #'* target-shape))
+			    (vt-reshape values-vt target-shape))
+			   ((= (vt-size values-vt) 1)
+			    (vt-full target-shape (vt-item values-vt) :dtype (vt-dtype values-vt)))
+			   (t (error "vt-insert: values 形状 ~a 无法与插入块形状 ~a 匹配（元素数不一致且不可广播）"
+				     values-nd target-shape)))
+		     (vt-reshape values-vt target-shape)))
 	       (arr-slices
 		 (loop for i from 0 below ax-size
 		       collect (vt-narrow arr-vt ax i (1+ i))))

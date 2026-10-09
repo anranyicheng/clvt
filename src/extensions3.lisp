@@ -579,15 +579,21 @@
           (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
           :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
+(defun %e3-sign-bit-p (x)
+  "IEEE 754 符号位判定（含 -0.0 与 NaN 的符号位）。
+   minusp/float-sign 均无法区分 ±0.0，这里直接读 double-float 位模式。"
+  (declare (double-float x))
+  (logbitp 63 (logand #xFFFFFFFFFFFFFFFF (sb-kernel:double-float-bits x))))
+
 (defun vt-copysign (x y &key out dtype)
   "逐元素赋予 X 的绝对值与 Y 的符号（对标 numpy.copysign）。
    结果恒为浮点；NaN 符号位处理与 numpy 一致（copysign(1, nan) → 1）。
    :out 契约同 vt-abs（支持广播）。"
   (vt-map (lambda (a b)
+            ;; v0.4.1 修复（差分测试 R4）：符号取自 y 的 IEEE 符号位，
+            ;; minusp 无法识别 -0.0（copysign(1,-0.0) 应为 -1.0）。
             (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
-              (if (or (minusp bf) (and (floatp bf) (%nan-p bf) nil))
-                  (- (abs af))
-                  (abs af))))
+              (if (%e3-sign-bit-p bf) (- (abs af)) (abs af))))
           (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
           :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
@@ -595,9 +601,9 @@
   "逐元素符号位判定，返回 1/0，dtype 为 :int8（对标 numpy.signbit）。
    x < 0 或为负零（-0.0）→ 1，否则 0。:out 契约同 vt-=（dtype :int8）。"
   (vt-map (lambda (x)
-            (let ((xf (coerce x 'double-float)))
-              ;; float-sign 保留 -0.0 的符号位（返回 -1.0），故可直接用于符号判定
-              (if (minusp (float-sign xf)) 1 0)))
+            ;; v0.4.1 修复（差分测试 R5）：按 IEEE 符号位判定；正 NaN 符号位
+            ;; 为 0（numpy.signbit(+nan)=0），负 NaN/-0.0/负数为 1。
+            (if (%e3-sign-bit-p (coerce x 'double-float)) 1 0))
           (ensure-vt tensor :dtype :float64) :out out :dtype :int8))
 
 (defun %e3-nextafter (a b)
@@ -1086,23 +1092,31 @@
                (vt-get-pos-inf :float64)
                (/ (coerce smax 'double-float) (coerce smin 'double-float))))))
       ((eql p 1)
-       (let ((n (first (vt-shape matrix))))
-         (let ((maxcol 0.0d0) (mincol nil))
-           (dotimes (j n)
-             (let ((acc 0.0d0))
-               (dotimes (i n) (incf acc (abs (vt-ref matrix i j))))
-               (setf maxcol (max maxcol acc))
-               (setf mincol (if mincol (min mincol acc) acc))))
-           (if (zerop mincol) (vt-get-pos-inf :float64) (/ maxcol mincol)))))
+       ;; v0.4.1 修复（差分测试 R6）：cond_1 = ||A||_1 · ||A^-1||_1，
+       ;; 此前误用 A 自身列和的 max/min 比值，与 numpy 不一致。
+       ;; 奇异矩阵 vt-inv 报错，对标 numpy 的 LinAlgError。
+       (flet ((%norm-1 (m)
+                (let* ((sh (vt-shape m)) (rows (first sh)) (cols (second sh))
+                       (best 0.0d0))
+                  (dotimes (j cols)
+                    (let ((acc 0.0d0))
+                      (dotimes (i rows) (incf acc (abs (vt-ref m i j))))
+                      (setf best (max best acc))))
+                  best)))
+         (let ((ainv (vt-inv matrix)))
+           (* (%norm-1 matrix) (%norm-1 ainv)))))
       ((or (eql p :inf) (eql p :infinity))
-       (let ((n (first (vt-shape matrix))))
-         (let ((maxrow 0.0d0) (minrow nil))
-           (dotimes (i n)
-             (let ((acc 0.0d0))
-               (dotimes (j n) (incf acc (abs (vt-ref matrix i j))))
-               (setf maxrow (max maxrow acc))
-               (setf minrow (if minrow (min minrow acc) acc))))
-           (if (zerop minrow) (vt-get-pos-inf :float64) (/ maxrow minrow)))))
+       ;; cond_inf = ||A||_inf · ||A^-1||_inf（行绝对和之最大）
+       (flet ((%norm-inf (m)
+                (let* ((sh (vt-shape m)) (rows (first sh)) (cols (second sh))
+                       (best 0.0d0))
+                  (dotimes (i rows)
+                    (let ((acc 0.0d0))
+                      (dotimes (j cols) (incf acc (abs (vt-ref m i j))))
+                      (setf best (max best acc))))
+                  best)))
+         (let ((ainv (vt-inv matrix)))
+           (* (%norm-inf matrix) (%norm-inf ainv)))))
       (t (error "vt-cond: 不支持的 p 值 ~a（支持 nil/2/1/:inf）" p)))))
 
 (defun vt-multi-dot (arrays)

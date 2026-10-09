@@ -199,6 +199,9 @@
               (setf final-output-subs
 		    (append (sort ellipsis-subs #'>)
 			    (sort normal-subs #'<)))))
+          ;; 注：显式模式下「只出现在输入、不在输出」的下标（如
+          ;; ij,kl->ij 的 k/l）numpy 会对该操作数对应轴求和而非报错，
+          ;; 本实现语义一致，无需校验。
           (let* ((sum-labels
 		   (set-difference all-labels-list final-output-subs))
                  (all-labels
@@ -1129,7 +1132,14 @@
                                     :dtype effective-dtype :out out)))
             (vt-sqrt sum-res :dtype (vt-dtype sum-res) :out sum-res))
           (let ((sum-res (vt-sum sq :dtype effective-dtype :out out)))
-            (vt-sqrt sum-res :dtype (vt-dtype sum-res) :out sum-res))))))
+            (vt-sqrt sum-res :dtype (vt-dtype sum-res) :out sum-res)
+            ;; v0.4.1（差分测试 R10）：keepdims 且无 axis 时对标
+            ;; np.linalg.norm(x, keepdims=True) —— 全部维度收缩为 1
+            ;; （1d → (1,)，2d → (1,1)），而非 0 维。
+            (if (and keepdims (vt-shape vt))
+                (vt-reshape sum-res (make-list (length (vt-shape vt))
+                                               :initial-element 1))
+                sum-res))))))
 
 (defun vt-l1-norm (vt &key axis keepdims dtype out)
   "l1 范数"
@@ -1564,7 +1574,7 @@
             u-full)))))
 
 
-(defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50) (tol 1e-10))
+(defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50) (tol 1e-14))
   "奇异值分解 a = u s v^t。
   full-matrices : t 则返回完整尺寸 u(m×m), s(k), vt(n×n) (k = min(m,n))
                   : nil 返回经济尺寸 u(m×k), s(k), vt(k×n)
@@ -1825,7 +1835,14 @@
             (let ((sc (vt-ref s-pinv j)))
               (loop for i fixnum from 0 below n do
                 (setf (vt-ref v-scaled i j) (* (vt-ref vt-mat j i) sc)))))
-          (vt-@ v-scaled (vt-transpose u)))))))
+          ;; v0.4.1（差分测试 R12）：Newton–Schulz 迭代精化
+          ;; X ← X(2I − AX)，把 SVD 初始估计 ~1e-11 级的误差二次收敛到
+          ;; 机器精度（对标 LAPACK 的 pinv 精度）。
+          (let* ((x (vt-@ v-scaled (vt-transpose u)))
+                 (m (first (vt-shape matrix)))
+                 (eye2 (vt-* (vt-eye m :dtype :float64) 2.0d0)))
+            (dotimes (_ 2 x)
+              (setf x (vt-@ x (vt-- eye2 (vt-matmul matrix x)))))))))))
 
 ;;; ============================================================
 ;;; 4. 最小二乘

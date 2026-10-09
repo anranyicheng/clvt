@@ -101,9 +101,14 @@
 
 (defun vt-relu (vt &key dtype out)
   "ReLU 激活。连续 float 张量走特化快路径（消除 funcall 开销）。
-  dtype 语义同 vt-sigmoid（§4.2 H3「严格相等」）。"
+  v0.4.1（差分测试 R8）：整数输入保持整数 dtype（对标 numpy.maximum
+  与 torch.relu）；浮点输入保持自身精度；显式 :dtype 仍生效。"
   (with-float-safe
-    (let* ((dt (or dtype (if (eq (vt-dtype vt) :float32) :float32 :float64)))
+    (let* ((in-dt (vt-dtype vt))
+           (dt (or dtype
+                   (if (member in-dt '(:int8 :int16 :int32 :int64 :uint8 :uint16))
+                       in-dt
+                       (if (eq in-dt :float32) :float32 :float64))))
            (a (ensure-vt vt))
            (res (if out
                     (vt-check-out out (vt-shape a) dt :op-name "vt-relu")

@@ -1246,17 +1246,7 @@
              (out-strides (vt-strides result))
              (out-data (vt-data result)))
         (labels ((recurse (depth in-ptr out-ptr)
-                   (cond ((= depth ax)
-                          (let* ((in-stride (nth ax in-strides))
-                                 (out-stride (nth ax out-strides))
-                                 (vals (loop for i from 0 below ax-dim
-                                             for off = (+ in-ptr (* i in-stride))
-                                             collect (aref in-data off)))
-                                 (sv (vt-numpy-sort vals #'<)))
-                            (loop for val in sv
-                                  for off = out-ptr then (+ off out-stride)
-                                  do (setf (aref out-data off) val))))
-                         ((< depth rank)
+                   (cond ((< depth ax)
                           (let ((dim (nth depth shape))
                                 (in-stride (nth depth in-strides))
                                 (out-stride (nth depth out-strides)))
@@ -1264,6 +1254,35 @@
                               (recurse (1+ depth)
                                        (+ in-ptr (* i in-stride))
                                        (+ out-ptr (* i out-stride))))))
+                         ((= depth ax)
+                          ;; v0.4.1 修复（差分测试 R2 根因）：此前 depth=ax
+                          ;; 时只排序「第一个」尾部位置的切片，从未遍历 axis
+                          ;; 之后的维度，导致非末轴排序静默失效
+                          ;;（vt-sort :axis 0 返回原矩阵）。镜像 vt-argsort
+                          ;; 的结构，遍历尾部维度并对每个切片排序。
+                          (let* ((in-stride (nth ax in-strides))
+                                 (out-stride (nth ax out-strides))
+                                 (tail-dims (subseq shape (1+ ax)))
+                                 (tail-size (reduce #'* tail-dims :initial-value 1))
+                                 (tail-in-strides (subseq in-strides (1+ ax)))
+                                 (tail-out-strides (subseq out-strides (1+ ax))))
+                            (dotimes (tail-i tail-size)
+                              (let ((extra-in 0) (extra-out 0) (rem tail-i))
+                                (loop for idx from (1- (length tail-dims)) downto 0
+                                      for dim = (nth idx tail-dims)
+                                      for is = (nth idx tail-in-strides)
+                                      for os = (nth idx tail-out-strides)
+                                      do (multiple-value-bind (q r) (floor rem dim)
+                                           (incf extra-in (* r is))
+                                           (incf extra-out (* r os))
+                                           (setf rem q)))
+                                (let* ((vals (loop for i from 0 below ax-dim
+                                                   for off = (+ in-ptr extra-in (* i in-stride))
+                                                   collect (aref in-data off)))
+                                       (sv (vt-numpy-sort vals #'<)))
+                                  (loop for val in sv
+                                        for off = (+ out-ptr extra-out) then (+ off out-stride)
+                                        do (setf (aref out-data off) val)))))))
                          (t nil))))
           (recurse 0 in-offset 0))
         result)
@@ -1649,8 +1668,11 @@
         (loop for i from 0 below x-size
               for xi = (aref x-data i) do
                 (setf (aref out-data i)
-                      (cond ((<= xi xp0) left-val)
-                            ((>= xi xp-end) right-val)
+                      ;; v0.4.1 修复（差分测试 R3）：numpy 的 left/right 仅在
+                      ;; 严格越界时生效；x==xp[0] 应取 fp[0]（插值分支给出
+                      ;; 精确 fp0），而非 left。
+                      (cond ((< xi xp0) left-val)
+                            ((> xi xp-end) right-val)
                             (t (let ((lo 0) (hi (- n 2)))
                                  (loop while (< lo hi) do
                                    (let ((mid (ash (+ lo hi 1) -1)))

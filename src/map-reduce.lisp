@@ -671,7 +671,16 @@
         ;; ================================================================
         (when (and global (not keepdims) (not return-arg)
                    (numberp init-val)
-                   (vt-contiguous-p tensor))
+                   (vt-contiguous-p tensor)
+                   ;; v0.4.1 修复（差分测试 R1）：自定义 reducer-fn 必须走
+                   ;; 通用路径 —— 此前快路径 1 按 init-val 分派内建
+                   ;; sum/max/min，任意 fn 的全局归约都被静默替换为求和。
+                   ;; 仅当 fn 与内建语义严格对应时才允许快路径。
+                   (or (and (eq reducer-fn #'+) (zerop init-val))
+                       (and (eq reducer-fn #'max)
+                            (= init-val +vt-dfloat-neg-inf+))
+                       (and (eq reducer-fn #'min)
+                            (= init-val +vt-dfloat-pos-inf+))))
           (let* ((size (vt-size tensor))
                  (in-data (vt-data tensor))
                  (in-off (vt-offset tensor))

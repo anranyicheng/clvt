@@ -21,6 +21,11 @@
   "保护 *vt-default-random-state* 的锁。
    仅 %copy-default-rng 内部使用。")
 
+(defvar *vt-active-generator* nil
+  "with-generator 作用域内绑定的生成器。
+   作用域内 rng=nil 的抽样直接消费该生成器的状态（抽样推进它），
+   对标 NumPy「显式 Generator 的抽样消耗其流」的语义。")
+
 ;;; NumPy 的 SeedSequence 核心功能：从任意 seed 派生 N 个独立子序列。
 
 (defstruct (vt-seed-sequence (:constructor %make-vt-seed-sequence))
@@ -125,11 +130,14 @@
      ,@body))
 
 (defmacro with-generator ((gen) &body body)
-  "在 GENERATOR 指定的随机状态下执行 BODY。
+  "在 GENERATOR 的随机流上执行 BODY：作用域内 rng=nil 的抽样直接
+   消费 GENERATOR 的状态（流连续、生成器状态被推进），对标 NumPy。
    用法：
      (with-generator (my-gen)
        (vt-random-normal '(3)))"
-  `(let ((*vt-default-random-state* (%ensure-random-state ,gen)))
+  `(let* ((g ,gen)
+          (*vt-active-generator* g)
+          (*vt-default-random-state* (vt-generator-state g)))
      ,@body))
 
 (defun vt-make-random-state (&optional seed)
@@ -165,12 +173,18 @@
 
 (declaim (inline %copy-default-rng))
 (defun %copy-default-rng ()
-  "返回全局随机状态的快照，并推进全局状态一步。
-   保证连续调用返回不同序列（避免同 seed 下连续 vt-random-* 返回相同结果）。"
-  (sb-thread:with-mutex (*vt-random-state-lock*)
-    (let ((snapshot (make-random-state *vt-default-random-state*)))
-      (random 1.0d0 *vt-default-random-state*)
-      snapshot)))
+  "解析 rng=nil 时的活动随机状态。
+   with-generator 作用域内 → 直接返回生成器状态对象（抽样推进其流，
+   v0.4.1 修复差分测试 R11：此前每次抽样都从同一快照复制、且只推进
+   生成器一步，生成器自身永不前进）。
+   否则 → 返回全局状态的快照并推进全局状态一步，
+   保证连续调用返回不同序列。"
+  (if *vt-active-generator*
+      (vt-generator-state *vt-active-generator*)
+      (sb-thread:with-mutex (*vt-random-state-lock*)
+        (let ((snapshot (make-random-state *vt-default-random-state*)))
+          (random 1.0d0 *vt-default-random-state*)
+          snapshot))))
 
 
 (declaim (inline %uniform-rand %normal-rand))

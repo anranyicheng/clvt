@@ -314,8 +314,10 @@
 (check "matrix-power 1" '((1 2) (3 4)) (vt-matrix-power (mki '((1 2) (3 4))) 1))
 
 (check "cond 单位阵" 1d0 (vt-cond (vt-eye 3)))
-(check "cond 1-范数" 1.5d0 (vt-cond (mk '((1d0 2d0) (3d0 4d0))) :p 1))
-(check "cond inf 范数" 2.3333333333333335d0 (vt-cond (mk '((1d0 2d0) (3d0 4d0))) :p :inf))
+;; v0.4.1 cond 修复：p=1/:inf 现按 numpy 实现 ||A||·||A^-1||（21.0），
+;; 旧实现误用 A 自身列/行和的 max/min 比值（1.5 / 2.333…）
+(check "cond 1-范数" 21.0d0 (vt-cond (mk '((1d0 2d0) (3d0 4d0))) :p 1))
+(check "cond inf 范数" 21.0d0 (vt-cond (mk '((1d0 2d0) (3d0 4d0))) :p :inf))
 
 (check "multi-dot 形状" '(2 2)
        (vt-shape (vt-multi-dot (list (vt-ones '(2 3)) (vt-ones '(3 4)) (vt-ones '(4 2))))))
@@ -410,7 +412,10 @@
 
 (check "nancumsum 全 NaN" '(0d0 0d0) (vt-nancumsum (list *nan* *nan*)))
 (check "any-nan sign" (list *nan*) (vt-sign (list *nan*)))
-(check "copysign NaN 符号" '(1d0) (vt-copysign (list 1.0d0) (list *nan*)))
+;; v0.4.1 copysign 修复：按 IEEE 符号位处理；*nan* 由硬件生成
+;; （符号位为 1），numpy 对 0/0 生成的 NaN 同样符号位为 1，
+;; np.copysign(1, 0/0) => -1.0（常量 +NaN 才是 +1.0）
+(check "copysign NaN 符号" '(-1d0) (vt-copysign (list 1.0d0) (list *nan*)))
 (check "isposinf nan" '(0) (vt-isposinf (list *nan*)))
 (check "spacing nan" (list *nan*) (vt-spacing (list *nan*)))
 
@@ -431,13 +436,14 @@
 (format t "~%--- 审查修复回归 ---~%")
 
 ;; [P0-1] vt-relu 整数输入曾触发段错误（%relu-double 类型声明被违背）。
-;;       现要求整数输入正常提升为 float64，且数值与 numpy 一致。
+;;       v0.4.1 起整数输入保持整数 dtype（对标 numpy.maximum/torch.relu），
+;;       数值仍与 numpy 一致（负数截断为 0，不再提升 float64）。
 (check "P0-1 relu int64"  '(1d0 2d0 3d0 4d0)
        (vt-relu (vt-asarray '(1 2 3 4) :dtype :int64)))
 (check "P0-1 relu int64 负数截断" '(0d0 0d0 3d0)
        (vt-relu (vt-asarray '(-1 -2 3) :dtype :int64)))
 (check-true "P0-1 relu int64 dtype"
-            (eq :float64 (vt-dtype (vt-relu (vt-asarray '(1 2 3) :dtype :int64)))))
+            (eq :int64 (vt-dtype (vt-relu (vt-asarray '(1 2 3) :dtype :int64)))))
 (check "P0-1 relu int32 2d" '((1d0 0d0) (0d0 4d0))
        (vt-relu (vt-from-array #2A((1 -2)(-3 4)) :dtype :int32)))
 (check "P0-1 relu float32 保持" '(1.0 2.0 0.0)
