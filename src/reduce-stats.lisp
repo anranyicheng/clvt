@@ -1118,7 +1118,8 @@
                      (fs (vt-size fiber)))
                 (setf (aref (vt-data result) ptr)
                       (if (zerop fs)
-                          (vt-get-nan :float64)
+                          ;; v0.4.x：归约区为空 → numpy ValueError 语义
+                          (error "vt-percentile: zero-size array to reduction operation percentile which has no identity（numpy 语义）")
                           (let ((raw (loop for i below fs collect (vt-ref fiber i))))
                             (if (some #'%nan-p raw)
                                 (vt-get-nan :float64)
@@ -1134,7 +1135,10 @@
                                 (make-list rank :initial-element 1)
                                 nil)))
             (if (zerop size)
-                (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
+                ;; v0.4.x：numpy 对空数组 percentile 抛 ValueError
+                ;; （zero-size array to reduction operation percentile
+                ;;   which has no identity），不再返回 NaN。
+                (error "vt-percentile: zero-size array to reduction operation percentile which has no identity（numpy 语义）")
                 (let ((raw (loop for i below size collect (aref (vt-data flat) i))))
                   (if (some #'%nan-p raw)
                       (make-vt out-shape (vt-get-nan :float64) :dtype :float64)

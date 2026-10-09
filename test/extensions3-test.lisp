@@ -500,16 +500,27 @@
 (check "P2-3 cov 1d 缺省" 1d0 (vt-cov (mk '(1d0 2d0 3d0))))
 
 ;; [P2#6] vt-pow：整数基 + 正整数指数应保持整数 dtype（对标 numpy）；
-;;        非整数指数 → float64；传张量指数须明确报错（曾静默返回 NaN）。
+;;        非整数指数 → float64。v0.4.x 契约变更：张量指数不再报错，
+;;        改为对标 numpy.power 的逐元素语义（C99 pow 特例表，根治了
+;;        曾静默返回 NaN 的问题）；形状不可广播时仍报错。
 (check "P2-6 pow int**2" '(4 9) (vt-pow (vt-asarray '(2 3) :dtype :int64) 2))
 (check-true "P2-6 pow int**2 dtype int64"
             (eq :int64 (vt-dtype (vt-pow (vt-asarray '(2 3) :dtype :int64) 2))))
 (check "P2-6 pow int**0.5" '(2d0 3d0) (vt-pow (vt-asarray '(4 9) :dtype :int64) 0.5d0))
 (check-true "P2-6 pow int**0.5 dtype float64"
             (eq :float64 (vt-dtype (vt-pow (vt-asarray '(4 9) :dtype :int64) 0.5d0))))
-(check-error "P2-6 pow 张量指数报错"
-             (lambda () (vt-pow (vt-asarray '(2 3) :dtype :int64)
-                                (vt-asarray '(2 2) :dtype :int64))))
+(check "P2-6 pow 张量指数逐元素" '(8 27)
+       (vt-pow (vt-asarray '(2 3) :dtype :int64) (vt-asarray '(3 3) :dtype :int64)))
+(check-true "P2-6 pow 张量指数 dtype int64"
+            (eq :int64 (vt-dtype (vt-pow (vt-asarray '(2 3) :dtype :int64)
+                                         (vt-asarray '(3 3) :dtype :int64)))))
+;; vt-asarray 首参是数据：((1 2 3)(2 2 2))→(2,3) 与指数 (2,3) 同形逐元素幂
+(check "P2-6 pow 张量指数同形" '((1 8 27) (16 16 16))
+       (vt-pow (vt-asarray '((1 2 3) (2 2 2)) :dtype :int64)
+               (vt-asarray '((3 3 3) (4 4 4)) :dtype :int64)))
+(check-error "P2-6 pow 形状不可广播报错"
+             (lambda () (vt-pow (vt-asarray '((1 2 3) (4 5 6)) :dtype :int64)
+                                (vt-asarray '((1 2 3) (4 5 6) (7 8 9)) :dtype :int64))))
 
 ;; [P2#2] vt-logical-* 曾默认返回 :float64，违反 §3.1「比较/逻辑返回 :int8」。
 (check-true "P2-2 logical-and dtype int8"

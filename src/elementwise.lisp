@@ -383,38 +383,100 @@ lambda 算子请使用 %%float-map-fn"))
   (%float-map #'exp vt out (%infer-float-dtype vt dtype)))
 
 
-(defun vt-pow (vt power &key out dtype)
-  "逐元素幂 VT**POWER。POWER 为**标量**指数（整数或浮点）。
-      整数 + 正指数走精确整数幂，结果保持整数 dtype（对标 numpy：
-      int**正int → int；int**负int/非整数 → float64）。
-      其余（负指数/非整数/浮点）走浮点幂并对非实数结果返回 NaN
-      （对标 numpy.power）。:out 契约同 vt-+。
-      注：POWER 必须是标量；传入张量会报错（numpy 的 elementwise
-      power 需用 vt-* 系列，本库 vt-pow 不承担二元张量语义）。"
-  (when (vt-p power)
-    (error "vt-pow: POWER 必须为标量指数，得到一个张量；逐元素张量幂请使用 \
-vt-fast-map #'expt 或对应的二元接口"))
-  (let* ((in-dt (vt-dtype (ensure-vt vt)))
-         (int-pow-p (and (integerp power) (plusp power)))
-         ;; 整数基 + 正整数指数 → 保持整数 dtype（对标 numpy）；
-         ;; 其余一律浮点（float32 进 float32 出，整数→float64）。
-         (dt (cond (dtype dtype)
-                   ((and int-pow-p (member in-dt '(:int8 :int16 :int32 :int64
-                                                   :uint8 :uint16)))
-                    in-dt)
-                   ((eq in-dt :float32) :float32)
-                   (t :float64)))
-         (nan (vt-get-nan (if (member dt '(:float64 :float32)) dt :float64))))
+(defun %pow-odd-int-p (y)
+  "y 是否为奇整数值（支持浮点表示的整数，如 -3.0d0）。"
+  (cond ((integerp y) (oddp y))
+        ((and (floatp y) (= y (ftruncate y))) (oddp (truncate y)))
+        (t nil)))
+
+(defun %pow-int-valued-p (y)
+  "y 是否为整数值（整数或整值浮点）。"
+  (or (integerp y)
+      (and (floatp y) (= y (ftruncate y)))))
+
+(defun %pow-op (x y nan)
+  "逐元素幂的 C99 pow 特例表（对标 numpy.power 实数语义）。
+   覆盖：pow(x,±0)=1、pow(±1,y)=1、pow(±0,y)=±0/±Inf（奇偶）、
+   pow(±Inf,y)=±Inf/±0/NaN（整值奇偶）、pow(负底数,非整指数)=NaN。
+   x/y 可为整数或浮点（vt-map 原始元素）；结果由写入层按 dtype 转换。"
+  (labels ((pos-inf () sb-ext:double-float-positive-infinity)
+           (neg-inf () sb-ext:double-float-negative-infinity))
     (cond
-      (int-pow-p
-       (vt-map (lambda (x) (expt x power)) vt :out out :dtype dt))
-      (t
-       (let ((vf (if (member dt '(:float64 :float32)) vt (vt-astype (ensure-vt vt) dt))))
-         (vt-map (lambda (x)
-                   (let ((result (handler-case (expt x power)
-                                   (error () nan))))
-                     (if (realp result) result nan)))
-                 vf :out out :dtype dt))))))
+      ;; 1) pow(x, ±0) = 1（C99，含 NaN 底数与 ±Inf 底数）
+      ((and (numberp y) (zerop y)) 1)
+      ;; 2) NaN 底数
+      ((and (floatp x) (%nan-p x)) x)
+      ;; 3) pow(1, y) = 1（C99：含 y=NaN）
+      ((and (numberp x) (= x 1)) 1)
+      ;; 4) NaN 指数
+      ((and (floatp y) (%nan-p y)) y)
+      ;; 5) ±Inf 底数（y 非零非 NaN）
+      ((and (floatp x) (%inf-p x))
+       (cond ((not (%pow-int-valued-p y))
+              (if (plusp x) (pos-inf) nan))       ; -Inf**非整数 → NaN
+             ((minusp y)
+              (if (and (minusp x) (%pow-odd-int-p y)) -0.0d0 0.0d0))
+             (t
+              (if (and (minusp x) (%pow-odd-int-p y)) (neg-inf) (pos-inf)))))
+      ;; 6) ±Inf 指数（x 有限；x=±1 已被 3) 拦截）
+      ((and (floatp y) (%inf-p y))
+       (if (< (abs x) 1)
+           (if (plusp y) 0.0d0 (pos-inf))
+           (if (plusp y) (pos-inf) 0.0d0)))
+      ;; 7) x = ±0（y 非零非 NaN）：正指数 → ±0，负指数 → ±Inf（奇偶定号）
+      ((and (numberp x) (zerop x))
+       (if (plusp y)
+           (if (and (minusp x) (%pow-odd-int-p y)) -0.0d0 0.0d0)
+           (if (and (minusp x) (%pow-odd-int-p y)) (neg-inf) (pos-inf))))
+      ;; 8) 负底数 + 非整值指数 → NaN
+      ((and (minusp x) (not (%pow-int-valued-p y))) nan)
+      ;; 9) 常规幂（整数指数 → 精确；负整数指数的整数对由调用方处理）
+      (t (expt x y)))))
+
+(defun vt-pow (vt power &key out dtype)
+  "逐元素幂 VT**POWER。POWER 为标量指数或张量（张量时逐元素广播幂，
+      对标 numpy.power，v0.4.x 起支持）。
+      整数 + 非负整数指数 → 精确整数幂，保持整数 dtype；负整数指数按
+      numpy 整型语义返回 0。其余走浮点幂并按 C99 pow 特例表处理
+      非有限值（pow(-8,1/3)=NaN、pow(0,-1)=+Inf、pow(1,NaN)=1 等）。
+      :out 契约同 vt-+。"
+  (let ((vt (ensure-vt vt)))
+    (if (vt-p power)
+        ;; ---- 张量指数：逐元素广播幂（自然提升，与 numpy.power 一致）----
+        (let* ((promoted (if dtype
+                             dtype
+                             (vt-promote-type (vt-dtype vt) (vt-dtype power))))
+               (int-result (member promoted
+                                   '(:int8 :int16 :int32 :int64 :uint8 :uint16)))
+               (nan (vt-get-nan :float64)))
+          (if int-result
+              ;; numpy 整型幂：负整数指数 → 0（C99 pow 后截断为整型）
+              (vt-map (lambda (x y) (if (minusp y) 0 (expt x y)))
+                      vt power :out out :dtype dtype)
+              (vt-map (lambda (x y) (%pow-op x y nan))
+                      vt power :out out :dtype dtype)))
+        ;; ---- 标量指数：原路径 ----
+        (let* ((in-dt (vt-dtype vt))
+               (int-pow-p (and (integerp power) (plusp power)))
+               ;; 整数基 + 正整数指数 → 保持整数 dtype（对标 numpy）；
+               ;; 其余一律浮点（float32 进 float32 出，整数→float64）。
+               (dt (cond (dtype dtype)
+                         ((and int-pow-p (member in-dt '(:int8 :int16 :int32 :int64
+                                                         :uint8 :uint16)))
+                          in-dt)
+                         ((eq in-dt :float32) :float32)
+                         (t :float64)))
+               (nan (vt-get-nan (if (member dt '(:float64 :float32)) dt :float64))))
+          (cond
+            (int-pow-p
+             (vt-map (lambda (x) (expt x power)) vt :out out :dtype dt))
+            (t
+             (let ((vf (if (member dt '(:float64 :float32)) vt (vt-astype vt dt))))
+               (vt-map (lambda (x)
+                         (let ((result (handler-case (expt x power)
+                                         (error () nan))))
+                           (if (realp result) result nan)))
+                       vf :out out :dtype dt))))))))
 
 (defun vt-expt (vt power &key out dtype)
   "vt-pow 的别名（CL 习惯命名）。语义与参数契约见 vt-pow。"

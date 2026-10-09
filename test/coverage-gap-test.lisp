@@ -217,7 +217,9 @@
     (T! "softmax large: sum=1" 1.0d0 (vt-item (vt-sum probs)) 1e-5)
     (T! "softmax large: no NaN"
 	'(0.09003057317038046 0.24472847105479764 0.6652409557748218)
-	(vt-to-list probs)))
+	(vt-to-list probs))
+    ;; v0.4.x：vt-item 已对齐 numpy（size≠1 报错），多元素检查改用 to-list
+    (T! "softmax large: no NaN" t (notany #'vt-float-nan-p (vt-to-list probs))))
 
   ;; 4.6 sigmoid 极端值
   (let* ((x (vt-from-sequence '(-1000.0 -100.0 0.0 100.0 1000.0)))

@@ -611,7 +611,24 @@
                  do (push (aref tensor-data i) result))
          (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor))))
       (t
-       (vt-extract (vt-broadcast-to condition tshape) tensor)))))
+       ;; numpy 语义：arr.take(condition.nonzero()[0], mode='clip')（展平）。
+       ;; v0.4.x 修复：原实现把 condition 广播到 TENSOR 形状，与 numpy 的
+       ;; 「条件展平非零索引 + clip 采集」不一致（如 (2,1) 条件配 (3,) 数据，
+       ;; numpy 取 arr[0]，原实现广播失败报错）。
+       (let* ((flat-cond (vt-flatten condition))
+              (flat-data (vt-flatten tensor))
+              (cd (vt-data flat-cond))
+              (td (vt-data flat-data))
+              (csize (vt-size flat-cond))
+              (tsize (vt-size flat-data))
+              (result '()))
+         (loop for i from 0 below csize
+               when (/= (aref cd i) 0)
+                 do (if (zerop tsize)
+                        (error "vt-extract: 条件含真值但 TENSOR 为空（numpy IndexError）")
+                        (let ((idx (max 0 (min i (1- tsize)))))
+                          (push (aref td idx) result))))
+         (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor)))))))
 
 (defun vt-searchsorted (tensor values &key (side :left))
   "在有序数组中查找插入点。返回形状与 VALUES 相同的 int64 张量（NumPy 语义）。"

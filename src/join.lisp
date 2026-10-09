@@ -107,6 +107,28 @@
                pos)))
   (let* ((arr-vt (ensure-vt arr))
          (values-vt (ensure-vt values :dtype (vt-dtype arr-vt))))
+    ;; v0.4.x：obj 归一化（对标 numpy 接受数组索引）：
+    ;;   VT → 展平为整数列表；标量 obj 在 values 元素数 > 1 时
+    ;;   按 numpy 广播为重复索引（np.insert(a,1,[7,8]) ≡ obj=[1,1]）。
+    (setf obj (cond ((vt-p obj)
+                     (let ((flat (vt-flatten obj)))
+                       (loop for i below (vt-size flat)
+                             collect (truncate (aref (vt-data flat) i)))))
+                    ((integerp obj)
+                     ;; 重复次数：flat 模式 = values 展平后元素数；
+                     ;; axis 模式 = values 沿插入轴的大小（numpy 语义，
+                     ;; 修复：原先用总元素数，导致 axis 插入 (1,2) 块被误广播）
+                     (let ((n (if axis
+                                  (let ((vs (vt-shape values-vt)))
+                                    (if vs
+                                        (nth (vt-normalize-axis axis (length vs)) vs)
+                                        1))
+                                  (vt-size (vt-flatten values-vt)))))
+                       (if (> n 1)
+                           (make-list n :initial-element obj)
+                           (list obj))))
+                    ((listp obj) obj)
+                    (t (error "无效 obj 类型：~a" obj))))
     (if (null axis)
         (let* ((flat (vt-flatten arr-vt)) (flat-val (vt-flatten values-vt))
 					  (val-size (vt-size flat-val)))
@@ -189,6 +211,14 @@
   "对标 numpy.delete 删除元素。"
   (let* ((tensor (ensure-vt arr)) (sh (vt-shape tensor)) (rank (length sh))
 				  (dtype (vt-dtype tensor)))
+    ;; v0.4.x：obj 归一化——VT 索引展平为整数列表（对标 numpy），
+    ;; 标量视为单元素列表（后续 keep 分支统一按列表处理）。
+    (setf obj (cond ((vt-p obj)
+                     (let ((flat (vt-flatten obj)))
+                       (loop for i below (vt-size flat)
+                             collect (truncate (aref (vt-data flat) i)))))
+                    ((listp obj) obj)
+                    (t (list obj))))
     (labels ((norm-idx (idx dim)
                (let ((n (if (minusp idx) (+ idx dim) idx)))
                  (unless (<= 0 n (1- dim))
