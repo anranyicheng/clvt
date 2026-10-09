@@ -1236,14 +1236,17 @@ lRA16 = "(vt-from-sequence (list (list 0 1 2) (list 3 4 5)) :dtype :int64)"
 def g18():
     add('*vt-fun-list* 规模', "(* (length *vt-fun-list*) 1)", lambda: np.asarray(FUN_COUNT))
     add('*vt-fun-list* 含vt-sum', "(if (member 'clvt:vt-sum *vt-fun-list*) 1 0)", lambda: np.asarray(1))
+    # 注：搜索串不带 d0 后缀——与浮点表示形式无关（print-vt-recursive
+    # 经 %format-number 的 ~,vF 分支输出 "1.0"，PRIN1 兜底输出 "1.0d0"，
+    # 两者均包含 "1.0"），跨 SBCL/clvt 版本稳定。
     add('print-vt-recursive 1d 输出',
-        "(let ((s (make-string-output-stream))) (print-vt-recursive (vt-from-sequence (list 1.0d0 2.0d0) :dtype :float64) 0 nil 2 8 :float64 s) (if (search \"1.0d0\" (get-output-stream-string s)) 1 0))",
+        "(let ((s (make-string-output-stream))) (print-vt-recursive (vt-from-sequence (list 1.0d0 2.0d0) :dtype :float64) 0 nil 2 8 :float64 s) (if (search \"1.0\" (get-output-stream-string s)) 1 0))",
         lambda: np.asarray(1))
     add('print 1d 包含数据',
-        "(let ((s (make-string-output-stream))) (print-vt-recursive (vt-from-sequence (list 1.0d0 2.0d0) :dtype :float64) 0 nil 2 8 :float64 s) (if (search \"2.0d0\" (get-output-stream-string s)) 1 0))",
+        "(let ((s (make-string-output-stream))) (print-vt-recursive (vt-from-sequence (list 1.0d0 2.0d0) :dtype :float64) 0 nil 2 8 :float64 s) (if (search \"2.0\" (get-output-stream-string s)) 1 0))",
         lambda: np.asarray(1))
     add('print-vt-recursive 2d 输出',
-        "(let ((s (make-string-output-stream))) (print-vt-recursive (vt-reshape (vt-from-sequence (list 1.0d0 2.0d0 3.0d0 4.0d0) :dtype :float64) '(2 2)) 0 nil 2 8 :float64 s) (if (search \"3.0d0\" (get-output-stream-string s)) 1 0))",
+        "(let ((s (make-string-output-stream))) (print-vt-recursive (vt-reshape (vt-from-sequence (list 1.0d0 2.0d0 3.0d0 4.0d0) :dtype :float64) '(2 2)) 0 nil 2 8 :float64 s) (if (search \"3.0\" (get-output-stream-string s)) 1 0))",
         lambda: np.asarray(1))
     add('set-print-options 生效',
         "(let ((saved (vt-get-print-options))) (unwind-protect (progn (vt-set-print-options :precision 5) (nth 1 (vt-get-print-options))) (apply #'vt-set-print-options (mapcan (lambda (k v) (list (intern (string-upcase k) :keyword) v)) '(threshold precision indent-step) saved))))",
