@@ -32,6 +32,7 @@ SUITES[robustness-test]="178 鲁棒性边界测试"
 SUITES[coverage-gap-test]="97 numpy/pytorch 覆盖差距测试"
 SUITES[comprehensive-test]="119 综合功能测试"
 SUITES[auto-compare-test]="63 JSON 自动对比测试"
+SUITES[legacy-coverage-test]="284 静态JSON时代未接线用例盘活 (gen_all/gen_param 遗产 281 例 + narrow 语义回归 3 例)"
 SUITES[benchmark-copy]="性能基准测试"
 SUITES[numpy-compare-test]="69 numpy/pytorch 实时对比测试"
 SUITES[extensions2-test]="37 新增函数测试 (fliplr/geomspace/one-hot/layer-norm等)"
@@ -264,6 +265,16 @@ main() {
     check_sbcl
     PY_AVAILABLE=0
     check_python && PY_AVAILABLE=1 || true
+
+    # 防漂移门禁（静态，秒级）：ref_compute key 约定 + 探针 codegen 同步。
+    # 历史上 key 漂移曾两次发生（gen_all_tests/gen_param_tests 旧架构遗留），
+    # 该检查确保任何漂移在跑套件前即被拦截并给出明确报因。
+    if command -v python3 &>/dev/null; then
+        if ! python3 "$SCRIPT_DIR/check_key_sync.py"; then
+            fail "测试工具链 key 同步检查未通过（先修复漂移再运行套件，详见上方输出）"
+            exit 1
+        fi
+    fi
 
     header "clvt 自动化测试"
     log "项目目录: $PROJECT_DIR"

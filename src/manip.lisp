@@ -289,16 +289,21 @@
 ;;; ------------------------------------------------------------------
 
 (defun vt-narrow (vt axis start end)
-  "零拷贝切片（等价 pytorch narrow）。"
+  "零拷贝切片（等价 pytorch narrow）。
+
+start/end 支持 numpy 切片负索引语义：负值先加轴长（-1 → 末尾）；
+规约后自动截断到 [0, dim-size]（对标 numpy 切片对越界的 clip 行为，
+v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start 仍报错。"
   (let* ((shape (copy-list (vt-shape vt)))
          (rank (length shape))
          (ax (vt-normalize-axis axis rank))
          (strides (vt-strides vt))
-         (dim-size (nth ax shape)))
-    (when (or (< start 0) (> end dim-size))
-      (error "切片索引 [~a, ~a) 越界，轴大小 ~a" start end dim-size))
+         (dim-size (nth ax shape))
+         ;; numpy 切片语义：负索引 +轴长，再 clip 到 [0, dim-size]
+         (start (max 0 (min (+ start (if (< start 0) dim-size 0)) dim-size)))
+         (end   (max 0 (min (+ end   (if (< end 0)   dim-size 0)) dim-size))))
     (when (< end start)
-      (error "vt-narrow: end (~a) 必须大于 start (~a)" end start))
+      (error "vt-narrow: 规约后 end (~a) 必须不小于 start (~a)" end start))
     (setf (nth ax shape) (- end start))
     (%make-vt :data (vt-data vt) :shape shape :strides strides
               :offset (+ (vt-offset vt) (* start (nth ax strides)))

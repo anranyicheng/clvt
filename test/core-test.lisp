@@ -322,6 +322,10 @@
   (vt-to-list (vt-rot90 (vt-from-sequence '((1 2) (3 4))) :k 2)) '((4 3) (2 1)))
 (check "vt-narrow(52): 沿轴取 [start,end) 视图"
   (vt-to-list (vt-narrow (vt-from-sequence '((1 2 3) (4 5 6))) 0 0 1)) '((1 2 3)))
+(check "vt-narrow(52b): 负切片索引（numpy 语义，-1 → 末尾）"
+  (vt-to-list (vt-narrow (vt-arange 10 :dtype :int64) 0 -3 -1)) '(7 8))
+(check "vt-narrow(52c): 越界 clip（numpy 切片语义，v0.4.2）"
+  (vt-to-list (vt-narrow (vt-arange 10 :dtype :int64) 0 0 100)) '(0 1 2 3 4 5 6 7 8 9))
 (check "vt-split(53): 按段数均分返回列表"
   (mapcar #'vt-shape (vt-split (vt-zeros '(4 2)) 2)) '((2 2) (2 2)))
 (check "vt-vsplit(54): 按行拆分"

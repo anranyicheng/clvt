@@ -4,6 +4,29 @@
 
 ---
 
+## 2026-10-10 测试工具链防漂移 + 遗产用例盘活 + vt-narrow 负索引
+
+### vt-narrow 语义修复（src/manip.lisp）
+- `vt-narrow` 的 start/end 支持 **numpy 切片负索引语义**：负值先加轴长，
+  规约后自动 clip 到 `[0, dim-size]`（此前负索引/越界直接报错）。
+  规约后 `end < start` 仍报错。core-test 新增 52b/52c 两条断言。
+
+### 测试工具链
+- 删除旧架构孤儿生成器 `gen_all_tests.py` / `gen_param_tests.py`
+  （静态 JSON 迁移遗留，产出物无任何消费者，且旧 key 风格易误导维护者）
+- 新增 `test/check_key_sync.py` 防漂移门禁并挂入 `run-tests.sh` 前导：
+  5 套件查询 key 与 ref_compute 供给机械核对（缺失→FAIL+报因，死供给→WARN），
+  探针 codegen 与提交 .lisp 逐字节校验
+- 遗产盘活：架构迁移时仅 280/560 例被接线，其余 281 例从未被任何套件消费。
+  现全部恢复：oracle 并入 `ref_compute.py`（651 key，0 缺失 0 死供给），
+  lisp 调用补入新套件 `test/legacy-coverage-test.lisp`（284/284 通过）
+- 新增 `test/README-tools.md` 工具链地图（各 py/lisp 角色、消费方、修改清单）
+- 盘活中确认的语义差异（已在 README-tools.md 登记）：
+  `vt-det` 暂不支持 3D 批量；`vt-diagonal` 3D 为 pytorch 末两维风格；
+  `vt-gradient` 1D 返回裸 VT
+
+---
+
 ## 2026-10-06（四）— 新增 `vt-cross-entropy-logits`：真正的 torch.nn.CrossEntropyLoss 语义
 
 ### 问题
