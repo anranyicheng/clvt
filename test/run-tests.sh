@@ -41,6 +41,7 @@ SUITES[property-test]="性质测试"
 SUITES[test-extensions]="19 扩展函数回归测试"
 SUITES[simd-test]="SIMD 路径测试"
 SUITES[test-overlap]="6 重叠拷贝回归测试"
+SUITES[svd-fast-path-test]="SVD 双路径测试 (差分参考/选路不变量/数学性质/numpy对比/退化形状)"
 SUITES[test-copy-into]="35 vt-copy-into 正确性测试"
 SUITES[io-interop-test]="77 vt-load/vt-save 持久化与 numpy .npy 互操作测试（含 NaN payload 逐位/视图字节等价/不变性/覆盖语义）"
 SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
@@ -316,6 +317,7 @@ main() {
             out-contig-tests
             shape-degenerate-tests
             property-strided-tests
+	    svd-fast-path-test
             error-contract-tests
             refactor-bugfix-tests
             numpy-convention-tests
