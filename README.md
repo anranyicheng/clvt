@@ -456,7 +456,8 @@ vt-random-multinomial
 #:generator-from-seed-sequence 
 #:spawn-generators
 ;; 作用域宏
-#:with-seed #:with-generator
+#:with-seed 
+#:with-generator
 
 ;; nan的相关
 vt-float-nan
@@ -491,7 +492,19 @@ vt-out-contig-p       ;; out 是否连续（仅影响选路）
 vt-out-snapshot       ;; 别名场景下的输入快照
 vt-check-out-dtype-consistency ;; :dtype 与 :out 一致性 (H5)
 vt-reduce-dtypes      ;; 归约结果 dtype 推导
+vt-write
 
+;; 打印与调试 (io.lisp)
+print-vt-recursive
+*vt-print-threshold*
+*vt-print-precision*
+*vt-indent-step*
+*vt-fun-list*
+*vt-einsum-parse-cache*
+;; 持久化与互操作 (io.lisp)
+vt-load
+vt-save
+   
 ;; 扩展功能 (extensions.lisp)
 vt-count-nonzero    ;; 统计非零元素个数 (对标 numpy.count_nonzero)
 vt-count            ;; 统计等于指定值的元素个数

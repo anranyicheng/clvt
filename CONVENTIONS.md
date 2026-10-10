@@ -920,7 +920,7 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | `vt-out-writable-p` | 广播视图（dim>1 且 stride=0）判定为不可写 |
 | `vt-out-snapshot` | 别名保护：重叠输入先 `vt-copy` 快照 |
 | `vt-out-contig-p` | 仅作选路建议，不影响结果 |
-| `vt-write-1` | **strides 驱动**寻址写入，零连续性假设 |
+| `vt-write` | **strides 驱动**寻址写入，零连续性假设 |
 | `vt-reduce-dtypes` | 归约类精度解耦三段式 |
 | `%parcontract-self-check` | 加载期自检（寻址/快照三点回归网），失败中断加载 |
 | `vt-params-audit` / `vt-params-audit-report` | 参数契约审计（个数/默认值/`&key`/`&rest`/docstring） |
@@ -1056,7 +1056,7 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 
 `vt-select`（condlist/choicelist 列表语义）、`vt-dsplit`（axis=2）、
 `vt-vsplit`、`vt-hsplit`、`vt-moveaxis`（含负轴与多轴 `(0,1)->(2,3)`）、
-`vt-lerp`（CL 参数顺序 start/end/weight）、`vt-write-1`（strides 驱动寻址）、
+`vt-lerp`（CL 参数顺序 start/end/weight）、`vt-write`（strides 驱动寻址）、
 `vt-layer-norm`、`vt-apply-along-axis`、`vt-tensordot`、`vt-geomspace`、
 `vt-identity` 的非缺省 dtype 分支。
 

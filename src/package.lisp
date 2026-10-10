@@ -356,7 +356,8 @@
    #:generator-from-seed-sequence
    #:spawn-generators
    ;; 作用域宏
-   #:with-seed #:with-generator
+   #:with-seed
+   #:with-generator
 
    ;; ------------------------------------------------------------------
    ;; nan / inf 相关 (nan.lisp)
@@ -389,7 +390,7 @@
    #:vt-out-writable-p
    #:vt-out-contig-p
    #:vt-out-snapshot
-   #:vt-write-1
+   #:vt-write
    #:vt-reduce-dtypes
    #:vt-params-audit
 

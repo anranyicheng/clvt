@@ -15,7 +15,7 @@
 ;;;;       H1 out 是 vt      H2 形状精确匹配    H3 dtype 精确匹配
 ;;;;       H4 可写（非 stride-0 广播视图）      H5 :dtype 与 :out 不冲突
 ;;;;
-;;;;   (B) 计算期保障 —— vt-out-view / vt-write-* / vt-out-snapshot
+;;;;   (B) 计算期保障 —— vt-out-view / vt-write / vt-out-snapshot
 ;;;;       把 "out 的正确写入" 从 "每个函数各自拼装" 变成 "库级原语统一保证"：
 ;;;;         · 一切寻址基于 out 的真实 strides 与 offset（绝不假设连续）
 ;;;;         · 写入前必查可写性（计算路径内部再查一次，防止绕过入口）
@@ -172,7 +172,7 @@
 ;;; 3. 统一写入入口（strides 驱动，零连续性假设）
 ;;; ==================================================================
 
-(defun vt-write-1 (out index value)
+(defun vt-write (out index value)
   "向 out 的**逻辑**索引 index 写入 value。
    index 为索引列表（长度 = rank；标量 out 传 nil）。
    全程使用 out 的真实 offset/strides，支持任意非连续视图。"
