@@ -42,6 +42,7 @@ SUITES[test-extensions]="19 扩展函数回归测试"
 SUITES[simd-test]="SIMD 路径测试"
 SUITES[test-overlap]="6 重叠拷贝回归测试"
 SUITES[test-copy-into]="35 vt-copy-into 正确性测试"
+SUITES[io-interop-test]="77 vt-load/vt-save 持久化与 numpy .npy 互操作测试（含 NaN payload 逐位/视图字节等价/不变性/覆盖语义）"
 SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
 SUITES[test-bug0]="37 已知 bug 回归测试"
 SUITES[test-ai-edge-cases]="40 AI 主流函数语义回归测试 (matmul 1-D/广播 0-size/BCE NaN/vstack)"
@@ -325,6 +326,7 @@ main() {
             fastmap-invariant-test
             differential-probes-test
             differential-probes-test2
+            io-interop-test
             test-all
         )
         if [[ "$skip_benchmark" == false ]]; then

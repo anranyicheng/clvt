@@ -412,6 +412,12 @@
    #:*vt-einsum-parse-cache*
 
    ;; ------------------------------------------------------------------
+   ;; 持久化与互操作 (io.lisp)
+   ;; ------------------------------------------------------------------
+   #:vt-load
+   #:vt-save
+
+   ;; ------------------------------------------------------------------
    ;; 扩展功能 (extensions.lisp)
    ;; ------------------------------------------------------------------
    #:vt-count-nonzero
@@ -521,7 +527,7 @@
   (setf *vt-fun-list* nil)
   (do-symbols (var :clvt)
     (when (and (> (length (symbol-name var)) 2)
-	       (search "vt-" (symbol-name var) :test #'equalp :end2 3))
+               (search "vt-" (symbol-name var) :test #'equalp :end2 3))
       (push var *vt-fun-list*)))
   (setf *vt-fun-list* (nreverse *vt-fun-list*)))
 
