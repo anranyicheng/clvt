@@ -151,11 +151,9 @@
             passed-tests failed-tests *assert-pass* *assert-fail*)
     (format t "结果: ~a~%"
             (if (zerop failed-tests) "====> 全部通过 <====" "====> 存在失败 <===="))
+    (format t "~&Total: ~d~%Pass: ~d~%Fail: ~d~%"
+        (+ passed-tests failed-tests) passed-tests failed-tests) 
     (values passed-tests failed-tests)))
-
-(defun run-all-tests ()
-  "运行全部注册测试。"
-  (run-tests))
 
 ;;; ==================================================================
 ;;; 1. 物理层访问器与视图（core.lisp）
@@ -334,7 +332,9 @@
             (vt-to-list (vt-from-function '(2 3) (lambda (idx) (apply #'+ idx))))
             '(0.0d0 1.0d0 2.0d0 1.0d0 2.0d0 3.0d0))
   (check-dtype "vt-from-function :dtype :int64"
-               (vt-from-function '(2) (lambda (idx) 1) :dtype :int64) :int64)
+               (vt-from-function '(2) (lambda (idx)
+					(declare (ignore idx)) 1)
+				 :dtype :int64) :int64)
   (check-eq "vt-fromiter 从生成器取 count 个"
             (vt-to-list (vt-fromiter (loop for i below 4 collect (* i i))
                                      :dtype :int64 :count 4))
@@ -357,6 +357,7 @@
   (destructuring-bind (xs ys)
       (vt-meshgrid (list (vt-from-sequence '(1 2)) (vt-from-sequence '(3 4 5)))
                    :indexing :ij)
+    (declare (ignore ys))
     (check-shape "vt-meshgrid :ij 第一输出 (2 3)" xs '(2 3))
     (check-eq "vt-meshgrid :ij 第一行" (vt-to-list xs)
               '((1.0d0 1.0d0 1.0d0) (2.0d0 2.0d0 2.0d0))))
@@ -447,6 +448,7 @@
       (check-eq "vt-split 索引切分 p2" (vt-to-list p2) '(2 3 4 5))))
   (let ((m (vt-reshape (vt-arange 6 :dtype :int64) '(2 3))))
     (destructuring-bind (h1 h2 h3) (vt-hsplit m 3)
+      (declare (ignore h3))
       (check-shape "vt-hsplit 列切分" h1 '(2 1))
       (check-item "vt-hsplit 元素" (vt-ref h2 0 0) 1))
     (destructuring-bind (v1 v2) (vt-vsplit m 2)
@@ -1283,7 +1285,7 @@
     (multiple-value-bind (packed piv nswaps) (vt-lu a)
       (check "vt-lu packed 为 2x2 张量"
              (and (vt-p packed) (equal (vt-shape packed) '(2 2))))
-      (check "vt-lu piv 为行交换向量" (and (listp piv) (= (length piv) 2)))
+      (check "vt-lu piv 为行交换向量" (and (vectorp piv) (= (length piv) 2)))
       (check "vt-lu nswaps 为整数" (integerp nswaps))
       ;; 由 packed 还原 L（单位下三角）与 U（上三角），验证 L@U = a
       (let* ((l (vt-from-sequence (list (list 1.0d0 0.0d0)
@@ -1690,4 +1692,6 @@
     (declare (ignore p))
     (zerop f)))
 
-(run-all-tests)
+(unless (run-all-tests)
+  #+sbcl (sb-ext:exit :code 1)
+  #-sbcl (error "test-all failed"))

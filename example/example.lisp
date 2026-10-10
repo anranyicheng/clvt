@@ -5720,7 +5720,7 @@
          (sign (third lu-and-piv)))
     ;; 无交换，sign 为 1，piv 保持原样
     (assert (= sign 1))
-    (assert (equal piv '(0 1)))
+    (assert (equalp piv #(0 1)))
     ;; 检查紧凑 lu 矩阵
     ;; u 的部分 (第一行和第二行后半)
     (assert (< (abs (- (vt-ref lu 0 0) 3.0d0)) 1e-9))
@@ -5740,7 +5740,7 @@
     ;; 发生一次交换，sign 变为 -1
     (assert (= sign -1))
     ;; piv 记录：结果的第 0 行来自原第 1 行，结果的第 1 行来自原第 0 行
-    (assert (equal piv '(1 0)))
+    (assert (equalp piv #(1 0)))
     ;; 交换后，第一行变成了原第二行 [3.0, 4.0]
     (assert (< (abs (- (vt-ref lu 0 0) 3.0d0)) 1e-9))
     (assert (< (abs (- (vt-ref lu 0 1) 4.0d0)) 1e-9))

@@ -1325,7 +1325,7 @@
 					    (* i b-s0)
 					    (* j b-s1)))
 			    (aref ob-data (+ ob-off
-					     (* (nth i piv) ob-s0)
+					     (* (elt piv i) ob-s0)
 					     (* j ob-s1))))))          
 		  ;; 2. 前代
 		  (loop for k from 0 below n do
@@ -1385,95 +1385,134 @@
 ;;; 3. 矩阵分解
 
 (defun vt-qr (matrix &key (mode :reduced))
-  "矩阵 qr 分解。 
+  "矩阵 qr 分解。
    matrix : m×n 矩阵。
    mode :reduced 返回 q(m×k), r(k×n)，k = min(m,n)。
-         :full 返回 q(m×m), r(m×n)。
-   返回。"
+         :full 返回 q(m×m), r(m×n)。"
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
-    (let* ((row (first (vt-shape matrix)))
+    (let* ((row (first  (vt-shape matrix)))
            (col (second (vt-shape matrix)))
-           (k (min row col))
-           (r (vt-astype matrix :float64))
-           (vlist (make-array k :initial-element nil))
-           (betas (make-array k :element-type 'double-float)))
-      
-      ;; ---- 1. 正向分解，更新 r ----
-      (loop for i from 0 below k
-            for x = (vt-slice r (list i row) (list i)) ;; 第 i 列，i 行开始
-            do (if (<= (vt-size x) 1)
-                   (setf (aref betas i) 0.0d0)
-                   (multiple-value-bind (v beta sigma)
-                       (compute-householder x)
-                     (declare (ignore sigma))
-                     (setf (aref vlist i) v
-                           (aref betas i) beta)
-                     ;; 对子矩阵 r(i:m, i:n) 应用反射: R = R - beta * v * (v^T R)
-                     ;; 直接用循环实现，避免 einsum 的 stride 问题
-                     (let* ((m-sub (- row i))
-                            (n-sub (- col i))
-                            (r-data (vt-data r))
-                            (r-s0 (first (vt-strides r)))
-                            (r-s1 (second (vt-strides r)))
-                            (r-off (vt-offset r))
-                            (v-data (vt-data v))
-                            (v-stride (first (vt-strides v)))
-                            (v-off (vt-offset v)))
-                       ;; w[j] = sum_k v[k] * R[i+k, i+j]
-                       (let ((w (make-array n-sub :element-type 'double-float :initial-element 0.0d0)))
-                         (loop for j fixnum from 0 below n-sub do
-                           (let ((s 0.0d0))
-                             (loop for ii fixnum from 0 below m-sub do
-                               (incf s (* (aref v-data (+ v-off (* ii v-stride)))
-                                          (aref r-data (+ r-off (* (+ i ii) r-s0)
-							  (* (+ i j) r-s1))))))
-                             (setf (aref w j) s)))
-                         ;; R[i+ii, i+j] -= beta * v[ii] * w[j]
-                         (loop for ii fixnum from 0 below m-sub do
-                           (let ((vi (aref v-data (+ v-off (* ii v-stride)))))
-                             (loop for j fixnum from 0 below n-sub do
-                               (decf (aref r-data (+ r-off (* (+ i ii) r-s0)
-						     (* (+ i j) r-s1)))
-                                     (* beta vi (aref w j)))))))))))
-      
-      ;; ---- 2. 反向累积 q (必须从 k-1 到 0) ----
+           (k   (min row col))
+           (r      (vt-astype matrix :float64))
+           (vlist  (make-array k))
+           (betas  (make-array k :element-type 'double-float))
+           (r-data (vt-data r))
+           (r-s0   (first  (vt-strides r)))
+           (r-s1   (second (vt-strides r)))
+           (r-off  (vt-offset r))
+           ;; 复用的工作缓冲，长度取 max(row,col) 覆盖两种模式
+           (w (make-array (max row col) :element-type 'double-float
+                                      :initial-element 0.0d0)))
+      (declare (type fixnum row col k r-s0 r-s1 r-off)
+               (type (simple-array double-float (*)) r-data betas w)
+               (optimize (speed 3) (safety 0) (debug 0)))
+
+      ;; ============ 1. 正向分解，更新 r ============
+      (loop for i of-type fixnum from 0 below k
+            do (let ((m-sub (- row i))
+                     (n-sub (- col i)))
+                 (declare (type fixnum m-sub n-sub))
+                 (if (<= m-sub 1)
+                     (setf (aref betas i) 0.0d0)
+                     (multiple-value-bind (v beta sigma)
+                         (compute-householder
+                          (vt-slice r (list i row) (list i)))
+                       (declare (ignore sigma))
+                       (setf (aref vlist i) v
+                             (aref betas i) beta)
+                       (when (> beta 0.0d0)
+                         (let* ((v-data   (vt-data v))
+                                (v-stride (first (vt-strides v)))
+                                (v-off    (vt-offset v))
+                                ;; r[i+ii, i+j] 的地址 = base + ii*r-s0 + j*r-s1
+                                (base (+ r-off (* i r-s0) (* i r-s1))))
+                           (declare (type (simple-array double-float (*)) v-data)
+                                    (type fixnum v-stride v-off base))
+
+                           ;; ---- w[j] = sum_ii v[ii] * R[i+ii, i+j] ----
+                           (loop for j of-type fixnum from 0 below n-sub
+                                 for col-base of-type fixnum = (+ base (* j r-s1))
+                                 do (let ((s  0.0d0)
+                                          (p  col-base)
+                                          (pv v-off))
+                                      (declare (type double-float s)
+                                               (type fixnum p pv))
+                                      (loop for ii of-type fixnum from 0 below m-sub
+                                            do (incf s (* (aref v-data pv)
+                                                          (aref r-data p)))
+                                               (incf p  r-s0)
+                                               (incf pv v-stride))
+                                      (setf (aref w j) s)))
+
+                           ;; ---- R[i+ii, i+j] -= beta * v[ii] * w[j] ----
+                           (loop for ii of-type fixnum from 0 below m-sub
+                                 for row-base of-type fixnum = (+ base (* ii r-s0))
+                                 for pv of-type fixnum = v-off then (+ pv v-stride)
+                                 for vi of-type double-float = (aref v-data pv)
+                                 for bvi of-type double-float = (* beta vi)
+                                 do (let ((p  row-base)
+                                          (pw 0))
+                                      (declare (type fixnum p pw))
+                                      (loop for j of-type fixnum from 0 below n-sub
+                                            do (decf (aref r-data p)
+                                                     (* bvi (aref w pw)))
+                                               (incf p  r-s1)
+                                               (incf pw 1))))))))))
+
+      ;; ============ 2. 反向累积 q ============
       (let* ((need-full (eq mode :full))
              (q (if need-full
                     (vt-eye row :cols row :dtype :float64)
-                    (vt-eye row :cols k :dtype :float64))))
-        
-        (loop for i from (1- k) downto 0 ;; 反向循环
-              for beta = (aref betas i)
+                    (vt-eye row :cols k   :dtype :float64)))
+             (nq     (second (vt-shape q)))
+             (q-data (vt-data q))
+             (q-s0   (first  (vt-strides q)))
+             (q-s1   (second (vt-strides q)))
+             (q-off  (vt-offset q)))
+        (declare (type fixnum nq q-s0 q-s1 q-off)
+                 (type (simple-array double-float (*)) q-data))
+        (loop for i of-type fixnum from (1- k) downto 0
+              for beta of-type double-float = (aref betas i)
               for v = (aref vlist i)
               when (and v (> beta 0.0d0))
-                do ;; Q[i:m, :] = Q[i:m, :] - beta * v * (v^T Q[i:m, :])
-                   (let* ((m-sub (- row i))
-                          (nq (second (vt-shape q)))
-                          (q-data (vt-data q))
-                          (q-s0 (first (vt-strides q)))
-                          (q-s1 (second (vt-strides q)))
-                          (q-off (vt-offset q))
-                          (v-data (vt-data v))
+                do (let* ((m-sub    (- row i))
+                          (v-data   (vt-data v))
                           (v-stride (first (vt-strides v)))
-                          (v-off (vt-offset v)))
-                     ;; w[j] = sum_k v[k] * Q[i+k, j]
-                     (let ((w (make-array nq :element-type 'double-float :initial-element 0.0d0)))
-                       (loop for j fixnum from 0 below nq do
-                         (let ((s 0.0d0))
-                           (loop for ii fixnum from 0 below m-sub do
-                             (incf s (* (aref v-data (+ v-off (* ii v-stride)))
-                                        (aref q-data (+ q-off (* (+ i ii) q-s0)
-							(* j q-s1))))))
-                           (setf (aref w j) s)))
-                       ;; Q[i+ii, j] -= beta * v[ii] * w[j]
-                       (loop for ii fixnum from 0 below m-sub do
-                         (let ((vi (aref v-data (+ v-off (* ii v-stride)))))
-                           (loop for j fixnum from 0 below nq do
-                             (decf (aref q-data (+ q-off (* (+ i ii) q-s0)
-						   (* j q-s1)))
-                                   (* beta vi (aref w j)))))))))
-        
+                          (v-off    (vt-offset v))
+                          (base     (+ q-off (* i q-s0))))
+                     (declare (type (simple-array double-float (*)) v-data)
+                              (type fixnum m-sub v-stride v-off base))
+
+                     ;; ---- w[j] = sum_ii v[ii] * Q[i+ii, j] ----
+                     (loop for j of-type fixnum from 0 below nq
+                           for col-base of-type fixnum = (+ base (* j q-s1))
+                           do (let ((s  0.0d0)
+                                    (p  col-base)
+                                    (pv v-off))
+                                (declare (type double-float s)
+                                         (type fixnum p pv))
+                                (loop for ii of-type fixnum from 0 below m-sub
+                                      do (incf s (* (aref v-data pv)
+                                                    (aref q-data p)))
+                                         (incf p  q-s0)
+                                         (incf pv v-stride))
+                                (setf (aref w j) s)))
+
+                     ;; ---- Q[i+ii, j] -= beta * v[ii] * w[j] ----
+                     (loop for ii of-type fixnum from 0 below m-sub
+                           for row-base of-type fixnum = (+ base (* ii q-s0))
+                           for pv of-type fixnum = v-off then (+ pv v-stride)
+                           for vi of-type double-float = (aref v-data pv)
+                           for bvi of-type double-float = (* beta vi)
+                           do (let ((p  row-base)
+                                    (pw 0))
+                                (declare (type fixnum p pw))
+                                (loop for j of-type fixnum from 0 below nq
+                                      do (decf (aref q-data p)
+                                               (* bvi (aref w pw)))
+                                         (incf p  q-s1)
+                                         (incf pw 1))))))
         (values q (if need-full r (vt-slice r (list 0 k) '(:all))))))))
 
 (defun compute-householder (x)
@@ -1482,32 +1521,36 @@
    其中 sigma = -sign(x[0]) * ||x||，β = 2 / ||v||²。
    当 x 为零向量时返回 beta=0, sigma=0。"
   (with-float-safe
-    (let* ((x-data (vt-data x))
-           (x-stride (first (vt-strides x)))
-           (x-off (vt-offset x))
-           (size (vt-size x))
-           (norm-sq 0.0d0))
-      (loop for i from 0 below size
-            for ptr = (+ x-off (* i x-stride))
-            for val = (aref x-data ptr)
-            do (incf norm-sq (* val val)))
-      (let ((norm (sqrt norm-sq)))
-        (if (zerop norm)
-            (values (vt-copy x) 0.0d0 0.0d0)
-            (let* ((sx0 (aref x-data x-off))
-                   (sigma (if (>= sx0 0.0d0) (- norm) norm))
-                   (v (vt-copy x))
-                   (v-data (vt-data v)))
-              (setf (aref v-data 0) (- sx0 sigma))
-              (let* ((beta-num 0.0d0)
-                     (v-stride (first (vt-strides v)))
-                     (v-off (vt-offset v)))
-                (loop for i from 0 below size
-                      for ptr = (+ v-off (* i v-stride))
-                      for val = (aref v-data ptr)
-                      do (incf beta-num (* val val)))
-                (let ((beta (/ 2.0d0 beta-num)))
-                  (values v beta sigma)))))))))
+    (let* ((x-data   (vt-data x))
+           (x-stride (first  (vt-strides x)))
+           (x-off    (vt-offset x))
+           (size     (vt-size x)))
+      (declare (type (simple-array double-float (*)) x-data)
+               (type fixnum x-stride x-off size)
+               (optimize (speed 3) (safety 0) (debug 0)))
+      ;; 一次遍历求 ||x||²
+      (let ((norm-sq 0.0d0))
+        (declare (type double-float norm-sq))
+        (loop for i of-type fixnum from 0 below size
+              for p of-type fixnum = x-off then (+ p x-stride)
+              for val of-type double-float = (aref x-data p)
+              do (incf norm-sq (* val val)))
+        (let ((norm (sqrt norm-sq)))
+          (declare (type double-float norm))
+          (if (zerop norm)
+              (values (vt-copy x) 0.0d0 0.0d0)
+              (let* ((x0   (aref x-data x-off))
+                     (sigma (if (>= x0 0.0d0) (- norm) norm))
+                     (v-norm-sq (* 2.0d0 norm (+ norm (abs x0))))
+                     (beta (/ 2.0d0 v-norm-sq))
+                     (v      (vt-copy x))
+                     (v-data (vt-data v))
+                     (v-off    (vt-offset v)))
+                (declare (type double-float x0 sigma beta v-norm-sq)
+                         (type (simple-array double-float (*)) v-data)
+                         (type fixnum v-off))
+                (setf (aref v-data v-off) (- x0 sigma))
+		(values v beta sigma))))))))
 
 (defun vt-matrix-rank (matrix &optional (tol 1e-10))
   "计算矩阵的秩 (线性代数定义：线性无关的行/列数)。
@@ -1601,7 +1644,6 @@
                           (error "failed to generate orthogonal vector"))))
             u-full)))))
 
-
 (defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50) (tol 1e-14))
   "奇异值分解 a = u s v^t。
   full-matrices : t 则返回完整尺寸 u(m×m), s(k), vt(n×n) (k = min(m,n))
@@ -1611,9 +1653,10 @@
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
     (let* ((mat (vt-astype matrix :float64))
-           (m (first (vt-shape mat)))
+           (m (first  (vt-shape mat)))
            (n (second (vt-shape mat)))
            (k (min m n)))
+      ;; ---- 1×1 边界 ----
       (when (and (= m 1) (= n 1))
         (let ((val (aref (vt-data mat) (vt-offset mat))))
           (return-from vt-svd
@@ -1621,79 +1664,129 @@
                     (vt-const '(1) (abs val) :dtype :float64)
                     (if (>= val 0) (vt-ones '(1 1) :dtype :float64)
                         (vt-const '(1 1) -1.0d0 :dtype :float64))))))
+
       (let* ((u (vt-copy mat))
              (v (vt-eye n :dtype :float64))
-             (changed t)
-             (sweep 0))
-        (let ((u-data (vt-data u))
-              (u-s0 (first (vt-strides u)))
-              (u-s1 (second (vt-strides u)))
-              (u-off (vt-offset u))
-              (v-data (vt-data v))
-              (v-s0 (first (vt-strides v)))
-              (v-s1 (second (vt-strides v)))
-              (v-off (vt-offset v)))
-          (flet ((col-norm-sq (col)
-                   (let ((sum 0.0d0))
-                     (loop for r from 0 below m
-                           for ptr = (+ u-off (* r u-s0) (* col u-s1))
-                           do (incf sum (* (aref u-data ptr)
-					   (aref u-data ptr))))
-                     sum))
-                 (col-dot (c1 c2)
-                   (let ((sum 0.0d0))
-                     (loop for r from 0 below m
-                           for ptr1 = (+ u-off (* r u-s0) (* c1 u-s1))
-                           for ptr2 = (+ u-off (* r u-s0) (* c2 u-s1))
-                           do (incf sum (* (aref u-data ptr1)
-                                           (aref u-data ptr2))))
-                     sum)))
+             (u-data (vt-data u))
+             (u-s0 (first  (vt-strides u)))
+             (u-s1 (second (vt-strides u)))
+             (u-off (vt-offset u))
+             (v-data (vt-data v))
+             (v-s0 (first  (vt-strides v)))
+             (v-s1 (second (vt-strides v)))
+             (v-off (vt-offset v))
+             (col-norms (make-array n :element-type 'double-float :initial-element 0.0d0)))
+        (declare (type fixnum m n k u-s0 u-s1 u-off v-s0 v-s1 v-off)
+                 (type (simple-array double-float (*)) u-data v-data col-norms)
+                 (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+
+        ;; ====== 重算所有列范数（每轮扫描调用一次）======
+        (macrolet ((refresh-norms ()
+                     `(loop for i of-type fixnum from 0 below n
+                            do (let ((sum 0.0d0)
+                                     (p (+ u-off (* i u-s1))))
+                                 (declare (type double-float sum)
+                                          (type fixnum p))
+                                 (loop for r of-type fixnum from 0 below m
+                                       do (let ((val (aref u-data p)))
+                                            (incf sum (* val val)))
+                                          (incf p u-s0))
+                                 (setf (aref col-norms i) sum)))))
+          (refresh-norms)
+
+          ;; ====== 主 Jacobi 迭代 ======
+          (let ((sweep 0)
+                (changed t))
+            (declare (type fixnum sweep))
             (loop while (and changed (< sweep max-sweeps)) do
               (setf changed nil)
-              (loop for i from 0 below (1- n) do
-                (loop for j from (1+ i) below n
-                      for alpha = (col-norm-sq i)
-                      for beta = (col-norm-sq j)
-                      for gamma = (col-dot i j)
+              (loop for i of-type fixnum from 0 below (1- n) do
+                (loop for j of-type fixnum from (1+ i) below n
+                      for alpha of-type double-float = (aref col-norms i)
+                      for beta  of-type double-float = (aref col-norms j)
+                      ;; ---- 点积：递增指针，单次遍历 ----
+                      for gamma of-type double-float =
+                        (let ((sum 0.0d0)
+                              (p1 (+ u-off (* i u-s1)))
+                              (p2 (+ u-off (* j u-s1))))
+                          (declare (type double-float sum)
+                                   (type fixnum p1 p2))
+                          (loop for r of-type fixnum from 0 below m
+                                do (incf sum (* (aref u-data p1)
+                                                (aref u-data p2)))
+                                   (incf p1 u-s0)
+                                   (incf p2 u-s0))
+                          sum)
                       when (> (abs gamma) (* tol (sqrt (* alpha beta)))) do
                         (setf changed t)
-                        (let* ((zeta (/ (- beta alpha) (* 2 gamma)))
+                        (let* ((zeta (/ (- beta alpha) (* 2.0d0 gamma)))
                                (t-abs (/ 1.0d0 (+ (abs zeta)
-                                                  (sqrt (+ 1 (* zeta zeta))))))
-                               (t-val (if (>= zeta 0) t-abs (- t-abs)))
-                               (c (/ 1.0d0 (sqrt (+ 1 (* t-val t-val)))))
+                                                  (sqrt (+ 1.0d0 (* zeta zeta))))))
+                               (t-val (if (>= zeta 0.0d0) t-abs (- t-abs)))
+                               (c (/ 1.0d0 (sqrt (+ 1.0d0 (* t-val t-val)))))
                                (s (* c t-val)))
-                          (loop for r from 0 below m do
-                            (let* ((ptr-i (+ u-off (* r u-s0) (* i u-s1)))
-                                   (ptr-j (+ u-off (* r u-s0) (* j u-s1)))
-                                   (ui (aref u-data ptr-i))
-                                   (uj (aref u-data ptr-j)))
-                              (setf (aref u-data ptr-i) (- (* ui c) (* uj s)))
-                              (setf (aref u-data ptr-j) (+ (* ui s) (* uj c)))))
-                          (loop for r from 0 below n do
-                            (let* ((ptr-i (+ v-off (* r v-s0) (* i v-s1)))
-                                   (ptr-j (+ v-off (* r v-s0) (* j v-s1)))
-                                   (vi (aref v-data ptr-i))
-                                   (vj (aref v-data ptr-j)))
-                              (setf (aref v-data ptr-i) (- (* vi c) (* vj s)))
-                              (setf (aref v-data ptr-j) (+ (* vi s) (* vj c))))))))
-              (incf sweep))
+                          (declare (type double-float zeta t-abs t-val c s))
+                          ;; ---- 旋转 U 的第 i, j 列 ----
+                          (let ((p-i (+ u-off (* i u-s1)))
+                                (p-j (+ u-off (* j u-s1))))
+                            (declare (type fixnum p-i p-j))
+                            (loop for r of-type fixnum from 0 below m
+                                  do (let* ((ui (aref u-data p-i))
+                                            (uj (aref u-data p-j)))
+                                       (setf (aref u-data p-i) (- (* ui c) (* uj s))
+                                             (aref u-data p-j) (+ (* ui s) (* uj c))))
+                                     (incf p-i u-s0)
+                                     (incf p-j u-s0)))
+                          ;; ---- 旋转 V 的第 i, j 列 ----
+                          (let ((p-i (+ v-off (* i v-s1)))
+                                (p-j (+ v-off (* j v-s1))))
+                            (declare (type fixnum p-i p-j))
+                            (loop for r of-type fixnum from 0 below n
+                                  do (let* ((vi (aref v-data p-i))
+                                            (vj (aref v-data p-j)))
+                                       (setf (aref v-data p-i) (- (* vi c) (* vj s))
+                                             (aref v-data p-j) (+ (* vi s) (* vj c))))
+                                     (incf p-i v-s0)
+                                     (incf p-j v-s0)))
+                          ;; ---- 用解析公式更新缓存范数（O(1)）----
+                          ;; new α = c²·α - 2cs·γ + s²·β
+                          ;; new β = s²·α + 2cs·γ + c²·β
+                          (setf (aref col-norms i)
+                                (+ (* c c alpha)
+                                   (* -2.0d0 c s gamma)
+                                   (* s s beta)))
+                          (setf (aref col-norms j)
+                                (+ (* s s alpha)
+                                   (*  2.0d0 c s gamma)
+                                   (* c c beta))))))
+              (incf sweep)
+              ;; 每轮结束重算一次，抑制浮点漂移
+              (when changed (refresh-norms)))
+
+            ;; ====== 重建：按范数降序排列 ======
             (let* ((s-vec (make-array k :element-type 'double-float))
-                   (u-k (vt-zeros (list m k) :dtype :float64))
-                   (pairs (stable-sort (loop for col from 0 below n
-					     collect (cons (sqrt (col-norm-sq col)) col))
-                                       #'> :key #'car)))
+                   (u-k   (vt-zeros (list m k) :dtype :float64))
+                   ;; 用 cons 列表记录 (范数 . 原列号)，只排一次
+                   (pairs (stable-sort
+                           (loop for col of-type fixnum from 0 below n
+                                 collect (cons (sqrt (aref col-norms col)) col))
+                           #'> :key #'car)))
+              (declare (type (simple-array double-float (*)) s-vec))
+
+              ;; ---- 提取 U 的 k 列 ----
               (dotimes (new-i k)
                 (destructuring-bind (val . old-col) (nth new-i pairs)
                   (setf (aref s-vec new-i) val)
                   (setf (vt-slice u-k '(:all) (list new-i))
-                        (vt-slice u '(:all) (list old-col)))))
+                        (vt-slice u   '(:all) (list old-col)))))
+
+              ;; ---- 零奇异值 → 随机正交补 ----
               (dotimes (i k)
                 (if (zerop (aref s-vec i))
-                    (let ((random-v (vt-random (list m) :rng *vt-default-random-state*)))
+                    (let ((random-v (vt-random (list m)
+                                               :rng *vt-default-random-state*)))
                       (loop repeat 2 do
                         (dotimes (j i)
-                          ;; flatten 避免 2D-1D 广播分配
                           (let* ((uj (vt-flatten (vt-slice u-k '(:all) (list j))))
                                  (proj (vt-ref (vt-dot uj random-v))))
                             (setf random-v (vt-- random-v (vt-scale uj proj))))))
@@ -1705,32 +1798,34 @@
                     (let ((inv (/ 1.0d0 (aref s-vec i))))
                       (setf (vt-slice u-k '(:all) (list i))
                             (vt-scale (vt-slice u-k '(:all) (list i)) inv)))))
+
+              ;; ---- V 按同一次排序排列 ----
               (let* ((v-sorted (vt-zeros (list n n) :dtype :float64))
                      (used-cols nil))
                 (dotimes (new-i k)
                   (let ((old-col (cdr (nth new-i pairs))))
                     (push old-col used-cols)
                     (setf (vt-slice v-sorted '(:all) (list new-i))
-                          (vt-slice v '(:all) (list old-col)))))
-                (let ((rest-cols (loop for col from 0 below n
-                                       unless (member col used-cols) collect col)))
-                  (loop for offset from 0 for col in rest-cols do
-                    (setf (vt-slice v-sorted '(:all) (list (+ k offset)))
-                          (vt-slice v '(:all) (list col)))))
+                          (vt-slice v        '(:all) (list old-col)))))
+                (let ((rest-cols (loop for col of-type fixnum from 0 below n
+                                       unless (member col used-cols)
+                                         collect col)))
+                  (loop for offset of-type fixnum from 0
+                        for col in rest-cols
+                        do (setf (vt-slice v-sorted '(:all) (list (+ k offset)))
+                                 (vt-slice v        '(:all) (list col)))))
+
                 (let ((s-vt (vt-from-sequence (coerce s-vec 'list) :dtype :float64))
-                      (vt (vt-transpose v-sorted)))
+                      (vt   (vt-transpose v-sorted)))
                   (if (not full-matrices)
                       (let ((vt-k (vt-slice vt (list 0 k) '(:all))))
                         (values u-k s-vt vt-k))
                       (cond ((= m n) (values u-k s-vt vt))
                             ((> m n) (let ((u-full (extend-orthogonal-basis u-k)))
                                        (values u-full s-vt vt)))
-                            ((< m n) (values u-k s-vt vt))))))))))))) 
+                            ((< m n) (values u-k s-vt vt)))))))))))))
 
 ;;;; linalg-extensions.lisp — 扩展线性代数功能
-
-(in-package :clvt)
-
 ;;; ============================================================
 ;;; 1. Cholesky 分解
 ;;; ============================================================
