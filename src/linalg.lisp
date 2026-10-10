@@ -1161,77 +1161,335 @@
 	vt
 	(vt-contiguous vt))))
 
+;;; ============================================================
+;;; 分解函数双路径内核：SIMD(AVX/FMA) 快速内核 + 通用内核
+;;; ------------------------------------------------------------
+;;; 路由模式与 simd-matmul.lisp（vt-matmul）、vt-svd 一致：
+;;;   1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：sb-simd
+;;;      f64.4 + FMA 内核（SAP 访问，with-pinned-objects 固定数组）；
+;;;   2. 通用路径（任何平台 / *vt-linalg-simd-enabled* = nil）：纯标量
+;;;      内核（仅 simple-array aref，零 SIMD/SAP 依赖），即原实现的
+;;;      算法与逐元素公式。
+;;; 内核语义与原实现逐元素公式一致（axpy/dir 由调用方传入符号），
+;;; 仅浮点求和分组不同（SIMD 分部分和，同 vt-svd 的容差约定）。
+;;; ============================================================
+
+(defvar *vt-linalg-simd-enabled* t
+  "vt-lu/vt-qr/vt-solve/vt-cholesky/vt-eig 是否启用 SIMD(AVX/FMA) 内核；置 nil 强制使用通用内核（无 SIMD 依赖，同 vt-matmul 回退 einsum 的模式）。")
+
+;;; ============ 通用内核（无 SIMD 依赖：simple-array + aref）============
+
+(declaim (inline %ln-f64-axpy %ln-f64-dot %ln-f64-rot2))
+
+;; y[yi+k] += a * x[xi+k]，k = 0..n-1
+(defun %ln-f64-axpy (x xi y yi n a)
+  (declare (type (simple-array double-float (*)) x y)
+           (type fixnum xi yi n)
+           (type double-float a)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (loop for k of-type fixnum from 0 below n
+        do (incf (aref y (+ yi k)) (* a (aref x (+ xi k))))))
+
+;; Σ_k x[xi+k] * y[yi+k]
+(defun %ln-f64-dot (x xi y yi n)
+  (declare (type (simple-array double-float (*)) x y)
+           (type fixnum xi yi n)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((sum 0.0d0))
+    (declare (type double-float sum))
+    (loop for k of-type fixnum from 0 below n
+          do (incf sum (* (aref x (+ xi k)) (aref y (+ yi k)))))
+    sum))
+
+;; 双行旋转（就地）：x' = c·x + s·y ; y' = -s·x + c·y
+(defun %ln-f64-rot2 (x xi y yi n c s)
+  (declare (type (simple-array double-float (*)) x y)
+           (type fixnum xi yi n)
+           (type double-float c s)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (loop for k of-type fixnum from 0 below n
+        do (let ((xv (aref x (+ xi k)))
+                 (yv (aref y (+ yi k))))
+             (setf (aref x (+ xi k)) (+ (* c xv) (* s yv))
+                   (aref y (+ yi k)) (+ (* (- s) xv) (* c yv))))))
+
+;;; ============ AVX 快速内核（SBCL + sb-simd）============
+;;; 寻址约定同 %svd-f64-*-avx：f64.4-sap-ref 的下标为【元素索引】，
+;;; 标量尾经 sap-ref-double 访问时才乘 8 转字节偏移。
+#+sbcl
+(progn
+  (declaim (inline %ln-f64-axpy-avx %ln-f64-dot-avx %ln-f64-rot2-avx))
+
+  ;; y += a·x（2×f64.4 FMA 展开打破依赖链，尾部标量补齐）
+  (defun %ln-f64-axpy-avx (sx xi sy yi n a)
+    (declare (type sb-sys:system-area-pointer sx sy)
+             (type fixnum xi yi n)
+             (type double-float a)
+             (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+    (let ((av (sb-simd-avx:f64.4 a))
+          (main8 (the fixnum (logand n -8)))
+          (main4 (the fixnum (logand n -4))))
+      (declare (type fixnum main8 main4))
+      (do ((k 0 (the fixnum (+ k 8)))
+           (i xi (the fixnum (+ i 8)))
+           (j yi (the fixnum (+ j 8))))
+          ((>= k main8))
+        (declare (type fixnum k i j))
+        (setf (sb-simd-avx:f64.4-sap-ref sy j)
+              (sb-simd-fma:f64.4-fmadd av (sb-simd-avx:f64.4-sap-ref sx i)
+                                       (sb-simd-avx:f64.4-sap-ref sy j))
+              (sb-simd-avx:f64.4-sap-ref sy (+ j 4))
+              (sb-simd-fma:f64.4-fmadd av (sb-simd-avx:f64.4-sap-ref sx (+ i 4))
+                                       (sb-simd-avx:f64.4-sap-ref sy (+ j 4)))))
+      (do ((k main8 (the fixnum (+ k 4)))
+           (i (+ xi main8) (the fixnum (+ i 4)))
+           (j (+ yi main8) (the fixnum (+ j 4))))
+          ((>= k main4))
+        (declare (type fixnum k i j))
+        (setf (sb-simd-avx:f64.4-sap-ref sy j)
+              (sb-simd-fma:f64.4-fmadd av (sb-simd-avx:f64.4-sap-ref sx i)
+                                       (sb-simd-avx:f64.4-sap-ref sy j))))
+      (do ((k main4 (1+ k))
+           (i (+ xi main4) (1+ i))
+           (j (+ yi main4) (1+ j)))
+          ((>= k n))
+        (declare (type fixnum k i j))
+        (incf (sb-sys:sap-ref-double sy (* j 8))
+              (* a (sb-sys:sap-ref-double sx (* i 8)))))))
+
+  ;; Σ x·y（4 累加器展开，结构同 %svd-f64-dot-avx）
+  (defun %ln-f64-dot-avx (sx xi sy yi n)
+    (declare (type sb-sys:system-area-pointer sx sy)
+             (type fixnum xi yi n)
+             (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+    (let ((acc0 (sb-simd-avx:f64.4 0.0d0))
+          (acc1 (sb-simd-avx:f64.4 0.0d0))
+          (acc2 (sb-simd-avx:f64.4 0.0d0))
+          (acc3 (sb-simd-avx:f64.4 0.0d0))
+          (main16 (the fixnum (logand n -16)))
+          (main4  (the fixnum (logand n -4)))
+          (tail 0.0d0))
+      (declare (type fixnum main16 main4) (type double-float tail))
+      (do ((e 0 (the fixnum (+ e 16)))
+           (i xi (the fixnum (+ i 16)))
+           (j yi (the fixnum (+ j 16))))
+          ((>= e main16))
+        (declare (type fixnum e i j))
+        (setf acc0 (sb-simd-fma:f64.4-fmadd
+                    (sb-simd-avx:f64.4-sap-ref sx i)
+                    (sb-simd-avx:f64.4-sap-ref sy j) acc0)
+              acc1 (sb-simd-fma:f64.4-fmadd
+                    (sb-simd-avx:f64.4-sap-ref sx (+ i 4))
+                    (sb-simd-avx:f64.4-sap-ref sy (+ j 4)) acc1)
+              acc2 (sb-simd-fma:f64.4-fmadd
+                    (sb-simd-avx:f64.4-sap-ref sx (+ i 8))
+                    (sb-simd-avx:f64.4-sap-ref sy (+ j 8)) acc2)
+              acc3 (sb-simd-fma:f64.4-fmadd
+                    (sb-simd-avx:f64.4-sap-ref sx (+ i 12))
+                    (sb-simd-avx:f64.4-sap-ref sy (+ j 12)) acc3)))
+      (do ((e main16 (the fixnum (+ e 4)))
+           (i (+ xi main16) (the fixnum (+ i 4)))
+           (j (+ yi main16) (the fixnum (+ j 4))))
+          ((>= e main4))
+        (declare (type fixnum e i j))
+        (setf acc0 (sb-simd-fma:f64.4-fmadd
+                    (sb-simd-avx:f64.4-sap-ref sx i)
+                    (sb-simd-avx:f64.4-sap-ref sy j) acc0)))
+      (do ((e main4 (1+ e))
+           (i (+ xi main4) (1+ i))
+           (j (+ yi main4) (1+ j)))
+          ((>= e n))
+        (declare (type fixnum e i j))
+        (incf tail (* (sb-sys:sap-ref-double sx (* i 8))
+                      (sb-sys:sap-ref-double sy (* j 8)))))
+      (let ((ab (sb-simd-avx:f64.4+ acc0 acc1))
+            (cd (sb-simd-avx:f64.4+ acc2 acc3)))
+        (multiple-value-bind (a b c d) (sb-simd-avx:f64.4-values (sb-simd-avx:f64.4+ ab cd))
+          (declare (type double-float a b c d))
+          (+ tail (+ (+ a c) (+ b d)))))))
+
+  ;; 双行旋转（2×f64.4 展开；x' = c·x + s·y ; y' = -s·x + c·y）
+  (defun %ln-f64-rot2-avx (sx xi sy yi n c s)
+    (declare (type sb-sys:system-area-pointer sx sy)
+             (type fixnum xi yi n)
+             (type double-float c s)
+             (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+    (let ((cv (sb-simd-avx:f64.4 c))
+          (sv (sb-simd-avx:f64.4 s))
+          (nsv (sb-simd-avx:f64.4 (- s)))
+          (main8 (the fixnum (logand n -8)))
+          (main4 (the fixnum (logand n -4))))
+      (declare (type fixnum main8 main4))
+      (do ((k 0 (the fixnum (+ k 8)))
+           (i xi (the fixnum (+ i 8)))
+           (j yi (the fixnum (+ j 8))))
+          ((>= k main8))
+        (declare (type fixnum k i j))
+        (let ((xv  (sb-simd-avx:f64.4-sap-ref sx i))
+              (yv  (sb-simd-avx:f64.4-sap-ref sy j))
+              (xv2 (sb-simd-avx:f64.4-sap-ref sx (+ i 4)))
+              (yv2 (sb-simd-avx:f64.4-sap-ref sy (+ j 4))))
+          (setf (sb-simd-avx:f64.4-sap-ref sx i)
+                (sb-simd-fma:f64.4-fmadd cv xv (sb-simd-avx:f64.4* sv yv))
+                (sb-simd-avx:f64.4-sap-ref sy j)
+                (sb-simd-fma:f64.4-fmadd cv yv (sb-simd-avx:f64.4* nsv xv))
+                (sb-simd-avx:f64.4-sap-ref sx (+ i 4))
+                (sb-simd-fma:f64.4-fmadd cv xv2 (sb-simd-avx:f64.4* sv yv2))
+                (sb-simd-avx:f64.4-sap-ref sy (+ j 4))
+                (sb-simd-fma:f64.4-fmadd cv yv2 (sb-simd-avx:f64.4* nsv xv2)))))
+      (do ((k main8 (the fixnum (+ k 4)))
+           (i (+ xi main8) (the fixnum (+ i 4)))
+           (j (+ yi main8) (the fixnum (+ j 4))))
+          ((>= k main4))
+        (declare (type fixnum k i j))
+        (let ((xv (sb-simd-avx:f64.4-sap-ref sx i))
+              (yv (sb-simd-avx:f64.4-sap-ref sy j)))
+          (setf (sb-simd-avx:f64.4-sap-ref sx i)
+                (sb-simd-fma:f64.4-fmadd cv xv (sb-simd-avx:f64.4* sv yv))
+                (sb-simd-avx:f64.4-sap-ref sy j)
+                (sb-simd-fma:f64.4-fmadd cv yv (sb-simd-avx:f64.4* nsv xv)))))
+      (do ((k main4 (1+ k))
+           (i (+ xi main4) (1+ i))
+           (j (+ yi main4) (1+ j)))
+          ((>= k n))
+        (declare (type fixnum k i j))
+        (let ((xv (sb-sys:sap-ref-double sx (* i 8)))
+              (yv (sb-sys:sap-ref-double sy (* j 8))))
+          (setf (sb-sys:sap-ref-double sx (* i 8)) (+ (* c xv) (* s yv))
+                (sb-sys:sap-ref-double sy (* j 8)) (+ (* (- s) xv) (* c yv))))))))
+
+
+;;; ============ 句柄统一访问器（aref / SAP 同签名，供宏内联）============
+(declaim (inline %ln-f64-aref))
+(defun %ln-f64-aref (arr idx)
+  (declare (type (simple-array double-float (*)) arr)
+           (type fixnum idx)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (aref arr idx))
+
+(declaim (inline (setf %ln-f64-aref)))
+(defun (setf %ln-f64-aref) (v arr idx)
+  (declare (type double-float v)
+           (type (simple-array double-float (*)) arr)
+           (type fixnum idx)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (setf (aref arr idx) v))
+
+#+sbcl
+(progn
+  (declaim (inline %ln-sap-f64-aref))
+  (defun %ln-sap-f64-aref (sap idx)
+    (declare (type sb-sys:system-area-pointer sap)
+             (type fixnum idx)
+             (optimize (speed 3) (safety 0) (debug 0)))
+    (sb-sys:sap-ref-double sap (* idx 8)))
+
+  (declaim (inline (setf %ln-sap-f64-aref)))
+  (defun (setf %ln-sap-f64-aref) (v sap idx)
+    (declare (type double-float v)
+             (type sb-sys:system-area-pointer sap)
+             (type fixnum idx)
+             (optimize (speed 3) (safety 0) (debug 0)))
+    (setf (sb-sys:sap-ref-double sap (* idx 8)) v)))
+
+;;; ============ LU 消元核心（宏生成通用 / AVX 双引擎）============
+;;; 迭代次序、部分选主元、行交换与消元公式与原 vt-lu 完全一致；
+;;; 消元内层改用 AXPY 内核（data[i,j] -= mult·data[k,j] ≡
+;;; y += (-mult)·x，IEEE 负号精确，逐元素位一致）。
+
+(defmacro %define-vt-lu-core (name axpy-fn eref handle-type)
+  `(defun ,name (wh off s0 s1 m n k-max piv)
+     "部分选主元 LU 消元核心（就地修改 wh，填充 piv，返回 sign）。
+wh: 连续工作矩阵句柄（通用: simple-array；AVX: SAP），行主序，s1=1。"
+     (declare (type ,handle-type wh)
+              (type fixnum off s0 s1 m n k-max)
+              (type (simple-array fixnum (*)) piv)
+              (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+     (let ((sign 1))
+       (declare (type fixnum sign))
+       (loop for k of-type fixnum from 0 below k-max
+             for base-k of-type fixnum = (+ off (* k s0))
+             for kk     of-type fixnum = (+ off (* k s0) (* k s1))
+             do (let ((max-row k)
+                      (max-val (abs (,eref wh kk))))
+                  (declare (type fixnum max-row)
+                           (type double-float max-val))
+                  ;; ---------- 选主元（部分选主元，与原实现一致）----------
+                  (loop for i of-type fixnum from (1+ k) below m
+                        for p of-type fixnum = (+ off (* i s0) (* k s1))
+                        for val of-type double-float = (abs (,eref wh p))
+                        do (when (> val max-val)
+                             (setf max-val val max-row i)))
+                  (unless (< max-val 1d-300)
+                    ;; ---------- 行交换 ----------
+                    (unless (= max-row k)
+                      (rotatef (aref piv k) (aref piv max-row))
+                      (setf sign (- sign))
+                      (loop for j of-type fixnum from 0 below n
+                            do (rotatef (,eref wh (+ base-k j))
+                                        (,eref wh (+ off (* max-row s0) j)))))
+                    ;; ---------- 消元：mult 写入 ik，剩余段 AXPY ----------
+                    (let ((pivot (,eref wh kk))
+                          (j0    (1+ k)))
+                      (declare (type double-float pivot) (type fixnum j0))
+                      (loop for i of-type fixnum from j0 below m
+                            for base-i of-type fixnum = (+ off (* i s0))
+                            for mult of-type double-float
+                              = (/ (,eref wh (+ base-i k)) pivot)
+                            do (setf (,eref wh (+ base-i k)) mult)
+                               ;; data[i,j0..] -= mult·data[k,j0..]
+                               (,axpy-fn wh (+ base-k j0) wh (+ base-i j0)
+                                         (- n j0) (- mult)))))))
+       sign)))
+
+;; 通用引擎：无 SIMD 依赖（原 vt-lu 的算法与逐元素公式，纯 aref）
+(%define-vt-lu-core %vt-lu-core-generic %ln-f64-axpy %ln-f64-aref
+                    (simple-array double-float (*)))
+
+;; AVX 快速引擎：SBCL + sb-simd（内核约定同 simd-matmul.lisp）
+#+sbcl
+(%define-vt-lu-core %vt-lu-core-avx %ln-f64-axpy-avx %ln-sap-f64-aref
+                    sb-sys:system-area-pointer)
+
 (defun vt-lu (matrix)
   "部分选主元 LU 分解。返回 (values a piv sign)：
    a    : 原地修改后的合并 LU 矩阵（vt，float64）
    piv  : fixnum 向量（不是列表），行置换
    sign : 行交换符号（+1/-1）
-   满足 P @ A = L @ U，其中 P[i, piv[i]] = 1。支持非方阵。"
+   满足 P @ A = L @ U，其中 P[i, piv[i]] = 1。支持非方阵。
+
+  实现：双路径路由（同 vt-matmul/vt-svd 模式）——
+  1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：消元内层 AXPY
+     用 sb-simd AVX/FMA 内核（FMA 乘加，舍入分组略有差异）；
+  2. 通用路径：原实现的纯标量循环，逐元素位一致。
+  *vt-linalg-simd-enabled* 控制路由，两条路径共享选主元/行交换语义。"
   (let* ((a (ensure-contiguous-2d-vt (vt-astype matrix :float64)))
          (m (first (vt-shape a)))    ; 行数
          (n (second (vt-shape a)))   ; 列数
          (k-max (min m n))
          (data (vt-data a))
          (s0 (first (vt-strides a))) ; 行步长
-         (s1 (second (vt-strides a))); 列步长
+         (s1 (second (vt-strides a))); 列步长（ensure-contiguous 保证 =1）
          (off (vt-offset a))
          (piv (make-array m :element-type 'fixnum))
          (sign 1))
     (declare (type (simple-array double-float (*)) data)
              (type fixnum m n k-max s0 s1 off sign)
-             (type (simple-array fixnum (*)) piv)
-             (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+             (type (simple-array fixnum (*)) piv))
     ;; 初始化置换向量
     (loop for i of-type fixnum from 0 below m
           do (setf (aref piv i) i))
-    (loop for k of-type fixnum from 0 below k-max
-          ;; 提前算好这一主元步用到的不变量
-          for base-k of-type fixnum = (+ off (the fixnum (* k s0)))
-          for kk     of-type fixnum = (+ off
-					 (the fixnum (* k s0))
-					 (the fixnum (* k s1)))
-          do (let ((max-row k)
-                   (max-val (abs (aref data kk))))
-               (declare (type fixnum max-row)
-			(type double-float max-val))
-               ;; ---------- 选主元 ----------
-               (loop for i of-type fixnum from (1+ k) below m
-                     for p of-type fixnum = (+ off
-					       (the fixnum (* i s0))
-					       (the fixnum (* k s1)))
-                     for val of-type double-float = (abs (aref data p))
-                     do (when (> val max-val)
-                          (setf max-val val max-row i)))
-               (unless (< max-val 1d-300)
-                 ;; ---------- 行交换 ----------
-                 (unless (= max-row k)
-                   (rotatef (aref piv k) (aref piv max-row))
-                   (setf sign (- sign))
-                   (let ((base-r (+ off (the fixnum (* max-row s0)))))
-                     (declare (type fixnum base-r))
-                     (loop for j of-type fixnum from 0 below n
-                           for p1 of-type fixnum = (+ base-k (the fixnum (* j s1)))
-                           for p2 of-type fixnum = (+ base-r (the fixnum (* j s1)))
-                           do (rotatef (aref data p1) (aref data p2)))))
-                 ;; ---------- 消元 ----------
-                 (let ((pivot (aref data kk))
-                       (j0    (1+ k)))
-                   (declare (type double-float pivot) (type fixnum j0))
-                   (loop for i of-type fixnum from j0 below m
-                         for base-i of-type fixnum = (+ off (the fixnum (* i s0)))
-                         for ik of-type fixnum = (+ base-i (the fixnum (* k s1)))
-                         for mult of-type double-float = (/ (aref data ik) pivot)
-                         do (setf (aref data ik) mult)
-                            (let ((pij (+ base-i (the fixnum (* j0 s1))))
-                                  (pkj (+ base-k (the fixnum (* j0 s1))))
-                                  (cnt (- n j0)))
-                              (declare (type fixnum pij pkj cnt))
-                              (loop repeat cnt
-                                    do (decf (aref data pij)
-                                             (* mult (aref data pkj)))
-                                       (incf pij s1)
-                                       (incf pkj s1))))))))
+    ;; 引擎分派（ensure-contiguous 保证 s1=1，AXPY 内核要求连续段）
+    (cond
+      #+sbcl
+      ((and *vt-linalg-simd-enabled* (= s1 1))
+       (setf sign (sb-sys:with-pinned-objects (data)
+                    (%vt-lu-core-avx (sb-sys:vector-sap data)
+                                     off s0 s1 m n k-max piv))))
+      (t
+       (setf sign (%vt-lu-core-generic data off s0 s1 m n k-max piv))))
     (values a piv sign)))
+
 
 (defun vt-det (matrix &key out)
   "基于 lu 分解计算行列式，返回 0 维张量"
@@ -1264,8 +1522,77 @@
         (if out (vt-fill out det) (make-vt nil det :dtype :float64))))))
 
 
+
+;;; ============ 三角替换核心（宏生成通用 / AVX 双引擎）============
+;;; 置换 → 前代 → 回代，迭代次序与原 vt-solve 完全一致；
+;;; 前代/回代的内层（nrhs 维连续段）改用 AXPY 内核：
+;;; b[i,j] -= mult·b[k,j] ≡ y += (-mult)·x（IEEE 负号精确，逐元素
+;;; 位一致；AVX 路径经 FMA，舍入分组略有差异）。
+;;; vt-inv（nrhs = n，O(n³)）是最大受益者。
+
+(defmacro %define-vt-solve-subst (name axpy-fn eref handle-type)
+  `(defun ,name (lu-h lu-off lu-s0 lu-s1 n
+                 b-h b-off b-s0 b-s1
+                 ob-h ob-off ob-s0 ob-s1
+                 piv nrhs singular-threshold)
+     "行置换 + 前代 + 回代核心（就地修改 b）。
+lu/b/ob: 连续行主序句柄（通用: simple-array；AVX: SAP），s1=1。"
+     (declare (type ,handle-type lu-h b-h ob-h)
+              (type (simple-array fixnum (*)) piv)
+              (type fixnum lu-off lu-s0 lu-s1 n
+                    b-off b-s0 b-s1 ob-off ob-s0 ob-s1 nrhs)
+              (type double-float singular-threshold)
+              (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+     ;; 1. 应用行置换 pb（逐元素拷贝，与原实现一致）
+     (loop for i of-type fixnum from 0 below n do
+       (loop for j of-type fixnum from 0 below nrhs do
+         (setf (,eref b-h (+ b-off (* i b-s0) (* j b-s1)))
+               (,eref ob-h (+ ob-off (* (aref piv i) ob-s0)
+                             (* j b-s1))))))
+     ;; 2. 前代（单位下三角）：b[i,:] -= L[i,k]·b[k,:]
+     (loop for k of-type fixnum from 0 below n do
+       (loop for i of-type fixnum from (1+ k) below n
+             for mult of-type double-float
+               = (,eref lu-h (+ lu-off (* i lu-s0) (* k lu-s1)))
+             do (,axpy-fn b-h (+ b-off (* k b-s0))
+                          b-h (+ b-off (* i b-s0))
+                          nrhs (- mult))))
+     ;; 3. 回代（上三角）：除对角，b[i,:] -= U[i,k]·b[k,:]
+     (loop for k of-type fixnum from (1- n) downto 0 do
+       (let ((pivot (,eref lu-h (+ lu-off (* k lu-s0) (* k lu-s1)))))
+         (declare (type double-float pivot))
+         (when (or (zerop pivot)
+                   (< (abs pivot) singular-threshold))
+           (error "LinAlgError: Singular matrix. Cannot solve or invert."))
+         (loop for j of-type fixnum from 0 below nrhs do
+           (setf (,eref b-h (+ b-off (* k b-s0) (* j b-s1)))
+                 (/ (,eref b-h (+ b-off (* k b-s0) (* j b-s1)))
+                    pivot)))
+         (loop for i of-type fixnum from 0 below k
+               for factor of-type double-float
+                 = (,eref lu-h (+ lu-off (* i lu-s0) (* k lu-s1)))
+               do (,axpy-fn b-h (+ b-off (* k b-s0))
+                            b-h (+ b-off (* i b-s0))
+                            nrhs (- factor)))))))
+
+;; 通用引擎：无 SIMD 依赖（原 vt-solve 的算法与逐元素公式，纯 aref）
+(%define-vt-solve-subst %vt-solve-subst-generic %ln-f64-axpy %ln-f64-aref
+                        (simple-array double-float (*)))
+
+;; AVX 快速引擎：SBCL + sb-simd
+#+sbcl
+(%define-vt-solve-subst %vt-solve-subst-avx %ln-f64-axpy-avx %ln-sap-f64-aref
+                        sb-sys:system-area-pointer)
+
 (defun vt-solve (a b &key out)
-  "求解线性方程组 ax = b (支持多右端项)"
+  "求解线性方程组 ax = b (支持多右端项)
+
+  实现：双路径路由（同 vt-matmul/vt-svd 模式）——
+  1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：前代/回代的
+     nrhs 维连续段走 sb-simd AVX/FMA AXPY 内核（vt-inv 多右端项
+     O(n³) 主受益）；
+  2. 通用路径：原实现的纯标量循环，逐元素位一致。
+  *vt-linalg-simd-enabled* 控制路由，两条路径共享置换/阈值/奇异报错语义。"
   (with-float-safe
     (let* ((a-shape (vt-shape a)))
       ;; 校验系数矩阵为方阵
@@ -1284,95 +1611,66 @@
           (error "vt-solve: b 的行数 ~a 与系数矩阵阶数 ~a 不匹配（b 形状 ~a）"
                  (if b-shape (first b-shape) 0) n b-shape))
         (let* ((nrhs (if (> (length b-shape) 1) (second b-shape) 1))
-               (b-copy (if (= nrhs 1)
-			   (vt-reshape (vt-astype (vt-copy b-vt) :float64)
-				       (list n 1))
-			   (vt-astype (vt-copy b-vt) :float64)))
+               ;; 1D b 先 reshape 为 n×1 列向量（与原实现一致），再确保连续
+               (b-copy (ensure-contiguous-2d-vt
+                        (let ((b2 (vt-astype (vt-copy b-vt) :float64)))
+                          (if (= nrhs 1)
+                              (vt-reshape b2 (list n 1))
+                              b2))))
                (orig-b (vt-copy b-copy)))
-	  (multiple-value-bind (lu piv sign)
+          (multiple-value-bind (lu piv sign)
               (vt-lu a)
             (declare (ignore sign))
             (let ((lu-data (vt-data lu))
-		  (lu-s0 (first (vt-strides lu)))
-		  (lu-s1 (second (vt-strides lu)))
-		  (lu-off (vt-offset lu))
-		  (b-data (vt-data b-copy))
-		  (b-s0 (first (vt-strides b-copy)))
-		  (b-s1 (second (vt-strides b-copy)))
-		  (b-off (vt-offset b-copy))
-		  (ob-data (vt-data orig-b))
-		  (ob-s0 (first (vt-strides orig-b)))
-		  (ob-s1 (second (vt-strides orig-b)))
-		  (ob-off (vt-offset orig-b)))
+                  (lu-s0 (first (vt-strides lu)))
+                  (lu-s1 (second (vt-strides lu)))
+                  (lu-off (vt-offset lu))
+                  (b-data (vt-data b-copy))
+                  (b-s0 (first (vt-strides b-copy)))
+                  (b-s1 (second (vt-strides b-copy)))
+                  (b-off (vt-offset b-copy))
+                  (ob-data (vt-data orig-b))
+                  (ob-s0 (first (vt-strides orig-b)))
+                  (ob-s1 (second (vt-strides orig-b)))
+                  (ob-off (vt-offset orig-b)))
               ;; 计算相对奇异阈值：基于 LU 矩阵的最大绝对值元素，
               ;; 避免绝对阈值 1e-12 对小范数矩阵误判为奇异、对大范数矩阵漏判。
               ;; 阈值 = n * eps * max|lu_ij|，n 为矩阵阶数，
               ;; eps = double-float-epsilon (≈2.22e-16)，n 倍补偿消元累积误差。
               (let ((max-abs 0.0d0))
-		(declare (double-float max-abs))
-		(loop for i below (length lu-data) do
+                (declare (double-float max-abs))
+                (loop for i below (length lu-data) do
                   (let ((v (abs (aref lu-data i))))
                     (when (> v max-abs)
                       (setf max-abs v))))
-		(let ((singular-threshold
-			(* (max 1 n) double-float-epsilon
+                (let ((singular-threshold
+                        (* (max 1 n) double-float-epsilon
                            (max max-abs 1.0d0))))
                   (declare (double-float singular-threshold))
-		  ;; 1. 应用行置换 pb
-		  (loop for i from 0 below n do
-		    (loop for j from 0 below nrhs do
-		      (setf (aref b-data (+ b-off
-					    (* i b-s0)
-					    (* j b-s1)))
-			    (aref ob-data (+ ob-off
-					     (* (elt piv i) ob-s0)
-					     (* j ob-s1))))))          
-		  ;; 2. 前代
-		  (loop for k from 0 below n do
-		    (loop for i from (1+ k) below n
-			  for mult = (aref lu-data (+ lu-off
-						      (* i lu-s0)
-						      (* k lu-s1)))
-			  do (loop for j from 0 below nrhs do
-			    (decf (aref b-data (+ b-off
-						  (* i b-s0)
-						  (* j b-s1)))
-				  (* mult (aref b-data (+ b-off
-							  (* k b-s0)
-							  (* j b-s1))))))))          
-		  ;; 3. 回代
-		  (loop for k from (1- n) downto 0 do
-		    (let ((pivot (aref lu-data (+ lu-off
-						  (* k lu-s0)
-						  (* k lu-s1)))))
-		      (when (or (zerop pivot)
-				(< (abs pivot) singular-threshold))
-			(error "LinAlgError: Singular matrix. Cannot solve or invert."))
-		      (loop for j from 0 below nrhs do
-			(setf (aref b-data (+ b-off
-					      (* k b-s0)
-					      (* j b-s1)))
-			      (/ (aref b-data (+ b-off
-						 (* k b-s0)
-						 (* j b-s1)))
-				 pivot)))
-		      (loop for i from 0 below k
-			    for factor = (aref lu-data (+ lu-off
-							  (* i lu-s0)
-							  (* k lu-s1)))
-			    do (loop for j from 0 below nrhs do
-			      (decf (aref b-data (+ b-off
-						    (* i b-s0)
-						    (* j b-s1)))
-				    (* factor (aref b-data (+ b-off
-							      (* k b-s0)
-							      (* j b-s1)))))))))
-		  (let ((res (if (= nrhs 1)
-				 (vt-reshape b-copy (list n))
-				 b-copy)))
-		    (if out
-			(vt-map #'identity res :out out)
-			res)))))))))))
+                  ;; 引擎分派（ensure-contiguous/vt-lu 保证 s1=1）
+                  (cond
+                    #+sbcl
+                    ((and *vt-linalg-simd-enabled*
+                          (= lu-s1 1) (= b-s1 1) (= ob-s1 1))
+                     (sb-sys:with-pinned-objects (lu-data b-data ob-data)
+                       (%vt-solve-subst-avx
+                        (sb-sys:vector-sap lu-data) lu-off lu-s0 lu-s1 n
+                        (sb-sys:vector-sap b-data) b-off b-s0 b-s1
+                        (sb-sys:vector-sap ob-data) ob-off ob-s0 ob-s1
+                        piv nrhs singular-threshold)))
+                    (t
+                     (%vt-solve-subst-generic
+                      lu-data lu-off lu-s0 lu-s1 n
+                      b-data b-off b-s0 b-s1
+                      ob-data ob-off ob-s0 ob-s1
+                      piv nrhs singular-threshold)))
+                  (let ((res (if (= nrhs 1)
+                                 (vt-reshape b-copy (list n))
+                                 b-copy)))
+                    (if out
+                        (vt-map #'identity res :out out)
+                        res)))))))))))
+
 
 (defun vt-inv (matrix)
   "矩阵求逆。"
@@ -1384,136 +1682,166 @@
 
 ;;; 3. 矩阵分解
 
+;;; ============ QR 核心（宏生成通用 / AVX 双引擎）============
+;;; 迭代次序、Householder 公式与原 vt-qr 完全一致。两处完善：
+;;;   1. 原实现的 w[j] = Σ v[ii]·R[i+ii, i+j] 沿「列」跨行访问（stride
+;;;      = r-s0），缓存命中率差——重构为按行 AXPY 累加
+;;;      （w += v[ii]·R[i+ii, i..]），每个 w[j] 的逐元素求和顺序不变，
+;;;      结果与原实现位一致；
+;;;   2. reflector 向量不再逐级构造 vt-slice/vt-copy 对象，直接在打包
+;;;      的扁平缓冲 v-buf 上操作。
+;;; 消元/更新内层统一走 AXPY 内核（y -= a·x ≡ y += (-a)·x，IEEE 负号
+;;; 精确，逐元素位一致；AVX 路径经 FMA，舍入分组略有差异）。
+
+(defmacro %define-vt-qr-core (name axpy-fn eref handle-type)
+  `(defun ,name (r-h r-off r-s0 n m k
+                 q-h q-off nq
+                 v-buf v-offs betas w w-h)
+     "Householder QR 核心（就地修改 r/q，填充 v-buf/v-offs/betas）。
+r: m×n 连续行主序（s1=1）；q: m×nq 连续行主序（s1=1）。
+v-offs[i]: 第 i 个 reflector 在 v-buf 中的起始下标；长度 m-i。
+w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=w，AVX=SAP）。"
+     (declare (type ,handle-type r-h q-h w-h)
+              (type (simple-array double-float (*)) v-buf betas w)
+              (type (simple-array fixnum (*)) v-offs)
+              (type fixnum r-off r-s0 n m k q-off nq)
+              (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+     ;; ======== 1. 正向分解，更新 r，存 reflector ========
+     (loop for i of-type fixnum from 0 below k
+           do (let ((m-sub (- m i))
+                    (n-sub (- n i))
+                    (v-off (aref v-offs i)))
+                (declare (type fixnum m-sub n-sub v-off))
+                (if (<= m-sub 1)
+                    (setf (aref betas i) 0.0d0)
+                    (let ((base-r (+ r-off (* i r-s0) i))) ; R[i, i]
+                      (declare (type fixnum base-r))
+                      ;; ---- Householder：x = R[i..m-1, i]，stride r-s0 ----
+                      (let ((norm-sq 0.0d0))
+                        (declare (type double-float norm-sq))
+                        (loop for ii of-type fixnum from 0 below m-sub
+                              do (let ((val (,eref r-h (+ base-r (* ii r-s0)))))
+                                   (incf norm-sq (* val val))
+                                   (setf (aref v-buf (+ v-off ii)) val)))
+                        (let ((norm (sqrt norm-sq)))
+                          (declare (type double-float norm))
+                          (if (zerop norm)
+                              (setf (aref betas i) 0.0d0)
+                              (let* ((x0 (aref v-buf v-off))
+                                     (sigma (if (>= x0 0.0d0) (- norm) norm))
+                                     (v-norm-sq (* 2.0d0 norm (+ norm (abs x0)))))
+                                (declare (type double-float x0 sigma v-norm-sq))
+                                ;; v[0] = x0 - sigma（与 compute-householder 一致）
+                                (setf (aref v-buf v-off) (- x0 sigma))
+                                (let ((beta (/ 2.0d0 v-norm-sq)))
+                                  (declare (type double-float beta))
+                                  (setf (aref betas i) beta)
+                                  (when (> beta 0.0d0)
+                                    ;; ---- w += v[ii]·R[i+ii, i..n-1]（行 AXPY）----
+                                    (loop for j of-type fixnum from 0 below n-sub
+                                          do (setf (aref w j) 0.0d0))
+                                    (loop for ii of-type fixnum from 0 below m-sub
+                                          do (,axpy-fn r-h
+                                                       (+ base-r (* ii r-s0))
+                                                       w-h 0 n-sub
+                                                       (aref v-buf (+ v-off ii))))
+                                    ;; ---- R[i+ii, i..] -= (β·v[ii])·w ----
+                                    (loop for ii of-type fixnum from 0 below m-sub
+                                          do (,axpy-fn w-h 0
+                                                       r-h (+ base-r (* ii r-s0))
+                                                       n-sub
+                                                       (- (* beta
+                                                             (aref v-buf (+ v-off ii))))))))))))))))
+     ;; ======== 2. 反向累积 q ========
+     (loop for i of-type fixnum from (1- k) downto 0
+           do (let ((m-sub (- m i))
+                    (nq-sub nq)
+                    (beta (aref betas i))
+                    (v-off (aref v-offs i)))
+                (declare (type fixnum m-sub nq-sub v-off))
+                (when (> beta 0.0d0)
+                  (let ((base-q (+ q-off (* i nq))))
+                    (declare (type fixnum base-q))
+                    ;; ---- w += v[ii]·Q[i+ii, 0..nq-1]（行 AXPY）----
+                    (loop for j of-type fixnum from 0 below nq-sub
+                          do (setf (aref w j) 0.0d0))
+                    (loop for ii of-type fixnum from 0 below m-sub
+                          do (,axpy-fn q-h (+ base-q (* ii nq)) w-h 0 nq-sub
+                                       (aref v-buf (+ v-off ii))))
+                    ;; ---- Q[i+ii, 0..nq-1] -= (β·v[ii])·w ----
+                    (loop for ii of-type fixnum from 0 below m-sub
+                          do (,axpy-fn w-h 0
+                                       q-h (+ base-q (* ii nq)) nq-sub
+                                       (- (* beta (aref v-buf (+ v-off ii))))))))))))
+
+;; 通用引擎：无 SIMD 依赖（原 vt-qr 算法 + 行 AXPY 重构，纯 aref）
+(%define-vt-qr-core %vt-qr-core-generic %ln-f64-axpy %ln-f64-aref
+                    (simple-array double-float (*)))
+
+;; AVX 快速引擎：SBCL + sb-simd
+#+sbcl
+(%define-vt-qr-core %vt-qr-core-avx %ln-f64-axpy-avx %ln-sap-f64-aref
+                    sb-sys:system-area-pointer)
+
 (defun vt-qr (matrix &key (mode :reduced))
   "矩阵 qr 分解。
    matrix : m×n 矩阵。
    mode :reduced 返回 q(m×k), r(k×n)，k = min(m,n)。
-         :full 返回 q(m×m), r(m×n)。"
+         :full 返回 q(m×m), r(m×n)。
+
+  实现：双路径路由（同 vt-matmul/vt-svd 模式）——
+  1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：AXPY 内层走
+     sb-simd AVX/FMA 内核；
+  2. 通用路径：原算法 + 行 AXPY 重构（修复原实现按列跨行访问的
+     性能缺陷，逐元素求和顺序不变），纯标量 aref，无 SIMD 依赖。
+  两条路径共享 Householder 公式、迭代次序与输出形状契约。"
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
     (let* ((row (first  (vt-shape matrix)))
            (col (second (vt-shape matrix)))
            (k   (min row col))
-           (r      (vt-astype matrix :float64))
-           (vlist  (make-array k))
-           (betas  (make-array k :element-type 'double-float))
+           (need-full (eq mode :full))
+           (nq   (if need-full row k))
+           (r    (ensure-contiguous-2d-vt (vt-astype matrix :float64)))
+           (q    (vt-eye row :cols nq :dtype :float64))
            (r-data (vt-data r))
            (r-s0   (first  (vt-strides r)))
            (r-s1   (second (vt-strides r)))
            (r-off  (vt-offset r))
+           (q-data (vt-data q))
+           (q-s1   (second (vt-strides q)))
+           (q-off  (vt-offset q))
+           (betas  (make-array k :element-type 'double-float))
+           ;; 打包 reflector 缓冲：Σ_{i<k} (m-i)
+           (v-total (loop for i of-type fixnum from 0 below k
+                          sum (- row i) of-type fixnum))
+           (v-buf  (make-array v-total :element-type 'double-float
+                                       :initial-element 0.0d0))
+           (v-offs (make-array k :element-type 'fixnum))
            ;; 复用的工作缓冲，长度取 max(row,col) 覆盖两种模式
            (w (make-array (max row col) :element-type 'double-float
                                       :initial-element 0.0d0)))
-      (declare (type fixnum row col k r-s0 r-s1 r-off)
-               (type (simple-array double-float (*)) r-data betas w)
-               (optimize (speed 3) (safety 0) (debug 0)))
+      (declare (type fixnum row col k r-s0 r-s1 r-off q-s1 q-off)
+               (type (simple-array double-float (*)) r-data q-data betas v-buf w)
+               (type (simple-array fixnum (*)) v-offs))
+      (let ((acc 0))
+        (declare (type fixnum acc))
+        (loop for i of-type fixnum from 0 below k
+              do (setf (aref v-offs i) acc)
+                 (incf acc (- row i))))
+      ;; 引擎分派（ensure-contiguous/vt-eye 保证 s1=1）
+      (cond
+        #+sbcl
+        ((and *vt-linalg-simd-enabled* (= r-s1 1) (= q-s1 1))
+         (sb-sys:with-pinned-objects (r-data q-data v-buf betas w)
+           (%vt-qr-core-avx (sb-sys:vector-sap r-data) r-off r-s0 col row k
+                            (sb-sys:vector-sap q-data) q-off nq
+                            v-buf v-offs betas w (sb-sys:vector-sap w))))
+        (t
+         (%vt-qr-core-generic r-data r-off r-s0 col row k
+                              q-data q-off nq v-buf v-offs betas w w)))
+      (values q (if need-full r (vt-slice r (list 0 k) '(:all)))))))
 
-      ;; ============ 1. 正向分解，更新 r ============
-      (loop for i of-type fixnum from 0 below k
-            do (let ((m-sub (- row i))
-                     (n-sub (- col i)))
-                 (declare (type fixnum m-sub n-sub))
-                 (if (<= m-sub 1)
-                     (setf (aref betas i) 0.0d0)
-                     (multiple-value-bind (v beta sigma)
-                         (compute-householder
-                          (vt-slice r (list i row) (list i)))
-                       (declare (ignore sigma))
-                       (setf (aref vlist i) v
-                             (aref betas i) beta)
-                       (when (> beta 0.0d0)
-                         (let* ((v-data   (vt-data v))
-                                (v-stride (first (vt-strides v)))
-                                (v-off    (vt-offset v))
-                                ;; r[i+ii, i+j] 的地址 = base + ii*r-s0 + j*r-s1
-                                (base (+ r-off (* i r-s0) (* i r-s1))))
-                           (declare (type (simple-array double-float (*)) v-data)
-                                    (type fixnum v-stride v-off base))
-
-                           ;; ---- w[j] = sum_ii v[ii] * R[i+ii, i+j] ----
-                           (loop for j of-type fixnum from 0 below n-sub
-                                 for col-base of-type fixnum = (+ base (* j r-s1))
-                                 do (let ((s  0.0d0)
-                                          (p  col-base)
-                                          (pv v-off))
-                                      (declare (type double-float s)
-                                               (type fixnum p pv))
-                                      (loop for ii of-type fixnum from 0 below m-sub
-                                            do (incf s (* (aref v-data pv)
-                                                          (aref r-data p)))
-                                               (incf p  r-s0)
-                                               (incf pv v-stride))
-                                      (setf (aref w j) s)))
-
-                           ;; ---- R[i+ii, i+j] -= beta * v[ii] * w[j] ----
-                           (loop for ii of-type fixnum from 0 below m-sub
-                                 for row-base of-type fixnum = (+ base (* ii r-s0))
-                                 for pv of-type fixnum = v-off then (+ pv v-stride)
-                                 for vi of-type double-float = (aref v-data pv)
-                                 for bvi of-type double-float = (* beta vi)
-                                 do (let ((p  row-base)
-                                          (pw 0))
-                                      (declare (type fixnum p pw))
-                                      (loop for j of-type fixnum from 0 below n-sub
-                                            do (decf (aref r-data p)
-                                                     (* bvi (aref w pw)))
-                                               (incf p  r-s1)
-                                               (incf pw 1))))))))))
-
-      ;; ============ 2. 反向累积 q ============
-      (let* ((need-full (eq mode :full))
-             (q (if need-full
-                    (vt-eye row :cols row :dtype :float64)
-                    (vt-eye row :cols k   :dtype :float64)))
-             (nq     (second (vt-shape q)))
-             (q-data (vt-data q))
-             (q-s0   (first  (vt-strides q)))
-             (q-s1   (second (vt-strides q)))
-             (q-off  (vt-offset q)))
-        (declare (type fixnum nq q-s0 q-s1 q-off)
-                 (type (simple-array double-float (*)) q-data))
-        (loop for i of-type fixnum from (1- k) downto 0
-              for beta of-type double-float = (aref betas i)
-              for v = (aref vlist i)
-              when (and v (> beta 0.0d0))
-                do (let* ((m-sub    (- row i))
-                          (v-data   (vt-data v))
-                          (v-stride (first (vt-strides v)))
-                          (v-off    (vt-offset v))
-                          (base     (+ q-off (* i q-s0))))
-                     (declare (type (simple-array double-float (*)) v-data)
-                              (type fixnum m-sub v-stride v-off base))
-
-                     ;; ---- w[j] = sum_ii v[ii] * Q[i+ii, j] ----
-                     (loop for j of-type fixnum from 0 below nq
-                           for col-base of-type fixnum = (+ base (* j q-s1))
-                           do (let ((s  0.0d0)
-                                    (p  col-base)
-                                    (pv v-off))
-                                (declare (type double-float s)
-                                         (type fixnum p pv))
-                                (loop for ii of-type fixnum from 0 below m-sub
-                                      do (incf s (* (aref v-data pv)
-                                                    (aref q-data p)))
-                                         (incf p  q-s0)
-                                         (incf pv v-stride))
-                                (setf (aref w j) s)))
-
-                     ;; ---- Q[i+ii, j] -= beta * v[ii] * w[j] ----
-                     (loop for ii of-type fixnum from 0 below m-sub
-                           for row-base of-type fixnum = (+ base (* ii q-s0))
-                           for pv of-type fixnum = v-off then (+ pv v-stride)
-                           for vi of-type double-float = (aref v-data pv)
-                           for bvi of-type double-float = (* beta vi)
-                           do (let ((p  row-base)
-                                    (pw 0))
-                                (declare (type fixnum p pw))
-                                (loop for j of-type fixnum from 0 below nq
-                                      do (decf (aref q-data p)
-                                               (* bvi (aref w pw)))
-                                         (incf p  q-s1)
-                                         (incf pw 1))))))
-        (values q (if need-full r (vt-slice r (list 0 k) '(:all))))))))
 
 (defun compute-householder (x)
   "给定向量 x，返回 v, beta, sigma 使得
@@ -2076,15 +2404,57 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
 ;;; 1. Cholesky 分解
 ;;; ============================================================
 
+;;; ============ Cholesky 核心（宏生成通用 / AVX 双引擎）============
+;;; 算法与原 vt-cholesky 完全一致（k 递增累加、非正定报错、upper 转置）；
+;;; 两个内层 k 点积改用 dot 内核（通用路径逐元素顺序与原实现一致；
+;;; AVX 路径分部分和分组不同，同 vt-svd 容差约定）。
+
+(defmacro %define-vt-cholesky-core (name dot-fn eref handle-type)
+  `(defun ,name (a-h a-off a-s0 l-h l-off n)
+     "就地计算 L（下三角）。a/l: 连续行主序句柄，s1=1。"
+     (declare (type ,handle-type a-h l-h)
+              (type fixnum a-off a-s0 l-off n)
+              (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+     (loop for j of-type fixnum from 0 below n do
+       (let ((sum (,eref a-h (+ a-off (* j a-s0) j))))
+         (declare (type double-float sum))
+         ;; sum -= Σ_k l[j,k]² （k 递增，与原实现一致）
+         (decf sum (,dot-fn l-h (+ l-off (* j n)) l-h (+ l-off (* j n)) j))
+         (when (<= sum 0.0d0)
+           (error "vt-cholesky: 矩阵不是正定的"))
+         (setf (,eref l-h (+ l-off (* j n) j)) (sqrt sum)))
+       (loop for i of-type fixnum from (1+ j) below n do
+         (let ((sum (,eref a-h (+ a-off (* i n) j))))
+           (declare (type double-float sum))
+           ;; sum -= Σ_k l[i,k]·l[j,k]
+           (decf sum (,dot-fn l-h (+ l-off (* i n)) l-h (+ l-off (* j n)) j))
+           (setf (,eref l-h (+ l-off (* i n) j))
+                 (/ sum (,eref l-h (+ l-off (* j n) j)))))))))
+
+;; 通用引擎：无 SIMD 依赖（原 vt-cholesky 算法，纯 aref）
+(%define-vt-cholesky-core %vt-cholesky-core-generic %ln-f64-dot %ln-f64-aref
+                          (simple-array double-float (*)))
+
+;; AVX 快速引擎：SBCL + sb-simd
+#+sbcl
+(%define-vt-cholesky-core %vt-cholesky-core-avx %ln-f64-dot-avx %ln-sap-f64-aref
+                          sb-sys:system-area-pointer)
+
 (defun vt-cholesky (matrix &key (upper nil))
-  "对正定对称矩阵进行 Cholesky 分解。"
+  "对正定对称矩阵进行 Cholesky 分解。
+
+  实现：双路径路由（同 vt-matmul/vt-svd 模式）——
+  1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：k 点积走
+     sb-simd AVX/FMA 内核；
+  2. 通用路径：原实现算法（逐元素顺序一致），纯标量 aref。
+  *vt-linalg-simd-enabled* 控制路由，非正定报错与 upper 语义共享。"
   (assert (= 2 (vt-order matrix)))
   (let ((shape (vt-shape matrix)))
     (assert (= (first shape) (second shape))
             (matrix) "Cholesky 分解要求方阵"))
   (with-float-safe
     (let* ((n (first (vt-shape matrix)))
-           (a (vt-astype matrix :float64))
+           (a (ensure-contiguous-2d-vt (vt-astype matrix :float64)))
            (l (vt-zeros (list n n) :dtype :float64))
            (a-data (vt-data a))
            (l-data (vt-data l))
@@ -2096,92 +2466,190 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
            (l-off (vt-offset l)))
       (declare (type (simple-array double-float (*)) a-data l-data)
                (type fixnum n a-s0 a-s1 a-off l-s0 l-s1 l-off))
-      (loop for j fixnum from 0 below n do
-        (let ((sum (aref a-data (+ a-off (* j a-s0) (* j a-s1)))))
-          (declare (type double-float sum))
-          (loop for k fixnum from 0 below j do
-            (let ((l-jk (aref l-data (+ l-off (* j l-s0) (* k l-s1)))))
-              (decf sum (* l-jk l-jk))))
-          (when (<= sum 0.0d0)
-            (error "vt-cholesky: 矩阵不是正定的"))
-          (setf (aref l-data (+ l-off (* j l-s0) (* j l-s1))) (sqrt sum)))
-        (loop for i fixnum from (1+ j) below n do
-          (let ((sum (aref a-data (+ a-off (* i a-s0) (* j a-s1)))))
-            (declare (type double-float sum))
-            (loop for k fixnum from 0 below j do
-              (decf sum (* (aref l-data (+ l-off (* i l-s0) (* k l-s1)))
-                           (aref l-data (+ l-off (* j l-s0) (* k l-s1))))))
-            (setf (aref l-data (+ l-off (* i l-s0) (* j l-s1)))
-                  (/ sum (aref l-data (+ l-off (* j l-s0) (* j l-s1))))))))
+      ;; 引擎分派（ensure-contiguous/vt-zeros 保证 s1=1）
+      (cond
+        #+sbcl
+        ((and *vt-linalg-simd-enabled* (= a-s1 1) (= l-s1 1))
+         (sb-sys:with-pinned-objects (a-data l-data)
+           (%vt-cholesky-core-avx (sb-sys:vector-sap a-data) a-off a-s0
+                                  (sb-sys:vector-sap l-data) l-off n)))
+        (t
+         (%vt-cholesky-core-generic a-data a-off a-s0 l-data l-off n)))
       (if upper (vt-transpose l) l))))
 
 ;;; ============================================================
 ;;; 2. 对称矩阵特征值分解 (Jacobi 旋转法)
 ;;; ============================================================
 
+;;; ============ Jacobi 特征值核心（通用 / AVX 双引擎）============
+;;; 通用引擎：原 vt-eig 算法逐元素一致（仅 vt-ref 函数调用 → 直接
+;;; aref，消除每元素 O(1) 调用与 stride 检查开销）。
+;;; AVX 引擎：利用对称性改读「行」p/q（连续），双行旋转走 rot2 内核、
+;;; 收敛判据走 dot 内核；V 以 V^T 形式累积（行旋转连续）；旋转后把
+;;; 行值镜像写回列（保对称，O(n) 每旋转）。
+
+(defun %vt-eig-core-generic (a-data v-data n max-iter tol)
+  "Jacobi 旋转（通用路径：与原 vt-eig 逐元素一致，纯 aref）。"
+  (declare (type (simple-array double-float (*)) a-data v-data)
+           (type fixnum n max-iter)
+           (type double-float tol)
+           (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+  (loop for iter of-type fixnum from 0 below max-iter do
+    ;; 收敛判据：上三角非对角平方和
+    (let ((off-sum 0.0d0))
+      (declare (type double-float off-sum))
+      (loop for i of-type fixnum from 0 below n do
+        (loop for j of-type fixnum from (1+ i) below n do
+          (let ((val (aref a-data (+ (* i n) j))))
+            (incf off-sum (* val val)))))
+      (when (< (sqrt off-sum) tol) (return)))
+    ;; 旋转扫描
+    (loop for p of-type fixnum from 0 below (1- n) do
+      (loop for q of-type fixnum from (1+ p) below n do
+        (let ((apq (aref a-data (+ (* p n) q))))
+          (declare (type double-float apq))
+          (when (> (abs apq) tol)
+            (let* ((app (aref a-data (+ (* p n) p)))
+                   (aqq (aref a-data (+ (* q n) q)))
+                   (theta (* 0.5d0 (atan (* 2.0d0 apq) (- app aqq))))
+                   (c (cos theta))
+                   (s (sin theta)))
+              (declare (type double-float app aqq theta c s))
+              ;; 对角与 pq 位置
+              (setf (aref a-data (+ (* p n) q)) 0.0d0
+                    (aref a-data (+ (* q n) p)) 0.0d0
+                    (aref a-data (+ (* p n) p))
+                    (+ (* c c app) (* 2.0d0 s c apq) (* s s aqq))
+                    (aref a-data (+ (* q n) q))
+                    (+ (* s s app) (* -2.0d0 s c apq) (* c c aqq)))
+              ;; 非对角：r 行读列 p/q，写回 4 个对称位置（与原实现一致）
+              (loop for r of-type fixnum from 0 below n
+                    when (and (/= r p) (/= r q)) do
+                      (let ((arp (aref a-data (+ (* r n) p)))
+                            (arq (aref a-data (+ (* r n) q))))
+                        (declare (type double-float arp arq))
+                        (let ((na (+ (* c arp) (* s arq)))
+                              (nb (+ (* (- s) arp) (* c arq))))
+                          (declare (type double-float na nb))
+                          (setf (aref a-data (+ (* r n) p)) na
+                                (aref a-data (+ (* p n) r)) na
+                                (aref a-data (+ (* r n) q)) nb
+                                (aref a-data (+ (* q n) r)) nb))))
+              ;; 特征向量：V 的 p/q 列
+              (loop for r of-type fixnum from 0 below n do
+                (let ((vp (aref v-data (+ (* r n) p)))
+                      (vq (aref v-data (+ (* r n) q))))
+                  (declare (type double-float vp vq))
+                  (setf (aref v-data (+ (* r n) p))
+                        (+ (* c vp) (* s vq))
+                        (aref v-data (+ (* r n) q))
+                        (+ (* (- s) vp) (* c vq))))))))))))
+
+#+sbcl
+(defun %vt-eig-core-avx (a-h a-data v-h v-data n max-iter tol)
+  "Jacobi 旋转（AVX 路径：行对称访问 + rot2/dot 内核 + V^T 累积）。"
+  (declare (type sb-sys:system-area-pointer a-h v-h)
+           (type (simple-array double-float (*)) a-data v-data)
+           (type fixnum n max-iter)
+           (type double-float tol)
+           (optimize (speed 3) (safety 0) (debug 0) (space 0)))
+  (loop for iter of-type fixnum from 0 below max-iter do
+    ;; 收敛判据：逐行上三角段 ‖a[i, i+1..n-1]‖²（dot 内核，行内连续）
+    (let ((off-sum 0.0d0))
+      (declare (type double-float off-sum))
+      (loop for i of-type fixnum from 0 below n do
+        (incf off-sum
+              (%ln-f64-dot-avx a-h (+ (* i n) i) a-h (+ (* i n) i)
+                               (- n i 1))))
+      (when (< (sqrt off-sum) tol) (return)))
+    ;; 旋转扫描
+    (loop for p of-type fixnum from 0 below (1- n) do
+      (loop for q of-type fixnum from (1+ p) below n do
+        (let ((apq (aref a-data (+ (* p n) q))))
+          (declare (type double-float apq))
+          (when (> (abs apq) tol)
+            (let* ((app (aref a-data (+ (* p n) p)))
+                   (aqq (aref a-data (+ (* q n) q)))
+                   (theta (* 0.5d0 (atan (* 2.0d0 apq) (- app aqq))))
+                   (c (cos theta))
+                   (s (sin theta)))
+              (declare (type double-float app aqq theta c s))
+              ;; 行 p/q 双行旋转（连续，rot2 内核；pq 处的值随后覆盖）
+              (%ln-f64-rot2-avx a-h (* p n) a-h (* q n) n c s)
+              ;; V^T 的 p/q 行旋转（= V 的 p/q 列，连续）
+              (%ln-f64-rot2-avx v-h (* p n) v-h (* q n) n c s)
+              ;; 对角与 pq 位置：覆盖 rot2 的临时值（公式与原实现一致）
+              (setf (aref a-data (+ (* p n) p))
+                    (+ (* c c app) (* 2.0d0 s c apq) (* s s aqq))
+                    (aref a-data (+ (* q n) q))
+                    (+ (* s s app) (* -2.0d0 s c apq) (* c c aqq))
+                    (aref a-data (+ (* p n) q)) 0.0d0
+                    (aref a-data (+ (* q n) p)) 0.0d0)
+              ;; 镜像写回：行值 → 列（保对称，供后续列读与收敛扫描）
+              (loop for r of-type fixnum from 0 below n
+                    unless (or (= r p) (= r q)) do
+                      (setf (aref a-data (+ (* r n) p))
+                            (aref a-data (+ (* p n) r))
+                            (aref a-data (+ (* r n) q))
+                            (aref a-data (+ (* q n) r)))))))))))
+
 (defun vt-eig (matrix &key (max-iter 200) (tol 1e-10))
-  "对称矩阵特征值分解 (Jacobi 旋转法)。"
+  "对称矩阵特征值分解 (Jacobi 旋转法)。
+
+  实现：双路径路由（同 vt-matmul/vt-svd 模式）——
+  1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：双行旋转与
+     收敛判据走 sb-simd AVX/FMA 内核，V 以 V^T 形式累积；
+  2. 通用路径：原 vt-eig 算法逐元素一致（完善：vt-ref 函数调用开销
+     → 直接 aref），纯标量，无 SIMD 依赖。
+  两条路径共享旋转公式、收敛判据、特征值降序排序与输出契约。"
   (assert (= 2 (vt-order matrix)))
   (let ((shape (vt-shape matrix)))
     (assert (= (first shape) (second shape))
             (matrix) "特征值分解要求方阵"))
   (with-float-safe
     (let* ((n (first (vt-shape matrix)))
-           (a (vt-copy (vt-astype matrix :float64)))
-           (v (vt-eye n :dtype :float64)))
-      ;; Jacobi iterations - use local variables to avoid compiler issues
-      (loop for iter fixnum from 0 below max-iter do
-        ;; Check convergence
-        (let ((off-sum 0.0d0))
-          (declare (type double-float off-sum))
-          (loop for i fixnum from 0 below n do
-            (loop for j fixnum from (1+ i) below n do
-              (let ((val (vt-ref a i j)))
-                (incf off-sum (* val val)))))
-          (when (< (sqrt off-sum) tol) (return)))
-        ;; Apply rotations
-        (loop for p fixnum from 0 below (1- n) do
-          (loop for q fixnum from (1+ p) below n do
-            (let ((apq (vt-ref a p q)))
-              (when (> (abs apq) tol)
-                (let* ((app (vt-ref a p p))
-                       (aqq (vt-ref a q q))
-                       (theta (* 0.5d0 (atan (* 2.0d0 apq) (- app aqq))))
-                       (c (cos theta))
-                       (s (sin theta)))
-                  ;; Update A
-                  (setf (vt-ref a p q) 0.0d0)
-                  (setf (vt-ref a q p) 0.0d0)
-                  (setf (vt-ref a p p) (+ (* c c app) (* 2.0d0 s c apq) (* s s aqq)))
-                  (setf (vt-ref a q q) (+ (* s s app) (* -2.0d0 s c apq) (* c c aqq)))
-                  ;; Update off-diagonal
-                  (loop for r fixnum from 0 below n
-                        when (and (/= r p) (/= r q)) do
-                          (let ((arp (vt-ref a r p))
-                                (arq (vt-ref a r q)))
-                            (let ((na (+ (* c arp) (* s arq)))
-                                  (nb (+ (* (- s) arp) (* c arq))))
-                              (setf (vt-ref a r p) na)
-                              (setf (vt-ref a p r) na)
-                              (setf (vt-ref a r q) nb)
-                              (setf (vt-ref a q r) nb))))
-                  ;; Update eigenvectors
-                  (loop for r fixnum from 0 below n do
-                    (let ((vp (vt-ref v r p))
-                          (vq (vt-ref v r q)))
-                      (setf (vt-ref v r p) (+ (* c vp) (* s vq)))
-                      (setf (vt-ref v r q) (+ (* (- s) vp) (* c vq)))))))))))
-      ;; Extract and sort eigenvalues
-      (let ((pairs (loop for i fixnum from 0 below n
-                         collect (cons (vt-ref a i i) i))))
+           (a (ensure-contiguous-2d-vt (vt-copy (vt-astype matrix :float64))))
+           (a-data (vt-data a))
+           (v-tensor (vt-eye n :dtype :float64))
+           (v-data (vt-data v-tensor))
+           ;; AVX 模式下 v-data 存 V^T（行旋转连续）；通用模式存 V
+           (avx-mode
+             #+sbcl
+             (and *vt-linalg-simd-enabled*
+                  (= (second (vt-strides a)) 1) (= (second (vt-strides v-tensor)) 1))
+             #-sbcl
+             nil)
+           ;; tol 收敛到 double-float（兼容旧默认值 1e-10 为 single-float 的情况）
+           (tol-d (coerce tol 'double-float)))
+      (declare (type (simple-array double-float (*)) a-data v-data)
+               (type boolean avx-mode))
+      (cond
+        (avx-mode
+         (sb-sys:with-pinned-objects (a-data v-data)
+           (%vt-eig-core-avx (sb-sys:vector-sap a-data) a-data
+                             (sb-sys:vector-sap v-data) v-data
+                             n max-iter tol-d)))
+        (t
+         (%vt-eig-core-generic a-data v-data n max-iter tol-d)))
+      ;; 特征值降序排序（stable，同原实现）+ 特征向量列重排
+      (let ((pairs (loop for i of-type fixnum from 0 below n
+                         collect (cons (aref a-data (+ (* i n) i)) i))))
         (setf pairs (sort pairs #'> :key #'car))
         (let ((vals (vt-from-sequence (mapcar #'car pairs) :dtype :float64))
               (vec (vt-zeros (list n n) :dtype :float64)))
-          (loop for ni fixnum from 0 below n
+          (loop for ni of-type fixnum from 0 below n
                 for oi = (cdr (nth ni pairs))
-                do (loop for r fixnum from 0 below n do
-                  (setf (vt-ref vec r ni) (vt-ref v r oi))))
+                do (if avx-mode
+                       ;; VT：vec 列 ni = VT 行 oi
+                       (loop for r of-type fixnum from 0 below n do
+                         (setf (aref (vt-data vec) (+ (* r n) ni))
+                               (aref v-data (+ (* oi n) r))))
+                       ;; V：vec 列 ni = V 列 oi
+                       (loop for r of-type fixnum from 0 below n do
+                         (setf (aref (vt-data vec) (+ (* r n) ni))
+                               (aref v-data (+ (* r n) oi))))))
           (values vals vec))))))
+
 
 
 (defun vt-pinv (matrix &key (rcond 1e-15))
