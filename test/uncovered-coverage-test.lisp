@@ -15,7 +15,7 @@
 ;;;;   vt-vsplit vt-dsplit vt-clamp vt-float-nan-inf-= vt-select
 ;;;;   vt-nonzero-p vt-lstsq vt-copy-to! vt-vander vt-flatten-sequence
 ;;;;   vt-compute-strides vt-compute-logical-strides vt-normalize-axis
-;;;;   vt-element-type vt-out-contig-p vt-out-writable-p vt-write-1
+;;;;   vt-element-type vt-out-contig-p vt-out-writable-p vt-write
 ;;;;   vt-count-nonzero vt-flatnonzero vt-inner vt-topk vt-moveaxis
 ;;;;   vt-fliplr vt-flipud vt-ediff1d vt-ravel-multi-index
 ;;;;   vt-tril-indices vt-triu-indices vt-standardize vt-seed-sequence
@@ -300,18 +300,18 @@
   (check "vt-out-writable-p 普通" t (vt-out-writable-p (vt-zeros '(2 2))))
   ;; 广播 stride=0 视图不可写（CONVENTIONS §4.2 H4）
   (check "vt-out-writable-p 广播" nil (vt-out-writable-p (vt-broadcast-to (vt-ones '(1 3)) '(4 3))))
-  ;; vt-write-1：strides 驱动的逻辑索引写入
+  ;; vt-write：strides 驱动的逻辑索引写入
   (let ((o (vt-zeros '(3))))
-    (vt-write-1 o (list 1) 42.0d0)
-    (check "vt-write-1 1d" '(0.0d0 42.0d0 0.0d0) (nlist o)))
+    (vt-write o (list 1) 42.0d0)
+    (check "vt-write 1d" '(0.0d0 42.0d0 0.0d0) (nlist o)))
   (let ((o (vt-zeros '(2 3))))
-    (vt-write-1 o (list 1 2) 9.0d0)
-    (check "vt-write-1 2d" '((0.0d0 0.0d0 0.0d0) (0.0d0 0.0d0 9.0d0)) (nlist o)))
+    (vt-write o (list 1 2) 9.0d0)
+    (check "vt-write 2d" '((0.0d0 0.0d0 0.0d0) (0.0d0 0.0d0 9.0d0)) (nlist o)))
   ;; 非连续视图写入：写入位置 = offset + Σ idx*stride
   (let* ((base (vt-zeros '(2 6)))
          (v (vt-slice base '(:all) '(0 6 2))))   ; 列步长 2 的非连续视图
-    (vt-write-1 v (list 1 1) 5.0d0)              ; 逻辑 (1,1) → 物理 (1,2)
-    (check "vt-write-1 非连续寻址" 5.0d0 (scalar (vt-ref base 1 2)))))
+    (vt-write v (list 1 1) 5.0d0)              ; 逻辑 (1,1) → 物理 (1,2)
+    (check "vt-write 非连续寻址" 5.0d0 (scalar (vt-ref base 1 2)))))
 
 ;;; ============================================================
 ;;; 11. extensions：count-nonzero / flatnonzero / inner / topk / moveaxis

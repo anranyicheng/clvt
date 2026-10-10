@@ -950,8 +950,8 @@ def g13():
     add('out-snapshot 无重叠透传',
         "(let* ((a (vt-from-sequence (list 1.0d0) :dtype :float64)) (o (vt-zeros '(1) :dtype :float64)) (ins (vt-out-snapshot o (list a)))) (if (eq (car ins) a) 1 0))",
         lambda: np.asarray(1))
-    add('write-1 单元素写',
-        "(let ((o (vt-zeros '(3) :dtype :int64))) (vt-write-1 o (list 1) 42) (vt-to-list o))",
+    add('write 单元素写',
+        "(let ((o (vt-zeros '(3) :dtype :int64))) (vt-write o (list 1) 42) (vt-to-list o))",
         lambda: np.array([0, 42, 0]))
     add('reduce-dtypes int8→int64', "(multiple-value-bind (c e) (vt-reduce-dtypes (list (vt-zeros '(1) :dtype :int8)) nil) (if (eq c :int64) 1 0))", lambda: np.asarray(1))
     add('reduce-dtypes float32保持', "(multiple-value-bind (c e) (vt-reduce-dtypes (list (vt-zeros '(1) :dtype :float32)) nil) (if (eq c :float32) 1 0))", lambda: np.asarray(1))
