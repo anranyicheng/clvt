@@ -126,17 +126,29 @@
     ;; ============================================================
     (format t "~&  [5/5] 禁用 SIMD 回退...~%")
     (with-simd-disabled
-	(let* ((a (vt-random-normal '(4 8 6)))
+        (let* ((a (vt-random-normal '(4 8 6)))
                (b (vt-random-normal '(4 6 10)))
                (c (vt-matmul a b)))
           (assert-shape c (4 8 10) "禁用 SIMD 时输出")
           (assert (every (lambda (x)
                            (and (numberp x) (= x x)))
-			 (vt-to-list (vt-flatten c)))
+                         (vt-to-list (vt-flatten c)))
                   ()
                   "禁用 SIMD 时输出含 NaN 或非数值元素")))
 
     (format t "~&✅ test-simd-batched-matmul 全部通过~%")
     t))
 
-(test-simd-batched-matmul)
+;; 运行并以退出码兜底：整个套件记为 1 项聚合检查，
+;; 任一 ASSERT 失败都计入 Fail，保证 run-tests.sh 能解析到明确结果
+(handler-case (test-simd-batched-matmul)
+  (error (e)
+    (format t "~&❌ test-simd-batched-matmul 失败: ~a~%" e)
+    (format t "Total: 1 | Pass: 0 | Fail: 1~%")
+    (finish-output)
+    (sb-ext:exit :code 1))
+  (:no-error (result)
+    (declare (ignore result))
+    (format t "Total: 1 | Pass: 1 | Fail: 0~%")
+    (finish-output)
+    (sb-ext:exit :code 0)))

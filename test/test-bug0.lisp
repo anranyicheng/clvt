@@ -260,6 +260,11 @@
 
 (format t "~%~%========= 总结: ~a 项检查, ~a 项失败 =========~%"
         *checks* *failures*)
-
-(and (= *checks* 37)
-     (= *failures* 0))
+;; 供 run-tests.sh 解析的机器可读汇总（格式 1），并以退出码兜底
+;; 额外校验检查总数应恒为 37（防用例漂移导致的静默假阳性）
+(format t "Total: ~a | Pass: ~a | Fail: ~a~%"
+        *checks* (- *checks* *failures*) *failures*)
+(if (and (= *checks* 37)
+         (= *failures* 0))
+    (progn (format t "ALL PASS~%") (sb-ext:exit :code 0))
+    (progn (format t "FAILURES (或检查数漂移)~%") (sb-ext:exit :code 1)))

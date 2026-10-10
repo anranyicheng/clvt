@@ -244,6 +244,9 @@
                      (vt-to-list (vt-log (vt-softmax x)))
                      (vt-to-list (vt-log-softmax x)) 1d-12))
 
+;; 供 run-tests.sh 解析的机器可读汇总（格式 1）
+(format t "Total: ~a | Pass: ~a | Fail: ~a~%"
+        *checks* (- *checks* *failures*) *failures*)
 (format t "~%===== 结果: ~a 检查 / ~a 失败 =====~%" *checks* *failures*)
 (if (zerop *failures*)
     (progn (format t "ALL PASS~%") (sb-ext:exit :code 0))

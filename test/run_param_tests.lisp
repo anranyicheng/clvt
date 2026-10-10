@@ -70,7 +70,8 @@
                      (if (listp actual) (subseq (write-to-string actual) 0 (min 60 (length (write-to-string actual)))) actual)))))
 
 (defun summary ()
-  (format t "~%=== Parametric Tests: Total ~a | Pass ~a | Fail ~a ===~%" *N* *P* *F*)
+  ;; Total/Pass/Fail 后必须带冒号，供 run-tests.sh 解析（格式 1）
+  (format t "~%=== Parametric Tests: Total: ~a | Pass: ~a | Fail: ~a ===~%" *N* *P* *F*)
   (when *F-list*
     (format t "Failed:~%")
     (dolist (f (reverse *F-list*)) (format t "  - ~a~%" (car f))))

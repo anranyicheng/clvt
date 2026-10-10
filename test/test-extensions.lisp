@@ -121,3 +121,6 @@
 (vt-set-print-options :threshold 3 :precision 6 :indent-step 1)
 
 (format t "~%=== Results: ~a PASS, ~a FAIL ===~%" *pass* *fail*)
+;; 供 run-tests.sh 解析的机器可读汇总（格式 1），并以退出码兜底
+(format t "Total: ~a | Pass: ~a | Fail: ~a~%" (+ *pass* *fail*) *pass* *fail*)
+(sb-ext:exit :code (if (zerop *fail*) 0 1))

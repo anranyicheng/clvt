@@ -76,7 +76,7 @@
                      (if (listp actual) (subseq (write-to-string actual) 0 (min 60 (length (write-to-string actual)))) actual)))))
 
 (defun summary ()
-  (format t "~%=== Parametric Tests: Total ~a | Pass ~a | Fail ~a ===~%" *N* *P* *F*)
+  (format t "~%=== Parametric Tests: Total: ~a | Pass: ~a | Fail: ~a ===~%" *N* *P* *F*)
   (when *F-list*
     (format t "Failed:~%")
     (dolist (f (reverse *F-list*)) (format t "  - ~a~%" (car f))))
@@ -442,7 +442,8 @@
 
 (defun main ()
   (run-legacy-coverage)
-  (format t "~%=== Legacy Coverage: Total ~a | Pass ~a | Fail ~a ===~%" *n* *p* *f*)
+  ;; Total/Pass/Fail 后必须带冒号，供 run-tests.sh 解析（格式 1）
+  (format t "~%=== Legacy Coverage: Total: ~a | Pass: ~a | Fail: ~a ===~%" *n* *p* *f*)
   (when *fails*
     (format t "Failed keys:~%")
     (dolist (f (reverse *fails*)) (format t "  - ~a~%" f)))

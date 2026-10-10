@@ -204,6 +204,11 @@
             (if ok
                 "====> 全部通过 <===="
                 "====> 存在失败 <===="))
+    ;; 供 run-tests.sh 解析的机器可读汇总（格式 1）
+    (format t "Total: ~d | Pass: ~d | Fail: ~d~%" total passed (- total passed))
+    (finish-output)
     (if ok t nil)))
 
-(test-overlap-all)
+;; 运行并以退出码兜底：0 = 全部通过, 1 = 存在失败
+(let ((ok (test-overlap-all)))
+  (sb-ext:exit :code (if ok 0 1)))

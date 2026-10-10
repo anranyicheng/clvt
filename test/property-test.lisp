@@ -20,6 +20,8 @@
   (format t "~%========================================~%")
   (format t "  Property Tests: ~a total, ~a pass, ~a fail~%"
           *pt-N* *pt-P* *pt-F*)
+  ;; 供 run-tests.sh 解析的机器可读汇总（格式 1）
+  (format t "  Total: ~a | Pass: ~a | Fail: ~a~%" *pt-N* *pt-P* *pt-F*)
   (format t "========================================~%")
   (when *pt-F-list*
     (format t "Failed:~{~%  - ~a~}~%" (reverse *pt-F-list*)))
@@ -299,4 +301,6 @@
   (test-stability)
   (pt-summary))
 
-(run-property-tests)
+;; 运行并以退出码兜底：0 = 全部通过, 1 = 存在失败
+(let ((ok (run-property-tests)))
+  (sb-ext:exit :code (if ok 0 1)))

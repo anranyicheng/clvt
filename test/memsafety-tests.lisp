@@ -134,6 +134,8 @@
   ;; ---------- 汇总 ----------
   (format t "~&===== 汇总: ~a 通过 / ~a 失败 =====~%"
           *pass* *fail*)
+  ;; 供 run-tests.sh 解析的机器可读汇总（格式 1）
+  (format t "Total: ~a | Pass: ~a | Fail: ~a~%" (+ *pass* *fail*) *pass* *fail*)
   (when *failures*
     (format t "失败清单:~%")
     (dolist (f (nreverse *failures*))
@@ -141,4 +143,6 @@
   (finish-output)
   (zerop *fail*))
 
-(run)
+;; 运行并以退出码兜底：0 = 全部通过, 1 = 存在失败
+(let ((ok (run)))
+  (sb-ext:exit :code (if ok 0 1)))

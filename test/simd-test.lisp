@@ -514,7 +514,9 @@
   "运行全部测试。
    :skip-probe —— 跳过环境探测（信息输出较多）
    :skip-smoke —— 跳过 smoke test
-   :skip-bench —— 跳过基准（耗时较长）"
+   :skip-bench —— 跳过基准（耗时较长）
+   返回 T 当且仅当全部测试部分通过；聚合结果以
+   Total: N | Pass: N | Fail: N 汇总供 run-tests.sh 解析。"
   (format t "~&~%############################################################~%")
   (format t "# SB-SIMD 完整测试套件~%")
   (format t "############################################################~%~%")
@@ -522,17 +524,29 @@
   (unless skip-probe
     (run-probe))
 
-  (unless skip-smoke
-    (run-smoke))
+  ;; 聚合各测试部分的通过情况（每部分记 1 项）
+  (let ((results '()))
+    (unless skip-smoke
+      (push (cons "smoke" (run-smoke)) results))
 
-  (unless skip-bench
-    (run-bench-clvt 1000))
+    (unless skip-bench
+      (run-bench-clvt 1000))
 
-  (when (find-package :clvt)
-    (run-nan-inf)
-    (run-trap-consistency))
+    (when (find-package :clvt)
+      (push (cons "nan/inf 语义" (run-nan-inf)) results)
+      (push (cons "浮点陷阱一致性" (run-trap-consistency)) results))
 
-  (format t "~&测试完成。~%~%")
-  t)
+    (let* ((total  (length results))
+           (passed (count t results :key #'cdr))
+           (failed (- total passed)))
+      (dolist (r (nreverse results))
+        (format t "  ~a  ~a~%" (if (cdr r) "[PASS]" "[FAIL]") (car r)))
+      ;; 供 run-tests.sh 解析的机器可读汇总（格式 1）
+      (format t "~&Total: ~d | Pass: ~d | Fail: ~d~%" total passed failed)
+      (finish-output)
+      (format t "~&测试完成。~%~%")
+      (zerop failed))))
 
-(run-all)
+;; 运行并以退出码兜底：0 = 全部通过, 1 = 存在失败
+(let ((ok (run-all)))
+  (sb-ext:exit :code (if ok 0 1)))
