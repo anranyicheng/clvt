@@ -166,6 +166,54 @@
   (ln-t! "ref/eig-diag3"
          (ln-vec-close-p (vt-to-list (vt-eig (vt-copy *m-diag3*)))
                          '(5.0d0 3.0d0 1.0d0) 1d-12))
+  ;; C1 numpy.linalg.eigh 对齐：非对称输入不报错，返回单三角对称化
+  ;; 矩阵的特征值（默认 :lower，即下三角 [[0,0,0],[3,4,0],[6,7,8]] 的
+  ;; 对称化），与 np.linalg.eigh(C)（UPLO='L'）一致（升序转降序比较）。
+  ;; 镜像作用于内部拷贝，输入不被修改；两条路径结果一致。
+  (let ((c (vt-reshape (vt-arange 9) '(3 3))))
+    (multiple-value-bind (vals vecs) (vt-eig (vt-copy c))
+      ;; 残差对“下三角对称化矩阵”成立（非对称输入的特征向量属于它，
+      ;; 不属于 C 本身——与 numpy eigh 语义一致）
+      (let* ((c-lower (vt-+ (vt-tril (vt-copy c)) (vt-transpose (vt-tril (vt-copy c) :k -1))))
+             (v0 (vt-slice vecs '(:all) '(0)))
+             (err (vt-ref (vt-amax (vt-abs (vt-- (vt-@ c-lower v0)
+                                                 (vt-scale v0 (vt-ref vals 0))))))))
+        (ln-t! "ref/eig-asym-numpy-aligned"
+               (and (ln-vec-close-p (vt-to-list vals)
+                                    (list 16.012405149480088d0
+                                          -0.6733140221752988d0
+                                          -3.339091127304794d0)
+                                    1d-9)
+                    (< err 1d-9)))))
+    (ln-t! "ref/eig-asym-input-unmodified"
+           (ln-tensor-close-p c (vt-reshape (vt-arange 9) '(3 3)) 0.0d0))
+    (multiple-value-bind (vals-u vecs-u) (vt-eig (vt-copy c) :uplo :upper)
+      (declare (ignore vecs-u))
+      (ln-t! "ref/eig-asym-uplo-upper"
+             (ln-vec-close-p (vt-to-list vals-u)
+                             (list 11.801816018331547d0
+                                   0.689642676278743d0
+                                   -0.4914586946102887d0)
+                             1d-9))))
+  ;; 1e-16 级数值不对称（浮点残留）应被放行，且结果与对称参考一致
+  (let ((a (vt-from-sequence '((4.0d0 1.0d0 2.0d0) (1.0000000000000002d0 5.0d0 3.0d0) (2.0d0 3.0d0 6.0d0))
+                             :dtype :float64)))
+    (multiple-value-bind (vals vecs) (vt-eig (vt-copy a))
+      (declare (ignore vecs))
+      (ln-t! "ref/eig-near-sym-tolerated"
+             (ln-vec-close-p (vt-to-list vals)
+                             '(9.41883267597004d0 3.386770156607549d0 2.1943971674224088d0) 1d-8))))
+  ;; 对称化 (C+Cᵀ)/2：两路径一致且等于 numpy eigh（降序）
+  (let* ((c (vt-reshape (vt-arange 9) '(3 3)))
+         (sym (vt-scale (vt-+ c (vt-transpose c)) 0.5d0)))
+    (multiple-value-bind (vals vecs) (vt-eig (vt-copy sym))
+      (let* ((v0 (vt-slice vecs '(:all) '(0)))
+             (err (vt-ref (vt-amax (vt-abs (vt-- (vt-@ (vt-copy sym) v0)
+                                                 (vt-scale v0 (vt-ref vals 0))))))))
+        (ln-t! "ref/eig-symmetrized-arange"
+               (and (< err 1d-10)
+                    (ln-close-p (vt-ref vals 0) 13.74596669241483d0 1d-9)
+                    (ln-close-p (vt-ref vals 2) -1.745966692414833d0 1d-9))))))
   ;; RANK / LSTSQ（参考）
   (ln-t! "ref/rank-sing3"  (= (vt-matrix-rank (vt-copy *m-sing3*)) 2))
   (ln-t! "ref/rank-diag3"  (= (vt-matrix-rank (vt-copy *m-diag3*)) 3))
@@ -380,11 +428,13 @@
            (error () t)))
   ;; 非对称矩阵 eig 不崩溃（返回值仍可用；对称性由调用方保证）
   (ln-t! "edge/eig-asym-no-crash"
-         (multiple-value-list (vt-eig (a= '((2.0d0 1.0d0) (0.0d0 3.0d0))))))
-  (ln-t! "edge/eig-asym-ran" t)
+         (multiple-value-list (vt-eig (a= '((2.0d0 1.0d0) (1.0d0 3.0d0))))))
+  (ln-t! "edge/eig-2x2-sym" t)
   ;; 输入不被修改（astype/ensure-contiguous 拷贝语义）
   (let ((a (a= '((4.0d0 11.0d0 14.0d0) (8.0d0 7.0d0 -2.0d0) (1.0d0 5.0d0 9.0d0)))))
-    (vt-lu a) (vt-qr a) (vt-cholesky (vt-@ (vt-transpose a) a)) (vt-eig a) (vt-det a)
+    (vt-lu a) (vt-qr a) (vt-cholesky (vt-@ (vt-transpose a) a))
+    ;; numpy 对齐后非对称输入合法（单三角镜像在拷贝上完成，不动 a）
+    (vt-eig a) (vt-det a)
     (ln-t! "edge/input-unmodified"
            (ln-tensor-close-p a (a= '((4.0d0 11.0d0 14.0d0) (8.0d0 7.0d0 -2.0d0) (1.0d0 5.0d0 9.0d0))) 0.0d0))))
 

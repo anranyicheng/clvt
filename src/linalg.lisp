@@ -2593,8 +2593,15 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
                             (aref a-data (+ (* r n) q))
                             (aref a-data (+ (* q n) r)))))))))))
 
-(defun vt-eig (matrix &key (max-iter 200) (tol 1e-10))
-  "对称矩阵特征值分解 (Jacobi 旋转法)。
+(defun vt-eig (matrix &key (max-iter 200) (tol 1e-10) (uplo :lower))
+  "对称矩阵特征值分解 (Jacobi 旋转法)，输入约定与 numpy.linalg.eigh 对齐。
+   不校验对称性：仅使用 UPLO 指定的三角（:lower 对应 numpy 的
+   UPLO='L' 默认值，:upper 对应 UPLO='U'），将其镜像覆盖另一三角后
+   再做分解。对对称矩阵无任何影响；对非对称输入返回其单三角对称化
+   矩阵的特征值（GIGO，与 numpy eigh 行为一致）。镜像在入口一次性
+   完成，保证 AVX 与通用两条路径对任意输入使用完全相同的数据——
+   修复了旧版对非对称输入两路径给出不同结果的问题。
+   UPLO 仅接受 :lower / :upper（小写关键字，对应 numpy 的 'L'/'U'）。
 
   实现：双路径路由（同 vt-matmul/vt-svd 模式）——
   1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：双行旋转与
@@ -2623,6 +2630,21 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
            (tol-d (coerce tol 'double-float)))
       (declare (type (simple-array double-float (*)) a-data v-data)
                (type boolean avx-mode))
+      ;; ---- numpy.linalg.eigh 对齐：单三角镜像（替代旧对称性校验）----
+      ;; :lower（默认，numpy UPLO='L'）→ 下三角覆盖上三角；
+      ;; :upper（numpy UPLO='U'）→ 上三角覆盖下三角。
+      ;; a-data 是入口拷贝，原地镜像不影响调用方张量。
+      (ecase uplo
+        (:lower
+         (loop for i of-type fixnum from 0 below n do
+           (loop for j of-type fixnum from (1+ i) below n do
+             (setf (aref a-data (+ (* i n) j))
+                   (aref a-data (+ (* j n) i))))))
+        (:upper
+         (loop for i of-type fixnum from 0 below n do
+           (loop for j of-type fixnum from (1+ i) below n do
+             (setf (aref a-data (+ (* j n) i))
+                   (aref a-data (+ (* i n) j)))))))
       (cond
         (avx-mode
          (sb-sys:with-pinned-objects (a-data v-data)

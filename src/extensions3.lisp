@@ -1036,22 +1036,26 @@
       (error "vt-vdot: 输入元素个数不一致（~a vs ~a）" (vt-size af) (vt-size bf)))
     (vt-dot af bf :dtype dtype :out out)))
 
-(defun vt-eigvals (matrix &key (max-iter 200) (tol 1e-10))
+(defun vt-eigvals (matrix &key (max-iter 200) (tol 1e-10) (uplo :lower))
   "方阵特征值（对标 numpy.linalg.eigvals）。
-   实现基于对称 Jacobi（对本库而言特征分解仅支持实对称矩阵，与 vt-eig 同）。
+   实现基于对称 Jacobi，输入约定与 vt-eig 一致（numpy.linalg.eigh
+   三角语义：不校验对称性，仅使用 UPLO 指定的三角，默认 :lower）。
+   注意：与 numpy.linalg.eigvals（通用 QR 算法）不同，本实现对非对称
+   输入返回其单三角对称化矩阵的特征值，而非真实特征值。
    返回按降序排列的特征值 1 维张量（float64）。
    示例：(vt-eigvals (vt-from-array #2A((2.0 0.0)(0.0 3.0)))) => [3.0 2.0]"
-  (multiple-value-bind (vals vec) (vt-eig matrix :max-iter max-iter :tol tol)
+  (multiple-value-bind (vals vec) (vt-eig matrix :max-iter max-iter :tol tol :uplo uplo)
     (declare (ignore vec))
     vals))
 
-(defun vt-eigvalsh (matrix &key (max-iter 200) (tol 1e-10))
+(defun vt-eigvalsh (matrix &key (max-iter 200) (tol 1e-10) (uplo :lower))
   "对称（Hermitian）方阵特征值（对标 numpy.linalg.eigvalsh）。
-   与 numpy 一致：返回**升序**排列的特征值。
+   与 numpy 完全对齐：UPLO 关键字（:lower 默认 / :upper）语义同
+   numpy.linalg.eigvalsh 的 UPLO 参数；返回**升序**排列的特征值。
    （v0.4.0 修复：原实现直接透传 vt-eigvals 的非排序结果，
    不满足 numpy.linalg.eigvalsh 的升序约定。）
    示例：(vt-eigvalsh (vt-from-array #2A((2.0 1.0)(1.0 2.0)))) => [1.0 3.0]"
-  (let ((w (vt-eigvals matrix :max-iter max-iter :tol tol)))
+  (let ((w (vt-eigvals matrix :max-iter max-iter :tol tol :uplo uplo)))
     (vt-sort w :axis -1)))
 
 (defun vt-matrix-power (matrix n)

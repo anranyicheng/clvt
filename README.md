@@ -586,8 +586,8 @@ vt-cross            ;; 向量叉积 (对标 numpy.cross)
 
 ;; 线性代数类
 vt-vdot             ;; 展平后点积 (对标 numpy.vdot)
-vt-eigvals          ;; 特征值（一般矩阵）(对标 numpy.linalg.eigvals)
-vt-eigvalsh         ;; 特征值（对称/Hermitian）(对标 numpy.linalg.eigvalsh)
+vt-eigvals          ;; 特征值（对称 Jacobi，降序；非对称输入按单三角对称化，非 numpy.eigvals 通用语义）
+vt-eigvalsh         ;; 特征值（对称/Hermitian，升序；UPLO 参数对标 numpy.linalg.eigvalsh）
 vt-matrix-power     ;; 矩阵幂 (对标 numpy.linalg.matrix_power)
 vt-cond             ;; 条件数 (对标 numpy.linalg.cond)
 vt-multi-dot        ;; 链式矩阵乘（自动选序）(对标 numpy.linalg.multi_dot)
