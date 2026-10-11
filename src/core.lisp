@@ -519,7 +519,8 @@
              ;;      再递归走连续特化 cast 路径。两段均为特化快路径，
              ;;      实测优于逐元素 funcall 游走；代价是一个中间缓冲。
              ((and (not (eq (vt-dtype tensor) new-dtype)) (>= run-len 16))
-              (vt-astype (vt-contiguous tensor) new-dtype))
+	      (return-from vt-astype
+		(vt-astype (vt-contiguous tensor) new-dtype)))
              ;; ---- 完全步进 / 短 run（如转置）：保留逐元素 walker ----
              (t
               (let ((converter (vt-cast-fun new-dtype))
