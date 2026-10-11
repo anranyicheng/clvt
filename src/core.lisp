@@ -263,6 +263,64 @@
           ((subtypep out-lt 'integer)          `(truncate ,src-expr))
           (t                                   `(coerce ,src-expr ',out-lt)))))
 
+;;; ------------------------------------------------------------------
+;;; 内层连续 run 分解（strided 视图的块拷贝快路径原语）
+;;; ------------------------------------------------------------------
+
+(defun %inner-run-suffix (shape strides)
+  "把 strided 视图从尾部向头部延伸出最长的「行主序连续后缀」。
+   返回 (values cut run)：cut 为后缀起始轴下标（[0, rank]），
+   run 为后缀元素数（≥1）。dim=1 的轴不参与延伸（其 stride 无意义，
+   仅贡献单个元素）。完全连续视图 run = 总元素数（cut=0）；
+   转置/步进视图退化为 run=1（此时块拷贝无收益，调用方应走逐元素路径）。
+
+   铁律 1：本分解只影响选路，不改变任何语义。"
+  (declare (type list shape strides))
+  (let ((run 1)
+        (cut (length shape)))
+    (declare (type fixnum run cut))
+    (loop for d from (1- (length shape)) downto 0
+          for dim = (nth d shape)
+          for stride = (nth d strides)
+          when (> dim 1)
+            do (if (= stride run)
+                   (setf run (the fixnum (* run dim))
+                         cut d)
+                   (return)))
+    (values cut run)))
+
+(defun %map-inner-runs (shape strides offset cut run fn)
+  "对视图 [0, cut) 的外层索引空间做行主序 odometer，对每个外层组合调用
+   (funcall fn run-start)；run-start 为该组合对应内层连续 run 的物理起始
+   下标（= offset + Σ i_d × stride_d）。外层任一维度为 0 时不调用 FN。
+   各 run 物理区间互不重叠（dim>1 且 stride=0 的广播维度已在
+   vt-contiguous-p / 写入侧契约中排除）。
+   RUN 应与 (%inner-run-suffix shape strides) 的返回值一致。"
+  (declare (type list shape strides)
+           (type fixnum offset cut run))
+  (let* ((outer-dims (coerce (subseq shape 0 cut) 'simple-vector))
+         (outer-strides (coerce (subseq strides 0 cut) 'simple-vector))
+         (k (length outer-dims)))
+    (unless (some #'zerop outer-dims)
+      (let ((idx (make-array k :element-type 'fixnum :initial-element 0))
+            (p offset))
+        (declare (type simple-vector outer-dims outer-strides)
+                 (type (simple-array fixnum (*)) idx)
+                 (type fixnum p))
+        (loop
+          (funcall fn p)
+          (let ((d (1- k)))
+            (loop
+              (when (< d 0) (return-from %map-inner-runs))
+              (incf (aref idx d))
+              (if (< (aref idx d) (the fixnum (svref outer-dims d)))
+                  (progn (incf p (the fixnum (svref outer-strides d))) (return))
+                  (progn (decf p (* (1- (the fixnum (svref outer-dims d)))
+                                    (the fixnum (svref outer-strides d))))
+                         (setf (aref idx d) 0)
+                         (decf d)))))))))
+  (values))
+
 (defun vt-astype (tensor new-dtype)
   "将张量转换为新类型（浮点转整数截断）。返回连续的新张量。"
   (with-float-safe
@@ -414,31 +472,79 @@
                           (funcall conv (aref in-data p)))
                     (incf p))))))))
 
-        ;; ---- 非连续视图 ----
+        ;; ---- 非连续视图：内层连续 run 分解快路径 + 逐元素回退 ----
         (t
-         (let ((converter (vt-cast-fun new-dtype))
-               (dims (coerce shape 'simple-vector))
-               (i-strs (coerce in-strides 'simple-vector))
-               (indices (make-array rank :element-type 'fixnum :initial-element 0))
-               (i-ptr in-offset))
-           (declare (type simple-vector dims i-strs)
-                    (type (simple-array fixnum (*)) indices)
-                    (type fixnum i-ptr))
-           (dotimes (k size)
-             (setf (aref new-data k)
-                   (funcall converter (aref in-data i-ptr)))
-             (let ((d (the fixnum (1- rank))))
-               (declare (type fixnum d))
-               (loop
-                 (when (< d 0) (return))
-                 (incf (aref indices d))
-                 (incf i-ptr (the fixnum (svref i-strs d)))
-                 (when (< (aref indices d) (the fixnum (svref dims d)))
-                   (return))
-                 (let ((dim (the fixnum (svref dims d))))
-                   (decf i-ptr (* dim (the fixnum (svref i-strs d))))
-                   (setf (aref indices d) 0)
-                   (decf d))))))))
+         (multiple-value-bind (run-cut run-len)
+             (%inner-run-suffix shape in-strides)
+           (declare (type fixnum run-cut run-len))
+           (cond
+             ;; ---- 同 dtype 且 run 足够长：逐 run memcpy（单遍，无中间副本）。
+             ;;      每段 run 拷贝与逐元素 walker 数据完全一致（铁律 1/2）。
+             ;;      门控 run≥16：更短时每 run 的调用开销吞掉块拷贝收益。
+             ((and (eq (vt-dtype tensor) new-dtype) (>= run-len 16))
+              (let ((in-et (array-element-type in-data))
+                    (q 0))
+                (declare (type fixnum q))
+                (macrolet
+                    ((runs-memcpy (lt)
+                       `(let ((src (the (simple-array ,lt (*)) in-data))
+                              (dst (the (simple-array ,lt (*)) new-data)))
+                          (declare (type (simple-array ,lt (*)) src dst))
+                          (%map-inner-runs shape in-strides in-offset run-cut run-len
+                            (lambda (p)
+                              (declare (type fixnum p))
+                              (replace dst src
+                                       :start1 q :end1 (the fixnum (+ q run-len))
+                                       :start2 p :end2 (the fixnum (+ p run-len)))
+                              (incf q run-len))))))
+                  (cond
+                    ((equal in-et 'double-float)       (runs-memcpy double-float))
+                    ((equal in-et 'single-float)       (runs-memcpy single-float))
+                    ((equal in-et '(signed-byte 64))   (runs-memcpy (signed-byte 64)))
+                    ((equal in-et '(signed-byte 32))   (runs-memcpy (signed-byte 32)))
+                    ((equal in-et '(signed-byte 16))   (runs-memcpy (signed-byte 16)))
+                    ((equal in-et '(signed-byte 8))    (runs-memcpy (signed-byte 8)))
+                    ((equal in-et '(unsigned-byte 16)) (runs-memcpy (unsigned-byte 16)))
+                    ((equal in-et '(unsigned-byte 8))  (runs-memcpy (unsigned-byte 8)))
+                    ;; 防御：未知底层元素类型 → 通用逐 run 拷贝
+                    (t
+                     (%map-inner-runs shape in-strides in-offset run-cut run-len
+                       (lambda (p)
+                         (declare (type fixnum p))
+                         (replace new-data in-data
+                                  :start1 q :end1 (+ q run-len)
+                                  :start2 p :end2 (+ p run-len))
+                         (incf q run-len))))))))
+             ;; ---- 跨 dtype 且 run 足够长：先物化连续中间副本（块拷贝），
+             ;;      再递归走连续特化 cast 路径。两段均为特化快路径，
+             ;;      实测优于逐元素 funcall 游走；代价是一个中间缓冲。
+             ((and (not (eq (vt-dtype tensor) new-dtype)) (>= run-len 16))
+              (vt-astype (vt-contiguous tensor) new-dtype))
+             ;; ---- 完全步进 / 短 run（如转置）：保留逐元素 walker ----
+             (t
+              (let ((converter (vt-cast-fun new-dtype))
+                    (dims (coerce shape 'simple-vector))
+                    (i-strs (coerce in-strides 'simple-vector))
+                    (indices (make-array rank :element-type 'fixnum :initial-element 0))
+                    (i-ptr in-offset))
+                (declare (type simple-vector dims i-strs)
+                         (type (simple-array fixnum (*)) indices)
+                         (type fixnum i-ptr))
+                (dotimes (k size)
+                  (setf (aref new-data k)
+                        (funcall converter (aref in-data i-ptr)))
+                  (let ((d (the fixnum (1- rank))))
+                    (declare (type fixnum d))
+                    (loop
+                      (when (< d 0) (return))
+                      (incf (aref indices d))
+                      (incf i-ptr (the fixnum (svref i-strs d)))
+                      (when (< (aref indices d) (the fixnum (svref dims d)))
+                        (return))
+                      (let ((dim (the fixnum (svref dims d))))
+                        (decf i-ptr (* dim (the fixnum (svref i-strs d))))
+                        (setf (aref indices d) 0)
+                        (decf d)))))))))))
       new)))
 
 
@@ -700,6 +806,25 @@
            (replace dest-data src-data
                     :start1 dest-off :end1 (+ dest-off size)
                     :start2 src-off  :end2 (+ src-off size)))
+
+          ;; 快路径 1.5：dest 连续 + 同形 + 同 dtype + src 可分解为
+          ;; 「内层连续 run」（rank>2 且 run≥64；rank≤2 的行主序 walker
+          ;; 内层循环已是 memcpy 级，实测无需替换）→ 逐 run replace。
+          ;; 与通用路径为同一数据搬运，逐位等价（铁律 1/2）。
+          ((and dest-contig same-shape same-dtype (> rank 2)
+                (> (nth-value 1 (%inner-run-suffix src-shape src-strides)) 64))
+           (multiple-value-bind (run-cut run-len)
+               (%inner-run-suffix src-shape src-strides)
+             (declare (type fixnum run-cut run-len))
+             (let ((q dest-off))
+               (declare (type fixnum q))
+               (%map-inner-runs src-shape src-strides src-off run-cut run-len
+                 (lambda (p)
+                   (declare (type fixnum p))
+                   (replace dest-data src-data
+                            :start1 q :end1 (+ q run-len)
+                            :start2 p :end2 (+ p run-len))
+                   (incf q run-len))))))
 
           ;; 快路径 2：连续 + 同形 + 需要类型转换
           ((and dest-contig src-contig same-shape)
