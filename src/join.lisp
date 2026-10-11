@@ -1,285 +1,563 @@
 ;;;; join.lisp — 连接、堆叠、追加、插入、删除
+;;;;
+;;;; 约定基准：CONVENTIONS.md（唯一语义契约来源）。
+;;;;   - 铁律 1/2：连续性只影响选路；快路径失败必须回退通用路径，
+;;;;     且快路径与通用路径结果逐位一致。
+;;;;   - 本文件全部为纯数据搬运（不执行浮点运算），两条路径天然逐位等价；
+;;;;     需要归一 dtype 时复用 vt-astype（其 cast 语义与 vt-copy-into
+;;;;     的 vt-cast-fun 一致，见 dtype.lisp）。
+;;;;
+;;;; 性能设计：
+;;;;   1. vt-concatenate：结果缓冲一次分配（各输入块沿 axis 恰好平铺满
+;;;;      [0, total)，全部元素必被写入，故无需清零预热）；连续输入按
+;;;;      (outer, axis-size, inner) 三段视图直接 replace 块拷贝，
+;;;;      非连续输入回退 slice 视图 + vt-copy-into 通用路径。
+;;;;   2. vt-insert：flat 模式按「升序稳定排序 + 单遍装配」直接写入
+;;;;      结果缓冲 O(n + k·v)，替代旧实现逐索引 concatenate 的
+;;;;      O(k·n) 与中间副本；axis 模式把行切片与插入块单遍合并成
+;;;;      最终切片列表 O(n + k)，替代逐次 append/subseq 的 O(k·n)。
+;;;;   3. vt-delete：flat 模式按保留 run 顺序拷贝（单遍，替代
+;;;;      vt-take 的索引 gather）；axis 模式把保留行折叠为连续 run，
+;;;;      连续输入直接块拷贝，非连续输入以合并 run 的 narrow 视图
+;;;;      走 concatenate（视图数从 O(dim) 降到 O(run)）。
 
 (in-package :clvt)
 
-(defun vt-concatenate (axis &rest vts)
-  "沿指定轴连接数组。"
-  (when (null vts)
-    (error "vt-concatenate 至少需要一个张量"))
-  (let* ((shapes (mapcar #'vt-shape vts))
-         (rank (length (car shapes)))
+;;; ------------------------------------------------------------------
+;;; 内部原语：连续块拷贝（本文件快路径共用）
+;;; ------------------------------------------------------------------
+
+(declaim (inline %block-copy %axis-outer-inner))
+
+(defun %block-copy (dest-data src-data dst-start src-start length)
+  "同元素类型一维缓冲区间的块拷贝（等价 memcpy；length 为 0 时 no-op）。"
+  (declare (type (simple-array * (*)) dest-data src-data)
+           (type fixnum dst-start src-start length))
+  (when (plusp length)
+    (replace dest-data src-data
+             :start1 dst-start :end1 (+ dst-start length)
+             :start2 src-start :end2 (+ src-start length)))
+  (values))
+
+(defun %axis-outer-inner (shape axis)
+  "把 shape 沿 axis 拆为 (outer, axis-size, inner) 三段视图，返回 (values outer inner)。
+   C 连续张量沿该轴的存储可组织为 outer 段长 axis-size×inner 的连续 run。"
+  (declare (type fixnum axis))
+  (values (the fixnum (reduce #'* (subseq shape 0 axis) :initial-value 1))
+          (the fixnum (reduce #'* (subseq shape (1+ axis)) :initial-value 1))))
+
+(defun %copy-contiguous-blocks (dest-data source axis-pos axis-size outer inner dst-stride)
+  "快路径：把连续张量 source 的数据块拷入连续 dest 缓冲。
+   source 沿连接轴可视为 (outer, axis-size, inner)；对每个 outer 下标，
+   源与目标各是一段长 axis-size×inner 的连续 run（铁律 1：布局不同不改值）。"
+  (let ((src-data (vt-data source))
+        (src-offset (vt-offset source))
+        (run-length (* axis-size inner)))
+    (declare (type fixnum run-length dst-stride))
+    (dotimes (o outer)
+      (%block-copy dest-data src-data
+                   (+ (* o dst-stride) (* axis-pos inner))
+                   (+ src-offset (* o run-length))
+                   run-length))))
+
+;;; ------------------------------------------------------------------
+;;; 连接
+;;; ------------------------------------------------------------------
+
+(defun vt-concatenate (axis &rest tensors)
+  "沿指定轴连接多个张量（对标 numpy.concatenate / torch.cat）。
+
+注意：axis 为首个位置参数（clvt 历史契约，测试与示例依赖此顺序），
+支持负轴。各张量秩必须相同，非 axis 轴的维度必须严格一致。
+
+结果 dtype 为各输入 dtype 的公共提升（§3.2 提升表）；
+结果沿 axis 的长度 = 各输入该轴长度之和。
+
+NaN/Inf：纯数据搬运，逐位保留输入位模式。
+
+性能：dtype 归一后仍连续的输入走块拷贝快路径，否则逐输入回退
+stride 驱动的通用路径（slice 视图 + vt-copy-into），两者逐位一致。
+
+示例：(vt-concatenate 0 (vt-from-sequence '(1 2)) (vt-from-sequence '(3 4)))"
+  (when (null tensors)
+    (error "vt-concatenate: tensors 至少需要一个张量，收到 0 个"))
+  (let* ((shapes (mapcar #'vt-shape tensors))
+         (first-shape (car shapes))
+         (rank (length first-shape))
          (ax (vt-normalize-axis axis rank)))
+    ;; 逻辑层校验：秩一致 + 非 axis 轴维度一致（确定性报错，L2）
     (loop for shape in shapes
-	  for i from 0
+          for i from 0
           do (unless (= (length shape) rank)
-	       (error "张量 ~a 秩不匹配" i))
+               (error "vt-concatenate: 张量 ~a 秩 ~a 与首个张量秩 ~a 不匹配"
+                      i (length shape) rank))
              (loop for d in shape
-		   for j from 0
-                   unless (or (= j ax) (= d (nth j (car shapes))))
-                     do (error "形状不匹配")))
-    (let* ((new-shape (copy-list (car shapes)))
+                   for j from 0
+                   unless (or (= j ax) (= d (nth j first-shape)))
+                     do (error "vt-concatenate: 张量 ~a 沿轴 ~a 的维度 ~a 与首个张量的 ~a 不匹配"
+                               i j d (nth j first-shape))))
+    (let* ((new-shape (copy-list first-shape))
            (total (reduce #'+ (mapcar (lambda (s) (nth ax s)) shapes)))
-           (result-type (apply #'vt-promote-type (mapcar #'vt-dtype vts))))
+           (result-dtype (apply #'vt-promote-type (mapcar #'vt-dtype tensors))))
+      ;; 先把连接轴长度更新为 total，再按新形状分配结果缓冲
       (setf (nth ax new-shape) total)
-      (let ((result (vt-zeros new-shape :dtype result-type))
-	    (cur 0))
-        (dolist (vt vts)
-          (let* ((axis-size (nth ax (vt-shape vt)))
-                 (slice-args (loop for i below rank
-                                   append (if (= i ax)
-                                              (list (list cur (+ cur axis-size)))
-                                              (list '(:all))))))
-            (setf (apply #'vt-slice result slice-args) (vt-astype vt result-type))
-            (incf cur axis-size)))
+      (let* (;; 结果缓冲一次分配且不清零：各输入块沿 axis 平铺 [0, total)，
+             ;; 两条路径都会写满全部元素（未写满即 bug，与清零版语义一致）。
+             ;; 缓冲长度 = 结果完整元素数（total × inner × outer），非轴长 total。
+             (result-data (make-array (vt-shape-to-size new-shape)
+                                      :element-type (vt-dtype->lisp-type result-dtype)))
+             (result (%make-vt :data result-data :shape new-shape
+                               :strides (vt-compute-strides new-shape)
+                               :offset 0 :dtype result-dtype))
+             (dst-stride (* total (nth-value 1 (%axis-outer-inner first-shape ax))))
+             (cursor 0))
+        (declare (type fixnum cursor dst-stride))
+        (dolist (tensor tensors)
+          (let* ((axis-size (nth ax (vt-shape tensor)))
+                 ;; dtype 归一：与结果不同时先走 vt-astype 特化转换
+                 ;; （astype 输出连续，语义与通用路径的逐元素 cast 一致）
+                 (source (if (eq (vt-dtype tensor) result-dtype)
+                             tensor
+                             (vt-astype tensor result-dtype))))
+            (if (vt-contiguous-p source)
+                ;; ---- 执行层快路径：连续块拷贝 ----
+                (multiple-value-bind (outer inner)
+                    (%axis-outer-inner (vt-shape source) ax)
+                  (%copy-contiguous-blocks result-data source
+                                           cursor axis-size outer inner dst-stride))
+                ;; ---- 执行层通用路径：stride 驱动 ----
+                (let ((slice-specs (loop for i below rank
+                                         collect (if (= i ax)
+                                                     (list cursor (+ cursor axis-size))
+                                                     '(:all)))))
+                  (setf (apply #'vt-slice result slice-specs) source)))
+            (incf cursor axis-size)))
         result))))
 
-(defun vt-concat (axis &rest vts)
-  "沿既有轴连接多个张量（对标 numpy.concatenate / torch.cat）。"
-  (apply #'vt-concatenate axis vts))
+(defun vt-concat (axis &rest tensors)
+  "沿既有轴连接多个张量（对标 numpy.concatenate / torch.cat）。
+vt-concatenate 的别名，签名与语义完全一致。"
+  (apply #'vt-concatenate axis tensors))
 
-(defun vt-stack (axis &rest vts)
-  "沿新轴堆叠。"
-  (when (null vts) (error "vt-stack 至少需要一个张量"))
-  (let ((base-shape (vt-shape (car vts))))
-    (loop for vt in vts
-          unless (equal (vt-shape vt) base-shape)
-            do (error "张量形状不匹配"))
-    (apply #'vt-concatenate axis (mapcar (lambda (vt) (vt-expand-dims vt axis)) vts))))
+;;; ------------------------------------------------------------------
+;;; 堆叠
+;;; ------------------------------------------------------------------
 
-(defun vt-vstack (&rest vts)
-  "垂直堆叠（对标 torch.vstack/np.vstack）：1-D 先提升为 (1,n)，0-d 提升为 (1,1)，
-再沿轴 0 连接。"
-  (when (null vts) (error "vt-vstack 至少需要一个张量"))
+(defun vt-stack (axis &rest tensors)
+  "沿新轴堆叠（对标 numpy.stack / torch.stack）。
+
+所有张量形状必须完全一致；结果在 axis 位置插入长度为
+len(tensors) 的新轴。axis 支持负值（-1 表示插在末尾之后）。
+
+结果 dtype 为各输入 dtype 的公共提升（与 vt-concatenate 一致）。
+
+示例：(vt-stack 0 (vt-from-sequence '(1 2)) (vt-from-sequence '(3 4)))"
+  (when (null tensors)
+    (error "vt-stack: tensors 至少需要一个张量，收到 0 个"))
+  (let ((base-shape (vt-shape (car tensors))))
+    (loop for tensor in tensors
+          unless (equal (vt-shape tensor) base-shape)
+            do (error "vt-stack: 张量形状 ~a 与首个张量形状 ~a 不匹配"
+                      (vt-shape tensor) base-shape))
+    (apply #'vt-concatenate axis
+           (mapcar (lambda (tensor) (vt-expand-dims tensor axis)) tensors))))
+
+(defun vt-vstack (&rest tensors)
+  "垂直堆叠（对标 numpy.vstack / torch.vstack）。
+
+1-D 输入提升为 (1, n)，0-d 提升为 (1, 1)，≥2-D 原样，再沿轴 0 连接。
+结果 dtype 为各输入 dtype 的公共提升。
+
+示例：(vt-vstack (vt-from-sequence '(1 1)) (vt-from-sequence '(2 2)))"
+  (when (null tensors)
+    (error "vt-vstack: tensors 至少需要一个张量，收到 0 个"))
   (apply #'vt-concatenate 0
-         (mapcar (lambda (vt)
-                   (let ((rank (length (vt-shape vt))))
-                     (cond ((= rank 0) (vt-reshape vt '(1 1)))
-                           ((= rank 1) (vt-reshape vt (list 1 (first (vt-shape vt)))))
-                           (t vt))))
-                 vts)))
+         (mapcar (lambda (tensor)
+                   (let ((rank (length (vt-shape tensor))))
+                     (cond ((= rank 0) (vt-reshape tensor '(1 1)))
+                           ((= rank 1) (vt-reshape tensor
+                                                   (list 1 (first (vt-shape tensor)))))
+                           (t tensor))))
+                 tensors)))
 
-(defun vt-hstack (&rest vts)
-  "水平堆叠（对标 numpy.hstack）。1D 时沿轴 0 拼接，高维沿轴 1。"
-  (if (= (length (vt-shape (car vts))) 1)
-      (apply #'vt-concatenate 0 vts)
-      (apply #'vt-concatenate 1 vts)))
+(defun vt-hstack (&rest tensors)
+  "水平堆叠（对标 numpy.hstack）。
 
-(defun vt-dstack (&rest vts)
-  "深度堆叠（对标 numpy.dstack）。1D 视为 (1,n,1)，2D 视为 (m,n,1)。"
-  (when (null vts) (error "vt-dstack 至少需要一个张量"))
-  (let ((expanded
-	  (mapcar (lambda (vt)
-                    (let ((rank (length (vt-shape vt))))
-                      (cond ((= rank 0) (vt-reshape vt '(1 1 1))) ; numpy: 0-d → (1,1,1)
-                            ((= rank 1) (vt-reshape vt (list 1 (first (vt-shape vt)) 1)))
-                            ((= rank 2) (vt-reshape vt (append (vt-shape vt) '(1))))
-                            (t vt))))
-                  vts)))
-    (apply #'vt-concatenate 2 expanded)))
+1-D 输入沿轴 0 拼接，≥2-D 输入沿轴 1 拼接。
+结果 dtype 为各输入 dtype 的公共提升。
 
-(defun vt-append (arr values &key (axis nil))
-  "将 values 追加到 arr 末尾。"
-  (let ((arr-vt (ensure-vt arr)) (val-vt (ensure-vt values)))
+示例：(vt-hstack (vt-from-sequence '(1 1)) (vt-from-sequence '(2 2)))"
+  (when (null tensors)
+    (error "vt-hstack: tensors 至少需要一个张量，收到 0 个"))
+  (if (= (length (vt-shape (car tensors))) 1)
+      (apply #'vt-concatenate 0 tensors)
+      (apply #'vt-concatenate 1 tensors)))
+
+(defun vt-dstack (&rest tensors)
+  "深度堆叠（对标 numpy.dstack / torch.dstack）。
+
+0-d 视为 (1, 1, 1)，1-D 视为 (1, n, 1)，2-D 视为 (m, n, 1)，≥3-D 原样，
+再沿轴 2 连接。结果 dtype 为各输入 dtype 的公共提升。
+
+示例：(vt-dstack (vt-from-sequence '(1 1)) (vt-from-sequence '(2 2)))"
+  (when (null tensors)
+    (error "vt-dstack: tensors 至少需要一个张量，收到 0 个"))
+  (apply #'vt-concatenate 2
+         (mapcar (lambda (tensor)
+                   (let ((rank (length (vt-shape tensor))))
+                     (cond ((= rank 0) (vt-reshape tensor '(1 1 1)))
+                           ((= rank 1) (vt-reshape tensor
+                                                   (list 1 (first (vt-shape tensor)) 1)))
+                           ((= rank 2) (vt-reshape tensor (append (vt-shape tensor) '(1))))
+                           (t tensor))))
+                 tensors)))
+
+;;; ------------------------------------------------------------------
+;;; 追加
+;;; ------------------------------------------------------------------
+
+(defun vt-append (tensor values &key (axis nil))
+  "将 values 追加到 tensor 末尾（对标 numpy.append）。
+
+axis 为 NIL：两数组展平为一维后沿轴 0 连接，结果一维；
+axis 给定：两者秩必须一致，且除 axis 外各维度必须相等，
+结果沿 axis 的长度为两者之和。
+
+结果 dtype 为两者 dtype 的公共提升（与 vt-concatenate 一致）。
+纯数据搬运，NaN 逐位保留。
+
+示例：(vt-append (vt-from-sequence '(1 2)) (vt-from-sequence '(3 4)))"
+  (let ((tensor-vt (ensure-vt tensor))
+        (values-vt (ensure-vt values)))
     (if (null axis)
-        (vt-concatenate 0 (vt-flatten arr-vt) (vt-flatten val-vt))
-        (let* ((rank (length (vt-shape arr-vt)))
+        (vt-concatenate 0 (vt-ravel tensor-vt) (vt-ravel values-vt))
+        (let* ((rank (length (vt-shape tensor-vt)))
                (ax (vt-normalize-axis axis rank)))
-          (unless (= (length (vt-shape arr-vt)) (length (vt-shape val-vt)))
-            (error "vt-append: 维度不匹配"))
+          (unless (= (length (vt-shape tensor-vt)) (length (vt-shape values-vt)))
+            (error "vt-append: tensor 秩 ~a 与 values 秩 ~a 不匹配"
+                   (length (vt-shape tensor-vt)) (length (vt-shape values-vt))))
           (loop for i below rank
                 unless (or (= i ax)
-			   (= (nth i (vt-shape arr-vt))
-			      (nth i (vt-shape val-vt))))
-                  do (error "vt-append: 轴 ~a 形状不匹配" i))
-          (vt-concatenate ax arr-vt val-vt)))))
+                           (= (nth i (vt-shape tensor-vt))
+                              (nth i (vt-shape values-vt))))
+                  do (error "vt-append: 轴 ~a 维度 tensor=~a values=~a 不匹配"
+                            i (nth i (vt-shape tensor-vt))
+                            (nth i (vt-shape values-vt))))
+          (vt-concatenate ax tensor-vt values-vt)))))
 
-(defun vt-insert (arr obj values &key (axis nil))
-  "对标 numpy.insert 插入值。
-   多索引语义与 numpy 一致：
-   - 所有索引先按原数组尺寸归一化（负索引）并越界检查；
-   - 按位置升序稳定排序后依次插入，同位置多个值按 values 顺序
-     依次排布（v0.3.5 修复：旧实现降序插入导致同位置值逆序，
-     且负索引按演化中的尺寸解析，均与 numpy 不符）。"
-  (labels ((norm-pos (raw size)
-             (let ((pos (if (minusp raw) (+ size raw) raw)))
-               (when (or (< pos 0) (> pos size))
-                 (error "索引 ~a 越界（轴大小 ~a）" raw size))
-               pos)))
-  (let* ((arr-vt (ensure-vt arr))
-         (values-vt (ensure-vt values :dtype (vt-dtype arr-vt))))
-    ;; v0.4.x：obj 归一化（对标 numpy 接受数组索引）：
-    ;;   VT → 展平为整数列表；标量 obj 在 values 元素数 > 1 时
-    ;;   按 numpy 广播为重复索引（np.insert(a,1,[7,8]) ≡ obj=[1,1]）。
-    (setf obj (cond ((vt-p obj)
-                     (let ((flat (vt-flatten obj)))
-                       (loop for i below (vt-size flat)
-                             collect (truncate (aref (vt-data flat) i)))))
-                    ((integerp obj)
-                     ;; v0.4.2 修复（numpy 对齐，example.lisp 回归发现）：
-                     ;; flat 模式重复索引次数 = values 元素数（与 numpy
-                     ;; 单块结果等价）；axis 模式保持**单索引** —— numpy
-                     ;; scalar-obj 语义是对 values 做 moveaxis(0→axis) 后
-                     ;; **单块**插入（np.insert(a,1,[[99,100]],axis=1) =>
-                     ;; [[1,99,2],[3,100,4]]），原先广播为
-                     ;; values.shape[axis] 次插入会在 (1,2) 块上试图
-                     ;; reshape (1,2)→(2,2) 而报错。
-                     (let ((n (if axis
-                                  1
-                                  (vt-size (vt-flatten values-vt)))))
-                       (if (> n 1)
-                           (make-list n :initial-element obj)
-                           (list obj))))
-                    ((listp obj) obj)
-                    (t (error "无效 obj 类型：~a" obj))))
+;;; ------------------------------------------------------------------
+;;; 插入
+;;; ------------------------------------------------------------------
+
+(declaim (inline %insert-norm-pos))
+
+(defun %insert-norm-pos (raw size)
+  "insert 位置归一化：负索引加轴长，越界确定性报错（numpy 语义，
+位置允许等于轴长，即插入到末尾）。"
+  (let ((pos (if (minusp raw) (+ size raw) raw)))
+    (when (or (< pos 0) (> pos size))
+      (error "vt-insert: 索引 ~a 越界（轴大小 ~a）" raw size))
+    pos))
+
+(defun %insert-flat (flat flat-val insertions dtype)
+  "flat 模式插入：positions 已归一化为列表（未排序）。
+   flat / flat-val 均为一维连续张量；结果 dtype = dtype（values 已 coerce）。
+   numpy 语义：位置升序稳定排序后依次插入，同位置多个值按 values 顺序排布。
+   实现采用单遍装配：对排序后的插入计划，从左到右拷贝源区间与插入块，
+   O(n + k·v)，无中间副本。"
+  (let* ((size (vt-size flat))
+         (val-size (vt-size flat-val))
+         (num (length insertions)))
+    (unless (or (= val-size num) (= val-size 1))
+      (error "vt-insert: values 元素数 ~a 与索引数 ~a 不一致" val-size num))
+    ;; 稳定排序保证同位置值按 values 原顺序排布
+    (let* ((pairs (stable-sort
+                   (if (= val-size 1)
+                       (loop for raw-pos in insertions
+                             collect (cons (%insert-norm-pos raw-pos size)
+                                           flat-val))
+                       (loop for raw-pos in insertions
+                             for i from 0 below val-size
+                             collect (cons (%insert-norm-pos raw-pos size)
+                                           (vt-narrow flat-val 0 i (1+ i)))))
+                   #'< :key #'car))
+           (result-size (+ size (length pairs)))
+           (result-data (make-array result-size
+                                    :element-type (vt-dtype->lisp-type dtype)))
+           (src-data (vt-data flat))
+           (src-offset (vt-offset flat))
+           (read-pos 0)
+           (write-pos 0))
+      (declare (type fixnum read-pos write-pos))
+      (dolist (pair pairs)
+        (let* ((pos (car pair))
+               (block-vt (cdr pair))
+               (block-size (vt-size block-vt))
+               (run (- pos read-pos)))
+          ;; 源区间 [read-pos, pos)
+          (%block-copy result-data src-data
+                       write-pos (+ src-offset read-pos) run)
+          (incf write-pos run)
+          ;; 插入块（flat-val 的连续窄视图或单元素张量本身）
+          (%block-copy result-data (vt-data block-vt) write-pos
+                       (vt-offset block-vt) block-size)
+          (incf write-pos block-size)
+          (setf read-pos pos)))
+      ;; 末段源区间
+      (%block-copy result-data src-data
+                   write-pos (+ src-offset read-pos) (- size read-pos))
+      (%make-vt :data result-data :shape (list result-size)
+                :strides (list 1) :offset 0 :dtype dtype))))
+
+(defun %insert-axis (tensor-vt insertions values-vt axis)
+  "axis 模式插入：沿 axis 在指定行位置插入 values 块。
+   numpy 语义：位置升序稳定排序，同位置多个块按 values 顺序排布；
+   标量 positions 对 values 做 moveaxis(0→axis) 后单块插入。
+   切片列表单遍合并 O(ax-size + k) 后一次性 concatenate。"
+  (let* ((shape (vt-shape tensor-vt))
+         (rank (length shape))
+         (ax (vt-normalize-axis axis rank))
+         (ax-size (nth ax shape))
+         (num (length insertions))
+         (values-nd (vt-shape values-vt))
+         ;; 单索引块插入时块长取自 ndmin(values) 第 0 轴
+         ;; （numpy: moveaxis(values,0,axis) 后取 values.shape[axis]，
+         ;;   moveaxis 是零拷贝视图，故块 = values 的线性重排即可等价）；
+         ;; 标量 values 广播填满；多索引路径要求 values 沿 axis 为 num 块。
+         (adj-shape (if (and values-nd (= num 1) (< (length values-nd) rank))
+                        (append (make-list (- rank (length values-nd))
+                                           :initial-element 1)
+                                values-nd)
+                        values-nd))
+         (numnew (cond ((null values-nd) 1)
+                       ((= num 1) (first adj-shape))
+                       (t num)))
+         (target-shape
+           (loop for i below rank
+                 collect (if (= i ax) numnew (nth i shape))))
+         (values-vt
+           (cond ((null values-nd)
+                  (vt-full target-shape (vt-ref values-vt)
+                           :dtype (vt-dtype values-vt)))
+                 ((and (= num 1) (< (length values-nd) rank))
+                  ;; ndmin 前置补 1 轴（numpy ndmin=tensor.ndim）
+                  (vt-reshape values-vt adj-shape))
+                 (t values-vt)))
+         (values-reshaped
+           (if (and (= num 1) values-nd)
+               (cond ((= (vt-size values-vt) (reduce #'* target-shape))
+                      (vt-reshape values-vt target-shape))
+                     ((= (vt-size values-vt) 1)
+                      (vt-full target-shape (vt-item values-vt)
+                               :dtype (vt-dtype values-vt)))
+                     (t (error "vt-insert: values 形状 ~a 无法与插入块形状 ~a 匹配（元素数不一致且不可广播）"
+                               values-nd target-shape)))
+               (vt-reshape values-vt target-shape)))
+         (row-slices
+           (loop for i from 0 below ax-size
+                 collect (vt-narrow tensor-vt ax i (1+ i))))
+         (value-blocks
+           (if (= num 1)
+               (list values-reshaped)
+               (loop for i from 0 below num
+                     collect (vt-narrow values-reshaped ax i (1+ i)))))
+         ;; 先归一化再稳定排序（同 flat 模式，numpy 语义）
+         (pairs (stable-sort (loop for raw-pos in insertions
+                                   for block in value-blocks
+                                   collect (cons (%insert-norm-pos raw-pos ax-size)
+                                                 block))
+                             #'< :key #'car)))
+    ;; 单遍合并：行切片与插入块按最终顺序一次成型
+    (let ((final-slices '())
+          (pending pairs))
+      (loop for row below ax-size
+            do (loop while (and pending (= (car (first pending)) row))
+                     do (push (cdr (first pending)) final-slices)
+                        (pop pending))
+               (push (nth row row-slices) final-slices))
+      ;; 剩余插入点位置均为 ax-size（插入到末尾）
+      (dolist (p pending)
+        (push (cdr p) final-slices))
+      (apply #'vt-concatenate ax (nreverse final-slices)))))
+
+(defun vt-insert (tensor positions values &key (axis nil))
+  "对标 numpy.insert 在指定位置插入值。
+
+positions：整数 / 整数列表 / 整数张量。所有位置先按当前轴尺寸
+归一化（负索引）并做越界检查（位置允许等于轴长，即插入到末尾）；
+多位置按升序稳定排序后依次插入，同位置多个值按 values 顺序排布。
+标量 positions 在 axis 为 NIL 时按 values 元素数广播为重复位置
+（np.insert(a,1,[7,8]) ≡ positions=[1,1]）；axis 给定时保持单索引、
+对 values 做 moveaxis(0→axis) 后单块插入（numpy scalar-obj 语义）。
+
+axis 为 NIL：展平成一维后插入；axis 给定：沿该轴插入，
+values 经 reshape/broadcast 与插入块对齐。
+
+结果 dtype 与 tensor 一致（values 先 coerce 到 tensor dtype）。
+NaN/Inf：纯数据搬运，逐位保留。
+
+示例：(vt-insert (vt-from-sequence '(0 1 2)) 1 (vt-from-sequence '(10 20)))"
+  (let* ((tensor-vt (ensure-vt tensor))
+         (values-vt (ensure-vt values :dtype (vt-dtype tensor-vt)))
+         (insertions
+           (cond ((vt-p positions)
+                  (let ((flat (vt-flatten positions)))
+                    (loop for i below (vt-size flat)
+                          collect (truncate (aref (vt-data flat) i)))))
+                 ((integerp positions)
+                  (let ((n (if axis
+                               1
+                               (vt-size (vt-flatten values-vt)))))
+                    (if (> n 1)
+                        (make-list n :initial-element positions)
+                        (list positions))))
+                 ((listp positions) positions)
+                 (t (error "vt-insert: positions 类型无效，收到 ~a" positions)))))
     (if (null axis)
-        (let* ((flat (vt-flatten arr-vt)) (flat-val (vt-flatten values-vt))
-					  (val-size (vt-size flat-val)))
-          (if (integerp obj)
-              (let* ((size (vt-size flat))
-                       (pos (norm-pos obj size)))
-                (if (zerop val-size) flat
-                    (let ((left (if (> pos 0)
-				    (vt-slice flat (list 0 pos))
-				    (vt-zeros '(0) :dtype (vt-dtype flat))))
-                          (right (if (< pos size)
-				     (vt-slice flat (list pos size))
-				     (vt-zeros '(0) :dtype (vt-dtype flat)))))
-                      (vt-concatenate 0 left flat-val right))))
-              (let ((num (length obj)))
-                (unless (or (= val-size num) (= val-size 1))
-                  (error "flat mode: values 大小 ~a ≠ 索引数 ~a" val-size num))
-                  (let* ((size (vt-size flat))
-                         ;; 先按原尺寸归一化（负索引），再升序稳定排序：
-                         ;; 值跟随其索引，同位置按 values 顺序排布（numpy 语义）
-                         (pairs (stable-sort
-                              (if (= val-size 1)
-                                  (loop for idx in obj
-                                           collect (cons (norm-pos idx size) flat-val))
-                                  (loop for idx in obj
-					for i from 0 below val-size
-                                           collect (cons (norm-pos idx size)
-                                                         (vt-narrow flat-val 0 i (1+ i)))))
-                                 #'< :key #'car)))
-                  (loop with result = flat
-                          for j from 0
-                          for (norm-pos . val) in pairs
-                          ;; j 为此前已插入的个数，累进插入位置
-                          for pos = (+ norm-pos j)
-                          do (let ((left (if (> pos 0)
-					   (vt-slice result (list 0 pos))
-					   (vt-zeros '(0) :dtype (vt-dtype result))))
-                                   (right (if (< pos (vt-size result))
-                                              (vt-slice result (list pos (vt-size result)))
-					    (vt-zeros '(0) :dtype (vt-dtype result)))))
-                             (setf result (vt-concatenate 0 left val right)))
-                        finally (return result))))))
-        (let* ((shape (vt-shape arr-vt))
-	       (rank (length shape))
-	       (ax (vt-normalize-axis axis rank))
-	       (ax-size (nth ax shape))
-	       (obj-list (if (listp obj) obj (list obj)))
-	       (num (length obj-list))
-	       (values-nd (vt-shape values-vt))
-	       ;; v0.4.2（numpy 对齐）：单索引块插入时 numnew 取自
-	       ;; ndmin(values) 第 0 轴（numpy: moveaxis(values,0,axis)
-	       ;; 后取 values.shape[axis]）；moveaxis 是零拷贝视图，
-	       ;; 故块 = values 数据的线性重排（vt-reshape）即可等价。
-	       ;; 标量 values 广播填满；多索引路径要求 values.shape[axis]=num。
-	       (adj-shape (if (and values-nd (= num 1) (< (length values-nd) rank))
-			      (append (make-list (- rank (length values-nd))
-						 :initial-element 1)
-				      values-nd)
-			      values-nd))
-	       (numnew (cond ((null values-nd) 1)
-                             ((= num 1) (first adj-shape))
-                             (t num)))
-	       (target-shape
-		 (loop for i below rank
-		       collect (if (= i ax) numnew (nth i shape))))
-	       (values-vt
-		 (cond ((null values-nd)
-			(vt-full target-shape (vt-ref values-vt) :dtype (vt-dtype values-vt)))
-		       ((and (= num 1) (< (length values-nd) rank))
-			;; ndmin 前置补 1 轴（numpy ndmin=arr.ndim）
-			(vt-reshape values-vt adj-shape))
-		       (t values-vt)))
-	       (values-reshaped
-		 (if (and (= num 1) values-nd)
-		     (cond ((= (vt-size values-vt) (reduce #'* target-shape))
-			    (vt-reshape values-vt target-shape))
-			   ((= (vt-size values-vt) 1)
-			    (vt-full target-shape (vt-item values-vt) :dtype (vt-dtype values-vt)))
-			   (t (error "vt-insert: values 形状 ~a 无法与插入块形状 ~a 匹配（元素数不一致且不可广播）"
-				     values-nd target-shape)))
-		     (vt-reshape values-vt target-shape)))
-	       (arr-slices
-		 (loop for i from 0 below ax-size
-		       collect (vt-narrow arr-vt ax i (1+ i))))
-	       (value-blocks
-		 (if (= num 1)
-		     (list values-reshaped)
-		     (loop for i from 0 below num
-			   collect (vt-narrow values-reshaped ax i (1+ i)))))
-                 ;; 先归一化再排序（同 flat 模式，numpy 语义）
-                 (pairs (stable-sort (loop for raw-pos in obj-list
-					 for b in value-blocks
-                                           collect (cons (norm-pos raw-pos ax-size) b))
-                                     #'< :key #'car)))
-          (loop with slices = (copy-list arr-slices)
-                  for j from 0
-                  for (norm-pos . block) in pairs
-                  for pos = (+ norm-pos j)
-                  do (setf slices (append (subseq slices 0 pos)
-                                          (list block)
-                                          (subseq slices pos)))
-                  finally (return (apply #'vt-concatenate ax slices))))))))
+        (%insert-flat (vt-ravel tensor-vt) (vt-ravel values-vt)
+                      insertions (vt-dtype tensor-vt))
+        (%insert-axis tensor-vt insertions values-vt axis))))
 
-(defun vt-delete (arr obj &key (axis nil))
-  "对标 numpy.delete 删除元素。"
-  (let* ((tensor (ensure-vt arr)) (sh (vt-shape tensor)) (rank (length sh))
-				  (dtype (vt-dtype tensor)))
-    ;; v0.4.x：obj 归一化——VT 索引展平为整数列表（对标 numpy），
-    ;; 标量视为单元素列表（后续 keep 分支统一按列表处理）。
-    (setf obj (cond ((vt-p obj)
-                     (let ((flat (vt-flatten obj)))
-                       (loop for i below (vt-size flat)
-                             collect (truncate (aref (vt-data flat) i)))))
-                    ((listp obj) obj)
-                    (t (list obj))))
-    (labels ((norm-idx (idx dim)
-               (let ((n (if (minusp idx) (+ idx dim) idx)))
-                 (unless (<= 0 n (1- dim))
-		   (error "索引 ~d 越界（轴大小 ~d）" idx dim))
-                 n))
-             (norm-end (idx dim)
-               (let ((n (if (minusp idx) (+ idx dim) idx)))
-                 (unless (<= 0 n dim)
-		   (error "切片端点 ~d 越界（轴大小 ~d）" idx dim))
-                 n))
-             (keep (obj dim)
-               (let ((del (make-hash-table :test 'eql)))
-                 (flet ((add (i) (setf (gethash i del) t)))
-                   (cond ((integerp obj) (add (norm-idx obj dim)))
-                         ((and (listp obj) (eq (first obj) :slice))
-                          (destructuring-bind (_ s e) obj
-                            (declare (ignore _))
-                            (let ((ss (norm-end s dim))
-				  (ee (norm-end e dim)))
-                              (loop for i from ss below ee do (add i)))))
-                         ((listp obj) (dolist (idx obj) (add (norm-idx idx dim))))
-                         (t (error "无效 obj 类型 ~a" obj))))
-                 (loop for i from 0 below dim
-		       unless (gethash i del) collect i))))
-      (if (null axis)
-          (let* ((flat (vt-ravel tensor)) (k (keep obj (vt-size flat))))
-            (if k (vt-take flat (vt-from-sequence k :dtype :int64))
-                (vt-zeros '(0) :dtype dtype)))
-          (let* ((ax (vt-normalize-axis axis rank))
-		 (dim (nth ax sh))
-		 (k (keep obj dim)))
-            (if k
-                (apply #'vt-concatenate ax (loop for i in k
-						 collect (vt-narrow tensor ax i (1+ i))))
-                (let ((ns (copy-list sh)))
-                  (setf (nth ax ns) 0)
-                  (vt-zeros ns :dtype dtype))))))))
+;;; ------------------------------------------------------------------
+;;; 删除
+;;; ------------------------------------------------------------------
+
+(declaim (inline %delete-norm-idx %delete-norm-end))
+
+(defun %delete-norm-idx (idx dim)
+  "delete 行索引归一化：负索引加轴长，越界确定性报错（0 ≤ idx < dim）。"
+  (let ((n (if (minusp idx) (+ idx dim) idx)))
+    (unless (and (>= n 0) (< n dim))
+      (error "vt-delete: 索引 ~a 越界（轴大小 ~a）" idx dim))
+    n))
+
+(defun %delete-norm-end (idx dim)
+  "delete 切片端点归一化：允许 0 ≤ end ≤ dim（闭区间端点）。"
+  (let ((n (if (minusp idx) (+ idx dim) idx)))
+    (unless (and (>= n 0) (<= n dim))
+      (error "vt-delete: 切片端点 ~a 越界（轴大小 ~a）" idx dim))
+    n))
+
+(defun %deleted-flags (positions dim)
+  "把 positions（整数列表或 (:slice start end) 内部形式）编译为
+长度 dim 的位向量：1 = 删除。重复位置幂等。"
+  (let ((flags (make-array dim :element-type 'bit :initial-element 0)))
+    (if (and (listp positions) (eq (first positions) :slice))
+        (destructuring-bind (_ s e) positions
+          (declare (ignore _))
+          (let ((ss (%delete-norm-end s dim))
+                (ee (%delete-norm-end e dim)))
+            (loop for i from ss below ee do (setf (bit flags i) 1))))
+        (dolist (idx positions)
+          (setf (bit flags (%delete-norm-idx idx dim)) 1)))
+    flags))
+
+(defun %kept-runs (flags dim)
+  "把位向量折叠为保留区间的连续 run 列表 ((start end) ...)，end 排他，
+升序返回。将 O(dim) 个行视图压缩为 O(run) 个，减少 concatenate 视图数。"
+  (let ((runs '())
+        (run-start nil))
+    (loop for i below dim
+          do (if (zerop (bit flags i))
+                 (unless run-start (setf run-start i))
+                 (when run-start
+                   (push (cons run-start i) runs)
+                   (setf run-start nil)))
+          finally (when run-start (push (cons run-start dim) runs)))
+    (nreverse runs)))
+
+(defun %delete-axis-copy (source ax runs kept-count)
+  "快路径：C 连续张量沿 ax 删除后保留行的直接块拷贝。
+   连续张量沿 ax 可视为 (outer, dim, inner)；每个保留 run 在每个
+   outer 块内对应一段 (end-start)×inner 的连续 run。"
+  (let* ((shape (vt-shape source))
+         (dim (nth ax shape)))
+    (multiple-value-bind (outer inner)
+        (%axis-outer-inner shape ax)
+      (let* ((result-size (* kept-count inner outer))
+             (result-data (make-array result-size
+                                      :element-type (vt-element-type source)))
+             (src-data (vt-data source))
+             (src-offset (vt-offset source))
+             (src-outer-stride (* dim inner))
+             (dst-outer-stride (* kept-count inner))
+             (dst-run-base 0))
+        (declare (type fixnum dst-run-base))
+        (dolist (run runs)
+          (let* ((len (* (- (cdr run) (car run)) inner))
+                 (src-run-base (+ src-offset (* (car run) inner))))
+            (dotimes (o outer)
+              (%block-copy result-data src-data
+                           (+ (* o dst-outer-stride) dst-run-base)
+                           (+ src-run-base (* o src-outer-stride))
+                           len)))
+          (incf dst-run-base (* (- (cdr run) (car run)) inner)))
+        (let ((new-shape (copy-list shape)))
+          (setf (nth ax new-shape) kept-count)
+          (%make-vt :data result-data :shape new-shape
+                    :strides (vt-compute-strides new-shape)
+                    :offset 0 :dtype (vt-dtype source)))))))
+
+(defun vt-delete (tensor positions &key (axis nil))
+  "对标 numpy.delete 删除元素。
+
+positions：整数 / 整数列表 / 整数张量 / (:slice start end)（内部形式，
+删除区间 [start, end)）。所有索引先按当前轴尺寸归一化（负索引）并
+越界检查；重复位置幂等。
+
+axis 为 NIL：先展平成一维再删除（对标 numpy 扁平语义）；
+axis 给定：沿该轴删除对应行，其余维度不变。
+
+NaN/Inf：纯数据搬运，逐位保留。
+
+示例：(vt-delete (vt-from-sequence '(0 1 2)) 1)"
+  (let* ((tensor-vt (ensure-vt tensor))
+         (shape (vt-shape tensor-vt))
+         (rank (length shape))
+         (dtype (vt-dtype tensor-vt))
+         (positions-list
+           (cond ((vt-p positions)
+                  (let ((flat (vt-flatten positions)))
+                    (loop for i below (vt-size flat)
+                          collect (truncate (aref (vt-data flat) i)))))
+                 ((listp positions) positions)
+                 (t (list positions)))))
+    (if (null axis)
+        ;; ---- flat 模式：ravel 保证一维连续 → 保留 run 单遍拷贝 ----
+        (let* ((flat (vt-ravel tensor-vt))
+               (flat-size (vt-size flat))
+               (flags (%deleted-flags positions-list flat-size))
+               (runs (%kept-runs flags flat-size)))
+          (if (null runs)
+              (vt-zeros '(0) :dtype dtype)
+              (let* ((kept-count (loop for run in runs sum (- (cdr run) (car run))))
+                     (result-data (make-array kept-count
+                                              :element-type (vt-element-type tensor-vt)))
+                     (src-data (vt-data flat))
+                     (src-offset (vt-offset flat))
+                     (write-pos 0))
+                (declare (type fixnum write-pos))
+                (dolist (run runs)
+                  (let ((len (- (cdr run) (car run))))
+                    (%block-copy result-data src-data
+                                 write-pos (+ src-offset (car run)) len)
+                    (incf write-pos len)))
+                (%make-vt :data result-data :shape (list kept-count)
+                          :strides (list 1) :offset 0 :dtype dtype))))
+        ;; ---- axis 模式：保留行折叠为 run ----
+        (let* ((ax (vt-normalize-axis axis rank))
+               (dim (nth ax shape))
+               (flags (%deleted-flags positions-list dim))
+               (runs (%kept-runs flags dim))
+               (kept-count (loop for run in runs sum (- (cdr run) (car run)))))
+          (if (null runs)
+              (let ((empty-shape (copy-list shape)))
+                (setf (nth ax empty-shape) 0)
+                (vt-zeros empty-shape :dtype dtype))
+              (if (vt-contiguous-p tensor-vt)
+                  ;; 快路径：连续输入 → 直接块拷贝
+                  (%delete-axis-copy tensor-vt ax runs kept-count)
+                  ;; 通用路径：合并 run 的 narrow 视图走 concatenate
+                  (apply #'vt-concatenate ax
+                         (loop for run in runs
+                               collect (vt-narrow tensor-vt ax (car run) (cdr run))))))))))
