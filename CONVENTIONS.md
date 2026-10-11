@@ -620,7 +620,7 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | `vt-linspace` | float32 输出**以 double 精度计算后舍入存储**（对标 NumPy，避免累积漂移） | ✅ |
 | `vt-random-uniform` / `vt-random-normal` | `uniform` 要求 `low`/`high` 为有限实数，`low = high` 合法（返回常量数组）；`normal` 要求 `std` 为非负有限实数，`std = 0` 返回 `mean` 填充 | ✅ |
 | `vt-slice` | spec 语法须与文档统一（**无 `:range`** → D1） | ✅ 实现正确，仅需补文档 |
-| `vt-where` | 单参数形式 `(vt-where cond)` 返回 (n,rank) 坐标（对标 `np.where(cond)`）；三元形式同 `np.where(cond,x,y)` | ✅ 已对齐（本轮，D6） |
+| `vt-where` | 单参数形式 `(vt-where cond)` 返回**按轴分组的索引列表**（长度 = rank，等价 `vt-nonzero` / `np.nonzero(cond)`）；三元形式同 `np.where(cond,x,y)` | ✅ 已对齐（见 D6） |
 | 空归约 | 三分类语义 | ✅ 正面样板（D11） |
 | 比较运算 | 返回 `:int8` 承载布尔（0/1） | ✅（文档需写明） |
 | 三角/反三角 | `asin/acos/atan` 命名（非 arc*），越界返回 NaN | ✅（命名见 §3.1.1） |
@@ -805,13 +805,22 @@ NumPy 2.3.5 实测：`clip(a, a_min=None, a_max=None)`——两边界**均可省
 
 ```lisp
 (vt-where (vt-from-sequence '(1 0 1)))
-;; => shape (2 1) 坐标 ((0) (2))   ✅ 对齐 np.where(cond)
+;; => 长度 1 的索引列表，元素为 shape (2) 的 int64 张量 [0 2]   ✅ 对齐 np.where(cond)
+
+(vt-where (vt-from-sequence '((1 0) (0 1))))
+;; => 长度 2 的索引列表：轴0 -> [0 1]，轴1 -> [0 1]
 ```
 
-`np.where(cond)` 返回非零元素坐标。clvt 采用 **(n, rank)** 坐标张量
-（int64），与 `vt-argwhere` 一致（CL 无元组，故不返回索引元组）。
-三元形式 `(vt-where cond x y)` 不变。
-**裁决**：✅ **已增加单参数重载**（本轮修复）。
+numpy 文档明确 `np.where(cond)` 是 `np.asarray(cond).nonzero()` 的**简写**，
+返回的是**按轴分组的索引元组**（长度 = rank），**不是** `np.argwhere` 的
+`(n, rank)` 坐标堆叠。此前 clvt 返回 `(n, rank)`（理由是「CL 无元组」），
+与 numpy 契约不符；CL 侧用**张量列表**承载该元组即可，这也正是库内
+`vt-nonzero` 既有的返回约定，因此二者现在完全一致。
+
+需要 `(n, rank)` 形式请直接用 `vt-argwhere`。
+三元形式 `(vt-where cond x y)` 不受影响。
+**裁决**：✅ **已修正为按轴分组列表**（回归见
+`test/contract-regression-test.lisp`）。
 
 ### D7 — `vt-var` / `vt-std` **已有** `ddof`，但**缺 docstring**
 
@@ -1015,7 +1024,7 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | `:out` 别名快照 | `vt-map` / SIMD matmul / einsum 统一用物理区间重叠判定 | — |
 | 零除（整数） | `mod` / `rem` / `div`（floor_divide）均返回 0、dtype 保持（D16） | — |
 | `vt-clip` 参数 | 已按 numpy 2.3.5 语义：无边/只 max 合法，只 min 报错（D5） | — |
-| `vt-where` 单参 | 已对齐：`(vt-where cond)` → (n,rank) 坐标（D6） | — |
+| `vt-where` 单参 | 已对齐：`(vt-where cond)` → 按轴分组索引列表（= `vt-nonzero`，D6） | — |
 | `vt-arange` 报错 | **唯一例外**，保持现状不对齐（D8，用户豁免） | — |
 | `vt-reciprocal` 整数 | 已按 numpy 整数语义（D9） | — |
 | docstring 覆盖 | 公开 `vt-*` 基本齐全（余 4 个 defstruct 访问器） | — |

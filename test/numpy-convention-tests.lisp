@@ -223,15 +223,23 @@
              (and (eq :int64 (vt-dtype (vt-clip ai nil 2)))
                   (equal (vt-to-list (vt-clip ai nil 2)) '(1 2 2))))))
 
-  ;; where 单参 → 返回 (n,rank) 坐标（对齐 np.where(cond)）
-  (check "where 单参 1d → (n,1) 坐标"
-         (equal (vt-to-list (vt-where (vt-from-sequence '(1 0 1)))) '((0) (2))))
-  (check "where 单参 2d → (n,2) 坐标"
-         (equal (vt-to-list (vt-where (vt-from-sequence '((1 0) (0 1)))))
-                '((0 0) (1 1))))
-  (check "where 单参与 argwhere 一致"
-         (equal (vt-to-list (vt-where (vt-from-sequence '(1 0 1))))
-                (vt-to-list (vt-argwhere (vt-from-sequence '(1 0 1))))))
+  ;; np.where(cond) 文档明确等价 np.asarray(cond).nonzero()，
+  ;; 返回**按轴分组的索引元组**（长度 = rank，每项形状 (n,)）；
+  ;; 此前 clvt 返回 argwhere 的 (n, rank)，与 numpy 契约不符。
+  (check "where 单参 1d → 按轴分组元组（= np.nonzero）"
+         (equal (mapcar #'vt-to-list (vt-where (vt-from-sequence '(1 0 1))))
+                '((0 2))))
+  (check "where 单参 1d → 每项形状 (n,)"
+         (equal (mapcar #'vt-shape (vt-where (vt-from-sequence '(1 0 1))))
+                '((2))))
+  (check "where 单参 2d → 两个轴的索引"
+         (equal (mapcar #'vt-to-list (vt-where (vt-from-sequence '((1 0) (0 1)))))
+                '((0 1) (0 1))))
+  (check "where 单参与 vt-nonzero 一致"
+         (equal (mapcar #'vt-to-list (vt-where (vt-from-sequence '(1 0 1))))
+                (mapcar #'vt-to-list (vt-nonzero (vt-from-sequence '(1 0 1))))))
+  (check "argwhere 仍为 (n,rank) 坐标"
+         (equal (vt-to-list (vt-argwhere (vt-from-sequence '(1 0 1)))) '((0) (2))))
   ;; where 三元形式回归
   (check "where 三元正常"
          (equal (vt-to-list (vt-where (vt-from-sequence '(1 0 1)) 10 20)) '(10 20 10)))

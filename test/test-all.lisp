@@ -637,9 +637,13 @@
 (deftest test-indexing-where-family
     "indexing: vt-where / vt-argwhere / vt-nonzero / vt-flatnonzero / vt-extract / vt-select"
   (let ((c (vt-from-sequence '(1 0 2 0) :dtype :int64)))
+    ;; np.where(cond) == np.asarray(cond).nonzero()，
+    ;; 返回按轴分组的索引元组（长度 = rank），而非 argwhere 的 (n, rank)。
     (let ((w (vt-where c)))
-      (check-shape "vt-where 单参 → (n rank) 坐标" w '(2 1))
-      (check-eq "vt-where 坐标 [0 2]" (vt-to-list w) '(0 2)))
+      (check "vt-where 单参 → 按轴分组元组（长度 = rank）" (= (length w) 1))
+      (check-eq "vt-where 单参索引 [0 2]" (vt-to-list (first w)) '(0 2))
+      (check-eq "vt-where 单参与 vt-nonzero 一致"
+                (mapcar #'vt-to-list w) (mapcar #'vt-to-list (vt-nonzero c))))
     (check-eq "vt-argwhere 坐标" (vt-to-list (vt-argwhere c)) '(0 2))
     (let ((nz (vt-nonzero c)))
       (check "vt-nonzero 返回 rank 个索引张量" (= (length nz) 1))

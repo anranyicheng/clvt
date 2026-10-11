@@ -423,27 +423,39 @@
     (eq (vt-data (vt-slice a '(0) '(:all))) (vt-data a))))
 ;; vt-item：0 维 → Lisp 标量
 (check "vt-item(79): 0 维取值" (vt-item (vt-const nil 5)) 5)
+;; vt-take / vt-put 的索引必须是整数 dtype（对标 numpy：浮点索引抛
+;; IndexError: arrays used as indices must be of integer type）。
+;; 旧断言传入 vt-from-sequence 默认的 float64 索引，依赖了此前的静默截断。
 (check "vt-take(80): axis=nil 展平索引"
-  (vt-to-list (vt-take (vt-from-sequence '(10 20 30)) (vt-from-sequence '(0 2))))
+  (vt-to-list (vt-take (vt-from-sequence '(10 20 30))
+                       (vt-from-sequence '(0 2) :dtype :int64)))
   '(10 30))
 (check "vt-take(80): 重复索引"
-  (vt-to-list (vt-take (vt-from-sequence '(10 20 30)) (vt-from-sequence '(1 1))))
+  (vt-to-list (vt-take (vt-from-sequence '(10 20 30))
+                       (vt-from-sequence '(1 1) :dtype :int64)))
   '(20 20))
 (check-true "vt-put(81): 就地写入返回张量本身"
   (let ((a (vt-zeros '(3) :dtype :int64)))
     (and (eq (vt-put a 1 99) a) (= (aref (vt-data a) 1) 99)))
   )
 (check "vt-put(81): 列表索引批量写入"
-  (vt-to-list (vt-put (vt-zeros '(3) :dtype :int64) (vt-from-sequence '(0 2)) 7 :mode :raise))
+  (vt-to-list (vt-put (vt-zeros '(3) :dtype :int64)
+                      (vt-from-sequence '(0 2) :dtype :int64) 7 :mode :raise))
   '(7 0 7))
 (check "vt-where(82): 三参 where(cond, x, y)"
   (vt-to-list (vt-where (vt-from-sequence '(1 0) :dtype :int8)
                         (vt-const '(2) 1.0d0) (vt-const '(2) 2.0d0)))
   '(1 2))
-;; D6：单参 where 返回 (n, rank) 坐标
-(check "vt-where(82): 单参 → (n,rank) 坐标 (D6)"
-  (vt-to-list (vt-where (vt-from-sequence '((1 0) (0 1)) :dtype :int8)))
-  '((0 0) (1 1)) :shape '(2 2))
+;; 单参 where 对齐 np.where(cond)。numpy 文档明确
+;; `np.where(cond)` 是 `np.asarray(cond).nonzero()` 的简写，返回
+;; **按轴分组的索引元组**（长度 = rank，每项形状 (n,)），
+;; 而非 vt-argwhere 的 (n, rank) 坐标。
+(check-true "vt-where(82): 单参 → 按轴分组元组（= vt-nonzero）"
+  (let ((w (vt-where (vt-from-sequence '((1 0) (0 1)) :dtype :int8))))
+    (and (listp w)
+         (= (length w) 2)
+         (equal (mapcar #'vt-to-list w) '((0 1) (0 1)))
+         (equal (mapcar #'vt-shape w) '((2) (2))))))
 (check "vt-argwhere(83): 非零坐标 (n,rank)"
   (vt-to-list (vt-argwhere (vt-from-sequence '((1 0) (0 1)) :dtype :int8)))
   '((0 0) (1 1)) :shape '(2 2))

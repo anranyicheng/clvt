@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# run-tests.sh — clvt 自动化测试运行器
+# run-tests.sh — clvt 自动化测试运行器（唯一入口）
 # 用法: bash test/run-tests.sh [选项]
-#   无参数: 运行所有测试
+#   无参数: 运行所有默认套件（跳过性能基准）
 #   --suite NAME: 只运行指定测试套件
 #   --list: 列出所有可用测试套件
-#   --quick: 跳过性能基准测试
+#   --all: 连性能基准一起运行
+#
+# 说明: test/ 下每个测试套件都在本脚本登记（SUITES + DEFAULT_ORDER/
+#       BENCH_SUITES）。启动时自检运行列表覆盖全部已注册套件，任何
+#       「新增了测试文件却忘记接线」都会直接报错退出。
 # ============================================================
 
 set -euo pipefail
@@ -54,6 +58,7 @@ SUITES[shape-degenerate-tests]="70 空形状/退化形状表驱动测试 (C1/C2 
 SUITES[property-strided-tests]="67 选路不变量/代数恒等式测试 (C8 类目, strided≡contiguous)"
 SUITES[error-contract-tests]="19 错误路径契约测试 (C7 类目, L2 底线)"
 SUITES[refactor-bugfix-tests]="55 v0.3.5 重构回归测试 (floor族NaN/insert numpy语义/solve校验/tensordot负轴等)"
+SUITES[contract-regression-test]="115 numpy/pytorch 契约对齐回归 (广播写穿拦截/roll拷贝语义/diagonal轴参数/均分整除/where单参形态/标量choice/浮点索引报错/digitize形状·bins/insert moveaxis；期望来自 numpy 实测)"
 SUITES[numpy-convention-tests]="63 numpy 对齐语义测试 (空归约/:out解耦/mod零除/true_divide/random校验/clip·where 签名)"
 SUITES[out-contract-v2-test]="56 :out 契约 v2 严格相等测试 (形状/dtype/可写/别名/非连续 out)"
 SUITES[nan-broadcast-test]="31 NaN/Inf 广播对齐 numpy 测试 (算术/极值/比较/归约/dtype 提升)"
@@ -64,8 +69,70 @@ SUITES[test-all]="641 绝大多数函数的测试"
 SUITES[core-test]="282 基础契约回归 (1 结构/199 函数语义/返回值形状/错误契约, 参照 CONVENTIONS)"
 SUITES[differential-probes-test]="496 差分探针 vs numpy (期望内嵌逐项判定, 覆盖算术/超越/归约/索引/操纵/随机/错误路径)"
 SUITES[differential-probes-test2]="405 第2阶段差分探针 vs numpy (导出符号 #200-#377: NaN统计/linalg分解/NN/随机/契约, 期望内嵌逐项判定)"
-# 排除列表 (默认跳过)
-SKIP_BY_DEFAULT="benchmark-copy"
+SUITES[manip-interop-test]="190 形状/视图/拼接/切片 跨语言互操作测试 (Lisp vt-save 落盘 + NumPy 逐位校验, 1000x1000 基准)"
+SUITES[performance-bench]="性能基准测试 (1M 元素 / 1k×1k / 100×100 三档)"
+
+# 需要「Lisp 生成数据 + Python/NumPy 校验」两阶段流水线的套件
+# 格式: PIPELINE_SUITES[name]="<阶段1 .lisp 文件> <阶段2 .py 文件>"
+declare -A PIPELINE_SUITES
+PIPELINE_SUITES[manip-interop-test]="vt-manip-interop-test.lisp verify_manip_numpy.py"
+
+# ============================================================
+# 运行列表 —— 测试的唯一入口
+#   DEFAULT_ORDER : 默认执行的套件及其顺序
+#   BENCH_SUITES  : 性能基准类，默认跳过，--all 时执行
+# 启动时自检二者之并必须恰好覆盖 SUITES 的全部条目，防止新增测试文件后
+# 忘记接线（历史上 legacy-coverage-test 曾被注册却从未纳入运行列表）。
+# 新增测试的步骤：写 <name>.lisp（或流水线套件）→ 登记 SUITES →
+# 加入下面两个列表之一。
+# ============================================================
+DEFAULT_ORDER=(
+    core-test
+    run_all_tests
+    run_param_tests
+    nested-test
+    robustness-test
+    coverage-gap-test
+    comprehensive-test
+    auto-compare-test
+    numpy-compare-test
+    extensions2-test
+    nan-random-test
+    property-test
+    test-extensions
+    simd-test
+    test-overlap
+    test-copy-into
+    test-simd-batch-matmul
+    test-bug0
+    test-ai-edge-cases
+    memsafety-tests
+    out-contig-tests
+    shape-degenerate-tests
+    property-strided-tests
+    svd-fast-path-test
+    linalg-fast-path-test
+    error-contract-tests
+    refactor-bugfix-tests
+    contract-regression-test
+    numpy-convention-tests
+    out-contract-v2-test
+    nan-broadcast-test
+    uncovered-coverage-test
+    extensions3-test
+    fastmap-invariant-test
+    legacy-coverage-test
+    differential-probes-test
+    differential-probes-test2
+    io-interop-test
+    manip-interop-test
+    test-all
+)
+
+BENCH_SUITES=(
+    benchmark-copy
+    performance-bench
+)
 
 # ============================================================
 # 辅助函数
@@ -84,22 +151,28 @@ clvt 自动化测试运行器
 用法: bash test/run-tests.sh [选项]
 
 选项:
-  无参数          运行所有测试 (跳过 benchmark)
+  无参数          运行所有默认套件 (跳过性能基准)
   --suite NAME    只运行指定测试套件
-  --list          列出所有可用测试套件
-  --quick         跳过性能基准和慢速测试
-  --all           运行所有测试包括 benchmark
+  --list          列出所有可用测试套件 (标注默认跳过项与流水线套件)
+  --quick         跳过性能基准和慢速测试 (等同无参数)
+  --all           运行所有测试包括性能基准 (benchmark-copy / performance-bench)
   --verbose       显示完整 SBCL 输出
   --help          显示此帮助信息
 
 环境变量:
   SBCL            SBCL 可执行文件路径 (默认: sbcl)
   TIMEOUT         每个测试超时秒数 (默认: 300)
+  CLVT_TEST_OUT   流水线套件的产物目录 (默认: 临时目录，跑完自动清理)
+
+本脚本是 clvt 全部测试的唯一入口：test/ 下每个测试套件（含「Lisp 生成 +
+NumPy 校验」两阶段流水线套件）都在此注册，启动时会自检运行列表是否覆盖
+全部已注册套件。
 
 示例:
   bash test/run-tests.sh
-  bash test/run-tests.sh --suite run_all_tests
-  bash test/run-tests.sh --quick
+  bash test/run-tests.sh --list
+  bash test/run-tests.sh --suite manip-interop-test
+  bash test/run-tests.sh --suite contract-regression-test
   bash test/run-tests.sh --all --verbose
 EOF
 }
@@ -136,8 +209,161 @@ check_python() {
     fi
 }
 
-# 运行单个测试套件
+# ------------------------------------------------------------
+# 启动自检：运行列表必须恰好覆盖已注册套件
+#   防止「文件写了、SUITES 登记了、却没人运行」的静默漏接线。
+# ------------------------------------------------------------
+check_suite_wiring() {
+    local missing=() unknown=() name s found
+    for name in "${!SUITES[@]}"; do
+        found=0
+        for s in "${DEFAULT_ORDER[@]}" "${BENCH_SUITES[@]}"; do
+            [[ "$s" == "$name" ]] && { found=1; break; }
+        done
+        [[ $found -eq 1 ]] || missing+=("$name")
+    done
+    for s in "${DEFAULT_ORDER[@]}" "${BENCH_SUITES[@]}"; do
+        [[ -n "${SUITES[$s]:-}" ]] || unknown+=("$s")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        fail "以下套件已注册但未接入运行列表，请补进 DEFAULT_ORDER 或 BENCH_SUITES:"
+        printf '  - %s\n' "${missing[@]}"
+        return 1
+    fi
+    if [[ ${#unknown[@]} -gt 0 ]]; then
+        fail "运行列表中出现了未注册到 SUITES 的套件:"
+        printf '  - %s\n' "${unknown[@]}"
+        return 1
+    fi
+    # 流水线套件的两个阶段文件必须存在，且阶段 1 文件不应与套件名同名（避免走错分支）
+    for name in "${!PIPELINE_SUITES[@]}"; do
+        local spec="${PIPELINE_SUITES[$name]}" lisp_rel py_rel
+        read -r lisp_rel py_rel <<<"$spec"
+        if [[ -z "${SUITES[$name]:-}" ]]; then
+            fail "PIPELINE_SUITES 中出现未注册套件: $name"
+            return 1
+        fi
+        [[ -f "${SCRIPT_DIR}/${lisp_rel}" ]] || { fail "流水线套件 $name 缺少阶段 1 文件: $lisp_rel"; return 1; }
+        [[ -f "${SCRIPT_DIR}/${py_rel}"   ]] || { fail "流水线套件 $name 缺少阶段 2 文件: $py_rel";   return 1; }
+    done
+    return 0
+}
+
+# ------------------------------------------------------------
+# 两阶段流水线套件
+#   阶段 1: SBCL 加载 clvt 跑用例，把结果用 vt-save 落盘（.npy / .lisp），
+#           并做 Lisp 端 oracle / 错误契约 / 落盘往返自检；
+#   阶段 2: NumPy 读取落盘文件，逐用例比对 shape / dtype / 数值。
+#   两个阶段都必须退出码为 0 才算通过。
+# ------------------------------------------------------------
+run_pipeline_suite() {
+    local name="$1"
+    local desc="${SUITES[$name]:-未知测试}"
+    local spec="${PIPELINE_SUITES[$name]}"
+    local lisp_rel py_rel
+    read -r lisp_rel py_rel <<<"$spec"
+    local lisp_file="${SCRIPT_DIR}/${lisp_rel}"
+    local py_file="${SCRIPT_DIR}/${py_rel}"
+
+    [[ -f "$lisp_file" ]] || { fail "测试文件不存在: $lisp_file"; return 1; }
+    [[ -f "$py_file"   ]] || { fail "校验脚本不存在: $py_file";   return 1; }
+
+    header "$name — $desc"
+
+    if ! python3 -c 'import numpy' &>/dev/null; then
+        warn "$name: 未找到 python3/numpy，跳过本轮"
+        return 0
+    fi
+
+    # 输出目录：默认用临时目录，跑完即清理；用 CLVT_TEST_OUT 可指定以保留产物
+    local out_dir own_out=0
+    if [[ -n "${CLVT_TEST_OUT:-}" ]]; then
+        out_dir="$CLVT_TEST_OUT"
+        mkdir -p "$out_dir"
+    else
+        out_dir="$(mktemp -d "${TMPDIR:-/tmp}/clvt-interop.XXXXXX")"
+        own_out=1
+    fi
+
+    local start_time end_time rc=0
+    start_time=$(date +%s)
+
+    log "阶段 1/2: Lisp 生成数据 (vt-save) + Lisp 端自检"
+    log "  阶段 1 文件: $lisp_file"
+    log "  输出目录   : $out_dir"
+    local lisp_out="" lisp_code=0
+    lisp_out=$(CLVT_TEST_OUT="$out_dir" "$SBCL" --noinform --non-interactive \
+        --eval "(require :asdf)" \
+        --eval "(push #p\"${PROJECT_DIR}/\" asdf:*central-registry*)" \
+        --eval "(asdf:load-system :clvt)" \
+        --eval "(load \"$lisp_file\")" \
+        2>&1) || lisp_code=$?
+
+    local n_gen="" lisp_pass="" lisp_fail=""
+    n_gen=$(echo "$lisp_out"     | grep -oP '生成成功用例:\s*\K[0-9]+'        | tail -1 || true)
+    lisp_pass=$(echo "$lisp_out" | grep -oP 'Lisp 自检：PASS=\K[0-9]+'        | tail -1 || true)
+    lisp_fail=$(echo "$lisp_out" | grep -oP 'Lisp 自检：PASS=[0-9]+ FAIL=\K[0-9]+' | tail -1 || true)
+
+    if [[ $lisp_code -ne 0 ]]; then
+        fail "阶段 1/2 失败 (exit=$lisp_code): 生成 ${n_gen:-?} 个用例, Lisp 自检 PASS=${lisp_pass:-?} FAIL=${lisp_fail:-?}"
+        echo "$lisp_out" | grep -E "FAIL|错误|Error" | head -15
+        warn "阶段 1 输出末尾 20 行（含 Lisp 报错/回溯）："
+        echo "$lisp_out" | tail -20 | sed 's/^/    /'
+        rc=1
+    else
+        ok "阶段 1/2 通过: 生成 ${n_gen:-?} 个用例, Lisp 自检 ${lisp_pass:-?} 通过 / ${lisp_fail:-0} 失败"
+    fi
+
+    if [[ $rc -eq 0 ]]; then
+        log "阶段 2/2: NumPy 逐位校验 (shape / dtype / 数值)"
+        log "  阶段 2 文件: $py_file"
+        local py_out="" py_code=0
+        py_out=$(CLVT_TEST_OUT="$out_dir" python3 "$py_file" 2>&1) || py_code=$?
+
+        local py_total="" py_pass="" py_fail="" py_dev="" py_missing=""
+        py_total=$(echo "$py_out"   | grep -oP '总计:\s*\K[0-9]+'                    | tail -1 || true)
+        py_pass=$(echo "$py_out"    | grep -oP '通过:\s*\K[0-9]+'                    | tail -1 || true)
+        py_fail=$(echo "$py_out"    | grep -oP '失败:\s*\K[0-9]+'                    | tail -1 || true)
+        py_dev=$(echo "$py_out"     | grep -oP '已知差异:\s*\K[0-9]+'                | tail -1 || true)
+        py_missing=$(echo "$py_out" | grep -oP '缺参考:\s*\K[0-9]+'                  | tail -1 || true)
+
+        if [[ $py_code -eq 0 ]]; then
+            ok "阶段 2/2 通过: ${py_pass:-?}/${py_total:-?} 逐位一致, 失败 ${py_fail:-0}, 已知差异 ${py_dev:-0}, 缺参考 ${py_missing:-0}"
+        else
+            fail "阶段 2/2 失败 (exit=$py_code): ${py_pass:-?}/${py_total:-?} 一致, 失败 ${py_fail:-?}, 缺参考 ${py_missing:-?}"
+            echo "$py_out" | grep -E "^\[FAIL|^ *\[FAIL" | head -15
+            rc=1
+        fi
+    fi
+
+    end_time=$(date +%s)
+
+    if [[ $own_out -eq 1 ]]; then
+        rm -rf "$out_dir"
+    else
+        log "保留输出目录（CLVT_TEST_OUT=$out_dir）"
+    fi
+
+    if [[ $rc -eq 0 ]]; then
+        ok "$name: 用例 ${n_gen:-?} 个 + Lisp 自检 ${lisp_pass:-?} 项 + NumPy 逐位校验 ${py_pass:-?}/${py_total:-?}, $((end_time - start_time))s"
+    else
+        fail "$name: 失败, $((end_time - start_time))s"
+    fi
+    return $rc
+}
+
+# 套件调度：流水线套件走 run_pipeline_suite，其余走 run_lisp_suite
 run_suite() {
+    if [[ -n "${PIPELINE_SUITES[$1]:-}" ]]; then
+        run_pipeline_suite "$1"
+    else
+        run_lisp_suite "$1"
+    fi
+}
+
+# 运行单个 lisp 测试套件（单文件形态）
+run_lisp_suite() {
     local name="$1"
     local file="${SCRIPT_DIR}/${name}.lisp"
     local desc="${SUITES[$name]:-未知测试}"
@@ -205,13 +431,19 @@ run_suite() {
         fi
         return 0
     else
-        fail "$name: $pass/$total 通过, $fail_count 失败 (${duration}s)"
+        fail "$name: $pass/$total 通过, $fail_count 失败 (exit=$exit_code, ${duration}s)"
 
         # 显示失败详情
         if [[ -n "$VERBOSE" ]]; then
             echo "$output" | grep -E "❌|FAIL|Failed|error" | head -20
         else
             echo "$output" | grep -E "❌|Failed" | head -10
+        fi
+        # 计数完全解析不出（通常意味着进程异常退出/被信号终止）时，直接给出
+        # 原始输出尾部——否则失败会变成一句无法追查的 "?/?"。
+        if [[ "$total" == "?" && "$pass" == "?" && "$fail_count" == "?" ]]; then
+            warn "无法从输出解析测试计数（exit=$exit_code），以下为输出末尾 20 行："
+            echo "$output" | tail -20 | sed 's/^/    /'
         fi
         return 1
     fi
@@ -223,7 +455,7 @@ run_suite() {
 
 main() {
     local suites_to_run=()
-    local skip_benchmark=true
+    local run_benchmarks=false
     local specific_suite=""
 
     # 解析参数
@@ -234,18 +466,25 @@ main() {
                 shift 2
                 ;;
             --list)
-                header "可用测试套件"
-                for name in "${!SUITES[@]}"; do
-                    echo "  $name — ${SUITES[$name]}"
+                header "可用测试套件（共 $((${#DEFAULT_ORDER[@]} + ${#BENCH_SUITES[@]})) 个）"
+                echo -e "  ${BOLD}[默认执行]${NC}"
+                for name in "${DEFAULT_ORDER[@]}"; do
+                    local mark=""
+                    [[ -n "${PIPELINE_SUITES[$name]:-}" ]] && mark=" ${CYAN}[两阶段: Lisp+NumPy]${NC}"
+                    echo -e "    $name — ${SUITES[$name]:-未知}$mark"
+                done
+                echo -e "  ${BOLD}[性能基准，默认跳过；--all 执行]${NC}"
+                for name in "${BENCH_SUITES[@]}"; do
+                    echo "    $name — ${SUITES[$name]:-未知}"
                 done
                 exit 0
                 ;;
             --quick)
-                skip_benchmark=true
+                run_benchmarks=false
                 shift
                 ;;
             --all)
-                skip_benchmark=false
+                run_benchmarks=true
                 shift
                 ;;
             --verbose)
@@ -279,6 +518,12 @@ main() {
         fi
     fi
 
+    # 运行列表自检：每个已注册套件都必须被接线（防「写了却没人跑」的漏接线）
+    if ! check_suite_wiring; then
+        fail "套件接线自检未通过（见上方输出）"
+        exit 1
+    fi
+
     header "clvt 自动化测试"
     log "项目目录: $PROJECT_DIR"
     log "测试目录: $SCRIPT_DIR"
@@ -293,56 +538,21 @@ main() {
         fi
         suites_to_run=("$specific_suite")
     else
-        # 按顺序运行所有测试
-        suites_to_run=(
-            core-test
-            run_all_tests
-            run_param_tests
-            nested-test
-            robustness-test
-            coverage-gap-test
-            comprehensive-test
-            auto-compare-test
-            numpy-compare-test
-            extensions2-test
-            nan-random-test
-            property-test
-            test-extensions
-            simd-test
-            test-overlap
-            test-copy-into
-            test-simd-batch-matmul
-            test-bug0
-            test-ai-edge-cases
-            memsafety-tests
-            out-contig-tests
-            shape-degenerate-tests
-            property-strided-tests
-	    svd-fast-path-test
-	    linalg-fast-path-test
-            error-contract-tests
-            refactor-bugfix-tests
-            numpy-convention-tests
-            out-contract-v2-test
-            nan-broadcast-test
-            uncovered-coverage-test
-            extensions3-test
-            fastmap-invariant-test
-            differential-probes-test
-            differential-probes-test2
-            io-interop-test
-            test-all
-        )
-        if [[ "$skip_benchmark" == false ]]; then
-            suites_to_run+=(benchmark-copy)
+        # 唯一入口：按 DEFAULT_ORDER 顺序运行；--all 追加性能基准套件
+        suites_to_run=("${DEFAULT_ORDER[@]}")
+        if [[ "$run_benchmarks" == true ]]; then
+            suites_to_run+=("${BENCH_SUITES[@]}")
         fi
     fi
 
-    # python/numpy/torch 不可用时移除对比套件
+    # python/numpy 不可用时移除依赖 NumPy 的套件
     if [[ "$PY_AVAILABLE" == "0" ]]; then
         local filtered=()
         for s in "${suites_to_run[@]}"; do
-            [[ "$s" == "numpy-compare-test" ]] || filtered+=("$s")
+            case "$s" in
+                numpy-compare-test|manip-interop-test) ;;
+                *) filtered+=("$s") ;;
+            esac
         done
         suites_to_run=("${filtered[@]}")
     fi

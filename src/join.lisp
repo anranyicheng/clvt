@@ -309,58 +309,69 @@ axis 给定：两者秩必须一致，且除 axis 外各维度必须相等，
       (%make-vt :data result-data :shape (list result-size)
                 :strides (list 1) :offset 0 :dtype dtype))))
 
-(defun %insert-axis (tensor-vt insertions values-vt axis)
-  "axis 模式插入：沿 axis 在指定行位置插入 values 块。
-   numpy 语义：位置升序稳定排序，同位置多个块按 values 顺序排布；
-   标量 positions 对 values 做 moveaxis(0→axis) 后单块插入。
-   切片列表单遍合并 O(ax-size + k) 后一次性 concatenate。"
+(defun %shape-broadcastable-to-p (from to)
+  "FROM 形状能否按 numpy 规则广播到 TO（右对齐，逐维相等或 FROM 维为 1）。"
+  (let ((nf (length from)) (nt (length to)))
+    (and (<= nf nt)
+         (let ((pad (append (make-list (- nt nf) :initial-element 1) from)))
+           (every (lambda (a b) (or (= a 1) (= a b))) pad to)))))
+
+(defun %insert-axis (tensor-vt insertions values-vt axis scalar-pos)
+  "axis 模式插入：沿 axis 在指定位置插入 values 块。
+
+   完整复刻 numpy 2.x `insert` 的 axis 路径：
+     values = array(values, ndmin=arr.ndim, dtype=arr.dtype)
+     if <obj 为标量>:  values = np.moveaxis(values, 0, axis)
+     numnew = values.shape[axis]
+     new[..., index:index+numnew, ...] = values        ; 广播写入
+   多索引 obj 路径不做 ndmin / 不做 moveaxis，直接把 values 广播进块。
+
+   此前实现用 vt-reshape（行主序重排）顶替 moveaxis(values, 0, axis)。
+   两者仅当 values 首轴长度为 1 时等价；values 含多行时形状校验只看
+   「元素总数」，恰在元素总数相同时通过，从而**静默**产出与 numpy 不同的
+   结果（实测：a(1000,1000)、obj=7、axis=1、values=(2,1000)，
+   首处差异 (0,8)：clvt 1.0 vs numpy 1000.0）。"
   (let* ((shape (vt-shape tensor-vt))
          (rank (length shape))
          (ax (vt-normalize-axis axis rank))
          (ax-size (nth ax shape))
          (num (length insertions))
          (values-nd (vt-shape values-vt))
-         ;; 单索引块插入时块长取自 ndmin(values) 第 0 轴
-         ;; （numpy: moveaxis(values,0,axis) 后取 values.shape[axis]，
-         ;;   moveaxis 是零拷贝视图，故块 = values 的线性重排即可等价）；
-         ;; 标量 values 广播填满；多索引路径要求 values 沿 axis 为 num 块。
-         (adj-shape (if (and values-nd (= num 1) (< (length values-nd) rank))
-                        (append (make-list (- rank (length values-nd))
-                                           :initial-element 1)
-                                values-nd)
-                        values-nd))
-         (numnew (cond ((null values-nd) 1)
-                       ((= num 1) (first adj-shape))
-                       (t num)))
+         ;; (1) ndmin：左侧补 1 轴到 rank（numpy: array(values, ndmin=arr.ndim)）
+         (ranked (if (and values-nd (< (length values-nd) rank))
+                     (vt-reshape values-vt
+                                 (append (make-list (- rank (length values-nd))
+                                                    :initial-element 1)
+                                         values-nd))
+                     values-vt))
+         ;; (2) 单索引：标量 obj 需 moveaxis(values, 0, axis)
+         (prepared (if (= num 1)
+                       (let ((base (if values-nd
+                                       ranked
+                                       (vt-reshape values-vt
+                                                   (make-list rank
+                                                              :initial-element 1)))))
+                         (if scalar-pos (vt-moveaxis base 0 ax) base))
+                       ranked))
+         ;; (3) numnew = prepared.shape[ax]
+         (numnew (if (= num 1) (nth ax (vt-shape prepared)) num))
          (target-shape
            (loop for i below rank
                  collect (if (= i ax) numnew (nth i shape))))
-         (values-vt
-           (cond ((null values-nd)
-                  (vt-full target-shape (vt-ref values-vt)
-                           :dtype (vt-dtype values-vt)))
-                 ((and (= num 1) (< (length values-nd) rank))
-                  ;; ndmin 前置补 1 轴（numpy ndmin=tensor.ndim）
-                  (vt-reshape values-vt adj-shape))
-                 (t values-vt)))
-         (values-reshaped
-           (if (and (= num 1) values-nd)
-               (cond ((= (vt-size values-vt) (reduce #'* target-shape))
-                      (vt-reshape values-vt target-shape))
-                     ((= (vt-size values-vt) 1)
-                      (vt-full target-shape (vt-item values-vt)
-                               :dtype (vt-dtype values-vt)))
-                     (t (error "vt-insert: values 形状 ~a 无法与插入块形状 ~a 匹配（元素数不一致且不可广播）"
-                               values-nd target-shape)))
-               (vt-reshape values-vt target-shape)))
+         ;; (4) 广播 prepared 到插入块形状（numpy: new[..., sl(ax), ...] = values）
+         (block (cond ((equal (vt-shape prepared) target-shape) prepared)
+                      ((%shape-broadcastable-to-p (vt-shape prepared) target-shape)
+                       (vt-broadcast-to prepared target-shape))
+                      (t (error "vt-insert: values 形状 ~a 无法广播到插入块形状 ~a（numpy 广播语义）"
+                                values-nd target-shape))))
          (row-slices
            (loop for i from 0 below ax-size
                  collect (vt-narrow tensor-vt ax i (1+ i))))
          (value-blocks
            (if (= num 1)
-               (list values-reshaped)
+               (list block)
                (loop for i from 0 below num
-                     collect (vt-narrow values-reshaped ax i (1+ i)))))
+                     collect (vt-narrow block ax i (1+ i)))))
          ;; 先归一化再稳定排序（同 flat 模式，numpy 语义）
          (pairs (stable-sort (loop for raw-pos in insertions
                                    for block in value-blocks
@@ -387,11 +398,17 @@ positions：整数 / 整数列表 / 整数张量。所有位置先按当前轴�
 归一化（负索引）并做越界检查（位置允许等于轴长，即插入到末尾）；
 多位置按升序稳定排序后依次插入，同位置多个值按 values 顺序排布。
 标量 positions 在 axis 为 NIL 时按 values 元素数广播为重复位置
-（np.insert(a,1,[7,8]) ≡ positions=[1,1]）；axis 给定时保持单索引、
-对 values 做 moveaxis(0→axis) 后单块插入（numpy scalar-obj 语义）。
+（np.insert(a,1,[7,8]) ≡ positions=[1,1]）。
 
-axis 为 NIL：展平成一维后插入；axis 给定：沿该轴插入，
-values 经 reshape/broadcast 与插入块对齐。
+axis 给定时严格复刻 numpy 2.x：
+  - 单索引（obj 为标量或 [k]）：values 先经
+    `array(values, ndmin=tensor.ndim)` 左侧补 1 轴；若 obj 为**标量**，
+    再对 values 做 `moveaxis(0 → axis)`（这正是
+    `np.insert(a,1,v)` 与 `np.insert(a,[1],v)` 结果不同的原因）。
+    块长 numnew = values.shape[axis]，随后把 values 广播写入该块。
+  - 多索引：不做 ndmin / moveaxis，values 直接广播进 (…, num, …) 块。
+
+axis 为 NIL：展平成一维后插入。
 
 结果 dtype 与 tensor 一致（values 先 coerce 到 tensor dtype）。
 NaN/Inf：纯数据搬运，逐位保留。
@@ -399,8 +416,16 @@ NaN/Inf：纯数据搬运，逐位保留。
 示例：(vt-insert (vt-from-sequence '(0 1 2)) 1 (vt-from-sequence '(10 20)))"
   (let* ((tensor-vt (ensure-vt tensor))
          (values-vt (ensure-vt values :dtype (vt-dtype tensor-vt)))
+         ;; positions 是否为「标量 obj」：numpy 只对 obj.ndim==0 做
+         ;; moveaxis(values, 0, axis)，对 obj=[1] 不做，二者结果不同。
+         (scalar-pos (cond ((integerp positions) t)
+                           ((vt-p positions) (null (vt-shape positions)))
+                           (t nil)))
          (insertions
            (cond ((vt-p positions)
+                  (when (vt-float-dtype-p (vt-dtype positions))
+                    (error "vt-insert: positions 必须为整数类型，收到 ~a（对标 numpy）"
+                           (vt-dtype positions)))
                   (let ((flat (vt-flatten positions)))
                     (loop for i below (vt-size flat)
                           collect (truncate (aref (vt-data flat) i)))))
@@ -411,12 +436,15 @@ NaN/Inf：纯数据搬运，逐位保留。
                     (if (> n 1)
                         (make-list n :initial-element positions)
                         (list positions))))
-                 ((listp positions) positions)
+                 ((listp positions)
+                  (unless (every #'integerp positions)
+                    (error "vt-insert: positions 列表必须全为整数，收到 ~a" positions))
+                  positions)
                  (t (error "vt-insert: positions 类型无效，收到 ~a" positions)))))
     (if (null axis)
         (%insert-flat (vt-ravel tensor-vt) (vt-ravel values-vt)
                       insertions (vt-dtype tensor-vt))
-        (%insert-axis tensor-vt insertions values-vt axis))))
+        (%insert-axis tensor-vt insertions values-vt axis scalar-pos))))
 
 ;;; ------------------------------------------------------------------
 ;;; 删除

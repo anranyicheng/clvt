@@ -31,8 +31,16 @@
               (t (aref data ptr)))))))
 
 (defun (setf vt-ref) (value vt &rest indices)
-  "设置指定位置元素（支持负索引，带边界检查）。"
+  "设置指定位置元素（支持负索引，带边界检查）。
+
+   H4 写入契约：目标若是只读的广播视图（存在 dim>1 且 stride=0 的轴），
+   禁止写入 —— 该轴上的所有逻辑位置共享同一物理单元，写入语义歧义。
+   对标 numpy：np.broadcast_to 的结果只读，赋值抛 ValueError。
+   注：vt-put / vt-copy-into 早已具备该保护，本函数与 (setf vt-slice)
+   的标量分支此前缺失，会写穿并污染共享底层数据。"
   (declare (optimize (speed 3)))
+  (unless (vt-out-writable-p vt)
+    (error "vt-ref: 目标是只读的广播视图（存在 dim>1 且 stride=0 的轴），禁止写入（H4 契约）"))
   (let* ((shape (vt-shape vt))
          (rank (length shape)))
     (when (some #'zerop shape) (error "cannot index into an empty tensor"))
@@ -208,7 +216,15 @@
                         :dtype   (vt-dtype vt)))))))))
 
 (defun (setf vt-slice) (value vt &rest specs)
-  "设置切片区域值（value 可为标量或张量，支持广播）。"
+  "设置切片区域值（value 可为标量或张量，支持广播）。
+
+   H4 写入契约：广播视图整体只读。切片/降维都无法解除 stride-0 带来的
+   物理共享（即便把该轴索引掉，剩余元素仍与其它逻辑位置共用单元），
+   因此在**源张量**上先行拦截。
+   注：此前仅张量分支经 vt-copy-into 间接触发只读检查，标量分支直接调
+   (setf vt-ref) 而无保护，可写穿。"
+  (unless (vt-out-writable-p vt)
+    (error "vt-slice: 目标是只读的广播视图（存在 dim>1 且 stride=0 的轴），禁止写入（H4 契约）"))
   (let ((target-view (apply #'vt-slice vt specs)))
     (if (null (vt-shape target-view))
         (let ((scalar (cond ((numberp value) value)
@@ -232,15 +248,21 @@
          out 的 dtype/形状必须精确匹配结果，否则报错（错误信息以 \"vt-where\"
          开头）。
     2. `(vt-where cond)` —— 单参数形式（对标 np.where(cond)）：
-       返回条件中非零元素的坐标，形状 (n, rank)（int64），等价于
-       `(vt-argwhere cond)`。
+       返回**按轴分组的索引元组**，等价于 `(vt-nonzero cond)`，
+       即 `np.nonzero(cond)` —— 长度 = rank 的张量列表，第 d 个元素是
+       非零位置在第 d 轴的坐标（形状 (n,)），全为零时各项形状为 (0,)。
+       注意 numpy 文档明确 `np.where(cond)` 是
+       `np.asarray(cond).nonzero()` 的简写，**不是** `np.argwhere`
+       （后者把坐标堆叠成 (n, rank)）。
+       （此前返回 (n, rank) 坐标即 argwhere 语义，与 numpy 契约不符；
+       argwhere 请直接用 `vt-argwhere`。）
 
-  只给 X 或只给 Y（参数不配对）时报错，对齐 numpy 的必填参数语义。"
+   只给 X 或只给 Y（参数不配对）时报错，对齐 numpy 的必填参数语义。"
   (let ((x-p x-p) (y-p y-p))
     (cond
-      ;; 单参数形式：返回坐标 (n, rank)
+      ;; 单参数形式：按轴分组的索引元组（= vt-nonzero / np.nonzero）
       ((and (not x-p) (not y-p))
-       (vt-argwhere (ensure-vt condition)))
+       (vt-nonzero (ensure-vt condition)))
       ;; 参数不配对 → 报错
       ((not y-p)
        (error "vt-where: 单参数形式只接受 (vt-where cond)；\
@@ -356,7 +378,16 @@
                                    :dtype :int64))))))))
 
 (defun vt-take (tensor indices &key axis)
-  "按索引取值（axis 为 nil 时展平取值，否则沿指定轴 gather）。"
+  "按索引取值（axis 为 nil 时展平取值，否则沿指定轴 gather）。
+
+   INDICES 必须为整数张量：浮点索引报错，对标 numpy
+   （IndexError: arrays used as indices must be of integer
+   (or boolean) type）。原实现无条件 truncate，浮点索引会被静默
+   截断（如 0.9 → 0）并返回看似合理却错误的结果。"
+  (let ((idx-vt (ensure-vt indices)))
+    (when (vt-float-dtype-p (vt-dtype idx-vt))
+      (error "vt-take: 索引必须为整数类型，收到 ~a（对标 numpy：浮点索引抛 IndexError）"
+             (vt-dtype idx-vt))))
   (labels ((fixnum-1d (vt)
              (let* ((len (vt-size vt))
                     (off (vt-offset vt))
@@ -533,7 +564,18 @@
 
 
 (defun vt-put (tensor indices values &key (mode :raise))
-  "按展平索引就地写入 values。"
+  "按展平索引就地写入 values。
+
+   INDICES 必须为整数（整数标量 / 整数张量）：浮点会报错，对标 numpy
+   （'float' object cannot be interpreted as an integer）。原实现用
+   round/truncate 静默截断浮点索引。"
+  (cond
+    ((and (numberp indices) (floatp indices))
+     (error "vt-put: 索引必须为整数，收到 ~a（对标 numpy）" indices))
+    ((not (numberp indices))
+     (let ((iv (ensure-vt indices)))
+       (when (vt-float-dtype-p (vt-dtype iv))
+         (error "vt-put: 索引必须为整数类型，收到 ~a（对标 numpy）" (vt-dtype iv))))))
   (let* ((total (vt-size tensor))
          (idx-list (if (numberp indices) (list (round indices))
                        (let ((flat (vt-flatten (ensure-vt indices))))
@@ -548,10 +590,13 @@
                                   collect (aref (vt-data flat) i))))))
          (n-values (length val-list)) (shape (vt-shape tensor))
          (strides (vt-strides tensor)) (offset (vt-offset tensor)) (data (vt-data tensor)))
-    ;; H4 写入契约（v0.4.x 修复）：stride-0 广播视图禁止就地写入，
-    ;; 否则一个逻辑位置会经零步长复制污染整片共享底层数据。
-    (when (some #'zerop strides)
-      (error "vt-put: 目标包含 stride-0 广播维度，禁止写入（H4 契约）"))
+    ;; H4 写入契约（v0.4.x 修复）：dim>1 且 stride=0 的广播维度禁止就地写入，
+    ;; 否则一个逻辑位置会经零步长污染整片共享底层数据。
+    ;; 改用 vt-out-writable-p 而非「任一 stride=0」：vt-slice 的 (:newa)
+    ;; 产生 size=1 且 stride=0 的轴，它不构成广播、写入无歧义
+    ;; （对标 numpy 允许 a[np.newaxis].put(...)）；原判定会误拒该情形。
+    (unless (vt-out-writable-p tensor)
+      (error "vt-put: 目标包含 dim>1 且 stride=0 的广播维度，禁止写入（H4 契约）"))
     (when (zerop n-values) (return-from vt-put tensor))
     (loop for raw in idx-list
           for vi from 0
@@ -577,7 +622,7 @@
 (defun vt-choose (choices indices &key (mode :raise))
   "根据索引数组从多个数组中选择值。对标 numpy.choose。
    choices : 候选张量列表，长度为 n。
-   indices : 整数索引张量。
+   indices : 整数索引张量（浮点类型报错，对标 numpy TypeError）。
    mode    : 越界索引的处理方式，对标 np.choose 的 mode 参数：
              :raise (默认) — 负数或 >= n 都报错；
              :wrap         — 索引按 n 取模（-1 -> n-1）；
@@ -615,6 +660,12 @@
            (result-data (make-array final-size
                                     :element-type
                                     (vt-dtype->lisp-type result-type))))
+      ;; numpy 对浮点 indices 抛 TypeError: 'float' object cannot be
+      ;; interpreted as an integer；此前用 truncate 静默截断（0.5 → 0），
+      ;; 会静默产生错误结果。
+      (when (vt-float-dtype-p (vt-dtype idx-vt))
+        (error "vt-choose: 索引必须为整数类型，收到 ~a（对标 numpy：indices 为浮点时抛 TypeError）"
+               (vt-dtype idx-vt)))
       (loop for i from 0 below final-size
             for raw = (truncate (aref idx-data (+ idx-off i)))
             for idx = (ecase mode
@@ -635,30 +686,38 @@
                 :dtype result-type))))
 
 (defun vt-select (condlist choicelist &key (default 0))
-  "根据多个条件从多个数组中选择。
+  "根据多个条件从多个数组中选择（对标 numpy.select）。
    result = default
    for i from n-1 downto 0:
        result = vt-where(cond_i, choice_i, result)
-   支持广播和非连续视图。"
+   condlist / choicelist 的元素可为张量或标量：标量经 ensure-vt 归一为
+   0 维张量后参与广播（对标 numpy.select 允许 choicelist 含标量，
+   condlist 含布尔标量），支持广播和非连续视图。
+   （此前对元素直接调 vt-shape/vt-dtype，标量元素会抛出
+   \"The value 99 is not of type CLVT:VT\"。）"
   (let ((n (length condlist)))
     (unless (= n (length choicelist))
       (error "condlist and choicelist must have same length"))
     (when (zerop n)
       (error "condlist and choicelist cannot be empty"))
 
-    (let* ((broadcast-shape (apply #'vt-broadcast-shapes
-                                   (append (mapcar #'vt-shape condlist)
-                                           (mapcar #'vt-shape choicelist))))
+    ;; condlist / choicelist 元素统一归一（标量 → 0 维张量），
+    ;; 使标量 choice / 标量条件参与广播（对标 numpy.select）。
+    (let* ((conds   (mapcar #'ensure-vt condlist))
+           (choices (mapcar #'ensure-vt choicelist))
+           (broadcast-shape (apply #'vt-broadcast-shapes
+                                   (append (mapcar #'vt-shape conds)
+                                           (mapcar #'vt-shape choices))))
            ;; 默认值类型：整数按 int64，浮点按 float64（足够安全）
            (default-dtype (if (integerp default) :int64 :float64))
            ;; 所有可能值（choicelist + 默认值）的类型提升
            (result-dtype (apply #'vt-promote-type
-                                (append (mapcar #'vt-dtype choicelist)
+                                (append (mapcar #'vt-dtype choices)
                                         (list default-dtype))))
            (result (vt-full broadcast-shape default :dtype result-dtype)))
       (loop for i from (1- n) downto 0
-            for cond = (nth i condlist)
-            for choice = (nth i choicelist)
+            for cond = (nth i conds)
+            for choice = (nth i choices)
             do (setf result (vt-where cond choice result)))
       result)))
 
@@ -756,17 +815,65 @@
     (%make-vt :data result :shape (list size) :strides '(1)
               :offset 0 :dtype :int64)))
 
+(defun %bins-monotonicity (data n)
+  "numpy._monotonicity：返回 1（单调不减）/ -1（单调不增）/ 0（都不是）。
+   全相等、长度 0 或 1 均视为 1（与 numpy 实测一致：np.digitize 不报错）。"
+  (let ((inc t) (dec t))
+    (loop for i from 1 below n
+          for prev = (aref data (1- i))
+          for cur = (aref data i)
+          do (cond ((< prev cur) (setf dec nil))
+                   ((> prev cur) (setf inc nil))))
+    (cond (inc 1) (dec -1) (t 0))))
+
+(defun %digitize-searchsorted (data n reverse-p side-right-p val)
+  "在单调序列 data[0,n) 上二分。REVERSE-P 为 T 时逻辑序列取 data 的逆序；
+   SIDE-RIGHT-P 为 T 等价 numpy searchsorted(side='right')，否则 'left'。"
+  (let ((lo 0) (hi n))
+    (loop while (< lo hi) do
+      (let* ((mid (ash (+ lo hi) -1))
+             (mv (aref data (if reverse-p (- n 1 mid) mid))))
+        (if (if side-right-p (> mv val) (>= mv val))
+            (setf hi mid)
+            (setf lo (1+ mid)))))
+    lo))
+
 (defun vt-digitize (x bins &key (right nil))
-  "返回输入值在 bins 中的索引。"
-  (let* ((flat-x (vt-flatten x)) (flat-bins (vt-flatten bins))
-         (bin-data (vt-data flat-bins)) (nbins (vt-size flat-bins))
+  "返回输入值在 bins 中的索引（对标 numpy.digitize）。
+
+   X 可为任意形状：结果形状与 X **完全一致**（多维输入不展平）。
+   BINS 接受张量或可直接构造为张量的序列（list / vector），
+   需为一维且单调（单调不减或单调不增，numpy 语义；否则报错）。
+
+   算法与 numpy 一致（numpy 文档：digitize 由 searchsorted 实现）：
+     side = 'left' if right else 'right'
+     bins 单调不减 → searchsorted(bins, x, side)
+     bins 单调不增 → len(bins) - searchsorted(bins[::-1], x, side)
+   即 right=False 时区间为 `bins[i-1] <= x < bins[i]`，
+   right=True 时为 `bins[i-1] < x <= bins[i]`（递增情形）。
+
+   （此前返回 (vt-shape flat-x)，多维输入被展平为 1-D；bins 直接
+   vt-flatten，传 Lisp list 会抛 \"The value (4 8) is not of type CLVT:VT\"；
+   且线性扫描把递减 bins 当作递增处理，结果与 numpy 不符。）"
+  (let* ((x-vt (ensure-vt x))
+         (bins-vt (ensure-vt bins))
+         (flat-x (vt-flatten x-vt))
+         (flat-bins (vt-flatten bins-vt))
+         (bin-data (vt-data flat-bins))
+         (nbins (vt-size flat-bins))
+         (x-shape (vt-shape x-vt))
+         (mono (%bins-monotonicity bin-data nbins))
+         ;; numpy: side='left' if right else 'right'
+         (side-right-p (not right))
+         (reverse-p (= mono -1))
          (result (make-array (vt-size flat-x) :element-type '(signed-byte 64))))
+    (when (zerop mono)
+      (error "vt-digitize: bins 必须单调递增或递减（numpy 语义）"))
     (vt-do-each (ptr val flat-x)
-      (setf (aref result ptr)
-            (loop for i from 0 below nbins
-                  until (if right
-                            (<= val (aref bin-data i))
-                            (< val (aref bin-data i)))
-                  finally (return i))))
-    (%make-vt :data result :shape (vt-shape flat-x) :strides '(1)
+      (let ((ss (%digitize-searchsorted bin-data nbins reverse-p
+                                        side-right-p val)))
+        (setf (aref result ptr) (if reverse-p (- nbins ss) ss))))
+    ;; 形状取 X 的原始形状（而非展平后的 (n)）
+    (%make-vt :data result :shape x-shape
+              :strides (vt-compute-strides x-shape)
               :offset 0 :dtype :int64)))

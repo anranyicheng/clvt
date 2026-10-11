@@ -236,7 +236,12 @@
    - shift 为整数, axis 为整数   → 沿该轴滚动
    - shift 为列表, axis 为列表   → 长度必须相同，逐轴滚动
    - shift 为列表, axis 为 nil   → 累加所有 shift 后展平滚动
-   - shift 为整数, axis 为 nil   → 展平滚动"
+   - shift 为整数, axis 为 nil   → 展平滚动
+
+   返回值始终是**新张量**、不与输入共享底层内存（对标 numpy.roll 总是
+   返回新数组）。此前在 shift 取模后为 0（含 shift=0、shift 为轴长
+   整数倍）或轴长为 0 时直接返回入参 `vt` 本身，调用者对结果的就地写入
+   会写穿到输入张量。"
   (let ((shift-list (if (listp shift) shift (list shift))))
     (cond
       ;; axis 为列表：逐轴滚动
@@ -256,9 +261,9 @@
                 shift-list))
        (let* ((sh (vt-shape vt)) (ax (vt-normalize-axis axis (length sh)))
                                  (n (nth ax sh)))
-         (if (zerop n) vt
+         (if (zerop n) (vt-copy vt)
              (let ((s (mod (car shift-list) n)))
-               (if (zerop s) vt
+               (if (zerop s) (vt-copy vt)
                    (vt-concatenate
                     ax
                     (apply #'vt-slice vt (loop for i below (length sh)
@@ -287,6 +292,19 @@
 ;;; ------------------------------------------------------------------
 ;;; 窄切片与分割
 ;;; ------------------------------------------------------------------
+
+(defun %require-equal-division (op-name dim sections)
+  "numpy 的 split / vsplit / hsplit / dsplit 在**整数段数**形式下要求整除，
+   否则抛 ValueError(\"array split does not result in an equal division\")。
+   整数列表形式（indices）无需整除，调用方不应走这里。
+   注意：本库的 vt-split 刻意对标 numpy.array_split（允许不整除），
+   故仅 vsplit / hsplit / dsplit 需要本检查。
+   （此前 hsplit / dsplit 直接转交 vt-split，沿用了 array_split 的余数
+   语义，与 numpy 的 hsplit/dsplit 契约不符。）"
+  (when (and (integerp sections) (plusp sections))
+    (unless (and (plusp dim) (zerop (mod dim sections)))
+      (error "~a: array split does not result in an equal division（该轴长度 ~a ÷ ~a 段不整除；numpy 的 split/vsplit/hsplit/dsplit 对整数段数要求整除，需不等分请改用 vt-split）"
+             op-name dim sections))))
 
 (defun vt-narrow (vt axis start end)
   "零拷贝切片（等价 pytorch narrow）。
@@ -336,26 +354,40 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
 
 (defun vt-vsplit (vt indices-or-sections)
   "垂直分割（对标 numpy.vsplit）。等价 split 沿轴 0，但 numpy.vsplit
-   对整数段数要求严格整除（不整除报错，v0.4.x 修复：原实现走
-   array_split 的余数语义，与 numpy.vsplit 契约不符）；
+   对整数段数要求严格整除（不整除报错）；
    索引列表形式（np.vsplit(a, [1,3])）无需整除，保持支持。"
-  (when (and (integerp indices-or-sections) (plusp indices-or-sections))
-    (let* ((sh (vt-shape vt))
-           (rows (if sh (first sh) (vt-size vt))))
-      (unless (and (plusp rows) (zerop (mod rows indices-or-sections)))
-        (error "vt-vsplit: array split does not result in an equal division \
-（~a 行 ÷ ~a 段不整除，numpy.vsplit 语义）" rows indices-or-sections))))
+  (let* ((sh (vt-shape vt))
+         (rows (if sh (first sh) (vt-size vt))))
+    (%require-equal-division "vt-vsplit" rows indices-or-sections))
   (vt-split vt indices-or-sections :axis 0))
 
 (defun vt-hsplit (vt indices-or-sections)
-  "水平均分（对标 numpy.hsplit）。1D 时等价 split 沿轴 0，否则沿轴 1。"
-  (if (<= (length (vt-shape vt)) 1)
-      (vt-split vt indices-or-sections :axis 0)
-      (vt-split vt indices-or-sections :axis 1)))
+  "水平均分（对标 numpy.hsplit）。1D 时等价 split 沿轴 0，否则沿轴 1。
+
+   numpy.hsplit 等价 numpy.split（非 array_split）：对**整数段数**
+   要求该轴整除，不整除抛 ValueError；整数列表形式无需整除。
+   （此前直接转交 vt-split，采用了 array_split 的余数语义，例如
+   (2,5) 按 2 段会得到 (2,3)+(2,2)，numpy 会报错。）"
+  (let ((rank (length (vt-shape vt))))
+    (when (zerop rank)
+      (error "vt-hsplit: hsplit only works on arrays of 1 or more dimensions（numpy 语义）"))
+    (let ((ax (if (<= rank 1) 0 1)))
+      (%require-equal-division "vt-hsplit" (nth ax (vt-shape vt)) indices-or-sections)
+      (vt-split vt indices-or-sections :axis ax))))
 
 (defun vt-dsplit (vt indices-or-sections)
-  "深度均分（对标 numpy.dsplit）。沿轴 2 均分。"
-  (vt-split vt indices-or-sections :axis 2))
+  "深度均分（对标 numpy.dsplit）。沿轴 2 均分，要求秩 >= 3。
+
+   numpy.dsplit 等价 numpy.split（非 array_split）：对**整数段数**
+   要求轴 2 整除，不整除抛 ValueError；整数列表形式无需整除。
+   （此前直接转交 vt-split，采用了 array_split 的余数语义，例如轴长 4
+   按 3 段会得到 2+1+1，numpy 会报错。）"
+  (let ((rank (length (vt-shape vt))))
+    (when (< rank 3)
+      (error "vt-dsplit: dsplit only works on arrays of 3 or more dimensions（当前秩 ~a，numpy 语义）"
+             rank))
+    (%require-equal-division "vt-dsplit" (nth 2 (vt-shape vt)) indices-or-sections)
+    (vt-split vt indices-or-sections :axis 2)))
 
 ;;; ------------------------------------------------------------------
 ;;; 三角与对角
@@ -415,43 +447,69 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
       (recurse 0 (vt-offset res)))
     res))
 
-(defun vt-diagonal (tensor &key (offset 0))
-  "提取对角线（支持 batch）。"
+(defun vt-diagonal (tensor &key (offset 0) axis1 axis2)
+  "提取对角线（支持 batch）。
+
+   AXIS1 / AXIS2 指定取对角线的两条轴（支持负索引）；结果形状 =
+   「去掉这两轴后其余各维（升序）」+「对角线长度」（对角线轴置于末尾），
+   与 numpy.diagonal / torch.diagonal 一致。
+
+   两者必须**同时**给出（只给其一无法确定对角平面）。
+
+   **默认（都不给）取最后两轴** —— pytorch / torch.diagonal 风格，
+   等价于 `np.diagonal(a, axis1=-2, axis2=-1)`；显式给出 axis1/axis2
+   则得到 numpy 语义。注意 numpy 的 `np.diagonal(a)` 缺省是
+   axis1=0 / axis2=1 的**历史特例**，batch 下与本函数默认行为不同，
+   需显式传 `axis1=0 axis2=1` 才能复现。
+
+   （此前只有 offset，且固定取最后两轴，无法表达 numpy 的 axis1/axis2。）"
   (let* ((in-shape (vt-shape tensor))
          (rank (length in-shape)))
     (when (< rank 2) (error "vt-diagonal 要求秩 >= 2"))
-    (let* ((batch-dims (subseq in-shape 0 (- rank 2)))
-           (rows (nth (- rank 2) in-shape))
-           (cols (nth (1- rank) in-shape))
-           (r-init (if (> offset 0) 0 (- offset)))
-           (c-init (if (> offset 0) offset 0))
-           (diag-len (max 0 (min (- rows r-init) (- cols c-init))))
-           (out-shape (append batch-dims (list diag-len)))
-           (res (vt-zeros out-shape :dtype (vt-dtype tensor)))
-           (res-data (vt-data res))
-           (in-data (vt-data tensor))
-           (in-strs (vt-strides tensor))
-           (out-idx 0)
-           (batch-size (reduce #'* batch-dims :initial-value 1))
-           (str-r (nth (- rank 2) in-strs))
-           (str-c (nth (1- rank) in-strs))
-           (in-offset (vt-offset tensor)))
-      (dotimes (batch batch-size)
-        (let ((in-ptr in-offset)
-              (rem batch))
-          ;; 关键修改：从最后一个 batch 维度开始反向解码，匹配 row-major 输出
-          (loop for d from (1- (length batch-dims)) downto 0
-                for dim = (nth d batch-dims)
-                for str = (nth d in-strs)
-                do (multiple-value-bind (q r) (floor rem dim)
-                     (incf in-ptr (* r str))
-                     (setf rem q)))
-          (loop for i from 0 below diag-len
-                for src = (+ in-ptr (* (+ r-init i) str-r)
-                             (* (+ c-init i) str-c))
-                do (setf (aref res-data out-idx) (aref in-data src))
-                   (incf out-idx))))
-      res)))
+    (unless (eq (null axis1) (null axis2))
+      (error "vt-diagonal: :axis1 与 :axis2 必须同时给出（只给其一无法确定对角平面）"))
+    (let* ((a1 (if axis1 (vt-normalize-axis axis1 rank) (- rank 2)))
+           (a2 (if axis2 (vt-normalize-axis axis2 rank) (1- rank))))
+      (when (= a1 a2)
+        (error "vt-diagonal: :axis1 与 :axis2 不能指向同一轴（~a）" a1))
+      (let* ((rows (nth a1 in-shape))
+             (cols (nth a2 in-shape))
+             (r-init (if (> offset 0) 0 (- offset)))
+             (c-init (if (> offset 0) offset 0))
+             (diag-len (max 0 (min (- rows r-init) (- cols c-init))))
+             ;; 保留轴（升序）：输出形状 = 保留各维 + 对角线维（末尾）
+             (keep (loop for i below rank unless (or (= i a1) (= i a2)) collect i))
+             (keep-dims (mapcar (lambda (i) (nth i in-shape)) keep))
+             (out-shape (append keep-dims (list diag-len)))
+             (res (vt-zeros out-shape :dtype (vt-dtype tensor)))
+             (res-data (vt-data res))
+             (in-data (vt-data tensor))
+             (in-strs (vt-strides tensor))
+             (batch-size (reduce #'* keep-dims :initial-value 1))
+             (str-r (nth a1 in-strs))
+             (str-c (nth a2 in-strs))
+             (in-offset (vt-offset tensor))
+             (out-idx 0))
+        (if (or (zerop diag-len) (zerop batch-size))
+            res
+            (progn
+              (dotimes (batch batch-size)
+                (let ((in-ptr in-offset)
+                      (rem batch))
+                  ;; 从最后一个保留轴反向解码坐标，匹配 row-major 输出
+                  (loop for d from (1- (length keep)) downto 0
+                        for ax = (nth d keep)
+                        for dim = (nth ax in-shape)
+                        for str = (nth ax in-strs)
+                        do (multiple-value-bind (q r) (floor rem dim)
+                             (incf in-ptr (* r str))
+                             (setf rem q)))
+                  (loop for i from 0 below diag-len
+                        for src = (+ in-ptr (* (+ r-init i) str-r)
+                                     (* (+ c-init i) str-c))
+                        do (setf (aref res-data out-idx) (aref in-data src))
+                           (incf out-idx))))
+              res))))))
 
 (defun vt-diag (tensor &key (k 0))
   "提取对角线或构造对角矩阵（对标 numpy.diag）。"

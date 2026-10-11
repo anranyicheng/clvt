@@ -610,9 +610,9 @@ vt-isin             ;; 元素是否在给定集合中 (对标 numpy.isin)
 (run-all-tests)
 ```
 
-自动化测试（32 个测试套件，共 2200+ 用例）:
+自动化测试（统一入口 `test/run-tests.sh`，共 42 个套件：40 个默认 + 2 个性能基准）:
 ```bash
-# 运行所有测试
+# 运行所有默认套件（跳过性能基准）
 bash test/run-tests.sh
 
 # 运行指定测试套件
@@ -622,11 +622,20 @@ bash test/run-tests.sh --suite nested-test
 # 运行时调用 numpy 实时对比结果 (需安装 python3 + numpy)
 bash test/run-tests.sh --suite numpy-compare-test
 
-# 列出所有测试套件
+# 两阶段流水线套件：Lisp 用 vt-save 落盘 → NumPy 逐位校验（1000x1000 基准）
+bash test/run-tests.sh --suite manip-interop-test
+
+# 连性能基准（benchmark-copy / performance-bench）一起跑
+bash test/run-tests.sh --all
+
+# 列出所有测试套件（标注默认跳过项与流水线套件）
 bash test/run-tests.sh --list
 ```
 
-主要测试套件：(具体请看 test/ 文件夹目录中)
+`test/run-tests.sh` 是**全部测试的唯一入口**：`test/` 下每个套件都在此登记，
+启动时会自检运行列表是否覆盖全部已注册套件，避免"写了测试却没人跑"。
+
+主要测试套件（完整清单以 `bash test/run-tests.sh --list` 为准）
 
 | 套件 | 用例数 | 内容 |
 |------|-------:|------|
@@ -657,7 +666,15 @@ bash test/run-tests.sh --list
 | `test-overlap` | 6 | 重叠拷贝回归测试 |
 | `test-simd-batch-matmul` | 5 | SIMD 批量矩阵乘测试 |
 | `property-test` / `simd-test` | — | 性质测试 / SIMD 路径测试 |
+| `core-test` | 282 | 基础契约回归（结构/函数语义/返回值形状/错误契约） |
 | `test-all` | 641 | 一般性测试 |
+| `legacy-coverage-test` | 284 | 静态 JSON 时代未接线用例盘活 |
+| `differential-probes-test` | 496 | 差分探针 vs numpy（期望内嵌逐项判定） |
+| `differential-probes-test2` | 405 | 第 2 阶段差分探针 vs numpy |
+| `io-interop-test` | 77 | `vt-load`/`vt-save` 持久化与 numpy `.npy` 互操作测试 |
+| `contract-regression-test` | 115 | numpy/pytorch 契约对齐回归（写入拦截/roll 拷贝/diagonal 轴/均分整除/where 单参/整数索引/digitize 形状·bins/insert moveaxis） |
+| `manip-interop-test` | 190 | 形状/视图/拼接/切片跨语言互操作测试（Lisp `vt-save` 落盘 + NumPy 逐位校验，两阶段流水线） |
+| `benchmark-copy` / `performance-bench` | — | 性能基准测试（默认跳过，`--all` 执行） |
 
 ## 架构
 
