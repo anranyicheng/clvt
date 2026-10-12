@@ -13,7 +13,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `vt-manip-interop-test.lisp` | Lisp 端（阶段 1）：190 个用例 + Lisp 自检（oracle/错误契约）+ `vt-save` 落盘 + `manifest.json` |
+| `vt-manip-interop-test.lisp` | Lisp 端（阶段 1）：195 个用例 + Lisp 自检（oracle/错误契约）+ `vt-save` 落盘 + `manifest.json` |
 | `verify_manip_numpy.py` | NumPy 端（阶段 2）：逐用例重建期望值，比对 shape / dtype / 数值 |
 
 本套件是**两阶段流水线**，已作为 `manip-interop-test` 注册进统一测试入口
@@ -65,27 +65,28 @@ CLVT_TEST_OUT=/tmp/clvt-out bash test/run-tests.sh --suite manip-interop-test
 
 ## 用例分布
 
-- **A–K 组，190 个用例**：A(12) view/reshape · B(20) transpose/rot90/flip/roll ·
+- **A–L 组，195 个用例**：A(12) view/reshape · B(20) transpose/rot90/flip/roll ·
   C(13) squeeze/flatten/ravel · D(15) narrow/slice · E(11) split 族 ·
   F(15) stack/concatenate 族 · G(21) repeat/tile/pad/broadcast/contiguous ·
   H(10) triu/tril/diagonal/flatten-to-nested · I(15) append/insert/delete ·
   J(33) take/put/where/nonzero/choose/select/extract/searchsorted/digitize/bincount/astype ·
   K(20) **多算子组合**（如 `transpose→reshape→contiguous`、`slice→transpose→flatten`、
   `stack→reshape`、`split→vstack` 往返、`pad→flip→roll`…）。
-- **Lisp 自检 55 项**：元素位置 oracle（如 `transpose[7][5] == m[5][7]`）、
+- **L 组（5 个用例）空索引**：`vt-take` 空索引（含 `:axis`）返回空结果、`vt-put` 空索引为 no-op、`vt-insert` 空 `positions` 原样返回 —— 与 `np.take(a, [])` / `a.put([], [])` / `np.insert(a, [], v)` 逐位一致。
+- **Lisp 自检 63 项**：元素位置 oracle（如 `transpose[7][5] == m[5][7]`）、
   连续性判定、形状推导，以及 15 条错误契约（越界、形状不匹配、非法参数等）断言。
 
 ## 结果
 
 ```
-总计: 190   通过: 190   失败: 0   已知差异: 0   缺参考: 0
+总计: 195   通过: 195   失败: 0   已知差异: 0   缺参考: 0
 结论: 全部通过 ✅
 ```
 
 （原始版本有 185 例、1 项已知差异 —— `vt-insert` 的 axis 路径问题；
 该缺陷已在源码中修复，用例改名为 `I15_insert_ax1_moveaxis` 并转入正常判定，
 同时新增 `H11–H13`（batch 对角线显式轴）、`G22/G23`（roll 位移取模 0）
-共 5 个用例，故为 190 例。差异详情与修复见 `test/CONTRACT-ALIGNMENT-REPORT.md`。）
+共 5 个用例；后又补 L 组 5 个空索引用例，故为 195 例。差异详情与修复见 `test/CONTRACT-ALIGNMENT-REPORT.md`。）
 
 ## 已修复的差异（原「已知差异」）
 

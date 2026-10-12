@@ -672,8 +672,8 @@ bash test/run-tests.sh --list
 | `differential-probes-test` | 496 | 差分探针 vs numpy（期望内嵌逐项判定） |
 | `differential-probes-test2` | 405 | 第 2 阶段差分探针 vs numpy |
 | `io-interop-test` | 77 | `vt-load`/`vt-save` 持久化与 numpy `.npy` 互操作测试 |
-| `contract-regression-test` | 115 | numpy/pytorch 契约对齐回归（写入拦截/roll 拷贝/diagonal 轴/均分整除/where 单参/整数索引/digitize 形状·bins/insert moveaxis） |
-| `manip-interop-test` | 190 | 形状/视图/拼接/切片跨语言互操作测试（Lisp `vt-save` 落盘 + NumPy 逐位校验，两阶段流水线） |
+| `contract-regression-test` | 136 | numpy/pytorch 契约对齐回归（写入拦截/roll 拷贝/diagonal 轴/均分整除/where 单参/整数索引但空索引合法/digitize 形状·bins/insert moveaxis） |
+| `manip-interop-test` | 195 | 形状/视图/拼接/切片跨语言互操作测试（Lisp `vt-save` 落盘 + NumPy 逐位校验，两阶段流水线） |
 | `benchmark-copy` / `performance-bench` | — | 性能基准测试（默认跳过，`--all` 执行） |
 
 ## 架构

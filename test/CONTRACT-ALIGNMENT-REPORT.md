@@ -69,10 +69,10 @@ numpy 期望上（不是为了让测试通过而放宽标准）：
 
 | 项 | 内容 |
 | --- | --- |
-| 新增套件 | `test/contract-regression-test.lisp`（115 断言，按行为分 10 节；期望来自 NumPy 实测；断言与分节均**异常安全**，实现损坏时报出全部失败而不中断） |
+| 新增套件 | `test/contract-regression-test.lisp`（**136** 断言，按行为分 11 节；期望来自 NumPy 实测；断言与分节均**异常安全**，实现损坏时报出全部失败而不中断） |
 | 注册 | `test/run-tests.sh`（唯一入口）的 `SUITES` + `DEFAULT_ORDER` |
 | 全量回归 | `bash test/run-tests.sh` → **40 / 40 套件通过**；`--all` → **42 / 42**（含 `benchmark-copy`、`performance-bench`） |
-| 跨语言互操作 | `test/vt-manip-interop-test.lisp` + `test/verify_manip_numpy.py` → **190 / 190 通过、0 已知差异**（规模基准 `(vt-reshape (vt-arange 1000000) '(1000 1000))`，经 `vt-save` 落盘后由 NumPy 逐位校验） |
+| 跨语言互操作 | `test/vt-manip-interop-test.lisp` + `test/verify_manip_numpy.py` → **195 / 195 通过、0 已知差异**（规模基准 `(vt-reshape (vt-arange 1000000) '(1000 1000))`，经 `vt-save` 落盘后由 NumPy 逐位校验） |
 | **反向验证** | 把同一套件放到修正前的源码上运行 → **通过 49 / 失败 51**（退出码 1）；修正后 → **通过 115 / 失败 0**。证明断言确实捕获上表各行为差异，而非「为通过而写」 |
 | 补丁可应用性 | 在基线 `6514cf9` 的干净克隆上 `git apply` → 干净应用，应用后 `bash test/run-tests.sh` **40 / 40 通过** |
 
@@ -103,12 +103,14 @@ numpy 期望上（不是为了让测试通过而放宽标准）：
 **源码**
 - `src/indexing.lisp` — 广播视图写入拦截（`(setf vt-ref)` / `(setf vt-slice)`，并放宽
   `vt-put` 的只读判定）、`vt-where` 单参返回形态、`vt-select` 标量 choice、
-  `vt-choose` / `vt-take` / `vt-put` 整数索引校验、`vt-digitize` 形状保持 +
+  `vt-choose` / `vt-take` / `vt-put` 整数索引校验（统一走新增的
+  `%check-integer-index`，**空索引放行**，见 §七）、`vt-digitize` 形状保持 +
   序列 `bins` + 递减 `bins`（新增 `%bins-monotonicity` / `%digitize-searchsorted`）
 - `src/manip.lisp` — `vt-roll` 拷贝语义、`vt-diagonal` 轴参数、
   `vt-hsplit` / `vt-dsplit` 整除与维度校验（新增 `%require-equal-division`）
 - `src/join.lisp` — `%insert-axis` 按 numpy 语义重写（新增
-  `%shape-broadcastable-to-p`），并区分标量 `obj` 与列表 `obj=[k]`
+  `%shape-broadcastable-to-p`），并区分标量 `obj` 与列表 `obj=[k]`；
+  `vt-insert` 的 `positions` 改用 `%check-integer-index`（空 positions 放行）
 - `CONVENTIONS.md` — 更正 `vt-where` 单参的契约描述
 
 **测试**
@@ -120,3 +122,65 @@ numpy 期望上（不是为了让测试通过而放宽标准）：
   补 `legacy-coverage-test` 到默认列表；新增启动期「运行列表必须覆盖全部
   已注册套件」的自检，防止漏接线）、`test/core-test.lisp`、
   `test/numpy-convention-tests.lisp`、`test/test-all.lisp`
+
+## 七、上游合并后的回归修复：整数索引契约误伤「空索引」
+
+上一轮把 `vt-take` / `vt-put` / `vt-choose` / `vt-insert` 的浮点索引改成报错
+（对齐 numpy），但判断条件写成了「dtype 是浮点就报错」，于是把**空索引**也一并
+拒了 —— 而 CL 侧表示「无索引」的自然写法默认正是 float64：
+
+| 调用 | 修复前 | numpy 对应写法 | 应有行为 |
+| --- | --- | --- | --- |
+| `(vt-take a '())` / `#()` | 报错 | `np.take(a, [])` | 空结果 |
+| `(vt-take a (vt-from-sequence '()))` | 报错 | —— | 空结果 |
+| `(vt-take a (vt-zeros '(0)))` | 报错 | —— | 空结果 |
+| `(vt-put z '() '())` | 报错 | `z.put([], [])` | no-op |
+| `(vt-insert a '() v)` | 报错 | `np.insert(a, [], v)` | 原样返回 |
+
+**修复**：抽出统一辅助 `%check-integer-index`（`src/indexing.lisp`），规则改为
+**「元素数为 0 的索引不做整数检查」**，四个入口（`vt-take` / `vt-put` /
+`vt-choose` / `vt-insert` 的 `positions`）统一调用。非空浮点索引仍然一律报错，
+上一轮的目的（禁止 `0.5 → 0` 这类静默截断）完全保留。
+
+理由两点：
+1. 空索引没有任何元素会被截断 ⇒ 不存在静默错值风险，拒绝它不带来任何安全性收益；
+2. 拒绝只会把「索引为空」这一正常用法判成错误，属纯粹的误伤。
+
+### 与 numpy 的窄分歧（新增，方向为「更宽松且不影响正确性」）
+
+numpy 的精确行为其实是「空 **list** 放行、空 **float64 数组** 报错」：
+
+| | 空 list | 空 float64 数组 |
+| --- | --- | --- |
+| `np.take` | OK（空结果） | ERR（casting） |
+| `ndarray.put` | OK（no-op） | ERR（casting） |
+| `np.choose` | ERR（casting） | ERR（casting） |
+| `np.insert` | OK（原样返回） | ERR（IndexError） |
+
+clvt 对两者**统一放行**（顺序 API 取其宽松侧）。多出的那部分放宽是刻意的：
+numpy 只对空 float64 数组报错是 `float64 → int64` 的 casting 副作用，并非有意
+契约；而 CL 侧 `(vt-from-sequence '())` 这类「空索引」的自然写法恰好就是
+float64，照搬 numpy 的 casting 行为会让用户无法用统一写法表达「无索引」。
+
+### 验证
+
+- `test/contract-regression-test.lisp` 新增一节 21 条断言：空 `list` / `#()` /
+  空 float64 张量 / `(vt-zeros '(0))` / 带 `:axis` 的空索引 / 非空浮点仍报错 /
+  浮点标量仍报错 / 正常整数索引不受影响；套件 115 → **136**。
+- `test/vt-manip-interop-test.lisp` 新增 L 组 5 个用例（规模 1000×1000），
+  由 NumPy 逐位校验，对应 `np.take(M, [])` / `np.take(M, [], axis=0|1)` /
+  `M.copy().put([], [])` / `np.insert(M, [], M[0:1], axis=0)`：
+  190 → **195**，全部通过；Lisp 端自检同步增加 8 条空索引 oracle（55 → 63）。
+- 空张量的 `vt-save`（`:npy` / `:lisp` 两种格式）→ `vt-load` 往返正常，
+  写出的 `.npy` 也能被 NumPy 直接 `np.load`（shape / dtype 一致）。
+- **反向验证**：把新断言放到未修复的源码（上游合并提交 `fdc77fa`）上运行 →
+  空索引一节 **11 条失败**（整体 125 通过 / 11 失败），而「非空浮点仍报错」
+  的各条全部通过 —— 正是本次修复的差异面；修复后 136 / 0 全部通过。
+- **顺带修掉测试基础设施的一处偶发崩溃**：冷编译整个库（新克隆目录 / CI 干净
+  容器首次运行）时，SBCL 默认动态空间（实测 1 GB）会偶发
+  `Heap exhausted, game over` 直接崩溃，进程带**空输出**退出 —— 运行器只能
+  报一句无法追查的 `core-test: ?/? 通过, ? 失败`。冷编译实测 3 次：默认堆
+  1 次崩溃；`--dynamic-space-size 4096` 3 次全稳。`test/run-tests.sh` 现统一
+  传 `--dynamic-space-size`（默认 4096 MB，可用环境变量
+  `SBCL_DYNAMIC_SPACE_SIZE` 覆盖），并在 `--help` 中写明。
+- 全量 `bash test/run-tests.sh` → **40 / 40 套件通过**。

@@ -377,17 +377,48 @@
                                    :offset 0
                                    :dtype :int64))))))))
 
+;;; ------------------------------------------------------------------
+;;; 索引 dtype 契约
+;;; ------------------------------------------------------------------
+
+(defun %check-integer-index (subject index-vt)
+  "整数索引契约检查（对标 numpy）。SUBJECT 为出错的入口名，如
+\"vt-take\"、\"vt-insert 的 positions\"。
+
+numpy 对**非空**浮点索引一律报错：
+  - np.take / ndarray.put → TypeError: Cannot cast array data from
+    dtype('float64') to dtype('int64') ...
+  - np.choose / np.insert    → TypeError: 'float' object cannot be
+    interpreted as an integer
+此前各实现无条件 truncate，浮点索引被静默截断（0.5 → 0），返回看似
+合理却错误的结果，故一律拒绝。
+
+例外：**空索引**（元素数 0）不做检查，视为合法的 no-op。
+理由有两点：
+  1. 空索引没有任何元素会被截断，不存在静默错值风险；
+  2. CL 侧表示「无索引」的自然写法 —— (vt-from-sequence '())、
+     #()、(vt-zeros '(0)) —— 默认都是 float64，若一并拒绝会把
+     「索引为空」这一正常用法误判为错误。
+numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
+→ no-op、np.insert(a, [], v) → 原样返回）；它只对空 float64 *数组*
+因 casting 规则报错，那是 casting 的副作用而非有意契约，这里统一
+放宽为放行。"
+  (when (and (> (vt-size index-vt) 0)
+             (vt-float-dtype-p (vt-dtype index-vt)))
+    (error "~a: 索引必须为整数类型，收到 ~a（对标 numpy：非空浮点索引抛 TypeError/IndexError；空索引不受此限制）"
+           subject (vt-dtype index-vt))))
+
 (defun vt-take (tensor indices &key axis)
   "按索引取值（axis 为 nil 时展平取值，否则沿指定轴 gather）。
 
-   INDICES 必须为整数张量：浮点索引报错，对标 numpy
+   INDICES 必须为整数：非空浮点索引报错，对标 numpy
    （IndexError: arrays used as indices must be of integer
    (or boolean) type）。原实现无条件 truncate，浮点索引会被静默
-   截断（如 0.9 → 0）并返回看似合理却错误的结果。"
+   截断（如 0.9 → 0）并返回看似合理却错误的结果。
+   空索引（如 '() / (vt-from-sequence '()) / (vt-zeros '(0))）合法，
+   返回空结果（见 `%check-integer-index`）。"
   (let ((idx-vt (ensure-vt indices)))
-    (when (vt-float-dtype-p (vt-dtype idx-vt))
-      (error "vt-take: 索引必须为整数类型，收到 ~a（对标 numpy：浮点索引抛 IndexError）"
-             (vt-dtype idx-vt))))
+    (%check-integer-index "vt-take" idx-vt))
   (labels ((fixnum-1d (vt)
              (let* ((len (vt-size vt))
                     (off (vt-offset vt))
@@ -566,16 +597,16 @@
 (defun vt-put (tensor indices values &key (mode :raise))
   "按展平索引就地写入 values。
 
-   INDICES 必须为整数（整数标量 / 整数张量）：浮点会报错，对标 numpy
-   （'float' object cannot be interpreted as an integer）。原实现用
-   round/truncate 静默截断浮点索引。"
+   INDICES 必须为整数（整数标量 / 整数张量）：非空浮点会报错，对标
+   numpy（'float' object cannot be interpreted as an integer）。原实现
+   用 round/truncate 静默截断浮点索引。
+   空索引（如 '() / (vt-from-sequence '()) / (vt-zeros '(0))）合法，
+   为空操作（见 `%check-integer-index`）。"
   (cond
     ((and (numberp indices) (floatp indices))
      (error "vt-put: 索引必须为整数，收到 ~a（对标 numpy）" indices))
     ((not (numberp indices))
-     (let ((iv (ensure-vt indices)))
-       (when (vt-float-dtype-p (vt-dtype iv))
-         (error "vt-put: 索引必须为整数类型，收到 ~a（对标 numpy）" (vt-dtype iv))))))
+     (%check-integer-index "vt-put" (ensure-vt indices))))
   (let* ((total (vt-size tensor))
          (idx-list (if (numberp indices) (list (round indices))
                        (let ((flat (vt-flatten (ensure-vt indices))))
@@ -660,12 +691,10 @@
            (result-data (make-array final-size
                                     :element-type
                                     (vt-dtype->lisp-type result-type))))
-      ;; numpy 对浮点 indices 抛 TypeError: 'float' object cannot be
+      ;; numpy 对非空浮点 indices 抛 TypeError: 'float' object cannot be
       ;; interpreted as an integer；此前用 truncate 静默截断（0.5 → 0），
-      ;; 会静默产生错误结果。
-      (when (vt-float-dtype-p (vt-dtype idx-vt))
-        (error "vt-choose: 索引必须为整数类型，收到 ~a（对标 numpy：indices 为浮点时抛 TypeError）"
-               (vt-dtype idx-vt)))
+      ;; 会静默产生错误结果。空索引合法（no-op），见 `%check-integer-index`。
+      (%check-integer-index "vt-choose" idx-vt)
       (loop for i from 0 below final-size
             for raw = (truncate (aref idx-data (+ idx-off i)))
             for idx = (ecase mode

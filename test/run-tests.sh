@@ -18,6 +18,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SBCL="${SBCL:-sbcl}"
 TIMEOUT="${TIMEOUT:-300}"
+# SBCL 动态空间大小（MB）。冷编译整个库（新克隆目录首次运行、CI 干净容器）
+# 在 SBCL 默认动态空间下可能直接 "Heap exhausted, game over" 崩溃，进程带着
+# 空输出退出 —— 运行器只能报一句无法追查的 "?/?"。统一给足内存。
+SBCL_DYNAMIC_SPACE_SIZE="${SBCL_DYNAMIC_SPACE_SIZE:-4096}"
 
 # 颜色
 RED='\033[0;31m'
@@ -58,7 +62,7 @@ SUITES[shape-degenerate-tests]="70 空形状/退化形状表驱动测试 (C1/C2 
 SUITES[property-strided-tests]="67 选路不变量/代数恒等式测试 (C8 类目, strided≡contiguous)"
 SUITES[error-contract-tests]="19 错误路径契约测试 (C7 类目, L2 底线)"
 SUITES[refactor-bugfix-tests]="55 v0.3.5 重构回归测试 (floor族NaN/insert numpy语义/solve校验/tensordot负轴等)"
-SUITES[contract-regression-test]="115 numpy/pytorch 契约对齐回归 (广播写穿拦截/roll拷贝语义/diagonal轴参数/均分整除/where单参形态/标量choice/浮点索引报错/digitize形状·bins/insert moveaxis；期望来自 numpy 实测)"
+SUITES[contract-regression-test]="136 numpy/pytorch 契约对齐回归 (广播写穿拦截/roll拷贝语义/diagonal轴参数/均分整除/where单参形态/标量choice/浮点索引报错但空索引合法/digitize形状·bins/insert moveaxis；期望来自 numpy 实测)"
 SUITES[numpy-convention-tests]="63 numpy 对齐语义测试 (空归约/:out解耦/mod零除/true_divide/random校验/clip·where 签名)"
 SUITES[out-contract-v2-test]="56 :out 契约 v2 严格相等测试 (形状/dtype/可写/别名/非连续 out)"
 SUITES[nan-broadcast-test]="31 NaN/Inf 广播对齐 numpy 测试 (算术/极值/比较/归约/dtype 提升)"
@@ -69,7 +73,7 @@ SUITES[test-all]="641 绝大多数函数的测试"
 SUITES[core-test]="282 基础契约回归 (1 结构/199 函数语义/返回值形状/错误契约, 参照 CONVENTIONS)"
 SUITES[differential-probes-test]="496 差分探针 vs numpy (期望内嵌逐项判定, 覆盖算术/超越/归约/索引/操纵/随机/错误路径)"
 SUITES[differential-probes-test2]="405 第2阶段差分探针 vs numpy (导出符号 #200-#377: NaN统计/linalg分解/NN/随机/契约, 期望内嵌逐项判定)"
-SUITES[manip-interop-test]="190 形状/视图/拼接/切片 跨语言互操作测试 (Lisp vt-save 落盘 + NumPy 逐位校验, 1000x1000 基准)"
+SUITES[manip-interop-test]="195 形状/视图/拼接/切片 跨语言互操作测试 (Lisp vt-save 落盘 + NumPy 逐位校验, 1000x1000 基准)"
 SUITES[performance-bench]="性能基准测试 (1M 元素 / 1k×1k / 100×100 三档)"
 
 # 需要「Lisp 生成数据 + Python/NumPy 校验」两阶段流水线的套件
@@ -161,6 +165,9 @@ clvt 自动化测试运行器
 
 环境变量:
   SBCL            SBCL 可执行文件路径 (默认: sbcl)
+  SBCL_DYNAMIC_SPACE_SIZE
+                  SBCL 动态空间 MB (默认: 4096)。冷编译整个库时若用 SBCL
+                  默认值可能 "Heap exhausted" 崩溃并报出无法追查的 ?/?
   TIMEOUT         每个测试超时秒数 (默认: 300)
   CLVT_TEST_OUT   流水线套件的产物目录 (默认: 临时目录，跑完自动清理)
 
@@ -293,7 +300,11 @@ run_pipeline_suite() {
     log "  阶段 1 文件: $lisp_file"
     log "  输出目录   : $out_dir"
     local lisp_out="" lisp_code=0
-    lisp_out=$(CLVT_TEST_OUT="$out_dir" "$SBCL" --noinform --non-interactive \
+    # 注意：--dynamic-space-size 是 C 运行时选项，必须排在 Lisp 选项
+    # （--non-interactive 之后即报 "in the middle of Lisp options"）之前。
+    lisp_out=$(CLVT_TEST_OUT="$out_dir" "$SBCL" \
+        --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" \
+        --noinform --non-interactive \
         --eval "(require :asdf)" \
         --eval "(push #p\"${PROJECT_DIR}/\" asdf:*central-registry*)" \
         --eval "(asdf:load-system :clvt)" \
@@ -382,7 +393,9 @@ run_lisp_suite() {
 
     local output
     local exit_code=0
-    output=$("$SBCL" --noinform --non-interactive \
+    output=$("$SBCL" \
+        --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" \
+        --noinform --non-interactive \
         --eval "(require :asdf)" \
         --eval "(push #p\"${PROJECT_DIR}/\" asdf:*central-registry*)" \
         --eval "(asdf:load-system :clvt)" \

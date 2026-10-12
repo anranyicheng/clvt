@@ -609,6 +609,7 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | `vt-concatenate` | dtype 按提升规则统一 | ✅ |
 | `vt-take` | `axis nil` 展平；负索引支持 `mode` | ✅ |
 | `vt-put` | `mode=:raise` 默认 | ✅ |
+| 索引 dtype 契约 | `vt-take` / `vt-put` / `vt-choose` / `vt-insert` 的 `positions`：**非空**浮点索引报错（对标 numpy 的 TypeError/IndexError，禁止 `0.5 → 0` 静默截断）；**空索引合法**（no-op / 空结果），因为空索引没有元素可截断，且 `(vt-from-sequence '())` 这类「无索引」写法默认是 float64。统一由 `%check-integer-index` 判定 | ✅ |
 | `vt-reshape` | 至多一个 `-1`；尺寸不符报错 | ✅ |
 | `vt-squeeze` | 默认移除**全部**长度 1 轴（`(1,3,1)→(3)` ✅ 实测） | ✅ |
 | `vt-transpose` | 默认反转全部轴 | ✅ |

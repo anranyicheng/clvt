@@ -856,6 +856,38 @@ def _():
 
 
 # ---------------------------------------------------------------------------
+# L 组：空索引（整数索引契约不得误伤「空索引」）
+#   空索引没有任何元素会被截断，numpy 对空 *list* 同样放行：
+#   np.take(a, []) → 空结果、a.put([], []) → no-op、np.insert(a, [], v)
+#   → 原样返回。故这里以 numpy 的空 list 作为参照。
+#   （clvt 对「空 float64 索引张量」也放行；numpy 在此因 float64→int64 的
+#     casting 规则报错，属 casting 副作用，已在 CONTRACT-ALIGNMENT-REPORT
+#     中记为刻意分歧。）
+# ---------------------------------------------------------------------------
+@case("L01_take_empty_index")
+def _():
+    return np.take(M, [])
+
+@case("L02_take_empty_axis0")
+def _():
+    return np.take(M, [], axis=0)
+
+@case("L03_take_empty_axis1")
+def _():
+    return np.take(M, [], axis=1)
+
+@case("L04_put_empty_index_noop")
+def _():
+    out = M.copy()
+    out.put([], [])
+    return out
+
+@case("L05_insert_empty_positions")
+def _():
+    return np.insert(M, [], M[0:1], axis=0)
+
+
+# ---------------------------------------------------------------------------
 # 已知差异（KNOWN DEVIATIONS）
 # 这些用例的 clvt 行为与 numpy 契约不一致，已由 Lisp 端/NumPy 端双向确认。
 # 它们被单独统计，不计入失败，但会在报告中显式列出，便于上游修复。

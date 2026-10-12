@@ -763,6 +763,30 @@
              2 :axis 0))
 
 ;;; ---------------------------------------------------------------------------
+;;; L 组：空索引（整数索引契约不得误伤「空索引」）
+;;; ---------------------------------------------------------------------------
+;; 空索引没有任何元素会被截断 ⇒ 不存在静默错值风险；而 CL 侧表示「无索引」
+;; 的自然写法默认是 float64，若按 dtype 一律拒绝会把正常用法判错。
+;; numpy 对空 list 同样放行：np.take(a, []) → 空结果、
+;; np.insert(a, [], v) → 原样返回。本组确保空索引在 1000x1000 规模下
+;; 也逐位与 numpy 一致。
+(defcase "L01_take_empty_index"
+  "(vt-take m '())"
+  (vt-take *m* '()))
+(defcase "L02_take_empty_axis0"
+  "(vt-take m '() :axis 0)"
+  (vt-take *m* '() :axis 0))
+(defcase "L03_take_empty_axis1"
+  "(vt-take m '() :axis 1)"
+  (vt-take *m* '() :axis 1))
+(defcase "L04_put_empty_index_noop"
+  "(vt-put (vt-copy m) '() '())"
+  (vt-put (vt-copy *m*) '() '()))
+(defcase "L05_insert_empty_positions"
+  "(vt-insert m '() (vt-narrow m 0 0 1) :axis 0)"
+  (vt-insert *m* '() (vt-narrow *m* 0 0 1) :axis 0))
+
+;;; ---------------------------------------------------------------------------
 ;;; 13. 运行器：落盘 + 往返自检 + manifest
 ;;; ---------------------------------------------------------------------------
 
@@ -1008,6 +1032,23 @@
                         (vt-full '(1000 1000) 5 :dtype :int64)))
   (chk-error "err: vt-repeat 列表长度不符"
              (vt-repeat (vt-narrow *m* 0 0 3) '(1 2) :axis 1))
+
+  ;; --- 空索引契约（回归：不得把「索引为空」判成错误）---
+  (chk "oracle: 空索引 take 形状 (0)" '(0) (vt-shape (vt-take *m* '())))
+  (chk "oracle: 空索引 take axis=0 形状 (0 1000)" '(0 1000)
+       (vt-shape (vt-take *m* '() :axis 0)))
+  (chk "oracle: 空索引 take axis=1 形状 (1000 0)" '(1000 0)
+       (vt-shape (vt-take *m* '() :axis 1)))
+  (chk "oracle: 空索引 take(float64 空张量) 同样合法" '(0)
+       (vt-shape (vt-take *m* (vt-zeros '(0)))))
+  (chk "oracle: 空索引 put 为 no-op（首元素仍为 0）" 0.0d0
+       (vt-ref (vt-put (vt-copy *m*) '() '()) 0 0))
+  (chk "oracle: 空 positions insert 原样返回" '(1000 1000)
+       (vt-shape (vt-insert *m* '() (vt-narrow *m* 0 0 1) :axis 0)))
+  (chk-error "err: 非空浮点索引仍必须报错（不得静默截断）"
+             (vt-take *m* '(0.5)))
+  (chk-error "err: 非空浮点 positions 仍必须报错"
+             (vt-insert *m* (vt-from-sequence '(1.5)) (vt-narrow *m* 0 0 1) :axis 0))
 
   (format t "~&~%Lisp 自检：PASS=~D FAIL=~D~%" *pass* *fail*)
   (values *pass* *fail*))

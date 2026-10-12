@@ -399,6 +399,9 @@ positions：整数 / 整数列表 / 整数张量。所有位置先按当前轴�
 多位置按升序稳定排序后依次插入，同位置多个值按 values 顺序排布。
 标量 positions 在 axis 为 NIL 时按 values 元素数广播为重复位置
 （np.insert(a,1,[7,8]) ≡ positions=[1,1]）。
+非空浮点 positions 报错（对标 numpy TypeError/IndexError）；**空**
+positions 合法，等价于原样返回（np.insert(a, [], v) 亦如此），
+见 `%check-integer-index`。
 
 axis 给定时严格复刻 numpy 2.x：
   - 单索引（obj 为标量或 [k]）：values 先经
@@ -423,9 +426,7 @@ NaN/Inf：纯数据搬运，逐位保留。
                            (t nil)))
          (insertions
            (cond ((vt-p positions)
-                  (when (vt-float-dtype-p (vt-dtype positions))
-                    (error "vt-insert: positions 必须为整数类型，收到 ~a（对标 numpy）"
-                           (vt-dtype positions)))
+                  (%check-integer-index "vt-insert 的 positions" positions)
                   (let ((flat (vt-flatten positions)))
                     (loop for i below (vt-size flat)
                           collect (truncate (aref (vt-data flat) i)))))

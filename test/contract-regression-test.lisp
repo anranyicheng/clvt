@@ -15,6 +15,8 @@
 ;;;;   返回形态   vt-where 单参 = np.nonzero（按轴分组元组）
 ;;;;   广播输入   vt-select 接受标量 choice
 ;;;;   索引类型   vt-choose 浮点索引报错（对齐 numpy TypeError）
+;;;;   空索引     vt-take / vt-put / vt-choose / vt-insert 的空索引合法（no-op），
+;;;;              仅**非空**浮点索引报错
 ;;;;   形状保持   vt-digitize 多维输入保持形状；bins 接受 list/vector；递减 bins
 ;;;;   索引类型   vt-take / vt-put 浮点索引报错（对齐 numpy IndexError）
 ;;;;   axis 语义  vt-insert axis 路径施加 moveaxis(values, 0, axis)
@@ -322,6 +324,66 @@
                                   (vt-from-sequence '(0.5) :dtype :float64) 7)))
   (check-error "vt-put 浮点标量索引 → 报错"
                (lambda () (vt-put (vt-zeros '(4) :dtype :int64) 0.5 7)))
+
+  ;; =========================================================================
+)
+
+  (section "空索引合法：仅非空浮点索引报错"
+
+  ;; 回归：整数索引契约不得误伤「空索引」。
+  ;;   空索引没有任何元素会被截断 ⇒ 不存在静默错值风险；
+  ;;   而 CL 侧表示「无索引」的自然写法 —— '()、#()、
+  ;;   (vt-from-sequence '())、(vt-zeros '(0)) —— 默认都是 float64，
+  ;;   若按 dtype 一律拒绝，会把「索引为空」这一正常用法判成错误。
+  ;; numpy 对空 *list* 同样放行：np.take(a, []) → 空结果、
+  ;; a.put([], []) → no-op、np.insert(a, [], v) → 原样返回。
+  (let ((a (vt-arange 5 :dtype :int64)))
+    (check-shape "vt-take 空 list → 空结果"            '(0) (vt-take a '()))
+    (check-shape "vt-take 空 vector → 空结果"          '(0) (vt-take a #()))
+    (check-shape "vt-take 空 float64 张量 → 空结果"     '(0) (vt-take a (vt-from-sequence '())))
+    (check-shape "vt-take (vt-zeros '(0)) → 空结果"     '(0) (vt-take a (vt-zeros '(0))))
+    (check-shape "vt-take 空索引 + :axis → 轴长 0"      '(0) (vt-take a '() :axis 0))
+    (check-eq "vt-take 空结果 dtype 仍为 INT64"
+              :int64 (vt-dtype (vt-take a (vt-from-sequence '()))))
+    ;; 非空浮点仍必须报错（原来靠 truncate 静默截断 0.5 → 0）
+    (check-error "vt-take 非空浮点张量索引 → 仍报错"
+                 (lambda () (vt-take a (vt-from-sequence '(0.5)))))
+    (check-error "vt-take 非空浮点 list 索引 → 仍报错"
+                 (lambda () (vt-take a '(0.5))))
+    (check-error "vt-take 浮点标量 → 仍报错"
+                 (lambda () (vt-take a 0.5d0)))
+    (check-eq "vt-take 正常整数索引不受影响" '(0 2) (vt-to-list (vt-take a '(0 2)))))
+
+  (let ((z (vt-zeros '(5) :dtype :int64)))
+    (check-eq "vt-put 空 list 索引 → no-op" '(0 0 0 0 0)
+              (vt-to-list (vt-put z '() '())))
+    (check-eq "vt-put 空 float64 张量索引 → no-op" '(0 0 0 0 0)
+              (vt-to-list (vt-put z (vt-from-sequence '()) (vt-from-sequence '()))))
+    (check-eq "vt-put (vt-zeros '(0)) → no-op" '(0 0 0 0 0)
+              (vt-to-list (vt-put z (vt-zeros '(0)) '())))
+    (check-error "vt-put 非空浮点张量索引 → 仍报错"
+                 (lambda () (vt-put z (vt-from-sequence '(0.5)) 9)))
+    (check-error "vt-put 浮点标量索引 → 仍报错"
+                 (lambda () (vt-put z 0.5 9)))
+    (check-eq "vt-put 正常索引不受影响" '(7 0 9 0 0)
+              (vt-to-list (vt-put z '(0 2) '(7 9)))))
+
+  ;; vt-choose：索引与 choices 形状自洽的空索引 → 空结果
+  (let ((e (vt-zeros '(0) :dtype :int64)))
+    (check-shape "vt-choose 空索引（形状自洽）→ 空结果" '(0)
+                 (vt-choose (list e e) '())))
+  (check-error "vt-choose 非空浮点索引 → 仍报错"
+               (lambda () (vt-choose (list (a32) (a32)) (vt-from-sequence '(0.5)))))
+
+  ;; vt-insert：空 positions 等价于原样返回（np.insert(a, [], v) 亦如此）
+  (let ((a3 (vt-from-sequence '(0 1 2) :dtype :int64))
+        (v1 (vt-from-sequence '(9) :dtype :int64)))
+    (check-eq "vt-insert 空 list positions → 原样返回" '(0 1 2)
+              (vt-to-list (vt-insert a3 '() v1)))
+    (check-eq "vt-insert 空 float64 positions → 原样返回" '(0 1 2)
+              (vt-to-list (vt-insert a3 (vt-from-sequence '()) v1)))
+    (check-error "vt-insert 非空浮点 positions → 仍报错"
+                 (lambda () (vt-insert a3 (vt-from-sequence '(1.5)) v1))))
 
   ;; =========================================================================
 )
