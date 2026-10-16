@@ -3,7 +3,7 @@
 ;;;; 覆盖类目（对应 TEST-PLAN.md）：
 ;;;;   D1 差分参考   ：与优化前【原实现】的内嵌期望值逐项判定
 ;;;;                   （s 向量 / 重建误差上界 / 正交误差上界 / 首列符号向量）
-;;;;   C8 选路不变量 ：*vt-svd-simd-enabled* = t(AVX) ≡ nil(通用) 结果一致
+;;;;   C8 选路不变量 ：*vt-linalg-simd-enabled* = t(AVX) ≡ nil(通用) 结果一致
 ;;;;   C2/C3 数学性质：重建 a=u·s·vt、奇异值降序非负、U/Vt 正交（econ + full）
 ;;;;   G6 numpy 对比 ：奇异值 vs numpy.linalg.svd 实时对比（python3 不可用时跳过）
 ;;;;   C1 退化形状   ：1×1 / 1×n / n×1 / 零矩阵 / 空形状(0×3, 3×0)
@@ -226,12 +226,12 @@ recon-err = max|u·diag(s)·vt − a|；orth-err = max|uᵀu − I|。"
       (destructuring-bind (name . a) c
         (vt-random-seed 4242)
         (let ((p1 (route-props a)))
-          (setf *vt-svd-simd-enabled* nil)
+          (setf *vt-linalg-simd-enabled* nil)
           (vt-random-seed 4242)
           (let ((p2 (route-props a)))
-            (setf *vt-svd-simd-enabled* t)
+            (setf *vt-linalg-simd-enabled* t)
             (destructuring-bind (u1 s1 vt1 e1 o1 l1) p1
-	       (declare (ignore s1))
+               (declare (ignore s1))
               (destructuring-bind (u2 s2 vt2 e2 o2 l2) p2
                 (declare (ignore s2))
                 (svd-t! (format nil "route/~a/s" name)
