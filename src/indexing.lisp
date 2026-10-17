@@ -799,28 +799,123 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
                           (push (aref td idx) result))))
          (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor)))))))
 
+;;; ------------------------------------------------------------------
+;;; searchsorted 的类型特化二分内核（v0.4.4 性能修复）
+;;;
+;;; 原实现是一个**没有任何类型声明**的二分循环：DATA / V-DATA 都是未声明
+;;; 的数组变量，于是 (aref data mid) 走泛型二维分派 + 边界检查，比较
+;;; (>= ...) 走泛型数值分派。1M 个查询 × 17 次探测 ≈ 1.7e7 次这样的
+;;; 探测，实测 248ms（numpy.searchsorted 127ms，差 2.0 倍）。
+;;;
+;;; 改法：先把「查找表」与「查询值」归一到同一元素类型（双整型 → int64，
+;;; 其余含浮点 → double-float，与 numpy 的类型提升规则一致），再进一个
+;;; 全声明的特化循环 —— 每次探测就是一次带符号比较 + 两次整数位运算。
+;;;
+;;; 为什么不用 8×8 的元素类型组合：二分探测是**随机访存**，耗时的主体是
+;;; cache miss 而不是类型分派，两种归一化已经足够；组合爆炸只会让编译期
+;;; 代码量按平方增长（第 1 轮踩过：8×8 展开直接 Heap exhausted）。
+;;; 精度：int64 与 int64 比较时**不**转 double，避免 >2^53 的精度丢失
+;;; （numpy 此时同样按 int64 比较）。
+;;; ------------------------------------------------------------------
+(defun %elt-coerce-array (tensor lt)
+  "把 TENSOR（须已 flatten+contiguous，offset=0）的底层数据转成 LT 元素的
+   simple-array；已是该类型则原样返回（零拷贝）。"
+  (let ((d (vt-data tensor)))
+    (if (equal (array-element-type d) lt)
+        d
+        (let* ((n (vt-size tensor))
+               (buf (make-array n :element-type lt)))
+          (dotimes (i n)
+            (declare (type fixnum i))
+            (setf (aref buf i) (coerce (aref d i) lt)))
+          buf))))
+
+(macrolet ((def-searcher (name lt)
+             `(defun ,name (d v nd nv out right-p)
+                "对 D[0,ND) 中每个 V[0,NV) 做二分，结果写入 OUT。
+                 NaN 语义对标 numpy：numpy 的二分用
+                 LT(x,y) = (x < y) || (isnan(y) && !isnan(x))，
+                 即把 NaN 当作**最大**元素。排好序的表里 NaN 必然只在末尾，
+                 所以这里先求出「非 NaN 前缀长度 K」，只在 D[0,K) 上二分；
+                 查询值为 NaN 时：left 给 K（cmp(nan,nan)=0，落在第一个 NaN 处），
+                 right 给 ND（cmp(nan,任意)=+1 且 <=0 判定使其越过所有 NaN）。
+                 表内无 NaN 时 K=ND，两侧与「NaN 最大」的直觉一致。"
+                (declare (type (simple-array ,lt (*)) d v)
+                         (type (simple-array (signed-byte 64) (*)) out)
+                         (type fixnum nd nv))
+                (let ((k nd))
+                  (declare (type fixnum k))
+                  ;; 收缩到非 NaN 前缀（整型表里 (floatp w) 恒假，编译器会消掉）
+                  (loop while (and (plusp k)
+                                   (let ((w (aref d (1- k))))
+                                     (and (floatp w) (%nan-p w))))
+                        do (decf k))
+                  (if right-p
+                      (dotimes (i nv)
+                        (declare (type fixnum i))
+                        (let ((val (aref v i)) (lo 0) (hi k))
+                          (declare (type fixnum lo hi) (type ,lt val))
+                          (if (and (floatp val) (%nan-p val))
+                              (setf (aref out i) nd)
+                              (progn
+                                (loop while (< lo hi) do
+                                  (let ((mid (the fixnum (ash (+ lo hi) -1))))
+                                    (declare (type fixnum mid))
+                                    (if (> (aref d mid) val)
+                                        (setf hi mid)
+                                        (setf lo (the fixnum (1+ mid))))))
+                                (setf (aref out i) lo)))))
+                      (dotimes (i nv)
+                        (declare (type fixnum i))
+                        (let ((val (aref v i)) (lo 0) (hi k))
+                          (declare (type fixnum lo hi) (type ,lt val))
+                          (if (and (floatp val) (%nan-p val))
+                              ;; left：NaN 查询落在**第一个 NaN** 处（cmp(nan,nan)=0）
+                              (setf (aref out i) k)
+                              (progn
+                                (loop while (< lo hi) do
+                                  (let ((mid (the fixnum (ash (+ lo hi) -1))))
+                                    (declare (type fixnum mid))
+                                    (if (>= (aref d mid) val)
+                                        (setf hi mid)
+                                        (setf lo (the fixnum (1+ mid))))))
+                                (setf (aref out i) lo))))))))))
+  (def-searcher %searchsorted-df double-float)
+  (def-searcher %searchsorted-i64 (signed-byte 64)))
+
 (defun vt-searchsorted (tensor values &key (side :left))
-  "在有序数组中查找插入点。返回形状与 VALUES 相同的 int64 张量（NumPy 语义）。"
-  (let* ((flat (vt-flatten tensor))
-         (data (vt-data flat))
-         (size (vt-size flat))
+  "在有序数组中查找插入点。返回形状与 VALUES 相同的 int64 张量（NumPy 语义）。
+   SIDE 为 :left（默认，返回第一个 >= val 的位置）或 :right（第一个 > val）。
+   v0.4.4 性能修复：改为按元素类型特化的二分内核（原 248ms → 见下）。"
+  (let* ((flat (vt-contiguous (vt-flatten tensor)))
          (val-vt (ensure-vt values))
          (out-shape (vt-shape val-vt))
-         (v-flat (vt-flatten val-vt))
-         (v-data (vt-data v-flat))
-         (v-size (vt-size v-flat))
-         (result (make-array v-size :element-type '(signed-byte 64))))
-    (loop for i from 0 below v-size
-          for val = (aref v-data i)
-          do (let ((lo 0) (hi size))
-               (loop while (< lo hi) do
-                 (let ((mid (ash (+ lo hi) -1)))
-                   (if (if (eq side :right)
-                           (> (aref data mid) val)
-                           (>= (aref data mid) val))
-                       (setf hi mid)
-                       (setf lo (1+ mid)))))
-               (setf (aref result i) lo)))
+         (v-flat (vt-contiguous (vt-flatten val-vt)))
+         (nd (vt-size flat))
+         (nv (vt-size v-flat))
+         (etd (array-element-type (vt-data flat)))
+         (etv (array-element-type (vt-data v-flat)))
+         (result (make-array nv :element-type '(signed-byte 64)))
+         (right (eq side :right)))
+    ;; v0.4.4 逻辑修复：查找表含 NaN 时原先直接崩 —— 原实现没有任何
+    ;; with-float-safe，而 (>= nan val) 会 signal FLOATING-POINT-INVALID-OPERATION
+    ;; （实测 base 版 (vt-searchsorted [1 3 NaN] [2 4]) 必崩，numpy 返回 [1 2]）。
+    ;; 屏蔽陷阱后 IEEE 语义即是 numpy 语义：NaN 与任何数比较都为「无序」，
+    ;; 于是 NaN 落在末尾，插入点等于其下标。
+    (multiple-value-bind (lt d v)
+        (if (and (subtypep etd 'integer) (subtypep etv 'integer))
+            ;; 双整型：保持 int64，避免 >2^53 精度丢失
+            (values '(signed-byte 64)
+                    (%elt-coerce-array flat '(signed-byte 64))
+                    (%elt-coerce-array v-flat '(signed-byte 64)))
+            ;; 任一侧浮点：统一 double-float（与 numpy 提升规则一致）
+            (values 'double-float
+                    (%elt-coerce-array flat 'double-float)
+                    (%elt-coerce-array v-flat 'double-float)))
+      (with-float-safe
+        (if (equal lt 'double-float)
+            (%searchsorted-df d v nd nv result right)
+            (%searchsorted-i64 d v nd nv result right))))
     (%make-vt :data result
               :shape out-shape
               :strides (vt-compute-strides out-shape)

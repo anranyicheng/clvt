@@ -1302,6 +1302,122 @@
           (with-float-safe (%sort-fibers buf n 1))
           (values buf n)))))
 
+;;; ------------------------------------------------------------------
+;;; 间接排序（vt-argsort 的引擎）
+;;;
+;;; v0.4.4 性能修复：vt-argsort 原来把每个 fiber 摊成 (cons 值 . 下标) 的
+;;; **list**，再 (stable-sort list #'< :key #'car)。1M 元素 = 1M 个 cons +
+;;; 指针追逐式归并，实测 146ms（numpy.argsort 19.7ms，差 7.4 倍）。
+;;;
+;;; 改为「值拷贝到专用数组 + 下标数组间接归并」：
+;;;   · 比较走 (aref vals (aref idx j))，值数组有元素类型声明 → 标量比较；
+;;;   · NaN 先用一趟 O(n) **稳定分区**挪到末尾，于是比较器里只剩一条 <
+;;;     （否则每次比较都要两次 FLOATP + 两次 (not (= x x))，成本翻倍）；
+;;;   · 长度 ≤ 32 用插入排序，免去 scratch 分配（沿轴 argsort 的 fiber
+;;;     经常只有几十个元素）。
+;;; 语义与旧实现逐位一致：升序、稳定、NaN 压下且保持原相对顺序。
+;;; ------------------------------------------------------------------
+(macrolet ((def-argsorter (name lt)
+             `(progn
+                (defun ,name (vals idx n)
+                  "对 IDX[0,N) 按 VALS 升序稳定排序（间接归并，就地改 IDX）。"
+                  (declare (type (simple-array ,lt (*)) vals)
+                           (type (simple-array (signed-byte 64) (*)) idx)
+                           (type fixnum n))
+                  (cond
+                    ((<= n 1) nil)
+                    ((<= n 32)
+                     ;; ---- 插入排序（小 fiber）----
+                     (dotimes (ii (1- n))
+                       (let* ((i (1+ ii))
+                              (x (aref idx i))
+                              (xv (aref vals x))
+                              (j (1- i)))
+                         (declare (type fixnum i j) (type ,lt xv))
+                         (loop while (and (>= j 0)
+                                          (< xv (aref vals (aref idx j))))
+                               do (setf (aref idx (1+ j)) (aref idx j))
+                                  (decf j))
+                         (setf (aref idx (1+ j)) x))))
+                    (t
+                     ;; ---- 自底向上稳定归并 ----
+                     (let ((aux (make-array n :element-type '(signed-byte 64)))
+                           (w 1))
+                       (declare (type (simple-array (signed-byte 64) (*)) aux)
+                                (type fixnum w))
+                       (loop while (< w n) do
+                         (let ((lo 0))
+                           (declare (type fixnum lo))
+                           (loop while (< lo n) do
+                             (let* ((mid (min (+ lo w) n))
+                                    (hi (min (+ lo w w) n))
+                                    (i lo) (j mid) (k lo))
+                               (declare (type fixnum mid hi i j k))
+                               (loop while (and (< i mid) (< j hi)) do
+                                 (if (< (aref vals (aref idx j))
+                                        (aref vals (aref idx i)))
+                                     (progn (setf (aref aux k) (aref idx j))
+                                            (incf j))
+                                     (progn (setf (aref aux k) (aref idx i))
+                                            (incf i)))
+                                 (incf k))
+                               (loop while (< i mid) do
+                                 (setf (aref aux k) (aref idx i))
+                                 (incf i) (incf k))
+                               (loop while (< j hi) do
+                                 (setf (aref aux k) (aref idx j))
+                                 (incf j) (incf k))
+                               (replace idx aux :start1 lo :end1 hi
+                                            :start2 lo :end2 hi))
+                             (incf lo (* 2 w))))
+                         (setf w (* 2 w))))))))))
+  (def-argsorter %argsort-idx-df double-float)
+  (def-argsorter %argsort-idx-sf single-float)
+  (def-argsorter %argsort-idx-i64 (signed-byte 64))
+  (def-argsorter %argsort-idx-i32 (signed-byte 32)))
+
+(defun %argsort-dispatch (vals idx n)
+  "按 VALS 的元素类型分派间接排序；不支持的类型返回 NIL。"
+  (declare (type fixnum n))
+  (let ((et (array-element-type vals)))
+    (cond ((equal et 'double-float)     (%argsort-idx-df vals idx n) t)
+          ((equal et 'single-float)     (%argsort-idx-sf vals idx n) t)
+          ((equal et '(signed-byte 64)) (%argsort-idx-i64 vals idx n) t)
+          ((equal et '(signed-byte 32)) (%argsort-idx-i32 vals idx n) t)
+          (t nil))))
+
+(defun %argsort-fiber (data base stride n)
+  "对 DATA 中从 BASE 起、步长 STRIDE、长度 N 的 fiber 求升序下标数组
+   （int64，**相对 fiber 起点**；NaN 稳定压末尾）。
+   元素类型不在支持集内时返回 NIL，调用方据此回退通用 list 路径。"
+  (declare (type fixnum base stride n))
+  (let ((et (array-element-type data)))
+    (unless (%sortable-element-type-p et)
+      (return-from %argsort-fiber nil))
+    (let ((vals (make-array n :element-type et))
+          (idx  (make-array n :element-type '(signed-byte 64)))
+          (nans (make-array n :element-type '(signed-byte 64)))
+          (m 0) (tc 0))
+      (declare (type fixnum m tc))
+      (with-float-safe
+        (if (= stride 1)
+            (replace vals data :start2 base :end2 (the fixnum (+ base n)))
+            (dotimes (i n)
+              (declare (type fixnum i))
+              (setf (aref vals i) (aref data (the fixnum (+ base (* i stride)))))))
+        ;; 稳定分区：非 NaN 保序进 IDX 前缀，NaN 下标顺序收集到 NANS
+        (dotimes (i n)
+          (declare (type fixnum i))
+          (let ((v (aref vals i)))
+            (if (and (floatp v) (%nan-p v))
+                (progn (setf (aref nans tc) i) (incf tc))
+                (progn (setf (aref idx m) i) (incf m)))))
+        (when (> m 1)
+          (%argsort-dispatch vals idx m))
+        (when (plusp tc)
+          (replace idx nans :start1 m :start2 0 :end2 tc)))
+      idx)))
+
 (defun %sorted-has-nan-p (seq n)
   "升序序列的末尾是 NaN ⇔ 序列中存在 NaN。"
   (and (plusp n)
@@ -1638,19 +1754,31 @@
   "返回升序排序后的下标（对标 numpy.argsort）。AXIS 缺省 -1。"
   (with-float-safe
     (if (null axis)
-        (let* ((flat (vt-ravel tensor))
-               (n (vt-size flat))
-               (in-data (vt-data flat))
-               (pairs (loop for i from 0 below n
-                            collect (cons (aref in-data i) i)))
-               (non-nans '())
-               (nans '()))
-          (dolist (p pairs) (if (%nan-p (car p)) (push p nans) (push p non-nans)))
-          (setf non-nans (stable-sort (nreverse non-nans) #'< :key #'car)
-                nans (nreverse nans))
-          (%make-vt :data (make-array n :element-type '(signed-byte 64)
-                                        :initial-contents (mapcar #'cdr (append non-nans nans)))
-                    :shape (list n) :strides '(1) :offset 0 :dtype :int64))
+        (let* ;; v0.4.4：改用 vt-contiguous 而不是 vt-ravel —— vt-ravel 对
+              ;; 连续输入返回**保留原 offset** 的视图，而旧代码直接
+              ;; (aref in-data i) 从 0 开始读，于是带 offset 的切片会静默
+              ;; 返回错误下标（实测 (vt-argsort (slice [100 200 300 5 1 9] 3..6)
+              ;; :axis nil) 返回 (0 1 2)，numpy 是 (1 0 2)）。
+              ;; vt-contiguous 保证 offset=0、stride=1。
+              ((c (vt-contiguous (vt-flatten tensor)))
+               (n (vt-size c))
+               (idx (and (plusp n) (%argsort-fiber (vt-data c) 0 1 n))))
+          (if idx
+              (%make-vt :data idx :shape (list n) :strides '(1)
+                        :offset 0 :dtype :int64)
+              ;; ---- 回退：元素类型不在内核支持集内，走原 list 路径 ----
+              (let* ((in-data (vt-data c))
+                     (pairs (loop for i from 0 below n
+                                  collect (cons (aref in-data i) i)))
+                     (non-nans '())
+                     (nans '()))
+                (dolist (p pairs) (if (%nan-p (car p)) (push p nans) (push p non-nans)))
+                (setf non-nans (stable-sort (nreverse non-nans) #'< :key #'car)
+                      nans (nreverse nans))
+                (%make-vt :data (make-array n :element-type '(signed-byte 64)
+                                              :initial-contents
+                                              (mapcar #'cdr (append non-nans nans)))
+                          :shape (list n) :strides '(1) :offset 0 :dtype :int64))))
         (let* ((shape (vt-shape tensor))
                (rank (length shape))
                (ax (vt-normalize-axis axis rank))
@@ -1689,19 +1817,30 @@
                                     do (multiple-value-bind (q r) (floor rem dim)
                                          (incf extra-in (* r is))
                                          (incf extra-out (* r os)) (setf rem q)))
-                              (let ((pairs (loop for pos from 0 below ax-dim
-                                                 for off = (+ in-ptr (* pos in-stride) extra-in)
-                                                 collect (cons (aref in-data off) pos)))
-                                    (non-nans '()) (nans '()))
-                                (dolist (p pairs)
-                                  (if (%nan-p (car p))
-                                      (push p nans)
-                                      (push p non-nans)))
-                                (setf non-nans (stable-sort (nreverse non-nans) #'< :key #'car)
-                                      nans (nreverse nans))
-                                (loop for (val . pos) in (append non-nans nans)
-                                      for off = out-ptr then (+ off out-stride)
-                                      do (setf (aref out-data (+ off extra-out)) pos)))))))
+                              ;; v0.4.4：fiber 下标排序走间接归并内核
+                              ;; （原为 per-fiber 的 cons list + stable-sort）
+                              (let ((idx (and (plusp ax-dim)
+                                              (%argsort-fiber in-data
+                                                              (+ in-ptr extra-in)
+                                                              in-stride ax-dim))))
+                                (if idx
+                                    (loop for pos across idx
+                                          for off = out-ptr then (+ off out-stride)
+                                          do (setf (aref out-data (+ off extra-out)) pos))
+                                    ;; ---- 回退：原 list 路径 ----
+                                    (let ((pairs (loop for pos from 0 below ax-dim
+                                                       for off = (+ in-ptr (* pos in-stride) extra-in)
+                                                       collect (cons (aref in-data off) pos)))
+                                          (non-nans '()) (nans '()))
+                                      (dolist (p pairs)
+                                        (if (%nan-p (car p))
+                                            (push p nans)
+                                            (push p non-nans)))
+                                      (setf non-nans (stable-sort (nreverse non-nans) #'< :key #'car)
+                                            nans (nreverse nans))
+                                      (loop for (val . pos) in (append non-nans nans)
+                                            for off = out-ptr then (+ off out-stride)
+                                            do (setf (aref out-data (+ off extra-out)) pos)))))))))
                        (t nil))))
             (recurse 0 in-offset 0))
           result))))
