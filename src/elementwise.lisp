@@ -541,16 +541,24 @@ lambda 算子请使用 %%float-map-fn"))
       :out 契约同 vt-+。"
   (vt-fast-map #'abs vt :out out :dtype dtype))
 
+(declaim (inline %sign1))
+(defun %sign1 (x)
+  "符号函数：-1/0/+1，NaN 传播，浮点零一律返回 +0.0（对标 numpy.sign）。
+   浮点分支用 (float 1 x) 而非字面 1.0d0 —— 后者写进 single-float 数组
+   会触发 specialized-array 类型错误。"
+  (cond ((%nan-p x) x)
+        ((zerop x)    (if (floatp x) (float 0.0 x) 0))
+        ((plusp x)    (if (floatp x) (float 1 x) 1))
+        (t            (if (floatp x) (float -1 x) -1))))
+
 (defun vt-signum (vt &key out dtype)
   "逐元素符号函数（-1 / 0 / +1）。整数保持整数 dtype，
       NaN 原样传播。:out 契约同 vt-+。
       v0.4.x 修复：signum(-0.0) 原 CL 语义返回 -0.0，现对浮点零
-      统一返回 +0.0（对标 numpy.sign：sign(-0.0)=0.0）。"
-  (vt-map (lambda (x)
-            (cond ((%nan-p x) x)
-                  ((and (floatp x) (zerop x)) 0.0d0)
-                  (t (signum x))))
-          vt :out out :dtype dtype))
+      统一返回 +0.0（对标 numpy.sign：sign(-0.0)=0.0）。
+      v0.4.3：改用内联字面算子 %sign1（原匿名 lambda 让 vt-map 退回
+      funcall + 泛型 aref，1M 元素 69ms）。"
+  (vt-fast-map #'%sign1 vt :out out :dtype dtype))
 
 (defun vt-positive-p (vt &key out (dtype :int8))
   "逐元素正数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
@@ -728,33 +736,74 @@ lambda 算子请使用 %%float-map-fn"))
                  (float res ,x))
              res))))
 
+;;; ------------------------------------------------------------------
+;;; 取整族的 DIVISOR=1 特化（v0.4.3 性能修复）
+;;;
+;;; 原实现四个函数统一写成
+;;;     (vt-map (lambda (x) (%floor-family-body x op)) vt ...)
+;;; 闭包会让 vt-fast-map 的算子内联**彻底失效** —— 该宏只认 #'symbol
+;;; 形式字面算子，遇到 (lambda ...) 直接 `(apply #'vt-map ...)` 回退，
+;;; 于是循环里既没有数组元素类型声明、又是逐元素 funcall，还要为每个
+;;; 元素求值一次 (%nan-or-inf-p ...)。实测 1M 元素 69ms，而同类的一元
+;;; 逐元素 vt-abs（用 #'abs 走内联）只要 1.7ms —— 差 40 倍；
+;;; numpy.floor 是 0.19ms，差 370 倍。
+;;;
+;;; 改法：把 DIVISOR=1（默认值，也是 numpy 唯一存在的形态）固化成
+;;; 单参**命名**函数，交给 vt-fast-map 内联进元素类型循环；DIVISOR≠1
+;;; 是本库扩展（numpy 无对应物），仍走原闭包路径，语义逐位不变。
+;;; ------------------------------------------------------------------
+(defmacro %floor-family-body1 (x op)
+  "DIVISOR 恒为 1 时 %floor-family-body 的等价展开（供内联快路径使用）。"
+  `(if (and (floatp ,x) (%nan-or-inf-p ,x))
+       ,x
+       (let ((res (nth-value 0 (,op ,x))))
+         (if (floatp ,x)
+             (if (and (zerop res) (minusp (float-sign ,x)))
+                 (- (float 0.0 ,x))
+                 (float res ,x))
+             res))))
+
+(declaim (inline %floor1 %ceiling1 %round1 %truncate1))
+(defun %floor1 (x)    (%floor-family-body1 x floor))
+(defun %ceiling1 (x)  (%floor-family-body1 x ceiling))
+(defun %round1 (x)    (%floor-family-body1 x round))
+(defun %truncate1 (x) (%floor-family-body1 x truncate))
+
 (defun vt-floor (vt &key (divisor 1) out dtype)
   "逐元素向下取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.floor）；整数输入保持整数 dtype。
       :out 契约同 vt-+。"
-  (vt-map (lambda (x) (%floor-family-body x floor))
-          vt :out out :dtype dtype))
+  (if (eql divisor 1)
+      (vt-fast-map #'%floor1 vt :out out :dtype dtype)
+      (vt-map (lambda (x) (%floor-family-body x floor))
+              vt :out out :dtype dtype)))
 
 (defun vt-ceiling (vt &key (divisor 1) out dtype)
   "逐元素向上取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.ceil）；整数输入保持整数 dtype。
       :out 契约同 vt-+。"
-  (vt-map (lambda (x) (%floor-family-body x ceiling))
-          vt :out out :dtype dtype))
+  (if (eql divisor 1)
+      (vt-fast-map #'%ceiling1 vt :out out :dtype dtype)
+      (vt-map (lambda (x) (%floor-family-body x ceiling))
+              vt :out out :dtype dtype)))
 
 (defun vt-round (vt &key (divisor 1) out dtype)
   "逐元素四舍五入取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.round）；整数输入保持整数 dtype。
       注意：舍入策略为「最近偶数」，与 CL round 一致。"
-  (vt-map (lambda (x) (%floor-family-body x round))
-          vt :out out :dtype dtype))
+  (if (eql divisor 1)
+      (vt-fast-map #'%round1 vt :out out :dtype dtype)
+      (vt-map (lambda (x) (%floor-family-body x round))
+              vt :out out :dtype dtype)))
 
 (defun vt-truncate (vt &key (divisor 1) out dtype)
   "逐元素向零取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.trunc）；整数输入保持整数 dtype。
       :out 契约同 vt-+。"
-  (vt-map (lambda (x) (%floor-family-body x truncate))
-          vt :out out :dtype dtype))
+  (if (eql divisor 1)
+      (vt-fast-map #'%truncate1 vt :out out :dtype dtype)
+      (vt-map (lambda (x) (%floor-family-body x truncate))
+              vt :out out :dtype dtype)))
 
 (defun vt-rint (vt &key out dtype)
   "逐元素取整到最近偶数（对标 numpy.rint）。
@@ -1019,26 +1068,52 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
                     (t (* (signum x) (expt (abs x) third)))))
             vt :out out :dtype dt)))
 
+;;; v0.4.3 性能修复：vt-hypot / vt-lerp / vt-cbrt 等原本一律写成
+;;;     (vt-map (lambda (a b) ...) ...)
+;;; 闭包让 vt-fast-map 的算子内联失效（该宏只认 #'symbol 形式），循环里
+;;; 既无数组元素类型声明、又是逐元素 funcall —— hypot 1M 元素实测 100ms
+;;; （numpy 5.9ms，差 17 倍）。改成命名算子 + 按 dtype 分派即可内联。
+(declaim (inline %hypot-df %hypot-sf))
+(defun %hypot-df (a b)
+  "hypot 的 double-float 内核。"
+  (let ((abs-a (abs a)) (abs-b (abs b)))
+    (cond ((or (%inf-p abs-a) (%inf-p abs-b))
+           ;; NumPy hypot：任一参数 ±Inf → +Inf（即便另一参数为 NaN）
+           (vt-get-pos-inf :float64))
+          ((%nan-p abs-a) abs-a)
+          ((%nan-p abs-b) abs-b)
+          ((zerop abs-a) abs-b)
+          ((zerop abs-b) abs-a)
+          (t (let* ((mx (max abs-a abs-b))
+                    (mn (min abs-a abs-b))
+                    (r  (/ mn mx)))
+               (* mx (sqrt (+ 1.0d0 (* r r)))))))))
+
+(defun %hypot-sf (a b)
+  "hypot 的 single-float 内核（常量与结果都保持 single，避免写入
+   specialized-array 时的类型错误）。"
+  (let ((abs-a (abs a)) (abs-b (abs b)))
+    (cond ((or (%inf-p abs-a) (%inf-p abs-b))
+           (vt-get-pos-inf :float32))
+          ((%nan-p abs-a) abs-a)
+          ((%nan-p abs-b) abs-b)
+          ((zerop abs-a) abs-b)
+          ((zerop abs-b) abs-a)
+          (t (let* ((mx (max abs-a abs-b))
+                    (mn (min abs-a abs-b))
+                    (r  (/ mn mx)))
+               (* mx (sqrt (+ 1.0s0 (* r r)))))))))
+
 (defun vt-hypot (t1 t2 &key out dtype)
   "逐元素直角三角斜边 sqrt(x² + y²)（对标 numpy.hypot）。任一输入为 ±Inf → 结果 +Inf；NaN 传播。"
-  (let* ((dt (or dtype (if (or (eq (vt-dtype (ensure-vt t1)) :float32)
-                               (eq (vt-dtype (ensure-vt t2)) :float32))
-                           :float32 :float64)))
-         (one (if (eq dt :float32) 1.0s0 1.0d0)))
-    (vt-map (lambda (a b)
-              (let ((abs-a (abs a)) (abs-b (abs b)))
-                (cond ((or (%inf-p abs-a) (%inf-p abs-b))
-                       ;; NumPy hypot：任一参数 ±Inf → +Inf（即便另一参数为 NaN）
-                       (vt-get-pos-inf dt))
-                      ((%nan-p abs-a) abs-a)
-                      ((%nan-p abs-b) abs-b)
-                      ((zerop abs-a) abs-b)
-                      ((zerop abs-b) abs-a)
-                      (t (let* ((mx (max abs-a abs-b))
-                                (mn (min abs-a abs-b))
-                                (r  (/ mn mx)))
-                           (* mx (sqrt (+ one (* r r)))))))))
-            (ensure-vt t1) (ensure-vt t2) :out out :dtype dt)))
+  (let* ((v1 (ensure-vt t1))
+         (v2 (ensure-vt t2))
+         (dt (or dtype (if (or (eq (vt-dtype v1) :float32)
+                               (eq (vt-dtype v2) :float32))
+                           :float32 :float64))))
+    (if (eq dt :float32)
+        (vt-fast-map #'%hypot-sf v1 v2 :out out :dtype dt)
+        (vt-fast-map #'%hypot-df v1 v2 :out out :dtype dt))))
 
 (defun vt-reciprocal (vt &key out dtype)
   "逐元素倒数 (1/x)。

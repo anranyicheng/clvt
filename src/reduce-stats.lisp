@@ -1151,255 +1151,10 @@
 ;;; ------------------------------------------------------------------
 ;;; 中位数 / 百分位 / 直方图
 ;;; ------------------------------------------------------------------
-(defun vt-median (tensor &key axis keepdims)
-  "中位数（对标 numpy.median）。偶数个元素取中间两数平均。"
-  (with-float-safe
-    (if axis
-        ;; ---- 轴归约 ----
-        (let* ((shape (vt-shape tensor))
-               (rank (length shape))
-               (ax (vt-normalize-axis axis rank))
-               (out-shape (if keepdims
-                              (loop for d in shape for i from 0
-                                    collect (if (= i ax) 1 d))
-                              (loop for d in shape for i from 0
-                                    unless (= i ax) collect d)))
-               (result (vt-zeros out-shape :dtype :float64))
-               (out-strides (vt-strides result)))
-          (vt-do-each (ptr val result)
-            (declare (ignore val))
-            (let* ((out-idx (vt-unravel-index ptr out-shape out-strides))
-                   (specs
-                     (loop for i from 0 below rank
-                           for out-i = (cond ((= i ax) nil)
-                                             (keepdims i)
-                                             ((< i ax) i)
-                                             (t (1- i)))
-                           collect (if (null out-i)
-                                       '(:all)
-                                       (list (nth out-i out-idx)))))
-                   (fiber (apply #'vt-slice tensor specs))
-                   (fs (vt-size fiber)))
-              (setf (aref (vt-data result) ptr)
-                    (if (zerop fs)
-                        (vt-get-nan :float64)
-                        (let ((vals (loop for i below fs collect (vt-ref fiber i))))
-                          (if (some #'%nan-p vals)
-                              (vt-get-nan :float64)
-                              (let ((sv (vt-numpy-sort vals #'<)))
-                                (if (oddp fs)
-                                    (vt-cast (nth (floor fs 2) sv) :float64)
-                                    (/ (+ (vt-cast (nth (1- (floor fs 2)) sv) :float64)
-                                          (vt-cast (nth (floor fs 2) sv) :float64))
-                                       2.0d0)))))))))
-          result)
-        ;; ---- 全局归约 ----
-        (let* ((in-shape (vt-shape tensor))
-               (rank (length in-shape))
-               (flat (vt-flatten tensor))
-               (size (vt-size flat))
-               (out-shape (if keepdims
-                              (make-list rank :initial-element 1)
-                              nil)))
-          (if (zerop size)
-              (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
-              (let ((vals (loop for i below size collect (aref (vt-data flat) i))))
-                (if (some #'%nan-p vals)
-                    (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
-                    (let ((sv (vt-numpy-sort vals #'<)))
-                      (if (oddp size)
-                          (make-vt out-shape
-                                   (vt-cast (nth (floor size 2) sv) :float64)
-                                   :dtype :float64)
-                          (make-vt out-shape
-                                   (/ (+ (vt-cast (nth (1- (floor size 2)) sv) :float64)
-                                         (vt-cast (nth (floor size 2) sv) :float64))
-                                      2.0d0)
-                                   :dtype :float64))))))))))
-
-(defun %percent-from-sorted (sorted q interpolation)
-  (let* ((n (length sorted))
-         (idx (* q (1- n)))
-         (lower (floor idx))
-         (upper (min (ceiling idx) (1- n)))
-         (frac (- idx lower)))
-    (case interpolation
-      (:linear (if (= lower upper) (vt-cast (nth lower sorted) :float64)
-                   (+ (* (- 1 frac) (vt-cast (nth lower sorted) :float64))
-                      (* frac (vt-cast (nth upper sorted) :float64)))))
-      (:lower (vt-cast (nth lower sorted) :float64))
-      (:higher (vt-cast (nth upper sorted) :float64))
-      (:midpoint (/ (+ (vt-cast (nth lower sorted) :float64)
-                       (vt-cast (nth upper sorted) :float64))
-                    2.0d0))
-      (:nearest (vt-cast (nth (if (<= frac 0.5d0) lower upper) sorted) :float64)))))
-
-(defun vt-percentile (tensor percentile &key axis keepdims (interpolation :linear))
-  "计算百分位数（对标 numpy.percentile）。
-   PERCENTILE 必须在 [0, 100] 内：
-     - 0   → 最小值
-     - 50  → 中位数
-     - 100 → 最大值
-     越界（<0 或 >100）报错；NaN 亦报错（NaN 不满足 <= 比较）。
-   INTERPOLATION 取值：:linear / :lower / :higher / :midpoint / :nearest，
-     对标 numpy.percentile 的 interpolation 参数。默认 :linear。
-   KEEPDIMS = t 时，轴归约保留归约轴为 1，全局归约返回 (1 1 ... 1)，
-     与 numpy 的 keepdims=True 一致。
-   返回：0 维张量（当 axis=nil 且 keepdims=nil）、形状 (1 1 ... 1)
-         的张量（当 axis=nil 且 keepdims=t）、或降维后的张量。"
-  (with-float-safe
-    (unless (realp percentile)
-      (error "vt-percentile: percentile 必须为实数，得到 ~a (type ~a)"
-             percentile (type-of percentile)))
-    (unless (<= 0 percentile 100)
-      (error "vt-percentile: percentile 必须在 [0, 100] 内，得到 ~a"
-             percentile))
-    (unless (member interpolation '(:linear :lower :higher :midpoint :nearest))
-      (error "vt-percentile: interpolation 必须是 :linear/:lower/:higher/:midpoint/:nearest 之一，得到 ~a"
-             interpolation))
-    (let ((q (/ percentile 100.0d0)))
-      (if axis
-          ;; ---- 轴归约 ----
-          (let* ((shape (vt-shape tensor))
-                 (rank (length shape))
-                 (ax (vt-normalize-axis axis rank))
-                 (out-shape (if keepdims
-                                (loop for d in shape for i from 0
-                                      collect (if (= i ax) 1 d))
-                                (loop for d in shape for i from 0
-                                      unless (= i ax) collect d)))
-                 (result (vt-zeros out-shape :dtype :float64))
-                 (out-strides (vt-strides result)))
-            (vt-do-each (ptr val result)
-              (declare (ignore val))
-              (let* ((out-idx (vt-unravel-index ptr out-shape out-strides))
-                     (specs
-                       (loop for i from 0 below rank
-                             for out-i = (cond ((= i ax) nil)
-                                               (keepdims i)
-                                               ((< i ax) i)
-                                               (t (1- i)))
-                             collect (if (null out-i)
-                                         '(:all)
-                                         (list (nth out-i out-idx)))))
-                     (fiber (apply #'vt-slice tensor specs))
-                     (fs (vt-size fiber)))
-                (setf (aref (vt-data result) ptr)
-                      (if (zerop fs)
-                          ;; v0.4.x：归约区为空 → numpy ValueError 语义
-                          (error "vt-percentile: zero-size array to reduction operation percentile which has no identity（numpy 语义）")
-                          (let ((raw (loop for i below fs collect (vt-ref fiber i))))
-                            (if (some #'%nan-p raw)
-                                (vt-get-nan :float64)
-                                (%percent-from-sorted
-                                 (vt-numpy-sort raw #'<) q interpolation)))))))
-            result)
-          ;; ---- 全局归约 ----
-          (let* ((in-shape (vt-shape tensor))
-                 (rank (length in-shape))
-                 (flat (vt-flatten tensor))
-                 (size (vt-size flat))
-                 (out-shape (if keepdims
-                                (make-list rank :initial-element 1)
-                                nil)))
-            (if (zerop size)
-                ;; v0.4.x：numpy 对空数组 percentile 抛 ValueError
-                ;; （zero-size array to reduction operation percentile
-                ;;   which has no identity），不再返回 NaN。
-                (error "vt-percentile: zero-size array to reduction operation percentile which has no identity（numpy 语义）")
-                (let ((raw (loop for i below size collect (aref (vt-data flat) i))))
-                  (if (some #'%nan-p raw)
-                      (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
-                      (make-vt out-shape
-                               (%percent-from-sorted
-                                (vt-numpy-sort raw #'<) q interpolation)
-                               :dtype :float64)))))))))
-
-(defun vt-quantile (tensor q &key axis keepdims (interpolation :linear))
-  "计算分位数（对标 numpy.quantile）。
-   Q 必须在 [0, 1] 内：
-     - 0.0  → 最小值
-     - 0.5  → 中位数
-     - 1.0  → 最大值
-     越界（<0 或 >1）报错；NaN 亦报错（NaN 不满足 <= 比较）。
-   等价于 (vt-percentile tensor (* q 100) ...)。
-   INTERPOLATION 含义见 vt-percentile；KEEPDIMS 语义见 vt-percentile。"
-  (unless (realp q)
-    (error "vt-quantile: q 必须为实数，得到 ~a (type ~a)"
-           q (type-of q)))
-  (unless (<= 0 q 1)
-    (error "vt-quantile: q 必须在 [0, 1] 内，得到 ~a" q))
-  (vt-percentile tensor (* q 100)
-                 :axis axis
-                 :keepdims keepdims
-                 :interpolation interpolation))
-
-(defun vt-ptp (tensor &key axis)
-  "峰谷差 max - min（对标 numpy.ptp）。"
-  (if axis (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
-      (- (vt-item (vt-amax tensor)) (vt-item (vt-amin tensor)))))
-
-(defun vt-histogram (tensor &key bins range density)
-  "直方图统计（对标 numpy.histogram）。返回 (values counts edges)。"
-  (with-float-safe
-    (let* ((flat (vt-flatten tensor))
-           (data (vt-data flat))
-           (size (vt-size flat))
-           (bins (or bins 10))
-           (data-min nil)
-           (data-max nil))
-      (unless (and (integerp bins) (plusp bins))
-        (error "vt-histogram: bins (~a) 必须为正整数" bins))
-
-      (if range
-          (progn
-            (unless (and (listp range) (= (length range) 2))
-              (error "vt-histogram: range 必须是 (min max) 二元列表，得到 ~a"
-                     range))
-            (setf data-min (first range)
-                  data-max (second range))
-            (unless (< data-min data-max)
-              (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
-                     data-max data-min)))
-          (progn
-            (unless (= (vt-item (vt-all (vt-isfinite tensor))) 1.0d0)
-              (error "自动确定 bin 范围需要有限输入"))
-            (setf data-min (vt-item (vt-amin tensor))
-                  data-max (vt-item (vt-amax tensor)))
-            (when (= data-min data-max)
-              (setf data-min (- data-min 0.5)
-                    data-max (+ data-max 0.5)))))
-      (let* ((bin-width (/ (- data-max data-min) bins))
-             (hist (make-array bins :initial-element 0))
-             (edges (make-array (1+ bins) :element-type t)))
-        (loop for i from 0 to bins do
-          (setf (aref edges i) (+ data-min (* i bin-width))))
-        (loop for i from 0 below size
-              for val = (aref data i)
-              when (and (>= val data-min) (<= val data-max))
-                do (let ((bi (if (= val data-max)
-                                 (1- bins)
-                                 (floor (- val data-min) bin-width))))
-                     (incf (aref hist bi))))
-        (when density
-          (let ((total (reduce #'+ hist)))
-            (if (zerop total)
-                (loop for i from 0 below bins do
-                  (setf (aref hist i) 0.0d0))
-                (loop for i from 0 below bins do
-                  (setf (aref hist i)
-                        (/ (aref hist i)
-                           (* total bin-width)))))))
-        (values (vt-from-sequence hist
-                                  ;; 对标 numpy：counts 为整数（int64）；
-                                  ;; density=t 时为归一化密度（float64）。
-                                  :dtype (if density :float64 :int64))
-                (vt-from-sequence edges :dtype :float64))))))
-
 ;;; ------------------------------------------------------------------
-;;; 排序
+;;; 连续 fiber 的原地升序排序内核（vt-sort / vt-median / vt-percentile 共用）
+;;; 定义位置提前到 vt-median 之前，避免调用方前向引用产生编译告警。
 ;;; ------------------------------------------------------------------
-
 ;;; ------------------------------------------------------------------
 ;;; 连续 fiber 的原地升序排序（vt-sort 快路径的引擎）
 ;;;
@@ -1505,6 +1260,305 @@
           ((equal et '(signed-byte 64)) (%sort-fibers-i64 data n count) t)
           ((equal et '(signed-byte 32)) (%sort-fibers-i32 data n count) t)
           (t nil))))
+
+
+;;; ------------------------------------------------------------------
+;;; 顺序统计量的公共取数层（median / percentile / quantile / nanmedian 共用）
+;;;
+;;; v0.4.3 性能修复：这四个函数原来统一
+;;;     (loop for i below n collect (aref data i))   → list
+;;;     (vt-numpy-sort list #'<)
+;;; 而 vt-numpy-sort 内部又 (coerce sequence 'list)，然后按 NaN 拆两个 list、
+;;; append、stable-sort —— 1M 元素要 cons 两遍、再做指针追逐式归并。
+;;; 实测 median 773ms / percentile 709ms / nanmedian 644ms
+;;; （numpy 分别 10.0ms / 12.3ms / 10.2ms，差 60–77 倍）。
+;;;
+;;; 改用「专用数组 + %sort-fibers」：一次 replace + 原地稳定归并，零 cons，
+;;; 之后按下标直接取顺序统计量。元素类型不在支持集内时仍回退 list 路径
+;;; （语义完全相同）。
+;;;
+;;; 顺序保证：升序，NaN 稳定压到末尾 —— 因此「末尾元素是 NaN」⇔「存在
+;;; NaN」，检查一个元素即可判定，无需再 O(n) 扫一遍。
+;;; ------------------------------------------------------------------
+
+(defun %sortable-element-type-p (et)
+  (member et '(double-float single-float (signed-byte 64) (signed-byte 32))
+          :test #'equal))
+
+(defun %sorted-values (tensor)
+  "把 TENSOR 的全部元素升序排序（NaN 在末尾）并返回 (values SEQ N)。
+   SEQ 为专用数组（快路径）或 list（兜底），二者都支持 ELT / LENGTH。"
+  (let* ((c (vt-contiguous (vt-flatten tensor)))
+         (n (vt-size c))
+         (et (array-element-type (vt-data c))))
+    (if (or (zerop n) (not (%sortable-element-type-p et)))
+        (with-float-safe
+          (values (if (zerop n)
+                      '()
+                      (vt-numpy-sort (coerce (vt-data c) 'list) #'<))
+                  n))
+        (let ((buf (make-array n :element-type et)))
+          (replace buf (vt-data c))
+          (with-float-safe (%sort-fibers buf n 1))
+          (values buf n)))))
+
+(defun %sorted-has-nan-p (seq n)
+  "升序序列的末尾是 NaN ⇔ 序列中存在 NaN。"
+  (and (plusp n)
+       (let ((w (elt seq (1- n))))
+         (and (floatp w) (%nan-p w)))))
+
+(defun vt-median (tensor &key axis keepdims)
+  "中位数（对标 numpy.median）。偶数个元素取中间两数平均。"
+  (with-float-safe
+    (let ((nanv (vt-get-nan :float64)))
+      (if axis
+          ;; ---------------- 轴归约 ----------------
+          (let* ((shape (vt-shape tensor))
+                 (rank (length shape))
+                 (ax (vt-normalize-axis axis rank))
+                 (out-shape (if keepdims
+                                (loop for d in shape for i from 0
+                                      collect (if (= i ax) 1 d))
+                                (loop for d in shape for i from 0
+                                      unless (= i ax) collect d)))
+                 (result (vt-zeros out-shape :dtype :float64))
+                 (out-strides (vt-strides result)))
+            (vt-do-each (ptr val result)
+              (declare (ignore val))
+              (let* ((out-idx (vt-unravel-index ptr out-shape out-strides))
+                     (specs
+                       (loop for i from 0 below rank
+                             for out-i = (cond ((= i ax) nil)
+                                               (keepdims i)
+                                               ((< i ax) i)
+                                               (t (1- i)))
+                             collect (if (null out-i)
+                                         '(:all)
+                                         (list (nth out-i out-idx)))))
+                     (fiber (apply #'vt-slice tensor specs))
+                     (fs (vt-size fiber)))
+                (setf (aref (vt-data result) ptr)
+                      (if (zerop fs)
+                          nanv
+                          ;; v0.4.3：fiber 排序改走专用数组内核（原为 list 化 +
+                          ;; vt-numpy-sort，1000×1000 沿轴归约实测 225ms）
+                          (multiple-value-bind (sv n) (%sorted-values fiber)
+                            (if (%sorted-has-nan-p sv n)
+                                nanv
+                                (if (oddp n)
+                                    (vt-cast (elt sv (floor n 2)) :float64)
+                                    (/ (+ (vt-cast (elt sv (1- (floor n 2))) :float64)
+                                          (vt-cast (elt sv (floor n 2)) :float64))
+                                       2.0d0))))))))
+            result)
+          ;; ---------------- 全局归约 ----------------
+          (let* ((in-shape (vt-shape tensor))
+                 (rank (length in-shape))
+                 (out-shape (if keepdims
+                                (make-list rank :initial-element 1)
+                                nil)))
+            (if (zerop (vt-size tensor))
+                (make-vt out-shape nanv :dtype :float64)
+                ;; v0.4.3：去掉 list 化。原实现 1M 元素 773ms（numpy 10ms）。
+                (multiple-value-bind (sv n) (%sorted-values tensor)
+                  (if (%sorted-has-nan-p sv n)
+                      (make-vt out-shape nanv :dtype :float64)
+                      (if (oddp n)
+                          (make-vt out-shape
+                                   (vt-cast (elt sv (floor n 2)) :float64)
+                                   :dtype :float64)
+                          (make-vt out-shape
+                                   (/ (+ (vt-cast (elt sv (1- (floor n 2))) :float64)
+                                         (vt-cast (elt sv (floor n 2)) :float64))
+                                      2.0d0)
+                                   :dtype :float64))))))))))
+
+(defun %percent-from-sorted (sorted q interpolation)
+  "从**已升序**的序列取 Q 分位点。SORTED 可以是专用数组（ELT = O(1)）或
+   list（ELT 退化为线性，仅兜底路径）。v0.4.3：原来用 NTH，只能吃 list，
+   迫使调用方把数据摊成 list —— 现统一用 ELT，可直接吃排序后的专用数组。"
+  (let* ((n (length sorted))
+         (idx (* q (1- n)))
+         (lower (floor idx))
+         (upper (min (ceiling idx) (1- n)))
+         (frac (- idx lower)))
+    (case interpolation
+      (:linear (if (= lower upper) (vt-cast (elt sorted lower) :float64)
+                   (+ (* (- 1 frac) (vt-cast (elt sorted lower) :float64))
+                      (* frac (vt-cast (elt sorted upper) :float64)))))
+      (:lower (vt-cast (elt sorted lower) :float64))
+      (:higher (vt-cast (elt sorted upper) :float64))
+      (:midpoint (/ (+ (vt-cast (elt sorted lower) :float64)
+                       (vt-cast (elt sorted upper) :float64))
+                    2.0d0))
+      (:nearest (vt-cast (elt sorted (if (<= frac 0.5d0) lower upper)) :float64)))))
+
+(defun vt-percentile (tensor percentile &key axis keepdims (interpolation :linear))
+  "计算百分位数（对标 numpy.percentile）。
+   PERCENTILE 必须在 [0, 100] 内：
+     - 0   → 最小值
+     - 50  → 中位数
+     - 100 → 最大值
+     越界（<0 或 >100）报错；NaN 亦报错（NaN 不满足 <= 比较）。
+   INTERPOLATION 取值：:linear / :lower / :higher / :midpoint / :nearest，
+     对标 numpy.percentile 的 interpolation 参数。默认 :linear。
+   KEEPDIMS = t 时，轴归约保留归约轴为 1，全局归约返回 (1 1 ... 1)，
+     与 numpy 的 keepdims=True 一致。
+   返回：0 维张量（当 axis=nil 且 keepdims=nil）、形状 (1 1 ... 1)
+         的张量（当 axis=nil 且 keepdims=t）、或降维后的张量。"
+  (with-float-safe
+    (unless (realp percentile)
+      (error "vt-percentile: percentile 必须为实数，得到 ~a (type ~a)"
+             percentile (type-of percentile)))
+    (unless (<= 0 percentile 100)
+      (error "vt-percentile: percentile 必须在 [0, 100] 内，得到 ~a"
+             percentile))
+    (unless (member interpolation '(:linear :lower :higher :midpoint :nearest))
+      (error "vt-percentile: interpolation 必须是 :linear/:lower/:higher/:midpoint/:nearest 之一，得到 ~a"
+             interpolation))
+    (let ((q (/ percentile 100.0d0)))
+      (if axis
+          ;; ---- 轴归约 ----
+          (let* ((shape (vt-shape tensor))
+                 (rank (length shape))
+                 (ax (vt-normalize-axis axis rank))
+                 (out-shape (if keepdims
+                                (loop for d in shape for i from 0
+                                      collect (if (= i ax) 1 d))
+                                (loop for d in shape for i from 0
+                                      unless (= i ax) collect d)))
+                 (result (vt-zeros out-shape :dtype :float64))
+                 (out-strides (vt-strides result)))
+            (vt-do-each (ptr val result)
+              (declare (ignore val))
+              (let* ((out-idx (vt-unravel-index ptr out-shape out-strides))
+                     (specs
+                       (loop for i from 0 below rank
+                             for out-i = (cond ((= i ax) nil)
+                                               (keepdims i)
+                                               ((< i ax) i)
+                                               (t (1- i)))
+                             collect (if (null out-i)
+                                         '(:all)
+                                         (list (nth out-i out-idx)))))
+                     (fiber (apply #'vt-slice tensor specs))
+                     (fs (vt-size fiber)))
+                (setf (aref (vt-data result) ptr)
+                      (if (zerop fs)
+                          ;; v0.4.x：归约区为空 → numpy ValueError 语义
+                          (error "vt-percentile: zero-size array to reduction operation percentile which has no identity（numpy 语义）")
+                          ;; v0.4.3：fiber 排序走专用数组内核（去掉 list 化）
+                          (multiple-value-bind (sv n) (%sorted-values fiber)
+                            (if (%sorted-has-nan-p sv n)
+                                (vt-get-nan :float64)
+                                (%percent-from-sorted sv q interpolation)))))))
+            result)
+          ;; ---- 全局归约 ----
+          (let* ((in-shape (vt-shape tensor))
+                 (rank (length in-shape))
+                 (flat (vt-flatten tensor))
+                 (size (vt-size flat))
+                 (out-shape (if keepdims
+                                (make-list rank :initial-element 1)
+                                nil)))
+            (if (zerop size)
+                ;; v0.4.x：numpy 对空数组 percentile 抛 ValueError
+                ;; （zero-size array to reduction operation percentile
+                ;;   which has no identity），不再返回 NaN。
+                (error "vt-percentile: zero-size array to reduction operation percentile which has no identity（numpy 语义）")
+                ;; v0.4.3：去掉 list 化，直接读排序后的专用数组
+                (multiple-value-bind (sv n) (%sorted-values tensor)
+                  (if (%sorted-has-nan-p sv n)
+                      (make-vt out-shape (vt-get-nan :float64) :dtype :float64)
+                      (make-vt out-shape
+                               (%percent-from-sorted sv q interpolation)
+                               :dtype :float64)))))))))
+
+(defun vt-quantile (tensor q &key axis keepdims (interpolation :linear))
+  "计算分位数（对标 numpy.quantile）。
+   Q 必须在 [0, 1] 内：
+     - 0.0  → 最小值
+     - 0.5  → 中位数
+     - 1.0  → 最大值
+     越界（<0 或 >1）报错；NaN 亦报错（NaN 不满足 <= 比较）。
+   等价于 (vt-percentile tensor (* q 100) ...)。
+   INTERPOLATION 含义见 vt-percentile；KEEPDIMS 语义见 vt-percentile。"
+  (unless (realp q)
+    (error "vt-quantile: q 必须为实数，得到 ~a (type ~a)"
+           q (type-of q)))
+  (unless (<= 0 q 1)
+    (error "vt-quantile: q 必须在 [0, 1] 内，得到 ~a" q))
+  (vt-percentile tensor (* q 100)
+                 :axis axis
+                 :keepdims keepdims
+                 :interpolation interpolation))
+
+(defun vt-ptp (tensor &key axis)
+  "峰谷差 max - min（对标 numpy.ptp）。"
+  (if axis (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
+      (- (vt-item (vt-amax tensor)) (vt-item (vt-amin tensor)))))
+
+(defun vt-histogram (tensor &key bins range density)
+  "直方图统计（对标 numpy.histogram）。返回 (values counts edges)。"
+  (with-float-safe
+    (let* ((flat (vt-flatten tensor))
+           (data (vt-data flat))
+           (size (vt-size flat))
+           (bins (or bins 10))
+           (data-min nil)
+           (data-max nil))
+      (unless (and (integerp bins) (plusp bins))
+        (error "vt-histogram: bins (~a) 必须为正整数" bins))
+
+      (if range
+          (progn
+            (unless (and (listp range) (= (length range) 2))
+              (error "vt-histogram: range 必须是 (min max) 二元列表，得到 ~a"
+                     range))
+            (setf data-min (first range)
+                  data-max (second range))
+            (unless (< data-min data-max)
+              (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
+                     data-max data-min)))
+          (progn
+            (unless (= (vt-item (vt-all (vt-isfinite tensor))) 1.0d0)
+              (error "自动确定 bin 范围需要有限输入"))
+            (setf data-min (vt-item (vt-amin tensor))
+                  data-max (vt-item (vt-amax tensor)))
+            (when (= data-min data-max)
+              (setf data-min (- data-min 0.5)
+                    data-max (+ data-max 0.5)))))
+      (let* ((bin-width (/ (- data-max data-min) bins))
+             (hist (make-array bins :initial-element 0))
+             (edges (make-array (1+ bins) :element-type t)))
+        (loop for i from 0 to bins do
+          (setf (aref edges i) (+ data-min (* i bin-width))))
+        (loop for i from 0 below size
+              for val = (aref data i)
+              when (and (>= val data-min) (<= val data-max))
+                do (let ((bi (if (= val data-max)
+                                 (1- bins)
+                                 (floor (- val data-min) bin-width))))
+                     (incf (aref hist bi))))
+        (when density
+          (let ((total (reduce #'+ hist)))
+            (if (zerop total)
+                (loop for i from 0 below bins do
+                  (setf (aref hist i) 0.0d0))
+                (loop for i from 0 below bins do
+                  (setf (aref hist i)
+                        (/ (aref hist i)
+                           (* total bin-width)))))))
+        (values (vt-from-sequence hist
+                                  ;; 对标 numpy：counts 为整数（int64）；
+                                  ;; density=t 时为归一化密度（float64）。
+                                  :dtype (if density :float64 :int64))
+                (vt-from-sequence edges :dtype :float64))))))
+
+;;; ------------------------------------------------------------------
+;;; 排序
+;;; ------------------------------------------------------------------
 
 (defun vt-sort (tensor &key (axis -1))
   "升序排序（对标 numpy.sort）。AXIS 缺省 -1；NaN 排在末尾。"
@@ -1726,17 +1780,23 @@
            (in-shape (vt-shape tensor))
            (rank (length in-shape)))
       (if (null axis)
-          (let ((vals '()))
-            (vt-do-each (ptr val tensor)
-              (declare (ignore ptr))
-              (unless (%nan-p val) (push val vals)))
-            (setf vals (sort vals #'<))
-            (let ((result (cond ((null vals) nan)
-                                ((oddp (length vals))
-                                 (coerce (nth (floor (length vals) 2) vals) 'double-float))
-                                (t (/ (+ (nth (1- (/ (length vals) 2)) vals)
-                                         (nth (/ (length vals) 2) vals))
-                                      2.0d0)))))
+          ;; v0.4.3 性能修复：原实现把非 NaN 值 push 进 list 再 sort ——
+          ;; 1M 元素要 cons 1M 个 cell，实测 644ms（numpy.nanmedian 10.2ms）。
+          ;; 改为「整体排序（NaN 稳定压尾）+ 从尾部数 NaN 个数」：
+          ;; 一次 replace + 原地归并，零 cons，之后按下标直接取中位。
+          (multiple-value-bind (sv n) (%sorted-values tensor)
+            (let* ((m n))
+              ;; NaN 全在末尾：从后往前剥掉
+              (loop while (and (plusp m)
+                               (let ((w (elt sv (1- m))))
+                                 (and (floatp w) (%nan-p w))))
+                    do (decf m))
+              (let ((result (cond ((zerop m) nan)
+                                  ((oddp m)
+                                   (coerce (elt sv (floor m 2)) 'double-float))
+                                  (t (/ (+ (coerce (elt sv (1- (/ m 2))) 'double-float)
+                                           (coerce (elt sv (/ m 2)) 'double-float))
+                                        2.0d0)))))
               (if out
                   (progn
                     ;; 全局归约（axis=nil）：结果形状为 NIL（标量）。
@@ -1759,7 +1819,7 @@
                                        ":out 是只读的广播视图（存在 dim>1 且 stride=0 的轴）")))
                     (vt-fill out result)
                     out)
-                  (make-vt nil result :dtype :float64))))
+                  (make-vt nil result :dtype :float64)))))
           (let* ((ax (vt-normalize-axis axis rank))
                  (ax-size (nth ax in-shape))
                  (ax-stride (nth ax in-strides))
