@@ -688,21 +688,91 @@
 (def-vt-reduce nanargmin :nanargmin)
 
 
+;;; ------------------------------------------------------------------
+;;; 判定算子（具名 + 内联）
+;;;
+;;; 类型声明（性能）：这三个函数原本以 lambda 形式交给 vt-map，
+;;; 循环体里没有任何类型信息（泛型 aref + 装箱 funcall + 泛型 cast），
+;;; 而结果 dtype 固定 :int8，正落在 %vt-mask1-fast 的「窄整型输出」
+;;; 矩阵（double/single/int64/int32 进 → int8 出）内。
+;;; 改成具名 inline 算子后即可命中该特化循环。
+;;; ------------------------------------------------------------------
+(declaim (inline %op-isfinite %op-isinf %op-isnan))
+
+(defun %op-isfinite (x) (if (and (not (%nan-p x)) (not (%inf-p x))) 1 0))
+
+(defun %op-isinf (x) (if (%inf-p x) 1 0))
+
+(defun %op-isnan (x) (if (%nan-p x) 1 0))
+
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) out)
   "逐元素判断 |a - b| <= atol + rtol*|b|，返回 :int8 布尔张量（1/0）。
    v0.4.x 修复两点：
      1) 公式原用 max(|a|,|b|)，与 numpy.isclose 的 |b| 不一致，已对齐；
      2) 结果 dtype 原误为 :float64，违反 F4（比较返回 :int8），已修正。
    NaN 恒不接近（numpy 默认 equal_nan=False）；±Inf 仅与相等的 ±Inf 接近。
-   RTOL/ATOL 缺省 1e-5 / 1e-8（float64 计算精度，对标 numpy 内部实现）。"
-  (vt-map (lambda (a b)
-            (let ((fa (vt-cast a :float64)) (fb (vt-cast b :float64)))
-              (cond ((or (%nan-p fa) (%nan-p fb)) 0)
-                    ((or (%inf-p fa) (%inf-p fb)) (if (= fa fb) 1 0))
-                    (t (if (<= (abs (- fa fb))
-                               (+ atol (* rtol (abs fb))))
-                           1 0)))))
-          t1 t2 :dtype :int8 :out out))
+   RTOL/ATOL 缺省 1e-5 / 1e-8（float64 计算精度，对标 numpy 内部实现）。
+
+   性能：两输入连续、同形、同元素类型（double/single/int64/int32）且
+   out 不与输入重叠时走特化内核（RTOL/ATOL 提为循环外局部变量）；
+   其余情形回退 vt-map 通用路径，结果逐位相同。"
+  (with-float-safe
+    (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
+           (out-shape (vt-broadcast-shapes (vt-shape a) (vt-shape b)))
+           (res (if out
+                    (vt-check-out out out-shape :int8 :op-name "vt-isclose")
+                    (make-vt out-shape 0 :dtype :int8))))
+      (macrolet ((close-kernel (lt)
+                   `(let ((od (the (simple-array (signed-byte 8) (*)) (vt-data res)))
+                          (d0 (the (simple-array ,lt (*)) (vt-data a)))
+                          (d1 (the (simple-array ,lt (*)) (vt-data b)))
+                          (rt (coerce rtol 'double-float))
+                          (at (coerce atol 'double-float))
+                          (n (the fixnum (vt-size res)))
+                          (p0 (the fixnum (vt-offset a)))
+                          (p1 (the fixnum (vt-offset b))))
+                      (declare (type (simple-array (signed-byte 8) (*)) od)
+                               (type (simple-array ,lt (*)) d0 d1)
+                               (type double-float rt at)
+                               (type fixnum n p0 p1))
+                      (dotimes (i n)
+                        (declare (type fixnum i))
+                        (let* ((x (coerce (aref d0 (+ p0 i)) 'double-float))
+                               (y (coerce (aref d1 (+ p1 i)) 'double-float)))
+                          (setf (aref od i)
+                                (cond ((or (%nan-p x) (%nan-p y)) 0)
+                                      ((or (%inf-p x) (%inf-p y)) (if (= x y) 1 0))
+                                      (t (if (<= (abs (- x y))
+                                                 (+ at (* rt (abs y))))
+                                             1 0)))))))))
+        (let ((et (array-element-type (vt-data a))))
+          (when (and (eq (vt-dtype res) :int8)
+                     (equal (array-element-type (vt-data res)) '(signed-byte 8))
+                     (eq (vt-offset res) 0)
+                     (equal (vt-strides res) (vt-compute-strides out-shape))
+                     (vt-contiguous-p a) (vt-contiguous-p b)
+                     (equal (vt-shape a) out-shape)
+                     (equal (vt-shape b) out-shape)
+                     (equal et (array-element-type (vt-data b)))
+                     (member et (list 'double-float 'single-float
+                                      '(signed-byte 64) '(signed-byte 32))
+                             :test #'equal)
+                     ;; 别名（out 与输入重叠）交给 vt-map 的快照机制
+                     (not (and out (or (%vt-views-overlap-p out a)
+                                       (%vt-views-overlap-p out b)))))
+            (cond ((equal et 'double-float)     (close-kernel double-float))
+                  ((equal et 'single-float)     (close-kernel single-float))
+                  ((equal et '(signed-byte 64)) (close-kernel (signed-byte 64)))
+                  ((equal et '(signed-byte 32)) (close-kernel (signed-byte 32))))
+            (return-from vt-isclose res)))))
+    (vt-map (lambda (a b)
+              (let ((fa (vt-cast a :float64)) (fb (vt-cast b :float64)))
+                (cond ((or (%nan-p fa) (%nan-p fb)) 0)
+                      ((or (%inf-p fa) (%inf-p fb)) (if (= fa fb) 1 0))
+                      (t (if (<= (abs (- fa fb))
+                                 (+ atol (* rtol (abs fb))))
+                             1 0)))))
+            t1 t2 :dtype :int8 :out out)))
 
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个张量在 RTOL/ATOL 容差下是否全部相等（对标 numpy.allclose），返回布尔。"
@@ -711,16 +781,15 @@
 (defun vt-isfinite (vt &key out)
   "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回 int8 布尔张量（1/0）。
       dtype 固定 :int8（承载布尔语义，CONVENTIONS §3.1）。"
-  (vt-map (lambda (x) (if (and (not (%nan-p x)) (not (%inf-p x))) 1 0))
-          vt :dtype :int8 :out out))
+  (vt-fast-map #'%op-isfinite vt :dtype :int8 :out out))
 
 (defun vt-isinf (vt &key out)
   "逐元素判断是否为 ±Inf，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
-  (vt-map (lambda (x) (if (%inf-p x) 1 0)) vt :dtype :int8 :out out))
+  (vt-fast-map #'%op-isinf vt :dtype :int8 :out out))
 
 (defun vt-isnan (vt &key out)
   "逐元素判断是否为 NaN，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
-  (vt-map (lambda (x) (if (%nan-p x) 1 0)) vt :dtype :int8 :out out))
+  (vt-fast-map #'%op-isnan vt :dtype :int8 :out out))
 
 ;;; ------------------------------------------------------------------
 ;;; 均值 / 方差 / 标准差
@@ -904,7 +973,11 @@
 
 (defun vt-cumulative (tensor op init-val &key axis dtype out)
   "累积归约核心原语：沿 AXIS 依次累积 OP（#\+ / #\*），以 INIT-VAL 起始。
-  dtype 语义（§4.2 H3）：结果 dtype = 显式 :dtype，否则为输入 dtype；out 必须精确匹配。"
+  dtype 语义（§4.2 H3）：结果 dtype = 显式 :dtype，否则为输入 dtype；out 必须精确匹配。
+
+  结果形状（v0.4.1 逻辑修复，对标 numpy）：
+    axis=NIL → **先展平再累积**，返回一维（np.cumsum([[1,2],[3,4]]) -> (4,)）；
+    axis 给定 → 形状与输入相同，仅该轴被累积。"
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
          ;; 结果 dtype 由「输入 dtype + 显式 :dtype」决定，不由 out 决定。
@@ -917,14 +990,81 @@
                             ((:int8 :uint8 :int16 :uint16 :int32) :int64)
                             (t (vt-dtype tensor)))))
          (lisp-type (vt-dtype->lisp-type final-dtype))
+         ;; 结果形状（逻辑契约）：numpy 在 axis=None 时先展平再累积。
+         ;; 原实现沿用输入形状，且 axis=nil 的递归遍历在 rank>=2 上直接
+         ;; 信号 "The value NIL is not of type NUMBER"（实测原版
+         ;; (vt-cumsum 2x2) 必崩）。按 CONVENTIONS §0「与 NumPy 冲突以
+         ;; NumPy 为准」改为展平形状，并去掉该递归。
+         (res-shape (if axis shape (list (vt-size tensor))))
          ;; out 给出时统一入口校验（形状/dtype 严格相等/可写性）
          (result (if out
-                     (vt-check-out out shape final-dtype :op-name "vt-cumulative")
-                     (vt-zeros shape :dtype final-dtype)))
+                     (vt-check-out out res-shape final-dtype :op-name "vt-cumulative")
+                     (vt-zeros res-shape :dtype final-dtype)))
          (in-data (vt-data tensor)) (out-data (vt-data result))
          (in-strides (vt-strides tensor)) (in-offset (vt-offset tensor))
          (out-strides (vt-strides result)) (out-offset (vt-offset result)))
+    ;; ================================================================
+    ;; 快路径（类型声明驱动）：输入连续 + 结果连续 + op 是内建 +/* +
+    ;; 元素类型在四种存储类型之内。
+    ;;
+    ;; 通用路径是「逐元素 funcall op + 逐元素 vt-cast」，实测 1M 元素需
+    ;; 227ms（约 227ns/元素，比 numpy 慢 70 倍），瓶颈全部来自没有类型信息：
+    ;;   · aref 走泛型二维分派（慢 ~20x）
+    ;;   · (funcall op ...) 每次调用都要装箱
+    ;;   · (vt-cast cum final-dtype) 走 ecase + 泛型算术
+    ;; 这里把「数组元素类型」与「累加器类型」同时声明，并把 op 提到
+    ;; 循环外做一次 eq 分派，让 +/* 直接编译成机器指令。
+    ;; 结果与通用路径逐位相同（同为行主序顺序累加，铁律 1/2）。
+    ;; ================================================================
+    (macrolet ((cum-typed (lt)
+                 ;; 存储表达式按元素类型在**编译期**选定：整数用 dtype.lisp 中
+                 ;; 已声明返回类型的 %coerce-* 做回绕收窄，浮点直接存。
+                 (let ((store (cond ((equal lt '(signed-byte 64)) `(%coerce-int64 acc))
+                                    ((equal lt '(signed-byte 32)) `(%coerce-int32 acc))
+                                    (t 'acc))))
+                   `(let ((src (the (simple-array ,lt (*)) in-data))
+                          (dst (the (simple-array ,lt (*)) out-data))
+                          (n (the fixnum (vt-size result)))
+                          (ip (the fixnum in-offset))
+                          (opos (the fixnum out-offset)))
+                      (declare (type (simple-array ,lt (*)) src dst)
+                               (type fixnum n ip opos))
+                      (if (eq op #'+)
+                          (let ((acc (the ,lt (coerce init-val ',lt))))
+                            (declare (type ,lt acc))
+                            (dotimes (i n)
+                              (declare (type fixnum i))
+                              (setf acc (+ acc (aref src (+ ip i))))
+                              (setf (aref dst (+ opos i)) ,store)))
+                          (let ((acc (the ,lt (coerce init-val ',lt))))
+                            (declare (type ,lt acc))
+                            (dotimes (i n)
+                              (declare (type fixnum i))
+                              (setf acc (* acc (aref src (+ ip i))))
+                              (setf (aref dst (+ opos i)) ,store))))))))
+      (when (and (member op (list #'+ #'*))
+                 ;; 仅在「全局累积（axis=nil）」时可用线性快路径：
+                 ;; 此时累加正是按行主序对整块做一次顺序累加，
+                 ;; 与 numpy 的 flat 语义完全一致。axis 非空时累加沿
+                 ;; 指定轴进行，必须走通用路径。
+                 (null axis)
+                 (vt-contiguous-p tensor)
+                 (vt-contiguous-p result)
+                 (equal (array-element-type in-data)
+                        (array-element-type out-data)))
+        (let ((et (array-element-type in-data)))
+          (cond ((equal et 'double-float)     (cum-typed double-float))
+                ((equal et 'single-float)     (cum-typed single-float))
+                ((equal et '(signed-byte 64)) (cum-typed (signed-byte 64)))
+                ((equal et '(signed-byte 32)) (cum-typed (signed-byte 32)))
+                (t nil)))
+        (when (member (array-element-type in-data)
+                      (list 'double-float 'single-float
+                            '(signed-byte 64) '(signed-byte 32))
+                      :test #'equal)
+          (return-from vt-cumulative result))))
     (if axis
+        ;; ---------------- 沿指定轴累积（形状不变）----------------
         (let* ((ax (vt-normalize-axis axis rank))
                (ax-dim (nth ax shape))
                (indices (make-array rank :element-type '(signed-byte 64)
@@ -951,25 +1091,26 @@
                     (setf (aref out-data (+ out-ptr (* i out-stride)))
                           (vt-cast cum final-dtype)))))
               (unless (advance) (return)))))
+        ;; ---------------- 全局累积（axis=nil）：展平后线性累加 ----------------
+        ;; 原实现是「递归遍历 + funcall op + 逐元素 vt-cast」：rank>=2 时
+        ;; 直接崩，且 1M 元素耗时 227ms。此处改为对展平视图的一次线性扫描，
+        ;; 语义与 numpy 的 flat 累积一致；非常规 dtype 仍走通用 funcall/cast
+        ;; 兜底（结果正确，仅慢）。
         (let* ((flat (vt-ravel tensor))
-               (flat-in (vt-data flat))
-               (flat-offset (vt-offset flat))
+               (src (vt-data flat))
+               (soff (the fixnum (vt-offset flat)))
+               (dst (vt-data result))
+               (n (the fixnum (vt-size result)))
+               (doff (the fixnum (vt-offset result)))
+               (conv (vt-cast-fun final-dtype))
                (cum (coerce init-val lisp-type))
-               (out-shape-vec (coerce (vt-shape result) 'simple-vector))
-               (out-strs-vec (coerce out-strides 'simple-vector))
-               (out-rank (length out-shape-vec)))
-          (labels ((recurse (depth out-ptr flat-idx)
-                     (if (= depth out-rank)
-                         (progn (setf cum (funcall op cum (aref flat-in (+ flat-offset flat-idx))))
-                                (setf (aref out-data out-ptr)
-                                      (vt-cast cum final-dtype))
-                                (1+ flat-idx))
-                         (let ((dim (svref out-shape-vec depth))
-                               (stride (svref out-strs-vec depth)))
-                           (loop for i from 0 below dim
-                                 for cur = out-ptr then (+ cur stride)
-                                 do (setf flat-idx (recurse (1+ depth) cur flat-idx)))))))
-            (recurse 0 out-offset 0))))
+               (i 0))
+          (declare (type fixnum soff n doff i))
+          (dotimes (k n)
+            (declare (ignore k))
+            (setf cum (funcall op cum (aref src (+ soff i))))
+            (setf (aref dst (+ doff i)) (funcall conv cum))
+            (incf i))))
     result))
 
 (defun vt-cumsum (tensor &key axis dtype out)
@@ -1748,4 +1889,5 @@
         (if (and (or (null axis) (integerp axis))
                  (null (cdr results)))
             (car results) results)))))
+
 

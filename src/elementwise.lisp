@@ -836,82 +836,108 @@ lambda 算子请使用 %%float-map-fn"))
                      (/ pi 180.0d0))))
     (vt-map (lambda (x) (* x factor)) vt :out out :dtype dt)))
 
+;;; ------------------------------------------------------------------
+;;; 极值 / 逻辑算子（具名 + 内联）
+;;;
+;;; 类型声明（性能）：这些算子此前全部以 `(vt-map (lambda (a b) ...))` 形式
+;;; 传入，`vt-map` 只能在运行时经 funcall 调用闭包，循环体拿不到任何类型
+;;; 信息 —— aref 走泛型分派、结果装箱、写回再做一次泛型 cast。
+;;; 实测 1M float64 的 vt-maximum 需 22ms（numpy 0.24ms，慢 93 倍）。
+;;; 改成「具名函数 + inline 声明」后，`vt-fast-map` 能在编译期把算子
+;;; 内联进 %inline{1,2,3}-loop 的特化循环，读写两端都是特化 aref。
+;;; 语义与原来的 lambda 逐字相同（同样的 NaN 分支顺序）。
+;;; ------------------------------------------------------------------
+(declaim (inline %op-maximum %op-minimum %op-fmax %op-fmin
+                 %op-logical-and %op-logical-or %op-logical-not
+                 %op-logical-xor))
+
+(defun %op-maximum (a b)
+  "NaN 传播取大（对标 numpy.maximum）：任一为 NaN 即取该侧（左优先）。"
+  (cond ((%nan-p a) a)
+        ((%nan-p b) b)
+        (t (max a b))))
+
+(defun %op-minimum (a b)
+  "NaN 传播取小（对标 numpy.minimum）。"
+  (cond ((%nan-p a) a)
+        ((%nan-p b) b)
+        (t (min a b))))
+
+(defun %op-fmax (a b)
+  "忽略 NaN 取大（对标 numpy.fmax）：仅两侧皆 NaN 时返回 NaN。"
+  (cond ((and (%nan-p a) (%nan-p b)) a)
+        ((%nan-p a) b)
+        ((%nan-p b) a)
+        (t (max a b))))
+
+(defun %op-fmin (a b)
+  "忽略 NaN 取小（对标 numpy.fmin）。"
+  (cond ((and (%nan-p a) (%nan-p b)) a)
+        ((%nan-p a) b)
+        ((%nan-p b) a)
+        (t (min a b))))
+
+(defun %op-logical-and (a b) (if (and (not (zerop a)) (not (zerop b))) 1 0))
+
+(defun %op-logical-or (a b) (if (or (not (zerop a)) (not (zerop b))) 1 0))
+
+(defun %op-logical-not (v) (if (zerop v) 1 0))
+
+(defun %op-logical-xor (a b) (if (not (eq (not (zerop a)) (not (zerop b)))) 1 0))
+
 (defun vt-maximum (t1 t2 &key out dtype)
   "逐元素取较大值，**NaN 传播**（任一为 NaN → NaN，且优先取左）
       对标 numpy.maximum。:out 契约同 vt-+。"
-  (vt-map (lambda (a b)
-            (cond ((%nan-p a) a)
-                  ((%nan-p b) b)
-                  (t (max a b))))         
-          t1 t2 :out out :dtype dtype))
+  (vt-fast-map #'%op-maximum t1 t2 :out out :dtype dtype))
+
 (defun vt-minimum (t1 t2 &key out dtype)
   "逐元素取较小值，**NaN 传播**（任一为 NaN → NaN，且优先取左）
       对标 numpy.minimum。:out 契约同 vt-+。"
-  (vt-map (lambda (a b)
-            (cond ((%nan-p a) a)
-                  ((%nan-p b) b)
-                  (t (min a b))))
-          t1 t2 :out out :dtype dtype))
+  (vt-fast-map #'%op-minimum t1 t2 :out out :dtype dtype))
 
 (defun vt-fmax (t1 t2 &key out dtype)
   "逐元素取较大值，**忽略 NaN**（仅两侧皆 NaN 时返回 NaN）
       对标 numpy.fmax。:out 契约同 vt-+。"
-  (vt-map (lambda (a b)
-            (cond ((and (%nan-p a) (%nan-p b)) a)
-                  ((%nan-p a) b) ((%nan-p b) a)
-                  (t (max a b))))
-          (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-fmax t1 t2 :out out :dtype dtype))
 
 (defun vt-fmin (t1 t2 &key out dtype)
   "逐元素取较小值，**忽略 NaN**（仅两侧皆 NaN 时返回 NaN）
       对标 numpy.fmin。:out 契约同 vt-+。"
-  (vt-map (lambda (a b)
-            (cond ((and (%nan-p a) (%nan-p b)) a)
-                  ((%nan-p a) b) ((%nan-p b) a)
-                  (t (min a b))))
-          (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-fmin t1 t2 :out out :dtype dtype))
 
 (defun vt-logical-and (t1 t2 &key out (dtype :int8))
   "逐元素逻辑与（非零视为真），返回 1/0。
    dtype 默认 :int8——与 §3.1「比较/逻辑运算返回 :int8」一致，
    语义等价 numpy 的 bool（本库不引入独立 :bool dtype）。"
-  (vt-map (lambda (a b)
-            (if (and (not (zerop a)) (not (zerop b))) 1 0))
-          (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-logical-and t1 t2 :dtype dtype :out out))
 
 (defun vt-logical-or (t1 t2 &key out (dtype :int8))
   "逐元素逻辑或（非零视为真），返回 1/0。dtype 默认 :int8（同 §3.1）。"
-  (vt-map (lambda (a b)
-            (if (or (not (zerop a)) (not (zerop b))) 1 0))
-          (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-logical-or t1 t2 :dtype dtype :out out))
 
 (defun vt-logical-not (vt &key out (dtype :int8))
   "逐元素逻辑非，返回 1/0。dtype 默认 :int8（同 §3.1）。"
-  (vt-map (lambda (v)
-            (if (zerop v) 1 0))
-          vt :dtype dtype :out out))
+  (vt-fast-map #'%op-logical-not vt :dtype dtype :out out))
 
 (defun vt-logical-xor (t1 t2 &key out (dtype :int8))
   "逐元素逻辑异或，返回 1/0。dtype 默认 :int8（同 §3.1）。"
-  (vt-map (lambda (a b)
-            (if (not (eq (not (zerop a)) (not (zerop b)))) 1 0))
-          (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'%op-logical-xor t1 t2 :dtype dtype :out out))
 
 (defun vt-bit-and (t1 t2 &key out dtype)
   "逐元素按位与 logand。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'logand (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'logand t1 t2 :dtype dtype :out out))
 
 (defun vt-bit-ior (t1 t2 &key out dtype)
   "逐元素按位或 logior。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'logior (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'logior t1 t2 :dtype dtype :out out))
 
 (defun vt-bit-xor (t1 t2 &key out dtype)
   "逐元素按位异或 logxor。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'logxor (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+  (vt-fast-map #'logxor t1 t2 :dtype dtype :out out))
 
 (defun vt-bit-not (vt &key out dtype)
   "逐元素按位取反 lognot。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'lognot vt :dtype dtype :out out))
+  (vt-fast-map #'lognot vt :dtype dtype :out out))
 
 (defun vt-left-shift (vt shift &key out dtype)
   "逐元素左移 SHIFT 位（ash x shift）。SHIFT 为整数标量。

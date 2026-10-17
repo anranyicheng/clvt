@@ -165,6 +165,26 @@
                  %coerce-int8 %coerce-int16 %coerce-uint8 %coerce-uint16
                  %coerce-int32 %coerce-int64))
 
+;;; 类型声明（性能）：这 12 个函数是**全部**窄化转换的唯一出口
+;;; （vt-cast / vt-astype / %cast-to / %vt-map-run 的写回都经过它们）。
+;;; 没有返回类型声明时，SBCL 只能把它们的结果当作 INTEGER / REAL，
+;;; 于是在热循环写回 specialized-array 时插入 range check 并对结果装箱，
+;;; 这是 int8/int16/uint8/uint16 结果张量（比较运算、布尔掩码）慢 ~20x 的根因。
+;;; 这里声明的返回类型与各函数体内的 mod/回绕实现严格一致（可证明），
+;;; 只是把「已经成立的事实」告诉编译器，不改变任何语义。
+(declaim (ftype (function (real) (signed-byte 8))   %wrap-int8)
+         (ftype (function (real) (signed-byte 16))  %wrap-int16)
+         (ftype (function (real) (signed-byte 32))  %wrap-int32)
+         (ftype (function (real) (signed-byte 64))  %wrap-int64)
+         (ftype (function (real) (unsigned-byte 8)) %wrap-uint8)
+         (ftype (function (real) (unsigned-byte 16)) %wrap-uint16)
+         (ftype (function (real) (signed-byte 8))   %coerce-int8)
+         (ftype (function (real) (signed-byte 16))  %coerce-int16)
+         (ftype (function (real) (signed-byte 32))  %coerce-int32)
+         (ftype (function (real) (signed-byte 64))  %coerce-int64)
+         (ftype (function (real) (unsigned-byte 8)) %coerce-uint8)
+         (ftype (function (real) (unsigned-byte 16)) %coerce-uint16))
+
 (defun %wrap-int8 (v)
   "int8 范围 [-128,127] 回绕（NumPy 语义），NaN/Inf→0。"
   (let ((m (mod (%safe-truncate v) 256)))

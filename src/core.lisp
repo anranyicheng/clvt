@@ -653,10 +653,72 @@
                       src-data src-strides src-off
                       shape size rank same-dtype)
   "通用拷贝：rank 0/1/2/3 走专门化嵌套循环；rank ≥ 4 退回里程计。
-   所有路径单遍遍历，无中间缓冲。"
+   所有路径单遍遍历，无中间缓冲。
+
+   类型声明（性能）：DEST-DATA / SRC-DATA 的元素类型由运行时 dtype 决定，
+   本函数声明里没有它们的具体类型，于是下面所有 AREF/SETF 都是**泛型**
+   分派（一次 aref 要判数组类型 + 拆装箱）。这是 vt-contiguous /
+   vt-copy / vt-reshape(非连续) / vt-take 等基础操作的共同瓶颈：
+   实测 50 万元素 stride=2 的 vt-contiguous 需 3.0ms，numpy 0.14ms。
+   同 dtype 时两条数组类型相同，可以安全地按 8 种元素类型各生成一份
+   「三轴游标」内核（缺失轴用 dim=1、stride=0 补位，故一份代码覆盖
+   rank 0/1/2/3）；rank ≥ 4 与跨 dtype 仍走原路径，语义不变（铁律 1/2）。"
   (declare (type fixnum size dest-off src-off rank)
            (type list shape dest-strides src-strides))
   (when (zerop size) (return-from %copy-generic nil))
+  (flet ((d (i) (if (> rank i) (the fixnum (nth i shape)) 1))
+         (ds (i) (if (> rank i) (the fixnum (nth i dest-strides)) 0))
+         (ss (i) (if (> rank i) (the fixnum (nth i src-strides)) 0)))
+    (when (and same-dtype (<= rank 3))
+      (macrolet ((typed-walk (lt)
+                   `(let ((dd (the (simple-array ,lt (*)) dest-data))
+                          (sd (the (simple-array ,lt (*)) src-data))
+                          (d0 (d 0)) (d1 (d 1)) (d2 (d 2))
+                          (ds0 (ds 0)) (ds1 (ds 1)) (ds2 (ds 2))
+                          (ss0 (ss 0)) (ss1 (ss 1)) (ss2 (ss 2)))
+                      (declare (type (simple-array ,lt (*)) dd sd)
+                               (type fixnum d0 d1 d2 ds0 ds1 ds2 ss0 ss1 ss2))
+                      (let ((dp dest-off) (sp src-off))
+                        (declare (type fixnum dp sp))
+                        (dotimes (i0 d0)
+                          (declare (type fixnum i0))
+                          (let ((dp1 dp) (sp1 sp))
+                            (declare (type fixnum dp1 sp1))
+                            (dotimes (i1 d1)
+                              (declare (type fixnum i1))
+                              (let ((dp2 dp1) (sp2 sp1))
+                                (declare (type fixnum dp2 sp2))
+                                (dotimes (i2 d2)
+                                  (declare (type fixnum i2))
+                                  (setf (aref dd dp2) (aref sd sp2))
+                                  (incf dp2 ds2) (incf sp2 ss2))
+                                (incf dp1 ds1) (incf sp1 ss1)))
+                            (incf dp ds0) (incf sp ss0)))))))
+        (let ((et (array-element-type dest-data)))
+          (cond ((equal et 'double-float)      (typed-walk double-float))
+                ((equal et 'single-float)      (typed-walk single-float))
+                ((equal et '(signed-byte 64))  (typed-walk (signed-byte 64)))
+                ((equal et '(signed-byte 32))  (typed-walk (signed-byte 32)))
+                ((equal et '(signed-byte 16))  (typed-walk (signed-byte 16)))
+                ((equal et '(signed-byte 8))   (typed-walk (signed-byte 8)))
+                ((equal et '(unsigned-byte 16)) (typed-walk (unsigned-byte 16)))
+                ((equal et '(unsigned-byte 8))  (typed-walk (unsigned-byte 8)))
+                (t (return-from %copy-generic
+                     (%copy-generic-slow dest-data dest-dtype dest-strides dest-off
+                                         src-data src-strides src-off
+                                         shape size rank same-dtype))))
+          (return-from %copy-generic nil))))
+  (%copy-generic-slow dest-data dest-dtype dest-strides dest-off
+                      src-data src-strides src-off
+                      shape size rank same-dtype)))
+
+(defun %copy-generic-slow (dest-data dest-dtype dest-strides dest-off
+                           src-data src-strides src-off
+                           shape size rank same-dtype)
+  "跨 dtype / rank ≥ 4 的通用拷贝（原 %copy-generic 实现，语义基准）。"
+  (declare (type fixnum size dest-off src-off rank)
+           (type list shape dest-strides src-strides))
+  (when (zerop size) (return-from %copy-generic-slow nil))
   (let ((caster (unless same-dtype (vt-cast-fun dest-dtype))))
     (declare (type (or null function) caster))
     (case rank

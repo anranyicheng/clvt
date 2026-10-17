@@ -111,6 +111,39 @@
              (data (make-array size :element-type lisp-type
                                     :initial-element (coerce 0 lisp-type)))
              (strides (vt-compute-strides shape)))
+        ;; 一维扁平快路径（类型声明驱动）。
+        ;; FILL-TENSOR 是递归逐元素填充：每层都要 typecase、每次写回都走
+        ;; 泛型 (setf aref)、每个元素再做一次 (vt-cast ...) 的 ecase 分派。
+        ;; 实测 1 万元素需 1.87ms（约 187ns/元素，numpy 约 0.16ms）。
+        ;; 一维是最常见形态（列表/向量的字面量构造），这里把「数据数组」
+        ;; 「下标」「转换算子」三者都声明并内联，循环体可直接编译成
+        ;; 「读一个、转一个、存一个」。多维情形仍走 FILL-TENSOR，语义不变。
+        (when (= (length shape) 1)
+          (macrolet ((fill1d (lt cast)
+                       `(let ((dv (the (simple-array ,lt (*)) data))
+                              (i 0))
+                          (declare (type (simple-array ,lt (*)) dv)
+                                   (type fixnum i))
+                          (flet ((put (x)
+                                   (declare (type real x))
+                                   (setf (aref dv i) ,cast)
+                                   (incf i)))
+                            (declare (inline put))
+                            (etypecase contents
+                              (list (dolist (e contents) (put e)))
+                              (vector (loop for e across contents do (put e))))))))
+            (cond ((eq dtype :float64) (fill1d double-float (coerce x 'double-float)))
+                  ((eq dtype :float32) (fill1d single-float (coerce x 'single-float)))
+                  ((eq dtype :int64)   (fill1d (signed-byte 64)  (%wrap-int64 x)))
+                  ((eq dtype :int32)   (fill1d (signed-byte 32)  (%wrap-int32 x)))
+                  ((eq dtype :int16)   (fill1d (signed-byte 16)  (%wrap-int16 x)))
+                  ((eq dtype :int8)    (fill1d (signed-byte 8)   (%wrap-int8 x)))
+                  ((eq dtype :uint8)   (fill1d (unsigned-byte 8)  (%wrap-uint8 x)))
+                  ((eq dtype :uint16)  (fill1d (unsigned-byte 16) (%wrap-uint16 x)))
+                  (t (fill-tensor data contents shape strides 0)))
+            (return-from vt-from-sequence
+              (%make-vt :data data :shape shape :strides strides
+                        :offset 0 :dtype dtype))))
         (fill-tensor data contents shape strides 0)
         (%make-vt :data data :shape shape :strides strides :offset 0 :dtype dtype)))))
 

@@ -114,7 +114,16 @@
 ;;; 用于 vt-map / vt-reduce / vt-numpy-sort / vt-unique 等已 with-float-safe 的热路径。
 ;;; ------------------------------------------------------------------
 
-(declaim (inline %nan-p %inf-p %pos-inf-p %neg-inf-p))
+(declaim (inline %nan-p %inf-p %pos-inf-p %neg-inf-p %nan-or-inf-p))
+
+;;; 类型声明（性能）：四个谓词分别只在 double-float / single-float 上被调用，
+;;; 返回恒为 boolean。声明后调用点不再需要把结果当 T 装箱，也可被内联进
+;;; 比较/裁剪/极值热循环的布尔分支中。
+(declaim (ftype (function (t) boolean) %nan-p)
+         (ftype (function (t) boolean) %inf-p)
+         (ftype (function (t) boolean) %pos-inf-p)
+         (ftype (function (t) boolean) %neg-inf-p)
+         (ftype (function (t) boolean) %nan-or-inf-p))
 
 (defun %nan-p (x)
   "快速 NaN 判定：IEEE 754 中 NaN != NaN。调用方需屏蔽浮点陷阱。"
@@ -137,8 +146,13 @@
 	   (> (abs x) most-positive-double-float))))
 
 (declaim (inline %safe-truncate))
+;;; 类型声明（性能）：输入恒为实数，输出恒为整数。这是所有窄化转换
+;;; （%wrap-* → %coerce-* → 写入 specialized-array）的第一跳，缺了它
+;;; 整条链路都退化为 GENERIC-TRUNCATE + 装箱。
+(declaim (ftype (function (real) integer) %safe-truncate))
 (defun %safe-truncate (v)
   "把数值截断为整数；浮点 NaN/±Inf 返回 0。调用方需屏蔽浮点陷阱。"
+  (declare (type real v))
   (if (floatp v)
       (if (%nan-or-inf-p v)
 	  0

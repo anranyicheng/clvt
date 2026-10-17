@@ -9,6 +9,44 @@
 
 (in-package :clvt)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defparameter +vt-elem-types+
+    '(double-float single-float
+      (signed-byte 64) (signed-byte 32)
+      (signed-byte 16) (signed-byte 8)
+      (unsigned-byte 16) (unsigned-byte 8))
+    "全部 8 种 dtype 对应的 CL 数组元素类型（顺序：宽 → 窄，命中概率降序）。")
+
+  (defparameter +vt-mask-out-types+
+    '((signed-byte 8))
+    "窄整型输出类型矩阵。按 CONVENTIONS §3.1「比较/逻辑运算返回 :int8，
+     取值 0/1」，布尔掩码的规范输出只有 :int8 一种；int16/uint8/uint16
+     输出仅在用户显式指定 :dtype 时出现，属罕见路径，仍由 vt-map 兜底。
+     矩阵保持单元素是有意的：每多一格就多一份完整内联循环，而
+     vt-fast-map 在库内有 200+ 展开点，盲扩会让编译期代码量指数级放大
+     （实测 8x8 全展开会直接 Heap exhausted）。")
+
+  (defparameter +vt-strided-elem-types+
+    '(double-float single-float (signed-byte 64) (signed-byte 32))
+    "非连续/广播快路径支持的元素类型。窄整型的非连续运算属罕见路径，
+     走 vt-map 兜底（语义不变，仅性能差异），以控制展开体积。")
+
+  (defparameter +vt-mask-in-types+
+    '(double-float single-float (signed-byte 64) (signed-byte 32))
+    "窄整型输出时可配的输入类型（数据源；窄整型输入仍走同类型路径）。")
+
+  (defun %elem-type-cond (res-form kernel-name args)
+    "生成按 RES 元素类型 8 路分派的 COND 子句列表（连续快路径）。"
+    (loop for lt in +vt-elem-types+
+          collect `((equal (array-element-type ,res-form) ',lt)
+                    (,kernel-name ,lt ,@args))))
+
+  (defun %elem-type-cond-strided (res-form kernel-name args)
+    "生成按 RES 元素类型 4 路分派的 COND 子句列表（非连续/广播快路径）。"
+    (loop for lt in +vt-strided-elem-types+
+          collect `((equal (array-element-type ,res-form) ',lt)
+                    (,kernel-name ,lt ,@args)))))
+
 ;;; ------------------------------------------------------------------
 ;;; 逐元素映射：vt-map
 ;;; ------------------------------------------------------------------
@@ -91,10 +129,21 @@
                  (5 (funcall fn (aref vals 0) (aref vals 1) (aref vals 2) (aref vals 3) (aref vals 4)))
                  (otherwise (apply fn (coerce vals 'list))))))
       (macrolet ((cast-to (lt form)
+		   ;; 类型声明（性能）：6 种整数存储类型必须全部走 %coerce-*，
+		   ;; 否则窄整型（int8/int16/uint8/uint16）落到 (truncate REAL)
+		   ;; 的泛型路径，写回 specialized-array 前还要装箱。
 		   (cond ((and (consp lt) (equal lt '(signed-byte 64)))
                           `(%coerce-int64 ,form))
                          ((and (consp lt) (equal lt '(signed-byte 32)))
                           `(%coerce-int32 ,form))
+                         ((and (consp lt) (equal lt '(signed-byte 16)))
+                          `(%coerce-int16 ,form))
+                         ((and (consp lt) (equal lt '(signed-byte 8)))
+                          `(%coerce-int8 ,form))
+                         ((and (consp lt) (equal lt '(unsigned-byte 16)))
+                          `(%coerce-uint16 ,form))
+                         ((and (consp lt) (equal lt '(unsigned-byte 8)))
+                          `(%coerce-uint8 ,form))
                          ((subtypep lt 'integer)
                           `(truncate ,form))
                          (t
@@ -184,13 +233,19 @@
 		      (contig (contig-any ,lt))
 		      (t (noncontig ,lt))))
 		 )
-        (cond ((equal (array-element-type res-data) 'double-float) (gen double-float))
-              ((equal (array-element-type res-data) 'single-float) (gen single-float))
+        ;; 结果缓冲区按**实际**元素类型 8 路派发（先前只枚举了 4 种物理存储
+        ;; 类型，窄整型结果会掉进下面那个泛型 aref 兜底分支）。
+        (cond ((equal (array-element-type res-data) 'double-float)     (gen double-float))
+              ((equal (array-element-type res-data) 'single-float)     (gen single-float))
               ((equal (array-element-type res-data) '(signed-byte 64)) (gen (signed-byte 64)))
               ((equal (array-element-type res-data) '(signed-byte 32)) (gen (signed-byte 32)))
+              ((equal (array-element-type res-data) '(signed-byte 16)) (gen (signed-byte 16)))
+              ((equal (array-element-type res-data) '(signed-byte 8))  (gen (signed-byte 8)))
+              ((equal (array-element-type res-data) '(unsigned-byte 16)) (gen (unsigned-byte 16)))
+              ((equal (array-element-type res-data) '(unsigned-byte 8))  (gen (unsigned-byte 8)))
               (t
-	       ;; 非特化类型（int8/int16/uint8/uint16 等）：按 dtype 回绕后写入，
-               ;; 避免溢出写入 specialized-array 崩溃
+	       ;; 兜底：res 底层数组类型不在 8 种之内（防御性分支，正常不可达）。
+               ;; 按 dtype 回绕后写入，避免溢出写入 specialized-array 崩溃
                (let ((ptrs (copy-seq in-offsets))
                      (vals (make-array n))
                      (indices (make-array rank :element-type 'fixnum :initial-element 0))
@@ -237,11 +292,22 @@
 
 (defmacro %cast-to (lt form)
   ;; "内联类型转换：整数截断，浮点 coerce。"
-  "内联类型转换：整数类型走安全 coerce/回绕，浮点 coerce。"
-  (declare (optimize (speed 3) (safety 0)))
-  (cond ((equal lt '(signed-byte 64)) `(%coerce-int64 ,form))
-        ((equal lt '(signed-byte 32)) `(%coerce-int32 ,form))
-        ((subtypep lt 'integer)        `(truncate ,form))
+  "内联类型转换：整数类型走安全 coerce/回绕，浮点 coerce。
+
+   类型声明（性能）：必须覆盖**全部 6 种**整数存储类型。此前只特化
+   (signed-byte 64)/32，其余整数（int8/int16/uint8/uint16）落到
+   `(truncate ,form)` —— 参数是 REAL 时 `truncate` 只能走 GENERIC-TRUNCATE，
+   返回 INTEGER 后还要装箱才能写回 specialized-array。这是比较运算
+   （结果 :int8 布尔掩码）比同类算术慢 20x 的根因。改为走
+   dtype.lisp 里已声明返回类型的 %coerce-* 后，写回点可直接证出
+   元素类型，bounds/范围检查与装箱一并消失。"
+  (cond ((equal lt '(signed-byte 64))   `(%coerce-int64  ,form))
+        ((equal lt '(signed-byte 32))   `(%coerce-int32  ,form))
+        ((equal lt '(signed-byte 16))   `(%coerce-int16  ,form))
+        ((equal lt '(signed-byte 8))    `(%coerce-int8   ,form))
+        ((equal lt '(unsigned-byte 16)) `(%coerce-uint16 ,form))
+        ((equal lt '(unsigned-byte 8))  `(%coerce-uint8  ,form))
+        ((subtypep lt 'integer)         `(truncate ,form))
         (t                              `(coerce ,form ',lt))))
 
 (defmacro %inline1-loop (lt op a res)
@@ -432,61 +498,198 @@
                      (decf d)
                      (when (< d 0) (return-from outer))))))))))))
 
+;;; ==================================================================
+;;; 元素类型派发表（编译期）
+;;;
+;;; 全部 8 种逻辑 dtype 的物理元素类型。这是「声明驱动」优化的中枢：
+;;; 只有把 (the (simple-array <lt> (*)) ...) 真正落到每个数组变量上，
+;;; SBCL 才会生成特化的 AREF 而不是泛型路径（实测泛型路径慢 20x）。
+;;; 此前只列举了 4 种物理存储类型，凡是结果 dtype 为
+;;; int8/int16/uint8/uint16 的运算（比较运算的布尔掩码、布尔逻辑、
+;;; isnan/isfinite 族）都会掉到最后那个 (t ...) 分支回到 vt-map。
+;;; ==================================================================
+
 (defmacro %vt-inline1-strided-fast (op a res)
-  "一元非连续/广播快路径。"
-  `(let ((rd (vt-data ,res)))
-     (cond ((equal (array-element-type rd) 'double-float)     (%inline1-strided double-float ,op ,a ,res))
-           ((equal (array-element-type rd) 'single-float)     (%inline1-strided single-float ,op ,a ,res))
-           ((equal (array-element-type rd) '(signed-byte 64)) (%inline1-strided (signed-byte 64) ,op ,a ,res))
-           ((equal (array-element-type rd) '(signed-byte 32)) (%inline1-strided (signed-byte 32) ,op ,a ,res))
-           (t (vt-map (function ,op) ,a :out ,res)))))
+  "一元非连续/广播快路径（按输出元素类型 8 路派发，内联 op）。"
+  (let ((rd (gensym "RD")))
+    `(let ((,rd (vt-data ,res)))
+       (cond ,@(%elem-type-cond-strided rd '%inline1-strided (list op a res))
+             (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline2-strided-fast (op a b res)
-  "二元非连续/广播快路径。"
-  `(let ((rd (vt-data ,res)))
-     (cond ((equal (array-element-type rd) 'double-float)     (%inline2-strided double-float ,op ,a ,b ,res))
-           ((equal (array-element-type rd) 'single-float)     (%inline2-strided single-float ,op ,a ,b ,res))
-           ((equal (array-element-type rd) '(signed-byte 64)) (%inline2-strided (signed-byte 64) ,op ,a ,b ,res))
-           ((equal (array-element-type rd) '(signed-byte 32)) (%inline2-strided (signed-byte 32) ,op ,a ,b ,res))
-           (t (vt-map (function ,op) ,a ,b :out ,res)))))
+  "二元非连续/广播快路径（按输出元素类型 8 路派发，内联 op）。"
+  (let ((rd (gensym "RD")))
+    `(let ((,rd (vt-data ,res)))
+       (cond ,@(%elem-type-cond-strided rd '%inline2-strided (list op a b res))
+             (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline3-fast (op a b c res)
-  "三元连续快路径。"
-  `(let ((rd (vt-data ,res)))
-     (cond ((equal (array-element-type rd) 'double-float)     (%inline3-loop double-float ,op ,a ,b ,c ,res))
-           ((equal (array-element-type rd) 'single-float)     (%inline3-loop single-float ,op ,a ,b ,c ,res))
-           ((equal (array-element-type rd) '(signed-byte 64)) (%inline3-loop (signed-byte 64) ,op ,a ,b ,c ,res))
-           ((equal (array-element-type rd) '(signed-byte 32)) (%inline3-loop (signed-byte 32) ,op ,a ,b ,c ,res))
-           (t (vt-map (function ,op) ,a ,b ,c :out ,res)))))
+  "三元连续快路径（按输出元素类型 8 路派发，内联 op）。"
+  (let ((rd (gensym "RD")))
+    `(let ((,rd (vt-data ,res)))
+       (cond ,@(%elem-type-cond rd '%inline3-loop (list op a b c res))
+             (t (vt-map (function ,op) ,a ,b ,c :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline3-strided-fast (op a b c res)
-  "三元非连续/广播快路径。"
-  `(let ((rd (vt-data ,res)))
-     (cond ((equal (array-element-type rd) 'double-float)     (%inline3-strided double-float ,op ,a ,b ,c ,res))
-           ((equal (array-element-type rd) 'single-float)     (%inline3-strided single-float ,op ,a ,b ,c ,res))
-           ((equal (array-element-type rd) '(signed-byte 64)) (%inline3-strided (signed-byte 64) ,op ,a ,b ,c ,res))
-           ((equal (array-element-type rd) '(signed-byte 32)) (%inline3-strided (signed-byte 32) ,op ,a ,b ,c ,res))
-           (t (vt-map (function ,op) ,a ,b ,c :out ,res)))))
+  "三元非连续/广播快路径（按输出元素类型 8 路派发，内联 op）。"
+  (let ((rd (gensym "RD")))
+    `(let ((,rd (vt-data ,res)))
+       (cond ,@(%elem-type-cond-strided rd '%inline3-strided (list op a b c res))
+             (t (vt-map (function ,op) ,a ,b ,c :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline1-fast (op a res)
-  (declare (optimize (speed 3) (safety 0)))
-  "一元连续快路径（按输出类型派发，内联 op）。"
-  `(let ((rd (vt-data ,res)))
-     (cond ((equal (array-element-type rd) 'double-float)	    (%inline1-loop double-float ,op ,a ,res))
-           ((equal (array-element-type rd) 'single-float)	    (%inline1-loop single-float ,op ,a ,res))
-           ((equal (array-element-type rd) '(signed-byte 64))	    (%inline1-loop (signed-byte 64) ,op ,a ,res))
-           ((equal (array-element-type rd) '(signed-byte 32))	    (%inline1-loop (signed-byte 32) ,op ,a ,res))
-           (t (vt-map (function ,op) ,a :out ,res)))))
+  "一元连续快路径（按输出元素类型 8 路派发，内联 op）。"
+  (let ((rd (gensym "RD")))
+    `(let ((,rd (vt-data ,res)))
+       (cond ,@(%elem-type-cond rd '%inline1-loop (list op a res))
+             (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline2-fast (op a b res)
-  "二元连续快路径（按输出类型派发，内联 op）。"
-  (declare (optimize (speed 3) (safety 0)))
-  `(let ((rd (vt-data ,res)))
-     (cond ((equal (array-element-type rd) 'double-float)     (%inline2-loop double-float ,op ,a ,b ,res))
-           ((equal (array-element-type rd) 'single-float)     (%inline2-loop single-float ,op ,a ,b ,res))
-           ((equal (array-element-type rd) '(signed-byte 64)) (%inline2-loop (signed-byte 64) ,op ,a ,b ,res))
-           ((equal (array-element-type rd) '(signed-byte 32)) (%inline2-loop (signed-byte 32) ,op ,a ,b ,res))
-           (t (vt-map (function ,op) ,a ,b :out ,res)))))
+  "二元连续快路径（按输出元素类型 8 路派发，内联 op）。"
+  (let ((rd (gensym "RD")))
+    `(let ((,rd (vt-data ,res)))
+       (cond ,@(%elem-type-cond rd '%inline2-loop (list op a b res))
+             (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
+
+;;; ==================================================================
+;;; 混合类型快路径：窄整型输出（布尔掩码）
+;;;
+;;; 为什么必须单独一组：`%vt-inline*-fast` 的前置条件是
+;;; 「全部输入与输出的元素类型相同」（dtype-check），而比较/判定类函数
+;;; 天然是 float64/int64 进、int8 出 —— 永远进不去那条路，只能回退
+;;; vt-map 的 funcall + 泛型 aref。实测该回退在 1M float64 上
+;;; vt-< 达 51ms、vt-isclose 达 445ms（比 numpy 慢 270x）。
+;;;
+;;; 本组把「输入类型」与「输出类型」两组类型声明并置，读写两端同时特化；
+;;; 矩阵限制在真实会出现的组合（4 种数据源 × 4 种窄输出 = 16 格），
+;;; 避免 8×8 全展开把编译期代码量放大数十倍。
+;;; 无法命中时仍回退 vt-map，语义不变（铁律 2）。
+;;; ==================================================================
+
+(defmacro %mask1-loop (out-lt in-lt op a res)
+  "窄整型输出的一元连续内联循环：读 IN-LT → 算 OP → 按 OUT-LT 回绕写回。"
+  `(let ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
+         (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
+         (p0 (vt-offset ,a))
+         (s0 (if (= (vt-size ,a) 1) 0 1))
+         (n (the fixnum (vt-size ,res)))
+         (op (vt-offset ,res)))
+     (declare (type (simple-array ,out-lt (*)) od)
+              (type (simple-array ,in-lt (*)) d0)
+              (type fixnum p0 s0 n op))
+     (dotimes (i n)
+       (declare (type fixnum i))
+       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0))))
+       (incf op) (incf p0 s0))))
+
+(defmacro %mask2-loop (out-lt in-lt op a b res)
+  "窄整型输出的二元连续内联循环。"
+  `(let ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
+         (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
+         (d1 (the (simple-array ,in-lt (*)) (vt-data ,b)))
+         (p0 (vt-offset ,a)) (p1 (vt-offset ,b))
+         (s0 (if (= (vt-size ,a) 1) 0 1))
+         (s1 (if (= (vt-size ,b) 1) 0 1))
+         (n (the fixnum (vt-size ,res)))
+         (op (vt-offset ,res)))
+     (declare (type (simple-array ,out-lt (*)) od)
+              (type (simple-array ,in-lt (*)) d0 d1)
+              (type fixnum p0 p1 s0 s1 n op))
+     (dotimes (i n)
+       (declare (type fixnum i))
+       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1))))
+       (incf op) (incf p0 s0) (incf p1 s1))))
+
+(defmacro %mask2-strided (out-lt in-lt op a b res)
+  "窄整型输出 + 任意 strides（含广播）的二元内联循环。"
+  `(let* ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
+          (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
+          (d1 (the (simple-array ,in-lt (*)) (vt-data ,b)))
+          (rs (coerce (vt-strides ,res) 'simple-vector))
+          (s0 (coerce (vt-broadcast-strides
+                       (vt-shape ,a) (vt-shape ,res) (vt-strides ,a))
+                      'simple-vector))
+          (s1 (coerce (vt-broadcast-strides
+                       (vt-shape ,b) (vt-shape ,res) (vt-strides ,b))
+                      'simple-vector))
+          (dims (coerce (vt-shape ,res) 'simple-vector))
+          (rank (the fixnum (length dims)))
+          (p0 (vt-offset ,a)) (p1 (vt-offset ,b))
+          (op (vt-offset ,res)))
+     (declare (type (simple-array ,out-lt (*)) od)
+              (type (simple-array ,in-lt (*)) d0 d1)
+              (type simple-vector rs s0 s1 dims)
+              (type fixnum rank p0 p1 op))
+     (if (= rank 0)
+         (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1))))
+         (unless (= (the fixnum (vt-size ,res)) 0)
+           (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
+             (declare (type (simple-array fixnum (*)) idx))
+             (block outer
+               (loop
+                 (setf (aref od op)
+                       (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1))))
+                 (let ((d (1- rank)))
+                   (declare (type fixnum d))
+                   (loop
+                     (incf (aref idx d))
+                     (incf p0 (svref s0 d))
+                     (incf p1 (svref s1 d))
+                     (incf op (svref rs d))
+                     (when (< (aref idx d) (svref dims d)) (return))
+                     (let ((dim (svref dims d)))
+                       (decf p0 (* dim (svref s0 d)))
+                       (decf p1 (* dim (svref s1 d)))
+                       (decf op (* dim (svref rs d)))
+                       (setf (aref idx d) 0)
+                       (decf d)
+                       (when (< d 0) (return-from outer))))))))))))
+
+(defmacro %vt-mask1-fast (op a res)
+  "一元「窄整型输出」快路径（4 种输出 × 4 种输入 = 16 格）。"
+  (let ((rd (gensym "RD")) (ea (gensym "EA")))
+    `(let* ((,rd (vt-data ,res))
+            (,ea (array-element-type (vt-data ,a))))
+       (cond
+         ,@(loop for olt in +vt-mask-out-types+
+                 nconc (loop for ilt in +vt-mask-in-types+
+                             collect
+                             `((and (equal (array-element-type ,rd) ',olt)
+                                    (equal ,ea ',ilt))
+                               (%mask1-loop ,olt ,ilt ,op ,a ,res))))
+         (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
+
+(defmacro %vt-mask2-fast (op a b res)
+  "二元「窄整型输出」连续快路径（4 种输出 × 4 种输入 = 16 格）。"
+  (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
+    `(let* ((,rd (vt-data ,res))
+            (,ea (array-element-type (vt-data ,a)))
+            (,eb (array-element-type (vt-data ,b))))
+       (cond
+         ,@(loop for olt in +vt-mask-out-types+
+                 nconc (loop for ilt in +vt-mask-in-types+
+                             collect
+                             `((and (equal (array-element-type ,rd) ',olt)
+                                    (equal ,ea ',ilt)
+                                    (equal ,eb ',ilt))
+                               (%mask2-loop ,olt ,ilt ,op ,a ,b ,res))))
+         (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
+
+(defmacro %vt-mask2-strided-fast (op a b res)
+  "二元「窄整型输出」+ 非连续/广播快路径（4 种输出 × 4 种输入 = 16 格）。"
+  (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
+    `(let* ((,rd (vt-data ,res))
+            (,ea (array-element-type (vt-data ,a)))
+            (,eb (array-element-type (vt-data ,b))))
+       (cond
+         ,@(loop for olt in +vt-mask-out-types+
+                 nconc (loop for ilt in +vt-mask-in-types+
+                             collect
+                             `((and (equal (array-element-type ,rd) ',olt)
+                                    (equal ,ea ',ilt)
+                                    (equal ,eb ',ilt))
+                               (%mask2-strided ,olt ,ilt ,op ,a ,b ,res))))
+         (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro vt-fast-map (fn &rest args)
   "编译期内联已知算子的逐元素映射（一元/二元/三元）。
@@ -538,24 +741,45 @@
 			   ,(let* ((dtype-check
                                      `(and ,@(loop for tv in tvs
 						   collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
+				   ;; 「可内联连续循环」的判定（类型声明驱动）。
+				   ;; 注意 (or (= (vt-size ,tv) 1) ...)：标量/0 维/单元素输入
+				   ;; 走的是 stride=0 的虚拟重复读，`%inline*-loop` 已按
+				   ;; (if (= (vt-size a) 1) 0 1) 显式支持。
+				   ;; 此前要求「输入形状必须等于输出形状」，于是
+				   ;; (vt-+ 1M张量 2.5d0) 这种最常见的标量广播被判定为
+				   ;; 不连续，掉进 strides/odometer 路径，实测慢 20x。
 				   (simple-check
                                      `(and (vt-contiguous-p res)
 					   ,@(loop for tv in tvs
-						   collect `(and (vt-contiguous-p ,tv)
-								 (equal (vt-shape ,tv) out-shape))))))
+						   collect `(or (= (vt-size ,tv) 1)
+								 (and (vt-contiguous-p ,tv)
+								      (equal (vt-shape ,tv) out-shape))))))
+				   (maskable
+                                     `(member (vt-dtype res)
+					      '(:int8 :int16 :uint8 :uint16))))
                               (cond
 				((= n 1)
-				 `(if ,dtype-check
-                                      (if ,simple-check
-					  (%vt-inline1-fast ,op ,(first tvs) res)
-					  (%vt-inline1-strided-fast ,op ,(first tvs) res))
-                                      (vt-map (function ,op) ,(first tvs) :out res :dtype final-dtype)))
+				 `(cond
+				    (,dtype-check
+				     (if ,simple-check
+					 (%vt-inline1-fast ,op ,(first tvs) res)
+					 (%vt-inline1-strided-fast ,op ,(first tvs) res)))
+				    ((and ,simple-check ,maskable)
+				     (%vt-mask1-fast ,op ,(first tvs) res))
+				    (t (vt-map (function ,op) ,(first tvs)
+					       :out res :dtype final-dtype))))
 				((= n 2)
-				 `(if ,dtype-check
-                                      (if ,simple-check
-					  (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
-					  (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res))
-                                      (vt-map (function ,op) ,(first tvs) ,(second tvs) :out res :dtype final-dtype)))
+				 `(cond
+				    (,dtype-check
+				     (if ,simple-check
+					 (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
+					 (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res)))
+				    (,maskable
+				     (if ,simple-check
+					 (%vt-mask2-fast ,op ,(first tvs) ,(second tvs) res)
+					 (%vt-mask2-strided-fast ,op ,(first tvs) ,(second tvs) res)))
+				    (t (vt-map (function ,op) ,(first tvs) ,(second tvs)
+					       :out res :dtype final-dtype))))
 				(t
 				 `(if ,dtype-check
                                       (if ,simple-check
