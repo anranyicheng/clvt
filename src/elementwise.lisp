@@ -925,19 +925,19 @@ lambda 算子请使用 %%float-map-fn"))
 
 (defun vt-bit-and (t1 t2 &key out dtype)
   "逐元素按位与 logand。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-fast-map #'logand t1 t2 :dtype dtype :out out))
+  (vt-map #'logand (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-ior (t1 t2 &key out dtype)
   "逐元素按位或 logior。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-fast-map #'logior t1 t2 :dtype dtype :out out))
+  (vt-map #'logior (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-xor (t1 t2 &key out dtype)
   "逐元素按位异或 logxor。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-fast-map #'logxor t1 t2 :dtype dtype :out out))
+  (vt-map #'logxor (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-not (vt &key out dtype)
   "逐元素按位取反 lognot。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-fast-map #'lognot vt :dtype dtype :out out))
+  (vt-map #'lognot vt :dtype dtype :out out))
 
 (defun vt-left-shift (vt shift &key out dtype)
   "逐元素左移 SHIFT 位（ash x shift）。SHIFT 为整数标量。

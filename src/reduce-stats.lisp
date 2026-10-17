@@ -1103,14 +1103,12 @@
                (n (the fixnum (vt-size result)))
                (doff (the fixnum (vt-offset result)))
                (conv (vt-cast-fun final-dtype))
-               (cum (coerce init-val lisp-type))
-               (i 0))
-          (declare (type fixnum soff n doff i))
-          (dotimes (k n)
-            (declare (ignore k))
+               (cum (coerce init-val lisp-type)))
+          (declare (type fixnum soff n doff))
+          (dotimes (i n)
+            (declare (type fixnum i))
             (setf cum (funcall op cum (aref src (+ soff i))))
-            (setf (aref dst (+ doff i)) (funcall conv cum))
-            (incf i))))
+            (setf (aref dst (+ doff i)) (funcall conv cum)))))
     result))
 
 (defun vt-cumsum (tensor &key axis dtype out)
@@ -1373,8 +1371,120 @@
 ;;; 排序
 ;;; ------------------------------------------------------------------
 
+;;; ------------------------------------------------------------------
+;;; 连续 fiber 的原地升序排序（vt-sort 快路径的引擎）
+;;;
+;;; 为什么单独写引擎：通用路径把每个 fiber 摊成 **list** 再 stable-sort，
+;;; 1M 元素要 cons 1M 个 cell、再做指针追逐式归并 —— 实测 520ms
+;;; （numpy.sort 5.5ms）。而 SBCL 通用 SORT 作用在 specialized-array 上
+;;; 反而更慢（1057ms，因为它走泛型序列协议）。所以这里按元素类型各生成
+;;; 一份「数组 + 下标」的内核：
+;;;   · 长度 ≤ 32 → 插入排序（小 fiber 免去 scratch 开销，典型场景是
+;;;     vt-median / vt-sort 沿轴排序长度几十的 fiber）
+;;;   · 更长 → 自底向上稳定归并（顺序访存、无 cons）
+;;; 语义与通用路径逐位一致：升序；NaN 统一排在各 fiber 末尾，且保持
+;;; 原有相对顺序（稳定压缩 + 尾部回填）。铁律 1/2 不变。
+;;; ------------------------------------------------------------------
+(macrolet ((def-sorters (sorter msort lt floatp)
+             `(progn
+                (defun ,msort (v base aux n)
+                  "对 V 的 [BASE, BASE+N) 段做自底向上稳定归并排序，AUX 为等长 scratch。"
+                  (declare (type (simple-array ,lt (*)) v aux)
+                           (type fixnum base n))
+                  (let ((w 1))
+                    (declare (type fixnum w))
+                    (loop while (< w n) do
+                      (let ((lo 0))
+                        (declare (type fixnum lo))
+                        (loop while (< lo n) do
+                          (let* ((mid (min (+ lo w) n))
+                                 (hi (min (+ lo w w) n))
+                                 (i lo) (j mid) (k lo))
+                            (declare (type fixnum mid hi i j k))
+                            (loop while (and (< i mid) (< j hi)) do
+                              (if (< (aref v (+ base j)) (aref v (+ base i)))
+                                  (progn (setf (aref aux k) (aref v (+ base j))) (incf j))
+                                  (progn (setf (aref aux k) (aref v (+ base i))) (incf i)))
+                              (incf k))
+                            (loop while (< i mid) do
+                              (setf (aref aux k) (aref v (+ base i))) (incf i) (incf k))
+                            (loop while (< j hi) do
+                              (setf (aref aux k) (aref v (+ base j))) (incf j) (incf k))
+                            (replace v aux :start1 (+ base lo) :end1 (+ base hi)
+                                       :start2 lo :end2 hi))
+                          (incf lo (* 2 w))))
+                      (setf w (* 2 w)))))
+                (defun ,sorter (data n count)
+                  "把 DATA 中 COUNT 段、每段长度 N 的连续 fiber 各自原地升序排序。"
+                  (declare (type (simple-array ,lt (*)) data)
+                           (type fixnum n count))
+                  (with-float-safe
+                    (let ((aux (make-array (max n 1) :element-type ',lt))
+                          ,@(when floatp
+                              `((nanv (make-array (max n 1) :element-type ',lt)))))
+                      (declare (type (simple-array ,lt (*)) aux))
+                      (dotimes (c count)
+                        (let* ((base (* c n))
+                               (k n)
+                               ,@(when floatp `((m 0))))
+                          (declare (type fixnum base k))
+                          ,@(when floatp
+                              `((declare (type fixnum m))
+                                ;; 稳定压缩：非 NaN 依次前移，NaN 收集备用
+                                (let ((w 0))
+                                  (declare (type fixnum w))
+                                  (dotimes (i n)
+                                    (let ((x (aref data (+ base i))))
+                                      (if (not (= x x))
+                                          (progn (setf (aref nanv m) x) (incf m))
+                                          (progn (setf (aref data (+ base w)) x)
+                                                 (incf w)))))
+                                  (setf k w))))
+                          (when (> k 1)
+                            (if (<= k 32)
+                                ;; ---- 插入排序（小 fiber）----
+                                (dotimes (ii (1- k))
+                                  (let* ((i (1+ ii))
+                                         (x (aref data (+ base i)))
+                                         (j (1- i)))
+                                    (declare (type fixnum i j))
+                                    (loop while (and (>= j 0)
+                                                     (< x (aref data (+ base j)))) do
+                                      (setf (aref data (+ base (1+ j))) (aref data (+ base j)))
+                                      (decf j))
+                                    (setf (aref data (+ base (1+ j))) x)))
+                                ;; ---- 归并排序（大 fiber）----
+                                (progn (,msort data base aux k)
+                                       (replace data aux
+                                                :start1 base :end1 (+ base k)
+                                                :start2 0 :end2 k))))
+                          ,@(when floatp
+                              `((dotimes (i m)
+                                  (setf (aref data (+ base k i)) (aref nanv i)))))))))))))
+  (def-sorters %sort-fibers-df %msort-df double-float t)
+  (def-sorters %sort-fibers-sf %msort-sf single-float t)
+  (def-sorters %sort-fibers-i64 %msort-i64 (signed-byte 64) nil)
+  (def-sorters %sort-fibers-i32 %msort-i32 (signed-byte 32) nil))
+
+(defun %sort-fibers (data n count)
+  "按 DATA 的实际元素类型分派到对应的 fiber 排序内核；其余类型返回 NIL
+   （调用方据此回退通用 list 路径，铁律 2）。"
+  (declare (type fixnum n count))
+  (let ((et (array-element-type data)))
+    (cond ((equal et 'double-float)     (%sort-fibers-df data n count) t)
+          ((equal et 'single-float)     (%sort-fibers-sf data n count) t)
+          ((equal et '(signed-byte 64)) (%sort-fibers-i64 data n count) t)
+          ((equal et '(signed-byte 32)) (%sort-fibers-i32 data n count) t)
+          (t nil))))
+
 (defun vt-sort (tensor &key (axis -1))
   "升序排序（对标 numpy.sort）。AXIS 缺省 -1；NaN 排在末尾。"
+  ;; ===== 快路径：axis=nil 且输入连续 =====
+  ;; 展平后就是一整段连续 run，直接原地排序；结果仍是一维（与原实现一致）。
+  (when (and (null axis) (plusp (vt-size tensor)) (vt-contiguous-p tensor))
+    (let ((r (vt-copy (vt-flatten tensor))))
+      (when (%sort-fibers (vt-data r) (the fixnum (vt-size r)) 1)
+        (return-from vt-sort r))))
   (if axis
       (let* ((shape (vt-shape tensor))
              (rank (length shape))
@@ -1386,6 +1496,16 @@
              (result (vt-copy tensor))
              (out-strides (vt-strides result))
              (out-data (vt-data result)))
+        ;; ===== 快路径：排序轴是最后一维 + 结果连续 =====
+        ;; 此时每个 fiber 在 result 缓冲区里就是一段**连续 run**，
+        ;; 可以直接原地排序，无需 list 化。判定不成立则落到下方通用路径。
+        (when (and (= ax (1- rank))
+                   (plusp ax-dim)
+                   (eq (vt-offset result) 0)
+                   (vt-contiguous-p result))
+          (when (%sort-fibers out-data ax-dim
+                              (the fixnum (truncate (the fixnum (vt-size result)) ax-dim)))
+            (return-from vt-sort result)))
         (labels ((recurse (depth in-ptr out-ptr)
                    (cond ((< depth ax)
                           (let ((dim (nth depth shape))
