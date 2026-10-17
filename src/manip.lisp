@@ -196,6 +196,32 @@
       (vt-view vt (list (vt-size vt)))
       (vt-flatten vt)))
 
+;;; ------------------------------------------------------------------
+;;; 扁平化 + 强制 offset=0（v0.4.5 修复一类静默错误）
+;;;
+;;; vt-ravel 对**连续**输入返回的是 vt-view，它**保留原 offset**。于是所有
+;;; 「先展平、再 (aref (vt-data flat) i) 按扁平下标直接取数」的代码，一旦
+;;; 遇到带 offset 的切片视图（base[a:b]），读到的都是**基数组开头**的数据
+;;; —— 不报错，只给出错误答案。
+;;;
+;;; 合并态实测受害者：
+;;;   (vt-take (vt-slice [100 200 300 5 1 9] 3 6) '(0 2) :axis nil)
+;;;     => (100.0d0 300.0d0)    numpy: (5.0d0 9.0d0)
+;;; 第 5 轮的 vt-argsort(:axis nil) 是同一根因（已在那边单独修掉）。
+;;;
+;;; 约定：凡是「扁平下标 + 裸 AREF」的路径一律先过本函数；用 vt-ref 的路径
+;;; （自带 offset 计算）不受影响，无需改动。
+;;; ------------------------------------------------------------------
+(defun %flat-offset0 (tensor)
+  "展平成 offset=0、stride=1 的一维张量；能零拷贝就零拷贝。
+   VT-FLATTEN 恒返回副本（offset=0），故非连续/带 offset 的情况直接用它。"
+  (cond
+    ((and (vt-contiguous-p tensor) (zerop (vt-offset tensor)))
+     (if (= (length (vt-shape tensor)) 1)
+         tensor
+         (vt-view tensor (list (vt-size tensor)))))
+    (t (vt-flatten tensor))))
+
 (defun vt-broadcast-to (vt new-shape)
   "广播到新形状（零拷贝视图）。"
   (let ((bs (vt-broadcast-shapes (vt-shape vt) new-shape)))
@@ -408,11 +434,17 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                          (cols (svref shape-vec (1+ depth)))
                          (str-r (svref strs-vec depth))
                          (str-c (svref strs-vec (1+ depth))))
+                     ;; 同上：清零 [0, r+k) 这一段连续区间
                      (loop for r from 0 below rows
                            for rp = ptr then (+ rp str-r)
-                           do (loop for c from 0 below cols
-                                    when (< c (+ r k))
-                                      do (setf (aref res-data (+ rp (* c str-c))) zero))))
+                           do (if (= str-c 1)
+                                  (let ((c1 (min cols (max 0 (+ r k)))))
+                                    (when (plusp c1)
+                                      (fill res-data zero :start rp :end (+ rp c1))))
+                                  (loop for c from 0 below cols
+                                        when (< c (+ r k))
+                                          do (setf (aref res-data (+ rp (* c str-c)))
+                                                   zero)))))
                    (let ((dim (svref shape-vec depth))
                          (stride (svref strs-vec depth)))
                      (loop for i from 0 below dim do
@@ -435,11 +467,22 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                          (cols (svref shape-vec (1+ depth)))
                          (str-r (svref strs-vec depth))
                          (str-c (svref strs-vec (1+ depth))))
+                     ;; v0.4.5 性能修复：每行要清零的是**连续一段**（res 由
+                     ;; vt-copy 得到，恒为 C 连续 → str-c = 1），用 FILL 一次
+                     ;; 写完，避免逐元素泛型 (setf (aref ...))（原 9485us /
+                     ;; numpy 725us）。非连续（str-c ≠ 1）退回逐元素循环。
                      (loop for r from 0 below rows
                            for rp = ptr then (+ rp str-r)
-                           do (loop for c from 0 below cols
-                                    when (> c (+ r k))
-                                      do (setf (aref res-data (+ rp (* c str-c))) zero))))
+                           do (if (= str-c 1)
+                                  (let ((c0 (max 0 (1+ (+ r k)))))
+                                    (when (< c0 cols)
+                                      (fill res-data zero
+                                            :start (+ rp c0)
+                                            :end (+ rp cols))))
+                                  (loop for c from 0 below cols
+                                        when (> c (+ r k))
+                                          do (setf (aref res-data (+ rp (* c str-c)))
+                                                   zero)))))
                    (let ((dim (svref shape-vec depth))
                          (stride (svref strs-vec depth)))
                      (loop for i from 0 below dim do
@@ -564,12 +607,43 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                (soff (the fixnum (vt-offset flat)))
                (pos 0))
           (declare (type fixnum soff pos))
-          (loop for r in reps
-                for i fixnum from 0
-                do (let ((v (aref sd (the fixnum (+ soff i)))))
-                     (dotimes (k (max r 0))
-                       (setf (aref rd pos) v)
-                       (incf pos))))
+          ;; v0.4.5 性能修复：RD / SD 原来都没有元素类型声明，逐元素
+          ;; (setf (aref rd pos) v) 走泛型二维分派 + 装箱（1M×2 实测
+          ;; 23273us / numpy 1869us）。改为按元素类型特化的写循环。
+          ;; 注：这里**不**用 FILL —— 每段只有 REPEATS 个元素，1M 次 FILL
+          ;; 调用本身的开销比逐元素写还大（实测反而慢 6%）。
+          (macrolet ((dup (lt)
+                       `(let ((d (the (simple-array ,lt (*)) rd))
+                              (sc (the (simple-array ,lt (*)) sd)))
+                          (declare (type (simple-array ,lt (*)) d sc)
+                                   (type fixnum soff pos))
+                          (loop for r in reps
+                                for i fixnum from 0
+                                do (let ((v (aref sc (the fixnum (+ soff i))))
+                                         (rr (max r 0)))
+                                     (declare (type ,lt v) (type fixnum rr))
+                                     (dotimes (k rr)
+                                       (declare (type fixnum k))
+                                       (setf (aref d pos) v)
+                                       (incf pos)))))))
+            (let ((et (array-element-type rd)))
+              (cond
+                ((equal et 'double-float)     (dup double-float))
+                ((equal et 'single-float)     (dup single-float))
+                ((equal et '(signed-byte 64)) (dup (signed-byte 64)))
+                ((equal et '(signed-byte 32)) (dup (signed-byte 32)))
+                ((equal et '(signed-byte 16)) (dup (signed-byte 16)))
+                ((equal et '(signed-byte 8))  (dup (signed-byte 8)))
+                ((equal et '(unsigned-byte 16)) (dup (unsigned-byte 16)))
+                ((equal et '(unsigned-byte 8))  (dup (unsigned-byte 8)))
+                (t (loop for r in reps
+                         for i fixnum from 0
+                         do (let ((v (aref sd (the fixnum (+ soff i))))
+                                  (rr (max r 0)))
+                              (dotimes (k rr)
+                                (declare (ignore k))
+                                (setf (aref rd pos) v)
+                                (incf pos))))))))
           res))
       ;; ---------------- 沿指定轴重复 ----------------
       (let* ((sh (vt-shape vt))

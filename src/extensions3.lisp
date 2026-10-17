@@ -266,45 +266,106 @@
       (let* ((oshape (loop for d from 0 below rank
                            collect (if (= d ax) (nth d ishape) (nth d shape))))
              (out (vt-zeros oshape :dtype (vt-dtype tensor)))
-             (idx (vt-ravel (vt-astype indices :int64)))
-             (strides (vt-strides tensor))
+             (idx (%flat-offset0 (vt-astype indices :int64)))
+             (total (vt-size out))
              (src-data (vt-data tensor))
              (src-off (vt-offset tensor))
              (out-data (vt-data out))
              (out-off (vt-offset out))
-             (ostrides (vt-strides out)))
-        (labels ((lin (coords dims strd)
-                   (let ((acc 0))
-                     (loop for d from 0 below (length dims)
-                           do (incf acc (* (nth d coords) (nth d strd))))
-                     acc)))
-          ;; 遍历输出所有坐标，回溯到 indices 坐标（非 AXIS 维按广播规则取 0）
-          (dotimes (olinear (vt-size out) out)
-            (let* ((ocoords (make-list rank))
-                   (rem olinear))
-              (loop for d from (1- rank) downto 0
-                    for dim = (nth d oshape)
-                    do (multiple-value-bind (q r) (floor rem (max 1 dim))
-                         (setf (nth d ocoords) r)
-                         (setf rem q)))
-              ;; 输出坐标 → indices 坐标：AXIS 维用输出坐标；其余维若 indices 长度为 1 取 0
-              (let* ((icoords (loop for d from 0 below rank
-                                    collect (if (or (= d ax)
-                                                    (/= (nth d ishape) 1))
-                                                (nth d ocoords)
-                                                0)))
-                     ;; v0.4.0 修复：idx 已按行主序 ravel，平面下标必须用
-                     ;; 行主序 strides（vt-compute-strides）计算；原实现传全 1
-                     ;; 步长等价于按列主序展开，导致第 r 行索引整体偏移 +r。
-                     (ilinear (lin icoords ishape (vt-compute-strides ishape)))
-                     (sel (vt-ref idx ilinear))
-                     (src-coords (copy-list ocoords)))
-                (setf sel (if (minusp sel) (+ sel ax-dim) sel))
-                (unless (<= 0 sel (1- ax-dim))
-                  (error "vt-take-along-axis: 索引 ~a 越界（轴长 ~a）" sel ax-dim))
-                (setf (nth ax src-coords) sel)
-                (setf (aref out-data (+ out-off (lin ocoords oshape ostrides)))
-                      (aref src-data (+ src-off (lin src-coords shape strides))))))))))))
+             (strides (vt-strides tensor))
+             (strd (coerce strides 'simple-vector))
+             (i-strd (coerce (vt-compute-strides ishape) 'simple-vector))
+             (odims (coerce oshape 'simple-vector))
+             (idims (coerce ishape 'simple-vector))
+             (in-ax-stride (nth ax strides))
+             (idx-arr (vt-data idx)))
+        ;; ================================================================
+        ;; v0.4.5 重写（原 157964us / numpy 5820us / 27.1 倍）
+        ;;
+        ;; 原实现对**每个输出元素**都：make-list 建两份坐标表 → 两趟 NTH
+        ;; 走表 → lin 里再 (nth d coords)(nth d strd) 走两遍 → vt-ref 反射。
+        ;; 1000×1000 = 1e6 次这样的分配 + 链表遍历。
+        ;;
+        ;; 改为**增量里程计**：源指针拆成「除 AX 外各维贡献 src-other」+
+        ;; 「AX 维贡献 sel*in-ax-stride」两部分，每前进一个元素只做若干次
+        ;; 整数加减与一次比较；零分配、无 NTH。输出恒为新建 C 连续张量，
+        ;; 故 out 指针就是线性自增。
+        ;; ================================================================
+        (macrolet ((store (lt)
+                     `(let ((dst (the (simple-array ,lt (*)) out-data))
+                            (src (the (simple-array ,lt (*)) src-data)))
+                        (declare (type (simple-array ,lt (*)) dst src)
+                                 (type fixnum total))
+                        (%walk (lambda (op sp)
+                                 (declare (type fixnum op sp))
+                                 (setf (aref dst (the fixnum (+ out-off op)))
+                                       (aref src sp)))))))
+          (flet ((%walk (emit)
+                   ;; EMIT 接收 (out-linear-相对下标, 源绝对下标)
+                   (let ((coords (make-array rank :element-type 'fixnum
+                                                  :initial-element 0))
+                         (src-other 0)
+                         (idx-off 0)
+                         (sel 0)
+                         (op 0))
+                     (declare (type fixnum src-other idx-off sel op)
+                              (type (simple-array fixnum (*)) coords))
+                     (when (zerop total) (return-from %walk nil))
+                     ;; 初始 sel（全零坐标）
+                     (setf sel (aref idx-arr idx-off))
+                     (loop
+                       ;; ---- 逐元素：输出线性自增，AX 维取 sel ----
+                       ;; 负索引按原实现折返（+AX-DIM），越界才报错
+                       (let* ((sel* (if (minusp sel) (the fixnum (+ sel ax-dim)) sel))
+                              (s (the fixnum (+ src-off src-other
+                                                (* sel* in-ax-stride)))))
+                         (declare (type fixnum sel* s))
+                         (unless (<= 0 sel* (1- ax-dim))
+                           (error "vt-take-along-axis: 索引 ~a 越界（轴长 ~a）"
+                                  sel ax-dim))
+                         (funcall emit op s))
+                       (incf op)
+                       (when (>= op total) (return))
+                       ;; ---- 里程计进位（最后一维最快）----
+                       (let ((d (1- rank)))
+                         (declare (type fixnum d))
+                         (loop
+                           (when (< d 0) (return))
+                           (let ((nd (the fixnum (1+ (aref coords d)))))
+                             (cond
+                               ((< nd (aref odims d))
+                                (setf (aref coords d) nd)
+                                (if (= d ax)
+                                    (incf idx-off (the fixnum (aref i-strd d)))
+                                    (progn (incf src-other (the fixnum (aref strd d)))
+                                           (unless (= (aref idims d) 1)
+                                             (incf idx-off (the fixnum (aref i-strd d))))))
+                                (return))
+                               (t
+                                ;; 进位：坐标从 (DIM-1) 归零 → 贡献减少 (DIM-1)*STRIDE
+                                ;; （写成 DIM*STRIDE 会每次多减一个 stride，累积成负偏移）
+                                (let ((last (the fixnum (1- (the fixnum (aref odims d))))))
+                                  (declare (type fixnum last))
+                                  (setf (aref coords d) 0)
+                                  (if (= d ax)
+                                      (decf idx-off (the fixnum (* last (the fixnum (aref i-strd d)))))
+                                      (progn (decf src-other (the fixnum (* last (the fixnum (aref strd d)))))
+                                             (unless (= (aref idims d) 1)
+                                               (decf idx-off (the fixnum (* last (the fixnum (aref i-strd d)))))))))
+                                (decf d))))))
+                       (setf sel (aref idx-arr idx-off))))))
+            (cond
+              ((equal (array-element-type out-data) 'double-float)     (store double-float))
+              ((equal (array-element-type out-data) 'single-float)     (store single-float))
+              ((equal (array-element-type out-data) '(signed-byte 64)) (store (signed-byte 64)))
+              ((equal (array-element-type out-data) '(signed-byte 32)) (store (signed-byte 32)))
+              ((equal (array-element-type out-data) '(signed-byte 16)) (store (signed-byte 16)))
+              ((equal (array-element-type out-data) '(signed-byte 8))  (store (signed-byte 8)))
+              ((equal (array-element-type out-data) '(unsigned-byte 16)) (store (unsigned-byte 16)))
+              ((equal (array-element-type out-data) '(unsigned-byte 8))  (store (unsigned-byte 8)))
+              (t (error "vt-take-along-axis: 不支持的输出元素类型 ~a"
+                        (array-element-type out-data))))))
+        out))))
 
 (defun vt-put-along-axis (tensor indices values axis)
   "沿 AXIS 把 VALUES 按 INDICES 写入 TENSOR 的拷贝并返回。
@@ -379,31 +440,65 @@
   "沿 AXIS 按布尔 CONDITION 选取切片（对标 numpy.compress）。
    CONDITION 为长度 ≤ 该轴长度的序列（不足部分视为假）；
    AXIS 为 nil 时展平后选取。
-   示例：(vt-compress '(1 0 1 0 1) (vt-fromiter '(0 1 2 3 4))) => [0 2 4]"
+   示例：(vt-compress '(1 0 1 0 1) (vt-fromiter '(0 1 2 3 4))) => [0 2 4]
+
+   v0.4.5 性能修复：numpy 的 compress 等价于 take(nonzero(cond))，本实现现在
+   真的这么走 —— 先扫一遍条件得到选中的下标向量，再委托 vt-take。
+   原 axis=nil 分支是「list 化条件 + 逐元素 vt-ref + vt-from-sequence」，
+   1M 元素实测 44245us（numpy 1011us，差 43 倍）；axis 分支原本就委托
+   vt-take，但用 (nth i full) 在 list 上取元素（长度 1M 时是 O(n²)），
+   一并改为数组扫描。"
   (let* ((cond-v (ensure-vt condition))
-         (cond-list (mapcar (lambda (x) (if (zerop x) nil t))
-                            (coerce (vt-data (vt-astype (vt-ravel cond-v) :int64)) 'list))))
-    (if (null axis)
-        (let* ((flat (vt-ravel tensor))
-               (n (vt-size flat))
-               (sel '()))
-          (loop for i from 0 below n
-                for c in (append cond-list (make-list (max 0 (- n (length cond-list)))
-                                                      :initial-element nil))
-                when c do (push (vt-ref flat i) sel))
-          (vt-from-sequence (nreverse sel) :dtype (vt-dtype tensor)))
-        (let* ((shape (vt-shape tensor))
-               (rank (length shape))
-               (ax (vt-normalize-axis axis rank))
-               (ax-dim (nth ax shape)))
-          (when (> (length cond-list) ax-dim)
-            (error "vt-compress: condition 长度 ~a 超过轴长 ~a"
-                   (length cond-list) ax-dim))
-          (let* ((full (append cond-list
-                               (make-list (max 0 (- ax-dim (length cond-list)))
-                                          :initial-element nil)))
-                 (idxs (loop for i from 0 below ax-dim when (nth i full) collect i)))
-            (vt-take tensor (vt-from-sequence idxs :dtype :int64) :axis ax))))))
+         ;; 不再 (vt-astype ... :int64) —— 那会把 1M 条件整块转换一遍（8MB 分配
+         ;; + 逐元素 coerce），实测占 compress 总耗时的大头。直接按条件的原生
+         ;; 元素类型扫描「非零」即可。
+         (cflat (%flat-offset0 cond-v))
+         (cdata (vt-data cflat))
+         (clen (vt-size cflat)))
+    (flet ((selected-indices (limit)
+             ;; 返回长度 = 条件中为真的个数、元素为 [0,LIMIT) 下标的 int64 张量
+             (let* ((m (min limit clen))
+                    (buf (make-array (max m 1) :element-type '(signed-byte 64)))
+                    (k 0))
+               (declare (type fixnum k))
+               (macrolet ((scan (lt)
+                            `(let ((c (the (simple-array ,lt (*)) cdata)))
+                               (declare (type (simple-array ,lt (*)) c)
+                                        (type fixnum m k))
+                               (dotimes (i m)
+                                 (declare (type fixnum i))
+                                 (unless (zerop (aref c i))
+                                   (setf (aref buf k) i)
+                                   (incf k))))))
+                 (let ((et (array-element-type cdata)))
+                   (cond
+                     ((equal et 'double-float)     (scan double-float))
+                     ((equal et 'single-float)     (scan single-float))
+                     ((equal et '(signed-byte 64)) (scan (signed-byte 64)))
+                     ((equal et '(signed-byte 32)) (scan (signed-byte 32)))
+                     ((equal et '(signed-byte 16)) (scan (signed-byte 16)))
+                     ((equal et '(signed-byte 8))  (scan (signed-byte 8)))
+                     ((equal et '(unsigned-byte 16)) (scan (unsigned-byte 16)))
+                     ((equal et '(unsigned-byte 8))  (scan (unsigned-byte 8)))
+                     (t (dotimes (i m)
+                          (declare (type fixnum i))
+                          (unless (zerop (aref cdata i))
+                            (setf (aref buf k) i)
+                            (incf k)))))))
+               (%make-vt :data (if (= k (max m 1)) buf (subseq buf 0 k))
+                         :shape (list k) :strides '(1) :offset 0 :dtype :int64))))
+      (if (null axis)
+          (let* ((v (ensure-vt tensor))
+                 (n (vt-size v)))
+            ;; axis=nil：先展平再按条件选取（vt-take 内部会做 %flat-offset0）
+            (vt-take v (selected-indices n) :axis nil))
+          (let* ((shape (vt-shape tensor))
+                 (rank (length shape))
+                 (ax (vt-normalize-axis axis rank))
+                 (ax-dim (nth ax shape)))
+            (when (> clen ax-dim)
+              (error "vt-compress: condition 长度 ~a 超过轴长 ~a" clen ax-dim))
+            (vt-take tensor (selected-indices ax-dim) :axis ax))))))
 
 (defun vt-indices (dimensions &key (dtype :int64) (sparse nil))
   "网格索引张量（对标 numpy.indices）。
