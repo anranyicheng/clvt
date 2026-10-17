@@ -804,13 +804,42 @@
                     (reduce #'* shape :initial-value 1))))
     (values axes count)))
 
-(defun vt-average (tensor weights &key axis keepdims dtype out)
+(defun vt-average (tensor &rest args)
   "加权平均：sum(tensor * weights) / sum(weights)。对标 numpy.average。
+
+  WEIGHTS 缺省（不传或传 NIL）→ 等权平均，等价 numpy 的 `weights=None`，
+  即 `(vt-average a)` ≡ `(vt-mean a)`。此时直接走均值内核，不额外构造
+  全 1 权重张量（v0.4.2 对齐：原实现把 weights 定为必填，`(vt-average a)`
+  会报 invalid number of arguments，与 numpy 的 `weights=None` 不符）。
+
+  为什么用 &REST 而不是 &OPTIONAL：`&optional` 紧跟 `&key` 时，CL 规定
+  关键字实参可能被可选参数吞掉 —— `(vt-average a :axis 0)` 会把 `:axis`
+  当成 WEIGHTS、再把 `0` 当成游离的关键字而报
+  「odd number of &KEY arguments」。用 &REST 先摘掉位置 weights 再转发，
+  两种调用形态都成立：
+     (vt-average a)                   等权
+     (vt-average a w)                 位置 weights（历史 API）
+     (vt-average a :axis 0)           等权 + 轴
+     (vt-average a w :axis 0)         位置 weights + 轴
+  注：vt-params-audit 会把本函数标为「用 &REST 吞参数」，这是上述兼容的
+  有意代价，不是 §6.2 的疏漏。
 
   dtype 语义（§4.2 H3「严格相等」）：
     结果 dtype 由「输入提升 + 显式 :dtype」决定，**不由 out 决定**。
     out 的 dtype 必须精确等于结果 dtype，否则报错。
     numpy 的 average 对整型输入会提升到 float64（本库一致）。"
+  (let ((weights nil))
+    (when (and args (not (keywordp (first args))))
+      (setf weights (pop args)))
+    (apply #'%average-impl tensor weights args)))
+
+(defun %average-impl (tensor weights &key axis keepdims dtype out)
+  "vt-average 的实现体（weights 已由外层归一：NIL 表示等权）。"
+  ;; weights 缺省 → 等权（numpy: weights=None）。走 vt-mean 既省一次全 1 张量
+  ;; 与一次逐元素乘法，又天然继承 axis/keepdims/dtype/out 的同一套契约。
+  (when (null weights)
+    (return-from %average-impl
+      (vt-mean tensor :axis axis :keepdims keepdims :dtype dtype :out out)))
   (with-float-safe
     (let ((a-shape (vt-shape tensor))
           (w-shape (vt-shape weights))
@@ -1834,7 +1863,15 @@
     (string (intern (string-upcase mode) "KEYWORD"))))
 
 (defun vt-correlate (a v &key (mode :full))
-  "1D 互相关，对标 np.correlate。mode 支持关键字(:full/:valid/:same)或字符串。"
+  "1D 互相关。mode 支持关键字(:full/:valid/:same)或字符串。
+
+  ⚠ 默认值与 numpy **不同**（v0.4.2 记录；行为保持不变，以免破坏既有调用方）：
+    numpy  np.correlate(a, v)   默认 mode='valid'
+    clvt   (vt-correlate a v)   默认 :mode :full
+  三种模式本身与 numpy 逐值一致（:full/:valid/:same 均已对齐）；
+  需要 numpy 默认行为时请显式写 :mode :valid。
+  core-test 与 test-all 均以 :full 为约定，故此处只修正文档，不改默认。"
+  (when (null mode) (setf mode :full))
   (let* ((mode-kw (%normalize-mode-keyword mode))
          (a-flat (vt-contiguous (vt-flatten a)))
          (v-flat (vt-contiguous (vt-flatten v)))

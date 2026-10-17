@@ -538,54 +538,100 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
 ;;; 重复与平铺
 ;;; ------------------------------------------------------------------
 (defun vt-repeat (vt repeats &key axis)
-  "重复元素。repeats 可为标量或列表；若为列表，其长度必须等于被重复轴的长度。"
+  "重复元素。repeats 可为标量或列表；若为列表，其长度必须等于被重复轴的长度。
+
+  v0.4.2 修复（原实现两处严重缺陷）：
+    1) axis=nil 时对每个元素 `(make-vt (list rep) ...)` 造一个独立张量，
+       再 `(apply #'vt-concatenate 0 parts)` —— 1M 元素即 1M 次小分配，
+       且 apply 要压 1M 个实参，实测直接 **Control stack exhausted**
+       （数据大一点就崩，不是慢的问题）；axis 分支同样用 apply 拼 ax-size 个切片。
+    2) 现在两条分支都改为「先算输出形状、再直接填充」：内存分配 1 次、
+       循环 O(输出元素数)、无 apply、无中间视图。"
   (if (null axis)
-      (let* ((flat (vt-flatten vt))
+      ;; ---------------- 扁平重复：一维结果，线性填充 ----------------
+      (let* ((flat (vt-contiguous (vt-flatten vt)))
              (size (vt-size flat))
              (reps (if (listp repeats)
-                       repeats (make-list size :initial-element repeats))))
-        ;; ---- 新增：长度校验 ----
+                       repeats
+                       (make-list size :initial-element repeats))))
         (unless (= (length reps) size)
           (error "vt-repeat: repeats 长度 ~a 与张量元素总数 ~a 不匹配"
                  (length reps) size))
-        ;; ------------------------
-        (let ((parts (loop for i from 0 below size
-                           for rep in reps
-                           when (> rep 0)
-                             collect
-                             (make-vt (list rep) (vt-ref flat i)
-                                      :dtype (vt-dtype vt)))))
-          (if parts
-              (apply #'vt-concatenate 0 parts)
-              (vt-zeros '(0) :dtype (vt-dtype vt)))))
+        (let* ((total (loop for r in reps sum (max r 0)))
+               (res (make-vt (list total) 0 :dtype (vt-dtype vt)))
+               (rd (vt-data res))
+               (sd (vt-data flat))
+               (soff (the fixnum (vt-offset flat)))
+               (pos 0))
+          (declare (type fixnum soff pos))
+          (loop for r in reps
+                for i fixnum from 0
+                do (let ((v (aref sd (the fixnum (+ soff i)))))
+                     (dotimes (k (max r 0))
+                       (setf (aref rd pos) v)
+                       (incf pos))))
+          res))
+      ;; ---------------- 沿指定轴重复 ----------------
       (let* ((sh (vt-shape vt))
-             (ax (vt-normalize-axis axis (length sh)))
+             (rank (length sh))
+             (ax (vt-normalize-axis axis rank))
              (ax-size (nth ax sh))
              (reps (if (listp repeats)
                        repeats
                        (make-list ax-size :initial-element repeats))))
-        ;; ---- 新增：长度校验 ----
         (unless (= (length reps) ax-size)
           (error "vt-repeat: repeats 长度 ~a 与轴 ~a 长度 ~a 不匹配"
                  (length reps) ax ax-size))
-        ;; ------------------------
-        (let ((slices
-                (loop for i from 0 below ax-size
-                      for rep in reps
-                      for part = (apply #'vt-slice vt
-                                        (loop for d below (length sh)
-                                              collect (if (= d ax)
-                                                          (list i (1+ i))
-                                                          '(:all))))
-                      when (> rep 0)
-                        collect (if (= rep 1) part
-                                    (apply #'vt-concatenate
-                                           ax (loop repeat rep
-                                                    collect part))))))
-          (if slices (apply #'vt-concatenate ax slices)
-              (let ((zero-shape (copy-list sh)))
-                (setf (nth ax zero-shape) 0)
-                (vt-zeros zero-shape :dtype (vt-dtype vt))))))))
+        (let* ((out-ax (loop for r in reps sum (max r 0)))
+               (out-shape (loop for d in sh for i fixnum from 0
+                                collect (if (= i ax) out-ax d)))
+               (res (make-vt out-shape 0 :dtype (vt-dtype vt)))
+               (src (vt-contiguous vt))
+               (sd (vt-data src)) (rd (vt-data res))
+               (in-str (vt-strides src)) (out-str (vt-strides res))
+               (soff (the fixnum (vt-offset src)))
+               (in-ax-str (the fixnum (nth ax in-str)))
+               (out-ax-str (the fixnum (nth ax out-str)))
+               ;; 除 AX 之外的外层轴（源与目标同构下标）
+               (o-dims (loop for d in sh for i fixnum from 0
+                             unless (= i ax) collect d))
+               (o-in (loop for st in in-str for i fixnum from 0
+                           unless (= i ax) collect st))
+               (o-out (loop for st in out-str for i fixnum from 0
+                            unless (= i ax) collect st))
+               (no (length o-dims)))
+          (if (zerop out-ax)
+              res
+              (let ((idx (make-list no :initial-element 0))
+                    (ip soff)
+                    (op 0))
+                (declare (type fixnum ip op))
+                (loop
+                  ;; 对当前外层组合：沿 AX 逐元素重复（REPEATS 是「每个元素
+                  ;; 重复几次」，不是「整条切片重复几次」—— 后者是 tile 语义）
+                  (let ((pos op))
+                    (declare (type fixnum pos))
+                    (loop for r in reps
+                          for j fixnum from 0
+                          do (let ((v (aref sd (the fixnum (+ ip (the fixnum (* j in-ax-str)))))))
+                               (dotimes (k (max r 0))
+                                 (setf (aref rd pos) v)
+                                 (incf pos out-ax-str)))))
+                  ;; 推进外层里程计（行主序，最后一维最快）
+                  (let ((d (1- no)))
+                    (declare (type fixnum d))
+                    (loop
+                      (when (< d 0) (return-from vt-repeat res))
+                      (let ((nd (1+ (nth d idx))))
+                        (cond ((< nd (nth d o-dims))
+                               (setf (nth d idx) nd)
+                               (incf ip (nth d o-in))
+                               (incf op (nth d o-out))
+                               (return))
+                              (t (decf ip (the fixnum (* (nth d idx) (nth d o-in))))
+                                 (decf op (the fixnum (* (nth d idx) (nth d o-out))))
+                                 (setf (nth d idx) 0)
+                                 (decf d)))))))))))))
 
 (defun vt-tile (vt reps)
   "平铺构造新数组（对标 numpy.tile）。
@@ -789,3 +835,4 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                   const-val
                   (aref in-data in-ptr)))))
     out))
+

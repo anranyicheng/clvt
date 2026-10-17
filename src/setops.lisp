@@ -114,11 +114,60 @@
         (push val result)))
     (vt-from-sequence (vt-numpy-sort result #'<) :dtype (vt-dtype t1))))
 
+;;; ------------------------------------------------------------------
+;;; 会员判定（in1d / isin 共用）
+;;;
+;;; v0.4.2 性能修复：原实现把 TEST 装成 **list**，再对每个待判定元素做
+;;; `(member x set :test #'vt-float-nan-inf-=)` —— 即 O(n×m) 次泛型浮点
+;;; 比较。1M 元素 × 1k 测试集 = 1e9 次调用，实测 **87 秒**
+;;; （numpy 同类操作约 20 ms，差 4000 倍）。
+;;; 改为「一次建哈希表 + O(1) 查表」：O(n+m)。
+;;;
+;;; 键的规范化保证语义不变（仍是 vt-float-nan-inf-= 的等价关系）：
+;;;   · NaN  → :%clvt-nan（NaN 与自身相等，故统一到哨兵键）
+;;;   · ±0.0 → 0.0d0（= 认为 -0.0 与 0.0 相等）
+;;;   · 浮点 → double-float（1.0s0 与 1.0d0 数值相等）
+;;;   · 整数 → 两数组皆整数时保留整数（避免 >2^53 精度丢失）；
+;;;            任一侧为浮点时统一转 double-float（与 numpy 把混合类型
+;;;            提升到 float64 的行为一致）
+;;; ------------------------------------------------------------------
+
+(defun %membership-float-mode-p (a b)
+  "两个备查数组中任一侧为浮点 → 用「全 double-float」键模式。"
+  (flet ((f (v) (subtypep (array-element-type (vt-data v)) 'float)))
+    (or (f a) (f b))))
+
+(defun %membership-key (x float-mode)
+  (cond ((floatp x)
+         (with-float-safe
+           (cond ((not (= x x)) :%clvt-nan)
+                 ((zerop x) 0.0d0)
+                 (t (coerce x 'double-float)))))
+        (float-mode (coerce x 'double-float))
+        (t x)))
+
+(defun %membership-table (test float-mode)
+  "把 TEST 的元素装进 EQL 哈希表，供 O(1) 会员判定。"
+  (let ((h (make-hash-table :test #'eql))
+        (flat (vt-contiguous (vt-flatten test)))
+        (n (vt-size test)))
+    (dotimes (i n)
+      (setf (gethash (%membership-key (vt-ref flat i) float-mode) h) t))
+    h))
+
+(defun %membership-map (elem table float-mode invert)
+  "对 ELEM 逐元素查表，返回 :int8 的 0/1（INVERT 时取反）。"
+  (vt-map (lambda (x)
+            (let ((hit (if (gethash (%membership-key x float-mode) table) 1 0)))
+              (if invert (- 1 hit) hit)))
+          elem :dtype :int8))
+
 (defun vt-in1d (t1 t2)
   "逐元素判定是否属于 TEST（对标 numpy.in1d）。返回与元素形状相同的布尔张量。
    dtype 为 :int8（F4：比较/逻辑结果一律 :int8）。
-   v0.4.1 修复（差分测试 R7）：此前返回 :float64。"
-  (let ((t2-set (coerce (vt-data (vt-unique t2)) 'list)))
-    (vt-map (lambda (x)
-              (if (member x t2-set :test #'vt-float-nan-inf-=) 1 0))
-            t1 :dtype :int8)))
+   v0.4.1 修复（差分测试 R7）：此前返回 :float64。
+   v0.4.2 性能修复：哈希会员判定，O(n+m)（原 O(n×m)，1M×1k 需 87s）。"
+  (let* ((elem (ensure-vt t1))
+         (test (ensure-vt t2))
+         (fm (%membership-float-mode-p elem test)))
+    (%membership-map elem (%membership-table (vt-unique test) fm) fm nil)))
