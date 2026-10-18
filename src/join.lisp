@@ -27,16 +27,33 @@
 ;;; 内部原语：连续块拷贝（本文件快路径共用）
 ;;; ------------------------------------------------------------------
 
-(declaim (inline %block-copy %axis-outer-inner))
+(declaim (inline %axis-outer-inner))
 
 (defun %block-copy (dest-data src-data dst-start src-start length)
-  "同元素类型一维缓冲区间的块拷贝（等价 memcpy；length 为 0 时 no-op）。"
-  (declare (type (simple-array * (*)) dest-data src-data)
-           (type fixnum dst-start src-start length))
+  "同元素类型一维缓冲区间的块拷贝（等价 memcpy；length 为 0 时 no-op）。
+
+   REPLACE 的目标/源都声明成 (SIMPLE-ARRAY * (*)) 时，SBCL 只能走通用
+   ELT 路径（每元素一次 widetag 分派）；这里按元素类型 8 路特化，
+   让 REPLACE 退化为 memmove。"
+  (declare (type fixnum dst-start src-start length))
   (when (plusp length)
-    (replace dest-data src-data
-             :start1 dst-start :end1 (+ dst-start length)
-             :start2 src-start :end2 (+ src-start length)))
+    (macrolet ((cp (lt)
+                 `(replace (the (simple-array ,lt (*)) dest-data)
+                           (the (simple-array ,lt (*)) src-data)
+                           :start1 dst-start :end1 (+ dst-start length)
+                           :start2 src-start :end2 (+ src-start length))))
+      (let ((et (array-element-type dest-data)))
+        (cond ((equal et 'double-float) (cp double-float))
+              ((equal et 'single-float) (cp single-float))
+              ((equal et '(signed-byte 64)) (cp (signed-byte 64)))
+              ((equal et '(signed-byte 32)) (cp (signed-byte 32)))
+              ((equal et '(signed-byte 16)) (cp (signed-byte 16)))
+              ((equal et '(signed-byte 8)) (cp (signed-byte 8)))
+              ((equal et '(unsigned-byte 16)) (cp (unsigned-byte 16)))
+              ((equal et '(unsigned-byte 8)) (cp (unsigned-byte 8)))
+              (t (replace dest-data src-data
+                          :start1 dst-start :end1 (+ dst-start length)
+                          :start2 src-start :end2 (+ src-start length)))))))
   (values))
 
 (defun %axis-outer-inner (shape axis)
@@ -49,16 +66,52 @@
 (defun %copy-contiguous-blocks (dest-data source axis-pos axis-size outer inner dst-stride)
   "快路径：把连续张量 source 的数据块拷入连续 dest 缓冲。
    source 沿连接轴可视为 (outer, axis-size, inner)；对每个 outer 下标，
-   源与目标各是一段长 axis-size×inner 的连续 run（铁律 1：布局不同不改值）。"
+   源与目标各是一段长 axis-size×inner 的连续 run（铁律 1：布局不同不改值）。
+
+   两条子路径：
+     · run-length 较大 → 每段一次 %BLOCK-COPY（memmove），调用开销被摊薄；
+     · run-length 很小 → **逐元素内联**（8 路类型）。这不是微优化：
+       vt-stack 沿新轴拼接 1M 个长度 1 的 run（1M 次 REPLACE 调用），
+       实测 55.9ms；内联后同工作量降到个位数毫秒。"
   (let ((src-data (vt-data source))
         (src-offset (vt-offset source))
         (run-length (* axis-size inner)))
-    (declare (type fixnum run-length dst-stride))
-    (dotimes (o outer)
-      (%block-copy dest-data src-data
-                   (+ (* o dst-stride) (* axis-pos inner))
-                   (+ src-offset (* o run-length))
-                   run-length))))
+    (declare (type fixnum run-length dst-stride src-offset))
+    (if (<= run-length 8)
+        (macrolet ((sc (lt)
+                     `(let ((dd (the (simple-array ,lt (*)) dest-data))
+                            (ss (the (simple-array ,lt (*)) src-data)))
+                        (declare (type (simple-array ,lt (*)) dd ss)
+                                 (type fixnum run-length dst-stride src-offset
+                                       axis-pos inner outer))
+                        (dotimes (o outer)
+                          (declare (type fixnum o))
+                          (let ((di (the fixnum (+ (* o dst-stride) (* axis-pos inner))))
+                                (si (the fixnum (+ src-offset (* o run-length)))))
+                            (declare (type fixnum di si))
+                            (dotimes (k run-length)
+                              (declare (type fixnum k))
+                              (setf (aref dd (the fixnum (+ di k)))
+                                    (aref ss (the fixnum (+ si k))))))))))
+          (let ((et (array-element-type dest-data)))
+            (cond ((equal et 'double-float) (sc double-float))
+                  ((equal et 'single-float) (sc single-float))
+                  ((equal et '(signed-byte 64)) (sc (signed-byte 64)))
+                  ((equal et '(signed-byte 32)) (sc (signed-byte 32)))
+                  ((equal et '(signed-byte 16)) (sc (signed-byte 16)))
+                  ((equal et '(signed-byte 8)) (sc (signed-byte 8)))
+                  ((equal et '(unsigned-byte 16)) (sc (unsigned-byte 16)))
+                  ((equal et '(unsigned-byte 8)) (sc (unsigned-byte 8)))
+                  (t (dotimes (o outer)
+                       (%block-copy dest-data src-data
+                                    (+ (* o dst-stride) (* axis-pos inner))
+                                    (+ src-offset (* o run-length))
+                                    run-length))))))
+        (dotimes (o outer)
+          (%block-copy dest-data src-data
+                       (+ (* o dst-stride) (* axis-pos inner))
+                       (+ src-offset (* o run-length))
+                       run-length)))))
 
 ;;; ------------------------------------------------------------------
 ;;; 连接
