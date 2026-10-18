@@ -483,17 +483,58 @@ NaN/Inf：纯数据搬运，逐位保留。
 
 (defun %kept-runs (flags dim)
   "把位向量折叠为保留区间的连续 run 列表 ((start end) ...)，end 排他，
-升序返回。将 O(dim) 个行视图压缩为 O(run) 个，减少 concatenate 视图数。"
+升序返回。将 O(dim) 个行视图压缩为 O(run) 个，减少 concatenate 视图数。
+
+  v0.4.6：补 FLAGS / DIM 的类型声明。原来两者都没声明，(bit flags i) 走
+  通用 AREF（二维分派 + 边界检查），1M 元素实测 8354us —— 而整件事只是
+  扫一遍位向量。"
+  (declare (type (simple-array bit (*)) flags) (type fixnum dim))
   (let ((runs '())
         (run-start nil))
-    (loop for i below dim
-          do (if (zerop (bit flags i))
-                 (unless run-start (setf run-start i))
-                 (when run-start
-                   (push (cons run-start i) runs)
-                   (setf run-start nil)))
-          finally (when run-start (push (cons run-start dim) runs)))
+    (dotimes (i dim)
+      (declare (type fixnum i))
+      (if (zerop (sbit flags i))
+          (unless run-start (setf run-start i))
+          (when run-start
+            (push (cons (the fixnum run-start) i) runs)
+            (setf run-start nil))))
+    (when run-start (push (cons (the fixnum run-start) dim) runs))
     (nreverse runs)))
+
+(defun %kept-runs-from-positions (positions dim)
+  "由**已归一化**的删除位置表直接生成保留 run（升序、end 排他）。
+  复杂度 O(k log k)（k = 删除个数），不需要扫全数组。
+  重复位置幂等（与位向量路径等价）。"
+  (declare (type fixnum dim))
+  (let ((sorted (sort (copy-list positions) #'<))
+        (runs '())
+        (cur 0))
+    (declare (type fixnum cur))
+    (dolist (p sorted)
+      (let ((p (the fixnum p)))
+        (when (> p cur)
+          (push (cons cur p) runs))
+        (when (>= p cur)
+          (setf cur (the fixnum (1+ p))))))
+    (when (< cur dim) (push (cons cur dim) runs))
+    (nreverse runs)))
+
+(defun %kept-runs-for (positions dim)
+  "把「删除位置表」折叠为保留 run。K << DIM 时走排序位置表 O(k log k)，
+  否则走位向量 O(dim)。
+
+  v0.4.6 性能修复：原实现**无论删几个元素**都建 len=DIM 的位向量并扫一遍。
+  (vt-delete 1M-元素 500000) 实测 17550us（numpy.delete 600us，差 29 倍），
+  其中 8354us 全在扫位向量、15us 在建位向量 —— 删除位置越少，浪费越大。"
+  (declare (type fixnum dim))
+  (cond
+    ((and (listp positions)
+          (not (eq (first positions) :slice))
+          (<= (length positions) (max 32 (ash dim -3))))
+     (%kept-runs-from-positions
+      (mapcar (lambda (i) (%delete-norm-idx i dim)) positions)
+      dim))
+    (t (%kept-runs (%deleted-flags positions dim) dim))))
 
 (defun %delete-axis-copy (source ax runs kept-count)
   "快路径：C 连续张量沿 ax 删除后保留行的直接块拷贝。
@@ -555,8 +596,7 @@ NaN/Inf：纯数据搬运，逐位保留。
         ;; ---- flat 模式：ravel 保证一维连续 → 保留 run 单遍拷贝 ----
         (let* ((flat (vt-ravel tensor-vt))
                (flat-size (vt-size flat))
-               (flags (%deleted-flags positions-list flat-size))
-               (runs (%kept-runs flags flat-size)))
+               (runs (%kept-runs-for positions-list flat-size)))
           (if (null runs)
               (vt-zeros '(0) :dtype dtype)
               (let* ((kept-count (loop for run in runs sum (- (cdr run) (car run))))
@@ -576,8 +616,7 @@ NaN/Inf：纯数据搬运，逐位保留。
         ;; ---- axis 模式：保留行折叠为 run ----
         (let* ((ax (vt-normalize-axis axis rank))
                (dim (nth ax shape))
-               (flags (%deleted-flags positions-list dim))
-               (runs (%kept-runs flags dim))
+               (runs (%kept-runs-for positions-list dim))
                (kept-count (loop for run in runs sum (- (cdr run) (car run)))))
           (if (null runs)
               (let ((empty-shape (copy-list shape)))

@@ -580,6 +580,106 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
 ;;; ------------------------------------------------------------------
 ;;; 重复与平铺
 ;;; ------------------------------------------------------------------
+;;; ------------------------------------------------------------------
+;;; 沿轴重复的填充内核（vt-repeat 的轴分支用）
+;;;
+;;; v0.4.6 性能修复：vt-repeat 的轴分支里 SD / RD 都取自 (vt-data ...)，
+;;; 没有元素类型声明，于是 `(aref sd ...)` 与 `(setf (aref rd ...) ...)`
+;;; 逐元素走通用 AREF（二维分派 + 边界检查）与装箱算术。
+;;; 500×2000 沿轴重复 ×2 实测 45778us（numpy.repeat 2643us）。
+;;;
+;;; 处理方式是「每元素沿轴重复 REPEATS[J] 次」：把一条 fiber 的写入
+;;; 抽成本函数，内部按元素类型展开成 8 份特化循环。里程计与外层指针
+;;; 推进仍留在 vt-repeat 里（它们只跟秩有关，与元素类型无关），
+;;; 所以这里只负责「从 IP 读一条 fiber，按 REPS 写到 OP 起的位置」，
+;;; 不回写任何指针 —— 调用方用固定的 OP 作为起点即可。
+;;; ------------------------------------------------------------------
+(defun %repeat-flat-scalar (sd soff rd size r)
+  "把 SD[SOFF, SOFF+SIZE) 的每个元素连续复制 R 份，写入 RD（从 0 开始）。
+   仅用于 vt-repeat 的「标量重复 + axis=nil」快路径。"
+  (declare (type fixnum soff size r))
+  (macrolet ((dup (lt)
+               `(let ((s (the (simple-array ,lt (*)) sd))
+                      (d (the (simple-array ,lt (*)) rd)))
+                  (declare (type (simple-array ,lt (*)) s d)
+                           (type fixnum soff size r))
+                  (when (plusp r)
+                    (dotimes (i size)
+                      (declare (type fixnum i))
+                      (let ((v (aref s (the fixnum (+ soff i))))
+                            (p (the fixnum (* i r))))
+                        (declare (type ,lt v) (type fixnum p))
+                        (dotimes (k r)
+                          (declare (type fixnum k))
+                          (setf (aref d (the fixnum (+ p k))) v))))))))
+    (let ((et (array-element-type rd)))
+      (cond
+        ((equal et 'double-float)       (dup double-float))
+        ((equal et 'single-float)       (dup single-float))
+        ((equal et '(signed-byte 64))   (dup (signed-byte 64)))
+        ((equal et '(signed-byte 32))   (dup (signed-byte 32)))
+        ((equal et '(signed-byte 16))   (dup (signed-byte 16)))
+        ((equal et '(signed-byte 8))    (dup (signed-byte 8)))
+        ((equal et '(unsigned-byte 16)) (dup (unsigned-byte 16)))
+        ((equal et '(unsigned-byte 8))  (dup (unsigned-byte 8)))
+        (t (error "vt-repeat: 不支持的输出元素类型 ~a" et))))))
+
+(defun %repeat-counts (repeats ax-size ax)
+  "把 repeats（标量或列表，可含 0/负数）归一成**长度 AX-SIZE 的非负 fixnum 向量**。
+   AX 只用于报错信息。列表形态要求长度恰好等于轴长（与原实现一致）。"
+  (declare (type fixnum ax-size ax))
+  (let ((v (make-array (max ax-size 1) :element-type 'fixnum)))
+    (cond
+      ((listp repeats)
+       (unless (= (length repeats) ax-size)
+         (error "vt-repeat: repeats 长度 ~a 与轴 ~a 长度 ~a 不匹配"
+                (length repeats) ax ax-size))
+       (loop for r in repeats
+             for i fixnum from 0
+             do (setf (aref v i) (max (the integer r) 0))))
+      (t (let ((r (max (the integer repeats) 0)))
+           (declare (type fixnum r))
+           (dotimes (i ax-size)
+             (declare (type fixnum i))
+             (setf (aref v i) r)))))
+    v))
+
+(defun %repeat-fiber (sd rd ip op reps n in-ax-str out-ax-str)
+  "把 SD 中从 IP 起、步长 IN-AX-STR 的 N 个元素，按 REPS[J] 次逐元素重复写入 RD。
+   OP 为写入起点；每写一份前进 OUT-AX-STR。
+   REPS 是长度 N 的 fixnum 向量（非负），标量/列表/负值已由调用方归一化。
+   要求 RD / SD 的元素类型相同且属于 8 种存储类型之一。"
+  (declare (type fixnum ip op n in-ax-str out-ax-str)
+           (type (simple-array fixnum (*)) reps))
+  (macrolet ((dup (lt)
+               `(let ((s (the (simple-array ,lt (*)) sd))
+                      (d (the (simple-array ,lt (*)) rd))
+                      (rv (the (simple-array fixnum (*)) reps)))
+                  (declare (type (simple-array ,lt (*)) s d)
+                           (type (simple-array fixnum (*)) rv)
+                           (type fixnum ip op n in-ax-str out-ax-str))
+                  (dotimes (j n)
+                    (declare (type fixnum j))
+                    (let ((v (aref s (the fixnum (+ ip (the fixnum (* j in-ax-str))))))
+                          (rr (aref rv j)))
+                      (declare (type ,lt v) (type fixnum rr))
+                      (when (plusp rr)
+                        (dotimes (k rr)
+                          (declare (type fixnum k))
+                          (setf (aref d op) v)
+                          (incf op out-ax-str))))))))
+    (let ((et (array-element-type rd)))
+      (cond
+        ((equal et 'double-float)       (dup double-float))
+        ((equal et 'single-float)       (dup single-float))
+        ((equal et '(signed-byte 64))   (dup (signed-byte 64)))
+        ((equal et '(signed-byte 32))   (dup (signed-byte 32)))
+        ((equal et '(signed-byte 16))   (dup (signed-byte 16)))
+        ((equal et '(signed-byte 8))    (dup (signed-byte 8)))
+        ((equal et '(unsigned-byte 16)) (dup (unsigned-byte 16)))
+        ((equal et '(unsigned-byte 8))  (dup (unsigned-byte 8)))
+        (t (error "vt-repeat: 不支持的输出元素类型 ~a" et))))))
+
 (defun vt-repeat (vt repeats &key axis)
   "重复元素。repeats 可为标量或列表；若为列表，其长度必须等于被重复轴的长度。
 
@@ -590,6 +690,24 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
        （数据大一点就崩，不是慢的问题）；axis 分支同样用 apply 拼 ax-size 个切片。
     2) 现在两条分支都改为「先算输出形状、再直接填充」：内存分配 1 次、
        循环 O(输出元素数)、无 apply、无中间视图。"
+  ;; ================================================================
+  ;; v0.4.6 快路径：**标量** repeats + axis=nil
+  ;;
+  ;; 原实现无条件把标量展开成 (make-list size :initial-element repeats)：
+  ;; 1M 元素即 1M 个 cons（约 16MB 垃圾），随后还要 (loop for r in reps)
+  ;; 遍历整张表取 r。实测 20892us（numpy.repeat 2636us，差 7.9 倍）。
+  ;; 标量情形根本不需要表 —— 每个元素连续复制 R 份即可。
+  ;; 独立成 (when ... (return-from ...)) 是有意的：不改动下方既有分支
+  ;; 的嵌套层次，回退/审查都只需看这一段。
+  ;; ================================================================
+  (when (and (null axis) (integerp repeats))
+    (let* ((flat (vt-contiguous (vt-flatten vt)))
+           (size (vt-size flat))
+           (r (max (the integer repeats) 0))
+           (total (the fixnum (* size r)))
+           (res (make-vt (list total) 0 :dtype (vt-dtype vt))))
+      (%repeat-flat-scalar (vt-data flat) (vt-offset flat) (vt-data res) size r)
+      (return-from vt-repeat res)))
   (if (null axis)
       ;; ---------------- 扁平重复：一维结果，线性填充 ----------------
       (let* ((flat (vt-contiguous (vt-flatten vt)))
@@ -650,13 +768,11 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
              (rank (length sh))
              (ax (vt-normalize-axis axis rank))
              (ax-size (nth ax sh))
-             (reps (if (listp repeats)
-                       repeats
-                       (make-list ax-size :initial-element repeats))))
-        (unless (= (length reps) ax-size)
-          (error "vt-repeat: repeats 长度 ~a 与轴 ~a 长度 ~a 不匹配"
-                 (length reps) ax ax-size))
-        (let* ((out-ax (loop for r in reps sum (max r 0)))
+             ;; v0.4.6：归一成 fixnum 向量（非负、长度 = 轴长），长度校验也搬进去。
+             ;; 原来这里既可能是用户给的 list 也可能是临时 make-list，内层循环
+             ;; 于是逐元素做一次 (max r 0) 的**泛型**算术 —— 1e6 次。
+             (reps (%repeat-counts repeats ax-size ax)))
+        (let* ((out-ax (reduce #'+ reps :initial-value 0))
                (out-shape (loop for d in sh for i fixnum from 0
                                 collect (if (= i ax) out-ax d)))
                (res (make-vt out-shape 0 :dtype (vt-dtype vt)))
@@ -683,14 +799,10 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                 (loop
                   ;; 对当前外层组合：沿 AX 逐元素重复（REPEATS 是「每个元素
                   ;; 重复几次」，不是「整条切片重复几次」—— 后者是 tile 语义）
-                  (let ((pos op))
-                    (declare (type fixnum pos))
-                    (loop for r in reps
-                          for j fixnum from 0
-                          do (let ((v (aref sd (the fixnum (+ ip (the fixnum (* j in-ax-str)))))))
-                               (dotimes (k (max r 0))
-                                 (setf (aref rd pos) v)
-                                 (incf pos out-ax-str)))))
+                  ;; v0.4.6：本段原来是「逐元素 (max r 0) + 未声明 AREF」的内层
+                  ;; 循环（500×2000 沿轴 ×2 实测 42773us / numpy 2643us）。
+                  ;; 现在把「按 REPS 把一条 fiber 写出去」交给类型化内核。
+                  (%repeat-fiber sd rd ip op reps ax-size in-ax-str out-ax-str)
                   ;; 推进外层里程计（行主序，最后一维最快）
                   (let ((d (1- no)))
                     (declare (type fixnum d))
@@ -874,6 +986,48 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
          (in-strides (coerce (vt-strides vt) 'simple-vector))
          (pad-before (coerce (mapcar #'first pad) 'simple-vector))
          (out-size (vt-size out)))
+
+    ;; ================================================================
+    ;; v0.4.6 性能修复（:constant 快路径）
+    ;;
+    ;; 原实现是「对每个输出元素做 rank 次 FLOOR 分解 + 泛型 AREF」：
+    ;; 1M 元素 × (1 次除法 + 2 次泛型访问)，实测 19966us
+    ;; （numpy.pad 225us，差 87 倍）。但 :constant 模式下输出被
+    ;; 「边界 + 内部盒」完整铺满，而**内部盒就是源的一次整块拷贝**：
+    ;;
+    ;;   1. 逐轴填充前后两条边界板（d 升序 → 后面的轴覆盖前面的轴，
+    ;;      与下方循环「最后一个越界轴胜出」的角点语义一致）；
+    ;;   2. 内部盒 = out 的居中视图，用 vt-copy-into 一次拷入源
+    ;;      （源任意步长都支持；dest 为 strided 视图时亦然）。
+    ;;
+    ;; 边界体积是 O(表面积) 而非 O(体积)：1M 元素 pad (10,10) 只有 20 个
+    ;; 边界元素，其余全走 memcpy。:edge/:wrap/:reflect/:symmetric 需要
+    ;; 逐点映射源下标，仍走下方通用循环（语义完全不变）。
+    ;; ================================================================
+    (when (eq mode :constant)
+      (loop for d from 0 below rank do
+        (let* ((pb (first (nth d pad)))
+               (pa (second (nth d pad))))
+          (when (plusp pb)
+            (vt-fill (apply #'vt-slice out
+                            (loop for e from 0 below rank
+                                  collect (if (= e d) (list 0 pb) '(:all))))
+                     (svref c-lefts d)))
+          (when (plusp pa)
+            (vt-fill (apply #'vt-slice out
+                            (loop for e from 0 below rank
+                                  collect (if (= e d)
+                                              (list (+ (nth e shape) pb)
+                                                    (nth e new-shape))
+                                              '(:all))))
+                     (svref c-rights d)))))
+      (vt-copy-into (apply #'vt-slice out
+                           (loop for e from 0 below rank
+                                 collect (list (first (nth e pad))
+                                               (+ (first (nth e pad))
+                                                  (nth e shape)))))
+                    vt)
+      (return-from vt-pad out))
 
     (loop for out-ptr fixnum from 0 below out-size do
       (let ((rem out-ptr)

@@ -288,83 +288,86 @@
         ;;
         ;; 改为**增量里程计**：源指针拆成「除 AX 外各维贡献 src-other」+
         ;; 「AX 维贡献 sel*in-ax-stride」两部分，每前进一个元素只做若干次
-        ;; 整数加减与一次比较；零分配、无 NTH。输出恒为新建 C 连续张量，
-        ;; 故 out 指针就是线性自增。
+        ;; 整数加减；零分配、无 NTH。输出恒为新建 C 连续张量，故 out 指针
+        ;; 就是线性自增。→ 28906us（5.36×）
+        ;;
+        ;; v0.4.6 再进一步：原先把写操作做成 FLET + FUNCALL 回调以复用里程计，
+        ;; 于是每元素多一次闭包调用（约 20ns）。现在把 store **内联**进 8 份
+        ;; 按元素类型特化的循环体（一份源码、8 次宏展开），→ 见下。
         ;; ================================================================
-        (macrolet ((store (lt)
+        (macrolet ((walk (lt)
                      `(let ((dst (the (simple-array ,lt (*)) out-data))
-                            (src (the (simple-array ,lt (*)) src-data)))
+                            (src (the (simple-array ,lt (*)) src-data))
+                            ;; v0.4.6：IDX-ARR 原先漏了声明 → 每次取 SEL 都是
+                            ;; 通用 AREF（二维分派 + 边界检查）。逐元素一次，
+                            ;; 1e6 元素就是 1e6 次（实测 ~15ns/次）。
+                            (ia  (the (simple-array (signed-byte 64) (*)) idx-arr))
+                            (coords (make-array rank :element-type 'fixnum
+                                                     :initial-element 0))
+                            (src-other 0) (idx-off 0) (sel 0) (op 0))
                         (declare (type (simple-array ,lt (*)) dst src)
-                                 (type fixnum total))
-                        (%walk (lambda (op sp)
-                                 (declare (type fixnum op sp))
-                                 (setf (aref dst (the fixnum (+ out-off op)))
-                                       (aref src sp)))))))
-          (flet ((%walk (emit)
-                   ;; EMIT 接收 (out-linear-相对下标, 源绝对下标)
-                   (let ((coords (make-array rank :element-type 'fixnum
-                                                  :initial-element 0))
-                         (src-other 0)
-                         (idx-off 0)
-                         (sel 0)
-                         (op 0))
-                     (declare (type fixnum src-other idx-off sel op)
-                              (type (simple-array fixnum (*)) coords))
-                     (when (zerop total) (return-from %walk nil))
-                     ;; 初始 sel（全零坐标）
-                     (setf sel (aref idx-arr idx-off))
-                     (loop
-                       ;; ---- 逐元素：输出线性自增，AX 维取 sel ----
-                       ;; 负索引按原实现折返（+AX-DIM），越界才报错
-                       (let* ((sel* (if (minusp sel) (the fixnum (+ sel ax-dim)) sel))
-                              (s (the fixnum (+ src-off src-other
-                                                (* sel* in-ax-stride)))))
-                         (declare (type fixnum sel* s))
-                         (unless (<= 0 sel* (1- ax-dim))
-                           (error "vt-take-along-axis: 索引 ~a 越界（轴长 ~a）"
-                                  sel ax-dim))
-                         (funcall emit op s))
-                       (incf op)
-                       (when (>= op total) (return))
-                       ;; ---- 里程计进位（最后一维最快）----
-                       (let ((d (1- rank)))
-                         (declare (type fixnum d))
-                         (loop
-                           (when (< d 0) (return))
-                           (let ((nd (the fixnum (1+ (aref coords d)))))
-                             (cond
-                               ((< nd (aref odims d))
-                                (setf (aref coords d) nd)
-                                (if (= d ax)
-                                    (incf idx-off (the fixnum (aref i-strd d)))
-                                    (progn (incf src-other (the fixnum (aref strd d)))
+                                 (type (simple-array (signed-byte 64) (*)) ia)
+                                 (type (simple-array fixnum (*)) coords)
+                                 (type fixnum src-other idx-off sel op))
+                        ;; 里程计：逐元素推进，零分配、无 NTH
+                        (when (plusp total)
+                          (setf sel (aref ia 0))
+                          (loop
+                            (let* ((sel* (if (minusp sel)
+                                             (the fixnum (+ sel ax-dim))
+                                             sel))
+                                   (s (the fixnum (+ src-off src-other
+                                                     (* sel* in-ax-stride)))))
+                              (declare (type fixnum sel* s))
+                              (unless (<= 0 sel* (1- ax-dim))
+                                (error "vt-take-along-axis: 索引 ~a 越界（轴长 ~a）"
+                                       sel ax-dim))
+                              (setf (aref dst (the fixnum (+ out-off op))) (aref src s)))
+                            (incf op)
+                            (when (>= op total) (return))
+                            (let ((d (1- rank)))
+                              (declare (type fixnum d))
+                              (loop
+                                (when (< d 0) (return))
+                                (let ((nd (the fixnum (1+ (aref coords d)))))
+                                  (cond
+                                    ((< nd (aref odims d))
+                                     (setf (aref coords d) nd)
+                                     (if (= d ax)
+                                         (incf idx-off (the fixnum (aref i-strd d)))
+                                         (progn
+                                           (incf src-other (the fixnum (aref strd d)))
                                            (unless (= (aref idims d) 1)
                                              (incf idx-off (the fixnum (aref i-strd d))))))
-                                (return))
-                               (t
-                                ;; 进位：坐标从 (DIM-1) 归零 → 贡献减少 (DIM-1)*STRIDE
-                                ;; （写成 DIM*STRIDE 会每次多减一个 stride，累积成负偏移）
-                                (let ((last (the fixnum (1- (the fixnum (aref odims d))))))
-                                  (declare (type fixnum last))
-                                  (setf (aref coords d) 0)
-                                  (if (= d ax)
-                                      (decf idx-off (the fixnum (* last (the fixnum (aref i-strd d)))))
-                                      (progn (decf src-other (the fixnum (* last (the fixnum (aref strd d)))))
+                                     (return))
+                                    (t
+                                     ;; 进位：坐标从 (DIM-1) 归零 → 贡献减少 (DIM-1)*STRIDE
+                                     (let ((last (the fixnum
+                                                      (1- (the fixnum (aref odims d))))))
+                                       (declare (type fixnum last))
+                                       (setf (aref coords d) 0)
+                                       (if (= d ax)
+                                           (decf idx-off
+                                                 (the fixnum (* last (the fixnum (aref i-strd d)))))
+                                           (progn
+                                             (decf src-other
+                                                   (the fixnum (* last (the fixnum (aref strd d)))))
                                              (unless (= (aref idims d) 1)
-                                               (decf idx-off (the fixnum (* last (the fixnum (aref i-strd d)))))))))
-                                (decf d))))))
-                       (setf sel (aref idx-arr idx-off))))))
+                                               (decf idx-off
+                                                     (the fixnum (* last (the fixnum (aref i-strd d)))))))))
+                                     (decf d))))))
+                            (setf sel (aref ia idx-off)))))))
+          (let ((et (array-element-type out-data)))
             (cond
-              ((equal (array-element-type out-data) 'double-float)     (store double-float))
-              ((equal (array-element-type out-data) 'single-float)     (store single-float))
-              ((equal (array-element-type out-data) '(signed-byte 64)) (store (signed-byte 64)))
-              ((equal (array-element-type out-data) '(signed-byte 32)) (store (signed-byte 32)))
-              ((equal (array-element-type out-data) '(signed-byte 16)) (store (signed-byte 16)))
-              ((equal (array-element-type out-data) '(signed-byte 8))  (store (signed-byte 8)))
-              ((equal (array-element-type out-data) '(unsigned-byte 16)) (store (unsigned-byte 16)))
-              ((equal (array-element-type out-data) '(unsigned-byte 8))  (store (unsigned-byte 8)))
-              (t (error "vt-take-along-axis: 不支持的输出元素类型 ~a"
-                        (array-element-type out-data))))))
+              ((equal et 'double-float)     (walk double-float))
+              ((equal et 'single-float)     (walk single-float))
+              ((equal et '(signed-byte 64)) (walk (signed-byte 64)))
+              ((equal et '(signed-byte 32)) (walk (signed-byte 32)))
+              ((equal et '(signed-byte 16)) (walk (signed-byte 16)))
+              ((equal et '(signed-byte 8))  (walk (signed-byte 8)))
+              ((equal et '(unsigned-byte 16)) (walk (unsigned-byte 16)))
+              ((equal et '(unsigned-byte 8))  (walk (unsigned-byte 8)))
+              (t (error "vt-take-along-axis: 不支持的输出元素类型 ~a" et)))))
         out))))
 
 (defun vt-put-along-axis (tensor indices values axis)
