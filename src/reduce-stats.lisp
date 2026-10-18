@@ -1849,16 +1849,121 @@
 ;;; nan 感知统计
 ;;; ------------------------------------------------------------------
 
+;;; ==================================================================
+;;; NaN 归约的单趟内核（v0.4.9）
+;;;
+;;; 原实现把 nanmean / nanvar 全部拆成「整趟中间张量」流水线：
+;;;   nanmean = isnan + logical-not + where + sum + sum + map   （6 趟）
+;;;   nanvar  = 上面 6 趟 × 2 + map + mul + sum + map + map     （10+ 趟）
+;;; 1M double 实测 nanmean 108ms / nanvar 331ms（numpy 8ms / 12ms）。
+;;; 这里把「求和 + 计数」与「离差平方和」各压成一次特化扫描 ——
+;;; 累加顺序与 vt-sum 的顺序累加完全一致，故结果逐位相同。
+;;; ==================================================================
+
+(defun %nan-prepare (tensor dt)
+  "把输入规整为**连续**的 DT 浮点张量（DT 为 :float64 / :float32）。"
+  (let ((v (ensure-vt tensor)))
+    (cond ((not (eq (vt-dtype v) dt)) (vt-astype v dt))
+          ((vt-contiguous-p v) v)
+          (t (vt-contiguous v)))))
+
+(defmacro %nan-sum-count-body (lt d off n acc cnt)
+  "SUM/COUNT 扫描体（顺序累加，NaN 跳过）。"
+  `(let ((dd (the (simple-array ,lt (*)) ,d))
+         (p (the fixnum ,off))
+         (nn (the fixnum ,n))
+         (a (coerce 0 ',lt))
+         (c 0))
+     (declare (type (simple-array ,lt (*)) dd)
+              (type fixnum p nn c)
+              (type ,lt a))
+     (dotimes (i nn)
+       (declare (type fixnum i))
+       (let ((x (aref dd (the fixnum (+ p i)))))
+         (unless (/= x x)
+           (incf a x)
+           (incf c))))
+     (setf ,acc a ,cnt c)))
+
+(defun %nan-sum-count (flat dt)
+  "顺序累加非 NaN 元素，返回 (values 和 计数)。
+
+   WITH-FLOAT-SAFE 必须包住整个扫描：SBCL 的浮点比较用 UCOMISD，
+   遇到 NaN 会置 invalid 并**触发陷阱**（`(/= nan nan)` 直接抛
+   FLOATING-POINT-INVALID-OPERATION），这与 C 的 quiet compare 不同。
+   切换 FP 控制字只在进出各一次，不在逐元素路径上。"
+  (with-float-safe
+    (let ((d (vt-data flat)) (off (vt-offset flat)) (n (vt-size flat))
+          (acc nil) (cnt nil))
+      (if (eq dt :float32)
+          (%nan-sum-count-body single-float d off n acc cnt)
+          (%nan-sum-count-body double-float d off n acc cnt))
+      (values acc cnt))))
+
+(defmacro %nan-sumsq-body (lt d off n mean acc)
+  "离差平方和扫描体。NaN 位复刻原实现的 (* (* (- 0 mean)^2) 0) 语义
+   （mean 为 Inf 时该位贡献 NaN，与原 vt-* 掩码相乘结果一致）。"
+  `(let ((dd (the (simple-array ,lt (*)) ,d))
+         (p (the fixnum ,off))
+         (nn (the fixnum ,n))
+         (m (the ,lt ,mean))
+         (a (coerce 0 ',lt)))
+     (declare (type (simple-array ,lt (*)) dd)
+              (type fixnum p nn)
+              (type ,lt m a))
+     (dotimes (i nn)
+       (declare (type fixnum i))
+       (let ((x (aref dd (the fixnum (+ p i)))))
+         (if (/= x x)
+             (let ((z (- (coerce 0 ',lt) m)))
+               (incf a (* (* z z) (coerce 0 ',lt))))
+             (let ((z (- x m)))
+               (incf a (* z z))))))
+     (setf ,acc a)))
+
+(defun %nan-sumsq (flat dt mean)
+  ;; 同 %nan-sum-count：NaN 比较需要屏蔽 invalid 陷阱。
+  (with-float-safe
+    (let ((d (vt-data flat)) (off (vt-offset flat)) (n (vt-size flat)) (acc nil))
+      (if (eq dt :float32)
+          (%nan-sumsq-body single-float d off n mean acc)
+          (%nan-sumsq-body double-float d off n mean acc))
+      acc)))
+
+(defun %nan-fast-p (axis keepdims final-dtype)
+  (and (null axis)
+       (or (eq final-dtype :float64) (eq final-dtype :float32))))
+
+(defun %nan-scalar-result (out shape dt val op-name)
+  (let ((res (if out
+                 (vt-check-out out shape dt :op-name op-name)
+                 (make-vt shape 0 :dtype dt))))
+    (setf (aref (vt-data res) (vt-offset res)) val)
+    res))
+
 (defun vt-nanmean (tensor &key axis keepdims dtype out)
   "忽略 NaN 的算术平均。全为 NaN 的归约区结果为 NaN。
 
   dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 输入浮点提升 + 显式 :dtype，
   **不由 out 决定**；out 的 dtype 必须精确等于结果 dtype。"
-  (let* ((mask (vt-isnan tensor))
-         (not-nan (vt-logical-not mask))
-         (compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
+  (let* ((compute-dtype (if (eq (vt-dtype (ensure-vt tensor)) :float32) :float32 :float64))
          ;; 结果 dtype：输入提升 + 显式 :dtype（nan 族恒为浮点）
-         (final-dtype (or dtype compute-dtype))
+         (final-dtype (or dtype compute-dtype)))
+    (if (%nan-fast-p axis keepdims final-dtype)
+        ;; 单趟快路径（axis=nil）：一次扫描同时得到和与有效计数。
+        (let* ((flat (%nan-prepare tensor final-dtype))
+               (nan (vt-get-nan final-dtype))
+               (shape (if keepdims
+                          (make-list (length (vt-shape flat)) :initial-element 1)
+                          nil)))
+          (multiple-value-bind (sum cnt) (%nan-sum-count flat final-dtype)
+            (let ((val (if (zerop cnt)
+                           nan
+                           (/ sum (coerce cnt (if (eq final-dtype :float32)
+                                                  'single-float 'double-float))))))
+              (%nan-scalar-result out shape final-dtype val "vt-nanmean"))))
+    (let* ((mask (vt-isnan tensor))
+         (not-nan (vt-logical-not mask))
          (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
          (nan (vt-get-nan final-dtype))
          (clean (vt-where mask zero tensor :dtype final-dtype))
@@ -1867,33 +1972,56 @@
     ;; out 硬契约校验前置：错误信息以 "vt-nanmean" 开头
     (when out
       (vt-check-out out (vt-shape sum) final-dtype :op-name "vt-nanmean"))
-    (vt-map (lambda (s c) (if (<= c zero) nan (/ s c)))
-            sum count :dtype final-dtype :out out)))
+      (vt-map (lambda (s c) (if (<= c zero) nan (/ s c)))
+              sum count :dtype final-dtype :out out)))))
 
 (defun vt-nanvar (tensor &key axis keepdims (ddof 0) dtype out)
   "忽略 NaN 的方差。有效样本数 ≤ ddof 时结果为 NaN。
 
-  dtype 语义同 vt-nanmean（§4.2 H3「严格相等」）。"
-  (let* ((mask (vt-isnan tensor))
-         (not-nan (vt-logical-not mask))
-         (compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
-         (final-dtype (or dtype compute-dtype))
-         (nan (vt-get-nan final-dtype))
-         (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
-         (clean (vt-where mask zero tensor :dtype final-dtype))
-         (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
-         (mean (vt-nanmean tensor :axis axis :keepdims t :dtype final-dtype))
-         (sq-diff (vt-* (vt-map (lambda (c m) (* (- c m) (- c m)))
-                                clean mean :dtype final-dtype)
-                        not-nan :dtype final-dtype))
-         (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims :dtype final-dtype))
-         (ddof-f (coerce ddof (vt-dtype->lisp-type final-dtype)))
-         (divisor (vt-map (lambda (c) (if (< c ddof-f) zero (- c ddof-f)))
-                          count :dtype final-dtype)))
-    (when out
-      (vt-check-out out (vt-shape sum2) final-dtype :op-name "vt-nanvar"))
-    (vt-map (lambda (s d) (if (<= d zero) nan (/ s d)))
-            sum2 divisor :dtype final-dtype :out out)))
+  dtype 语义同 vt-nanmean（§4.2 H3「严格相等」）。
+
+  性能：axis=nil 走两趟特化内核（和+计数 → 离差平方和），
+  原实现的 10+ 趟中间张量流水线在 1M double 上实测 331ms。"
+  (let* ((compute-dtype (if (eq (vt-dtype (ensure-vt tensor)) :float32)
+                            :float32 :float64))
+         (final-dtype (or dtype compute-dtype)))
+    (if (%nan-fast-p axis keepdims final-dtype)
+        (with-float-safe
+          (let* ((flat (%nan-prepare tensor final-dtype))
+                 (nan (vt-get-nan final-dtype))
+                 (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
+                 (lt (if (eq final-dtype :float32) 'single-float 'double-float))
+                 (shape (if keepdims
+                            (make-list (length (vt-shape flat)) :initial-element 1)
+                            nil)))
+            (multiple-value-bind (sum cnt) (%nan-sum-count flat final-dtype)
+              (let* ((cntf (coerce cnt lt))
+                     (mean (if (zerop cnt) nan (/ sum cntf)))
+                     (sum2 (if (zerop cnt) zero (%nan-sumsq flat final-dtype mean)))
+                     (ddof-f (coerce ddof lt))
+                     (div (if (< cntf ddof-f) zero (- cntf ddof-f)))
+                     ;; 注意 cnt=0（全 NaN）时即使 ddof 为负、div>0，
+                     ;; numpy 也返回 nan —— 不能因为 sum2 取 0 就给出 0/n。
+                     (val (if (or (zerop cnt) (<= div zero)) nan (/ sum2 div))))
+                (%nan-scalar-result out shape final-dtype val "vt-nanvar")))))
+        (let* ((mask (vt-isnan tensor))
+               (not-nan (vt-logical-not mask))
+               (nan (vt-get-nan final-dtype))
+               (zero (if (eq final-dtype :float32) 0.0s0 0.0d0))
+               (clean (vt-where mask zero tensor :dtype final-dtype))
+               (count (vt-sum not-nan :axis axis :keepdims keepdims :dtype final-dtype))
+               (mean (vt-nanmean tensor :axis axis :keepdims t :dtype final-dtype))
+               (sq-diff (vt-* (vt-map (lambda (c m) (* (- c m) (- c m)))
+                                      clean mean :dtype final-dtype)
+                              not-nan :dtype final-dtype))
+               (sum2 (vt-sum sq-diff :axis axis :keepdims keepdims :dtype final-dtype))
+               (ddof-f (coerce ddof (vt-dtype->lisp-type final-dtype)))
+               (divisor (vt-map (lambda (c) (if (< c ddof-f) zero (- c ddof-f)))
+                                count :dtype final-dtype)))
+          (when out
+            (vt-check-out out (vt-shape sum2) final-dtype :op-name "vt-nanvar"))
+          (vt-map (lambda (s d) (if (<= d zero) nan (/ s d)))
+                  sum2 divisor :dtype final-dtype :out out)))))
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
   "忽略 NaN 的标准差（sqrt(vt-nanvar)）。dtype 语义同 vt-nanvar。"

@@ -292,6 +292,143 @@ lambda 算子请使用 %%float-map-fn"))
       整数进 float64 出）；float32 进 float32 出。:out 契约同 vt-+。"
   (%float-map #'sin vt out (%infer-float-dtype vt dtype)))
 
+;;; ==================================================================
+;;; 一元数学函数的符号算子（供 vt-fast-map 编译期内联）
+;;;
+;;; 为什么需要这一组：`vt-fast-map` 只在算子写成 `(function <symbol>)`
+;;; 字面量时才做内联展开；写成 `(lambda ...)` 一律回退到 `vt-map` 的
+;;; `funcall` + 类型未知的通用循环。1M double 实测（v0.4.8）：
+;;;   sqrt 48ms / log 57ms / log2 103ms / cbrt 143ms，
+;;; 而同为 libm 调用的 sin（已是符号算子）只有 22ms —— 差距全在
+;;; 每元素一次 funcall 与泛型 aref 上。
+;;;
+;;; 为什么单/双精度各写一份：原 lambda 路径里 single-float 输入走的是
+;;; **单精度** libm（(sqrt 2.0s0) ≠ (float (sqrt 2d0) 1.0s0)），
+;;; 统一升双再降回会差 1 ulp，破坏「快路径与通用路径逐位可比」。
+;;; ==================================================================
+
+;;; 单/双精度算子分派宏：两条分支都展开为 vt-fast-map 内联循环。
+(defmacro %float-map-pair (dfn sfn vt out dt)
+  (let ((d (gensym "DT")))
+    `(let ((,d ,dt))
+       (if (eq ,d :float32)
+           (%float-map (function ,sfn) ,vt ,out ,d)
+           (%float-map (function ,dfn) ,vt ,out ,d)))))
+
+(declaim (inline %op-sqrt-df %op-sqrt-sf))
+(defun %op-sqrt-df (x)
+  (let ((x (coerce x 'double-float)))
+    (if (minusp x) +vt-dfloat-nan+ (sqrt x))))
+(defun %op-sqrt-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (if (minusp x) +vt-sfloat-nan+ (sqrt x))))
+
+(declaim (inline %op-asin-df %op-asin-sf %op-acos-df %op-acos-sf))
+(defun %op-asin-df (x)
+  (let ((x (coerce x 'double-float)))
+    ;; NaN 必须前置拦截：CL 的 (asin nan) 返回**复数** #C(nan nan)，
+    ;; 写回 double-float 数组时会抛 "is not of type REAL"。
+    ;; 原 lambda 实现同样漏了这一步（asin/acos/atanh 传 NaN 直接崩），
+    ;; numpy 的对应函数返回 nan —— 此处一并修正。
+    (cond ((/= x x) x)
+          ((> (abs x) 1.0d0) +vt-dfloat-nan+)
+          (t (asin x)))))
+(defun %op-asin-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (cond ((/= x x) x)
+          ((> (abs x) 1.0s0) +vt-sfloat-nan+)
+          (t (asin x)))))
+(defun %op-acos-df (x)
+  (let ((x (coerce x 'double-float)))
+    (cond ((/= x x) x)
+          ((> (abs x) 1.0d0) +vt-dfloat-nan+)
+          (t (acos x)))))
+(defun %op-acos-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (cond ((/= x x) x)
+          ((> (abs x) 1.0s0) +vt-sfloat-nan+)
+          (t (acos x)))))
+
+(declaim (inline %op-acosh-df %op-acosh-sf))
+(defun %op-acosh-df (x)
+  (let ((x (coerce x 'double-float)))
+    (if (< x 1.0d0) +vt-dfloat-nan+ (acosh x))))
+(defun %op-acosh-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (if (< x 1.0s0) +vt-sfloat-nan+ (acosh x))))
+
+(declaim (inline %op-atanh-df %op-atanh-sf))
+(defun %op-atanh-df (x)
+  (let ((x (coerce x 'double-float)))
+    (cond ((/= x x) x)
+          ((> (abs x) 1.0d0) +vt-dfloat-nan+)
+          ((= x 1.0d0) +vt-dfloat-pos-inf+)
+          ((= x -1.0d0) +vt-dfloat-neg-inf+)
+          (t (atanh x)))))
+(defun %op-atanh-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (cond ((/= x x) x)
+          ((> (abs x) 1.0s0) +vt-sfloat-nan+)
+          ((= x 1.0s0) +vt-sfloat-pos-inf+)
+          ((= x -1.0s0) +vt-sfloat-neg-inf+)
+          (t (atanh x)))))
+
+;;; 对数族。LOG2/LOG10 的底保持与原实现同型的常量：原代码是
+;;; `(log x base)`，base 为 double-float 变量 —— 对 single 输入会先把 x
+;;; 提升到 double 再算，故 sf 版算子直接返回 double，由内联循环的
+;;; %cast-to 降回 single，与原路径逐位一致。
+
+(declaim (inline %op-log-df %op-log-sf))
+(defun %op-log-df (x)
+  (let ((x (coerce x 'double-float)))
+    (if (> x 0.0d0)
+        (log x)
+        (if (zerop x) +vt-dfloat-neg-inf+ +vt-dfloat-nan+))))
+(defun %op-log-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (if (> x 0.0s0)
+        (log x)
+        (if (zerop x) +vt-sfloat-neg-inf+ +vt-sfloat-nan+))))
+
+(declaim (inline %op-log2-df %op-log2-sf %op-log10-df %op-log10-sf))
+(defun %op-log2-df (x)
+  (let ((x (coerce x 'double-float)))
+    (if (> x 0.0d0)
+        (log x 2.0d0)
+        (if (zerop x) +vt-dfloat-neg-inf+ +vt-dfloat-nan+))))
+(defun %op-log2-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (if (> x 0.0s0)
+        (log x 2.0d0)
+        (if (zerop x) +vt-sfloat-neg-inf+ +vt-sfloat-nan+))))
+(defun %op-log10-df (x)
+  (let ((x (coerce x 'double-float)))
+    (if (> x 0.0d0)
+        (log x 10.0d0)
+        (if (zerop x) +vt-dfloat-neg-inf+ +vt-dfloat-nan+))))
+(defun %op-log10-sf (x)
+  (let ((x (coerce x 'single-float)))
+    (if (> x 0.0s0)
+        (log x 10.0d0)
+        (if (zerop x) +vt-sfloat-neg-inf+ +vt-sfloat-nan+))))
+
+;;; 立方根：保持 (expt |x| third) 的原算式，third 按输入精度取
+;;; （single 用 1/3 的 single 表示，故结果与原来的 single 分支一致）。
+
+(declaim (inline %op-cbrt-df %op-cbrt-sf))
+(defun %op-cbrt-df (x)
+  (let ((x (coerce x 'double-float)))
+   (cond ((sb-ext:float-nan-p x) x)
+        ((or (= x sb-ext:double-float-positive-infinity)
+             (= x sb-ext:double-float-negative-infinity)) x)
+         (t (* (signum x) (expt (abs x) (/ 3.0d0)))))))
+(defun %op-cbrt-sf (x)
+  (let ((x (coerce x 'single-float)))
+   (cond ((sb-ext:float-nan-p x) x)
+        ((or (= x sb-ext:single-float-positive-infinity)
+             (= x sb-ext:single-float-negative-infinity)) x)
+         (t (* (signum x) (expt (abs x) (/ 3.0s0)))))))
+
 
 (defun vt-cos (vt &key out dtype)
   "逐元素余弦。整数输入输出 float64，float32 进 float32 出。
@@ -332,20 +469,14 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-asin (vt &key out dtype)
   "逐元素反正弦。|x|>1 返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt)))
-    (%float-map-lambda (lambda (x)
-                            (if (> (abs x) 1.0d0) nan (asin x)))
-                          vt out dt)))
+(let ((dt (%infer-float-dtype vt dtype)))
+    (%float-map-pair %op-asin-df %op-asin-sf vt out dt)))
 
 (defun vt-acos (vt &key out dtype)
   "逐元素反余弦。|x|>1 返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt)))
-    (%float-map-lambda (lambda (x)
-                            (if (> (abs x) 1.0d0) nan (acos x)))
-                          vt out dt)))
+(let ((dt (%infer-float-dtype vt dtype)))
+    (%float-map-pair %op-acos-df %op-acos-sf vt out dt)))
 
 (defun vt-asinh (vt &key out dtype)
   "逐元素反双曲正弦。整数输入输出 float64，float32 进 float32 出。
@@ -356,26 +487,15 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-acosh (vt &key out dtype)
   "逐元素反双曲余弦。x<1 返回 NaN（对标 numpy）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt)))
-    (%float-map-lambda (lambda (x)
-                            (if (< x 1.0d0) nan (acosh x)))
-                          vt out dt)))
+(let ((dt (%infer-float-dtype vt dtype)))
+    (%float-map-pair %op-acosh-df %op-acosh-sf vt out dt)))
 
 (defun vt-atanh (vt &key out dtype)
   "逐元素反双曲正切，对标 numpy.arctanh。
       |x|>1 返回 NaN；x=+1 返回 +Inf、x=-1 返回 -Inf（IEEE 极限，非 NaN）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt))
-         (pos-inf (vt-get-pos-inf dt))
-         (neg-inf (vt-get-neg-inf dt)))
-    (%float-map-lambda (lambda (x)
-                         (cond ((> (abs x) 1.0d0) nan)
-                               ((= x 1.0d0) pos-inf)
-                               ((= x -1.0d0) neg-inf)
-                               (t (atanh x))))
-                       vt out dt)))
+(let ((dt (%infer-float-dtype vt dtype)))
+    (%float-map-pair %op-atanh-df %op-atanh-sf vt out dt)))
 
 (defun vt-exp (vt &key out dtype)
   "逐元素指数。整数输入输出 float64，float32 进 float32 出。
@@ -491,50 +611,53 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-sqrt (vt &key out dtype)
   "逐元素平方根。负数输入返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt)))
-    (%float-map-lambda (lambda (x) (if (minusp x) nan (sqrt x))) vt out dt)))
+(let ((dt (%infer-float-dtype vt dtype)))
+    (%float-map-pair %op-sqrt-df %op-sqrt-sf vt out dt)))
 
 (defun vt-log (vt &key base out dtype)
   "逐元素自然对数；:base 给定时为换底对数。
       语义对标 numpy.log：x>0 正常；x=0 → -Inf（或 log(base)<0 时 +Inf）；
       x<0 → NaN；非法 base（<=0 或 =1）→ 全 NaN。
-      整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (nan (vt-get-nan dt))
-         (neginf (vt-get-neg-inf dt))
-         (posinf (vt-get-pos-inf dt)))
-    (let ((af (%coerce-float-input (ensure-vt vt) dt)))
-      (cond
-        ((and base (or (<= base 0) (= base 1)))
-         (vt-map (lambda (x)
-                   (declare (ignore x)) nan)
-                 af :out out :dtype dt))
-        ((null base)
+      整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。
+
+  性能：base 缺省 / base=2.0d0 / base=10.0d0 三种最常见情形走
+  `%float-map-pair` 的编译期内联循环（原实现对每种情形都用 lambda，
+  一律回退 vt-map 的 funcall 路径，1M 元素实测 log 57ms / log2 103ms）；
+  任意其它 base 仍是 lambda 路径（base 是运行期变量，无法内联）。"
+  (let ((dt (%infer-float-dtype vt dtype)))
+    (cond
+      ((null base)
+       (%float-map-pair %op-log-df %op-log-sf vt out dt))
+      ((eql base 2.0d0)
+       (%float-map-pair %op-log2-df %op-log2-sf vt out dt))
+      ((eql base 10.0d0)
+       (%float-map-pair %op-log10-df %op-log10-sf vt out dt))
+      ((or (<= base 0) (= base 1))
+       (let ((nan (vt-get-nan dt)))
+         (vt-map (lambda (x) (declare (ignore x)) nan)
+                 (%coerce-float-input (ensure-vt vt) dt) :out out :dtype dt)))
+      (t
+       (let* ((nan (vt-get-nan dt))
+              (neginf (vt-get-neg-inf dt))
+              (posinf (vt-get-pos-inf dt))
+              (zero-result (if (plusp (log base)) neginf posinf)))
          (vt-map (lambda (x)
                    (if (> x 0)
-                       (log x)
-                       (if (zerop x)
-                           neginf nan)))
-                 af :out out :dtype dt))
-        (t
-         (let ((zero-result (if (plusp (log base)) neginf posinf)))
-           (vt-map (lambda (x)
-                     (if (> x 0)
-                         (log x base)
-                         (if (zerop x)
-                             zero-result nan)))
-                   af :out out :dtype dt)))))))
+                       (log x base)
+                       (if (zerop x) zero-result nan)))
+                 (%coerce-float-input (ensure-vt vt) dt) :out out :dtype dt))))))
 
 (defun vt-log10 (vt &key out dtype)
   "逐元素常用对数（底 10）。语义等价 (vt-log vt :base 10)。
       :out 契约同 vt-+。"
-  (vt-log vt :base 10.0d0 :out out :dtype dtype))
+  (%float-map-pair %op-log10-df %op-log10-sf vt out
+                   (%infer-float-dtype vt dtype)))
 
 (defun vt-log2 (vt &key out dtype)
   "逐元素二进制对数（底 2）。语义等价 (vt-log vt :base 2)。
       :out 契约同 vt-+。"
-  (vt-log vt :base 2.0d0 :out out :dtype dtype))
+  (%float-map-pair %op-log2-df %op-log2-sf vt out
+                   (%infer-float-dtype vt dtype)))
 
 (defun vt-abs (vt &key out dtype)
   "逐元素绝对值。整数保持整数 dtype（对标 numpy.abs）。
@@ -1057,16 +1180,11 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
   "逐元素立方根。定义为 signum(x)*|x|^(1/3)，因此负数返回实数值
       （对标 numpy.cbrt，不返回 NaN）。整数输入输出 float64。
       v0.4.x 修复：cbrt(NaN) 原经 (expt NaN 1/3) 泄漏复数 NaN 导致
-      类型错误，现显式拦截：NaN → NaN、±Inf → ±Inf（numpy 对齐）。"
-  (let* ((dt (%infer-float-dtype vt dtype))
-         (third (if (eq dt :float32)
-                    (/ 3.0s0)
-                    (/ 3.0d0))))
-    (vt-map (lambda (x)
-              (cond ((%nan-p x) x)
-                    ((%inf-p x) x)
-                    (t (* (signum x) (expt (abs x) third)))))
-            vt :out out :dtype dt)))
+      类型错误，现显式拦截：NaN → NaN、±Inf → ±Inf（numpy 对齐）。
+  性能：改用符号算子 %OP-CBRT-Df/SF，编译期内联（原 lambda 走 vt-map
+  的 funcall 路径，1M 元素实测 143ms）。"
+  (let ((dt (%infer-float-dtype vt dtype)))
+    (%float-map-pair %op-cbrt-df %op-cbrt-sf vt out dt)))
 
 ;;; v0.4.3 性能修复：vt-hypot / vt-lerp / vt-cbrt 等原本一律写成
 ;;;     (vt-map (lambda (a b) ...) ...)

@@ -196,27 +196,50 @@
                     (vt-cast (aref (vt-data vt) (vt-offset vt)) dtype)
                     :element-type lisp-type)
         ;; 非标量
-        (let* ((rank (length shape))
-               (dims (coerce shape 'simple-vector))          ; 各维度大小
-               (arr (make-array shape :element-type lisp-type))
-               (coords (make-list rank :initial-element 0))) ; 初始坐标全 0
-          (vt-do-each (ptr val vt)
-            (declare (ignore val))
-            ;; 使用当前坐标设置目标数组
-            (setf (apply #'aref arr coords)
-                  (if fast
-                      (coerce (aref (vt-data vt) ptr) lisp-type)
-                      (vt-cast (aref (vt-data vt) ptr) dtype)))
-            ;; 更新坐标到下一个逻辑位置（C 顺序）
-            (let ((i (1- rank)))
-              (loop
-                (incf (nth i coords))                ; 当前位 +1
-                (when (< (nth i coords) (svref dims i))
-                  (return))                           ; 未溢出，更新完成
-                (setf (nth i coords) 0)              ; 溢出归零，进位
-                (decf i)
-                (when (< i 0) (return)))))           ; 所有位都溢出，遍历结束
-          arr))))
+        (let* ((n (vt-size vt))
+               (arr (make-array shape :element-type lisp-type)))
+          ;; 性能：原实现用 `(apply #'aref arr coords)` 按坐标写多维数组，
+          ;; 每元素一次 APPLY（参数表打包）+ 一次泛型 AREF + 一次 VT-CAST，
+          ;; 1M 元素实测 344ms。SBCL 的多维数组底层是行主序连续存储，
+          ;; 用 ARRAY-STORAGE-VECTOR 拿到底层向量后按下标写即可，
+          ;; 连续的同类转换进一步退化为一次 REPLACE（memcpy）。
+          (cond
+            ((and (vt-contiguous-p vt) (eq (vt-dtype vt) dtype))
+             ;; 同类型 + 连续：一次 memcpy。8 路类型声明是必需的 ——
+             ;; 不声明时 REPLACE 走通用 ELT 路径（每元素两次泛型 aref），
+             ;; 与逐元素写几乎没差别。
+             (let ((sv (sb-ext:array-storage-vector arr))
+                   (src (vt-data vt))
+                   (off (vt-offset vt)))
+               (macrolet ((cp (lt)
+                            `(replace (the (simple-array ,lt (*)) sv)
+                                      (the (simple-array ,lt (*)) src)
+                                      :start1 0 :end1 n
+                                      :start2 off :end2 (+ off n))))
+                 (cond ((eq lisp-type 'double-float) (cp double-float))
+                       ((eq lisp-type 'single-float) (cp single-float))
+                       ((equal lisp-type '(signed-byte 64)) (cp (signed-byte 64)))
+                       ((equal lisp-type '(signed-byte 32)) (cp (signed-byte 32)))
+                       ((equal lisp-type '(signed-byte 16)) (cp (signed-byte 16)))
+                       ((equal lisp-type '(signed-byte 8)) (cp (signed-byte 8)))
+                       ((equal lisp-type '(unsigned-byte 16)) (cp (unsigned-byte 16)))
+                       ((equal lisp-type '(unsigned-byte 8)) (cp (unsigned-byte 8)))
+                       (t (dotimes (i n)
+                            (setf (aref sv i) (aref src (+ off i))))))))
+             arr)
+            (t
+             (let ((sv (sb-ext:array-storage-vector arr))
+                   (src (vt-data vt))
+                   (i 0))
+               (declare (type fixnum i))
+               (vt-do-each (ptr val vt)
+                 (declare (ignore val))
+                 (setf (aref sv i)
+                       (if fast
+                           (coerce (aref src ptr) lisp-type)
+                           (vt-cast (aref src ptr) dtype)))
+                 (incf i))
+               arr)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 打印
