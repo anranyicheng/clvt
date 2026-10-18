@@ -1029,6 +1029,73 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                     vt)
       (return-from vt-pad out))
 
+    ;; ================================================================
+    ;; v0.4.7 快路径：:edge / :wrap / :reflect / :symmetric
+    ;;
+    ;; 原实现是「对每个输出元素做 rank 次 FLOOR 分解 + 泛型 AREF + 一次
+    ;; %PAD-MAP」，1M 元素 pad (10,10) 实测 37–41ms，1000×1000 pad (10,10)
+    ;; 达 68ms（numpy.pad 同等工作量 0.6–1.4ms）。
+    ;;
+    ;; 但边界体积是 O(表面积)：1M 元素 pad (10,10) 只有 20 个元素越界。
+    ;; 于是照 :constant 的骨架来，只是把「填常量」换成「按映射索引 gather」：
+    ;;   1. 内部盒 = 源的一次整块拷贝（与 :constant 相同）；
+    ;;   2. 逐轴（升序）把该轴的映射索引用 vt-take 取出，写进前/后板。
+    ;;
+    ;; 角点语义与 numpy 的「逐轴 concat」逐位一致：写第 D 轴的板时，其它轴
+    ;; e<D 取**已扩展**的全范围（:all），e>D 取尚未扩展的居中区间
+    ;; [pb_e, pb_e+shape_e)。因此后处理的轴覆盖先处理的轴 —— 正是 numpy 的
+    ;; 「最后一个越界轴胜出」。
+    ;;
+    ;; 注：gather 的索引是「相对内部盒」的，而 out 的 D 轴带有 PB 偏移，
+    ;; 故索引要加 PB；这是本段唯一容易写错的地方。
+    ;; ================================================================
+    (when (plusp rank)
+      (flet ((other-specs (d d-spec)
+               ;; 除 D 之外的轴向：e < D 已扩展 → :all；e > D 未扩展 → 居中区间
+               (loop for e from 0 below rank
+                     collect (if (= e d)
+                                 d-spec
+                                 (if (< e d)
+                                     '(:all)
+                                     (list (first (nth e pad))
+                                           (+ (first (nth e pad)) (nth e shape)))))))
+             (idx-tensor (lo-hi n)
+               ;; 构造长度为 N 的 int64 索引张量（零拷贝包装，见 %make-vt）
+               (%make-vt :data lo-hi :shape (list n) :strides '(1)
+                         :offset 0 :dtype :int64)))
+        ;; 1) 内部盒一次拷入
+        (vt-copy-into (apply #'vt-slice out
+                             (loop for e from 0 below rank
+                                   collect (list (first (nth e pad))
+                                                 (+ (first (nth e pad))
+                                                    (nth e shape)))))
+                      vt)
+        ;; 2) 逐轴前/后板
+        (loop for d from 0 below rank do
+          (let* ((pb (first (nth d pad)))
+                 (pa (second (nth d pad)))
+                 (sk (nth d shape)))
+            (when (plusp pb)
+              (let ((iv (make-array pb :element-type '(signed-byte 64))))
+                (dotimes (o pb)
+                  (setf (aref iv o)
+                        (the fixnum (+ pb (%pad-map mode (- pb o) sk :left)))))
+                (vt-copy-into (apply #'vt-slice out (other-specs d (list 0 pb)))
+                              (vt-take (apply #'vt-slice out (other-specs d '(:all)))
+                                       (idx-tensor iv pb)
+                                       :axis d))))
+            (when (plusp pa)
+              (let ((iv (make-array pa :element-type '(signed-byte 64))))
+                (dotimes (o pa)
+                  (setf (aref iv o)
+                        (the fixnum (+ pb (%pad-map mode (1+ o) sk :right)))))
+                (vt-copy-into (apply #'vt-slice out
+                                     (other-specs d (list (+ sk pb) (nth d new-shape))))
+                              (vt-take (apply #'vt-slice out (other-specs d '(:all)))
+                                       (idx-tensor iv pa)
+                                       :axis d)))))))
+      (return-from vt-pad out))
+
     (loop for out-ptr fixnum from 0 below out-size do
       (let ((rem out-ptr)
             (in-ptr in-offset)

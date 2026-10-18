@@ -280,6 +280,71 @@
              (in-ax-stride (nth ax strides))
              (idx-arr (vt-data idx)))
         ;; ================================================================
+        ;; v0.4.7 快路径：AX 是**末轴** + 源/输出均连续 + indices 无广播
+        ;;
+        ;; 此时布局就是 (ROWS, AX-DIM) → (ROWS, LEN)，每个输出元素只做
+        ;; 「一次索引读 + 一次 src 读 + 一次 dst 写」，增量里程计完全不需要
+        ;; （它每元素要多算几次加减与一次进位判断，都是纯开销）。
+        ;; 1000×1000 上轮实测 22305us（numpy 5387us），其中里程计占大头。
+        ;;
+        ;; 条件里要求 (equal (subseq ishape 0 ax) (subseq shape 0 ax))：indices
+        ;; 的非 AX 维必须与源完全一致，才说明 IDX 与输出同构（无广播）；有广播
+        ;; 时仍走下方通用路径（铁律 2：回退而非报错）。
+        ;; ================================================================
+        (when (and (= ax (1- rank))
+                   (vt-contiguous-p tensor)
+                   (zerop src-off)
+                   (plusp total)
+                   (equal (subseq ishape 0 ax) (subseq shape 0 ax)))
+          (let* ((len (nth ax ishape))
+                 (rows (the fixnum (truncate (the fixnum total) (max len 1))))
+                 (et (array-element-type out-data)))
+            (declare (type fixnum len rows))
+            (macrolet ((g (lt)
+                         `(let ((s (the (simple-array ,lt (*)) src-data))
+                                (d (the (simple-array ,lt (*)) out-data))
+                                (ia (the (simple-array (signed-byte 64) (*)) idx-arr)))
+                            (declare (type (simple-array ,lt (*)) s d)
+                                     (type (simple-array (signed-byte 64) (*)) ia)
+                                     (type fixnum len rows ax-dim))
+                            (dotimes (o rows)
+                              (declare (type fixnum o))
+                              (let ((sb (the fixnum (* o ax-dim)))
+                                    (db (the fixnum (* o len))))
+                                (declare (type fixnum sb db))
+                                (dotimes (j len)
+                                  (declare (type fixnum j))
+                                  ;; 注意：IDX 的扁平布局是 (ROWS, LEN)，索引必须
+                                  ;; 带行为偏移 O*LEN。漏掉它时「LEN=1 且多行」的
+                                  ;; 广播用例（如 idx 形状 (2,1) 配 (2,2) 源）会
+                                  ;; 每行都读第 0 个索引，静默给出错误结果。
+                                  (let* ((raw (aref ia (the fixnum (+ (* o len) j))))
+                                         (sel (if (minusp raw)
+                                                  (the fixnum (+ raw ax-dim))
+                                                  (the fixnum raw))))
+                                    (declare (type fixnum sel))
+                                    (unless (<= 0 sel (1- ax-dim))
+                                      (error "vt-take-along-axis: 索引 ~a 越界（轴长 ~a）"
+                                             raw ax-dim))
+                                    (setf (aref d (the fixnum (+ db j)))
+                                          (aref s (the fixnum (+ sb sel)))))))))))
+              (cond
+                ((equal et 'double-float)       (g double-float))
+                ((equal et 'single-float)       (g single-float))
+                ((equal et '(signed-byte 64))   (g (signed-byte 64)))
+                ((equal et '(signed-byte 32))   (g (signed-byte 32)))
+                ((equal et '(signed-byte 16))   (g (signed-byte 16)))
+                ((equal et '(signed-byte 8))    (g (signed-byte 8)))
+                ((equal et '(unsigned-byte 16)) (g (unsigned-byte 16)))
+                ((equal et '(unsigned-byte 8))  (g (unsigned-byte 8)))
+                (t nil)))
+            (when (member et (list 'double-float 'single-float
+                                   '(signed-byte 64) '(signed-byte 32)
+                                   '(signed-byte 16) '(signed-byte 8)
+                                   '(unsigned-byte 16) '(unsigned-byte 8))
+                          :test #'equal)
+              (return-from vt-take-along-axis out))))
+        ;; ================================================================
         ;; v0.4.5 重写（原 157964us / numpy 5820us / 27.1 倍）
         ;;
         ;; 原实现对**每个输出元素**都：make-list 建两份坐标表 → 两趟 NTH
