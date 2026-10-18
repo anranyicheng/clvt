@@ -2035,6 +2035,12 @@
         (setf result (vt-- (vt-narrow result ax 1 len) (vt-narrow result ax 0 (1- len)))))
           finally (return result))))
 
+(declaim (inline %trapz-term))
+(defun %trapz-term (l r hh)
+  "梯形法则的被积项 0.5*(L+R)*HH。命名成函数是为了让 vt-fast-map 能内联它
+   （宏只接受字面算子；传 (lambda ...) 会回退到通用 vt-map）。"
+  (* 0.5d0 (+ l r) hh))
+
 (defun vt-trapz (y &key (x nil) (dx 1.0d0) (axis -1))
   "梯形法则数值积分（对标 numpy.trapz）。X 给定则用非均匀间距，否则用 DX。"
   (let* ((sh (vt-shape y))
@@ -2050,9 +2056,13 @@
                                     (make-list (- (length sh) ax 1) :initial-element 1))))
       (let* ((left (vt-narrow y ax 0 (1- n)))
              (right (vt-narrow y ax 1 n))
-             (integrand (vt-map (lambda (l r hh)
-                                  (* 0.5d0 (+ l r) hh))
-                                left right h)))
+             ;; v0.4.8 性能修复：(vt-map (lambda (l r hh) ...) ...) 会走**通用**
+             ;; 路径 —— 循环里逐元素 FUNCALL 闭包，且 left/right 是视图、
+             ;; h 是带 0 步长的广播视图，通用路径对它们每个元素都要走一遍
+             ;; 通用 AREF。1M 元素实测 112420us（numpy.trapezoid 4638us）。
+             ;; 换成「命名算子 + vt-fast-map」即可命中第 1 轮建好的
+             ;; inline3-strided 快路径（三输入、按输出元素类型特化、支持广播）。
+             (integrand (vt-fast-map #'%trapz-term left right h)))
         (vt-sum integrand :axis ax)))))
 
 (defun %normalize-mode-keyword (mode)
@@ -2078,17 +2088,61 @@
          (m (vt-size v-flat))
          (a-data (vt-data a-flat))
          (v-data (vt-data v-flat)))
-    (flet ((compute (k)
-             (let ((sum 0.0d0))
-               (loop for j from (max 0 (- k)) below (min m (- n k))
-                     do (incf sum (* (aref a-data (+ j k)) (aref v-data j))))
-               sum)))
-      (let* ((full-len (+ n m -1))
-             (offset (1- m))
-             (full (make-array full-len :element-type 'double-float)))
-        (loop for k from (- offset) below n for i from 0
-              do (setf (aref full i) (compute k)))
-        (ecase mode-kw
+    ;; ================================================================
+    ;; v0.4.8 性能修复：内层点积按元素类型特化
+    ;;
+    ;; 原实现里 A-DATA / V-DATA 都没有元素类型声明，内层每次
+    ;;   (incf sum (* (aref a-data (+ j k)) (aref v-data j)))
+    ;; 都要走两次通用 AREF（二维分派 + 边界检查）再装箱相乘。
+    ;; 100k×64 的点积是 6.4e6 次迭代，实测 389ms（numpy.correlate 2.5ms，
+    ;; 差 157 倍）；vt-convolve 直接复用本函数，故两个函数同时受益。
+    ;;
+    ;; 只在**两侧元素类型相同且为浮点**时走特化（此时与原实现逐位等价：
+    ;; 同样是 <lt>×<lt> 后累加到 double-float）。整型输入仍走原通用路径 ——
+    ;; 那里 (incf sum (* i64 i64)) 可能溢出 fixnum 提升为 bignum，
+    ;; 特化会改变语义，不值得冒这个风险。
+    ;; ================================================================
+    (let* ((full-len (+ n m -1))
+           (offset (1- m))
+           (et-a (array-element-type a-data))
+           (et-b (array-element-type v-data)))
+      (flet ((fill-full-generic ()
+               ;; 原实现的逐 k 版本（整型/混合类型回退）
+               (let ((full (make-array full-len :element-type 'double-float)))
+                 (loop for k from (- offset) below n for i from 0
+                       do (let ((sum 0.0d0))
+                            (loop for j from (max 0 (- k)) below (min m (- n k))
+                                  do (incf sum (* (aref a-data (+ j k))
+                                                  (aref v-data j))))
+                            (setf (aref full i) sum)))
+                 full)))
+        (let ((full
+                (macrolet ((fill-full (lt)
+                             `(let ((s (the (simple-array ,lt (*)) a-data))
+                                    (w (the (simple-array ,lt (*)) v-data))
+                                    (full (make-array full-len
+                                                      :element-type 'double-float)))
+                                (declare (type (simple-array ,lt (*)) s w)
+                                         (type (simple-array double-float (*)) full)
+                                         (type fixnum n m offset full-len))
+                                (loop for k fixnum from (- offset) below n
+                                      for i fixnum from 0
+                                      do (let ((sum 0.0d0))
+                                           (declare (type double-float sum))
+                                           (loop for j fixnum
+                                                 from (the fixnum (max 0 (- k)))
+                                                 below (the fixnum (min m (- n k)))
+                                                 do (incf sum (* (aref s (the fixnum (+ j k)))
+                                                                 (aref w j))))
+                                           (setf (aref full i) sum)))
+                                full)))
+                  (cond
+                    ((and (equal et-a 'double-float) (equal et-b 'double-float))
+                     (fill-full double-float))
+                    ((and (equal et-a 'single-float) (equal et-b 'single-float))
+                     (fill-full single-float))
+                    (t (fill-full-generic))))))
+          (ecase mode-kw
           (:full (%make-vt :data full :shape (list full-len) :strides '(1)
                            :offset 0 :dtype :float64))
           (:valid (let* ((len (max 0 (1+ (- n m)))) (start offset)
@@ -2103,7 +2157,7 @@
                    (loop for i from 0 below out-len do
                      (setf (aref data i) (aref full (+ start i))))
                    (%make-vt :data data :shape (list out-len) :strides '(1)
-                             :offset 0 :dtype :float64))))))))
+                             :offset 0 :dtype :float64)))))))))
 
 (defun vt-convolve (a v &key (mode :full))
   "1D 卷积，对标 np.convolve。mode 支持关键字(:full/:valid/:same)或字符串。"
@@ -2130,11 +2184,14 @@
      (vt-interp #(0d0 5d0) #(1d0 3d0) #(10d0 30d0) :left -1d0 :right -2d0)
        => #(-1.0d0 -2.0d0)"
   (with-float-safe
-    (let* ((xp-vt (vt-contiguous
+    ;; v0.4.8：%FLAT-OFFSET0 保证 offset=0 —— 主循环用裸 AREF 取数，而
+    ;; vt-contiguous 对「已连续」输入是**原样返回**（保留 offset），于是 xp/fp
+    ;; 若是切片视图，读到的就是基数组开头的数据（静默错答案）。
+    (let* ((xp-vt (%flat-offset0
                    (if (eq (vt-dtype (ensure-vt xp)) :float64)
                        (ensure-vt xp)
                        (vt-astype (ensure-vt xp) :float64))))
-           (fp-vt (vt-contiguous
+           (fp-vt (%flat-offset0
                    (if (eq (vt-dtype (ensure-vt fp)) :float64)
                        (ensure-vt fp)
                        (vt-astype (ensure-vt fp) :float64))))
@@ -2162,9 +2219,20 @@
              (fp-end (aref fp-data (1- n)))
              (left-val (if left (vt-cast left :float64) fp0))
              (right-val (if right (vt-cast right :float64) fp-end)))
-        (loop for i from 0 below x-size
-              for xi = (aref x-data i) do
-                (setf (aref out-data i)
+        ;; v0.4.8 性能修复：主循环的 XP-DATA / FP-DATA / X-DATA / OUT-DATA 原先
+        ;; 都没有元素类型，(aref ...) 与 (setf (aref ...)) 走通用二维分派 +
+        ;; 边界检查；二分每查询约 14 次探测，1M 查询 = 1.4e7 次。实测 639588us
+        ;; （numpy.interp 141606us）。因为上面已把三者都归一到 float64，
+        ;; 这里只需一路 double-float 声明即可（不需要 8 路展开）。
+        (let ((xd (the (simple-array double-float (*)) x-data))
+              (xpd (the (simple-array double-float (*)) xp-data))
+              (fpd (the (simple-array double-float (*)) fp-data))
+              (od (the (simple-array double-float (*)) out-data)))
+          (declare (type (simple-array double-float (*)) xd xpd fpd od)
+                   (type fixnum x-size n))
+          (loop for i fixnum from 0 below x-size
+                for xi double-float = (aref xd i) do
+                  (setf (aref od i)
                       ;; v0.4.1 修复（差分测试 R3）：numpy 的 left/right 仅在
                       ;; 严格越界时生效；x==xp[0] 应取 fp[0]（插值分支给出
                       ;; 精确 fp0），而非 left。
@@ -2173,19 +2241,19 @@
                             (t (let ((lo 0) (hi (- n 2)))
                                  (loop while (< lo hi) do
                                    (let ((mid (ash (+ lo hi 1) -1)))
-                                     (if (<= (aref xp-data mid) xi)
+                                     (if (<= (aref xpd mid) xi)
                                          (setf lo mid)
                                          (setf hi (1- mid)))))
-                                 (let* ((xl (aref xp-data lo))
-                                        (xr (aref xp-data (1+ lo)))
-                                        (yl (aref fp-data lo))
-                                        (yr (aref fp-data (1+ lo)))
+                                 (let* ((xl (aref xpd lo))
+                                        (xr (aref xpd (1+ lo)))
+                                        (yl (aref fpd lo))
+                                        (yr (aref fpd (1+ lo)))
                                         (denom (- xr xl)))
                                    (if (zerop denom)
                                        yl
                                        (+ yl (* (- yr yl)
                                                 (/ (- xi xl) denom))))))))))
-        out))))
+          out)))))
 
 (defun vt-gradient (tensor &key (spacing 1.0d0) axis)
   "数值梯度（对标 numpy.gradient）。SPACING 为标量或每轴的间距；AXIS 限定求梯度的轴。"

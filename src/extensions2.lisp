@@ -239,11 +239,45 @@
          (total (reduce #'* in-shape :initial-value 1))
          (one-val (coerce 1 (vt-dtype->lisp-type dtype))))
     (declare (type fixnum total))
-    (dotimes (i total)
-      (let ((cls (aref xdata (+ x-off i))))
-        (unless (and (>= cls 0) (< cls num-classes))
-          (error "vt-one-hot: 类别 ~a 越界 [0, ~a)" cls num-classes))
-        (setf (aref rdata (+ (* i num-classes) cls)) one-val)))
+    ;; v0.4.8 性能修复：XDATA / RDATA 都没有元素类型声明，scatter 时
+    ;; `(setf (aref rdata ...) one-val)` 与 `(aref xdata ...)` 都走通用二维
+    ;; 分派（每元素一次 widetag 查询 + 边界检查）。1M×100 实测 555250us
+    ;; （numpy 同工作量 142740us）。这里按输出 dtype 展开 8 路特化：
+    ;; 只有 1M 次 scatter，但输出缓冲是 100M 元素（800MB），
+    ;; 分配与 memset 仍占大头，特化能省的是「写偏差点」这部分。
+    (macrolet ((scatter (lt)
+                 `(let ((rd (the (simple-array ,lt (*)) rdata))
+                        (xs (the (simple-array (signed-byte 64) (*)) xdata))
+                        (one (the ,lt one-val)))
+                    (declare (type (simple-array ,lt (*)) rd)
+                             (type (simple-array (signed-byte 64) (*)) xs)
+                             (type ,lt one)
+                             (type fixnum total num-classes x-off))
+                    (dotimes (i total)
+                      (declare (type fixnum i))
+                      (let ((cls (aref xs (the fixnum (+ x-off i)))))
+                        (declare (type fixnum cls))
+                        (unless (and (>= cls 0) (< cls num-classes))
+                          (error "vt-one-hot: 类别 ~a 越界 [0, ~a)" cls num-classes))
+                        (setf (aref rd (the fixnum (+ (* i num-classes) cls)))
+                              one))))))
+      (let ((et (array-element-type rdata)))
+        (cond
+          ((equal et 'double-float)       (scatter double-float))
+          ((equal et 'single-float)       (scatter single-float))
+          ((equal et '(signed-byte 64))   (scatter (signed-byte 64)))
+          ((equal et '(signed-byte 32))   (scatter (signed-byte 32)))
+          ((equal et '(signed-byte 16))   (scatter (signed-byte 16)))
+          ((equal et '(signed-byte 8))    (scatter (signed-byte 8)))
+          ((equal et '(unsigned-byte 16)) (scatter (unsigned-byte 16)))
+          ((equal et '(unsigned-byte 8))  (scatter (unsigned-byte 8)))
+          ;; 防御：其他元素类型 → 通用路径
+          (t (dotimes (i total)
+               (declare (type fixnum i))
+               (let ((cls (aref xdata (+ x-off i))))
+                 (unless (and (>= cls 0) (< cls num-classes))
+                   (error "vt-one-hot: 类别 ~a 越界 [0, ~a)" cls num-classes))
+                 (setf (aref rdata (+ (* i num-classes) cls)) one-val)))))))
     result))
 
 ;;; ------------------------------------------------------------------
