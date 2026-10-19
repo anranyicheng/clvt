@@ -1073,6 +1073,384 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 
 ---
 
+---
+
+## 16. 复数（complex）约定 — 第一轮进化
+
+> **基准**：NumPy **2.4.6**（本机实测）+ SBCL **2.6.8**（本机实测）。
+> **适用范围**：`dtype ∈ {:complex64, :complex128}` 的全部语义。
+> **落地文件**：`src/dtype.lisp`（类型系统）、`src/core.lisp`（构造/推断）、
+> `src/io.lisp`（打印/序列化入口）、`src/complex.lisp`（语义层，最后加载）。
+> **对照测试**：`test/complex-test.lisp` + `test/gen_complex_expected.py`
+> （期望值由 numpy 实测生成，共 **83 项差分用例 + 53 项契约断言 = 136 条断言**）。
+
+复数不是「多加一个 dtype」那么简单：它同时打破 4 条既有隐含假设——
+**全序比较**、**实数域数学函数的定义域**、**归约的单位元**、**结果 dtype = 输入 dtype**。
+本章把每一处都钉死。
+
+---
+
+### 14.1 物理表示与 dtype（唯一存储模型）
+
+| 项 | 规定 |
+|---|---|
+| dtype 符号 | `:complex64` / `:complex128`（导出为 `:complex128` 等关键字，与既有 8 种风格一致） |
+| CL 元素类型 | `(complex single-float)` / `(complex double-float)` |
+| itemsize | **8 / 16 字节**（= 2 × 分量宽度，与 `np.dtype('complex128').itemsize = 16` 一致） |
+| 内存布局 | **interleaved**（实部、虚部相邻），不是双平面（planar） |
+| strides 单位 | 仍是**元素**（1 个 stride 步 = 1 个复数 = 2 个浮点），**不是分量** |
+| 逻辑 zeroness | `complex(0,0)` 即「零」，`stride-0` 广播、切片、转置、别名快照全部沿用既有机制 |
+
+**铁律 3（本章新增）**：复数的存在**不改变物理层**。任何依赖 `data/shape/strides/offset/dtype`
+的既有代码（切片、广播、`vt-copy-into`、别名快照、`vt-astype` 的非连续 run 分解）
+在复数上必须**原样正确**，不得为复数分叉出第二套内存模型。
+
+> 实测依据：`(array-element-type (vt-data x))` = `(COMPLEX DOUBLE-FLOAT)`，
+> `vt-itemsize` = 16，`vt-slice`/`vt-transpose`/`vt-reshape` 在复数上与实数逐位同构。
+
+---
+
+### 14.2 构造与 dtype 推断
+
+| 输入 | NumPy 行为 | clvt 裁决 |
+|---|---|---|
+| `1+2j` 标量 | `complex128`（0 维） | `:complex128`（0 维） |
+| `#C(1.0 2.0)`（单精度分量） | `complex64` | `:complex64` |
+| `[1, 2, 3+4j]` 混合列表 | `complex128`（整数/浮点被提升） | `:complex128`（`%any-complex-in-sequence-p` 判定） |
+| `np.zeros(2, complex)` | `complex128` | `(vt-zeros '(2) :dtype :complex128)` |
+| `re + 1j*im` 惯用式 | — | `(vt-complex re im :dtype :complex128)` |
+| `np.array([1+2j], dtype=float)` | **TypeError**（`float() argument must be … not 'complex'`） | 显式实数 `:dtype` 时**按 §14.4 取实部**（不抛错）——这是 clvt 的 `vt-from-sequence` 既有「安全转换」立场，已记录为差异 D-C2 |
+
+**约定**：`vt-zeros / vt-ones / vt-empty / vt-full / vt-const / vt-zeros-like / vt-ones-like`
+的 `:dtype` **必须显式写** `:complex128` 才能得到复数（缺省仍是 `:float64`）。
+`vt-const '(1) #C(1 2)` 会按 §14.4 丢虚部 —— 这是**已接受的陷阱**，
+测试文件里凡是复数用例一律显式 `:dtype :complex128`。
+
+---
+
+### 14.3 类型提升（**100 格逐格实测**）
+
+`vt-promote-type` 必须复现下表（`np.zeros(1,dtype=a) + np.zeros(1,dtype=b)` 的实测结果）：
+
+| ⊔ | int8 | int16 | int32 | int64 | uint8 | uint16 | float32 | float64 | complex64 | complex128 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **int8** | int8 | int16 | int32 | int64 | int16 | int32 | float32 | float64 | complex64 | complex128 |
+| **int16** | int16 | int16 | int32 | int64 | int16 | int32 | float32 | float64 | complex64 | complex128 |
+| **int32** | int32 | int32 | int32 | int64 | int32 | int32 | float64 | float64 | complex128 | complex128 |
+| **int64** | int64 | int64 | int64 | int64 | int64 | int64 | float64 | float64 | complex128 | complex128 |
+| **uint8** | int16 | int16 | int32 | int64 | uint8 | uint16 | float32 | float64 | complex64 | complex128 |
+| **uint16** | int32 | int32 | int32 | int64 | uint16 | uint16 | float32 | float64 | complex64 | complex128 |
+| **float32** | float32 | float32 | float64 | float64 | float32 | float32 | float32 | float64 | complex64 | complex128 |
+| **float64** | float64 | float64 | float64 | float64 | float64 | float64 | float64 | float64 | complex128 | complex128 |
+| **complex64** | complex64 | complex64 | complex128 | complex128 | complex64 | complex64 | complex64 | complex128 | complex64 | complex128 |
+| **complex128** | complex128 | complex128 | complex128 | complex128 | complex128 | complex128 | complex128 | complex128 | complex128 | complex128 |
+
+#### 14.3.1 形式化规则（**唯一实现口径**）
+
+> **复数的实部分量参与普通实数提升；提升结果若为 `float32` → `complex64`，
+> 若为 `float64` → `complex128`。**
+
+即 `promote(a, b, …) = map_component(realpromote(σ(a), σ(b), …))`，其中
+`σ(:complex64) = :float32`、`σ(:complex128) = :float64`、其余 `σ(d) = d`，
+`map_component(:float32) = :complex64`、`map_component(:float64) = :complex128`。
+
+这一条规则**无需为复数单列任何特例**就能复现上表全部 100 格，包括最容易踩的：
+
+| 组合 | 结果 | 原因 |
+|---|---|---|
+| `complex64 ⊔ int16` | `complex64` | `float32 ⊔ int16 = float32` |
+| `complex64 ⊔ int32` | **`complex128`** | `float32 ⊔ int32 = float64`（24 位尾数规则） |
+| `complex64 ⊔ float64` | `complex128` | `float64` 胜出 |
+| `complex64 ⊔ complex128` | `complex128` | 分量 `float32 ⊔ float64 = float64` |
+
+> 注意 `complex64 ⊔ int32 = complex128` **不是笔误**：numpy 实测确认，
+> 与实数侧 `float32 ⊔ int32 = float64` 完全同源。任何「复数一律 complex128」
+> 或「complex64 总是保精度」的简化都会在这四格上失真。
+
+---
+
+### 14.4 转换与降级（casting）
+
+| 方向 | NumPy 行为 | clvt 裁决 |
+|---|---|---|
+| `complex128 → float64` | **取实部**，抛 `ComplexWarning`（可屏蔽） | **取实部，不产生警告**（差异 D-C1：CL 无警告机制；行为已在 docstring 写明） |
+| `complex128 → int64` | 取实部后截断，`ComplexWarning` | 取实部 → `%coerce-int*`（截断 + 回绕，与实数一致） |
+| `float64 → complex128` | 虚部补 0 | 同 |
+| ufunc 显式 `dtype=float64`（如 `np.sqrt(z, dtype=float)`） | **TypeError**（safe-casting 拒绝） | **报错**：`"复数输入的结果 dtype 必须是复数类型"` |
+| `np.float64(1+2j)` | **TypeError** | `vt-cast` 会取实部（差异同 D-C1） |
+| `np.array([1+2j], dtype=float)` | **TypeError** | 取实部（差异 D-C2） |
+
+统一出口：`vt-cast` / `vt-cast-fun` 对**目标为实/整**且**入参为复数**时先 `realpart`；
+对**目标为复数**时按分量 `coerce`（实数入参虚部补 0）。`vt-astype` 的所有快/慢路径
+都经由此出口，故 8×10 的组合矩阵无需逐格枚举。
+
+---
+
+### 14.5 算术与幂
+
+| 运算 | 语义 | 备注 |
+|---|---|---|
+| `+ - * /` | 复数四则（分量代数） | **不做共轭**（numpy 的 `*` `/` 也不做；共轭点积必须显式 `vt-conj`） |
+| 一元 `-` | 分量取负 | `vt-negative` |
+| `square` | `z*z` | ≠ `|z|²`；后者是 `vt-abs` 再平方 |
+| `pow` / `**` | `expt` 复数幂；指数可为实数或复数 | dtype 按 §14.3 提升 |
+| `0 ** 0` | `1+0i`（numpy 实测） | 先于极点判定 |
+| `0 ** 负数` | `nan+nanj`（numpy 实测） | CL 会抛条件，已拦截 |
+| `reciprocal` | `1/z`；`0` → `nan+nanj` | |
+| `floor_divide` / `mod` / `rem` | **无定义 → 报错** | numpy 抛 TypeError |
+| 位运算 `& \| ^ ~ << >>` | **无定义 → 报错** | numpy 抛 TypeError |
+| `floor/ceil/trunc/rint` | **报错** | numpy 同样不支持（复数无分量取整的全序） |
+| `round` | 分量各自取整 | numpy 2.x 支持（本库 `vt-round` 保留 divisor 参数语义） |
+
+---
+
+### 14.6 分量与派生量
+
+| 函数 | NumPy | clvt | 结果 dtype |
+|---|---|---|---|
+| `abs` | `np.abs(z)` = √(re²+im²) | `vt-abs` | complex128→**float64**，complex64→**float32** |
+| `real` | `z.real`（**视图**，可写） | `vt-real` | 分量浮点；**返回副本**（差异 D-C3） |
+| `imag` | `z.imag`（**视图**） | `vt-imag` | 同上；实数输入 → 全 0 |
+| `conj` | `np.conj(z)` | `vt-conj` / `vt-conjugate` | 保持复数 dtype |
+| `angle` | `np.angle(z[, deg])` = atan2(im, re) | `vt-angle`（`:deg`） | 实数（分量浮点） |
+| `sign` | `z/|z|`（零 → 0） | `vt-signum` | 保持复数 dtype |
+| `iscomplexobj` / `isrealobj` | 布尔 | `vt-iscomplexobj` / `vt-isrealobj` | 布尔 |
+
+**差异 D-C3（real/imag 是副本而非视图）的正式理由**：
+numpy 的 `z.real` 是同一缓冲的零拷贝视图（写它会改到原数组）。clvt 的 strided view
+把 stride 定义在**元素**上，无法表达「同一复数缓冲区里的实数子集」（缓冲元素类型是复数），
+强行支持会让 `strides/offset` 的语义分叉。因此第一轮取**副本**，并在
+`vt-real/vt-imag` 的 docstring 与本节显式声明；需要写回请用
+`(vt-complex new-re (vt-imag z))` 重组。
+
+**`abs(inf + nan·i) = inf`**：与 numpy 的 hypot 语义一致（不是 nan），已单独实现。
+
+---
+
+### 14.7 分支切割与主值（**SBCL 与 NumPy 逐点一致**）
+
+| 表达式 | NumPy 2.4.6 | SBCL 2.6.8 | 裁决 |
+|---|---|---|---|
+| `sqrt(-4+0j)` | `2j` | `#C(0 2)` | 一致（主值 + 虚部 -0.0 尊重符号） |
+| `sqrt(-4-0j)` | `-2j` | `#C(0 -2)` | 一致 |
+| `log(-1+0j)` | `+πi` | `#C(0 +π)` | 一致 |
+| `log(-1-0j)` | `-πi` | `#C(0 -π)` | 一致 |
+| `log(0+0j)` | `-inf+0j` | 需拦截（CL 抛条件） | **钳制为 `-Inf+0j`** |
+| `angle(-1-0j)` | `-π` | `(atan -0.0 -1.0) = -π` | 一致 |
+| `atanh(2+0j)` | `0.549…+1.571…j` | 同 | 一致 |
+| `exp/asinh/acosh/asin/acos/tanh/…` | 主值 | 同 | 一致 |
+| `cbrt(z)` | **TypeError** | 报错 | 一致（不支持） |
+
+**结论**：SBCL 的复数数学实现（`sqrt/log/exp/sin/…/atanh`）在**分支切割与符号零**上
+与 C99（numpy 的实现基础）逐位一致，因此 clvt 直接复用 CL 实现，
+只对**极点**（`log(0)`）与**非有限值**补返回约定，不自己重写公式。
+
+**符号零约定**：`-0.0` 的虚部是**语义信息**（决定分支），任何「规范化 `-0.0 → 0.0`」
+的优化都是 bug。`%cop-sqrt` 对 `y = ±0.0` 特判以保留符号。
+
+---
+
+### 14.8 比较、排序与极值（**字典序**）
+
+numpy 2.x 对复数定义了**字典序**（先实部，实部相等再比虚部），`<` / `<=` / `>` / `>=` /
+`sort` / `argsort` / `min` / `max` / `argmin` / `argmax` **全部遵此语义**（实测确认）。
+
+| 运算 | NumPy 2.4.6 | clvt | 备注 |
+|---|---|---|---|
+| `a == b` | 分量相等；任一分量 NaN → False | `vt-=`（`%cx-eq-flag`） | **不能**用 CL `=`：陷阱屏蔽后 `(= #C(nan 1) #C(nan 1))` 实测返回 **T** |
+| `a != b` | NaN → True | `vt-/=` | |
+| `a < b` | 字典序；NaN 参与 → False | `vt-<`（`%clt`） | 返回 `:int8` 的 1/0（§3.1） |
+| `a <= b` | 字典序 ≤ | `vt-<=` | |
+| `maximum/minimum` | 字典序；NaN 传播 | `vt-maximum/minimum` | `%cop-max/min` |
+| `fmax/fmin` | 字典序；忽略 NaN | `vt-fmax/fmin` | `%cop-fmax/min` |
+| `sort` | 字典序，NaN 排末尾 | `vt-sort` | `%cx-sort-axis` + `%cx-sort-less` |
+| `argsort` | 同上，返回下标 | `vt-argsort` | 稳定性：`stable-sort` |
+| `median` | 排序后取中位（偶数取两中位均值） | `vt-median` | 复数均值不是实数 |
+
+**为什么必须专列**：字典序不是「任意一致的全序」——`1+9j < 2+0j` 为真（实部优先），
+而按模长比较则为假。任何用 `abs` 或分量加权做比较的实现都会与 numpy 分歧。
+
+---
+
+### 14.9 NaN / Inf 语义
+
+| 判定 | 规定 |
+|---|---|
+| `isnan(z)` | **任一分量**为 NaN 即为真（`nan+1j` 与 `1+nanj` 都是 NaN） |
+| `isinf(z)` | 任一分量为 ±Inf 即为真 |
+| `isfinite(z)` | 两个分量都有限才为真 |
+| 算术传播 | 任一分量 NaN → 整个结果的对应该分量含 NaN（IEEE 逐分量） |
+| `sum` / `prod` | NaN 传播（结果为 NaN 复数） |
+| `amax` / `amin` | **NaN 胜出**（首个 NaN 元素成为结果，与 numpy 一致）；`fmax/fmin` 忽略 NaN |
+| `sort` | NaN 一律排在末尾（含 `nan+nanj`） |
+| `argmax/argmin` | NaN 元素的实部视为「最大」，即首个 NaN 的下标胜出 |
+| `==` | `nan+0j == nan+0j` → **False** |
+| `mean(空)` | `nan+nanj`（不是 0） |
+
+---
+
+### 14.10 归约与统计
+
+| 函数 | NumPy | clvt | 结果 dtype |
+|---|---|---|---|
+| `sum` | 保 dtype（complex64→complex64） | `vt-sum` | 输入复数 dtype |
+| `prod` | 同上 | `vt-prod` | 同上 |
+| `mean` | 同上 | `vt-mean` | 同上（空 → `nan+nanj`） |
+| `var` | `mean(|x-μ|²)` → **实数** | `vt-var` | **复数 → 分量浮点**（complex128→float64） |
+| `std` | `sqrt(var)` → **实数** | `vt-std` | 同上 |
+| `argmax/argmin` | `intp`（64 位平台 = int64） | `vt-argmax/argmin` | `:int64`；多轴不支持（与 numpy 同） |
+| `cumsum/cumprod` | 保 dtype | `vt-cumsum/vt-cumprod` | 同上 |
+| `norm` | `sqrt(Σ|z|²)` → **实数** | `vt-norm` | 复数 → 分量浮点 |
+| `median` | 字典序中位 | `vt-median` | 复数 |
+| `trace` | 对角线之和 | `vt-trace` | 复数 |
+| `percentile/quantile` | **TypeError**（"a must be an array of real numbers"） | 报错 | — |
+
+**空归约**（与 §5.5 一致，复数同样适用）：
+`sum → 0+0j`、`prod → 1+0j`、`mean → nan+nanj`、
+`amax/amin → ValueError`（"zero-size array to reduction operation maximum which has no identity"）。
+
+**陷阱提示**：`vt-var` **不能**写成 `vt-mean(vt-square(x))` —— 那会得到复数。
+正确形态是 `mean(square(abs(x - μ)))`，已封装在 `vt-var` 内。
+
+---
+
+### 14.11 线性代数
+
+| 函数 | 第一轮状态 |
+|---|---|
+| `vt-matmul` / `vt-@` | ✅ 专用内核（1d@1d、2d@2d、2d@1d、1d@2d、批量 `...ij,...jk->...ik`） |
+| `vt-dot` | ✅ 同 matmul 语义（**不取共轭**；共轭点积 = `(vt-dot (vt-conj a) b)`） |
+| `vt-outer` | ✅ 分量乘法 |
+| `vt-trace` | ✅ `sum(diagonal)` |
+| `vt-einsum` | ❌ 报错：dtype 白名单只含 4 种实数类型，复数缓冲会错配 → 第二轮 |
+| `vt-det/inv/solve/svd/eig/qr/lu/pinv/cholesky/cond` | ❌ 报错：需共轭转置与酉变换 → 第二轮 |
+
+**为什么 matmul 不走 einsum**：`vt-einsum` 的 `supported-types` 是
+`(:float64 :float32 :int64 :int32)`，其结果缓冲区按这 4 种分配。复数输入会得到
+`double-float` 缓冲并在写回时报 `"is not of type DOUBLE-FLOAT"`。
+第一轮为 matmul 家族写**独立专用内核**（`%cx-matmul`，先 `vt-contiguous` 落地再三重循环），
+语义与 einsum 的矩阵乘完全一致；einsum 复数路径留到第二轮（需要把 dtype 白名单改成
+「按 dtype 分配」而不是「按 4 种硬编码」）。
+
+---
+
+### 14.12 打印格式
+
+| 场景 | NumPy | clvt |
+|---|---|---|
+| 数组元素 | `[1.+2.j 3.-4.j]` | `[1.0+2.0j 3.0-4.0j]` |
+| 标量 | `(1+2j)` | `1.0+2.0j`（`print-object` 内联） |
+| NaN 分量 | `nan+nanj` | `nan+nanj` |
+
+**格式规定**：`<实部><符号><|虚部|>j`，实部/虚部沿用本库既有浮点打印风格
+（`~,6f` 定精度去尾零、至少保留一位小数）。与 numpy 只差「尾随 `.0`」的写法
+（numpy 省略 `1.`→`1.`，clvt 保留 `1.0`），**这是刻意保留的既有风格**，
+不为了对齐 numpy 而改动全部浮点打印（差异 D-C4）。
+
+---
+
+### 14.13 错误契约（L2 底线：确定性报错）
+
+| 触发 | 报错文本特征 |
+|---|---|
+| 复数入参 + 实数 `:dtype` | `"复数输入的结果 dtype 必须是复数类型"` |
+| `vt-var/vt-norm` + 复数 `:dtype` | `"结果 dtype 必须是实数类型"` |
+| 未支持函数 + 复数 | `"~a: 第一轮不支持复数输入（…）。见 CONVENTIONS §14.11"` |
+| `amax/amin` 空归约 | `"zero-size array to reduction operation maximum which has no identity"` |
+| `argmax/argmin` 空序列 | `"attempt to get argmax of an empty sequence"` |
+| `argmax/argmin` 多轴 | `"不支持多轴（对标 numpy：arg 归约只接受单个整数 axis）"` |
+
+**禁止**：静默把复数当实数算（例如 `vt-sqrt` 走实数路径返回 float64）——
+这类「静默降级」是最危险的失败模式，一律改为报错或返回正确复数结果。
+
+---
+
+### 14.14 执行层定位（第一轮：正确性优先）
+
+| 项 | 第一轮状态 |
+|---|---|
+| 通用路径（`vt-map` 的 `(t (vt-map …))` 兜底分支） | ✅ 复数全部正确（`aref` 泛型 + `vt-cast-fun`） |
+| 内联/SIMD 快路径 | ❌ 不适用（`%vt-inline*-fast` 按 8 种实数元素类型分派，复数落到兜底 `vt-map`） |
+| 归约内核 | ❌ 不复用 `def-vt-reduce`（其内核按 4 种存储 dtype 编译期特化，塞复数会在 `safety 0` 下段错误）；改用独立 stride 驱动内核 |
+| 性能定位 | 复数逐元素算子约为实数快路径的 1/5–1/10（`funcall` + 泛型 `aref`）；**第二轮**再补 `(complex double-float)` 的内联特化 |
+| 实数路径影响 | **零**（`%cx-orig` 捕获原实现，非复数入参原样转发） |
+
+**SBCL 平台陷阱（新增，务必遵守）**：
+> `&rest` + `(optimize (speed 3) (safety 0))` + call-site `apply` 三者同时成立时，
+> SBCL 2.6.8 会生成**段错误**（`Memory fault at (nil)`，无 Lisp 条件）。
+> 实测最小复现：`(apply #'f '(:float64 :int8))`，其中 `f` 是 `(&rest ds)` +
+> `safety 0` + 内部 `(the fixnum …)` 的函数。
+> **规定**：内部数值内核一律用**单个 list 参数**（`%promote-real-dtype`）而非 `&rest`；
+> 只有对外的 `vt-promote-type` 保留 `&rest`（它没有第二层 apply 转发）。
+
+---
+
+### 14.15 与 numpy 的已知差异清单（全部为**有意**保留）
+
+| 编号 | 差异 | 影响面 | 处置 |
+|---|---|---|---|
+| D-C1 | `complex → real` 转换不产生 `ComplexWarning` | 仅提示信息 | 文档声明；行为与 numpy（取实部）一致 |
+| D-C2 | `np.array([1+2j], dtype=float)` numpy 抛 TypeError，clvt 取实部 | 构造 | 文档声明（沿用 `vt-cast` 的「安全转换」立场） |
+| D-C3 | `vt-real/vt-imag` 返回**副本**（numpy 返回视图） | 写回语义 | 文档声明；用 `vt-complex` 重组 |
+| D-C4 | 打印保留 `1.0+2.0j`（numpy 为 `1.+2.j`） | 显示 | 沿用本库浮点风格 |
+| D-C5 | 复数逐元素算子无 SIMD/内联特化 | 性能 | 第二轮 |
+| D-C6 | `einsum` / LU 家族 / 百分位 不支持复数 | 功能面 | 显式报错，第二轮 |
+
+---
+
+### 14.16 测试约定（本章的验收方式）
+
+1. **差分对照（强制）**：`test/gen_complex_expected.py` 用**本机 numpy** 生成期望值
+   （`test/complex-expected.sexp`），Lisp 侧逐格比对值与 dtype/shape。
+   **禁止手写期望值**——这是 §10.4 在复数上的具体化。
+   新增复数语义时必须先在生成器里加用例，再让实现追上。
+2. **dtype 提升 100 格**：`test/complex-test.lisp` 内嵌整张表，逐格断言。
+3. **分支切割 8 点**：`sqrt(±0i)`、`log(±0i)`、`log(0)`、`angle(±0i)`、`atanh(2)`。
+4. **契约三底线**（§10.1）：`:out` 形状/dtype/可写；非连续视图；别名 `z += z`。
+5. **未支持即报错**：每个第一轮不支持的函数都有 `expect-error` 断言
+   （防止未来"悄悄支持了一半"）。
+6. **实数回归网**：加法/比较/排序（NaN 末尾）/sum dtype/mean/floor 六条，
+   保证 `complex.lisp` 的分派层没有破坏实数路径。
+
+运行方式：
+```bash
+bash test/run-tests.sh --suite complex-test        # 走统一入口（136 断言）
+python3 test/gen_complex_expected.py               # 重新生成期望值（numpy 升级后必做）
+```
+
+---
+
+### 14.17 第二轮路线图（本章的未完成项）
+
+| 优先级 | 项目 | 关键改动 |
+|---|---|---|
+| P0 | `vt-einsum` 复数 | 把 dtype 白名单换成「按 `vt-promote-type` 分配」，结果缓冲用 `vt-dtype->lisp-type` |
+| P0 | 复数归约的 `axis` 元组 + `keepdims` 全路径覆盖测试 | 复用 `%cx-reduce-values` 的多轴路径，补 3D 用例 |
+| P1 | 复数内联/SIMD 特化 | `%vt-inline*-fast` 增加 `(complex double-float)` 两格；`simd-matmul` 复数 GEMM |
+| P1 | LU/SVD/特征值 | 需要共轭转置（`vt-ctranspose`）与酉变换；`vt-det` 复数版（实测 numpy det 为复数） |
+| P2 | `real/imag` 真视图 | 需引入「分量视图」概念（`data` + 分量偏移），会动物理层，谨慎评估 |
+| P2 | `.npy` 复数互操作 | `<c16`/`<c8` descr + 两个 float 分量编码 |
+| P2 | `vt-npy` 打印/序列化的 `ComplexWarning` 等价物 | 引入可选告警通道 |
+
+---
+
+### 14.18 本章变更文件清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/dtype.lisp` | dtype 全集/存储集 + `vt-complex-dtype-p` / `vt-complex-real-dtype` / `vt-real-dtype-of`；`vt-promote-type` 复数分量规则；`vt-cast`/`vt-cast-fun` 复数与降级；值级原语 `%creal/%cimag/%cabs/%carg/%cconj/%cisnan/%cisinf/%cisfinite/%cis-zero/%clt/%cle/%cgt/%cge/%cneq` |
+| `src/core.lisp` | `make-vt` 复数分支；`ensure-vt` 复数标量/序列推断；`%any-complex-in-sequence-p` |
+| `src/io.lisp` | `%format-number` 复数打印；`vt-from-sequence` 含复数序列走通用 cast |
+| `src/complex.lisp` | **新增**：语义层（原实现登记 + 分派包装 + 22 个复数内核 + 归约/扫描/排序/线代内核 + 未支持报错 + 加载期自检） |
+| `src/package.lisp` | 导出 `vt-complex/vt-real/vt-imag/vt-conj/vt-conjugate/vt-angle/vt-iscomplexobj/vt-isrealobj` |
+| `clvt.asd` | `(:file "src/complex")` 置于最后 |
+| `test/complex-test.lisp` | **新增** 136 断言 |
+| `test/gen_complex_expected.py` | **新增** numpy 期望值生成器（83 用例） |
+| `test/complex-expected.sexp` | **新增** 生成产物（numpy 2.4.6 实测） |
+| `test/run-tests.sh` | 注册 `complex-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
+
+---
+
 ## 附录 C：实测缺陷复现脚本
 
 ```lisp

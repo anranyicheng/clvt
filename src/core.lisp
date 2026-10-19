@@ -97,6 +97,8 @@
                                               (the ,lt (vt-cast initial-element ,kw)))
                             :shape shape :strides strides :offset 0 :dtype dtype)))
       (ecase dtype
+        (:complex128 (mk (complex double-float) :complex128))
+        (:complex64  (mk (complex single-float) :complex64))
         (:float64 (mk double-float :float64))
         (:float32 (mk single-float :float32))
         (:int64   (mk (signed-byte 64) :int64))
@@ -120,14 +122,30 @@
                         (every #'%all-integer-sequence-p seq)))
     (t nil)))
 
+(defun %any-complex-in-sequence-p (seq)
+  "递归判断嵌套序列中是否含有复数叶子。
+   用于 ensure-vt 的 dtype 推断：numpy 对「含复数的列表」推断 complex128，
+   对「纯实数列表」仍推断 float64/int64（CONVENTIONS §16.2）。"
+  (cond
+    ((complexp seq) t)
+    ((consp seq) (some #'%any-complex-in-sequence-p seq))
+    ((vectorp seq) (some #'%any-complex-in-sequence-p seq))
+    (t nil)))
+
 (defun ensure-vt (obj &key (dtype nil))
-  "将标量/序列/张量统一转换为张量。标量 -> 0 维张量；序列 -> 一维以上张量。"
+  "将标量/序列/张量统一转换为张量。标量 -> 0 维张量；序列 -> 一维以上张量。
+   复数（#C(re im)）：标量推断 complex64/complex128（按分量浮点宽度），
+   序列中只要含一个复数叶子即整体 complex128（对标 numpy，
+   见 CONVENTIONS §16.2）。"
   (etypecase obj
     (vt (if (and dtype (not (eq (vt-dtype obj) dtype)))
             (vt-copy-into (make-vt (vt-shape obj) 0 :dtype dtype) obj)
             obj))
     (number
-     (let* ((infer (cond ((typep obj 'single-float) :float32)
+     (let* ((infer (cond ((complexp obj)
+                          (if (typep obj '(complex single-float))
+                              :complex64 :complex128))
+                         ((typep obj 'single-float) :float32)
                          ((typep obj 'double-float) :float64)
                          ((typep obj 'integer) :int64)
                          (t :float64)))
@@ -137,7 +155,9 @@
                                      :initial-element (vt-cast obj final))
                  :shape nil :strides nil :offset 0 :dtype final)))
     (sequence
-     (let ((infer (if (%all-integer-sequence-p obj) :int64 :float64)))
+     (let ((infer (cond ((%any-complex-in-sequence-p obj) :complex128)
+                        ((%all-integer-sequence-p obj) :int64)
+                        (t :float64))))
        (vt-from-sequence obj :dtype (or dtype infer))))))
 
 ;;; ------------------------------------------------------------------

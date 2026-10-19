@@ -132,15 +132,20 @@
                             (etypecase contents
                               (list (dolist (e contents) (put e)))
                               (vector (loop for e across contents do (put e))))))))
-            (cond ((eq dtype :float64) (fill1d double-float (coerce x 'double-float)))
-                  ((eq dtype :float32) (fill1d single-float (coerce x 'single-float)))
-                  ((eq dtype :int64)   (fill1d (signed-byte 64)  (%wrap-int64 x)))
-                  ((eq dtype :int32)   (fill1d (signed-byte 32)  (%wrap-int32 x)))
-                  ((eq dtype :int16)   (fill1d (signed-byte 16)  (%wrap-int16 x)))
-                  ((eq dtype :int8)    (fill1d (signed-byte 8)   (%wrap-int8 x)))
-                  ((eq dtype :uint8)   (fill1d (unsigned-byte 8)  (%wrap-uint8 x)))
-                  ((eq dtype :uint16)  (fill1d (unsigned-byte 16) (%wrap-uint16 x)))
-                  (t (fill-tensor data contents shape strides 0)))
+            ;; 含复数的序列不走 fill1d：fill1d 的转换算子带 (type real x)
+            ;; 声明（为速度），而复数元素在实数 dtype 下需要「取实部」这条
+            ;; CONVENTIONS §16.5 的规则，交给 fill-tensor 的 vt-cast 处理。
+            (if (%any-complex-in-sequence-p contents)
+                (fill-tensor data contents shape strides 0)
+                (cond ((eq dtype :float64) (fill1d double-float (coerce x 'double-float)))
+                      ((eq dtype :float32) (fill1d single-float (coerce x 'single-float)))
+                      ((eq dtype :int64)   (fill1d (signed-byte 64)  (%wrap-int64 x)))
+                      ((eq dtype :int32)   (fill1d (signed-byte 32)  (%wrap-int32 x)))
+                      ((eq dtype :int16)   (fill1d (signed-byte 16)  (%wrap-int16 x)))
+                      ((eq dtype :int8)    (fill1d (signed-byte 8)   (%wrap-int8 x)))
+                      ((eq dtype :uint8)   (fill1d (unsigned-byte 8)  (%wrap-uint8 x)))
+                      ((eq dtype :uint16)  (fill1d (unsigned-byte 16) (%wrap-uint16 x)))
+                      (t (fill-tensor data contents shape strides 0))))
             (return-from vt-from-sequence
               (%make-vt :data data :shape shape :strides strides
                         :offset 0 :dtype dtype))))
@@ -258,18 +263,36 @@
          :integer)
         ((member type '(single-float double-float short-float long-float float))
          :float)
+        ((and (listp type) (eq (first type) 'complex))
+         :complex)
         (t :other)))
+
+(defun %format-real-part (val)
+  "按浮点打印规则格式化一个实部分量（定精度 + 去尾零，至少保留一位小数）。"
+  (let* ((str (format nil "~,vf" *vt-print-precision* val))
+         (trimmed (string-right-trim "0" str)))
+    (when (and (> (length trimmed) 0)
+               (char= (char trimmed (1- (length trimmed))) #\.))
+      (setf trimmed (concatenate 'string trimmed "0")))
+    trimmed))
+
+(defun %format-complex-number (val)
+  "复数打印（CONVENTIONS §16.9）：`<实部><符号><|虚部|>j`，
+   例如 `1.0+2.0j` / `1.0-2.0j` / `nan+nanj`。
+   与 numpy 的 `1.+2.j` 只差尾随 `.0` 的写法：本库沿用自身
+   「浮点至少保留一位小数」的既有风格，保证打印结果可读回。"
+  (let ((re (%creal val))
+        (im (%cimag val)))
+    (format nil "~a~a~aj"
+            (%format-real-part re)
+            (if (minusp im) "-" "+")
+            (%format-real-part (abs im)))))
 
 (defun %format-number (val type)
   (case (%type-category type)
     (:integer (format nil "~d" val))
-    (:float
-     (let* ((str (format nil "~,vf" *vt-print-precision* val))
-            (trimmed (string-right-trim "0" str)))
-       (when (and (> (length trimmed) 0)
-                  (char= (char trimmed (1- (length trimmed))) #\.))
-         (setf trimmed (concatenate 'string trimmed "0")))
-       trimmed))
+    (:complex (%format-complex-number val))
+    (:float (%format-real-part val))
     (otherwise (format nil "~a" val))))
 
 (defun %phys-idx (vt indices)

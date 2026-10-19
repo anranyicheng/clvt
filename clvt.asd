@@ -30,4 +30,8 @@
                (:file "src/rotate")
                (:file "src/extensions")
                (:file "src/extensions2")
-               (:file "src/extensions3")))
+               (:file "src/extensions3")
+               ;; 复数语义层（CONVENTIONS §16）：必须**最后**加载 ——
+               ;; 它按「输入是否含复数」对公开函数做前置分派，
+               ;; 加载时捕获各函数的实数原实现。
+               (:file "src/complex")))

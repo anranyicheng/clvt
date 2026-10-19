@@ -516,7 +516,18 @@
    #:vt-isneginf
 
    ;; 集合类
-   #:vt-isin))
+   #:vt-isin
+   ;; ------------------------------------------------------------------
+   ;; 复数（complex.lisp，CONVENTIONS §16）
+   ;; ------------------------------------------------------------------
+   #:vt-complex
+   #:vt-real
+   #:vt-imag
+   #:vt-conj
+   #:vt-conjugate
+   #:vt-angle
+   #:vt-iscomplexobj
+   #:vt-isrealobj))
 
 (in-package :clvt)
 

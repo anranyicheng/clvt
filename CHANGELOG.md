@@ -4,6 +4,59 @@
 
 ---
 
+## 2026-10-19 — 第一轮进化：复数（complex64 / complex128）支持
+
+### 新增 dtype（src/dtype.lisp）
+- `:complex128` / `:complex64`（CL 元素类型 `(complex double-float)` / `(complex single-float)`，
+  itemsize 16 / 8，interleaved 存储；strides 仍以**元素**为单位）
+- 提升规则：**复数的实部分量参与普通实数提升**，结果映射回 complex64/complex128。
+  该单一规则复现 numpy 2.4.6 的 **100 格**提升表（含 `complex64 ⊔ int32 → complex128`）
+- 值级原语（唯一语义出口）：`%creal %cimag %cabs %carg %cconj %cisnan %cisinf
+  %cisfinite %cis-zero %clt %cle %cgt %cge %cneq`（字典序比较 + NaN 规则）
+- `vt-cast` / `vt-cast-fun`：complex→real/int **取实部**（对标 numpy astype 的
+  ComplexWarning 语义，本库不产生警告）；real→complex 虚部补 0
+
+### 构造与推断（src/core.lisp、src/io.lisp）
+- `ensure-vt`：复数标量 → complex64/complex128（按分量宽度）；含复数的列表 → complex128
+- `make-vt` / `vt-zeros` / `vt-ones` / `vt-const` 支持复数 dtype
+- 打印：`1.0+2.0j` 形式（`%format-number` 新增 :complex 分类）
+
+### 语义层（src/complex.lisp，新增，最后加载）
+- 分派机制：加载时捕获各函数的**原实现**（`%cx-orig`，预捕获以避免自我递归），
+  仅「输入含复数」的调用进复数内核，实数路径零改动
+- 一元数学 21 个（sqrt/exp/log/log2/log10/三角/双曲/反三角/反双曲/square/
+  reciprocal/signum/negative）+ 幂（复指数、`0**0=1`、`0**负=nan+nanj`）
+- 分量族：`vt-abs`（→实数 dtype）、`vt-real` / `vt-imag`（副本）、`vt-conj` /
+  `vt-conjugate`、`vt-angle`、`vt-complex`、`vt-iscomplexobj` / `vt-isrealobj`
+- 比较：`== != < <= > >=` 全部**字典序**（numpy 2.x 语义），NaN 参与恒假
+- 极值/排序：`maximum/minimum/fmax/fmin`、`sort/argsort`（字典序 + NaN 末尾）、`median`
+- 判定：`isnan/isinf/isfinite`（任一分量为真即真）
+- 归约：`sum/prod/mean`（保复数 dtype）、`var/std/norm`（**恒实数**）、
+  `argmax/argmin`（int64）、`cumsum/cumprod`、`trace`、独立 stride 驱动内核
+- 线代：`matmul/@/dot/outer` 专用内核（不复用 einsum —— 其 dtype 白名单只含 4 种实数类型）
+- 未支持即报错：floor/ceil/trunc/rint、floor_divide/mod/rem、位运算、atan2、
+  even/odd-p、percentile/quantile、einsum、LU/SVD/eig/inv/solve/cholesky/qr、
+  神经网络激活（均给出确定性错误，绝不静默丢虚部）
+
+### 文档
+- `CONVENTIONS.md` 新增 **§16 复数（complex）约定**（约 380 行）：物理表示、
+  100 格提升表与形式化规则、casting、分支切割（SBCL 与 numpy 逐点对照）、
+  字典序比较、NaN/Inf、归约、线代、打印、错误契约、执行层定位、已知差异 D-C1..D-C6、
+  第二轮路线图
+- 记录 SBCL 平台陷阱：`&rest` + `(safety 0)` + call-site `apply` 三者同时成立会段错误
+
+### 测试
+- `test/complex-test.lisp`（**136 断言**）+ `test/gen_complex_expected.py`
+  （numpy 2.4.6 实测生成 **83 项**差分期望，`test/complex-expected.sexp`）
+- 已接入 `test/run-tests.sh`（SUITES + DEFAULT_ORDER，防漏接线）
+
+### 回归
+- core-test 284/284、run_all_tests 143/143、nan-broadcast-test 31/31、
+  numpy-convention-tests 69/69、contract-regression-test 136/136、
+  out-contract-v2-test 56/56 全部通过（实数路径未受影响）
+
+---
+
 ## 2026-10-10 测试工具链防漂移 + 遗产用例盘活 + vt-narrow 负索引
 
 ### vt-narrow 语义修复（src/manip.lisp）
