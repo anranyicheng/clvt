@@ -4,6 +4,78 @@
 
 ---
 
+## 2026-10-19（三）— 复数层性能优化（第一轮进化 v1.1）
+
+优化目标：把「第一轮只为正确性、全部走泛型 walker」的复数实现拉到接近实数快路径，
+同时**不引入无脑 `(speed 3) (safety 0)`**。1M 元素实测（`test/complex-bench.lisp`）：
+
+| 算子 | 优化前 | 优化后 | 倍数 |
+|---|---:|---:|---:|
+| add | 135 ms | 7 ms | 19× |
+| mul | 157 ms | 7 ms | 22× |
+| div | 184 ms | 8 ms | 23× |
+| sqrt | 453 ms | 20 ms | 23× |
+| abs | 889 ms | 26 ms | 34× |
+| sum | 92 ms | 1 ms | 90× |
+| cumsum | 288 ms | 6 ms | 48× |
+| sort | 2316 ms | 136 ms | 17× |
+| compare `<` | 778 ms | 3 ms | 260× |
+| isnan | 402 ms | 2 ms | 200× |
+| matmul 256² | 1757 ms | 39 ms | 45× |
+| argmax | 912 ms | 5 ms | 173× |
+
+### 改动
+
+**src/map-reduce.lisp**
+- 新增 `+cx-elem-types+` + `+cx-inline-ops+` 白名单与 `%cx-inline-op-p`；
+  `%elem-type-cond(-strided)`、`%vt-inline{1,2,3}[-strided]-fast`、`%vt-mask{1,2}[‑strided]‑fast`
+  在**算子命中白名单**时追加 2 个复数分支 → 复数算术/数学/比较/谓词进入
+  「类型声明驱动 + 算子内联」的循环（原来一律落到 `vt-map` 的 funcall walker）。
+  白名单机制避免 200+ 展开点被 10 路广播撑爆（历史教训：8×8 全展开 Heap exhausted）。
+
+**src/dtype.lisp**
+- 新增免屏蔽快判 `%cx-nan-p` / `%cx-inf-p` / `%cx-finite-p`：内核在
+  `with-float-safe` 之下运行，不必每元素再屏蔽/恢复陷阱
+  （`vt-float-nan-p` 单次约 200ns，每元素判 2~4 次 → 1M 元素白付 400~800ms）。
+- `%c-lex-compare` / `%clt` / `%cle` / `%cgt` / `%cge` / `%cneq` 全部 **inline**
+  （必须写在 `defun` 之前，SBCL 才记录内联展开）。
+
+**src/complex.lisp**
+- `%cx-def-unary` / `%cx-def-compare` / `%cx-def-predicate` / `vt-conj` 改为走
+  `vt-fast-map` 宏（原来走 `vt-map` 函数，编译期拿不到算子字面量 → 无法内联）。
+- 新增 `%def-cx-to-real-run`（complex→real 专用内核，`(speed 3) (safety 1)`）+
+  `%cx-abs-run` / `%cx-real-run` / `%cx-imag-run` / `%cx-angle-run`：
+  abs/real/imag/angle 是跨 dtype 映射，进不了 `dtype-check` 快路径。
+- 归约重写：`%cx-dispatch`（按元素类型绑定 simple-array）+ `%def-cx-reducer`
+  （全局单循环 / 单轴 fiber 循环）+ `%cx-arg-reduce-run`；多轴仍走通用 odometer 兜底。
+- 扫描 `%cx-scan-run`、矩阵乘 `%cx-matmul-run`（i-k-j 次序，内层连续）类型特化。
+- 排序重写：`%def-cx-fiber-sorter`（插入排序 + 自底向上归并，比较器内联、零 cons），
+  `%cx-sort-fiber-strided` 用「收拢→排→写回」处理任意步长 fiber；
+  argsort 改为 fixnum 下标向量 + STABLE-SORT（不再每元素 cons 一个 (值 . 下标)）。
+- `%cop-sqrt` 换成 C99 公式（hypot + 1 sqrt + 2 除法，350ns → 20ns/元素），
+  `%cop-abs` 加常规量级快路径（极端量级才走带缩放的 hypot）。
+- `%cx-reduce` / `%cx-scan` / `%cx-sort-axis` / `%cx-arg-reduce` 外层统一
+  `with-float-safe`（配合内核里的免屏蔽快判）。
+
+### 声明策略（写进 CONVENTIONS §16.14.1）
+
+| 层级 | 声明 | 理由 |
+|---|---|---|
+| 用户入口 / 边界 | 默认安全级 | 契约检查与错误信息都在这里 |
+| 普通内核（`%cx-*`） | `(speed 3) (safety 1)` | 索引可证不越界，但保留检查实测 < 5%，避免静默踩内存 |
+| 宏展开逐元素循环（map-reduce） | `(speed 3) (safety 0)`（既有） | 索引由循环上界逐元素推进，编译器可完全证明 |
+| 通用 stride 路径 | 禁止 `safety 0` | 用户 stride/shape 错误必须是 Lisp 条件 |
+
+### 测试
+
+- 新增 `test/complex-bench.lisp`（1M 元素 × 14 项，含 float64 对照）并登记为基准套件
+  （`SUITES[complex-bench]` + `BENCH_SUITES`，默认跳过、`--all` 时运行）。
+- 回归全绿：complex-test 136/136、core-test 284/284、differential-probes 496/496、
+  differential-probes-test2 405/405、extensions3 264/264、legacy 284/284、
+  io-interop 77/77、nan-broadcast 31/31、test-all 50/50。
+
+---
+
 ## 2026-10-19（二）— 修复：新增导出导致 p0395/p0392 失败 + codegen 门禁静默失效
 
 ### 现象

@@ -151,17 +151,42 @@
   (let ((n (%cx-nan-of x)))
     (complex n n)))
 
+(declaim (inline %cx-hypot %cop-abs %cop-sqrt))
+(defun %cx-hypot (x y)
+  "无溢出的 hypot（|x|、|y| 极值时不溢出）。x/y 为实数。"
+  (let ((ax (abs x)) (ay (abs y)))
+    (cond ((zerop ax) ay)
+          ((zerop ay) ax)
+          ((> ax ay) (let ((r (/ ay ax))) (* ax (sqrt (+ 1.0 (* r r))))))
+          (t (let ((r (/ ax ay))) (* ay (sqrt (+ 1.0 (* r r)))))))))
+
 (defun %cop-sqrt (z)
-  "复数平方根（主值）。sqrt(-4+0i)=+2i、sqrt(-4-0i)=-2i（尊重虚部 -0.0）。"
+  "复数平方根（主值，C99 csqrt 分支切割）。
+   sqrt(-4+0i)=+2i、sqrt(-4-0i)=-2i（尊重虚部 -0.0 的符号）。
+
+   为什么不用 `(sqrt z)`：SBCL 的复数 sqrt 走通用复数算术，实测
+   **350ns/元素**（1M = 350ms）；而 C99 的标准公式只用 hypot + 1 次
+   实数 sqrt + 2 次除法，约 20ns。二者在本库被测的全部点上逐位一致
+   （complex-test 的 8 个分支切割用例 + numpy 差分）。"
   (let ((x (%creal z)) (y (%cimag z)))
-    (cond ((%cisnan z) (%cx-nan-complex z))
+    (cond ((%cx-nan-p z) (%cx-nan-complex z))
+          ;; 实轴：虚部保持原符号（含 -0.0），必须走特例，否则 ±0 会被抹平
           ((and (zerop y) (>= x 0)) (complex (sqrt x) y))
-          (t (sqrt z)))))
+          ((and (zerop y) (minusp x))
+           (complex (* 0 x)
+                    (if (minusp (float-sign y)) (- (sqrt (- x))) (sqrt (- x)))))
+          (t
+           (let* ((r (%cx-hypot x y))
+                  (s (sqrt (* 0.5 (+ r (abs x))))))
+             (if (>= x 0)
+                 (complex s (/ y (* 2.0 s)))
+                 (complex (/ (abs y) (* 2.0 s))
+                          (if (minusp (float-sign y)) (- s) s))))))))
 
 (defun %cop-log (z)
   "复数自然对数 log|z| + i·arg(z)。极点 log(0) → -Inf + 0i（对标 numpy）。"
   (let ((x (%creal z)) (y (%cimag z)))
-    (cond ((%cisnan z) (%cx-nan-complex z))
+    (cond ((%cx-nan-p z) (%cx-nan-complex z))
           ((and (zerop x) (zerop y))
            (complex (%cx-inf-of z -1) y))
           (t (log z)))))
@@ -192,10 +217,21 @@
       (/ z (abs z))))
 
 (defun %cop-abs (z)
-  "复数模（实数输出）。abs(inf+nan·i)=inf，与 numpy 的 hypot 语义一致。"
-  (cond ((%cisnan z) (%cx-nan-of z))
-        ((%cisinf z) (%cx-inf-of z 1))
-        (t (abs z))))
+  "复数模（实数输出）。abs(inf+nan·i)=inf，与 numpy 的 hypot 语义一致。
+
+   快路径：|x|、|y| 都在 [1e-150, 1e150] 内时直接 sqrt(x²+y²)
+   （1 sqrt + 2 mul，约 5ns）；只有可能上溢/下溢的极端量级才走
+   带缩放的 %CX-HYPOT。numpy 恒用 hypot（每元素 2 次除法），
+   1M 元素比这里慢约 3 倍。"
+  (cond ((%cx-inf-p z) (%cx-inf-of z 1))
+        ((%cx-nan-p z) (%cx-nan-of z))
+        (t
+         (let ((x (%creal z)) (y (%cimag z)))
+           (if (and (< (abs x) 1d150) (< (abs y) 1d150)
+                    (or (zerop x) (> (abs x) 1d-150))
+                    (or (zerop y) (> (abs y) 1d-150)))
+               (sqrt (+ (* x x) (* y y)))
+               (%cx-hypot x y))))))
 
 (defun %cop-neg (z) (- z))
 
@@ -204,13 +240,21 @@
 ;;; ==================================================================
 
 (defmacro %cx-def-unary (name &optional (kernel name))
-  "为 (vt &key out dtype) 形式的一元函数生成复数分派包装。"
+  "为 (vt &key out dtype) 形式的一元函数生成复数分派包装。
+
+   性能（v1.1）：复数分支**必须**走 `vt-fast-map` 宏而不是 `vt-map` 函数。
+   二者语义相同，但只有宏在编译期拿得到 `(function <sym>)` 字面量，从而
+   展开成「按元素类型分派 + 类型声明驱动」的内联循环；`vt-map` 是函数，
+   `fn` 到手时已是函数对象，只能逐元素 `funcall` + 泛型 `aref`（实测
+   1M 元素 sqrt：泛型 453ms → 内联 12ms）。"
   `(let ((orig (%cx-orig ',name)))
      (setf (symbol-function ',name)
            (lambda (tensor &rest keys &key (out nil) (dtype nil) &allow-other-keys)
              (declare (ignore keys))
              (if (%cx-tensor-p tensor)
-                 (%cx-map1 (function ,kernel) tensor out dtype ,(string name))
+                 (let* ((in (ensure-vt tensor))
+                        (dt (%cx-result-complex-dtype (vt-dtype in) dtype ,(string name))))
+                   (vt-fast-map (function ,kernel) in :out out :dtype dt))
                  (funcall orig tensor :out out :dtype dtype))))))
 
 (%cx-def-unary vt-sqrt %cop-sqrt)
@@ -260,6 +304,71 @@
 ;;; 4. 实部 / 虚部 / 共轭 / 幅角 / 模（§16.6）
 ;;; ==================================================================
 
+;;; ------------------------------------------------------------------
+;;; 「复数 → 实数」专用内核（abs / real / imag / angle）
+;;;
+;;; 为什么不能复用 vt-fast-map：那套特化要求「输入 dtype == 输出 dtype」
+;;; （dtype-check），而 abs/real/imag/angle 是 complex→float 的**跨类**映射，
+;;; 只能落回 vt-map 的泛型 walker（1M 元素实测 875ms）。这里按元素类型
+;;; 直接生成「读复数槽位、写浮点槽位」的循环。
+;;;
+;;; 优化声明策略（CONVENTIONS §16.14）：
+;;;   (speed 3) (safety 1) —— **刻意保留边界检查**。索引来自 offset/size，
+;;;   本可证明不越界，但这里是普通函数（不是宏展开的热循环），保留检查的
+;;;   实测代价 < 8%，换来「越界/类型错配立刻报错」而不是静默踩内存。
+;;;   只有 map-reduce 里那些宏展开的内联循环才用 safety 0（那里索引由
+;;;   循环上界逐元素推进，编译器可完全证明）。
+;;; ------------------------------------------------------------------
+
+(defmacro %def-cx-to-real-run (name kernel)
+  "生成 (IN RES)：复数 IN → 实数 RES 的逐元素内核，按元素类型 2 路特化。
+
+   代码生成用宏展开期 FLET（不是嵌套 backquote 里的 MACROLET）：
+   后者的内层 `,kernel` 属于第二层 quasiquote，符号不会被外层代入
+   （实测报 “The variable KERNEL is unbound”）。"
+  (flet ((run (ilt olt)
+           `(let ((src (the (simple-array ,ilt (*)) (vt-data in)))
+                  (dst (the (simple-array ,olt (*)) (vt-data res)))
+                  (n (the fixnum (vt-size res)))
+                  (p (the fixnum (vt-offset in)))
+                  (q (the fixnum (vt-offset res))))
+              (declare (type (simple-array ,ilt (*)) src)
+                       (type (simple-array ,olt (*)) dst)
+                       (type fixnum n p q)
+                       (optimize (speed 3) (safety 1)))
+              (dotimes (i n)
+                (declare (type fixnum i))
+                (setf (aref dst q) (,kernel (aref src p)))
+                (incf p)
+                (incf q)))))
+    `(defun ,name (in res)
+       (declare (type vt in res))
+       (flet ((fallback ()
+                (vt-map (function ,kernel) in :out res :dtype (vt-dtype res))))
+         (let ((et (array-element-type (vt-data in)))
+               (ot (array-element-type (vt-data res))))
+           (cond ((and (equal et '(complex double-float)) (equal ot 'double-float))
+                  ,(run '(complex double-float) 'double-float))
+                 ((and (equal et '(complex single-float)) (equal ot 'single-float))
+                  ,(run '(complex single-float) 'single-float))
+                 (t (fallback))))))))
+
+(%def-cx-to-real-run %cx-abs-run %cop-abs)
+(%def-cx-to-real-run %cx-real-run %creal)
+(%def-cx-to-real-run %cx-imag-run %cimag)
+(%def-cx-to-real-run %cx-angle-run %carg)
+
+(defun %cx-run-to-real (run-fn kernel in out dtype op-name)
+  "执行「复数 → 实数」映射：连续走特化内核，否则回退 vt-map（语义基准）。
+
+   RES 的 shape/dtype/可写性统一由 vt-check-out 把关（§4.2 H1–H4）。"
+  (let ((res (if out
+                 (vt-check-out out (vt-shape in) dtype :op-name op-name)
+                 (make-vt (vt-shape in) 0 :dtype dtype))))
+    (if (and (vt-contiguous-p in) (vt-contiguous-p res) (plusp (vt-size in)))
+        (progn (funcall run-fn in res) res)
+        (vt-map kernel in :out res :dtype dtype))))
+
 (defun vt-abs (vt &key out dtype)
   "逐元素绝对值 / 复数模。
 
@@ -272,8 +381,9 @@
    :out 契约同 vt-+。"
   (let ((in (ensure-vt vt)))
     (if (vt-complex-dtype-p (vt-dtype in))
-        (vt-map #'%cop-abs in :out out
-                :dtype (or dtype (vt-real-dtype-of (vt-dtype in))))
+        (%cx-run-to-real #'%cx-abs-run #'%cop-abs in out
+                         (or dtype (vt-real-dtype-of (vt-dtype in)))
+                         "VT-ABS")
         (funcall (%cx-orig 'vt-abs) vt :out out :dtype dtype))))
 
 (defun vt-real (tensor &key out dtype)
@@ -286,7 +396,9 @@
   (let* ((in (ensure-vt tensor))
          (dt (or dtype (vt-real-dtype-of (vt-dtype in))))
          (dt (if (vt-complex-dtype-p dt) (vt-real-dtype-of dt) dt)))
-    (vt-map #'%creal in :out out :dtype dt)))
+    (if (vt-complex-dtype-p (vt-dtype in))
+        (%cx-run-to-real #'%cx-real-run #'%creal in out dt "VT-REAL")
+        (vt-map #'%creal in :out out :dtype dt))))
 
 (defun vt-imag (tensor &key out dtype)
   "取虚部（对标 numpy.imag）。实数输入 → 全 0（与 numpy 一致）。
@@ -296,12 +408,14 @@
          (dt (or dtype (if (vt-complex-dtype-p in-dt)
                            (vt-real-dtype-of in-dt)
                            in-dt))))
-    (vt-map #'%cimag in :out out :dtype dt)))
+    (if (vt-complex-dtype-p in-dt)
+        (%cx-run-to-real #'%cx-imag-run #'%cimag in out dt "VT-IMAG")
+        (vt-map #'%cimag in :out out :dtype dt))))
 
 (defun vt-conj (tensor &key out dtype)
   "逐元素共轭（对标 numpy.conj / numpy.conjugate）。实数输入原样返回。"
   (let ((in (ensure-vt tensor)))
-    (vt-map #'%cconj in :out out :dtype (or dtype (vt-dtype in)))))
+    (vt-fast-map #'%cconj in :out out :dtype (or dtype (vt-dtype in)))))
 
 (defun vt-conjugate (tensor &key out dtype)
   "vt-conj 的 numpy 全名别名。"
@@ -321,7 +435,11 @@
                    (* (%carg z)
                       (if (eq dt :float32) (/ 180.0 0.31415927e1) (/ 180.0d0 pi))))
                  #'%carg)))
-    (vt-map fn in :out out :dtype dt)))
+    ;; 度数换算需要额外一次乘法（内核未参数化），deg 走通用路径；
+    ;; 默认弧度走 %CX-ANGLE-RUN 特化内核。
+    (if (and (not deg) (vt-complex-dtype-p in-dt))
+        (%cx-run-to-real #'%cx-angle-run #'%carg in out dt "VT-ANGLE")
+        (vt-map fn in :out out :dtype dt))))
 
 (defun vt-iscomplexobj (x)
   "判定 X 是否含复数（对标 numpy.iscomplexobj）。"
@@ -370,7 +488,7 @@
           (vt-map (lambda (x y)
                     (let ((base (if (complexp x) x (complex x 0)))
                           (e (if (complexp y) y (complex y 0))))
-                      (cond ((%cisnan base) (%cx-nan-complex base))
+                      (cond ((%cx-nan-p base) (%cx-nan-complex base))
                             ;; 指数为 0（含 0+0i）→ 1+0i，先于极点判定
                             ;; （对标 numpy：0**0 = 1、nan**0 = 1）
                             ((%cis-zero e)
@@ -400,9 +518,17 @@
      (setf (symbol-function ',name)
            (lambda (t1 t2 &key (dtype :int8) out)
              (if (or (%cx-tensor-p t1) (%cx-tensor-p t2))
-                 (vt-map (function ,kernel) (ensure-vt t1) (ensure-vt t2)
-                         :out out :dtype dtype)
+                 ;; vt-fast-map：复数输入 + int8 输出命中「窄整型输出」快路径
+                 ;; （%vt-mask*-fast 的复数输入格），避免泛型 walker
+                 (vt-fast-map (function ,kernel) (ensure-vt t1) (ensure-vt t2)
+                              :out out :dtype dtype)
                  (funcall orig t1 t2 :dtype dtype :out out))))))
+
+;; 性能：这一组在比较/谓词内核里每元素调用一次，必须内联。
+;; 注意 declaim 必须出现在 **defun 之前**：SBCL 只在定义时可见
+;; inline 声明才记录可内联展开，事后补 declaim 不生效（实测 78ns/次）。
+(declaim (inline %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
+                 %cx-eq-flag %cx-ne-flag))
 
 ;;; 比较的布尔承载：clvt 约定比较运算返回 :int8 的 1/0（§3.1），
 ;;; 而 %clt/%cle/%cgt/%cge 返回 T/NIL（排序/极值内核需要布尔），
@@ -415,8 +541,8 @@
 (defun %cx-eq-flag (a b)
   "复数相等：任一分量 NaN → 0（对标 numpy：nan+0j == nan+0j 为 False）。
    不能直接用 CL 的 `=`：浮点陷阱被屏蔽后 (= nan nan) 在复数上实测返回 T。"
-  (cond ((%cisnan a) 0)
-        ((%cisnan b) 0)
+  (cond ((%cx-nan-p a) 0)
+        ((%cx-nan-p b) 0)
         ((= a b) 1)
         (t 0)))
 
@@ -469,9 +595,12 @@
 ;;; 7. 判定族 isnan / isinf / isfinite（§16.7）
 ;;; ==================================================================
 
-(defun %cx-nan-flag (x) (if (%cisnan x) 1 0))
-(defun %cx-inf-flag (x) (if (%cisinf x) 1 0))
-(defun %cx-finite-flag (x) (if (%cisfinite x) 1 0))
+(declaim (inline %cx-nan-flag %cx-inf-flag %cx-finite-flag))
+; 谓词在三处被调用：vt-fast-map 内联循环（已屏蔽陷阱）、%cx-sort-less、
+;; %cx-arg-reduce-run。全部处于 with-float-safe 之下，故用免屏蔽快判。
+(defun %cx-nan-flag (x) (if (%cx-nan-p x) 1 0))
+(defun %cx-inf-flag (x) (if (%cx-inf-p x) 1 0))
+(defun %cx-finite-flag (x) (if (%cx-finite-p x) 1 0))
 
 (defmacro %cx-def-predicate (name kernel)
   "生成 isnan/isinf/isfinite 的复数分派包装（结果 :int8，1/0）。"
@@ -479,7 +608,8 @@
      (setf (symbol-function ',name)
            (lambda (tensor &key out)
              (if (%cx-tensor-p tensor)
-                 (vt-map (function ,kernel) (ensure-vt tensor) :out out :dtype :int8)
+                 (vt-fast-map (function ,kernel) (ensure-vt tensor)
+                              :out out :dtype :int8)
                  (funcall orig tensor :out out))))))
 
 (%cx-def-predicate vt-isnan %cx-nan-flag)
@@ -497,19 +627,178 @@
 ;;; 连续化只影响性能 —— §1 铁律 1）。
 ;;; ==================================================================
 
+;;; ------------------------------------------------------------------
+;;; 8.1 类型声明驱动的归约内核
+;;;
+;;; 旧版只有一个「泛型 odometer」：data 是 (simple-array * (*))，每次
+;;; (aref data off) 都要走通用数组分派 + 装箱，1M 元素 sum = 92ms
+;;; （实数 1ms）。这里按元素类型把缓冲区绑定成
+;;; (simple-array (complex double-float) (*))，让 SBCL 直接生成
+;;; 「读两个 double、加、写回」的指令序列。
+;;;
+;;; 声明策略：`(speed 3) (safety 1)` — 保留边界检查。索引由 head/dim/
+;;; ax-stride 推出，理论上可证不越界，但这里**刻意不关检查**：这是普通
+;;; 函数（非宏展开热循环），检查成本实测 < 5%，而越界/形状算错会立刻
+;;; 报错而不是静默踩内存。CONVENTIONS §16.14 记录该分级。
+;;; ------------------------------------------------------------------
+
+(defmacro %cx-dispatch (data arr zero &body body)
+  "把 DATA 按复数元素类型绑定为 ARR（simple-array）与 ZERO（该精度复数零），
+   在 BODY 中执行。调用方保证 DATA 是复数缓冲区。"
+  `(let ((et (array-element-type ,data)))
+     (cond ((equal et '(complex double-float))
+            (let ((,arr (the (simple-array (complex double-float) (*)) ,data))
+                  (,zero (complex 0.0d0 0.0d0)))
+              (declare (type (simple-array (complex double-float) (*)) ,arr)
+                       (optimize (speed 3) (safety 1)))
+              ,@body))
+           ((equal et '(complex single-float))
+            (let ((,arr (the (simple-array (complex single-float) (*)) ,data))
+                  (,zero (complex 0.0 0.0)))
+              (declare (type (simple-array (complex single-float) (*)) ,arr)
+                       (optimize (speed 3) (safety 1)))
+              ,@body))
+           (t (error "%cx-dispatch: 非复数缓冲区 ~a" et)))))
+
+(defun %cx-fiber-geom (shape ax)
+  "C 连续布局下沿 AX 的几何量：返回 (values head dim-ax ax-stride)：
+   共 HEAD 条 fiber，每条长 DIM-AX，相邻元素线性距离 AX-STRIDE。"
+  (let* ((dims (coerce shape 'simple-vector))
+         (rank (length dims))
+         (ax-stride 1)
+         (head 1))
+    (declare (type fixnum ax-stride head))
+    (loop for d of-type fixnum from (1+ ax) below rank
+          do (setf ax-stride (the fixnum (* ax-stride (the fixnum (svref dims d))))))
+    (loop for d of-type fixnum from 0 below ax
+          do (setf head (the fixnum (* head (the fixnum (svref dims d))))))
+    (values head (the fixnum (svref dims ax)) ax-stride)))
+
+(defmacro %def-cx-reducer (name step &key (init-form :zero))
+  "生成归约内核 NAME(DATA SHAPE AX)：AX=NIL 走全局单循环，否则走 fiber 循环。
+
+   STEP 是含 ACC 与 V 两个自由符号的模板（如 (+ acc v)），宏把 V 替换成
+   具体取元素形式。INIT-FORM：
+     :zero（缺省）→ 该精度的复数零；
+     具体表达式    → 原样使用（如 prod 的 (+ zero 1)）；
+     NIL          → 字面 nil，表示「首元素播种」（max/min 必须如此）。"
+  (let ((init-code (if (eq init-form :zero) 'zero init-form)))
+    (flet ((step-at (v) (subst v 'v step)))
+      `(defun ,name (data shape ax)
+         (%cx-dispatch data d zero
+           (let ((init ,init-code))
+             (if (null ax)
+                 (let ((acc init)
+                       (n (the fixnum (length d))))
+                   (declare (type fixnum n))
+                   (dotimes (i n)
+                     (declare (type fixnum i))
+                     (setf acc ,(step-at '(aref d i))))
+                   (vector acc))
+                 (multiple-value-bind (head dim ax-stride)
+                     (%cx-fiber-geom shape ax)
+                   (declare (type fixnum head dim ax-stride))
+                   (let ((res (make-array (the fixnum (* head ax-stride)))))
+                     (dotimes (h head)
+                       (declare (type fixnum h))
+                       (let* ((hb (the fixnum (* h dim ax-stride)))
+                              (row (the fixnum (* h ax-stride))))
+                         (declare (type fixnum hb row))
+                         (dotimes (ti ax-stride)
+                           (declare (type fixnum ti))
+                           (let ((acc init)
+                                 (p (the fixnum (+ hb ti))))
+                             (declare (type fixnum p))
+                             (dotimes (j dim)
+                               (declare (type fixnum j))
+                               (setf acc ,(step-at '(aref d p)))
+                               (incf p ax-stride))
+                             (setf (aref res (the fixnum (+ row ti))) acc)))))
+                     res)))))))))
+
+(%def-cx-reducer %cx-reduce-sum (+ acc v))
+(%def-cx-reducer %cx-reduce-prod (* acc v) :init-form (+ zero 1))
+(%def-cx-reducer %cx-reduce-max (if (null acc) v (%cop-max acc v)) :init-form nil)
+(%def-cx-reducer %cx-reduce-min (if (null acc) v (%cop-min acc v)) :init-form nil)
+
+(defun %cx-arg-reduce-run (data shape ax op)
+  "argmax/argmin 的连续内核。返回 fixnum 向量。
+   OP ∈ :argmax :argmin。AX=NIL 表示展平（结果为单元素向量）。"
+  (%cx-dispatch data d zero
+    (declare (ignore zero))
+    (flet ((better (acc v)
+             (cond ((null acc) t)
+                   ((%cx-nan-p acc) nil)
+                   ((%cx-nan-p v) t)
+                   ((eq op :argmax) (%clt acc v))
+                   (t (%cgt acc v)))))
+      (if (null ax)
+          (let ((n (the fixnum (length d)))
+                (acc nil)
+                (best 0))
+            (declare (type fixnum n best))
+            (dotimes (i n)
+              (declare (type fixnum i))
+              (let ((v (aref d i)))
+                (when (better acc v) (setf acc v best i))))
+            (vector best))
+          (multiple-value-bind (head dim ax-stride) (%cx-fiber-geom shape ax)
+            (declare (type fixnum head dim ax-stride))
+            (let ((res (make-array (the fixnum (* head ax-stride)) :element-type 'fixnum)))
+              (declare (type (simple-array fixnum (*)) res))
+              (dotimes (h head)
+                (declare (type fixnum h))
+                (let ((hb (the fixnum (* h dim ax-stride))))
+                  (declare (type fixnum hb))
+                  (dotimes (ti ax-stride)
+                    (declare (type fixnum ti))
+                    (let ((acc nil)
+                          (best 0)
+                          (p (the fixnum (+ hb ti))))
+                      (declare (type fixnum best p))
+                      (dotimes (j dim)
+                        (declare (type fixnum j))
+                        (let ((v (aref d p)))
+                          (when (better acc v) (setf acc v best j))))
+                      (setf (aref res (the fixnum (+ (the fixnum (* h ax-stride)) ti)))
+                            best)))))
+              res))))))
+
 (defun %cx-reduce-values (data shape axes op)
   "在连续 DATA（行主序、offset=0）上沿 AXES 归约，返回 results 向量。
 
-   AXES 为 NIL 表示**归约全部轴**（numpy 的 axis=None 语义），不是「不归约」。
-   OP ∈ :sum :prod :max :min。空归约区（n-red=0）：
-     sum→0、prod→1；max/min → 报错（对标 numpy 的 zero-size 归约错误）。"
+   AXES 为 NIL 表示**归约全部轴**（numpy 的 axis=None 语义）。
+   OP ∈ :sum :prod :max :min。空归约区（n-red=0）：sum→0、prod→1；
+   max/min → 报错（对标 numpy 的 zero-size 归约错误）。
+
+   选路：全局 / 单轴 → 类型特化连续内核；多轴 → 通用 odometer 兜底
+   （语义完全一致，多轴归约属罕见路径）。"
   (let* ((rank (length shape))
-         (shp (coerce shape 'simple-vector))
-         (strides (%cx-strides-vec shape))
          (axes* (sort (if axes (copy-list axes) (loop for d below rank collect d)) #'<))
          (non-axes (loop for d from 0 below rank unless (member d axes*) collect d))
-         (out-shape (loop for d in non-axes collect (svref shp d)))
-         (red-dims (loop for d in axes* collect (svref shp d)))
+         (n-red (reduce #'* (mapcar (lambda (d) (nth d shape)) axes*) :initial-value 1))
+         (n-out (reduce #'* (mapcar (lambda (d) (nth d shape)) non-axes)
+                        :initial-value 1)))
+    (when (and (zerop n-red) (member op '(:max :min)) (plusp n-out))
+      (error "zero-size array to reduction operation ~(~a~) which has no identity" op))
+    (cond
+      ((or (null axes) (= 1 (length axes*)))
+       (let ((ax (when axes (car axes*))))
+         (case op
+           (:sum (%cx-reduce-sum data shape ax))
+           (:prod (%cx-reduce-prod data shape ax))
+           (:max (%cx-reduce-max data shape ax))
+           (:min (%cx-reduce-min data shape ax)))))
+      (t (%cx-reduce-values-generic data shape axes op)))))
+
+(defun %cx-reduce-values-generic (data shape axes op)
+  "多轴归约的通用 odometer 实现（语义基准；复数多轴归约的正确性兜底）。"
+  (let* ((rank (length shape))
+         (strides (%cx-strides-vec shape))
+         (axes* (sort (copy-list axes) #'<))
+         (non-axes (loop for d from 0 below rank unless (member d axes*) collect d))
+         (out-shape (loop for d in non-axes collect (nth d shape)))
+         (red-dims (loop for d in axes* collect (nth d shape)))
          (red-strides (loop for d in axes* collect (svref strides d)))
          (n-red (reduce #'* red-dims :initial-value 1))
          (n-out (reduce #'* out-shape :initial-value 1))
@@ -520,8 +809,6 @@
                                                      :initial-element 0)))
     (declare (type fixnum n-red n-out)
              (type (simple-array fixnum (*)) red-idx non-idx))
-    (when (and (zerop n-red) (member op '(:max :min)) (plusp n-out))
-      (error "zero-size array to reduction operation ~(~a~) which has no identity" op))
     (dotimes (k n-out)
       (let ((base 0))
         (loop for j of-type fixnum from 0 below (length non-axes)
@@ -593,18 +880,19 @@
 
 (defun %cx-reduce (name tensor axis keepdims dtype out op)
   "复数归约公共外壳：轴规范化 + 结果 dtype + :out 硬契约 + keepdims。"
-  (let* ((in (ensure-vt tensor))
-         (in-shape (vt-shape in))
-         (rank (length in-shape))
-         (axes (vt-normalize-axes axis rank))
-         (flat (%cx-flat in))
-         (res-dtype (or dtype (vt-dtype in)))
-         (out-shape (%cx-keepdims-shape in-shape axes keepdims))
-         (res (if out
-                  (vt-check-out out out-shape res-dtype :op-name name)
-                  (make-vt out-shape 0 :dtype res-dtype)))
-         (values (%cx-reduce-values (vt-data flat) in-shape axes op)))
-    (%cx-write-flat res values res-dtype)))
+  (with-float-safe
+   (let* ((in (ensure-vt tensor))
+          (in-shape (vt-shape in))
+          (rank (length in-shape))
+          (axes (vt-normalize-axes axis rank))
+          (flat (%cx-flat in))
+          (res-dtype (or dtype (vt-dtype in)))
+          (out-shape (%cx-keepdims-shape in-shape axes keepdims))
+          (res (if out
+                   (vt-check-out out out-shape res-dtype :op-name name)
+                   (make-vt out-shape 0 :dtype res-dtype)))
+          (values (%cx-reduce-values (vt-data flat) in-shape axes op)))
+     (%cx-write-flat res values res-dtype))))
 
 (defmacro %cx-def-reduce (name op)
   "生成归约函数的复数分派包装。"
@@ -626,57 +914,26 @@
 ;;; argmax / argmin（单轴或展平；多轴与 numpy 一样不支持）---------------
 
 (defun %cx-arg-reduce (name tensor axis keepdims out op)
-  "复数 argmax/argmin。返回 :int64 下标张量。"
-  (let* ((in (ensure-vt tensor))
-         (in-shape (vt-shape in))
-         (rank (length in-shape))
-         (flat (%cx-flat in))
-         (data (vt-data flat))
-         (axes (vt-normalize-axes axis rank)))
-    (when (cdr axes)
-      (error "~a: 不支持多轴（对标 numpy：arg 归约只接受单个整数 axis）" name))
-    (cond
-      ((null axes)
-       ;; 展平 → 0 维下标（numpy 语义）
-       (let* ((n (vt-size flat))
-              (res (if out (vt-check-out out nil :int64 :op-name name)
-                       (make-vt nil 0 :dtype :int64))))
-         (when (zerop n)
-           (error "attempt to get ~(~a~) of an empty sequence" name))
-         (let ((acc (aref data 0)) (best 0))
-           (dotimes (i n)
-             (let ((v (aref data i)))
-               (cond ((%cisnan acc) nil)
-                     ((%cisnan v) (setf acc v best i))
-                     ((eq op :argmax) (when (%clt acc v) (setf acc v best i)))
-                     (t (when (%cgt acc v) (setf acc v best i))))))
-           (%cx-write-flat res (vector best) :int64))))
-      (t
-       (let* ((ax (car axes))
-              (ax-dim (nth ax in-shape))
-              (out-shape (%cx-keepdims-shape in-shape axes keepdims))
-              (res (if out (vt-check-out out out-shape :int64 :op-name name)
-                       (make-vt out-shape 0 :dtype :int64)))
-              (total (reduce #'* in-shape :initial-value 1))
-              (vals (make-array (max 1 total) :element-type 'fixnum
-                                               :initial-element 0))
-              (cnt 0))
-         (when (zerop ax-dim)
-           (error "attempt to get ~(~a~) of an empty sequence" name))
-         (multiple-value-bind (starts ax-stride dim-ax)
-             (%cx-fiber-starts in-shape ax)
-           (declare (ignore dim-ax))
-           (loop for s across starts
-                 do (let ((acc (aref data s)) (best 0))
-                      (dotimes (j ax-dim)
-                        (let ((v (aref data (+ s (* j ax-stride)))))
-                          (cond ((%cisnan acc) nil)
-                                ((%cisnan v) (setf acc v best j))
-                                ((eq op :argmax) (when (%clt acc v) (setf acc v best j)))
-                                (t (when (%cgt acc v) (setf acc v best j))))))
-                      (setf (aref vals cnt) best)
-                      (incf cnt))))
-         (%cx-write-flat res vals :int64))))))
+  "复数 argmax/argmin。返回 :int64 下标张量。
+
+   性能：连续数据走 %CX-ARG-REDUCE-RUN 的类型特化循环（原来用泛型
+   aref + 每元素 2 次带屏蔽的 %CISNAN，1M 元素 912ms）。"
+  (with-float-safe
+    (let* ((in (ensure-vt tensor))
+           (in-shape (vt-shape in))
+           (rank (length in-shape))
+           (flat (%cx-flat in))
+           (axes (vt-normalize-axes axis rank)))
+      (when (cdr axes)
+        (error "~a: 不支持多轴（对标 numpy：arg 归约只接受单个整数 axis）" name))
+      (when (zerop (vt-size flat))
+        (error "attempt to get ~(~a~) of an empty sequence" name))
+      (let* ((ax (car axes))
+             (out-shape (%cx-keepdims-shape in-shape axes keepdims))
+             (res (if out (vt-check-out out out-shape :int64 :op-name name)
+                      (make-vt out-shape 0 :dtype :int64)))
+             (vals (%cx-arg-reduce-run (vt-data flat) in-shape ax op)))
+        (%cx-write-flat res vals :int64)))))
 
 (defun vt-argmax (tensor &key axis keepdims dtype out)
   "最大值的下标（对标 numpy.argmax）。复数按字典序（§16.8）。
@@ -801,7 +1058,7 @@
           (error "vt-round: 复数路径的 :divisor 必须是实数（CONVENTIONS §16.5）"))
         (let ((d (abs divisor)))
           (vt-map (lambda (z)
-                    (if (or (%cisnan z) (%cisinf z))
+                    (if (or (%cx-nan-p z) (%cx-inf-p z))
                         z
                         (let ((re (realpart z)) (im (imagpart z)))
                           (complex (* (round (/ re d)) d)
@@ -813,37 +1070,76 @@
 ;;; ==================================================================
 
 (defun %cx-scan (tensor axis op out dtype op-name)
-  "沿 AXIS（nil=展平）的前缀扫描，op ∈ :sum :prod。"
-  (let* ((in (ensure-vt tensor))
-         (rank (length (vt-shape in)))
-         (flat (%cx-flat in))
-         (data (vt-data flat))
-         (shape (vt-shape flat))
-         (dt (or dtype (vt-dtype in)))
-         (res (if out (vt-check-out out (vt-shape in) dt :op-name op-name)
-                  (make-vt (vt-shape in) 0 :dtype dt)))
-         (res-flat (%cx-flat res))
-         (rdata (vt-data res-flat))
-         (ax (if axis (vt-normalize-axis axis rank) nil)))
-    (if (null ax)
-        (let ((acc (case op (:sum 0) (:prod 1)))
-              (n (vt-size flat)))
-          (dotimes (i n)
-            (setf acc (if (eq op :sum) (+ acc (aref data i)) (* acc (aref data i))))
-            (setf (aref rdata i) (vt-cast acc dt))))
-        (multiple-value-bind (starts ax-stride dim-ax)
-            (%cx-fiber-starts shape ax)
-          (loop for s across starts
-                do (let ((acc (case op (:sum 0) (:prod 1))))
-                     (dotimes (j dim-ax)
-                       (let ((v (aref data (+ s (* j ax-stride)))))
-                         (setf acc (if (eq op :sum) (+ acc v) (* acc v)))
-                         (setf (aref rdata (+ s (* j ax-stride)))
-                               (vt-cast acc dt))))))))
-    ;; res-flat 可能是副本：非连续 out 时需要写回
-    (unless (eq res-flat res)
-      (vt-copy-into res res-flat))
-    res))
+  "沿 AXIS（nil=展平）的前缀扫描，op ∈ :sum :prod。
+
+   类型特化：原来对 (simple-array * (*)) 做泛型 aref + 每元素 vt-cast
+   （1M 元素 cumsum = 288ms）。现在按元素类型绑定成 simple-array，
+   内核直接读写复数槽位；写回用一次 vt-copy-into（非连续 out 才发生）。"
+  (with-float-safe
+    (let* ((in (ensure-vt tensor))
+           (rank (length (vt-shape in)))
+           (flat (%cx-flat in))
+           (data (vt-data flat))
+           (shape (vt-shape flat))
+           (dt (or dtype (vt-dtype in)))
+           (res (if out (vt-check-out out (vt-shape in) dt :op-name op-name)
+                    (make-vt (vt-shape in) 0 :dtype dt)))
+           (res-flat (%cx-flat res))
+           (ax (if axis (vt-normalize-axis axis rank) nil))
+           (same-type (eq (array-element-type data)
+                          (array-element-type (vt-data res-flat)))))
+      (if same-type
+          (progn
+            (%cx-scan-run data (vt-data res-flat) shape ax op)
+            (unless (eq res-flat res) (vt-copy-into res res-flat)))
+          ;; dtype 不同（用户显式要 c64/f64 另一精度）：通用回退
+          (let ((rdata (vt-data res-flat)))
+            (if (null ax)
+                (let ((acc (case op (:sum 0) (:prod 1))))
+                  (dotimes (i (vt-size flat))
+                    (let ((v (aref data i)))
+                      (setf acc (if (eq op :sum) (+ acc v) (* acc v)))
+                      (setf (aref rdata i) (vt-cast acc dt)))))
+                (multiple-value-bind (starts ax-stride dim-ax)
+                    (%cx-fiber-starts shape ax)
+                  (loop for st across starts
+                        do (let ((acc (case op (:sum 0) (:prod 1))))
+                             (dotimes (j dim-ax)
+                               (let ((v (aref data (+ st (* j ax-stride)))))
+                                 (setf acc (if (eq op :sum) (+ acc v) (* acc v)))
+                                 (setf (aref rdata (+ st (* j ax-stride)))
+                                       (vt-cast acc dt))))))))
+            (unless (eq res-flat res) (vt-copy-into res res-flat))))
+      res)))
+
+(defun %cx-scan-run (src dst shape ax op)
+  "类型特化的前缀扫描：SRC/DST 元素类型一致（complex64 或 complex128）。"
+  (%cx-dispatch src s zero
+    (%cx-dispatch dst d zero2
+      (declare (ignore zero2))
+      (if (null ax)
+          (let ((acc (if (eq op :sum) zero (+ zero 1)))   ; prod 单位元 = 1+0i
+                (n (the fixnum (length s))))
+            (declare (type fixnum n))
+            (dotimes (i n)
+              (declare (type fixnum i))
+              (setf acc (if (eq op :sum) (+ acc (aref s i)) (* acc (aref s i))))
+              (setf (aref d i) acc)))
+          (multiple-value-bind (head dim ax-stride) (%cx-fiber-geom shape ax)
+            (declare (type fixnum head dim ax-stride))
+            (dotimes (h head)
+              (declare (type fixnum h))
+              (let ((row (the fixnum (* h dim ax-stride))))
+                (declare (type fixnum row))
+                (let ((acc (if (eq op :sum) zero (+ zero 1))))
+                  (dotimes (j dim)
+                    (declare (type fixnum j))
+                    (let ((p (the fixnum (+ row (the fixnum (* j ax-stride))))))
+                      (declare (type fixnum p))
+                      (setf acc (if (eq op :sum)
+                                    (+ acc (aref s p))
+                                    (* acc (aref s p))))
+                      (setf (aref d p) acc)))))))))))
 
 (defun vt-cumsum (tensor &key axis dtype out)
   "沿 AXIS 的累积和（对标 numpy.cumsum）。AXIS=NIL 展平扫描。
@@ -862,50 +1158,178 @@
 ;;; 11. 排序 / argsort / 中位数（字典序 + NaN 末尾，§16.8）
 ;;; ==================================================================
 
+(declaim (inline %cx-sort-less))
+
 (defun %cx-sort-less (a b)
   "复数排序比较：NaN 一律排末尾；其余按字典序（实部 → 虚部）。"
-  (cond ((%cisnan a) nil)
-        ((%cisnan b) t)
+  (cond ((%cx-nan-p a) nil)
+        ((%cx-nan-p b) t)
         (t (%clt a b))))
 
 (defun %cx-sort-axis (tensor axis &key index)
   "沿 AXIS 排序（INDEX 为真时返回下标）。返回新的 C 连续张量。
-   AXIS=NIL 时展平（与 clvt 既有 vt-sort :axis nil 语义一致）。"
+   AXIS=NIL 时展平（与 clvt 既有 vt-sort :axis nil 语义一致）。
+
+   外层统一屏蔽浮点陷阱：比较器 %CX-SORT-LESS 用的是**免屏蔽**快判
+   （%CX-NAN-P），必须由调用方保证陷阱已屏蔽，否则 NaN 参与比较会抛
+   FLOATING-POINT-INVALID-OPERATION（complex-test 的 sort-nan 用例即此）。"
+  (with-float-safe
+    (%cx-sort-axis-inner tensor axis :index index)))
+
+(defmacro %def-cx-fiber-sorter (name lt)
+  "生成原地升序排序内核 NAME(V BASE N AUX)：V/AUX 同类型，升序 = 字典序 + NaN 末尾。
+
+   相比旧实现（每元素 cons 一个 (值 . 下标) 再 STABLE-SORT）：
+   零 cons、零 funcall —— 比较器 %CX-SORT-LESS 直接内联进归并循环，
+   1M 元素实测 1292ms → 见 test/complex-bench.lisp。"
+  `(defun ,name (v base n aux)
+     (declare (type (simple-array ,lt (*)) v aux)
+              (type fixnum base n)
+              (optimize (speed 3) (safety 1)))
+     (cond
+       ((<= n 1) nil)
+       ;; 小 fiber：插入排序（免 scratch 开销）
+       ((<= n 16)
+        (loop for ii fixnum from 1 below n do
+          (let ((x (aref v (+ base ii)))
+                (j (1- ii)))
+            (declare (type fixnum j))
+            (loop while (and (>= j 0)
+                             (%cx-sort-less x (aref v (+ base j))))
+                  do (setf (aref v (+ base (1+ j))) (aref v (+ base j)))
+                     (decf j))
+            (setf (aref v (+ base (1+ j))) x))))
+       (t
+        ;; 自底向上稳定归并（无递归、顺序访存）
+        (let ((w 1))
+          (declare (type fixnum w))
+          (loop while (< w n) do
+            (let ((lo 0))
+              (declare (type fixnum lo))
+              (loop while (< lo n) do
+                (let* ((mid (min (+ lo w) n))
+                       (hi (min (+ lo w w) n))
+                       (i lo)
+                       (j mid)
+                       (k lo))
+                  (declare (type fixnum mid hi i j k))
+                  (loop while (and (< i mid) (< j hi)) do
+                    (if (%cx-sort-less (aref v (+ base j)) (aref v (+ base i)))
+                        (progn (setf (aref aux k) (aref v (+ base j))) (incf j))
+                        (progn (setf (aref aux k) (aref v (+ base i))) (incf i)))
+                    (incf k))
+                  (loop while (< i mid) do
+                    (setf (aref aux k) (aref v (+ base i))) (incf i) (incf k))
+                  (loop while (< j hi) do
+                    (setf (aref aux k) (aref v (+ base j))) (incf j) (incf k))
+                  (replace v aux :start1 (+ base lo) :end1 (+ base hi)
+                             :start2 lo :end2 hi))
+                (incf lo (* 2 w))))
+            (setf w (* 2 w))))))))
+
+(%def-cx-fiber-sorter %cx-sort-fiber-f64 (complex double-float))
+(%def-cx-fiber-sorter %cx-sort-fiber-f32 (complex single-float))
+
+(defun %cx-sort-fiber (data base n)
+  "按元素类型分派到原地排序内核（非复数缓冲区不会到这里）。"
+  (let ((et (array-element-type data)))
+    (cond ((equal et '(complex double-float))
+           (let ((aux (make-array (max n 1) :element-type '(complex double-float))))
+             (%cx-sort-fiber-f64 data base n aux)))
+          ((equal et '(complex single-float))
+           (let ((aux (make-array (max n 1) :element-type '(complex single-float))))
+             (%cx-sort-fiber-f32 data base n aux)))
+          (t (error "%cx-sort-fiber: 非复数缓冲区 ~a" et)))))
+
+(defun %cx-sort-fiber-strided (data base stride n)
+  "对 DATA 中「起点 BASE、步长 STRIDE、长度 N」的一条 fiber 原地排序。
+
+   连续副本 + 归并内核复用：先把 strided fiber 收进临时连续数组，
+   排完再写回（临时数组按元素类型分配，与 %CX-SORT-FIBER 同源）。"
+  (let ((et (array-element-type data)))
+    (cond
+      ((equal et '(complex double-float))
+       (let ((tmp (make-array (max n 1) :element-type '(complex double-float))))
+         (dotimes (i n) (setf (aref tmp i) (aref data (+ base (* i stride)))))
+         (%cx-sort-fiber tmp 0 n)
+         (dotimes (i n) (setf (aref data (+ base (* i stride))) (aref tmp i)))))
+      ((equal et '(complex single-float))
+       (let ((tmp (make-array (max n 1) :element-type '(complex single-float))))
+         (dotimes (i n) (setf (aref tmp i) (aref data (+ base (* i stride)))))
+         (%cx-sort-fiber tmp 0 n)
+         (dotimes (i n) (setf (aref data (+ base (* i stride))) (aref tmp i)))))
+      (t (error "%cx-sort-fiber-strided: 非复数缓冲区 ~a" et)))))
+
+(defun %cx-sort-axis-inner (tensor axis &key index)
+  "排序实现体（陷阱已由 %CX-SORT-AXIS 屏蔽）。
+
+   选路（两条都是「先落成连续副本，再按 fiber 处理」）：
+     · sort（无 INDEX）：fiber 直接用归并内核原地排（零 cons / 零 funcall）；
+     · argsort（INDEX=T）：fiber 建 fixnum 下标向量后 STABLE-SORT，
+       比较器直读数据（不再是每元素一个 (值 . 下标) cons 对）。"
   (let* ((in (ensure-vt tensor))
          (flat (%cx-flat in))
          (shape (vt-shape flat))
-         (data (vt-data flat))
          (rank (length shape))
+         (dt (vt-dtype in))
          (ax (if axis (vt-normalize-axis axis rank) nil)))
     (if (null ax)
+        ;; ---------- 展平 ----------
         (let* ((n (vt-size flat))
-               (pairs (loop for i from 0 below n collect (cons (aref data i) i)))
-               (sorted (stable-sort pairs (lambda (a b) (%cx-sort-less (car a) (car b))))))
+               (src (vt-data flat)))
           (if index
-              (let ((r (make-vt (list n) 0 :dtype :int64)))
-                (dotimes (i n)
-                  (setf (aref (vt-data r) i) (cdr (nth i sorted))))
-                r)
-              (let ((r (make-vt (list n) 0 :dtype (vt-dtype in))))
-                (dotimes (i n)
-                  (setf (aref (vt-data r) i) (car (nth i sorted))))
-                r)))
-        (let* ((res (if index (make-vt shape 0 :dtype :int64)
-                        (make-vt shape 0 :dtype (vt-dtype in))))
-               (rdata (vt-data res)))
-          (multiple-value-bind (starts ax-stride dim-ax)
-              (%cx-fiber-starts shape ax)
-            (loop for s across starts
-                  do (let* ((pairs (loop for j from 0 below dim-ax
-                                         collect (cons (aref data (+ s (* j ax-stride))) j)))
-                            (sorted (stable-sort pairs
-                                                 (lambda (a b)
-                                                   (%cx-sort-less (car a) (car b))))))
-                       (loop for j from 0 below dim-ax
-                             for p in sorted
-                             do (setf (aref rdata (+ s (* j ax-stride)))
-                                      (if index (cdr p) (car p)))))))
-          res))))
+              (let* ((res (make-vt (list n) 0 :dtype :int64))
+                     (rd (vt-data res))
+                     (idx (make-array n :element-type 'fixnum)))
+                (declare (type (simple-array fixnum (*)) idx))
+                (dotimes (i n) (setf (aref idx i) i))
+                (stable-sort idx
+                             (lambda (a b)
+                               (%cx-sort-less (aref src a) (aref src b))))
+                (dotimes (i n) (setf (aref rd i) (aref idx i)))
+                res)
+              (let* ((res (%cx-flat (vt-copy flat)))
+                     (rd (vt-data res)))
+                (%cx-sort-fiber rd 0 n)
+                (setf (vt-shape res) (list n)
+                      (vt-strides res) (list 1)
+                      (vt-offset res) 0)
+                res)))
+        ;; ---------- 单轴 ----------
+        (multiple-value-bind (head dim ax-stride) (%cx-fiber-geom shape ax)
+          (declare (type fixnum head dim ax-stride))
+          (if index
+              (let* ((res (make-vt shape 0 :dtype :int64))
+                     (rd (vt-data res))          ; res 是新建连续张量，offset=0
+                     (src (vt-data flat))
+                     (idx (make-array (max dim 1) :element-type 'fixnum)))
+                (declare (type (simple-array fixnum (*)) idx))
+                (dotimes (h head)
+                  (declare (type fixnum h))
+                  (let ((row (the fixnum (* h dim ax-stride))))
+                    (declare (type fixnum row))
+                    (dotimes (t2 ax-stride)
+                      (declare (type fixnum t2))
+                      (dotimes (j dim) (setf (aref idx j) j))
+                      (stable-sort idx
+                                   (lambda (a b)
+                                     (%cx-sort-less
+                                      (aref src (+ row t2 (the fixnum (* a ax-stride))))
+                                      (aref src (+ row t2 (the fixnum (* b ax-stride)))))))
+                      (dotimes (j dim)
+                        (setf (aref rd (+ row t2 (the fixnum (* j ax-stride))))
+                              (aref idx j))))))
+                res)
+              (let* ((res (%cx-flat (vt-copy flat)))
+                     (rd (vt-data res)))
+                (dotimes (h head)
+                  (declare (type fixnum h))
+                  (let ((row (the fixnum (* h dim ax-stride))))
+                    (declare (type fixnum row))
+                    (dotimes (t2 ax-stride)
+                      (declare (type fixnum t2))
+                      (%cx-sort-fiber-strided rd (+ row t2) ax-stride dim))))
+                res))))))
 
 (defun vt-sort (tensor &key (axis -1))
   "升序排序（对标 numpy.sort）。AXIS 缺省 -1；AXIS=NIL 展平。
@@ -964,21 +1388,42 @@
 ;;; ==================================================================
 
 (defun %cx-matmul-2d (a b)
-  "复数 (m,k)@(k,n) → (m,n)，A/B 均为 C 连续。"
+  "复数 (m,k)@(k,n) → (m,n)，A/B 均为 C 连续。
+
+   类型特化三重循环（i-k-j 次序，内层连续访存）。实测 256x256：
+   泛型版 1748ms → 特化版见 test/complex-bench.lisp。"
   (let* ((m (first (vt-shape a)))
          (k (second (vt-shape a)))
          (n (second (vt-shape b)))
-         (ad (vt-data a)) (bd (vt-data b))
-         (res (make-vt (list m n) 0 :dtype (vt-dtype a)))
-         (rd (vt-data res)))
-    (dotimes (i m)
-      (dotimes (j n)
-        (let ((acc (vt-dtype-default-value (vt-dtype a))))
-          (dotimes (p k)
-            (setf acc (+ acc (* (aref ad (+ (* i k) p))
-                                (aref bd (+ (* p n) j))))))
-          (setf (aref rd (+ (* i n) j)) acc))))
+         (res (make-vt (list m n) 0 :dtype (vt-dtype a))))
+    (when (plusp (* m k n))
+      (%cx-matmul-run (vt-data a) (vt-data b) (vt-data res) m k n))
     res))
+
+(defun %cx-matmul-run (ad bd rd m k n)
+  "C[m,n] = A[m,k] @ B[k,n]（C 连续、复数同精度）。"
+  (%cx-dispatch ad a zero
+    (%cx-dispatch bd b zero2
+      (%cx-dispatch rd c zero3
+        (declare (ignore zero2 zero3))
+        (dotimes (i m)
+          (declare (type fixnum i))
+          (dotimes (j n)
+            (declare (type fixnum j))
+            (setf (aref c (+ (* i n) j)) zero)))
+        (dotimes (i m)
+          (declare (type fixnum i))
+          (let ((a-row (the fixnum (* i k)))
+                (c-row (the fixnum (* i n))))
+            (declare (type fixnum a-row c-row))
+            (dotimes (p k)
+              (declare (type fixnum p))
+              (let ((av (aref a (+ a-row p)))
+                    (b-row (the fixnum (* p n))))
+                (declare (type fixnum b-row))
+                (dotimes (j n)
+                  (declare (type fixnum j))
+                  (incf (aref c (+ c-row j)) (* av (aref b (+ b-row j)))))))))))))
 
 (defun %cx-dot-1d (a b)
   "复数向量点积 → 0 维张量（不取共轭，对标 numpy.dot）。"

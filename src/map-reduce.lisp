@@ -35,17 +35,61 @@
     '(double-float single-float (signed-byte 64) (signed-byte 32))
     "窄整型输出时可配的输入类型（数据源；窄整型输入仍走同类型路径）。")
 
-  (defun %elem-type-cond (res-form kernel-name args)
-    "生成按 RES 元素类型 8 路分派的 COND 子句列表（连续快路径）。"
-    (loop for lt in +vt-elem-types+
-          collect `((equal (array-element-type ,res-form) ',lt)
-                    (,kernel-name ,lt ,@args))))
+  ;; ------------------------------------------------------------------
+  ;; 复数元素类型（CONVENTIONS §16.14 执行层）
+  ;;
+  ;; 为什么不把复数塞进 +vt-elem-types+ 的 8 路广播：vt-fast-map 在库内
+  ;; 有 200+ 展开点，每个展开点都复制一份完整循环体；把 8 路扩成 10 路
+  ;; 会让编译期代码量 +25%、镜像膨胀（历史实测 8x8 全展开直接 Heap exhausted）。
+  ;;
+  ;; 折中：**只对热算子**（+ - * / 与一元数学核）追加 2 个复数分支，
+  ;; 由 +cx-inline-ops+ 白名单在宏展开期决定。实测约 30 个展开点受影响，
+  ;; 换来复数算术从「泛型 walker」降到「类型声明驱动的普通循环」。
+  ;; ------------------------------------------------------------------
+  (defparameter +cx-elem-types+
+    '((complex double-float) (complex single-float))
+    "(complex128 / complex64) 的 CL 元素类型。")
 
-  (defun %elem-type-cond-strided (res-form kernel-name args)
-    "生成按 RES 元素类型 4 路分派的 COND 子句列表（非连续/广播快路径）。"
-    (loop for lt in +vt-strided-elem-types+
-          collect `((equal (array-element-type ,res-form) ',lt)
-                    (,kernel-name ,lt ,@args)))))
+  (defparameter +cx-inline-ops+
+    '(+ - * / abs sqrt exp log log2 log10 sin cos tan asin acos atan
+      sinh cosh tanh asinh acosh atanh square reciprocal signum
+      %cop-sqrt %cop-log %cop-log2 %cop-log10 %cop-square %cop-recip
+      %cop-signum %cop-abs %cconj %cop-neg
+      %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
+      %cx-nan-flag %cx-inf-flag %cx-finite-flag)
+    "允许生成复数内联分支的算子白名单。
+
+     只有**语义与元素类型无关**的算子才可列入：它们在内联循环里被直接
+     作用在 (complex double-float) 槽位上。未列入的算子仍走 vt-map 兜底
+     （语义相同，仅性能差异，铁律 2）。")
+
+  (defun %cx-inline-op-p (op)
+    (and op (symbolp op) (member op +cx-inline-ops+ :test #'eq)))
+
+  (defun %elem-type-cond (res-form kernel-name args &key complex)
+    "生成按 RES 元素类型分派的 COND 子句列表（连续快路径）。
+
+     COMPLEX 为真时追加 2 个复数分支（顺序在实数之后：复数命中率低，
+     且实数分支更短、预测更友好）。"
+    (append
+     (loop for lt in +vt-elem-types+
+           collect `((equal (array-element-type ,res-form) ',lt)
+                     (,kernel-name ,lt ,@args)))
+     (when complex
+       (loop for lt in +cx-elem-types+
+             collect `((equal (array-element-type ,res-form) ',lt)
+                       (,kernel-name ,lt ,@args))))))
+
+  (defun %elem-type-cond-strided (res-form kernel-name args &key complex)
+    "生成按 RES 元素类型分派的 COND 子句列表（非连续/广播快路径）。"
+    (append
+     (loop for lt in +vt-strided-elem-types+
+           collect `((equal (array-element-type ,res-form) ',lt)
+                     (,kernel-name ,lt ,@args)))
+     (when complex
+       (loop for lt in +cx-elem-types+
+             collect `((equal (array-element-type ,res-form) ',lt)
+                       (,kernel-name ,lt ,@args)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 逐元素映射：vt-map
@@ -510,45 +554,51 @@
 ;;; ==================================================================
 
 (defmacro %vt-inline1-strided-fast (op a res)
-  "一元非连续/广播快路径（按输出元素类型 8 路派发，内联 op）。"
+  "一元非连续/广播快路径（实数 4 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond-strided rd '%inline1-strided (list op a res))
+       (cond ,@(%elem-type-cond-strided rd '%inline1-strided (list op a res)
+                                        :complex (%cx-inline-op-p op))
              (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline2-strided-fast (op a b res)
-  "二元非连续/广播快路径（按输出元素类型 8 路派发，内联 op）。"
+  "二元非连续/广播快路径（实数 4 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond-strided rd '%inline2-strided (list op a b res))
+       (cond ,@(%elem-type-cond-strided rd '%inline2-strided (list op a b res)
+                                        :complex (%cx-inline-op-p op))
              (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline3-fast (op a b c res)
-  "三元连续快路径（按输出元素类型 8 路派发，内联 op）。"
+  "三元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond rd '%inline3-loop (list op a b c res))
+       (cond ,@(%elem-type-cond rd '%inline3-loop (list op a b c res)
+                                :complex (%cx-inline-op-p op))
              (t (vt-map (function ,op) ,a ,b ,c :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline3-strided-fast (op a b c res)
-  "三元非连续/广播快路径（按输出元素类型 8 路派发，内联 op）。"
+  "三元非连续/广播快路径（实数 4 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond-strided rd '%inline3-strided (list op a b c res))
+       (cond ,@(%elem-type-cond-strided rd '%inline3-strided (list op a b c res)
+                                        :complex (%cx-inline-op-p op))
              (t (vt-map (function ,op) ,a ,b ,c :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline1-fast (op a res)
-  "一元连续快路径（按输出元素类型 8 路派发，内联 op）。"
+  "一元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond rd '%inline1-loop (list op a res))
+       (cond ,@(%elem-type-cond rd '%inline1-loop (list op a res)
+                                :complex (%cx-inline-op-p op))
              (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline2-fast (op a b res)
-  "二元连续快路径（按输出元素类型 8 路派发，内联 op）。"
+  "二元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond rd '%inline2-loop (list op a b res))
+       (cond ,@(%elem-type-cond rd '%inline2-loop (list op a b res)
+                                :complex (%cx-inline-op-p op))
              (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 ;;; ==================================================================
@@ -646,13 +696,15 @@
                        (when (< d 0) (return-from outer))))))))))))
 
 (defmacro %vt-mask1-fast (op a res)
-  "一元「窄整型输出」快路径（4 种输出 × 4 种输入 = 16 格）。"
+  "一元「窄整型输出」快路径（4 种实数输入 + 2 种复数输入）。"
   (let ((rd (gensym "RD")) (ea (gensym "EA")))
     `(let* ((,rd (vt-data ,res))
             (,ea (array-element-type (vt-data ,a))))
        (cond
          ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in +vt-mask-in-types+
+                 nconc (loop for ilt in (if (%cx-inline-op-p op)
+                                             (append +vt-mask-in-types+ +cx-elem-types+)
+                                             +vt-mask-in-types+)
                              collect
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt))
@@ -660,14 +712,16 @@
          (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-mask2-fast (op a b res)
-  "二元「窄整型输出」连续快路径（4 种输出 × 4 种输入 = 16 格）。"
+  "二元「窄整型输出」连续快路径（4 种实数输入 + 2 种复数输入）。"
   (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
     `(let* ((,rd (vt-data ,res))
             (,ea (array-element-type (vt-data ,a)))
             (,eb (array-element-type (vt-data ,b))))
        (cond
          ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in +vt-mask-in-types+
+                 nconc (loop for ilt in (if (%cx-inline-op-p op)
+                                             (append +vt-mask-in-types+ +cx-elem-types+)
+                                             +vt-mask-in-types+)
                              collect
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt)
@@ -676,14 +730,16 @@
          (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-mask2-strided-fast (op a b res)
-  "二元「窄整型输出」+ 非连续/广播快路径（4 种输出 × 4 种输入 = 16 格）。"
+  "二元「窄整型输出」+ 非连续/广播快路径（4 种实数输入 + 2 种复数输入）。"
   (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
     `(let* ((,rd (vt-data ,res))
             (,ea (array-element-type (vt-data ,a)))
             (,eb (array-element-type (vt-data ,b))))
        (cond
          ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in +vt-mask-in-types+
+                 nconc (loop for ilt in (if (%cx-inline-op-p op)
+                                             (append +vt-mask-in-types+ +cx-elem-types+)
+                                             +vt-mask-in-types+)
                              collect
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt)

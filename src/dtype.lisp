@@ -371,9 +371,12 @@
 ;;; 全部是 (declaim inline) 的单指令级函数，热路径零开销。
 ;;; ------------------------------------------------------------------
 
+;;; 性能：这一组必须 INLINE。排序/比较/极值内核每元素要调用它们
+;;; 1e6~2e7 次，函数调用开销（~5ns/次）会直接主导总耗时：
+;;; 实测复数 sort 1M 元素 1370ms 中约 1000ms 是比较器的 funcall。
 (declaim (inline %c2 %creal %cimag %cabs %carg %cconj
                  %cisnan %cisinf %cisfinite %cis-zero
-                 %clt %cle %cgt %cge %cneq))
+                 %c-lex-compare %clt %cle %cgt %cge %cneq))
 
 (defun %c2 (re im)
   "由实部/虚部构造复数（RE 已保证为实数）。"
@@ -423,8 +426,43 @@
   "共轭：复数返回 conj，实数原样返回（对标 numpy.conj）。"
   (if (complexp x) (conjugate x) x))
 
+;;; ------------------------------------------------------------------
+;;; 快判原语（**前置条件：调用方已在 with-float-safe 内**）
+;;;
+;;; 为什么需要这一组：vt-float-nan-p / vt-float-inf-p 内部各包一层
+;;; `with-float-traps-masked`，单次约 200ns；而比较/极值/排序内核每元素
+;;; 要判 2~4 次分量 —— 1M 元素光「屏蔽/恢复陷阱」就吃掉 ~400-800ms
+;;; （实测 %cisnan(复数) 399ms/1M，而真正的 4 次浮点比较只要 34ms）。
+;;; 内核全部运行在 vt-map / vt-fast-map / %cx-* 的 with-float-safe 之下，
+;;; 陷阱已屏蔽，这里直接 `(not (= x x))` 即可，**不再嵌套屏蔽**。
+;;;
+;;; 边界函数（用户入口、非屏蔽上下文）仍用带屏蔽的 %cisnan/%cisinf，
+;;; 分工见 CONVENTIONS §16.14。
+;;; ------------------------------------------------------------------
+
+(declaim (inline %cx-nan-p %cx-inf-p))
+
+(defun %cx-nan-p (x)
+  "已屏蔽陷阱上下文中的 NaN 判定（实数返回自身未定义域，复数任一分量）。
+   前置条件：调用方在 with-float-safe 内。"
+  (if (complexp x)
+      (or (not (= (realpart x) (realpart x)))
+          (not (= (imagpart x) (imagpart x))))
+      (and (floatp x) (not (= x x)))))
+
+(defun %cx-inf-p (x)
+  "已屏蔽陷阱上下文中的 ±Inf 判定（实数/复数；复数任一分量）。"
+  (flet ((infp (v)
+           (and (floatp v) (> (abs v) most-positive-double-float))))
+    (if (complexp x)
+        (or (infp (realpart x)) (infp (imagpart x)))
+        (infp x))))
+
 (defun %cisnan (x)
-  "NaN 判定：复数「任一分量为 NaN」即 NaN（对标 numpy.isnan，§16.7）。"
+  "NaN 判定：复数「任一分量为 NaN」即 NaN（对标 numpy.isnan，§16.7）。
+
+   这是**带陷阱屏蔽的边界版本**（单次 ~200ns）：只用于用户入口与任何
+   未屏蔽上下文；内核热路径请用 %CX-NAN-P。"
   (if (complexp x)
       (or (vt-float-nan-p (realpart x)) (vt-float-nan-p (imagpart x)))
       (vt-float-nan-p x)))
@@ -436,11 +474,17 @@
       (vt-float-inf-p x)))
 
 (defun %cisfinite (x)
-  "有限性判定：复数的两个分量都有限才为有限（对标 numpy.isfinite，§16.7）。"
+  "有限性判定：复数的两个分量都有限才为有限（对标 numpy.isfinite，§16.7）。
+   边界版本（带屏蔽）；内核里请用 %CX-FINITE-P。"
   (if (complexp x)
       (and (not (vt-float-nan-p (realpart x))) (not (vt-float-inf-p (realpart x)))
            (not (vt-float-nan-p (imagpart x))) (not (vt-float-inf-p (imagpart x))))
       (and (not (vt-float-nan-p x)) (not (vt-float-inf-p x)))))
+
+(declaim (inline %cx-finite-p))
+(defun %cx-finite-p (x)
+  "已屏蔽陷阱上下文中的有限性判定（非 NaN 且非 Inf）。"
+  (not (or (%cx-nan-p x) (%cx-inf-p x))))
 
 (defun %cis-zero (x)
   "零判定：复数要求实部与虚部同时为 +0.0/-0.0（对标 numpy `z == 0`）。"
@@ -457,8 +501,11 @@
   "返回 -1 / 0 / 1（字典序）；任一分量含 NaN 时返回 NIL（不可比）。"
   (let ((ar (%creal a)) (ai (%cimag a))
         (br (%creal b)) (bi (%cimag b)))
-    (cond ((or (vt-float-nan-p ar) (vt-float-nan-p br)
-               (vt-float-nan-p ai) (vt-float-nan-p bi))
+    ;; 前置条件：调用方在 with-float-safe 内（排序/极值/比较内核皆然）。
+    ;; 用 %CX-NAN-P 而非 VT-FLOAT-NAN-P：后者每次都要屏蔽/恢复陷阱，
+    ;; 每元素 4 次 → 1M 元素多付约 800ms（实测）。
+    (cond ((or (%cx-nan-p ar) (%cx-nan-p br)
+               (%cx-nan-p ai) (%cx-nan-p bi))
            nil)
           ((< ar br) -1)
           ((> ar br) 1)
