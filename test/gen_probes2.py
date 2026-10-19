@@ -1234,7 +1234,22 @@ lRA16 = "(vt-from-sequence (list (list 0 1 2) (list 3 4 5)) :dtype :int64)"
 #                     300 *vt-fun-list*）
 # =====================================================================
 def g18():
-    add('*vt-fun-list* 规模', "(* (length *vt-fun-list*) 1)", lambda: np.asarray(FUN_COUNT))
+    # ---- API 指纹探针：断言「机制」而不是「数字」 ----
+    # 早期版本把导出数量写死（363 → 371 …），于是**每次在 package.lisp 新增导出**
+    # 都会让本探针变红——但新增导出是正常演进，不该被当成回归。
+    # 现在改为断言不变量：*vt-fun-list* 必须恰好等于包导出集（vt- 前缀）、
+    # 无重复、非空。它能在下列情况真正报警：
+    #   · refresh-vt-fun-list 误用 DO-SYMBOLS（把内部符号算进来）→ 数量不匹配
+    #   · 导出表出现重复项（defpackage 允许，但会让统计漂移）→ 重复检测命中
+    #   · 包定义被破坏 / 列表未刷新 → 非空或等式失败
+    # 导出数量本身的增减由 codegen（本文件重新生成）自然跟随，无需手工维护。
+    add('*vt-fun-list* 与导出集一致',
+        "(let ((n 0))"
+        " (do-external-symbols (s :clvt)"
+        " (when (and (> (length (symbol-name s)) 2) (string= \"VT-\" (symbol-name s) :end2 3)) (incf n)))"
+        " (if (and (plusp n) (= n (length *vt-fun-list*))"
+        " (= n (length (remove-duplicates *vt-fun-list* :test #'eq)))) 1 0))",
+        lambda: np.asarray(1))
     add('*vt-fun-list* 含vt-sum', "(if (member 'clvt:vt-sum *vt-fun-list*) 1 0)", lambda: np.asarray(1))
     # 注：搜索串不带 d0 后缀——与浮点表示形式无关（print-vt-recursive
     # 经 %format-number 的 ~,vF 分支输出 "1.0"，PRIN1 兜底输出 "1.0d0"，
@@ -1255,15 +1270,14 @@ def g18():
         "(let ((o (vt-get-print-options))) (list (if (nth 0 o) 1 0) (if (nth 1 o) 1 0) (if (nth 2 o) 1 0)))",
         lambda: np.array([1, 1, 1]))
 
-# *vt-fun-list* 期望长度：以 SBCL 实测为准（见 discover_fun_count()）
-def _static_fun_count():
-    import re as _re
-    _p = os.path.join(_SCRIPT_DIR, '..', 'src', 'package.lisp')
-    _s = open(_p, encoding='utf-8').read()
-    _i = _s.find('(:export'); _j = _s.find('(in-package', _i)
-    _syms = _re.findall(r'#:([A-Za-z0-9@!*\-+<>=/_]+)', _s[_i:_j])
-    return sum(1 for s in _syms if len(s) > 2 and s[:3].lower() == 'vt-')
-FUN_COUNT = _static_fun_count()
+# 注：这里曾有 _static_fun_count() / FUN_COUNT —— 用正则从 package.lisp 的
+# (:export …) 块数 `#:vt-*` 的**出现次数**，作为 *vt-fun-list* 的期望长度。
+# 它有两个缺陷，已废弃：
+#   1) 不区分重复项：defpackage 的导出表允许同名重复（历史上有
+#      vt-real/vt-imag/vt-conj/vt-angle 各出现两次），于是
+#      静态计数 371 ≠ 运行时 367，探针 p0395 恒定失败；
+#   2) 把「数量」当契约：任何新增导出都要改期望值，违背探针的用途。
+# 现由 g18() 的不变量探针替代（断言列表 ≡ 导出集且无重复），无需维护数字。
 
 # =====================================================================
 # G19 extensions3 收尾（375 isposinf, 376 isneginf + 补充鲁棒性）
@@ -1438,7 +1452,12 @@ def _tol_eq(a, b, rt=1e-11, at=1e-12):
     return abs(fa - fb) <= at + rt * max(abs(fa), abs(fb))
 
 if __name__ == '__main__':
-    if sys.argv[1] == 'gen':
+    # 无参默认 gen：check_key_sync.py 就是「无参调用 + 逐字节比对」来做
+    # codegen 漂移检查的。此前 `sys.argv[1]` 在无参时抛 IndexError，
+    # 生成器原地崩溃、文件没被重写，门禁于是永远「比对通过」——
+    # 一个静默失效的门禁比没有门禁更危险（历史上已让 9 行过期期望值潜伏）。
+    mode = sys.argv[1] if len(sys.argv) > 1 else 'gen'
+    if mode == 'gen':
         cmd_gen()
     else:
         cmd_compare()

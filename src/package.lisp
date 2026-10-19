@@ -520,12 +520,12 @@
    ;; ------------------------------------------------------------------
    ;; 复数（complex.lisp，CONVENTIONS §16）
    ;; ------------------------------------------------------------------
+   ;; 注意：vt-real / vt-imag / vt-conj / vt-angle 的导出**已在上方「杂项」块**
+   ;; 存在（它们自 extensions3 起就有了，复数层只是替换了实现），这里**不得重复导出**
+   ;; —— defpackage 的 export 列表重复会让 `(length *vt-fun-list*)` 这类
+   ;; 「API 指纹」统计与静态解析结果不一致（历史上正是由此触发 p0395 失败）。
    #:vt-complex
-   #:vt-real
-   #:vt-imag
-   #:vt-conj
    #:vt-conjugate
-   #:vt-angle
    #:vt-iscomplexobj
    #:vt-isrealobj))
 
@@ -536,12 +536,20 @@
   "所有以 `vt-` 开头的导出符号列表。")
 
 (defun refresh-vt-fun-list ()
-  (setf *vt-fun-list* nil)
-  (do-symbols (var :clvt)
-    (when (and (> (length (symbol-name var)) 2)
-               (search "vt-" (symbol-name var) :test #'equalp :end2 3))
-      (push var *vt-fun-list*)))
-  (setf *vt-fun-list* (nreverse *vt-fun-list*)))
+  "重建 *VT-FUN-LIST*：**导出**的、以 `vt-` 开头的符号，按包内顺序。
+
+   为什么必须用 DO-EXTERNAL-SYMBOLS 而不是 DO-SYMBOLS：
+   DO-SYMBOLS 会把**内部**辅助符号（如 vt-complex-dtype-p、vt-real-dtype-of）
+   一起算进来，于是这个列表的规模取决于「调用时已经 intern 了哪些符号」——
+   本函数在 package.lisp 末尾首次调用时恰好等于导出集，但任何一次晚到的
+   重新调用（测试、REPL、工具）都会把它撑大，使 API 指纹漂移。
+   导出集是唯一稳定、且与 docstring 表述一致的语义（CONVENTIONS §10.4）。"
+  (let (acc)
+    (do-external-symbols (var :clvt)
+      (when (and (> (length (symbol-name var)) 2)
+                 (string= "VT-" (symbol-name var) :end2 3))
+        (push var acc)))
+    (setf *vt-fun-list* (nreverse acc))))
 
 
 (refresh-vt-fun-list)

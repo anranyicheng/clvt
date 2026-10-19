@@ -965,5 +965,9 @@ def cmd_compare():
     print(f"\n{'='*70}\n各分类: " + ", ".join(f"{k}={len(v)}" for k,v in fails.items()))
 
 if __name__ == '__main__':
-    if sys.argv[1] == 'gen': cmd_gen()
+    # 无参默认 gen：check_key_sync.py 用「无参调用 + 逐字节比对」做 codegen 漂移
+    # 检查。原先 sys.argv[1] 在无参时抛 IndexError，生成器原地崩溃、文件未重写，
+    # 门禁于是永远「通过」——静默失效的门禁比没有门禁更危险。
+    _mode = sys.argv[1] if len(sys.argv) > 1 else 'gen'
+    if _mode == 'gen': cmd_gen()
     else: cmd_compare()

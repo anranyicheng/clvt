@@ -384,8 +384,15 @@
   (if (complexp x) (realpart x) x))
 
 (defun %cimag (x)
-  "取虚部：复数返回 imagpart，实数返回同类零（对标 numpy.imag）。"
-  (if (complexp x) (imagpart x) (* 0 x)))
+  "取虚部：复数返回 imagpart，实数返回**同类 +0.0**（对标 numpy.imag）。
+
+   实数分支必须是 +0.0，不能用 `(* 0 x)`：后者对负数给出 **-0.0**
+   （实测 (-2.0) → -0.0），而 numpy 的 `np.imag(实数数组)` 恒为 +0.0
+   （signbit 全 0）。差分探针 p0392 的 :exact 位级比较会因 -0.0 判不等，
+   这也是 §16.6「符号零是语义信息」的另一面：**不该出现 -0.0 的地方不能有**。"
+  (cond ((complexp x) (imagpart x))
+        ((floatp x) (float 0 x))        ; +0.0，保持单/双精度
+        (t 0)))
 
 (defun %cabs (x)
   "复数的模（欧几里得范数）；实数即绝对值。
@@ -394,13 +401,23 @@
   (abs x))
 
 (defun %carg (x)
-  "复数幅角 atan2(im, re) ∈ (-π, π]；实数按符号返回 0 / π / -π（对标 numpy.angle）。
-   注意 numpy：angle(-1.0) = π、angle(-1.0-0.0j) = -π（尊重 -0.0 虚部符号）。"
+  "复数幅角 atan2(im, re) ∈ (-π, π]；实数按符号返回 0 / π，NaN 传播。
+
+   numpy 实测（2.4.6）的实数语义：
+     angle(0.0)  = 0.0      angle(-0.0) = π（**看符号位**，不看数值比较）
+     angle(1.0)  = 0.0      angle(-1.0) = π      angle(nan) = nan
+   因此负零必须用 `float-sign` 判定（`minusp` 对 -0.0 返回 NIL，会漏掉），
+   非负分支必须返回 +0.0（不能 `(* 0 x)`，那会给 -0.0）。"
   (if (complexp x)
       (let ((re (realpart x)) (im (imagpart x)))
-        (cond ((and (zerop re) (zerop im)) (* 0 re))
+        (cond ((and (zerop re) (zerop im)) (float 0 re))
               (t (atan im re))))
-      (if (minusp x) (let ((p (coerce pi (type-of (float x))))) p) (* 0 x))))
+      (cond ((and (floatp x) (vt-float-nan-p x)) x)          ; NaN 传播
+            ((or (minusp x)
+                 (and (floatp x) (minusp (float-sign x))))    ; 负数 或 -0.0 → π
+             (coerce pi (if (and (floatp x) (typep x 'single-float))
+                            'single-float 'double-float)))
+            (t (if (floatp x) (float 0 x) 0)))))
 
 (defun %cconj (x)
   "共轭：复数返回 conj，实数原样返回（对标 numpy.conj）。"

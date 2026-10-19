@@ -31,6 +31,22 @@ lisp 侧的查询 key 与此文件中的 `R["..."]` **只靠命名约定同步**
 | `gen_numpy_expected.py` | 已废弃，仅重定向到 ref_compute.py | 兼容入口 | 勿扩展 |
 | `torch-compare.py` | 独立 PyTorch 对比 + 性能基线（18 算子） | 人工（可选） | 不在 run-tests.sh 链路 |
 
+## codegen 门禁的两条硬约束（2026-10 修复）
+
+`check_key_sync.py` 的「codegen 同步」检查是「**无参**调用生成器 + 逐字节比对」。
+这要求生成器满足：
+
+1. **无参必须等价于 gen**。历史版本用 `sys.argv[1]`，无参即 `IndexError` 崩溃、
+   文件不会被重写，比对自然「通过」——门禁静默失效，导致 9 行过期浮点期望值
+   潜伏（`0.272799` 应为 `0.27279899999999996`，旧 `str()` 口径）。
+   现已改为 `mode = sys.argv[1] if len(sys.argv) > 1 else 'gen'`。
+2. **生成必须可复现**。同一环境连续两次生成必须逐字节相同（随机类探针统一走
+   `rng(seed)` = `np.random.RandomState(seed)`，禁止裸用全局 RNG）。
+
+另外注意：门禁结束时会 `git checkout -- <生成物>` 还原工作区。因此**重新生成后
+必须先 `git add`**，否则你刚生成的改动会被门禁自己抹掉（这也是「改了却没生效」的
+经典坑）。
+
 ## 已删除的旧架构（勿重建）
 
 静态预生成 JSON 时代的三件套 `all_expected.json` / `param_expected.json` /
@@ -53,6 +69,12 @@ lisp 调用补入 `legacy-coverage-test.lisp`（284 例含 3 条 narrow 语义�
 
 - **给现有套件加数值用例**：在 `ref_compute.py` 加 `R["fn_场景"] = ...`，在对应 lisp 加
   `(T! "..." (funcall E "fn_场景") (vt-...))`，跑 `python3 test/check_key_sync.py`。
-- **改探针**：只改 `gen_probes*.py`，跑 `python3 test/gen_probes*.py` 重新生成，门禁会校验一致性。
+- **改探针**：只改 `gen_probes*.py`，跑 `python3 test/gen_probes*.py`（无参即生成）重新生成，
+  `git add` 生成物，再跑门禁校验一致性。
+- **新增导出函数（package.lisp）**：**不需要**改任何探针 —— `p0395` 断言的是
+  「`*vt-fun-list*` ≡ 包导出集（`vt-` 前缀）且无重复」，导出增减由机制自动跟随。
+  只需注意两点：① 同一个名字**不要重复导出**（defpackage 允许重复，但会让统计漂移）；
+  ② 新增的 `vt-` 前缀**内部**辅助函数不会被计入（`refresh-vt-fun-list` 用
+  `DO-EXTERNAL-SYMBOLS`），无需为它们调整任何期望值。
 - **新套件接参考值**：仿照 `auto-compare-test.lisp` 的子进程 + 内置 JSON 解析器结构，
   并把新文件的 key 提取正则登记进 `check_key_sync.py` 的 `CONSUMERS`。

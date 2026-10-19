@@ -4,6 +4,51 @@
 
 ---
 
+## 2026-10-19（二）— 修复：新增导出导致 p0395/p0392 失败 + codegen 门禁静默失效
+
+### 现象
+上游合并复数补丁后 `differential-probes-test2` 恒红：`403/405`，`p0392`（data）与
+`p0395`（data）。
+
+### 根因（四条，全部实测确认）
+
+1. **`p0395` 把导出数量写死成常量 371**，而运行时 `*vt-fun-list*` 只有 367：
+   `vt-real / vt-imag / vt-conj / vt-angle` 早在 `extensions3.lisp` 就存在并已导出，
+   复数层又**重复导出**了一次。`defpackage` 允许重复，静态解析因此多算 4 个。
+2. **`refresh-vt-fun-list` 用 `DO-SYMBOLS`**（把内部辅助符号也算进来），与其
+   docstring「导出符号」矛盾，且结果依赖"何时调用"——运行时重刷一次就会从 367 涨到 406。
+3. **`p0392` 是真语义 bug**：`%cimag` 的实数分支写成 `(* 0 x)`，对负数产生 **-0.0**，
+   而 numpy 的 `np.imag(实数)` 恒为 **+0.0**；探针 `:exact` 做位级比较（含符号位）故判不等。
+   同源的 `%carg` 也把 `-0.0` 漏判成 0（numpy: `angle(-0.0) = π`）。
+4. **codegen 门禁静默失效**：`check_key_sync.py` 用「无参调用生成器」做漂移检查，
+   而两个生成器都是 `sys.argv[1]` → 无参即 `IndexError`，文件未被重写，比对自然"通过"。
+   后果：9 行过期浮点期望值（旧 `str()` 口径 `0.272799`，现应为 `0.27279899999999996`）
+   一直没被发现。
+
+### 修复
+
+- `src/dtype.lisp`：`%cimag` 实数分支返回同类 **+0.0**；`%carg` 增加 NaN 传播与
+  **符号零**判定（`float-sign` 判 `-0.0` → π，返回 +0.0）。
+- `src/package.lisp`：删除 4 个重复导出并加注释；`refresh-vt-fun-list` 改用
+  `DO-EXTERNAL-SYMBOLS`（口径唯一、与调用时机无关）。
+- `test/gen_probes*.py`：无参默认 `gen`（门禁真正生效）；`p0395` 由"数量常量"
+  改为**不变量断言**（列表 ≡ 导出集、无重复、非空），新增导出不再变红；
+  删除失效的 `_static_fun_count`。重新生成 `differential-probes-test2.lisp`
+  （顺带把 9 行过期浮点期望值规范化）。
+- `test/README-tools.md`：新增「codegen 门禁的两条硬约束」与「新增导出函数怎么操作」。
+- `CONVENTIONS.md` §10.4.1：把 API 指纹规则固化（禁写死数量 / 口径唯一 /
+  导出不重复 / 无参=gen / 生成可复现 / 重新生成后先 add）。
+- `.gitignore`：忽略 `tmp/`（生成器中间产物）。
+
+### 验证
+
+- `differential-probes-test2`：**405/405**（原 403/405）
+- `complex-test` 136/136、`core-test` 284/284、`differential-probes-test` 496/496
+- `check_key_sync.py` 全绿且**真实生效**（人为制造漂移可被测出）
+- 不变量探针非空转：列表污染 / 含重复 / 为空 / 晚调用 refresh 四种破坏各自返回 0
+
+---
+
 ## 2026-10-19 — 第一轮进化：复数（complex64 / complex128）支持
 
 ### 新增 dtype（src/dtype.lisp）
