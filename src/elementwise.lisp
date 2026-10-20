@@ -1,5 +1,7 @@
 ;;;; elementwise.lisp — 逐元素算术 / 数学 / 比较 / 逻辑 / 位运算
 
+#+sbcl (sb-ext::gc :full t) ;; 在编译期间垃圾回收内存，防止爆炸
+
 (in-package :clvt)
 
 (defun vt-+ (&rest args)
@@ -1264,3 +1266,6 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
     (vt-map (lambda (x)
               (if (zerop x) 1.0d0 (/ (sin x) x)))
             x-pi :out out :dtype dt)))
+
+;; 在编译期间垃圾回收内存，防止爆炸
+#+sbcl (sb-ext::gc :full t)
