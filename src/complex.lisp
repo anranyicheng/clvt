@@ -157,8 +157,8 @@
   (let ((ax (abs x)) (ay (abs y)))
     (cond ((zerop ax) ay)
           ((zerop ay) ax)
-          ((> ax ay) (let ((r (/ ay ax))) (* ax (sqrt (+ 1.0 (* r r))))))
-          (t (let ((r (/ ax ay))) (* ay (sqrt (+ 1.0 (* r r)))))))))
+          ((> ax ay) (let ((r (/ ay ax))) (* ax (sqrt (+ 1.0s0 (* r r))))))
+          (t (let ((r (/ ax ay))) (* ay (sqrt (+ 1.0s0 (* r r)))))))))
 
 (defun %cop-sqrt (z)
   "复数平方根（主值，C99 csqrt 分支切割）。
@@ -177,10 +177,10 @@
                     (if (minusp (float-sign y)) (- (sqrt (- x))) (sqrt (- x)))))
           (t
            (let* ((r (%cx-hypot x y))
-                  (s (sqrt (* 0.5 (+ r (abs x))))))
+                  (s (sqrt (* 0.5s0 (+ r (abs x))))))
              (if (>= x 0)
-                 (complex s (/ y (* 2.0 s)))
-                 (complex (/ (abs y) (* 2.0 s))
+                 (complex s (/ y (* 2.0s0 s)))
+                 (complex (/ (abs y) (* 2.0s0 s))
                           (if (minusp (float-sign y)) (- s) s))))))))
 
 (defun %cop-log (z)
@@ -194,13 +194,13 @@
 (defun %cop-log2 (z)
   "复数 log2 = log(z)/ln2。极点 0 → -Inf + 0i。"
   (let* ((l (%cop-log z))
-         (ln2 (if (typep (%creal l) 'single-float) 0.6931472 0.6931471805599453d0)))
+         (ln2 (if (typep (%creal l) 'single-float) 0.6931472s0 0.6931471805599453d0)))
     (complex (/ (%creal l) ln2) (/ (%cimag l) ln2))))
 
 (defun %cop-log10 (z)
   "复数 log10 = log(z)/ln10。极点 0 → -Inf + 0i。"
   (let* ((l (%cop-log z))
-         (ln10 (if (typep (%creal l) 'single-float) 2.3025851
+         (ln10 (if (typep (%creal l) 'single-float) 2.3025851s0
                    2.302585092994046d0)))
     (complex (/ (%creal l) ln10) (/ (%cimag l) ln10))))
 
@@ -433,7 +433,7 @@
          (fn (if deg
                  (lambda (z)
                    (* (%carg z)
-                      (if (eq dt :float32) (/ 180.0 0.31415927e1) (/ 180.0d0 pi))))
+                      (if (eq dt :float32) (/ 180.0s0 0.31415927s1) (/ 180.0d0 pi))))
                  #'%carg)))
     ;; 度数换算需要额外一次乘法（内核未参数化），deg 走通用路径；
     ;; 默认弧度走 %CX-ANGLE-RUN 特化内核。
@@ -654,7 +654,7 @@
               ,@body))
            ((equal et '(complex single-float))
             (let ((,arr (the (simple-array (complex single-float) (*)) ,data))
-                  (,zero (complex 0.0 0.0)))
+                  (,zero (complex 0.0s0 0.0s0)))
               (declare (type (simple-array (complex single-float) (*)) ,arr)
                        (optimize (speed 3) (safety 1)))
               ,@body))
@@ -981,12 +981,12 @@
                          (make-vt shape (%cx-nan-complex (complex 0.0d0 0.0d0))
                                   :dtype dt))))
               (vt-fill r (%cx-nan-complex (if (eq (vt-complex-real-dtype dt) :float32)
-                                              (complex 0.0 0.0)
+                                              (complex 0.0s0 0.0s0)
                                               (complex 0.0d0 0.0d0))))
               r))
           (let ((sums (%cx-reduce "VT-MEAN" in axis keepdims nil nil :sum))
                 (inv (if (eq (vt-complex-real-dtype dt) :float32)
-                         (/ 1.0 (float cnt 1.0))
+                         (/ 1.0s0 (float cnt 1.0s0))
                          (/ 1.0d0 (float cnt 1.0d0)))))
             (vt-map (lambda (s) (* s inv)) sums :out out :dtype dt))))))
 
@@ -1018,7 +1018,7 @@
              (ss (funcall (%cx-orig 'vt-sum) sq :axis axis :keepdims keepdims
                                                   :dtype dt))
              (inv (if (eq dt :float32)
-                      (/ 1.0 (float den 1.0))
+                      (/ 1.0s0 (float den 1.0s0))
                       (/ 1.0d0 (float den 1.0d0)))))
         (vt-map (lambda (s) (* s inv)) ss :out out :dtype dt)))))
 
@@ -1082,8 +1082,12 @@
            (data (vt-data flat))
            (shape (vt-shape flat))
            (dt (or dtype (vt-dtype in)))
-           (res (if out (vt-check-out out (vt-shape in) dt :op-name op-name)
-                    (make-vt (vt-shape in) 0 :dtype dt)))
+           ;; AXIS=NIL 时 numpy 语义是「先展平再累积」，结果必须是 1-D；
+           ;; v1.2 修复：此前沿用 (vt-shape in)，对 2-D 输入会返回同形结果
+           ;; （数值仍是展平顺序的前缀和，但形状错了 → 与 numpy 不兼容）。
+           (out-shape (if axis (vt-shape in) (list (vt-size in))))
+           (res (if out (vt-check-out out out-shape dt :op-name op-name)
+                    (make-vt out-shape 0 :dtype dt)))
            (res-flat (%cx-flat res))
            (ax (if axis (vt-normalize-axis axis rank) nil))
            (same-type (eq (array-element-type data)

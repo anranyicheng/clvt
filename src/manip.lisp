@@ -622,6 +622,8 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
         ((equal et '(signed-byte 8))    (dup (signed-byte 8)))
         ((equal et '(unsigned-byte 16)) (dup (unsigned-byte 16)))
         ((equal et '(unsigned-byte 8))  (dup (unsigned-byte 8)))
+        ((equal et '(complex double-float)) (dup (complex double-float)))
+        ((equal et '(complex single-float)) (dup (complex single-float)))
         (t (error "vt-repeat: 不支持的输出元素类型 ~a" et))))))
 
 (defun %repeat-counts (repeats ax-size ax)
@@ -678,6 +680,8 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
         ((equal et '(signed-byte 8))    (dup (signed-byte 8)))
         ((equal et '(unsigned-byte 16)) (dup (unsigned-byte 16)))
         ((equal et '(unsigned-byte 8))  (dup (unsigned-byte 8)))
+        ((equal et '(complex double-float)) (dup (complex double-float)))
+        ((equal et '(complex single-float)) (dup (complex single-float)))
         (t (error "vt-repeat: 不支持的输出元素类型 ~a" et))))))
 
 (defun vt-repeat (vt repeats &key axis)
@@ -754,6 +758,8 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                 ((equal et '(signed-byte 8))  (dup (signed-byte 8)))
                 ((equal et '(unsigned-byte 16)) (dup (unsigned-byte 16)))
                 ((equal et '(unsigned-byte 8))  (dup (unsigned-byte 8)))
+                ((equal et '(complex double-float)) (dup (complex double-float)))
+                ((equal et '(complex single-float)) (dup (complex single-float)))
                 (t (loop for r in reps
                          for i fixnum from 0
                          do (let ((v (aref sd (the fixnum (+ soff i))))

@@ -2008,7 +2008,7 @@ w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=
                     (let ((norm (sqrt (vt-ref (vt-dot v v)))))
                       (if (> norm 1e-12)
                           (setf (vt-slice u-full '(:all) (list col))
-                                (vt-scale v (/ 1.0 norm)))
+                                (vt-scale v (/ 1.0s0 norm)))
                           (error "failed to generate orthogonal vector"))))
             u-full)))))
 

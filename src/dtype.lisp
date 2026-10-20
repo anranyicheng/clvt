@@ -358,7 +358,7 @@
   (declare (optimize (speed 3) (safety 0)))
   (ecase dtype
     (:complex128 (complex 0.0d0 0.0d0))
-    (:complex64  (complex 0.0 0.0))
+    (:complex64  (complex 0.0s0 0.0s0))
     (:float64 0.0d0)
     (:float32 0.0f0)
     ((:int64 :int32 :int16 :int8 :uint8 :uint16) 0)))

@@ -581,6 +581,8 @@
 (defun %npy-dtype->descr (dtype)
   "clvt dtype → npy descr 字符串。1 字节类型用 '|' 前缀（与 numpy 写法一致）。"
   (ecase dtype
+    (:complex128 "<c16")   ; numpy 的复数 descr：两个 f8 分量
+    (:complex64 "<c8")     ; 两个 f4 分量
     (:float64 "<f8")
     (:float32 "<f4")
     (:int64 "<i8")
@@ -593,7 +595,7 @@
 (defun %npy-descr->dtype (descr)
   "npy descr 字符串 → clvt dtype；不支持/非法时确定性报错（L2 契约）。"
   (labels ((fail (why)
-             (error "vt-load: npy dtype '~a' 不受支持（~a）；支持 f8/f4/i8/i4/i2/i1/u2/u1"
+             (error "vt-load: npy dtype '~a' 不受支持（~a）；支持 f8/f4/i8/i4/i2/i1/u2/u1/c16/c8"
                     descr why)))
     (when (or (not (stringp descr)) (zerop (length descr)))
       (fail "descr 为空"))
@@ -610,6 +612,7 @@
         (let ((size (or (ignore-errors (parse-integer tail))
                         (fail "itemsize 非数字"))))
           (or (cond ((char= code #\f) (case size (8 :float64) (4 :float32)))
+                    ((char= code #\c) (case size (16 :complex128) (8 :complex64)))
                     ((char= code #\i) (case size (8 :int64) (4 :int32)
                                         (2 :int16) (1 :int8)))
                     ((char= code #\u) (case size (2 :uint16) (1 :uint8))))
@@ -741,7 +744,17 @@
         (declare (fixnum k))
         (vt-do-each (ptr val vt)
           (declare (ignore ptr))
-          (%set-uint-le! buf (* k itemsize) (%npy-encode-bits dtype val) itemsize)
+          (if (vt-complex-dtype-p dtype)
+              ;; 复数：实部、虚部各按分量宽度写成一个小端字（interleaved，
+              ;; 与 numpy 的 <c16 / <c8 布局逐字节一致）
+              (let* ((half (floor itemsize 2))
+                     (base (* k itemsize))
+                     (bits-fn (if (= half 8) #'%f64-bits #'%f32-bits)))
+                (%set-uint-le! buf base
+                               (funcall bits-fn (realpart val)) half)
+                (%set-uint-le! buf (+ base half)
+                               (funcall bits-fn (imagpart val)) half))
+              (%set-uint-le! buf (* k itemsize) (%npy-encode-bits dtype val) itemsize))
           (incf k))))
     buf))
 
@@ -805,10 +818,18 @@
   (let ((raw (make-array count))
         (itemsize (vt-dtype-itemsize dtype)))
     (with-float-safe
-      (dotimes (k count)
-        (setf (aref raw k)
-              (%npy-decode-bits dtype
-                                (%uint-le-at oct (* k itemsize) itemsize)))))
+      (if (vt-complex-dtype-p dtype)
+          (let ((half (floor itemsize 2))
+                (bits-fn (if (= (floor itemsize 2) 8) #'%bits->f64 #'%bits->f32)))
+            (dotimes (k count)
+              (let ((base (* k itemsize)))
+                (setf (aref raw k)
+                      (complex (funcall bits-fn (%uint-le-at oct base half))
+                               (funcall bits-fn (%uint-le-at oct (+ base half) half)))))))
+          (dotimes (k count)
+            (setf (aref raw k)
+                  (%npy-decode-bits dtype
+                                    (%uint-le-at oct (* k itemsize) itemsize))))))
     raw))
 
 ;;; ------------------------------------------------------------------
@@ -888,14 +909,26 @@
     vec))
 
 (defun %encode-lisp-element (dtype x)
-  "张量元素 → lisp 格式元素：非有限浮点编码为关键字，其余原样。"
-  (if (member dtype '(:float64 :float32))
-      (with-float-safe
-        (cond ((%nan-p x) :nan)
-              ((%pos-inf-p x) :inf)
-              ((%neg-inf-p x) :neg-inf)
-              (t x)))
-      x))
+  "张量元素 → lisp 格式元素：非有限浮点编码为关键字，其余原样。
+
+   复数（§16.18）：两个分量都有限时直接写 `#C(re im)`（Lisp reader 原生可读）；
+   只要有一个分量非有限，就写成 `(:CX re im)` 列表，分量各自再编码为
+   :NAN/:INF/:NEG-INF —— `#C(:NAN 1d0)` 不是合法 Lisp 字面量，无法读回。"
+  (cond
+    ((member dtype '(:float64 :float32))
+     (with-float-safe
+       (cond ((%nan-p x) :nan)
+             ((%pos-inf-p x) :inf)
+             ((%neg-inf-p x) :neg-inf)
+             (t x))))
+    ((vt-complex-dtype-p dtype)
+     (with-float-safe
+       (if (%cisfinite x)
+           x
+           (let ((rdt (vt-complex-real-dtype dtype)))
+             (list :cx (%encode-lisp-element rdt (realpart x))
+                       (%encode-lisp-element rdt (imagpart x)))))))
+    (t x)))
 
 (defun %save-lisp-format (vt path)
   "把张量写为 clvt lisp 格式文本文件（单个可读 s-expression）。"
@@ -916,7 +949,19 @@
 (defun %decode-lisp-element (dtype v)
   "lisp 格式元素 → dtype 物理元素值：
    浮点 dtype 接受 :nan/:inf/:neg-inf 标记与数字；整型 dtype 仅接受整数。"
-  (cond ((member dtype '(:float64 :float32))
+  (cond
+    ((vt-complex-dtype-p dtype)
+     (let* ((rdt (vt-complex-real-dtype dtype))
+            (cast (vt-cast-fun rdt)))
+       (cond
+         ;; (:cx re im)：任一分量为非有限时必须走这种编码
+         ((and (consp v) (eq (first v) :cx) (= 3 (length v)))
+          (complex (funcall cast (%decode-lisp-element rdt (second v)))
+                   (funcall cast (%decode-lisp-element rdt (third v)))))
+         ((complexp v) (funcall (vt-cast-fun dtype) v))
+         ((numberp v) (funcall (vt-cast-fun dtype) v))
+         (t (error "vt-load: 复数 dtype 的 :data 元素必须是复数、数字或 (:cx re im)，收到 ~a" v)))))
+    ((member dtype '(:float64 :float32))
          (cond ((eq v :nan) (vt-get-nan dtype))
                ((eq v :inf) (vt-get-pos-inf dtype))
                ((eq v :neg-inf) (vt-get-neg-inf dtype))
@@ -1008,8 +1053,10 @@
         加载端兼容无 :VERSION 的旧文件，版本仅支持 1。
     :npy — NumPy .npy 格式（v1.0，头超长自动升 v2.0），C-order、小端，
         与 np.save / np.load 双向互操作：写出的文件 numpy 可直接读。
-        8 种 dtype 映射 <f8 <f4 <i8 <i4 <i2 |i1 |u1 <u2（1 字节类型用
-        '|' 前缀，与 numpy 写法一致，输出与 np.save 逐字节相同）。
+        10 种 dtype 映射 <f8 <f4 <i8 <i4 <i2 |i1 |u1 <u2 <c16 <c8（1 字节
+        类型用 '|' 前缀，与 numpy 写法一致，输出与 np.save 逐字节相同）。
+        复数按 interleaved 布局写两个分量（<c16 = 两个 f8、<c8 = 两个 f4），
+        与 numpy 完全互通（§16.18）。
 
   NaN/Inf 行为：npy 格式逐位往返（符号位与 payload 全保留，对标
   numpy.save）；lisp 文本格式经关键字标记往返（:NAN/:INF/:NEG-INF，
@@ -1061,8 +1108,9 @@
     nil（缺省）— 自动检测：文件以 \\x93NUMPY magic 开头按 :npy，
         否则按 :lisp。
 
-  npy dtype 支持矩阵与 vt-save 一致（f8 f4 i8 i4 i2 i1 u2 u1）；
-  float16/bool/complex/字符串等 descr 确定性报错（前缀 vt-load:）。
+  npy dtype 支持矩阵与 vt-save 一致（f8 f4 i8 i4 i2 i1 u2 u1 c16 c8）；
+  float16/bool/字符串等 descr 确定性报错（前缀 vt-load:）。
+  复数 descr 的实部/虚部按位模式逐位还原（含 NaN payload 与 ±0 符号位）。
   NaN 按位模式逐位还原（符号位与 payload 全保留，npy 格式），±Inf 与
   整数补码位模式精确保留；:lisp 格式 NaN 映射为库内 NaN 常量。
 

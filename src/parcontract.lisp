@@ -330,13 +330,13 @@
                           (vt-ref strided i))
                  (error "parcontract 自检失败：strided 寻址不一致 (i=~d)" i))))
     ;; 2) 标量视图（0 维）
-    (let ((s (ensure-vt 42.0)))
+    (let ((s (ensure-vt 42.0s0)))
       (unless (= (%vt-flat-idx (vt-offset s) nil
                                (make-array 0 :element-type 'fixnum))
                  (vt-offset s))
         (error "parcontract 自检失败：标量寻址")))
     ;; 3) 重叠检测与快照
-    (let* ((z (vt-from-sequence '(1.0 2.0 3.0 4.0)))
+    (let* ((z (vt-from-sequence '(1.0s0 2.0s0 3.0s0 4.0s0)))
            (rev (vt-slice z '(3 nil -1))))
       (unless (%vt-views-overlap-p z rev)
         (error "parcontract 自检失败：重叠检测漏报"))

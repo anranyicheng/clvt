@@ -163,7 +163,7 @@
 				 (reshape nil)
 				 (order 1)
 				 (mode :constant)
-				 (cval 0.0)
+				 (cval 0.0s0)
 				 (center nil))
   "将二维张量按指定角度旋转（完全对标 scipy.ndimage.rotate 的行为与精度）。
    
@@ -334,7 +334,7 @@
         cval)))
 
 (defun vt-rotate-origin
-    (tensor angle &key (order 0) (reshape nil) (mode :constant) (cval 0.0))
+    (tensor angle &key (order 0) (reshape nil) (mode :constant) (cval 0.0s0))
   "绕左上角原点 (0,0) 旋转张量，是 vt-rotate 的便捷版本。
        等价于 (vt-rotate tensor angle :center '(0 0) :order order ...)。
        该函数将张量的 (0,0) 点视为旋转中心，逆时针旋转 angle 度（注意是度数，不是弧度）。

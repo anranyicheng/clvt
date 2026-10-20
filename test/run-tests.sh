@@ -69,6 +69,7 @@ SUITES[nan-broadcast-test]="31 NaN/Inf 广播对齐 numpy 测试 (算术/极值/
 SUITES[uncovered-coverage-test]="136 覆盖缺口测试 (此前无任何测试/example 调用的公开函数 + identity/vander/atanh 回归)"
 SUITES[extensions3-test]="261 补充 NumPy 缺失函数测试 + 审查修复回归 (extensions3 + 审查报告 P0/P1/P2 + R-3 整数提升回归)"
 SUITES[fastmap-invariant-test]="24 数学函数快路径不变量测试 (宏展开结构 + 计时上界, 防 vt-fast-map→vt-map 性能回归)"
+SUITES[complex-ops-test]="128 复数数据搬运层测试 (97 项 numpy 2.4.6 差分对照: 转换/拼接/剪切/集合/nan 族/缩并/卷积 + dtype&shape 契约 + :out 硬契约 + 未支持组合报错 + 实数回归网; 期望由 test/gen_complex_ops_expected.py 生成)"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
 SUITES[test-all]="641 绝大多数函数的测试"
 SUITES[core-test]="282 基础契约回归 (1 结构/199 函数语义/返回值形状/错误契约, 参照 CONVENTIONS)"
@@ -128,6 +129,7 @@ DEFAULT_ORDER=(
     extensions3-test
     fastmap-invariant-test
     complex-test
+    complex-ops-test
     legacy-coverage-test
     differential-probes-test
     differential-probes-test2
@@ -306,9 +308,14 @@ run_pipeline_suite() {
     local lisp_out="" lisp_code=0
     # 注意：--dynamic-space-size 是 C 运行时选项，必须排在 Lisp 选项
     # （--non-interactive 之后即报 "in the middle of Lisp options"）之前。
+    #
+    # 另外先钉死 *read-default-float-format* = SINGLE-FLOAT：测试文件里的
+    # 期望值含裸浮点字面量，用户 .sbclrc 若改成 double-float，会把
+    # 「期望值变 double、实得 single」误报成 FAIL（CONVENTIONS §16.18.6）。
     lisp_out=$(CLVT_TEST_OUT="$out_dir" "$SBCL" \
         --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" \
         --noinform --non-interactive \
+        --eval "(setf *read-default-float-format* 'single-float)" \
         --eval "(require :asdf)" \
         --eval "(push #p\"${PROJECT_DIR}/\" asdf:*central-registry*)" \
         --eval "(asdf:load-system :clvt)" \
@@ -400,6 +407,7 @@ run_lisp_suite() {
     output=$("$SBCL" \
         --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" \
         --noinform --non-interactive \
+        --eval "(setf *read-default-float-format* 'single-float)" \
         --eval "(require :asdf)" \
         --eval "(push #p\"${PROJECT_DIR}/\" asdf:*central-registry*)" \
         --eval "(asdf:load-system :clvt)" \

@@ -4,6 +4,115 @@
 
 ---
 
+## 2026-10-20（二）— 修复：`*read-default-float-format*` = double-float 时 complex64 崩溃
+
+### 症状（用户环境 SBCL 2.6.9.446 / numpy 2.5.0）
+
+```
+差分对照完成：PASS=97 FAIL=0
+--- 契约断言 ---
+Unhandled TYPE-ERROR ... The value #C(0.0 0.0) is not of type (COMPLEX SINGLE-FLOAT)
+                            when binding SB-C::ITEM
+```
+
+### 根因（三段链，已用用户同版本 SBCL 精确复现）
+
+1. 用户 `.sbclrc` 把 `*read-default-float-format*` 设为 `double-float`；
+   源码里的**裸浮点字面量**（`0.0`/`0.5`/`180.0`）精度由读取时该变量决定。
+2. 于是 `(complex 0.0 0.0)`（complex64 的零值）被读成 `(complex 0.0d0 0.0d0)`。
+3. 往 `(simple-array (complex single-float) (*))` 填 double 复数时，SBCL 的
+   `vector-fill` 为每种元素类型预装的转换器
+   `(lambda (sb-c::item) (declare (type (complex single-float) sb-c::item)) ...)`
+   抛 TYPE-ERROR —— 报错里的 `#C(0.0 0.0)` 正是 double 在该读取格式下的打印形式，
+   具有极强误导性。（`(safety 0)` 旁路更糟：不报错，直接写错位模式。）
+
+### 修复（三层）
+
+- **`clvt.asd`**：新增 `:around-compile`，在编译/加载每个组件时绑定
+  `*read-default-float-format*` = `single-float`（read 发生在该动态范围内），
+  从根上消除对用户 init 的依赖。
+- **源码**：复数/单精度关键路径的裸字面量显式加 `s0`
+  （`(complex 0.0s0 0.0s0)`、`0.5s0`、`2.0s0`、`180.0s0`、`0.6931472s0`、
+  `0.31415927s1`、`(cval 0.0s0)`、`(/ 1.0s0 norm)`、`0.5s0` 直方图边界 等），
+  即使绕过 ASDF 直接 `load` 源文件也不漂移。
+- **测试**：`run-tests.sh` 两处 `sbcl` 调用插入
+  `--eval "(setf *read-default-float-format* 'single-float)"`；
+  `complex-ops-test` 增加 3 条「读取格式哨兵」断言
+  （`(type-of (vt-dtype-default-value :complex64))` 等），复发时立刻报红。
+
+### 文档
+
+- `CONVENTIONS.md` §16.18.6：完整复盘（症状/根因链/三层修复/用户侧 fasl 缓存提醒），
+  并固化约定：**源码里的裸浮点字面量一律视为 single-float；double 必须写 `d0`**。
+
+### 测试
+
+- 在**用户同版本** SBCL（2.6.9.446-9e249df9d）上复现并验证修复
+- double-float 读取环境：complex-ops 131/131、complex 136/136、core 284/284
+- 默认环境：全量 13 套件全绿
+
+> 用户侧注意：更新后需 `(asdf:load-system :clvt :force t)`（或清
+> `~/.cache/common-lisp`），否则可能继续加载用 double 编译的旧 fasl。
+
+---
+
+## 2026-10-20 — 第二轮进化：复数数据搬运层（转换 / 拼接 / 剪切 / 集合 / 缺失值 / 缩并）
+
+第一轮（§16）解决逐元素算术与归约；本轮补结构层，新增 `src/complex-ops.lisp`
+（紧随 `src/complex.lisp` 加载，同样「实数路径零改动 + 只对含复数调用分派」）。
+
+### 修掉的「静默错答案」（比不支持更危险）
+
+| 函数 | 修复前 | numpy 语义 |
+|---|---|---|
+| `vt-nanmean` | 返回**实数**（实部均值） | 复数 |
+| `vt-nanvar` / `vt-nanstd` | 数值错误 | 实数 = mean(\|x−mean\|²) |
+| `vt-nancumsum` / `vt-nancumprod` | **虚部清零** | 保复数（NaN→0/1 后累积） |
+| `vt-vdot` | 不取共轭 | **第一操作数取共轭** |
+| `vt-cumsum/cumprod` 的 `axis=nil` | 形状不展平（2-D 进 2-D 出） | 展平为 1-D |
+
+### 新增能力
+
+**转换**
+- `vt-nan-to-num`：实部/虚部各自替换（`nan`→0、`posinf/neginf`→该精度 ±最大有限值）
+- `vt-view` 支持 `:dtype` 重解释：`complex128 ↔ float64`、`complex64 ↔ float32`，
+  shape 省略时按 numpy 规则只缩放最后一维；三种调用形式
+  `(vt-view a shape)` / `(vt-view a shape :dtype dt)` / `(vt-view a :dtype dt)`
+- `vt-repeat`：三处 8 路元素类型分派各追加 2 个复数分支（标量/列表 repeats、任意 axis）
+- 持久化：npy 新增 `<c16` / `<c8` 编解码（与 numpy 双向互通，含 NaN payload）；
+  lisp 格式复数编码（分量全有限 → `#C(re im)`，否则 `(:CX re im)` 保证可读性）
+
+**集合 / 搜索**
+- `vt-unique`（含 `return-index/inverse/counts`）、`union1d`、`intersect1d`、
+  `setdiff1d`、`setxor1d`、`in1d`、`isin`、`searchsorted`（`:left`/`:right`）
+- 统一走「字典序排序 + `%cx-key` 哈希」：NaN 折叠为一个、`1.0s0` 与 `1.0d0` 同键
+- `vt-digitize` 对复数给出确定性错误（numpy 亦报 `x may not be complex`）
+
+**缺失值（nan 族）**：`nansum/nanprod/nanmax/nanmin/nanargmax/nanargmin/nanmean/nanvar/nanstd/nanmedian`
+- 全 NaN 切片：sum→0、prod→1、max/min→`NaN+0j`、mean→`NaN+NaNj`、var/std→`NaN`、arg→报错
+- 实现为「掩码 + 单位元替换 + 既有复数归约内核」的向量化写法（一次覆盖所有 axis/keepdims）
+
+**缩并 / 卷积**：`vt-inner`、`vt-tensordot`（transpose+reshape+复数 matmul）、
+`vt-correlate`（第二操作数**取共轭**）、`vt-convolve`（**不取共轭**，对 flip(v) 相关）
+
+### 文档
+- `CONVENTIONS.md` **§16.18 数据搬运层**：静默错答案清单、语义总表（按 numpy 2.4.6 实测）、
+  已知差异 **D-C7**（view 重解释是副本，非共享视图）、**D-C8**（take-along-axis 同秩约束）、
+  声明策略（能用既有内核组合就不新写循环）、测试口径
+- §16.17 路线图：标注 `.npy` 复数互操作已完成；§16.19 变更文件清单补齐
+
+### 测试
+- `test/complex-ops-test.lisp` **128 断言** = 97 项 numpy 2.4.6 差分用例 + 31 条契约断言
+  （dtype 提升 / 切片别名 / `:out` 硬契约 / 未支持组合报错 / NaN 折叠 / c64 精度 /
+  两种格式往返 / 7 条实数回归网）
+- `test/gen_complex_ops_expected.py` 生成 `test/complex-ops-expected.sexp`（禁手写期望值）
+- 已接入 `test/run-tests.sh`（`SUITES` + `DEFAULT_ORDER`）
+
+### 回归
+- complex 136/136、complex-ops 128/128、core 284/284、io-interop 77/77、test-all 50/50 全绿
+
+---
+
 ## 2026-10-19（三）— 复数层性能优化（第一轮进化 v1.1）
 
 优化目标：把「第一轮只为正确性、全部走泛型 walker」的复数实现拉到接近实数快路径，

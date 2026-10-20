@@ -1474,17 +1474,193 @@ python3 test/gen_complex_expected.py               # 重新生成期望值（num
 
 | 优先级 | 项目 | 关键改动 |
 |---|---|---|
-| P0 | `vt-einsum` 复数 | 把 dtype 白名单换成「按 `vt-promote-type` 分配」，结果缓冲用 `vt-dtype->lisp-type` |
-| P0 | 复数归约的 `axis` 元组 + `keepdims` 全路径覆盖测试 | 复用 `%cx-reduce-values` 的多轴路径，补 3D 用例 |
+| P0 | `vt-einsum` 复数 | 把 dtype 白名单换成「按 `vt-promote-type` 分配」，结果缓冲用 `vt-dtype->lisp-type`（`inner/tensordot` 已绕开它实现，见 §16.18） |
+| P0 | 复数归约的 `axis` 元组 + `keepdims` 全路径覆盖测试 | 复用 `%cx-reduce-values` 的多轴路径，补 3D 用例（`nan` 族已全 axis 覆盖，普通归约仍缺 3D 用例） |
 | P1 | 复数内联/SIMD 特化 | `%vt-inline*-fast` 增加 `(complex double-float)` 两格；`simd-matmul` 复数 GEMM |
 | P1 | LU/SVD/特征值 | 需要共轭转置（`vt-ctranspose`）与酉变换；`vt-det` 复数版（实测 numpy det 为复数） |
-| P2 | `real/imag` 真视图 | 需引入「分量视图」概念（`data` + 分量偏移），会动物理层，谨慎评估 |
-| P2 | `.npy` 复数互操作 | `<c16`/`<c8` descr + 两个 float 分量编码 |
+| P2 | `real/imag` 真视图 | 需引入「分量视图」概念（`data` + 分量偏移），会动物理层，谨慎评估（同 D-C7 的根因） |
+| ~~P2~~ | ~~`.npy` 复数互操作~~ | **已完成**（§16.18：`<c16`/`<c8` 两种格式双向互操作，含 NaN payload） |
 | P2 | `vt-npy` 打印/序列化的 `ComplexWarning` 等价物 | 引入可选告警通道 |
 
 ---
 
-### 16.18 本章变更文件清单
+### 16.18 数据搬运层（第二轮进化）：转换 / 拼接 / 剪切 / 集合 / 缺失值 / 缩并
+
+第一轮（16.1–16.14）解决的是**逐元素算术与归约**；这一轮补的是**结构层**。
+落地文件 `src/complex-ops.lisp`（在 `src/complex.lisp` 之后加载），
+同样遵守「实数路径零改动 + 只对含复数的调用分派」。
+
+#### 16.18.1 本轮修复的「静默错答案」
+
+比「不支持」更危险的是「看起来正常但错」。本轮实测发现 5 处：
+
+| 函数 | 修复前行为 | numpy 语义 | 根因 |
+|---|---|---|---|
+| `vt-nanmean` | 返回**实数**（实部均值） | 复数 | 内部 `vt-astype → :float64` 按 §16.5 取实部 |
+| `vt-nanvar` / `vt-nanstd` | 数值错误（按实部算） | 实数 = mean(\|x−mean\|²) | 同上 |
+| `vt-nancumsum` / `vt-nancumprod` | **虚部被清零** | 保复数（NaN→0/1 后累积） | `%e3-cumulative-skip-nan` 固定 `vt-astype :float64` |
+| `vt-vdot` | 不取共轭（= `vt-dot`） | **第一个操作数取共轭** | 第一轮漏做 |
+| `vt-cumsum/cumprod` 的 `axis=None` | 形状保持原样（2-D 进 2-D 出） | **展平为 1-D** | `%cx-scan` 沿用了 `(vt-shape in)` |
+
+另外 `vt-repeat` / `vt-unique` / `vt-searchsorted` / 集合运算 / `vt-nan[sum|prod|max|min|argmax|argmin|median]` /
+`vt-convolve` / `vt-inner` / `vt-tensordot` / `vt-nan-to-num` / `vt-view(:dtype)` 这些
+此前是**确定性报错**（类型声明里写死 real 或只列 8 种实数元素类型），本轮补齐。
+
+#### 16.18.2 语义总表（numpy 2.4.6 实测）
+
+**转换**
+
+| 操作 | 复数语义 |
+|---|---|
+| `vt-nan-to-num` | 实部/虚部**各自**替换；`nan` 缺省 0，`posinf/neginf` 缺省为该分量精度的 ±最大有限值；结果 dtype 不变 |
+| `vt-view` `:dtype` | `complex128 ↔ float64`、`complex64 ↔ float32`；`shape` 省略时**只缩放最后一维**（(2,3)→(2,6)） |
+| `vt-repeat` | 标量 / 列表 repeats，`axis` 可为 nil 或单轴；dtype 保持 |
+| `vt-astype` | 复数→实数/整数取实部（§16.5，仍是 astype 的既有约定） |
+
+**拼接 / 切分**：`concatenate/concat/stack/vstack/hstack/dstack/column-stack/append/block/split/hsplit/vsplit/dsplit`
+全部按 `vt-promote-type` 提升（`c128+c64→c128`、`c128+f64→c128`），切分返回的是视图。
+
+**剪切**：`slice`（步长/负步长/负索引）、`ref`、`narrow`、`take`、`take-along-axis`、
+`put`、`put-along-axis`、`compress`、`extract`、`where`、`choose`、`select`、`flip/fliplr/flipud`、
+`roll/rollaxis`、`pad`、`tile`、`rot90`、`resize`、`trim-zeros` 均可用。
+（`take-along-axis` / `put-along-axis` 仍要求 indices 与数组同秩，这是**库既有约束**，
+与复数无关，见 §16.15 D-C8。）
+
+**集合与搜索**
+
+| 函数 | 语义要点 |
+|---|---|
+| `vt-unique` | 展平 → 字典序排序 → run-length；**多个 NaN 折叠为一个**（排末尾）；支持 `return-index/inverse/counts` |
+| `union1d / intersect1d / setdiff1d / setxor1d` | 全部建立在 `unique` + 哈希判定上，结果升序去重 |
+| `in1d / isin` | 哈希键 `%cx-key`：NaN 折叠为同一哨兵、其余规范化为 double-float 复数（`1.0s0` 与 `1.0d0` 同键） |
+| `searchsorted` | 字典序二分；`:left` = 第一个 ≥ v，`:right` = 第一个 > v |
+| `digitize` | **不支持**（numpy 亦报 `x may not be complex`），给出确定性错误 |
+
+**缺失值（nan 族）**
+
+| 函数 | 全 NaN 切片 | dtype |
+|---|---|---|
+| `nansum` / `nanprod` | `0` / `1`（单位元） | 复数 |
+| `nanmax` / `nanmin` | `NaN+0j`（**不报错**） | 复数 |
+| `nanargmax` / `nanargmin` | **报错** `All-NaN slice encountered` | int64 |
+| `nanmean` | `NaN+NaNj` | 复数 |
+| `nanvar` / `nanstd` | `NaN` | **实数** |
+| `nanmedian` | `NaN+0j` | 复数 |
+
+实现采用「掩码 + 单位元替换 + 既有复数归约内核」的向量化写法：
+`sum/prod/mean` 把 NaN 换成 0/1 后直接调 `vt-sum/vt-prod`；
+`max/min` 换成 `(-inf,-inf)` / `(+inf,+inf)` 哨兵（字典序下必被淘汰），
+再用 `count==0` 的掩码补 `NaN`。这样一次覆盖所有 `axis/keepdims` 组合，
+且复用第一轮已优化的内核，不写第二套 fiber 循环。
+
+**缩并 / 卷积**
+
+| 函数 | 语义 |
+|---|---|
+| `vt-correlate` | `c[k] = Σ a[n+k]·conj(v[n])` —— **第二操作数取共轭**（numpy 的定义） |
+| `vt-convolve` | `c[k] = Σ a[n]·v[k−n]` —— **不取共轭**；实现为对 `flip(v)` 做不共轭相关 |
+| `vt-inner` | 最后一维收缩，**不取共轭**（与 numpy 一致；共轭点积是 `vt-vdot`） |
+| `vt-tensordot` | `transpose（收缩轴移末尾/开头）→ reshape 2D → 复数 matmul → reshape` |
+| `vt-einsum` | **仍不支持复数**（dtype 白名单只含 4 种实数类型），见 §16.17 路线图 |
+
+> `correlate` 与 `convolve` 的共轭差异在实数上不可观测，**只有复数能测出来**。
+> 第一版实现漏了这一点，差分测试（`correlate-*` / `convolve-*` 用例）当场抓到。
+
+#### 16.18.3 已知差异（D-C7 起）
+
+| 编号 | 差异 | 原因与影响 |
+|---|---|---|
+| **D-C7** | `vt-view` 的 dtype 重解释返回**独立副本**（numpy 是共享内存的视图） | Common Lisp 的 `make-array :displaced-to` 要求元素类型一致，无法跨类型别名同一块内存。数值完全等价，但「改视图即改原数组」不成立——已在 docstring 与本节显式声明 |
+| **D-C8** | `vt-take-along-axis` / `vt-put-along-axis` 要求 indices 与数据**同秩** | 库既有约束（numpy 会广播 indices），与复数无关，未在本轮改动 |
+
+#### 16.18.4 声明策略（延续 §16.14.1）
+
+本轮新增的内核只有两处带 `optimize` 声明，且都不是 `safety 0`：
+
+| 位置 | 声明 | 理由 |
+|---|---|---|
+| `%cx-correlate-full` 的卷积循环 | 继承 `%cx-dispatch` 的 `(speed 3) (safety 1)` | 索引由 `k/j` 的上下界决定，可证不越界，但保留检查 |
+| `%cx-unique-sorted` / `%cx-searchsorted-run` / `%cx-nan-arg-run` | 同上 | 同上 |
+
+其余（`nan` 族的向量化实现、集合过滤、`tensordot`）全部是**组合既有算子**，
+没有手写热循环，因此不需要任何 `optimize` 声明 —— 这也印证了 §16.14.1 的分级原则：
+**能用既有内核组合出来的，就不要新写循环**。
+
+#### 16.18.5 测试
+
+- `test/complex-ops-test.lisp`：**128 条断言**
+  = 97 项 numpy 差分用例（转换 4 / 拼接 17 / 剪切 17 / 集合 11 / nan 18 / 缩并卷积 9 / dtype 视图 11 / 其它 10）
+  + 31 条契约断言（dtype 提升、切片别名、`:out` 硬契约、未支持组合报错、NaN 折叠、
+  c64 精度保持、两种持久化格式往返、7 条实数回归网）。
+- 期望值全部由 `test/gen_complex_ops_expected.py` 从本机 numpy 2.4.6 实测生成
+  （`test/complex-ops-expected.sexp`），符合 §10.4「禁手写期望值」。
+- 已接入 `test/run-tests.sh`（`SUITES` + `DEFAULT_ORDER`）。
+
+---
+
+#### 16.18.6 可移植性：浮点字面量精度取决于**读取环境**（真实缺陷复盘）
+
+**症状**（用户环境 SBCL 2.6.9.446 / numpy 2.5.0，本机 2.6.8/2.6.9 release 无法复现）：
+
+```
+差分对照完成：PASS=97 FAIL=0
+--- 契约断言 ---
+Unhandled TYPE-ERROR ... The value #C(0.0 0.0) is not of type (COMPLEX SINGLE-FLOAT)
+                            when binding SB-C::ITEM
+```
+
+**根因链**（三段，缺一不可）：
+
+1. 用户 `.sbclrc` 里把 `*read-default-float-format*` 设成了 `double-float`
+   （科学计算用户的常见习惯）。CL 标准只规定默认值为 `single-float`，
+   源码里的**裸浮点字面量**（`0.0`、`0.5`、`180.0`）精度由**读取时**该变量决定。
+2. 于是 `(complex 0.0 0.0)`（complex64 的零值）被读成 `(complex 0.0d0 0.0d0)`。
+   把 double 复数填进 `(simple-array (complex single-float) (*))`：
+3. SBCL 的 `vector-fill` 为**每种元素类型**预装了带类型声明的值转换器
+   （`src/code/seq.lisp` 的 `init-fill-bashers`）：
+
+   ```lisp
+   (cons #'basher
+         (lambda (sb-c::item)
+           (declare (type ,et sb-c::item))   ; ← 报错里的 SB-C::ITEM 就是他
+           ,value-transform))
+   ```
+
+   它在 `(safety 0)` 之外执行，于是抛 TYPE-ERROR。**这不是 SBCL 的 bug**：
+   往 c64 数组塞 double 本来就是错的，只是错误信息里的 `#C(0.0 0.0)`
+   （double 在 `*read-default-float-format*` = double 时的打印形式）
+   误导性极强，看起来像「single 值被拒绝」。
+
+> 更危险的是旁路：`fill-float` 等 `(safety 0)` 路径**不报错**，
+> 直接把 double 的位模式硬写进 c64 数组 —— 静默内存错乱。
+
+**修复（三层）**
+
+| 层 | 改动 | 作用 |
+|---|---|---|
+| 系统定义 | `clvt.asd` 的 `:around-compile` 绑定 `*read-default-float-format*` = `single-float` | ASDF 包裹 `compile-file`/`load`，**read 在其动态范围内** → 无论用户 init 怎么设，库都按约定读取 |
+| 源码 | 复数/单精度关键路径的裸字面量显式加 `s0`：`(complex 0.0s0 0.0s0)`、`0.5s0`、`2.0s0`、`180.0s0`、`0.6931472s0` | 即使有人直接 `load` 源文件（绕过 ASDF），语义也不漂移 |
+| 测试 | `run-tests.sh` 的两处 `sbcl` 调用插入 `--eval "(setf *read-default-float-format* 'single-float)"`；`complex-ops-test` 增加 3 条**读取格式哨兵**断言 | 测试期望值不被用户 init 改成 double 而误报；哨兵在回归时立刻暴露复发 |
+
+**约定**（写进本节，后续新增代码必须遵守）：
+
+> **源码里的裸浮点字面量一律视为 single-float。**
+> 需要 double 时必须显式写 `d0` 后缀（`0.0d0`、`1.0d-9`）；
+> 需要 single 时**推荐**写 `s0`（尤其复数零值、numpy 对齐常量）。
+> 任何依赖 `*read-default-float-format*` 当前值的写法都是缺陷。
+
+**用户侧提醒**：修好后**必须强制重编译**，否则会继续加载用 double 编译的旧 fasl：
+
+```lisp
+(asdf:load-system :clvt :force t)
+;; 或删除 ~/.cache/common-lisp/**/clvt/ 后重试
+```
+
+（`clvt.asd` 本身变了，正常 `asdf:load-system` 也会重编；但若你的 ASDF 版本
+对 `:around-compile` 变化不敏感，用 `:force t` 最稳。）
+
+### 16.19 本章变更文件清单
+
 
 | 文件 | 改动 |
 |---|---|
@@ -1497,7 +1673,14 @@ python3 test/gen_complex_expected.py               # 重新生成期望值（num
 | `test/complex-test.lisp` | **新增** 136 断言 |
 | `test/gen_complex_expected.py` | **新增** numpy 期望值生成器（83 用例） |
 | `test/complex-expected.sexp` | **新增** 生成产物（numpy 2.4.6 实测） |
-| `test/run-tests.sh` | 注册 `complex-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
+| `src/complex-ops.lisp` | **第二轮新增**：数据搬运层（nan_to_num / view:dtype / repeat / unique 与集合 / searchsorted / nan 族 / correlate-convolve / tensordot-inner / nancumsum-cumprod / vdot / digitize 拒绝） |
+| `src/manip.lisp` | `vt-repeat` 的三处 8 路元素类型分派各追加 2 个复数分支 |
+| `src/io.lisp` | npy 的 `<c16`/`<c8` 编解码；lisp 格式的复数编码（有限 → `#C(...)`，含非有限 → `(:CX re im)`） |
+| `src/complex.lisp` | `%cx-scan` 修正 `axis=NIL` 时的输出形状（展平为 1-D） |
+| `test/complex-ops-test.lisp` | **新增** 128 断言 |
+| `test/gen_complex_ops_expected.py` | **新增** 期望值生成器（97 用例） |
+| `test/complex-ops-expected.sexp` | **新增** 生成产物（numpy 2.4.6 实测） |
+| `test/run-tests.sh` | 注册 `complex-test` / `complex-ops-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
 
 ---
 

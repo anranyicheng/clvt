@@ -6,6 +6,33 @@
   :license  "MIT"
   :version "0.3.6"
   :serial t
+  ;; ------------------------------------------------------------------
+  ;; 读取格式锁定（**不要删**）
+  ;;
+  ;; 本库源码里存在大量「裸浮点字面量」（`0.0`、`0.5`、`180.0` …），
+  ;; 它们的精度由 **read 时的 `*read-default-float-format*`** 决定，
+  ;; 而不是由代码意图决定。CL 标准只要求实现默认值为 SINGLE-FLOAT，
+  ;; 但用户可以（而且不少科学计算用户确实会）在自己的 .sbclrc 里
+  ;;     (setf *read-default-float-format* 'double-float)
+  ;;
+  ;; 一旦如此，`(complex 0.0 0.0)`（complex64 的零值）会被读成
+  ;; `(complex 0.0d0 0.0d0)`，于是把 double 复数填进 complex64 数组：
+  ;;   · SBCL 的 vector-fill 对每个元素类型都装了带类型声明的转换器
+  ;;     `(lambda (sb-c::item) (declare (type (complex single-float) item)) ...)`，
+  ;;     直接抛
+  ;;       The value #C(0.0 0.0) is not of type (COMPLEX SINGLE-FLOAT)
+  ;;       when binding SB-C::ITEM
+  ;;   · 更糟的是在 safety 0 的路径上它会**静默写入错误位模式**。
+  ;;
+  ;; 因此这里把读取格式钉死为 SINGLE-FLOAT（库内约定：裸字面量 = 单精度，
+  ;; 双精度一律写 `d0` 后缀）。ASDF 的 :AROUND-COMPILE 包裹 compile-file /
+  ;; load，read 发生在其动态范围内，故对全部组件生效。
+  ;; 注意：**已有的 fasl 缓存不会自动失效** —— 换过该变量的用户需要
+  ;; `(asdf:load-system :clvt :force t)` 或清掉 ~/.cache/common-lisp 后重编。
+  ;; ------------------------------------------------------------------
+  :around-compile (lambda (next)
+                    (let ((*read-default-float-format* 'single-float))
+                      (funcall next)))
   :depends-on (#+sbcl #:sb-simd)
   :components ((:file "src/package")
                (:file "src/util")
@@ -34,4 +61,7 @@
                ;; 复数语义层（CONVENTIONS §16）：必须**最后**加载 ——
                ;; 它按「输入是否含复数」对公开函数做前置分派，
                ;; 加载时捕获各函数的实数原实现。
-               (:file "src/complex")))
+               (:file "src/complex")
+               ;; 复数数据搬运层（§16.18，第二轮）：转换/拼接/剪切/集合/
+               ;; 缺失值/缩并。依赖 complex 的 %CX-* 内核，故紧随其后。
+               (:file "src/complex-ops")))
