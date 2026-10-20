@@ -432,6 +432,12 @@
               ((equal et '(signed-byte 8))  (walk (signed-byte 8)))
               ((equal et '(unsigned-byte 16)) (walk (unsigned-byte 16)))
               ((equal et '(unsigned-byte 8))  (walk (unsigned-byte 8)))
+              ;; 复数（CONVENTIONS §16.19 / 第四轮补齐）：本函数只做「按索引搬
+              ;; 元素」，与元素类型无关 —— 8 路分派纯粹是性能特化，
+              ;; 漏掉复数就会掉进报错分支。注意 SEL 是**下标**（fixnum），
+              ;; 元素值是复数，不受 fixnum 声明影响。
+              ((equal et '(complex double-float)) (walk (complex double-float)))
+              ((equal et '(complex single-float)) (walk (complex single-float)))
               (t (error "vt-take-along-axis: 不支持的输出元素类型 ~a" et)))))
         out))))
 

@@ -46,7 +46,9 @@
                   vt-cov vt-corrcoef vt-fromiter
                   vt-nextafter vt-spacing vt-logaddexp vt-hypot vt-copysign
                   vt-signbit vt-deg2rad vt-rad2deg vt-bincount vt-histogram
-                  vt-nanpercentile vt-nanquantile vt-interp vt-positive))
+                  vt-nanpercentile vt-nanquantile vt-interp vt-positive
+                  ;; 第四轮：any / all 的复数真值语义
+                  vt-any vt-all))
     (%cx-orig name)))
 
 ;;; ==================================================================
@@ -1367,3 +1369,32 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 (%cx-def-unsupported (vt-nanpercentile vt-nanquantile vt-interp)
   "需要实数全序 / 实数插值（numpy 实测：a must be an array of real numbers /
    Cannot cast complex128 to float64）")
+
+;;; ---- 12.6 any / all：复数按「非零」判定真值 ----------------------
+;;; numpy 对复数的布尔语义就是「任一分量非零即为真」（`bool(0+0j)` 为 False，
+;;; `bool(nan+0j)` 为 True）。clvt 的 vt-any / vt-all 是 8 路实数元素类型
+;;; 特化的归约，遇到复数直接抛 "unsupported input dtype"。
+;;;
+;;; 这里不重写归约内核 —— 先把复数转成 int8 的 0/1 真值掩码
+;;; （vt-nonzero-p，已经是公共算子），再交给原实现。
+;;; 语义与 numpy 完全一致，且自动继承 axis / keepdims / :out / 空输入单位元
+;;; （any→0、all→1）的全部既有契约。
+
+(defun %cx-bool-mask (v)
+  "复数张量 → int8 的 0/1 真值掩码。NaN 视为真（numpy 一致）。"
+  (vt-nonzero-p v))
+
+(defmacro %cx-def-bool-reduce (name)
+  "为 vt-any / vt-all 生成「复数 → 掩码 → 原实现」的分派包装。"
+  `(let ((orig (%cx-orig ',name)))
+     (setf (symbol-function ',name)
+           (lambda (tensor &key axis keepdims dtype out)
+             (let ((v (ensure-vt tensor)))
+               (if (vt-complex-dtype-p (vt-dtype v))
+                   (funcall orig (%cx-bool-mask v)
+                            :axis axis :keepdims keepdims :dtype dtype :out out)
+                   (funcall orig tensor
+                            :axis axis :keepdims keepdims :dtype dtype :out out)))))))
+
+(%cx-def-bool-reduce vt-any)
+(%cx-def-bool-reduce vt-all)

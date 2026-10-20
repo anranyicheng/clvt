@@ -89,6 +89,12 @@
                                       :dtype :complex128))
 (defparameter cx-dup (vt-from-sequence (list (z #C(3 1)) (z #C(1 5)) (z #C(1 2)) (z #C(3 1)))
                                        :dtype :complex128))
+;; 第四轮新增用例的输入（与生成器一一对应）
+(defparameter cx-nanc (vt-from-sequence (list (complex +nan+ 0.0d0)) :dtype :complex128))
+(defparameter cx-emptyc (vt-zeros (list 0) :dtype :complex128))
+(defparameter cx-idxcol (vt-from-sequence (list (list 1) (list 0)) :dtype :int64))
+(defparameter cx-idxrow (vt-from-sequence (list (list 1 0)) :dtype :int64))
+
 (defparameter flat4 (vt-from-sequence (list 1.0d0 2.0d0 3.0d0 4.0d0) :dtype :float64))
 
 ;;; ------------------------------------------------------------------

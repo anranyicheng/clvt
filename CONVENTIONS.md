@@ -1807,13 +1807,59 @@ l_ij = ( a_ij - Σ_{k<j} l_ik·conj(l_jk) ) / l_jj
 本轮实际因 `ld` 写错踩了 3 次（`vt-lu` 非方阵、QR 的 Q、SVD 的 U），
 全靠 `safety 1` 的边界检查当场报错才定位到。
 
-#### 16.19.8 测试
+#### 16.19.8 第四轮补齐：结构算子收尾
 
-- `test/complex-linalg-test.lisp`：**108 条断言**
+差分对照与结构恒等式之外，第四轮又用「全导出符号逐个试调」的方式扫了一遍
+剩余缺口。结论：**大部分结构算子本来就是 dtype 无关的**（eye/zeros/triu/
+reshape/tile/pad/insert/delete/block/meshgrid/select/choose/compress/
+where/broadcast/copy-to!/write/save-load/array-equal/isclose… 全部直接可用），
+真正缺的只有三处，且都是「8 路元素类型特化漏了第 9、10 种」这一种病：
+
+| 函数 | 症状 | 根因 |
+|---|---|---|
+| `vt-take-along-axis` | `不支持的输出元素类型 (COMPLEX DOUBLE-FLOAT)` | 逐元素内核按 8 种实数元素类型展开，`(t (error ...))` 兜底直接拒绝 |
+| `vt-outer` | `invalid number of arguments: 3` | 复数分支写成 `(vt-reshape ... :dtype dt)` —— `vt-reshape` 只接 `(vt shape)` 两个参数。**复数外积从来没跑通过**，实数走原实现所以一直正常 |
+| `vt-any` / `vt-all` | `unsupported input dtype (COMPLEX DOUBLE-FLOAT)` | 归约内核 8 路特化，复数落入 `(t (error ...))` |
+
+修复策略体现了本轮的一条原则：**能用既有算子组合的，就不要新写内核**。
+
+- `vt-take-along-axis`：只加两个 `(walk (complex double-float))` /
+  `(walk (complex single-float))` 分支。注意内核里的 `SEL` 是**下标**（fixnum），
+  元素值才是复数 —— 不受 `(type fixnum sel)` 声明影响。
+- `vt-outer`：删掉多余的 `:dtype` 实参，改为先广播乘再按需 `vt-astype`，
+  并补 `:out` 硬契约（`vt-check-out` + `vt-copy-into`）。
+- `vt-any` / `vt-all`：**不重写归约内核** —— 先把复数转成 int8 的 0/1 真值掩码
+  （`vt-nonzero-p`），再交给原实现。这样自动继承 `axis` / `keepdims` /
+  `:out` / 空输入单位元（any→0、all→1）的全部既有契约。
+
+复数真值语义（numpy 一致）：**任一分量非零即为真**，`bool(0+0j)=False`、
+`bool(nan+0j)=True`。
+
+#### 16.19.9 数值压测：为什么"差分对照"不够
+
+差分对照只能覆盖**我事先想到的矩阵**。近奇异、病态、非方阵、秩亏、全零
+这些情形一旦漏测，隐藏的收敛问题就会在用户那里爆。第四轮把压测固化成
+测试的一部分（`stress-tests`，108 条断言）：
+
+| 手法 | 内容 | 为什么有效 |
+|---|---|---|
+| **随机矩阵** | 确定性 LCG（`*lcg*` 固定种子 → 可复现）生成 1×1、3×3、5×5、2×5、5×2 | 覆盖"没想到的"数值组合 |
+| **恒等式** | `Q·R=A`、`Q^H Q=I`、`U·S·V^H=A`、`U^H U=I`、`V^H V=I`、`A·V=V·Λ`、`A·A⁻¹=I`、`A·x=b`、Moore–Penrose 四条 | 分解不唯一（相位自由度），但恒等式**完全刻画**了分解 |
+| **交叉验证** | `σ²` 必须等于 `eig(A^H A)` 的特征值 | SVD（单边 Jacobi）与 eig（厄米特 Jacobi）是**两条独立算法**，互证能抓出单边的系统性偏差 |
+| **退化** | 全零矩阵（σ 全 0 / rank 0 / cond ∞ / inv 报错）、秩亏（rank 1、σ₂≈0）、1×1 | 除零、主元为零、空循环等边界 |
+| **SPD 族** | `B^H B + nI`（1/2/3/6 阶）→ Cholesky + eig | 保证正定性，检验 `l_jj>0` 分支与特征值全正 |
+
+容差按 `scale = max(1, ‖A‖∞)` 缩放（`1e-11` 相对量级），而不是写死绝对值 ——
+否则病态矩阵会误报、良态矩阵又会漏报。
+
+#### 16.19.10 测试
+
+- `test/complex-linalg-test.lisp`：**216 条断言**
   = 46 项 numpy 2.4.6 差分用例（det/inv/solve/cholesky/SVD 奇异值/
   特征值/pinv/lstsq/rank/cond/matrix-power/einsum/范数）
   + 结构恒等式（`P·A=L·U`、`L·L^H=A`、`Q·R=A`、`Q^H Q=I`、`U·S·V^H=A`、
   `U^H U=I`、`V^H V=I`、`A·V=V·Λ`、Moore–Penrose 四条、`einsum ≡ 专用内核`）
+  + 数值压测 108 条（§16.19.9：随机 1×1/3×3/5×5/2×5/5×2 + 退化 + SPD 1/2/3/6 + lstsq 超定欠定）
   + 契约断言（`:out` 形状/dtype、奇异矩阵 `solve/inv` 报错、非方阵 `det` 报错、
   非正定 `cholesky` 报错、各函数结果 dtype、complex64 升精度、实数回归网）
 - 期望值由 `test/gen_complex_linalg_expected.py` 从本机 numpy 实测生成
@@ -1850,6 +1896,11 @@ l_ij = ( a_ij - Σ_{k<j} l_ik·conj(l_jk) ) / l_jj
 | `test/complex-linalg-test.lisp` | **新增** 108 断言（46 项差分 + 结构恒等式 + 契约） |
 | `test/gen_complex_linalg_expected.py` | **新增** 期望值生成器 |
 | `test/complex-linalg-expected.sexp` | **新增** 生成产物（numpy 2.4.6 实测） |
+| `src/extensions3.lisp` | 第四轮：`vt-take-along-axis` 的元素类型分派补 2 个复数分支 |
+| `src/complex-ops.lisp` | 第四轮：`vt-any` / `vt-all` 的复数真值分派（掩码 + 原实现） |
+| `src/complex.lisp` | 第四轮：修复 `vt-outer` 复数分支（`vt-reshape` 多传 `:dtype`，此前从未跑通） |
+| `test/complex-linalg-test.lisp` | **新增** 216 断言（46 差分 + 结构恒等式 + 108 压测 + 契约） |
+| `test/complex-ops-test.lisp` | 第四轮扩到 **149 断言**（新增 outer / any / all / take-along-axis） |
 | `test/run-tests.sh` | 注册 `complex-test` / `complex-ops-test` / `complex-linalg-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
 
 ---

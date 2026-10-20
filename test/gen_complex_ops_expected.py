@@ -234,6 +234,45 @@ case_symbol("shape-view-2d-explicit", "(vt-shape (vt-view CX-M2 nil :dtype :floa
 case_symbol("shape-tensordot-2", "(vt-shape (vt-tensordot CX-M2 CX-M2 :axes 2))", "NIL")
 
 
+# ---------------------------------------------------------------- 第四轮：outer / any / all / take-along-axis
+# vt-outer 的复数分支此前从未跑通（vt-reshape 多传了 :dtype），
+# vt-any/vt-all 是 8 路实数特化、遇复数直接报错。
+case("outer", "(vt-outer CX-A CX-B)", np.outer(A, B))
+case("outer-c64", "(vt-outer (vt-astype CX-A :complex64) (vt-astype CX-B :complex64))",
+     np.outer(A, B).astype(np.complex64))
+case("outer-shape", "(vt-shape (vt-outer CX-A CX-B))", np.array([2, 2]), dtype="int64")
+case_symbol("outer-dtype", "(vt-dtype (vt-outer CX-A CX-B))", ":COMPLEX128")
+
+# any / all：复数的真值 = 任一分量非零（NaN 为真）
+case("any-mixed", "(vt-any CX-C)", np.int8(np.any(C)), dtype=np.int8)
+case("all-mixed", "(vt-all CX-C)", np.int8(np.all(C)), dtype=np.int8)
+case("any-zero", "(vt-any CX-Z3)", np.int8(np.any(np.zeros(3, dtype=complex))),
+     dtype=np.int8)
+case("all-zero", "(vt-all CX-Z3)", np.int8(np.all(np.zeros(3, dtype=complex))),
+     dtype=np.int8)
+case("any-axis0", "(vt-any CX-M2 :axis 0)",
+     np.any(M2, axis=0).astype(np.int8), dtype=np.int8)
+case("all-axis1", "(vt-all CX-M2 :axis 1)",
+     np.all(M2, axis=1).astype(np.int8), dtype=np.int8)
+case("any-keepdims", "(vt-any CX-M2 :axis 1 :keepdims t)",
+     np.any(M2, axis=1, keepdims=True).astype(np.int8), dtype=np.int8)
+case("any-nan", "(vt-any CX-NANC)",
+     np.int8(np.any(np.array([complex(np.nan, 0)]))), dtype=np.int8)
+case("all-nan", "(vt-all CX-NANC)",
+     np.int8(np.all(np.array([complex(np.nan, 0)]))), dtype=np.int8)
+case("any-empty", "(vt-any CX-EMPTYC)",
+     np.int8(np.any(np.array([], dtype=complex))), dtype=np.int8)
+case("all-empty", "(vt-all CX-EMPTYC)",
+     np.int8(np.all(np.array([], dtype=complex))), dtype=np.int8)
+case_symbol("any-dtype", "(vt-dtype (vt-any CX-C))", ":INT8")
+
+# take-along-axis：8 路元素类型分派此前漏了复数
+case("take-along", "(vt-take-along-axis CX-M2 CX-IDXCOL 1)",
+     np.take_along_axis(M2, np.array([[1], [0]]), axis=1))
+case("take-along-axis0", "(vt-take-along-axis CX-M2 CX-IDXROW 0)",
+     np.take_along_axis(M2, np.array([[1, 0]]), axis=0))
+
+
 def emit():
     lines = []
     lines.append(";;; 由 test/gen_complex_ops_expected.py 自动生成，请勿手改。")

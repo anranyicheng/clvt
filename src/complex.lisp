@@ -1506,16 +1506,30 @@
       (funcall (%cx-orig 'vt-dot) a b :dtype dtype :out out)))
 
 (defun vt-outer (a b &key (flatten t) dtype out)
-  "外积（对标 numpy.outer）。复数：全部按分量乘法，dtype 保持复数。"
+  "外积（对标 numpy.outer）。复数：全部按分量乘法，dtype 保持复数。
+
+   实现就是 `a.reshape(-1,1) * b.reshape(1,-1)`（广播乘法），
+   不调用任何实数内核 —— 因此与元素类型无关。"
   (if (or (%cx-deep-p a) (%cx-deep-p b))
-      (let* ((av (ensure-vt a)) (bv (ensure-vt b))
+      (let* ((av (ensure-vt a))
+             (bv (ensure-vt b))
              (af (if flatten (vt-ravel av) av))
              (bf (if flatten (vt-ravel bv) bv))
              (dt (or dtype (vt-promote-type (vt-dtype av) (vt-dtype bv))))
-             (r (vt-reshape (vt-* (vt-reshape af (append (vt-shape af) (list 1)))
-                                  (vt-reshape bf (cons 1 (vt-shape bf))))
-                            :dtype dt)))
-        (if out (progn (vt-copy-into out r) out) r))
+             (prod (vt-* (vt-reshape af (append (vt-shape af) (list 1)))
+                         (vt-reshape bf (cons 1 (vt-shape bf)))))
+             ;; 显式 :dtype 与自然提升不一致时才转换（避免多余拷贝）
+             (r (if (eq (vt-dtype prod) dt) prod (vt-astype prod dt))))
+        ;; ⚠ 原实现写成 (vt-reshape ... :dtype dt)：vt-reshape 只接受
+        ;; (vt shape) 两个参数，多出的 :dtype 会变成第三个实参 →
+        ;; "invalid number of arguments: 3"。复数外积**从来没跑通过**，
+        ;; 而实数路径走原实现所以一直正常（§16.19 第四轮修复）。
+        (if out
+            (progn (vt-copy-into (vt-check-out out (vt-shape r) dt
+                                               :op-name "vt-outer")
+                                 r)
+                   out)
+            r))
       (funcall (%cx-orig 'vt-outer) a b :flatten flatten :dtype dtype :out out)))
 
 (defun vt-trace (matrix &key dtype out)

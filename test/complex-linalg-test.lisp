@@ -383,12 +383,195 @@
                     2))))
 
 ;;; ------------------------------------------------------------------
+;;; 数值压测：随机 / 退化 / 极端尺寸（不依赖 numpy，全部用恒等式判定）
+;;; ------------------------------------------------------------------
+;;; 差分对照只能覆盖「我事先想到的矩阵」；随机化 + 恒等式能覆盖
+;;; 「没想到的」情形（近奇异、病态、非方阵、秩亏、全零）。
+;;; 恒等式比逐元素比对更强：QR 的 R / SVD 的 U,V 都带相位自由度，
+;;; 但 `Q·R = A` 与 `U·S·V^H = A` + 正交性已经完全刻画了分解。
+
+(defvar *lcg* 12345)
+(defun rnd ()
+  "确定性 LCG（同一颗种子 → 同一批矩阵，测试可复现）。"
+  (setf *lcg* (mod (+ (* *lcg* 1103515245) 12345) 2147483648))
+  (/ (float *lcg* 1d0) 2147483648d0))
+(defun rnd-c () (complex (- (rnd) 0.5d0) (- (rnd) 0.5d0)))
+(defun rnd-mat (m n)
+  (vt-from-sequence
+   (loop for i below m
+         collect (loop for j below n collect (rnd-c)))
+   :dtype :complex128))
+
+(defun max-abs (x)
+  (let* ((f (vt-flatten (ensure-vt x))) (n (vt-size f)) (best 0.0d0))
+    (dotimes (i n best)
+      (let ((v (vt-item (vt-slice f (list i (1+ i))))))
+        (setf best (max best (abs (if (complexp v) v (complex v 0.0d0)))))))))
+
+(defun rd (a b) (max-abs (vt-- a b)))
+
+(defun stress-random (m n)
+  (let* ((a (rnd-mat m n))
+         (k (min m n))
+         (scale (max 1d0 (max-abs a)))
+         (tag (format nil "~ax~a" m n)))
+    ;; SVD：重构 + 双侧正交 + σ 单调
+    (multiple-value-bind (u sv vh) (vt-svd a)
+      (expect-true (format nil "stress ~a svd 重构" tag)
+                   (< (rd (vt-matmul (vt-matmul u (diag-complex sv)) vh) a)
+                      (* 1d-11 scale)))
+      (expect-true (format nil "stress ~a svd U 正交" tag)
+                   (< (rd (vt-matmul (vt-transpose (vt-conj u)) u) (eye-like k)) 1d-11))
+      (expect-true (format nil "stress ~a svd V 正交" tag)
+                   (< (rd (vt-matmul vh (vt-transpose (vt-conj vh))) (eye-like k)) 1d-11))
+      (expect-true (format nil "stress ~a svd σ 降序非负" tag)
+                   (let ((items (flatten-list (vt-to-list sv))))
+                     (and (every (lambda (x) (>= (float x 1d0) 0d0)) items)
+                          (every #'>= items (rest items)))))
+      ;; 交叉验证：σ² 应等于 A^H·A 的特征值（两条独立算法互证）
+      (let* ((aha (vt-matmul (vt-transpose (vt-conj a)) a))
+             (ev (flatten-list (vt-to-list (nth-value 0 (vt-eig aha)))))
+             (ss (mapcar (lambda (x) (let ((v (float x 1d0))) (* v v)))
+                         (flatten-list (vt-to-list sv)))))
+        (expect-true (format nil "stress ~a σ² = eig(A^H A)" tag)
+                     (< (loop for x in ss for y in ev
+                              maximize (abs (- x (float y 1d0))))
+                        (* 1d-8 scale scale)))))
+    ;; QR
+    (let ((q (nth-value 0 (vt-qr a))) (r (nth-value 1 (vt-qr a))))
+      (expect-true (format nil "stress ~a qr 重构" tag)
+                   (< (rd (vt-matmul q r) a) (* 1d-11 scale)))
+      (expect-true (format nil "stress ~a qr Q 正交" tag)
+                   (< (rd (vt-matmul (vt-transpose (vt-conj q)) q) (eye-like k)) 1d-11)))
+    ;; pinv：Moore–Penrose 四条
+    (let ((p (vt-pinv a)))
+      (expect-true (format nil "stress ~a pinv A·A⁺·A=A" tag)
+                   (< (rd (vt-matmul (vt-matmul a p) a) a) (* 1d-10 scale)))
+      (expect-true (format nil "stress ~a pinv A⁺·A·A⁺=A⁺" tag)
+                   (< (rd (vt-matmul (vt-matmul p a) p) p) (* 1d-10 scale)))
+      (expect-true (format nil "stress ~a pinv (AA⁺)^H 对称" tag)
+                   (< (rd (vt-transpose (vt-conj (vt-matmul a p)))
+                          (vt-matmul a p))
+                      1d-10))
+      (expect-true (format nil "stress ~a pinv (A⁺A)^H 对称" tag)
+                   (< (rd (vt-transpose (vt-conj (vt-matmul p a)))
+                          (vt-matmul p a))
+                      1d-10)))
+    ;; 方阵：逆 / 解
+    (when (= m n)
+      (expect-true (format nil "stress ~a A·A⁻¹=I" tag)
+                   (< (rd (vt-matmul a (vt-inv a)) (eye-like n)) 1d-8))
+      (let* ((b (rnd-mat n 1))
+             (x (vt-solve a (vt-flatten b))))
+        (expect-true (format nil "stress ~a A·x=b" tag)
+                     (< (rd (vt-matmul a (vt-reshape x (list n 1))) b)
+                        (* 1d-9 scale)))))
+    ;; 随机方阵应满秩
+    (expect-true (format nil "stress ~a 满秩" tag)
+                 (= (vt-matrix-rank a) k))))
+
+(defun stress-static ()
+  ;; 零矩阵
+  (let ((z0 (vt-zeros (list 3 3) :dtype :complex128)))
+    (expect-true "stress 零矩阵 det=0" (zerop (abs (vt-item (vt-det z0)))))
+    (expect-true "stress 零矩阵 rank=0" (= (vt-matrix-rank z0) 0))
+    (expect-true "stress 零矩阵 σ 全 0"
+                 (every (lambda (x) (zerop (float x 1d0)))
+                        (flatten-list (vt-to-list (nth-value 1 (vt-svd z0))))))
+    (expect-true "stress 零矩阵 pinv=0" (< (max-abs (vt-pinv z0)) 1d-12))
+    (expect-true "stress 零矩阵 inv 报错"
+                 (handler-case (progn (vt-inv z0) nil) (error () t)))
+    (expect-true "stress 零矩阵 cond=inf" (> (vt-cond z0) 1d300)))
+  ;; 秩亏（两行线性相关）
+  (let ((rk (vt-from-sequence (list (list (z #C(1 0)) (z #C(2 0)))
+                                   (list (z #C(2 0)) (z #C(4 0))))
+                             :dtype :complex128)))
+    (expect-true "stress 秩亏 rank=1" (= (vt-matrix-rank rk) 1))
+    (expect-true "stress 秩亏 det=0" (zerop (abs (vt-item (vt-det rk)))))
+    (expect-true "stress 秩亏 pinv A·A⁺·A=A"
+                 (< (rd (vt-matmul (vt-matmul rk (vt-pinv rk)) rk) rk) 1d-10))
+    (expect-true "stress 秩亏 σ₂≈0"
+                 (< (abs (float (second (flatten-list
+                                         (vt-to-list (nth-value 1 (vt-svd rk)))))
+                                1d0))
+                    1d-12)))
+  ;; 1×1
+  (let ((one (vt-from-sequence (list (list (z #C(3 4)))) :dtype :complex128)))
+    (expect-true "stress 1x1 det" (< (abs (- (vt-item (vt-det one)) (z #C(3 4)))) 1d-12))
+    (expect-true "stress 1x1 inv"
+                 (< (abs (- (vt-item (vt-inv one)) (/ (z #C(1 0)) (z #C(3 4))))) 1d-12))
+    (expect-true "stress 1x1 svd σ=|3+4i|"
+                 (< (abs (- (float (first (flatten-list
+                                           (vt-to-list (nth-value 1 (vt-svd one)))))
+                                  1d0)
+                            5d0))
+                    1d-12))))
+
+(defun stress-spd ()
+  (dolist (n '(1 2 3 6))
+    (let* ((b (rnd-mat n n))
+           (h (vt-+ (vt-matmul (vt-transpose (vt-conj b)) b)
+                    (vt-scale (eye-like n) (float n 1d0))))
+           (tag (format nil "spd~a" n)))
+      (let ((l (vt-cholesky h)))
+        (expect-true (format nil "stress ~a chol L·L^H=A" tag)
+                     (< (rd (vt-matmul l (vt-transpose (vt-conj l))) h) 1d-10))
+        (expect-true (format nil "stress ~a chol 下三角" tag)
+                     (let ((ok t))
+                       (dotimes (i n)
+                         (dotimes (j n)
+                           (when (and (> j i) (> (abs (vt-ref l i j)) 1d-12))
+                             (setf ok nil))))
+                       ok)))
+      (multiple-value-bind (vals vecs) (vt-eig h)
+        (expect-true (format nil "stress ~a eig A·V=V·Λ" tag)
+                     (< (rd (vt-matmul h vecs) (vt-matmul vecs (diag-complex vals)))
+                        1d-10))
+        (expect-true (format nil "stress ~a eig V 正交" tag)
+                     (< (rd (vt-matmul (vt-transpose (vt-conj vecs)) vecs)
+                            (eye-like n))
+                        1d-10))
+        (expect-true (format nil "stress ~a eig 特征值全正" tag)
+                     (every (lambda (x) (> (float x 1d0) 0d0))
+                            (flatten-list (vt-to-list vals))))
+        (expect-true (format nil "stress ~a eig 降序" tag)
+                     (let ((v (flatten-list (vt-to-list vals))))
+                       (every #'>= v (rest v))))))))
+
+(defun stress-lstsq ()
+  (dolist (sz '((6 3) (3 6)))
+    (let* ((m (first sz)) (n (second sz))
+           (a (rnd-mat m n))
+           (b (rnd-mat m 1))
+           (tag (format nil "lstsq~ax~a" m n)))
+      (multiple-value-bind (x res rank) (vt-lstsq a (vt-flatten b))
+        (declare (ignore res))
+        (expect-true (format nil "stress ~a 解长度" tag) (= (vt-size x) n))
+        (expect-true (format nil "stress ~a rank" tag) (= rank (min m n)))
+        (when (>= m n)
+          ;; 超定：法方程 A^H A x = A^H b
+          (let* ((aha (vt-matmul (vt-transpose (vt-conj a)) a))
+                 (ahb (vt-matmul (vt-transpose (vt-conj a)) b)))
+            (expect-true (format nil "stress ~a 法方程" tag)
+                         (< (rd (vt-matmul aha (vt-reshape x (list n 1))) ahb)
+                            1d-8))))))))
+
+(defun stress-tests ()
+  (format t "~&--- 数值压测（随机 / 退化 / SPD / lstsq）~%")
+  (dolist (sz '((1 1) (3 3) (5 5) (2 5) (5 2)))
+    (stress-random (first sz) (second sz)))
+  (stress-static)
+  (stress-spd)
+  (stress-lstsq))
+
+;;; ------------------------------------------------------------------
 
 (format t "~&=====================================~%")
 (format t "复数线性代数测试 (CONVENTIONS §16.19)~%")
 (format t "=====================================~%")
 (run-differential)
 (structural-tests)
+(stress-tests)
 (contract-tests)
 (format t "~&=====================================~%")
 (format t "Total: ~d / Pass: ~d / Fail: ~d~%" (+ *pass* *fail*) *pass* *fail*)

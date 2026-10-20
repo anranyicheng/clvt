@@ -4,6 +4,65 @@
 
 ---
 
+## 2026-10-20（四）— 第四轮：结构算子收尾 + 数值压测固化
+
+第三轮把线代补完；本轮用「全导出符号逐个试调」扫尾，并把随机压测写进测试。
+
+### 补齐（3 处，都是「8 路元素类型特化漏了第 9、10 种」）
+
+| 函数 | 修复前 | 根因 |
+|---|---|---|
+| `vt-outer` | `invalid number of arguments: 3` | 复数分支写成 `(vt-reshape ... :dtype dt)`，而 `vt-reshape` 只接 `(vt shape)` —— **复数外积从来没跑通过**，实数走原实现所以一直正常 |
+| `vt-any` / `vt-all` | `unsupported input dtype (COMPLEX DOUBLE-FLOAT)` | 归约内核 8 路特化，复数落入 `(t (error ...))` |
+| `vt-take-along-axis` | `不支持的输出元素类型 (COMPLEX DOUBLE-FLOAT)` | 逐元素内核只展开 8 种实数元素类型 |
+
+修复策略：**能用既有算子组合的就不新写内核**。
+`vt-any/vt-all` 先把复数转成 int8 真值掩码（`vt-nonzero-p`）再交给原实现，
+自动继承 `axis`/`keepdims`/`:out`/空输入单位元（any→0、all→1）；
+`vt-outer` 改为广播乘 + 按需 astype，并补 `:out` 硬契约。
+
+复数真值语义（numpy 一致）：任一分量非零即为真，`bool(0+0j)=False`、
+`bool(nan+0j)=True`。
+
+### 数值压测固化（108 条断言，`stress-tests`）
+
+差分对照只能覆盖"我事先想到的矩阵"。新增：
+- **随机矩阵**：确定性 LCG（固定种子，可复现）1×1 / 3×3 / 5×5 / 2×5 / 5×2
+- **恒等式**：`Q·R=A`、`Q^H Q=I`、`U·S·V^H=A`、`U^H U=I`、`V^H V=I`、
+  `A·V=V·Λ`、`A·A⁻¹=I`、`A·x=b`、Moore–Penrose 四条
+- **交叉验证**：`σ²` 必须等于 `eig(A^H A)` —— SVD（单边 Jacobi）与
+  eig（厄米特 Jacobi）是两条独立算法，互证可抓单边系统性偏差
+- **退化**：全零矩阵（σ 全 0 / rank 0 / cond ∞ / inv 报错）、秩亏（σ₂≈0）、1×1
+- **SPD 族**：`B^H B + nI`（1/2/3/6 阶）→ Cholesky + eig，检验 `l_jj>0` 与特征值全正
+- 容差按 `scale = max(1, ‖A‖∞)` 缩放，避免病态误报 / 良态漏报
+
+### 顺带确认「本来就是好的」的算子
+
+eye/identity/ones/full/*-like/tri/triu/tril/triu-indices/tril-indices/
+reshape/ravel/flatten/squeeze/expand-dims/narrow/swapaxes/moveaxis/rollaxis/
+rot90/tile/pad/insert/delete/append/block/repeat/resize/trim-zeros/meshgrid/
+select/choose/compress/extract/where/broadcast-to/broadcast-arrays/
+copy-to!/write/fill/stack/vstack/hstack/dstack/column-stack/split/hsplit/vsplit/
+concatenate/concat/dot/multi-dot/matmul/outer/kron/vander/diag/diagonal/diagflat/
+fill-diagonal/trace/topk/sort/argsort/median/nonzero/argwhere/flatnonzero/
+count-nonzero/zero-p/nonzero-p/array-equal/array-equiv/isclose/allclose/
+logical-and/or/not/xor/to-list/to-array/print —— 全部直接可用（dtype 无关）。
+
+### 文档
+
+- `CONVENTIONS.md` §16.19.8（第四轮补齐：三处缺口的症状/根因/修复策略）、
+  §16.19.9（为什么差分对照不够：压测的五种手法与容差口径）、
+  §16.19.10 测试计数更新、§16.20 变更文件清单
+
+### 测试与回归
+
+- complex-linalg-test **108 → 216**、complex-ops-test **131 → 149**
+- 其余套件全绿：complex 136、core 284、test-all 50（642 断言）、io-interop 77、
+  probes 496、probes2 405、extensions3 264、legacy 284、numpy-convention 69、
+  contract 136、out-contract-v2 56、nan-broadcast 31
+
+---
+
 ## 2026-10-20（三）— 第三轮进化：复数线性代数 + 算子补齐（收尾）
 
 前两轮做完「逐元素」与「结构层」；本轮把**复数线代整块**从硬报错变成可用，
