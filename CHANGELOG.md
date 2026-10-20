@@ -4,6 +4,89 @@
 
 ---
 
+## 2026-10-20（三）— 第三轮进化：复数线性代数 + 算子补齐（收尾）
+
+前两轮做完「逐元素」与「结构层」；本轮把**复数线代整块**从硬报错变成可用，
+并修掉 8 处「复数输入静默只算实部」。
+
+### 新增：src/complex-linalg.lisp（复数线代）
+
+| 函数 | 算法 | 说明 |
+|---|---|---|
+| `vt-lu` | 部分选主元 LU | 选主元按 `\|a\|`（复数无全序） |
+| `vt-det` / `vt-solve` / `vt-inv` | 基于 LU | 奇异 → det=0 / solve·inv 报错 |
+| `vt-cholesky` | 厄米特 Cholesky | `A = L·L^H`；`:upper` 返回 **L^H**（不是 L^T） |
+| `vt-qr` | 复 Householder | `:reduced`/`:full`；Q 用**逆序左乘**累积 |
+| `vt-svd` | 单边 Jacobi（复旋转） | 不形成 A^H A，无条件数平方问题 |
+| `vt-eig` / `vt-eigvals` / `vt-eigvalsh` | 厄米特 Jacobi | 特征值实数、降序；对角虚部清零 |
+| `vt-pinv` / `vt-lstsq` | 基于 SVD | `A⁺ = V·Σ⁺·U^H` |
+| `vt-matrix-rank` / `vt-cond` / `vt-matrix-power` | SVD / 复用 | rank 改用奇异值（原实现取实部） |
+
+### 修掉的「静默丢虚部」（8 处）
+
+| 函数 | 修复前 | numpy | 根因 |
+|---|---|---|---|
+| `vt-cov` / `vt-corrcoef` | float64 | 复厄米特 | `%e3-as-1d-float-transform` 首行 `ensure-vt :float64` |
+| `vt-expm1` / `vt-log1p` | float64 | 复数 | `%float-map` 只认实数 |
+| `vt-nanpercentile` / `vt-nanquantile` / `vt-interp` | float64 | **报错** | `astype :float64` 取实部 |
+| `vt-fromiter` | float64 | 复数 | 默认 `:dtype :float64` |
+| `vt-nextafter` 等 9 个 ufunc | 静默算实部 | **报错** | 无复数分派 |
+| `vt-matrix-rank` | 取实部消元 | 奇异值 | 同上 |
+| `vt-scale`（公共函数） | complex×实数标量 → dtype 判成 float64，写缓冲报 `%DOUBLE-FLOAT` | 保持 complex | dtype 推断只列 4 种实数类型 |
+
+### 新增/放开的算子
+
+- **新支持**：`vt-expm1` `vt-log1p` `vt-sinc` `vt-sign`（z/|z|）
+  `vt-clip`/`vt-clamp`（**字典序**整元素夹取）`vt-standardize`
+  `vt-cov`/`vt-corrcoef`（`X·X^H`）`vt-fromiter`（dtype 推断）
+  `vt-einsum`（放开白名单，走通用累加路径）
+- **新拒绝**（numpy 亦拒绝）：`nextafter` `spacing` `logaddexp` `hypot`
+  `copysign` `signbit` `deg2rad` `rad2deg` `bincount` `histogram`
+  `nanpercentile` `nanquantile` `interp`
+
+### 三个「只在非方阵/复数上暴露」的真实坑
+
+1. **约化 QR 的 Q 不能截断后顺次右乘** —— 反射器支撑长度 `m-i` 通常超过
+   `k = min(m,n)` 列，内积会读不存在的列。方阵/宽矩阵因为 Q 恰好是完整
+   `m×m` **碰巧正确**，只有 tall（m>n）错。正解：`Q = H_0···H_{k-1}·I_{m×k}`，
+   从 `i = k-1` **递减左乘**。
+2. **`ld`（行距）≠ 行数** —— 行主序 m×n 的行距是 **n**。本轮因写错 `ld`
+   踩了 3 次（`vt-lu` 非方阵、QR 的 Q、SVD 的 U），全靠 `(safety 1)` 的
+   边界检查当场报错才定位到。
+3. **Cholesky 的 `:upper` 必须是 `L^H`** —— 实数下 `L^T = L^H`，
+   复数下写成 `transpose` 会静默返回 `L^T`。
+
+另：`vt-eig` 的对角虚部必须清零，否则非厄米输入会收敛到**错的特征值**
+（`[[2+1j,1],[1-1j,3+2j]]` 给出 3.925/1.075，numpy 是 4/1）。
+
+### 文档
+
+- `CONVENTIONS.md` **§16.19 线性代数与算子补齐**：共轭转置这条唯一真分叉、
+  LU/Cholesky/Householder/Jacobi 的复公式、约化 QR 陷阱、对角虚部清零原因、
+  8 处静默错答案清单、已知差异 **D-C9..D-C13**（histogram 拒绝 / eig 是 eigh 语义 /
+  SVD·QR 向量带相位自由度 / lstsq residual 是 2-范数）、声明策略
+
+### 测试
+
+- `test/complex-linalg-test.lisp` **108 断言** = 46 项 numpy 2.4.6 差分对照
+  + 结构恒等式（`P·A=L·U`、`L·L^H=A`、`Q·R=A`、`Q^H Q=I`、`U·S·V^H=A`、
+  `U^H U=I`、`V^H V=I`、`A·V=V·Λ`、Moore–Penrose 四条、`einsum ≡ 专用内核`）
+  + 契约（`:out`、奇异/非方阵/非正定报错、dtype、实数回归网）
+- `test/gen_complex_linalg_expected.py` 生成 `test/complex-linalg-expected.sexp`
+  （禁手写期望值；线代比较用相对容差 1e-9，逐位相等无意义）
+- 已接入 `test/run-tests.sh`
+
+### 回归
+
+- complex-linalg 108/108、complex 136/136、complex-ops 131/131、core 284/284、
+  test-all 50/50（642 断言）、io-interop 77/77、differential-probes 496/496、
+  probes2 405/405、extensions3 264/264、legacy 284/284、numpy-convention 69/69、
+  contract-regression 136/136、out-contract-v2 56/56、nan-broadcast 31/31 —— 全绿
+- 过程中差分探针 **p0109/p0110** 抓到 `vt-matrix-rank` 的新增 `&optional tol`
+  把实数默认值 1e-10 覆盖成 NIL 的回归，已修
+
+---
+
 ## 2026-10-20（二）— 修复：`*read-default-float-format*` = double-float 时 complex64 崩溃
 
 ### 症状（用户环境 SBCL 2.6.9.446 / numpy 2.5.0）

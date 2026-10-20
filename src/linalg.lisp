@@ -586,7 +586,13 @@
                (all-f32-p (every #'(lambda (vt) (eq (vt-dtype vt) :float32)) vts))
                (all-i64-p (every #'(lambda (vt) (eq (vt-dtype vt) :int64)) vts))
                (all-i32-p (every #'(lambda (vt) (eq (vt-dtype vt) :int32)) vts))
-               (out-dtype (cond (all-f64-p :float64)
+               ;; 复数：缺这两支时 out-dtype 会落到 :float64，复数结果写进
+               ;; 实数缓冲区 → 在 %DOUBLE-FLOAT 处报错（原「不支持」的真相）
+               (all-c128-p (every #'(lambda (vt) (eq (vt-dtype vt) :complex128)) vts))
+               (all-c64-p (every #'(lambda (vt) (eq (vt-dtype vt) :complex64)) vts))
+               (out-dtype (cond (all-c128-p :complex128)
+                                (all-c64-p :complex64)
+                                (all-f64-p :float64)
                                 (all-f32-p :float32)
                                 (all-i64-p :int64)
                                 (all-i32-p :int32)
@@ -598,7 +604,8 @@
                                                    (if (< lbl 0)
                                                        (+ 256 lbl)
                                                        lbl))))))
-          (declare (type boolean all-f64-p all-f32-p all-i64-p all-i32-p)
+          (declare (type boolean all-f64-p all-f32-p all-i64-p all-i32-p
+                                 all-c128-p all-c64-p)
 		   (list out-shape))
           
           (let* ((output (or out (vt-zeros out-shape :dtype out-dtype))))
@@ -967,7 +974,11 @@
   (multiple-value-bind (tensors dtype-arg out-arg)
       (parse-vt-op-args args)    
     (let* ((clean-tensors (mapcar #'ensure-vt tensors))
-           (supported-types '(:float64 :float32 :int64 :int32)))
+           ;; 复数（complex64/complex128）也允许：einsum 的**通用累加路径**
+           ;; 只用泛型 aref + incf，与元素类型无关；只要不进 matmul 快路径
+           ;; （那条路径用 double-float SAP），复数语义就是对的。
+           (supported-types '(:float64 :float32 :int64 :int32
+                              :complex64 :complex128)))
       ;; 校验显式 dtype
       (when (and dtype-arg (not (member dtype-arg supported-types)))
         (error "vt-einsum: 不支持的显式 dtype (~a)。允许: ~a。"

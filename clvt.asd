@@ -64,4 +64,8 @@
                (:file "src/complex")
                ;; 复数数据搬运层（§16.18，第二轮）：转换/拼接/剪切/集合/
                ;; 缺失值/缩并。依赖 complex 的 %CX-* 内核，故紧随其后。
-               (:file "src/complex-ops")))
+               (:file "src/complex-ops")
+               ;; 复数线性代数层（§16.20，第三轮）：LU/det/solve/inv/
+               ;; Cholesky/QR/SVD/厄米特特征值/pinv/lstsq/matrix-rank。
+               ;; 依赖前面两层的 %CX-* 工具与 vt-matmul，故排在最后。
+               (:file "src/complex-linalg")))

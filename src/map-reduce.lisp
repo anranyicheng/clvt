@@ -55,6 +55,8 @@
       sinh cosh tanh asinh acosh atanh square reciprocal signum
       %cop-sqrt %cop-log %cop-log2 %cop-log10 %cop-square %cop-recip
       %cop-signum %cop-abs %cconj %cop-neg
+      ;; v1.3：补齐算子（复数的 expm1 / log1p / sinc / sign）
+      %cop-expm1 %cop-log1p %cop-sinc %cop-sign
       %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
       %cx-nan-flag %cx-inf-flag %cx-finite-flag)
     "允许生成复数内联分支的算子白名单。

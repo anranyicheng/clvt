@@ -1585,14 +1585,14 @@
 (%cx-def-unsupported (vt-percentile vt-quantile)
   "分位数需要实数全序（numpy: a must be an array of real numbers）")
 
-(%cx-def-unsupported (vt-det vt-inv vt-solve vt-svd vt-eig vt-pinv
-                     vt-cholesky vt-qr vt-lu vt-cond)
-  "复矩阵分解（LU/SVD/特征值）需共轭转置与酉变换，第二轮实现")
+;; 复数线代（det/inv/solve/lu/cholesky/qr/svd/eig/pinv/lstsq/
+;; matrix-rank/matrix-power）已由 src/complex-linalg.lisp 实现（第三轮）。
+;; vt-cond 复用 vt-svd + vt-inv，随之自动可用，故也不再列入拒绝清单。
+;; 详见 CONVENTIONS §16.19。
 
-(%cx-def-unsupported (vt-einsum)
-  "einsum 的 dtype 白名单只含 4 种实数类型，复数结果缓冲区会错配；
-   第一轮请用 vt-matmul / vt-dot / vt-outer（已提供复数专用内核），
-   einsum 复数路径第二轮实现")
+;; vt-einsum 已支持复数（第三轮）：白名单放开 complex64/complex128，
+;; 结果 dtype 由输入统一推导；走通用累加路径（matmul 快路径仍只服务实数，
+;; 复数请优先用 vt-matmul / vt-tensordot 的专用内核）。见 CONVENTIONS §16.19。
 
 (%cx-def-unsupported (vt-sigmoid vt-relu vt-leaky-relu vt-swish vt-softplus
                      vt-gelu vt-mish vt-hard-tanh vt-hard-sigmoid)

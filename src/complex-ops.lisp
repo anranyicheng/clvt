@@ -39,7 +39,14 @@
                   vt-nanargmax vt-nanargmin
                   vt-nanmean vt-nanvar vt-nanstd vt-nanmedian
                   vt-correlate vt-convolve vt-inner vt-tensordot
-                  vt-vdot vt-nancumsum vt-nancumprod vt-digitize))
+                  vt-vdot vt-nancumsum vt-nancumprod vt-digitize
+                  ;; v1.3：补齐 numpy 支持复数的算子 + 明确拒绝清单
+                  vt-expm1 vt-log1p vt-sinc vt-sign
+                  vt-clip vt-clamp vt-standardize
+                  vt-cov vt-corrcoef vt-fromiter
+                  vt-nextafter vt-spacing vt-logaddexp vt-hypot vt-copysign
+                  vt-signbit vt-deg2rad vt-rad2deg vt-bincount vt-histogram
+                  vt-nanpercentile vt-nanquantile vt-interp vt-positive))
     (%cx-orig name)))
 
 ;;; ==================================================================
@@ -1068,3 +1075,295 @@
           (vt-complex-dtype-p (vt-dtype (ensure-vt bins))))
       (error "vt-digitize: 复数不可分箱（numpy 对复数同样报 TypeError: x may not be complex）")
       (funcall (%cx-orig 'vt-digitize) x bins :right right)))
+
+;;; ==================================================================
+;;; 12. 补齐 numpy **支持**复数的算子（v1.3）
+;;; ==================================================================
+;;; 这一节修的是第二类缺陷：输入含复数时**静默只算实部**。它们既没报错、
+;;; 也没给出正确结果，是三轮里最危险的一类（用户完全看不出来）。
+;;; 判据统一为 numpy 2.4.6 实测：numpy 支持的，我们实现；numpy 拒绝的，
+;;; 我们给出确定性错误（见第 13 节）。
+
+;;; ---- 12.1 值级内核 -------------------------------------------------
+;;; 全部运行在 vt-fast-map 的内联循环里（外层已 with-float-safe），
+;;; 因此内部只用免屏蔽快判 %CX-NAN-P。白名单登记在
+;;; map-reduce.lisp 的 +cx-inline-ops+（未登记则走 vt-map 兜底，语义相同）。
+
+(declaim (inline %cop-expm1 %cop-log1p %cop-sinc %cop-sign))
+
+(defun %cop-expm1 (z)
+  "exp(z) - 1（对标 numpy.expm1 的复数分支）。
+
+   |z| 大时直接 exp(z)-1；|z| 小时灾难性抵消会把结果精度吃光
+   （z=1d-10 时 exp(z)-1 只剩 1 位有效数字），改用级数
+   expm1(z) = z·Σ_{k≥0} z^k/(k+1)!（Horner 形式，12 项对 |z|<0.5 足够：
+   0.5^12/13! ≈ 1e-13，远低于 double 的 eps 累积）。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((< (abs z) 0.5)
+         (let ((term z)
+               (sum z))
+           (declare (type (complex double-float) term sum))
+           (dotimes (k 12 sum)
+             (setf term (* term z (/ 1.0d0 (+ k 2))))
+             (incf sum term))))
+        (t (- (exp z) 1))))
+
+(defun %cop-log1p (z)
+  "log(1 + z)（对标 numpy.log1p 的复数分支）。
+
+   与 expm1 同源：|z| 小时 1+z 的有效位被吃掉，必须走级数
+   log1p(z) = z·Σ_{k≥0} (-z)^k/(k+1)（交替级数，|z|<0.5 时 12 项足够）。
+   z = -1 时 1+z = 0，交给 %COP-LOG 处理极点（-inf + 0i）。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((< (abs z) 0.5)
+         (let ((term z)
+               (sum z))
+           (declare (type (complex double-float) term sum))
+           (dotimes (k 12 sum)
+             (setf term (* term (- z) (/ 1.0d0 (+ k 2))))
+             (incf sum term))))
+        (t (%cop-log (+ 1 z)))))
+
+(defun %cop-sinc (z)
+  "归一化 sinc：sin(πz)/(πz)，sinc(0)=1（对标 numpy.sinc 的复数分支）。
+
+   |z| 很小时 sin(πz)/(πz) → 1 - (πz)²/6，直接算会 0/0。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((< (abs z) 1.0d-8)
+         (- 1 (* (/ (* pi pi) 6.0d0) z z)))
+        (t (let ((pz (* pi z)))
+             (/ (sin pz) pz)))))
+
+(defun %cop-sign (z)
+  "复数的「符号」：z/|z|（单位相量），0 → 0（对标 numpy.sign）。
+
+   numpy 的复数 sign 不是取实部符号，而是投影到单位圆 ——
+   这正是它与 %COP-SIGNUM 同源的地方（clvt 的 vt-signum 已如此实现）。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((zerop z) (%cx-complex-zero-of :complex128))
+        (t (/ z (abs z)))))
+
+(%cx-def-unary vt-expm1 %cop-expm1)
+(%cx-def-unary vt-log1p %cop-log1p)
+(%cx-def-unary vt-sinc %cop-sinc)
+(%cx-def-unary vt-sign %cop-sign)
+
+;;; ---- 12.2 clip / clamp：字典序夹取（numpy 语义）-------------------
+;;; numpy 的 clip 实现是 `np.minimum(np.maximum(a, lo), hi)`，
+;;; 而 maximum/minimum 对复数走字典序（§16.8）—— 所以复数的 clip
+;;; **不是**按分量裁剪，而是整元素按字典序夹取。实测：
+;;;   v=[1+2j, 3-4j, 5+0j], clip(0, 2) → [1+2j, 2+0j, 2+0j]
+;;; 第一项虚部 2 超出 2 却没被裁，正是因为比较的是 (1,2) 整体而不是 2。
+
+(defun vt-clip (vt &optional (min-val nil min-p) (max-val nil max-p)
+                   &key out dtype)
+  "逐元素裁剪（对标 numpy.clip）。复数按**字典序**整元素夹取，不按分量。"
+  (let ((v (ensure-vt vt)))
+    (if (not (vt-complex-dtype-p (vt-dtype v)))
+        ;; 实数路径原样转发。
+        ;; ⚠ 不能写 `(funcall orig vt :out out :dtype dtype)`：orig 的签名是
+        ;; `(&optional min max &key out dtype)` —— **&optional 在前**，关键字
+        ;; 会被当成 min-val 的位置实参（`min-p = T, min-val = :OUT`），
+        ;; 于是「无界参数」这条最常用的路径整天报错。必须把两个位置参数
+        ;; 显式填满（nil nil 与「不传」在 orig 里等价：都走 copy 分支）。
+        (cond ((and min-p max-p)
+               (funcall (%cx-orig 'vt-clip) vt min-val max-val :out out :dtype dtype))
+              (min-p
+               ;; 只给下限：orig 会立刻报错（numpy 语义），不必带关键字
+               (funcall (%cx-orig 'vt-clip) vt min-val))
+              (t
+               (funcall (%cx-orig 'vt-clip) vt nil nil :out out :dtype dtype)))
+        (progn
+          (when (and min-p (not max-p))
+            (error "vt-clip: 只提供 MIN-VAL 而未提供 MAX-VAL（numpy 语义：\
+clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
+          (let* ((dt (%cx-result-complex-dtype (vt-dtype v) dtype "VT-CLIP"))
+                 (r (if (and (null min-val) (null max-val))
+                        (vt-copy v)
+                        (let ((acc v))
+                          (when min-val
+                            (setf acc (vt-maximum acc (vt-cast min-val dt) :dtype dt)))
+                          (when max-val
+                            (setf acc (vt-minimum acc (vt-cast max-val dt) :dtype dt)))
+                          acc))))
+            (%cx-to-out r out "VT-CLIP"))))))
+
+(defun vt-clamp (vt &optional (min-val nil min-p) (max-val nil max-p)
+                    &key out dtype)
+  "vt-clip 的别名（对标 torch.clamp）。复数语义同 vt-clip（字典序）。"
+  (let ((v (ensure-vt vt)))
+    (if (vt-complex-dtype-p (vt-dtype v))
+        (cond ((and min-p max-p) (vt-clip v min-val max-val :out out :dtype dtype))
+              (min-p (vt-clip v min-val :out out :dtype dtype))
+              (t (vt-clip v :out out :dtype dtype)))
+        ;; 同 vt-clip：&optional 在 &key 之前，转发时必须填满位置参数
+        (cond ((and min-p max-p)
+               (funcall (%cx-orig 'vt-clamp) vt min-val max-val :out out :dtype dtype))
+              (min-p
+               (funcall (%cx-orig 'vt-clamp) vt min-val))
+              (t
+               (funcall (%cx-orig 'vt-clamp) vt nil nil :out out :dtype dtype))))))
+
+;;; ---- 12.3 standardize：按复数均值居中、按实标准差缩放 --------------
+;;; 复数的 std 恒为实数（§16.7），所以 (x-mean)/std 是「复数 / 实数」，
+;;; 结果仍是复数。原实现把 final-dtype 定成 float64，导致 vt-mean 收到
+;;; 复数输入 + 实数 dtype 而报错（我们第一版就撞上了这个）。
+
+(defun vt-standardize (vt &key axis (ddof 0) dtype out)
+  "Z-score 标准化 (x - mean) / std（对标 sklearn.preprocessing.scale）。
+   复数：均值是复数、标准差是实数（|x-mean|² 的均值开方），结果保复数。"
+  (let ((v (ensure-vt vt)))
+    (if (not (vt-complex-dtype-p (vt-dtype v)))
+        (funcall (%cx-orig 'vt-standardize) vt :axis axis :ddof ddof
+                 :dtype dtype :out out)
+        (let* ((rdt (vt-complex-real-dtype (vt-dtype v)))
+               (cdt (%cx-result-complex-dtype (vt-dtype v) dtype "VT-STANDARDIZE"))
+               (mu (vt-mean v :axis axis :keepdims t :dtype cdt))
+               (sd (vt-std v :axis axis :keepdims t :ddof ddof :dtype rdt))
+               (centered (vt-- v mu :dtype cdt))
+               ;; sd 为 0（常量切片）时按 numpy/sklearn 惯例输出 0 而不是 NaN
+               (zero-sd (vt-< (vt-abs sd) (vt-cast 1d-12 rdt)))
+               (safe-sd (vt-where zero-sd (vt-cast 1 rdt) sd :dtype rdt))
+               (r (vt-/ centered safe-sd))
+               (r (vt-where zero-sd (vt-cast 0 cdt) r :dtype cdt)))
+          (%cx-to-out r out "VT-STANDARDIZE")))))
+
+;;; ---- 12.4 cov / corrcoef：厄米特协方差 ---------------------------
+;;; numpy 的 np.cov 对复数用 X @ X.conj().T（不是 X @ X.T），
+;;; 得到厄米特矩阵；corrcoef 再由它归一化。原实现
+;;; （%e3-as-1d-float-transform）第一行就 `ensure-vt :dtype :float64`，
+;;; 复数的虚部在此被整体丢弃 —— 输出 FLOAT64，静默错答案。
+
+(defun %cx-cov-matrix (m rowvar what)
+  "把输入规范成 n-var × n-obs 的**复数**矩阵（对标 numpy.cov 的 rowvar 处理）。"
+  (let ((v (ensure-vt m)))
+    (when (not (vt-complex-dtype-p (vt-dtype v)))
+      (setf v (vt-astype v :complex128)))
+    (when (not (eq (vt-dtype v) :complex128))
+      (setf v (vt-astype v :complex128)))
+    (cond
+      ((null (vt-shape v)) (vt-reshape v '(1 1)))
+      ((= (vt-order v) 1)
+       (if rowvar
+           (vt-reshape v (list 1 (vt-size v)))
+           (vt-reshape v (list (vt-size v) 1))))
+      ((= (vt-order v) 2) (if rowvar v (vt-transpose v)))
+      (t (error "~a: 输入至多 2 维，收到 ~a 维" what (vt-order v))))))
+
+(defun %cx-conj-t (x)
+  "共轭转置（厄米特转置）X^H。复数线代里所有「转置」都应该是它。"
+  (vt-transpose (vt-conj x)))
+
+(defun %cx-cov (m y rowvar ddof bias)
+  "复数协方差矩阵（numpy 语义：X·X^H / denom，并厄米特对称化）。"
+  (let* ((mm (%cx-cov-matrix m rowvar "vt-cov"))
+         (xx (when y (%cx-cov-matrix y rowvar "vt-cov")))
+         (stacked (if xx (vt-concatenate 0 mm xx) mm))
+         (n-var (first (vt-shape stacked)))
+         (n-obs (second (vt-shape stacked)))
+         (denom (if bias n-obs (- n-obs ddof)))
+         (denom (if (<= denom 0) n-obs denom)))
+    (if (= n-var 1)
+        ;; 单变量 → 标量方差（实数，但保持复数 dtype 以对齐 numpy 的返回类型）
+        (let* ((row (vt-slice stacked '(0)))
+               (mu (vt-mean row))
+               (dev (vt-- row mu))
+               (acc (vt-item (vt-sum (vt-* dev (vt-conj dev))))))
+          (make-vt nil (/ acc denom) :dtype :complex128))
+        (let* ((x (vt-contiguous stacked))
+               (mu (vt-mean x :axis 1 :keepdims t))
+               (xc (vt-- x mu))
+               (raw (vt-matmul xc (%cx-conj-t xc)))
+               ;; 厄米特对称化：消掉浮点误差造成的 C_ji ≠ conj(C_ij)
+               (sym (vt-scale (vt-+ raw (%cx-conj-t raw)) 0.5d0)))
+          (if (= denom 1)
+              sym
+              (vt-scale sym (/ 1.0d0 denom)))))))
+
+(defun vt-cov (m &key (y nil y-p) (rowvar t) (ddof nil ddof-p) (bias nil))
+  "协方差矩阵（对标 numpy.cov）。复数得到**厄米特**矩阵（X·X^H）。"
+  (declare (ignore y-p))
+  (let ((ddof (if ddof-p ddof 1)))
+    (if (or (%cx-deep-p m) (%cx-deep-p y))
+        (%cx-cov m y rowvar ddof bias)
+        (funcall (%cx-orig 'vt-cov) m :y y :rowvar rowvar
+                 :ddof (if ddof-p ddof 1) :bias bias))))
+
+(defun vt-corrcoef (m &key (y nil y-p) (rowvar t))
+  "相关系数矩阵（对标 numpy.corrcoef）。复数结果仍是厄米特矩阵，
+   对角为 1.0+0.0j（实数 1）。"
+  (declare (ignore y-p))
+  (if (or (%cx-deep-p m) (%cx-deep-p y))
+      (let* ((c (%cx-cov m y rowvar 1 nil))
+             (shape (vt-shape c)))
+        (if (null shape)
+            (vt-full nil (complex 1.0d0 0.0d0) :dtype :complex128)
+            (let* ((n (first shape))
+                   (diag (vt-diagonal c))
+                   ;; 方差在对角上是实数（虚部只有浮点噪声），取模开方
+                   (sd (vt-sqrt (vt-abs diag)))
+                   (den (vt-outer sd sd))
+                   (zero-d (vt-= den (vt-cast 0 (vt-dtype den))))
+                   (safe (vt-where zero-d (vt-cast 1 (vt-dtype den)) den
+                                   :dtype (vt-dtype den)))
+                   (r0 (vt-/ c safe))
+                   (ident (vt-eye n :dtype :complex128)))
+              (vt-where zero-d ident r0 :dtype :complex128))))
+      (funcall (%cx-orig 'vt-corrcoef) m :y y :rowvar rowvar)))
+
+;;; ---- 12.5 fromiter：默认 dtype 推断含复数 -------------------------
+;;; 原实现默认 :float64，且显式传 :float64 时复数会被静默取实部。
+;;; numpy 的 fromiter 必须显式给 dtype，给实数 dtype 遇复数直接 TypeError。
+
+(defun vt-fromiter (iterable &key (dtype nil dtype-p) (count nil))
+  "从 Lisp 序列构建 1 维张量（对标 numpy.fromiter）。
+
+   dtype 缺省时**推断**：序列含复数 → :complex128，否则保持既有的
+   :float64（兼容旧调用）。显式传入实数 dtype 而序列含复数 → 报错，
+   与 numpy 的 TypeError 一致（绝不静默丢虚部）。"
+  (when (not (or (null iterable) (typep iterable 'sequence)))
+    (error "vt-fromiter: 需要序列输入，收到 ~a" (type-of iterable)))
+  (let ((seq (or iterable '())))
+    (cond
+      ((and dtype-p dtype)
+       (when (and (not (vt-complex-dtype-p dtype))
+                  (some (lambda (x) (or (complexp x) (%cx-deep-p x))) seq))
+         (error "vt-fromiter: 序列含复数，与显式 dtype ~a 冲突\
+（numpy 同样抛 TypeError: Cannot cast complex to real）" dtype))
+       (funcall (%cx-orig 'vt-fromiter) seq :dtype dtype :count count))
+      (t
+       (funcall (%cx-orig 'vt-fromiter) seq
+                :dtype (if (some (lambda (x) (or (complexp x) (%cx-deep-p x))) seq)
+                           :complex128
+                           :float64)
+                :count count)))))
+
+(defun vt-positive (tensor &key out dtype)
+  "逐元素取正（一元 +，对标 numpy.positive）。复数恒等映射，保复数 dtype。"
+  (let ((v (ensure-vt tensor)))
+    (if (not (vt-complex-dtype-p (vt-dtype v)))
+        (funcall (%cx-orig 'vt-positive) tensor :out out :dtype dtype)
+        (vt-fast-map #'identity v :out out
+                     :dtype (%cx-result-complex-dtype (vt-dtype v) dtype "VT-POSITIVE")))))
+
+;;; ==================================================================
+;;; 13. 明确拒绝：numpy 同样不做，但当前实现会**静默丢虚部**
+;;; ==================================================================
+;;; 这一节的函数在 numpy 2.4.6 上全部抛 TypeError（逐项实测见 §16.19）。
+;;; 我们此前要么把复数当实数算（静默错答案），要么漏出裸 TYPE-ERROR
+;;; （错误信息指向内部实现，用户看不懂）。统一改为确定性错误。
+;;;
+;;; 判据：只要**任一参数**含复数就拒绝 —— 与 %CX-DEF-UNSUPPORTED 一致。
+
+(%cx-def-unsupported (vt-nextafter vt-spacing vt-logaddexp
+                      vt-hypot vt-copysign vt-signbit
+                      vt-deg2rad vt-rad2deg)
+  "这些 ufunc 只对实数有定义（numpy 2.4.6 实测：ufunc not supported for the input types）")
+
+(%cx-def-unsupported (vt-bincount vt-histogram)
+  "分箱类函数需要实数全序（numpy：bincount 抛 Cannot cast complex to int64；
+   histogram 虽会「跑通」，但那是对复平面做线性插值分箱，语义无意义，本库拒绝）")
+
+(%cx-def-unsupported (vt-nanpercentile vt-nanquantile vt-interp)
+  "需要实数全序 / 实数插值（numpy 实测：a must be an array of real numbers /
+   Cannot cast complex128 to float64）")

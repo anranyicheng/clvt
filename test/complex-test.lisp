@@ -419,8 +419,16 @@
     (chk "atan2" (lambda () (vt-atan2 cx-a cx-b)))
     (chk "even-p" (lambda () (vt-even-p cx-a)))
     (chk "percentile" (lambda () (vt-percentile cx-a 50)))
-    (chk "det" (lambda () (vt-det cx-m)))
-    (chk "inv" (lambda () (vt-inv cx-m)))
+    ;; det / inv / cond 自第三轮起已支持复数（src/complex-linalg.lisp），
+    ;; 不再属于「未支持」清单 —— 这里改成正向断言。
+    ;; 注意：本文件的 expect-equal 是「抛错式」助手，计数由 with-case 负责，
+    ;; 所以必须包在 with-case 里，否则断言不计入总数（历史踩过）。
+    (with-case ("det 支持复数")
+      (expect-equal "det 支持复数"
+                    (type-of (vt-item (vt-det cx-m))) '(complex double-float)))
+    (with-case ("inv 支持复数")
+      (expect-equal "inv 支持复数"
+                    (vt-dtype (vt-inv cx-m)) :complex128))
     (chk "sigmoid" (lambda () (vt-sigmoid cx-a)))))
 
 ;;; ------------------------------------------------------------------

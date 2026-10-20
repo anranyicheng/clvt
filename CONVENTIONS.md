@@ -684,6 +684,7 @@ C1 形状/秩 · C2 dtype · C3 广播 · C4 归约轴 · C5 NaN/Inf · C6 空�
 | **导出表不得重复** | `defpackage` 允许同名重复导出，但静态解析会重复计数（曾出现 `vt-real/vt-imag/vt-conj/vt-angle` 各两次 → 静态 371 ≠ 运行时 367，`p0395` 恒红） |
 | **生成器无参 == gen** | `check_key_sync.py` 用无参调用 + 逐字节比对做漂移检查；生成器若在无参时崩溃（`IndexError`），文件不会被重写，门禁就**永远通过**——静默失效比没有门禁更危险 |
 | **生成必须可复现** | 连续两次生成必须逐字节相同；随机类用例统一 `rng(seed)`，禁止裸用全局 RNG |
+| **浮点格式随 numpy 版本变** | `gen_probes*.py` 用 `str(np.float64)` 输出期望值：numpy 2.4 给 `0.27279899999999996`、2.5 给 `0.272799`。**同一份代码在不同 numpy 下 codegen 必然漂移**，但数值只差 1 ulp（比较用 `:tol`）。遇到跨版本漂移时不要盲目「重新生成再提交」——先确认是格式化差异还是真语义变化（本轮就遇到过：本机 numpy 2.4.6 报漂移，上游 2.5.0 正常） |
 | **重新生成后先 `git add`** | 门禁结束时 `git checkout -- <生成物>` 还原工作区，否则改动会被门禁自己抹掉 |
 
 > 新增导出函数的完整操作：改 `package.lisp`（不重复）→ 跑 `python3 test/gen_probes2.py`
@@ -1659,7 +1660,170 @@ Unhandled TYPE-ERROR ... The value #C(0.0 0.0) is not of type (COMPLEX SINGLE-FL
 （`clvt.asd` 本身变了，正常 `asdf:load-system` 也会重编；但若你的 ASDF 版本
 对 `:around-compile` 变化不敏感，用 `:force t` 最稳。）
 
-### 16.19 本章变更文件清单
+### 16.19 线性代数与算子补齐（第三轮进化）
+
+前两轮把「逐元素」和「结构层」做完了，但**复数线代整块仍是硬报错**，
+另有一批算子在复数输入下**静默只算实部**。本轮收尾。
+
+落地：
+- `src/complex-linalg.lisp`（新增）：LU / det / solve / inv / Cholesky /
+  QR / SVD / 厄米特特征值 / pinv / lstsq / matrix-rank / matrix-power
+- `src/complex-ops.lisp` 第 12、13 节：补齐 numpy **支持**的算子 +
+  对 numpy 也拒绝的算子给出确定性错误
+- `src/linalg.lisp`：`vt-einsum` 放开复数白名单
+
+#### 16.19.1 复数线代的唯一真分叉：转置是共轭转置
+
+写复数线代时只有**一条**必须刻在脑子里的规则：
+
+> 实数线代里所有的 `A^T`，在复数里都是 `A^H = conj(A^T)`。
+
+它同时决定四件事，任一处写错都会得到「能跑、数值看起来像、但数学上错」的结果：
+
+| 位置 | 写成 `A^T` 的后果 |
+|---|---|
+| `cov = X·X^T` | 得到对称但不厄米特的矩阵（对角虚部非零），`corrcoef` 跟着错 |
+| Cholesky `A = L·L^T` | 分解不成立；且 `:upper` 返回 `L^T` 而不是 `L^H` |
+| `pinv = V·Σ⁺·U^T` | 得到 `A⁺` 的共轭，`A·A⁺` 不再是厄米特投影算子 |
+| 特征值 `A·V = V·Λ` | 只有实矩阵碰巧成立 |
+
+`correlate` 与 `convolve` 的共轭差异同理（§16.18 已记录）：实数上不可观测，
+只有复数能测出来。
+
+#### 16.19.2 算法与关键公式
+
+**LU（部分选主元）**：选主元用 `|a|`（复数无全序）。消元公式与实数完全一致
+——乘除法在复数域封闭，不需要额外共轭。
+
+**Cholesky（厄米特）**：
+
+```
+l_jj = sqrt( a_jj - Σ_{k<j} |l_jk|² )        ← 被开方数必须为实数且 > 0
+l_ij = ( a_ij - Σ_{k<j} l_ik·conj(l_jk) ) / l_jj
+```
+
+少了 `conj` 会得到满足 `A = L·L^T` 的「L」，但那不是厄米特分解。
+
+**QR（复 Householder）**：`H = I - β·v·v^H`，`v = x - α·e₁`，
+`α = -phase(x₀)·‖x‖`（让 α 与 x₀ 反相，避免相消）。两个方向的内积**不对称**：
+
+- 左乘 `H·R`：内层用 `conj(v)`，外层用 `v`
+- 右乘 `Q·H`：内层用 `v`，外层用 `conj(v)`
+
+> **约化 QR 的陷阱**（本轮实测踩到）：Q 只有 `k = min(m,n)` 列，而反射器
+> 的支撑长度是 `m-i`，通常伸到第 k 列之外。若沿用「`Q ← Q·H_i` 顺次右乘」，
+> 内积会去读 Q 不存在的列 —— 方阵与宽矩阵因为 Q 恰好是完整 `m×m` **碰巧正确**，
+> 只有 tall（`m > n`）是错的。正确写法是
+> `Q = H_0·H_1···H_{k-1}·I_{m×k}`，从 `i = k-1` **递减**依次**左乘**
+> （每次只改行 i..m-1，截断后都存在）。
+
+**SVD（单边 Jacobi）**：直接对 A 的列做酉旋转使之两两正交，不形成 `A^H A`，
+因此没有条件数平方问题。复旋转 `J = [[c, s],[-conj(s), c]]`（c 实）的推导：
+
+```
+α = ‖a_p‖², β = ‖a_q‖² (实), γ = a_p^H a_q (复)
+要求新内积为 0：  t(α-β) + γ - t²·conj(γ) = 0,   t = s/c
+令 γ = |γ|e^{iφ}, u = (α-β)/|γ|, 代换 t = e^{iφ}·w 后退化为实二次式：
+    w² - u·w - 1 = 0   →   w = -2 / (u + sign(u)·√(u²+4))    （|w| ≤ 1 的小根）
+    t = e^{iφ}·w,   c = 1/√(1+w²),   s = t·c
+```
+
+> 直接把实数的 `t = sign(θ)/(|θ|+√(1+θ²))` 套上来，在 γ 非实时**不会收敛**。
+
+**厄米特特征值（Jacobi）**：零化 2×2 块与 SVD 的旋转同源（同一个二次式），
+但变换是 `A ← U^H·A·U`，列变换用 `(c, conj(s))`、行变换用 `(c, s)` 且第二行
+取 `conj(s)` —— 这处不对称正是 `U^H` 与 `U` 的区别。
+
+**pinv / lstsq**：`A⁺ = V·Σ⁺·U^H`。注意 `A⁺` **一般不是厄米特矩阵**
+（只有 A 厄米特时才如此）；它的正确性质是 Moore–Penrose 四条。
+
+#### 16.19.3 厄米特特征值：对角虚部必须清零
+
+`vt-eig` 的契约与实数版一致（numpy `eigh` 的 UPLO 语义）：不校验厄米特，
+只用一个三角并用**共轭**镜像到另一三角，再**把对角元的虚部清零**。
+
+> 不清零的后果（本轮实测）：对 `[[2+1j, 1], [1-1j, 3+2j]]` 会返回
+> `(3.925, 1.075)`，而 numpy 返回 `(4, 1)`。原因是 Jacobi 用
+> `(realpart diag)` 当特征值候选、却让复对角元继续参与旋转 —
+> 迭代仍「收敛」，只是收敛到错的值。LAPACK 的 `zheevd` 同样直接按实部使用。
+
+#### 16.19.4 本轮修掉的「静默丢虚部」（第二轮同类，共 8 处）
+
+| 函数 | 修复前 | numpy 2.4.6 | 根因 |
+|---|---|---|---|
+| `vt-cov` / `vt-corrcoef` | 返回 **float64** | 复厄米特矩阵 | `%e3-as-1d-float-transform` 首行 `ensure-vt :dtype :float64` |
+| `vt-expm1` / `vt-log1p` | 返回 **float64** | 复数 | `%float-map` 只认实数元素类型 |
+| `vt-nanpercentile` / `vt-nanquantile` | 返回 **float64** | **报错** | 内部 `astype :float64` 取实部 |
+| `vt-interp` | 返回 **float64** | **报错** | 同上 |
+| `vt-fromiter` | 返回 **float64**（虚部清零） | 复数 | 默认 `:dtype :float64` |
+| `vt-nextafter` / `vt-spacing` / `vt-logaddexp` / `vt-hypot` / `vt-copysign` / `vt-signbit` / `vt-deg2rad` / `vt-rad2deg` / `vt-bincount` | 静默算实部 | **报错**（ufunc 不支持） | 无复数分派 |
+| `vt-matrix-rank` | `astype :float64` 后消元 | 基于奇异值 | 取实部 |
+| `vt-scale`（公共函数） | complex 数组 × 实数标量 → 结果 dtype 判成 `:float64`，写缓冲时 `%DOUBLE-FLOAT` 报错 | 保持 complex dtype | dtype 推断只列了 4 种实数类型 |
+
+全部改为「numpy 支持的实现，numpy 拒绝的确定性报错」。
+
+#### 16.19.5 本轮新增/放开的算子
+
+**新支持（numpy 支持复数）**
+
+| 函数 | 语义要点 |
+|---|---|
+| `vt-expm1` | `\|z\|<0.5` 走级数（12 项），否则 `exp(z)-1`；避免灾难性抵消 |
+| `vt-log1p` | 同上，交替级数；`z=-1` 交给极点（`-inf+0i`） |
+| `vt-sinc` | `sin(πz)/(πz)`；`\|z\|<1e-8` 用 `1-(πz)²/6` |
+| `vt-sign` | `z/\|z\|`（投影到单位圆），`sign(0)=0` |
+| `vt-clip` / `vt-clamp` | **字典序**整元素夹取，不按分量（numpy 的 clip 是 `minimum(maximum(a,lo),hi)`） |
+| `vt-standardize` | 均值复数、标准差实数（`\|x-mean\|²` 的均值开方），结果保复数 |
+| `vt-cov` / `vt-corrcoef` | `X·X^H`，厄米特对称化；对角为实数 1 |
+| `vt-fromiter` | dtype 缺省时推断（含复数 → complex128）；显式实数 dtype 遇复数报错 |
+| `vt-einsum` | 白名单放开 complex64/complex128，结果 dtype 由输入推导；走通用累加路径（matmul 快路径仍只服务实数） |
+| `vt-lu/det/solve/inv/cholesky/qr/svd/eig/pinv/lstsq/matrix-rank/matrix-power/cond` | 见 16.19.2 |
+
+**新拒绝（numpy 同样拒绝）**：`nextafter` `spacing` `logaddexp` `hypot`
+`copysign` `signbit` `deg2rad` `rad2deg` `bincount` `histogram`
+`nanpercentile` `nanquantile` `interp`（+ 已有的 `floor` 族、`mod`、位运算、
+`atan2`、`even-p/odd-p`、`percentile/quantile`、`digitize`、神经网络激活）。
+
+#### 16.19.6 已知差异（D-C9 起）
+
+| 编号 | 差异 | 原因与影响 |
+|---|---|---|
+| **D-C9** | `vt-histogram` 对复数**报错**，numpy 会「跑通」 | numpy 对复平面做线性插值分箱（bins 也是复数），语义无意义；本库选择确定性拒绝。若确需沿复平面分箱，请自行 `realpart`/`imagpart` 后分别直方图 |
+| **D-C10** | `vt-eig` 是 **eigh 语义**（厄米特），不是 numpy 的通用 `eig` | 与实数版一致（实数版也只支持对称）。通用非厄米特征值需要复 QR 迭代（Hessenberg + 双位移），不在本轮范围；非厄米输入与 numpy `eigh` 一样是 GIGO |
+| **D-C11** | `vt-svd` 的 U/V 与 numpy **逐元素不同**（重构等价） | 奇异向量带相位自由度：`u_j → e^{iθ}u_j, v_j → e^{iθ}v_j` 仍是同一分解。断言应使用重构/正交恒等式，不要逐元素比对 |
+| **D-C12** | `vt-qr` 的 R 与 numpy **逐元素不同**（重构等价） | Householder 的 α 取 `-phase(x₀)‖x‖`（numpy 用 LAPACK 的符号约定），R 的相位随之不同 |
+| **D-C13** | `vt-lstsq` 的 residual 是 **2-范数**（numpy 是平方和） | 库内既有契约（`vt-norm`），保持一致；`sqrt(numpy_res)` 即得 |
+
+#### 16.19.7 声明策略（延续 §16.14.1）
+
+本轮新增内核的声明**只有一档**：
+
+| 位置 | 声明 | 理由 |
+|---|---|---|
+| `%clu-factor!` `%clu-subst!` `%cchol-factor!` `%cqr-*` `%csvd-jacobi!` `%ceig-jacobi!` | `(speed 3) (safety 1)` | 索引由 `ld/m/n` 与循环上界推出，可证不越界；保留检查的成本在 O(n³) 算法里可忽略（<2%），而形状算错会立刻报错而不是静默踩内存 |
+| 所有对外入口（`vt-svd` 等） | 不写 `optimize` | 契约检查（方阵、`:out`、正定性）与错误信息都在这一层 |
+
+**没有**任何新的 `safety 0` —— 复数线代的索引组合（`ld` ≠ 行数）比实数更容易写错，
+本轮实际因 `ld` 写错踩了 3 次（`vt-lu` 非方阵、QR 的 Q、SVD 的 U），
+全靠 `safety 1` 的边界检查当场报错才定位到。
+
+#### 16.19.8 测试
+
+- `test/complex-linalg-test.lisp`：**108 条断言**
+  = 46 项 numpy 2.4.6 差分用例（det/inv/solve/cholesky/SVD 奇异值/
+  特征值/pinv/lstsq/rank/cond/matrix-power/einsum/范数）
+  + 结构恒等式（`P·A=L·U`、`L·L^H=A`、`Q·R=A`、`Q^H Q=I`、`U·S·V^H=A`、
+  `U^H U=I`、`V^H V=I`、`A·V=V·Λ`、Moore–Penrose 四条、`einsum ≡ 专用内核`）
+  + 契约断言（`:out` 形状/dtype、奇异矩阵 `solve/inv` 报错、非方阵 `det` 报错、
+  非正定 `cholesky` 报错、各函数结果 dtype、complex64 升精度、实数回归网）
+- 期望值由 `test/gen_complex_linalg_expected.py` 从本机 numpy 实测生成
+  （`test/complex-linalg-expected.sexp`），比较用**相对容差** 1e-9
+  （线代结果的最后几位随算法/求和顺序而异，逐位相等没有意义）。
+- 已接入 `test/run-tests.sh`（`SUITES` + `DEFAULT_ORDER`）。
+
+---
+
+### 16.20 本轮变更文件清单
 
 
 | 文件 | 改动 |
@@ -1680,7 +1844,13 @@ Unhandled TYPE-ERROR ... The value #C(0.0 0.0) is not of type (COMPLEX SINGLE-FL
 | `test/complex-ops-test.lisp` | **新增** 128 断言 |
 | `test/gen_complex_ops_expected.py` | **新增** 期望值生成器（97 用例） |
 | `test/complex-ops-expected.sexp` | **新增** 生成产物（numpy 2.4.6 实测） |
-| `test/run-tests.sh` | 注册 `complex-test` / `complex-ops-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
+| `src/complex-linalg.lisp` | **第三轮新增**：复数线代（LU/det/solve/inv/Cholesky/QR/SVD/厄米特特征值/pinv/lstsq/matrix-rank/matrix-power） |
+| `src/linalg.lisp` | `vt-einsum` 白名单放开 complex64/complex128，结果 dtype 由输入推导 |
+| `src/elementwise.lisp` | `vt-scale` 的 dtype 推断补「复数数组 × 实数标量 → 保持 complex dtype」 |
+| `test/complex-linalg-test.lisp` | **新增** 108 断言（46 项差分 + 结构恒等式 + 契约） |
+| `test/gen_complex_linalg_expected.py` | **新增** 期望值生成器 |
+| `test/complex-linalg-expected.sexp` | **新增** 生成产物（numpy 2.4.6 实测） |
+| `test/run-tests.sh` | 注册 `complex-test` / `complex-ops-test` / `complex-linalg-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
 
 ---
 

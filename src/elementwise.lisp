@@ -211,6 +211,12 @@
       (let ((dt (vt-dtype (ensure-vt a))))
         (vt-fast-map #'* a b :dtype
                      (cond ((member dt '(:float32 :float64)) dt)
+                           ;; 复数数组 × 实数标量：numpy 保持复数 dtype
+                           ;; （complex64×2.0 → complex64）。缺这一支时会把
+                           ;; 结果 dtype 判成 :float64，复数结果写不进实数
+                           ;; 缓冲，直接在 %DOUBLE-FLOAT 处报错 —— 实测
+                           ;; vt-scale 是 vt-cov 复数路径的第一个绊脚石。
+                           ((member dt '(:complex64 :complex128)) dt)
                            ((and (integerp b) (%int-fit-p dt b)) dt)
                            ((floatp b) :float64)
                            (t nil))
