@@ -1869,7 +1869,211 @@ where/broadcast/copy-to!/write/save-load/array-equal/isclose… 全部直接可�
 
 ---
 
-### 16.20 本轮变更文件清单
+### 16.21 第五轮：复数 einsum 的 GEMM 快路径
+
+#### 16.21.1 问题与实测
+
+复数 einsum 从第三轮起就**正确**（结果 dtype 由输入统一推导，通用累加状态机
+与元素类型无关），但一直**慢一个量级**：
+
+| 表达式（256×256 complex128） | 改前 | 改后 | 倍数 |
+|---|---|---|---|
+| `vt-einsum "ij,jk->ik"` | **2526 ms** | **31 ms** | **81×** |
+| `vt-matmul`（对照） | 33 ms | 33 ms | — |
+| `vt-einsum "i,i->"` | 9 ms | **<1 ms** | ~30× |
+| `vt-einsum "ij,ij->ij"`（1M 元素） | 138 ms | **8 ms** | **17×** |
+
+根因不是「复数没优化」，而是**三条快路径的判据全是实数 dtype 谓词**
+（`all-f64-p` / `all-f32-p` / `all-i64-p` / `all-i32-p`），复数直接落到
+最底下的通用迭代状态机：每个输出元素都要走「补码递推 + 逐张量泛型 `aref`」，
+而 `vt-matmul` 走的是元素类型特化的三重循环。
+
+#### 16.21.2 三条快路径一并放开
+
+| 通道 | 触发表达式 | 复数走什么 | 为什么安全 |
+|---|---|---|---|
+| P1-1 逐元素 | `ij,ij->ij` / `i,i->i` | `vt-*`（**不是** `vt-map`） | 复数走 `vt-*` 的元素类型特化内核；`vt-map` 对复数只能泛型 `funcall`，1M 元素实测 138ms vs 8ms（17×） |
+| P1-2 全收缩 | `i,i->` | `%CX-EINSUM-DOT` | 单累加器，不取共轭，与 `numpy.einsum` 一致 |
+| BMM | `ij,jk->ik` / `...ij,...jk->...ik` | `%CX-GEMM-STRIDED` | 语义 = `matmul`（不取共轭），strides 直通 |
+
+#### 16.21.3 钩子而不是直接调用：编译顺序约束
+
+`src/linalg.lisp` 在 `src/complex.lisp` **之前**编译（`.asd` 里复数层必须最后，
+因为它要做前置分派）。所以 `einsum-execute` 不能直接写 `(%cx-gemm-strided ...)`
+—— 编译期那是未定义函数。
+
+沿用仓库既有的「SIMD 注册」模式（`*simd-matmul-2d-fn*`）：
+
+```lisp
+;; linalg.lisp（先编译）
+(defvar *cx-einsum-gemm-fn* nil)   ; 复数 GEMM 快路径
+(defvar *cx-einsum-dot-fn*  nil)   ; 复数全收缩内积
+
+;; complex.lisp（后加载，顶层 setf）
+(setf *cx-einsum-gemm-fn* #'%cx-gemm-strided
+      *cx-einsum-dot-fn*  #'%cx-einsum-dot)
+```
+
+判据里**必须**带上钩子本身：
+
+```lisp
+(or all-f64-p all-f32-p all-i64-p all-i32-p
+    (and *cx-einsum-gemm-fn* (or all-c128-p all-c64-p)))
+```
+
+否则钩子为 NIL 时仍然进入 BMM 分支，`funcall` NIL 崩掉、或 `cond` 落到
+`(t nil)` 后**静默返回空结果**。这是「可选加速器」模式最容易踩的坑：
+**判据要与使用点同源**。
+
+#### 16.21.4 `%CX-GEMM-STRIDED` 的两套循环
+
+```lisp
+(defun %cx-gemm-strided (ad bd rd m k n
+                         a-off b-off c-off
+                         sa-i sa-j sb-j sb-k sc-i sc-k))
+```
+
+- **快分支**（`sa-j = sb-k = sc-k = 1`，即 A 行内连续 + C 连续 ——
+  `ij,jk->ik` 的常规情形）：i-p-j 次序，内层 `(aref c (+ c-row jj))` 连续访存，
+  与 `%CX-MATMUL-RUN` 同款。
+- **通用分支**：按 strides 逐元素寻址，覆盖转置输入（`ij,kj->ik`）、
+  非连续输入（列步长 >1）、非连续 `:out`（`ij,jk->ki`）。
+
+两套循环都用 `%CX-DISPATCH` 做 **complex64 / complex128 元素类型特化** ——
+`safety 1`，不是 `safety 0`（见 §16.14.1 的分级：通用 stride 路径不享受
+「无条件信任」的待遇，`ld` 类错误必须让边界检查抓住）。
+
+`%CX-EINSUM-DOT` 同理：单累加器，`%cx-dispatch` 特化，`offset` 透传。
+
+#### 16.21.5 语义一致性验证
+
+差分必须**同时**对齐 numpy 与 `vt-matmul`，因为 einsum 的语义是
+「不取共轭」（`numpy.einsum` 一致），而 `vt-vdot` 才是共轭点积。
+覆盖矩阵（complex64 / complex128 各 12 例，全部通过）：
+
+`ij,jk->ik`、`ij,kj->ik`(NT)、strided A、`ij,jk->ki`（转置输出）、
+`ij,ij->ij`、`i,i->`、`...ij,...jk->...ik`、batch 广播 `(1,4,5)@(3,5,6)`、
+`:out` 提供、`k=1`、`i=1`、三张量链 `ij,jk,kl->il`。
+
+---
+
+### 16.22 顺带修掉的两个「静默错答案」（批量复数 matmul）
+
+做 §16.21 的差分时，`vt-einsum "...ij,...jk->...ik"` 与 `vt-matmul` 差了 **3.3**
+（量级不对，说明不是精度问题）。三方对照（einsum / matmul / 手写三重循环）
+定位到 `%CX-BATCHED-MATMUL` 的两个独立缺陷：
+
+| 缺陷 | 现象 | 根因 |
+|---|---|---|
+| **offset 丢失** | 每个 batch 都读到基数组开头 → 结果全错 | `(vt-slice (vt-ravel a) ...)` 得到的 1D 片段**已连续**，`vt-contiguous` 零拷贝返回它，`offset` 保留非零；而 `%CX-MATMUL-RUN` 按扁平下标从 0 起算 |
+| **不支持 batch 广播** | `(1,4,5)@(3,5,6)` 直接 `重塑失败: 元素总数不一致 (旧 0, 新 20)` | 原实现用 `reshape` 切 batch，隐含「两侧 batch 形状相同」 |
+
+这与 `manip.lisp` 里 `%flat-offset0` 一节记录的是**同一类根因**
+（「扁平下标 + 裸 AREF」遇到带 offset 的视图），只是这次发生在复数线代内核里。
+
+修复（两处都改在源头，不做调用侧补救）：
+
+1. `%CX-MATMUL-RUN` 签名加 `a-off / b-off / c-off`，`%CX-MATMUL-2D` 透传
+   `(vt-offset a)` / `(vt-offset b)` / `(vt-offset res)`；
+2. `%CX-BATCHED-MATMUL` 改为**按 strides 递推 batch 偏移**（不再 reshape 切片）：
+   batch 维右对齐、缺的左侧补 1、维长 1 → stride 0（广播），
+   与实数 SIMD 批量路径的广播语义一致。
+
+`%CX-DOT-1D` 也顺手补了 offset（同样的假设，只是此前没被触发）。
+
+---
+
+### 16.23 `vt-unique :axis`（通用特性，非复数专属）
+
+numpy 2.x 的 `unique(axis=...)` 此前 clvt **实数路径也没有**，属于通用缺口。
+实现严格照 numpy 的算法（`lib/_arraysetops_impl.py`）：
+
+1. `moveaxis(axis, 0)` + `reshape(n, m)` —— 沿 AXIS 的每个切片是一行，
+   行内元素按「其余轴的 C 序」展开；
+2. 用**稳定**排序按**逐元素字典序**排行（numpy 在有 `return_index` 时用 mergesort，
+   稳定排序保证「组首 = 首次出现」）；
+3. 相邻行做全元素 `!=` 比较，全等才算重复。
+
+实现取巧点：先把 AXIS 搬到首轴并落地为 C 连续副本，这样「行」在内存中连续
+（行 i = `[i*m, (i+1)*m)`），比较器不需要偏移表；输出再用**逆置换**转回原轴序
+（`AXIS = 0` 时省掉这次 transpose）。
+
+**返回值的布局契约**：`vt-unique :axis` 的结果恒为 **C 连续新数组**
+（`vt-contiguous-p` = T），与 numpy `unique(axis=)` 以及本库的**展平路径**
+一致。`transpose` 换回轴序后必须再 `vt-contiguous` 落地 —— 否则用户会拿到
+「形状对、布局是视图」的结果，与展平路径不一致（代价最多一次「唯一行」
+大小的拷贝；唯一行数 ≤ 输入行数）。
+
+#### 16.23.1 与展平路径的语义差异（同一个 numpy 里两条分支）
+
+| 场景 | 展平（`axis=NIL`） | 按轴（`axis=k`） |
+|---|---|---|
+| NaN × 多个 | **折叠为一个** | **每个含 NaN 的行都保留**（`NaN != NaN`） |
+| `-0.0` vs `0.0` | 相等（合并） | 相等（合并） |
+| 排序 | 升序 + NaN 末尾 | 行字典序 + NaN 末尾 |
+| `return-inverse` 形状 | 与输入同形（numpy ≥ 2.0） | **一维，长度 = 该轴长度** |
+
+「NaN 行不折叠」不是 bug 而是 numpy 的实测行为：
+
+```python
+np.unique(np.array([[nan,1],[nan,1],[2,0]]), axis=0)
+# [[2,0], [nan,1], [nan,1]]   ← 两行 NaN 都保留，counts 全为 1
+np.unique(np.array([nan, nan, 1.]))     # [1., nan]  ← 展平则折叠
+```
+
+#### 16.23.2 退化形状（numpy 实测，逐一对齐）
+
+| 输入 | `axis` | 结果形状 | 说明 |
+|---|---|---|---|
+| `(0, 3)` | 0 | `(0, 3)` | 0 个切片 |
+| `(3, 0)` | 0 | `(1, 0)` | 3 个**空行**全部相等 → 合并成 1 行 |
+| `(4,)` | 0 | `(1,)` | 秩 1 时 AXIS 被忽略（走展平分支）|
+
+#### 16.23.3 复数
+
+比较原语按 `complexp` 分派：字典序 = （实部，虚部），NaN 视为最大。
+因此 `vt-unique` 的复数包装在 `axis` 给定时**直接复用实数层的 `%UNIQUE-AXIS`**，
+不再写第二份实现 —— 这也验证了「按轴去重的比较是元素类型无关的」这一点。
+
+---
+
+### 16.24 `vt-trace :offset`（+ `:axis1` / `:axis2`）
+
+`vt-diagonal` 早就支持 `:offset`，`vt-trace` 却没有，且硬编码 `(assert (= 2 (vt-order ...)))`。
+本轮补齐完整签名 `vt-trace (matrix &key offset axis1 axis2 dtype out)`。
+
+三个要点：
+
+1. **收缩轴是 `-1` 而不是「全部」**。`vt-diagonal` 把对角线轴放在**末尾**，
+   所以 `(vt-sum d :axis -1)` 才是「沿对角方向收缩、保留其余轴」。
+   直接 `(vt-sum d)` 会把 batch 轴一起吃掉 —— 3D 输入 `axis1=1 axis2=2`
+   本该得到 `(2,)`，却得到标量（差分测试第一条就抓到了）。
+2. **越界 offset 返回 0**（`diag-len = 0` → 空求和），与 numpy 一致，不报错。
+3. **硬契约用 `error` 而非 `assert`**：`assert` 可能被 `(safety 0)` 编译剔除
+   （§16.18 已记录同类问题），秩 < 2 现在抛明确错误。
+
+与 numpy 的**已知差异**：numpy 的 `trace` 缺省是 `axis1=0, axis2=1`，
+clvt 与自家 `vt-diagonal` 保持一致，缺省取**最后两轴**。2 维输入两者等价；
+batch 输入要复现 numpy 缺省需显式 `:axis1 0 :axis2 1`（已写入 docstring）。
+
+---
+
+### 16.25 第五轮测试
+
+- `test/setops-axis-trace-test.lisp`：**56 条断言**
+  = 37 项 numpy 2.4.6 差分（unique :axis 的 7 种轴/19 例含 index/inverse/counts、
+  NaN 行、非连续视图、退化形状、复数 2 例 + trace 的 14 例含 offset 正负/越界/
+  复数/3D axis1+axis2）
+  + 契约断言（dtype/shape 保持、NaN 折叠差异、inverse 重建、
+  axis 越界与秩不足报错、`:out` 非连续 0 维视图）
+  + 实数回归网（默认路径逐位不变）
+- 期望值由 `test/gen_setops_axis_expected.py` 从本机 numpy 实测生成
+  （`test/setops-axis-expected.sexp`），禁手写（§10.4）。
+- 已接入 `test/run-tests.sh`（`SUITES` + `DEFAULT_ORDER`），当前共 **44 个套件**。
+
+---
+
+### 16.20 累计变更文件清单（第一～五轮）
 
 
 | 文件 | 改动 |
@@ -1902,6 +2106,14 @@ where/broadcast/copy-to!/write/save-load/array-equal/isclose… 全部直接可�
 | `test/complex-linalg-test.lisp` | **新增** 216 断言（46 差分 + 结构恒等式 + 108 压测 + 契约） |
 | `test/complex-ops-test.lisp` | 第四轮扩到 **149 断言**（新增 outer / any / all / take-along-axis） |
 | `test/run-tests.sh` | 注册 `complex-test` / `complex-ops-test` / `complex-linalg-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
+| `src/linalg.lisp` | **第五轮**：`vt-einsum` 的 P1-1/P1-2/BMM 三条通道放开复数（走 `*CX-EINSUM-GEMM-FN*` / `*CX-EINSUM-DOT-FN*` 钩子，见 §16.21）；`vt-trace` 补 `:offset` / `:axis1` / `:axis2`，收缩轴改 `-1`（§16.24） |
+| `src/complex.lisp` | **第五轮**：新增 `%cx-gemm-strided`（带 strides 的复数 GEMM 内核）与 `%cx-einsum-dot`，并注册两个 einsum 钩子；`%cx-matmul-run` 增加 offset 形参、`%cx-batched-matmul` 改按 strides 递推（支持 batch 广播）、`%cx-dot-1d` 补 offset（§16.22）；复数 `vt-trace` 透传新参数 |
+| `src/setops.lisp` | **第五轮**：新增 `%unique-axis` 及比较原语 `%axis-elem-lessp` / `%axis-elem-eq`；`vt-unique` 原实现改名 `%unique-flat` 并加 `:axis` 分发（§16.23） |
+| `src/complex-ops.lisp` | **第五轮**：复数 `vt-unique` 增加 `:axis`（axis 路径复用实数层实现） |
+| `test/setops-axis-trace-test.lisp` | **第五轮新增** 56 断言（37 项差分 + 契约 + 实数回归） |
+| `test/gen_setops_axis_expected.py` | **第五轮新增** 期望值生成器 |
+| `test/setops-axis-expected.sexp` | **第五轮新增** 生成产物（numpy 2.4.6 实测） |
+| `test/run-tests.sh` | 第五轮：注册 `setops-axis-trace-test`（当前共 44 个套件） |
 
 ---
 

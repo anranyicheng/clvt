@@ -1429,71 +1429,216 @@
   "复数 (m,k)@(k,n) → (m,n)，A/B 均为 C 连续。
 
    类型特化三重循环（i-k-j 次序，内层连续访存）。实测 256x256：
-   泛型版 1748ms → 特化版见 test/complex-bench.lisp。"
+   泛型版 1748ms → 特化版见 test/complex-bench.lisp。
+
+   ⚠ A/B 的 **offset 必须透传**（第五轮 §16.22 修复）：
+   VT-CONTIGUOUS 对「本身已连续」的切片视图是零拷贝，offset 保留原值
+   （如 (vt-slice (vt-ravel a) i j) 得到的 1D 片段）。原实现按扁平下标
+   从 0 起算，批量 matmul 的每个 batch 切片都会读到基数组开头 → 结果
+   静默错误（einsum 与 matmul 差 ~3.3）。同一根因见 manip.lisp 的
+   「扁平化 + 强制 offset=0」一节。"
   (let* ((m (first (vt-shape a)))
          (k (second (vt-shape a)))
          (n (second (vt-shape b)))
          (res (make-vt (list m n) 0 :dtype (vt-dtype a))))
     (when (plusp (* m k n))
-      (%cx-matmul-run (vt-data a) (vt-data b) (vt-data res) m k n))
+      (%cx-matmul-run (vt-data a) (vt-data b) (vt-data res)
+                      (the fixnum (vt-offset a))
+                      (the fixnum (vt-offset b))
+                      (the fixnum (vt-offset res))
+                      m k n))
     res))
 
-(defun %cx-matmul-run (ad bd rd m k n)
-  "C[m,n] = A[m,k] @ B[k,n]（C 连续、复数同精度）。"
+(defun %cx-matmul-run (ad bd rd a-off b-off c-off m k n)
+  "C[m,n] = A[m,k] @ B[k,n]（C 连续、复数同精度；三者的 offset 由调用方给出）。"
   (%cx-dispatch ad a zero
     (%cx-dispatch bd b zero2
       (%cx-dispatch rd c zero3
-        (declare (ignore zero2 zero3))
+        (declare (ignorable zero2 zero3))
         (dotimes (i m)
           (declare (type fixnum i))
-          (dotimes (j n)
-            (declare (type fixnum j))
-            (setf (aref c (+ (* i n) j)) zero)))
+          (let ((c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+            (declare (type fixnum c-row))
+            (dotimes (j n)
+              (declare (type fixnum j))
+              (setf (aref c (the fixnum (+ c-row j))) zero))))
         (dotimes (i m)
           (declare (type fixnum i))
-          (let ((a-row (the fixnum (* i k)))
-                (c-row (the fixnum (* i n))))
+          (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+                (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
             (declare (type fixnum a-row c-row))
             (dotimes (p k)
               (declare (type fixnum p))
-              (let ((av (aref a (+ a-row p)))
-                    (b-row (the fixnum (* p n))))
+              (let ((av (aref a (the fixnum (+ a-row p))))
+                    (b-row (the fixnum (+ b-off (the fixnum (* p n))))))
                 (declare (type fixnum b-row))
                 (dotimes (j n)
                   (declare (type fixnum j))
-                  (incf (aref c (+ c-row j)) (* av (aref b (+ b-row j)))))))))))))
+                  (incf (aref c (the fixnum (+ c-row j)))
+                        (* av (aref b (the fixnum (+ b-row j))))))))))))))
 
 (defun %cx-dot-1d (a b)
   "复数向量点积 → 0 维张量（不取共轭，对标 numpy.dot）。"
   (let* ((n (vt-size a))
          (ad (vt-data a)) (bd (vt-data b))
+         ;; ⚠ 必须带 offset：VT-CONTIGUOUS 对已连续视图是零拷贝，
+         ;; 其 offset 未必为 0（如 a[3:] 的切片）。
+         (ao (the fixnum (vt-offset a)))
+         (bo (the fixnum (vt-offset b)))
          (acc (vt-dtype-default-value (vt-dtype a))))
     (dotimes (i n)
-      (setf acc (+ acc (* (aref ad i) (aref bd i)))))
+      (setf acc (+ acc (* (aref ad (the fixnum (+ ao i)))
+                          (aref bd (the fixnum (+ bo i)))))))
     (make-vt nil acc :dtype (vt-dtype a))))
 
+;;; 11.6 einsum 复数 GEMM / 内积快路径（§16.21）
+;;;
+;;; 复数 einsum 的正确性由通用累加状态机保证，但那条路径每个元素都要
+;;; 走「补码递推 + 逐张量 aref」，256×256 的 `ij,jk->ik` 实测 2526ms，
+;;; 而 vt-matmul 只要 44ms（≈57×）。这里给 einsum 提供两个内核：
+;;;
+;;;   %CX-GEMM-STRIDED —— 带 strides 的 A@B 增量累加（einsum 的 BMM 通道）
+;;;   %CX-EINSUM-DOT   —— 全收缩内积 "i,i->"
+;;;
+;;; 两者都由 complex.lisp 在加载期注册到 linalg.lisp 的钩子上，
+;;; 因此 linalg.lisp（先编译）不需要知道复数层存在（§16.12 分派约定）。
+;;; ==================================================================
+
+(defun %cx-gemm-strided (ad bd rd m k n a-off b-off c-off
+                         sa-i sa-j sb-j sb-k sc-i sc-k)
+  "C += A @ B（复数，增量累加；C 由调用方清零）。
+
+   A: m×k，行步长 SA-I、列步长 SA-J；B: k×n，SB-J/SB-K；
+   C: m×n，SC-I/SC-K。语义 = einsum 的 `...ij,...jk->...ik`（不取共轭）。
+
+   SA-J、SB-K、SC-K 全为 1 时（A 行内连续 + C 连续，即 `ij,jk->ik`
+   的常规情形）走 i-p-j 特化循环，内层连续访存 —— 与 vt-matmul 同款
+   内核；否则（转置 / 广播 / 非连续 :out）走通用 strided 循环，
+   仍是元素类型特化代码，比通用状态机快一个数量级。"
+  (%cx-dispatch ad a zero
+    (%cx-dispatch bd b zero2
+      (%cx-dispatch rd c zero3
+        (declare (ignorable zero2 zero3))
+        (if (and (= sa-j 1) (= sb-k 1) (= sc-k 1))
+            (dotimes (ii m)
+              (declare (type fixnum ii))
+              (let ((a-row (the fixnum (+ a-off (the fixnum (* ii sa-i)))))
+                    (c-row (the fixnum (+ c-off (the fixnum (* ii sc-i))))))
+                (declare (type fixnum a-row c-row))
+                (dotimes (pp k)
+                  (declare (type fixnum pp))
+                  (let ((av (aref a (the fixnum (+ a-row pp))))
+                        (b-row (the fixnum (+ b-off (the fixnum (* pp sb-j))))))
+                    (declare (type fixnum b-row))
+                    (dotimes (jj n)
+                      (declare (type fixnum jj))
+                      (incf (aref c (the fixnum (+ c-row jj)))
+                            (* av (aref b (the fixnum (+ b-row jj))))))))))
+            (dotimes (ii m)
+              (declare (type fixnum ii))
+              (let ((a-row (the fixnum (+ a-off (the fixnum (* ii sa-i)))))
+                    (c-row (the fixnum (+ c-off (the fixnum (* ii sc-i))))))
+                (declare (type fixnum a-row c-row))
+                (dotimes (pp k)
+                  (declare (type fixnum pp))
+                  (let ((av (aref a (the fixnum (+ a-row (the fixnum (* pp sa-j))))))
+                        (b-row (the fixnum (+ b-off (the fixnum (* pp sb-j))))))
+                    (declare (type fixnum b-row))
+                    (dotimes (jj n)
+                      (declare (type fixnum jj))
+                      (incf (aref c (the fixnum (+ c-row (the fixnum (* jj sc-k)))))
+                            (* av (aref b (the fixnum (+ b-row
+                                                         (the fixnum (* jj sb-k)))))))))))))))))
+
+(defun %cx-einsum-dot (a b)
+  "einsum \"i,i->\" 的复数全收缩内积，返回复数**标量**（不取共轭）。
+   A/B 由调用方保证已连续（这里仍按 offset 索引，见 %CX-DOT-1D 的注记）。"
+  (let* ((n (vt-size a))
+         (ad (vt-data a)) (bd (vt-data b))
+         (ao (the fixnum (vt-offset a)))
+         (bo (the fixnum (vt-offset b))))
+    (%cx-dispatch ad aa zero
+      (%cx-dispatch bd bb zero2
+        (declare (ignore zero2))
+        (let ((acc zero)
+              (pa ao)
+              (pb bo))
+          (declare (type fixnum pa pb))
+          (dotimes (i n)
+            (declare (type fixnum i))
+            (setf acc (+ acc (* (aref aa pa) (aref bb pb))))
+            (incf pa)
+            (incf pb))
+          acc)))))
+
+(setf *cx-einsum-gemm-fn* #'%cx-gemm-strided
+      *cx-einsum-dot-fn*  #'%cx-einsum-dot)
+
 (defun %cx-batched-matmul (a b)
-  "批量矩阵乘 (...,m,k)@(...,k,n) → (...,m,n)：逐 batch 调 2D 内核。"
+  "批量矩阵乘 (...,m,k)@(...,k,n) → (...,m,n)，支持 numpy 风格 batch 广播。
+
+   逐 batch 调 %CX-MATMUL-RUN（带 offset 的 2D 内核），偏移量由 batch 轴的
+   strides 递推得到 —— 因此下面两类此前的静默错误一并消失：
+     · **offset 丢失**：原实现用 (vt-slice (vt-ravel a) ...) 切 batch，切片
+       视图带着非零 offset，而 2D 内核从 0 起算 → 每个 batch 都读基数组开头，
+       einsum 与 matmul 结果差 ~3.3（§16.22）。
+     · **不支持广播**：(1,4,5)@(3,5,6) 原实现直接 reshape 失败；现在按
+       维长 1 → stride 0 处理，与实数路径一致。"
   (let* ((sa (vt-shape a)) (sb (vt-shape b))
-         (ba (subseq sa 0 (- (length sa) 2)))
-         (bb (subseq sb 0 (- (length sb) 2)))
-         (batch (if (> (length ba) (length bb)) ba bb))
-         (m (nth (- (length sa) 2) sa))
-         (k (nth (1- (length sa)) sa))
-         (n (nth (1- (length sb)) sb))
-         (size (reduce #'* batch :initial-value 1))
+         (ra (length sa)) (rb (length sb))
+         (ba (subseq sa 0 (- ra 2)))
+         (bb (subseq sb 0 (- rb 2)))
+         (bn (max (length ba) (length bb)))
+         (npad-a (- bn (length ba)))
+         (npad-b (- bn (length bb)))
+         ;; numpy 语义：batch 维右对齐，缺的左侧补 1
+         (ba* (append (make-list npad-a :initial-element 1) ba))
+         (bb* (append (make-list npad-b :initial-element 1) bb))
+         (batch (mapcar (lambda (x y)
+                          (cond ((= x y) x)
+                                ((= x 1) y)
+                                ((= y 1) x)
+                                (t (error "vt-matmul: 批量维不可广播：~a vs ~a"
+                                          ba bb))))
+                        ba* bb*))
+         (m (nth (- ra 2) sa))
+         (k (nth (1- ra) sa))
+         (n (nth (1- rb) sb))
          (res (make-vt (append batch (list m n)) 0 :dtype (vt-dtype a)))
-         (rd (vt-data res)))
-    (dotimes (i size)
-      (let* ((a-slice (vt-contiguous
-                       (vt-reshape (vt-slice (vt-ravel a) (list (* i m k) (* (1+ i) m k)))
-                                   (list m k))))
-             (b-slice (vt-contiguous
-                       (vt-reshape (vt-slice (vt-ravel b) (list (* i k n) (* (1+ i) k n)))
-                                   (list k n))))
-             (part (%cx-matmul-2d a-slice b-slice))
-             (pd (vt-data part)))
-        (replace rd pd :start1 (* i m n) :end1 (* (1+ i) m n))))
+         (ad (vt-data a)) (bd (vt-data b)) (rd (vt-data res))
+         (cs (vt-strides res)))
+    (flet ((batch-strides (orig-dims orig-strs pad)
+             "把 ORIG-DIMS/ORIG-STRS 右对齐到 BN 个 batch 轴（左侧补 0），
+              并把「维长 1 但结果维 >1」的轴 stride 置 0（广播）。"
+             (append (make-list pad :initial-element 0)
+                     (loop for d in orig-dims
+                           for s in orig-strs
+                           for bd in (nthcdr pad batch)
+                           collect (if (and (= d 1) (> bd 1)) 0 s)))))
+      (let ((a-strs (batch-strides ba (subseq (vt-strides a) 0 (- ra 2)) npad-a))
+            (b-strs (batch-strides bb (subseq (vt-strides b) 0 (- rb 2)) npad-b))
+            (c-strs (subseq cs 0 bn))
+            (a-off (the fixnum (vt-offset a)))
+            (b-off (the fixnum (vt-offset b)))
+            (c-off (the fixnum (vt-offset res))))
+        (when (plusp (* m k n (reduce #'* batch :initial-value 1)))
+          ;; 混合基数遍历 batch（零分配，递归深度 = batch 秩）
+          (labels ((walk-batch (ax oa ob oc)
+                     (cond
+                       ((= ax bn)
+                        (%cx-matmul-run ad bd rd oa ob oc m k n))
+                       (t
+                        (let ((dim (nth ax batch))
+                              (stra (nth ax a-strs))
+                              (strb (nth ax b-strs))
+                              (strc (nth ax c-strs)))
+                          (declare (type fixnum dim))
+                          (dotimes (i dim)
+                            (walk-batch (1+ ax)
+                                (+ oa (* i stra))
+                                (+ ob (* i strb))
+                                (+ oc (* i strc)))))))))
+            (walk-batch 0 a-off b-off c-off)))))
     res))
 
 (defun %cx-matmul (a b)
@@ -1566,15 +1711,20 @@
             r))
       (funcall (%cx-orig 'vt-outer) a b :flatten flatten :dtype dtype :out out)))
 
-(defun vt-trace (matrix &key dtype out)
-  "矩阵迹（对角线之和，对标 numpy.trace）。复数保持复数 dtype。"
+(defun vt-trace (matrix &key (offset 0) axis1 axis2 dtype out)
+  "矩阵迹（对角线之和，对标 numpy.trace）。复数保持复数 dtype。
+
+   OFFSET / AXIS1 / AXIS2 语义见实数层同名函数（本层只做 dtype 保持）。"
   (if (%cx-deep-p matrix)
       (let* ((m (ensure-vt matrix))
              (dt (or dtype (vt-dtype m)))
-             (d (vt-diagonal m))
-             (r (vt-sum d :dtype dt)))
+             (d (vt-diagonal m :offset offset :axis1 axis1 :axis2 axis2))
+             ;; 同实数层：对角线轴在末尾，沿 -1 收缩 → 保留其余轴
+             (r (vt-sum d :axis -1 :dtype dt)))
         (if out (progn (vt-copy-into out r) out) r))
-      (funcall (%cx-orig 'vt-trace) matrix :dtype dtype :out out)))
+      (funcall (%cx-orig 'vt-trace) matrix
+               :offset offset :axis1 axis1 :axis2 axis2
+               :dtype dtype :out out)))
 
 ;;; ==================================================================
 ;;; 12. 范数（必然实数，§16.7）
@@ -1638,9 +1788,13 @@
 ;; vt-cond 复用 vt-svd + vt-inv，随之自动可用，故也不再列入拒绝清单。
 ;; 详见 CONVENTIONS §16.19。
 
-;; vt-einsum 已支持复数（第三轮）：白名单放开 complex64/complex128，
-;; 结果 dtype 由输入统一推导；走通用累加路径（matmul 快路径仍只服务实数，
-;; 复数请优先用 vt-matmul / vt-tensordot 的专用内核）。见 CONVENTIONS §16.19。
+;; vt-einsum 已支持复数（第三轮白名单放开 complex64/complex128）。
+;; 第五轮（§16.21）把三类快路径也接上复数：
+;;   · 逐元素 "ij,ij->ij"    → vt-map（元素类型无关）
+;;   · 全收缩 "i,i->"        → %CX-EINSUM-DOT
+;;   · GEMM/BMM "...ij,...jk->...ik" → %CX-GEMM-STRIDED
+;; 全部通过 *CX-EINSUM-GEMM-FN* / *CX-EINSUM-DOT-FN* 钩子注册（linalg.lisp
+;; 先编译，不能直接引用复数层）。钩子为 NIL 时自动回落到通用累加状态机。
 
 (%cx-def-unsupported (vt-sigmoid vt-relu vt-leaky-relu vt-swish vt-softplus
                      vt-gelu vt-mish vt-hard-tanh vt-hard-sigmoid)

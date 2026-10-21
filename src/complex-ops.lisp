@@ -410,14 +410,24 @@
                       (when return-counts cnt-vt))
               uniq-vt))))))
 
-(defun vt-unique (tensor &key return-index return-inverse return-counts)
-  "返回展平后唯一元素（升序、NaN 折叠为一个）。复数按字典序（§16.8）。"
-  (if (vt-complex-dtype-p (vt-dtype (ensure-vt tensor)))
-      (%cx-unique tensor return-index return-inverse return-counts)
-      (funcall (%cx-orig 'vt-unique) tensor
-               :return-index return-index
-               :return-inverse return-inverse
-               :return-counts return-counts)))
+(defun vt-unique (tensor &key return-index return-inverse return-counts axis)
+  "返回展平后唯一元素（升序、NaN 折叠为一个）。复数按字典序（§16.8）。
+
+   AXIS 给定时按轴去重（§16.23）。该路径的元素比较原语（%AXIS-ELEM-LESSP /
+   %AXIS-ELEM-EQ）本身与元素类型无关，复数按 (实部, 虚部) 字典序参与比较，
+   因此直接复用实数层的 %UNIQUE-AXIS，无需第二份实现。"
+  (let* ((in (ensure-vt tensor))
+         (rank (length (vt-shape in))))
+    (cond ((and axis (> rank 1))
+           (%unique-axis in (vt-normalize-axis axis rank)
+                         return-index return-inverse return-counts))
+          ((vt-complex-dtype-p (vt-dtype in))
+           (%cx-unique in return-index return-inverse return-counts))
+          (t (funcall (%cx-orig 'vt-unique) in
+                      :return-index return-index
+                      :return-inverse return-inverse
+                      :return-counts return-counts
+                      :axis axis)))))
 
 (defun %cx-key-table (test)
   "把 TEST 的元素装进 EQL 哈希表（键为 %CX-KEY）。"

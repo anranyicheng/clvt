@@ -8,6 +8,23 @@
   "批量 matmul 的 SIMD 快速路径。在 vt-matmul 的 >2D 分支里尝试调用，
    返回 VT 成功，NIL 回退到 vt-einsum。")
 
+;;; ------------------------------------------------------------------
+;;; 复数 einsum 快路径钩子（由 src/complex.lisp 注册，§16.21）
+;;;
+;;; linalg.lisp 先于 complex.lisp 编译，故用钩子而非直接引用。两个钩子
+;;; 只在「输入全为 complex64/complex128」时被调用，签名如下：
+;;;   *CX-EINSUM-GEMM-FN* : (data-a data-b data-c m k n
+;;;                          a-off b-off c-off
+;;;                          sa-i sa-j sb-j sb-k sc-i sc-k) → C += A@B
+;;;   *CX-EINSUM-DOT-FN*  : (a b) → 复数标量值（两输入已连续，不取共轭）
+;;; 为 NIL 时复数走通用累加状态机（语义正确，只是慢）。
+;;; ------------------------------------------------------------------
+(defvar *cx-einsum-gemm-fn* nil
+  "复数 einsum 的 GEMM 快路径（见 src/complex.lisp 的 %CX-GEMM-STRIDED）。")
+
+(defvar *cx-einsum-dot-fn* nil
+  "复数 einsum 的全收缩内积快路径（见 src/complex.lisp 的 %CX-EINSUM-DOT）。")
+
 (defvar *vt-einsum-parse-cache* (make-hash-table :test 'equal))
 
 (defvar *vt-einsum-cache-lock*
@@ -651,14 +668,43 @@
                 (return-from einsum-execute output))
 	      ;; ★ P1-1: 纯逐元素 einsum 路由到 vt-map
               ;; 形如 "ij,ij->ij" / "i,i->i" / "...ij,...ij->...ij"
+              ;; 复数（§16.21）：走 VT-* 的复数特化元素内核。**不要**用
+              ;; VT-MAP —— 后者对复数要走泛型 funcall，1M 元素实测
+              ;; 138ms vs 8ms（17×）。实数维持原 VT-MAP 分支不动。
               (when (and (= n-vts 2)
                          (equal (first input-subs) (second input-subs))
                          (equal (first input-subs) output-subs)
 			 (= (length (first input-subs))
 			    (length (remove-duplicates (first input-subs) :test #'eql)))
-                         (or all-f64-p all-f32-p all-i64-p all-i32-p))
+                         (or all-f64-p all-f32-p all-i64-p all-i32-p
+                             all-c128-p all-c64-p))
                 (return-from einsum-execute
-                  (vt-map #'* (first vts) (second vts) :out output)))
+                  (if (or all-c128-p all-c64-p)
+                      (vt-* (first vts) (second vts) :out output)
+                      (vt-map #'* (first vts) (second vts) :out output))))
+              ;; ★ P1-2b: 复数全收缩内积 "i,i->"（§16.21）
+              ;; 与下面实数内核同条件，只是累加器为复数：交给复数层的
+              ;; %CX-DOT-1D（不做共轭，与 numpy.dot / einsum 一致）。
+              (when (and (= n-vts 2)
+                         (or all-c128-p all-c64-p)
+                         *cx-einsum-dot-fn*
+                         (equal (first input-subs) (second input-subs))
+                         (null output-subs)
+                         (equal (vt-shape (first vts)) (vt-shape (second vts)))
+			 (= (length (first input-subs))
+			    (length (remove-duplicates (first input-subs) :test #'eql)))
+                         (eq (vt-dtype (first vts)) (vt-dtype (second vts))))
+                (let* ((sum (funcall *cx-einsum-dot-fn*
+                                     (vt-contiguous (first vts))
+                                     (vt-contiguous (second vts))))
+                       (val (if (eq out-dtype :complex64)
+                                (complex (coerce (realpart sum) 'single-float)
+                                         (coerce (imagpart sum) 'single-float))
+                                sum)))
+                  (setf (aref (the (simple-array * (*)) (vt-data output))
+                              (vt-offset output))
+                        val)
+                  (return-from einsum-execute output)))
               ;; ★ P1-2: 全收缩内积 "i,i->" / "ij,ij->" 专用内核
               ;; 条件：两输入形状完全相同、output 为空
               (when (and (= n-vts 2)
@@ -722,7 +768,11 @@
               ;; 批量矩阵乘法 (BMM) 极速通道
               (when (and (= n-vts 2)
                          (>= (length output-subs) 2)
-                         (or all-f64-p all-f32-p all-i64-p all-i32-p))
+                         (or all-f64-p all-f32-p all-i64-p all-i32-p
+                             ;; 复数（§16.21）：钩子由 complex.lisp 注册；
+                             ;; 未注册时不进本通道，回落到通用累加（语义不变）。
+                             (and *cx-einsum-gemm-fn*
+                                  (or all-c128-p all-c64-p))))
                 (let* ((s1 (first input-subs))
                        (s2 (second input-subs))
                        (shared (intersection s1 s2))
@@ -798,7 +848,17 @@
                                                                nil))
                                      (all-i32-p (gen-bmm-logic (signed-byte 32)
                                                                %matmul-i32-fast-kernel
-                                                               nil)))
+                                                               nil))
+                                     ;; 复数（§16.21）：内核在 complex.lisp，
+                                     ;; 由 %CX-GEMM-STRIDED 按元素类型再分派，
+                                     ;; 因此这里不需要 gen-bmm-logic 的类型展开。
+                                     ((and *cx-einsum-gemm-fn*
+                                           (or all-c128-p all-c64-p))
+                                      (funcall *cx-einsum-gemm-fn*
+                                               data-a data-b out-data
+                                               d-i d-j d-k off-a off-b off-c
+                                               sa-i sa-j sb-j sb-k so-i so-k))
+                                     (t nil))
                                    
                                    (let* ((lbl (first b-labels))
                                           (pos-lbl (position lbl all-labels-vec :test #'eql))
@@ -974,9 +1034,9 @@
   (multiple-value-bind (tensors dtype-arg out-arg)
       (parse-vt-op-args args)    
     (let* ((clean-tensors (mapcar #'ensure-vt tensors))
-           ;; 复数（complex64/complex128）也允许：einsum 的**通用累加路径**
-           ;; 只用泛型 aref + incf，与元素类型无关；只要不进 matmul 快路径
-           ;; （那条路径用 double-float SAP），复数语义就是对的。
+           ;; 复数（complex64/complex128）也允许：类型无关的通用累加路径
+           ;; 天然正确；三类快路径（逐元素/内积/GEMM）在复数层注册钩子后
+           ;; 也一并对复数生效（§16.21）。钩子缺席时自动回落通用路径。
            (supported-types '(:float64 :float32 :int64 :int32
                               :complex64 :complex128)))
       ;; 校验显式 dtype
@@ -1119,11 +1179,27 @@
                 (vt-* a-reshaped b-reshaped :dtype dtype :out out)))))))
 
 
-(defun vt-trace (matrix &key dtype out)
-  "矩阵迹: 对角线元素之和"
-  (assert (= 2 (vt-order matrix)))
+(defun vt-trace (matrix &key (offset 0) axis1 axis2 dtype out)
+  "矩阵迹（对标 numpy.trace）：指定对角线上元素之和。
+
+   OFFSET 语义同 vt-diagonal —— 正数取主对角线上方（右上）的第 OFFSET 条
+   对角线，负数取下方；越界（没有任何对角元素）时结果是 0（numpy 亦然）。
+
+   AXIS1 / AXIS2 是取迹的两条轴，**必须同时给出**；缺省取最后两轴
+   （与 vt-diagonal 一致）。注意 numpy 的 trace 缺省是 axis1=0/axis2=1
+   —— 2 维时两者等价，batch 输入需显式给出才能复现 numpy 缺省行为。
+
+   复数：结果保持复数 dtype（见 complex.lisp 的同名分派）。"
+  (let ((rank (length (vt-shape (ensure-vt matrix)))))
+    ;; 硬契约用 ERROR 而非 ASSERT：assert 可能被 (safety 0) 编译剔除
+    (when (< rank 2)
+      (error "vt-trace: 要求秩 >= 2，收到秩 ~a" rank)))
   (with-float-safe
-    (vt-sum (vt-diagonal matrix) :dtype dtype :out out)))
+    ;; vt-diagonal 把对角线轴放在**末尾**，因此沿 -1 求和即「沿对角方向收缩」，
+    ;; 保留其余轴 —— 正是 numpy.trace 对高维输入的行为（3D + axis1/axis2
+    ;; 得到「去掉这两轴」的张量，而不是标量）。
+    (vt-sum (vt-diagonal matrix :offset offset :axis1 axis1 :axis2 axis2)
+            :axis -1 :dtype dtype :out out)))
 
 (defun vt-norm (vt &key axis keepdims dtype out)
   "l2 范数（欧几里得范数）

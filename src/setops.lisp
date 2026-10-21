@@ -74,6 +74,153 @@
 ;;; 回退到旧实现，语义完全相同。
 ;;; ==================================================================
 
+;;; ------------------------------------------------------------------
+;;; 按轴去重（:axis，numpy 2.x 语义）
+;;;
+;;; numpy 的算法（lib/_arraysetops_impl.py，unique(axis=...)）：
+;;;   1. moveaxis(axis, 0) 后 reshape 成 (n, m) —— 沿 AXIS 的每个切片是一行，
+;;;      行内元素按「其余轴的 C 序」展开；
+;;;   2. 用**稳定**排序（return_index 时 numpy 用 mergesort）按逐元素字典序
+;;;      排行，NaN 排末尾；
+;;;   3. 相邻行做 aux[i] != aux[i-1] 的全元素比较，全等才算重复。
+;;;      → NaN != NaN，所以**含 NaN 的行永不合并**（每个 NaN 行独立保留）。
+;;;        这与展平模式（NaN 折叠为一个）是 numpy 内部的另一条分支，
+;;;        本实现如实分层：axis 模式不折叠 NaN（§16.23）；
+;;;   4. return_inverse 是长度 n 的一维数组（axis 模式下不 reshape），
+;;;      return_index 是沿 AXIS 的原始下标，return_counts 长度 = 唯一行数。
+;;;
+;;; 实现要点：先把 AXIS 搬到首轴并落地为 C 连续副本，这样「行」在内存里
+;;; 连续（行 i = [i*m, (i+1)*m)），比较器无需偏移表；输出再用逆置换转回。
+;;; 与展平路径完全独立 —— 展平路径的 NaN 折叠语义不能复用。
+;;; ------------------------------------------------------------------
+
+(declaim (inline %axis-elem-lessp %axis-elem-eq))
+
+(defun %axis-elem-lessp (x y)
+  "行内元素的字典序比较：NaN 视为最大，且两 NaN 之间返回 NIL（即「不更小」），
+   稳定排序下保持输入顺序 —— 与 numpy 对 NaN 的处理一致。
+   复数按 (实部, 虚部) 字典序（numpy 2.x 复数排序约定，§16.8）。"
+  (cond ((%cx-nan-p x) nil)
+        ((%cx-nan-p y) t)
+        ((complexp x)
+         (let ((xr (realpart x)) (yr (realpart y)))
+           (cond ((< xr yr) t)
+                 ((> xr yr) nil)
+                 (t (< (imagpart x) (imagpart y))))))
+        (t (< x y))))
+
+(defun %axis-elem-eq (x y)
+  "行内元素的**严格**数值相等：NaN 与自身不等 → 含 NaN 的行不会被合并。
+   调用方必须已屏蔽浮点陷阱（NaN 参与 `=` 会抛 FLOATING-POINT-INVALID-OPERATION）。"
+  (if (complexp x)
+      (and (= (realpart x) (realpart y))
+           (= (imagpart x) (imagpart y)))
+      (= x y)))
+
+(defun %axis-row-lessp (data i j m)
+  "行 I 是否字典序小于行 J（两行各 M 个元素，行在 DATA 中连续）。"
+  (declare (type (simple-array * (*)) data) (type fixnum i j m))
+  (let ((bi (the fixnum (* i m)))
+        (bj (the fixnum (* j m))))
+    (declare (type fixnum bi bj))
+    (dotimes (k m nil)
+      (let ((x (aref data (the fixnum (+ bi k))))
+            (y (aref data (the fixnum (+ bj k)))))
+        (cond ((%axis-elem-eq x y))            ; 该位相同 → 比下一位
+              ((%axis-elem-lessp x y) (return t))
+              (t (return nil)))))))
+
+(defun %axis-row-eq-p (data i j m)
+  "两行是否逐元素严格相等（全部相等才算重复行）。"
+  (declare (type (simple-array * (*)) data) (type fixnum i j m))
+  (let ((bi (the fixnum (* i m)))
+        (bj (the fixnum (* j m))))
+    (declare (type fixnum bi bj))
+    (dotimes (k m t)
+      (unless (%axis-elem-eq (aref data (the fixnum (+ bi k)))
+                             (aref data (the fixnum (+ bj k))))
+        (return nil)))))
+
+(defun %unique-axis (tensor ax return-index return-inverse return-counts)
+  "沿 AX AXIS 拆切片去重（numpy 2.x 语义）。实数/整数/复数通用。
+   TENSOR 已由调用方 ENSURE-VT；AX 已归一化为正轴且 RANK ≥ 2。"
+  (with-float-safe
+    (let* ((shape (vt-shape tensor))
+           (rank (length shape))
+           ;; 轴置换：AX 搬到首轴，其余保持原相对顺序
+           (perm (cons ax (loop for i below rank unless (= i ax) collect i)))
+           (moved (vt-contiguous (vt-transpose tensor perm)))
+           (data (vt-data moved))
+           (n (first (vt-shape moved)))
+           (m (if (zerop n) 0 (the fixnum (floor (vt-size moved) n))))
+           (dt (vt-dtype tensor))
+           (order (make-array n :element-type 'fixnum
+                                :initial-contents (loop for i below n collect i)))
+           ;; STABLE-SORT：同值行保持输入顺序 → 组首 = 首次出现（numpy 语义）
+           (sorted (stable-sort order
+                                (lambda (i j) (%axis-row-lessp data i j m))))
+           (uniq-rows (make-array (max n 1) :element-type 'fixnum))
+           (cnts (make-array (max n 1) :element-type '(signed-byte 64)))
+           (inv (when return-inverse
+                  (make-array n :element-type '(signed-byte 64))))
+           (u 0) (pos 0))
+      (declare (type fixnum u pos))
+      ;; ---- run-length：等价行相邻，故与组首比较即可 ----
+      (loop while (< pos n) do
+        (let* ((start pos)
+               (row (aref sorted pos)))
+          (incf pos)
+          (loop while (and (< pos n) (%axis-row-eq-p data row (aref sorted pos) m))
+                do (incf pos))
+          (setf (aref uniq-rows u) row)
+          (setf (aref cnts u) (the fixnum (- pos start)))
+          (when inv
+            (loop for q of-type fixnum from start below pos
+                  do (setf (aref inv (aref sorted q)) u)))
+          (incf u)))
+      ;; ---- 输出：把唯一行按「首轴 = 唯一值」组装，再转回原轴序 ----
+      (let* ((rest-shape (rest (vt-shape moved)))
+             (res (make-vt (cons u rest-shape) 0 :dtype dt))
+             (rd (vt-data res))
+             (inv-perm (let ((v (make-array rank :element-type 'fixnum)))
+                         (loop for p in perm for i from 0
+                               do (setf (aref v p) i))
+                         (coerce v 'list))))
+        (dotimes (i u)
+          (declare (type fixnum i))
+          (let ((src (the fixnum (* (aref uniq-rows i) m)))
+                (dst (the fixnum (* i m))))
+            (declare (type fixnum src dst))
+            (dotimes (k m)
+              (setf (aref rd (the fixnum (+ dst k)))
+                    (aref data (the fixnum (+ src k)))))))
+        (let* ((out (if (= ax 0)
+                        res
+                        ;; 轴序还原后再落地成 C 连续：numpy 的 unique(axis=)
+                        ;; 返回的就是新数组（flags 连续），而本库的展平路径
+                        ;; 也返回连续结果 —— 两条路径保持一致，避免用户拿到
+                        ;; 「形状对、vt-contiguous-p 却为 NIL」的视图。
+                        ;; 代价最多一次结果大小的拷贝（唯一行 ≤ 输入行）。
+                        (vt-contiguous (vt-transpose res inv-perm))))
+               (idx-vt (when return-index
+                         (%make-vt :data (if (= u n) (copy-seq uniq-rows)
+                                             (subseq uniq-rows 0 u))
+                                   :shape (list u) :strides '(1)
+                                   :offset 0 :dtype :int64)))
+               (cnt-vt (%make-vt :data (if (= u n) (copy-seq cnts)
+                                           (subseq cnts 0 u))
+                                 :shape (list u) :strides '(1)
+                                 :offset 0 :dtype :int64))
+               (inv-vt (when inv
+                         (%make-vt :data inv :shape (list n) :strides '(1)
+                                   :offset 0 :dtype :int64))))
+          (if (or return-index return-inverse return-counts)
+              (values out
+                      (when return-index idx-vt)
+                      (when return-inverse inv-vt)
+                      (when return-counts cnt-vt))
+              out))))))
+
 (defun %unique-slow (tensor)
   "旧实现（list 化 + stable-sort 下标 + 闭包比较器）。作为非特化元素类型的兜底。"
   (with-float-safe
@@ -127,10 +274,8 @@
                           :offset 0 :dtype :int64)
                 (vt-from-sequence cnts :dtype :int64))))))
 
-(defun vt-unique (tensor &key return-index return-inverse return-counts)
-  "返回展平后唯一元素（升序，nan 视为同一值，只保留一个）。
-   可选返回 return-index（首次出现下标）/ return-inverse（原→唯一映射）/
-   return-counts（出现次数）。语义对标 numpy.unique。"
+(defun %unique-flat (tensor return-index return-inverse return-counts)
+  "展平去重（vt-unique 的 axis=NIL 路径；nan 折叠为一个）。"
   (with-float-safe
     (let* ((flat (vt-contiguous (vt-flatten tensor)))
            (n (vt-size flat))
@@ -208,6 +353,25 @@
                           (when return-inverse inv-vt)
                           (when return-counts cnt-vt))
                   uniq-vt)))))))
+
+(defun vt-unique (tensor &key return-index return-inverse return-counts axis)
+  "唯一元素（对标 numpy.unique）。
+
+   AXIS = NIL（默认）：展平去重，结果升序、NaN 折叠为一个。
+   AXIS = 整数：沿该轴把切片当元素去重（numpy 2.x 语义）——
+     · 结果是「去重后的切片」，该轴长度替换为唯一行数，其余轴顺序不变；
+     · 行按逐元素字典序排序（numpy 对 structured dtype 的排序约定），
+       NaN 排末尾；含 NaN 的行**不合并**（NaN != NaN，与展平模式不同）；
+     · return-index 是沿 AXIS 的原始下标；return-inverse 是长度 = 该轴长度
+       的一维数组（可用 (vt-take u inv :axis axis) 重建输入）；
+       return-counts 是每个唯一行的出现次数。
+   秩为 1 时 AXIS 被忽略（numpy 同样走展平分支）。"
+  (let* ((in (ensure-vt tensor))
+         (rank (length (vt-shape in))))
+    (if (and axis (> rank 1))
+        (%unique-axis in (vt-normalize-axis axis rank)
+                      return-index return-inverse return-counts)
+        (%unique-flat tensor return-index return-inverse return-counts))))
 
 (defun %set-filter (u keep-table invert)
   "按 KEEP-TABLE 过滤已升序的 U（保持顺序），返回与 U 同 dtype 的新张量。
