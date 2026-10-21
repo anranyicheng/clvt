@@ -4,6 +4,76 @@
 
 ---
 
+## 2026-10-21（十）— 第十轮：median 契约、前缀扫描首元素与 NaN/Inf 语义
+
+第九轮补了「数值对拍」这条扫描线，本轮把表达式从 190 条扩到 **262 条**，
+新增 NaN/Inf 全组合、`axis` 元组、`:out` × 非连续、einsum 补全四个方向。
+结果：**除 `vt-median` 外这三块都没有静默错值**，而 `median` 一次暴露三处。
+
+### 缺陷一：`vt-median` 复数版与自家实数版三处分叉（都不报错）
+
+```lisp
+(vt-median a)   ; a = (3 4) complex128
+;; 修复前 → 3 个中位、形状 (3);  修复后 → 0 维标量（与实数路径、numpy 一致）
+```
+
+| # | 症状 | 根因 |
+|---|---|---|
+| 1 | `axis=nil` 按**末轴**归约（`(3 4)` → 形状 `(3)`，`:keepdims` → `(3 1)`） | 缺省轴写成 `(1- rank)`；numpy 与实数版都是「先 ravel 再取全局中位」 |
+| 2 | 空 fiber（轴长 0）返回 **0+0i** | `lo = (floor -1 2) = -1` + `%cx-fiber-starts` 在 size=0 时返回 0 条 → 结果保持 `make-vt` 的 0 |
+| 3 | 含 NaN 返回**某个真实元素** | 复数版没有 NaN 检查；numpy 与实数版都传播 NaN |
+
+顺带补了个洞：**复数 `vt-median` 原来没包 `WITH-FLOAT-SAFE`**（实数版包了）。
+SBCL 默认开着 `OVERFLOW/INVALID/DIVIDE-BY-ZERO` 陷阱，于是 NaN 判定 `(= x x)`
+与 `inf + (-inf)` 会直接抛 `FLOATING-POINT-INVALID-OPERATION`。
+
+### 缺陷二：前缀扫描用「单位元」而非「首元素直拷」
+
+numpy 的 **accumulate** 与 **reduce** 在这里方向相反：
+
+```python
+np.prod([inf+0j])            # (inf+nanj)          ← reduce 从 1 起算
+np.cumprod([inf+0j, 2+0j])   # [inf+0j, inf+nanj]  ← accumulate 首元素直拷
+np.cumsum([-0.0+0j])         # [-0.+0.j]           ← 首元素直拷，符号位保留
+```
+
+`%CX-SCAN-RUN` 两条路径都从单位元起算，于是：
+
+* `cumsum` 把输入的 `-0.0` 洗成 `+0.0`（符号位丢失）；
+* `cumprod` 首元素走 `1 * (inf+0i)` → `(1·inf − 0·0, 1·0 + 0·inf)` = `inf + nan i`，
+  凭空多一个虚部 NaN，并被后续所有元素继承。
+
+修法：连续路径与 dtype 回退路径都改成「首元素直拷，从第二个起才 OP」。
+有限数据下与旧实现逐位相同，只在 -0.0 / Inf 上有别。
+
+> 遗留：实数线的 `vt-cumsum` 走通用 `VT-CUMULATIVE`（acc 从 0 起算），
+> `cumsum([-0.0])` 仍给 `+0.0`。修它要动四处循环，与本轮主题无关，列为下一轮候选。
+
+### 已核实「不是 bug」的差异
+
+对拍剩下的 7 项不一致逐项归因：QR 的相位约定（重构误差 1.1e-16 / 6.7e-16）、
+LU 的置换约定、numpy 复数均值用 `sum × (1/n)` 导致 `0*Inf` 污染另一分量、
+全 NaN 切片里「用哪个 NaN」（`NaN+0i` vs `NaN+NaN i`）。
+**对拍不一致 ≠ 缺陷** —— 先排除约定差异与对方的浮点副作用，再决定改不改。
+
+### 测试
+
+新增 `test/complex-nan-inf-test.lisp`（**77 断言**，已接入 `run-tests.sh`，现共 **49 套件**）：
+
+- median 契约 15 项（`axis=nil` 形状/值/keepdims、与实数路径形状一致、NaN 全局与逐 fiber 传播、空轴/空输入、c64、`nanmedian` 对照）；
+- 前缀扫描 8 项（`-0.0` 符号位、`cumprod` 首元素 `inf+0i`、`axis=0` 每列首元素、c64、`axis=nil` 展平）；
+- NaN/Inf 归约 17 项（`nan*` 家族含 ±Inf 与全 NaN 切片、`inf+(-inf)` 相消、掩码三兄弟、`nan_to_num` 三替换、含 NaN 排序）；
+- `axis` 元组 12 项（形状 + **逐元素手算**对照，不借道库函数）；
+- `:out` 7 项（列切片**逐位置**核对、转置视图、reduce keepdims 列视图、matmul、原地别名）；
+- einsum 9 项（`...i,...i->...`、`ii->`、`ij->ji`、`ijk->ik`、`ijk,jk->i`、`i,j->ij`、`ab,bc,cd->ad`、`ijk->kji`、`...ij->...i`）。
+
+测试进程**故意不关 FP 陷阱**（SBCL 默认全开），既验证开陷阱时也能安全产出 NaN，
+也顺带抓到了 `WITH-FLOAT-SAFE` 的缺失。全量 **49 套件全绿**。
+
+文档：CONVENTIONS §16.30（方法 / 两个缺陷 / 三类「不是 bug」/ 测试）、§16.20 变更清单。
+
+---
+
 ## 2026-10-21（九）— 第九轮：沿轴扫描的静默错值（cumsum/cumprod 只算第一条 fiber）
 
 上一轮修的是「dtype 静默降级」，这一轮补上「**数值静默错值**」这条线 ——

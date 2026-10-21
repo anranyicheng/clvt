@@ -1166,36 +1166,68 @@
           ;; dtype 不同（用户显式要 c64/f64 另一精度）：通用回退
           (let ((rdata (vt-data res-flat)))
             (if (null ax)
-                (let ((acc (case op (:sum 0) (:prod 1))))
-                  (dotimes (i (vt-size flat))
-                    (let ((v (aref data i)))
-                      (setf acc (if (eq op :sum) (+ acc v) (* acc v)))
-                      (setf (aref rdata i) (vt-cast acc dt)))))
+                (let ((n (the fixnum (vt-size flat))))
+                  (declare (type fixnum n))
+                  (when (plusp n)
+                    (let ((acc (aref data 0)))
+                      (setf (aref rdata 0) (vt-cast acc dt))
+                      (dotimes (i (the fixnum (1- n)))
+                        (declare (type fixnum i))
+                        (let ((p (the fixnum (1+ i))))
+                          (declare (type fixnum p))
+                          (setf acc (if (eq op :sum)
+                                        (+ acc (aref data p))
+                                        (* acc (aref data p))))
+                          (setf (aref rdata p) (vt-cast acc dt)))))))
                 (multiple-value-bind (starts ax-stride dim-ax)
                     (%cx-fiber-starts shape ax)
                   (loop for st across starts
-                        do (let ((acc (case op (:sum 0) (:prod 1))))
-                             (dotimes (j dim-ax)
-                               (let ((v (aref data (+ st (* j ax-stride)))))
-                                 (setf acc (if (eq op :sum) (+ acc v) (* acc v)))
-                                 (setf (aref rdata (+ st (* j ax-stride)))
-                                       (vt-cast acc dt))))))))
+                        do (when (plusp dim-ax)
+                             (let ((acc (aref data st))
+                                   (p (the fixnum st)))
+                               (declare (type fixnum p))
+                               (setf (aref rdata p) (vt-cast acc dt))
+                               (dotimes (j (the fixnum (1- dim-ax)))
+                                 (declare (ignore j))
+                                 (incf p ax-stride)
+                                 (setf acc (if (eq op :sum)
+                                               (+ acc (aref data p))
+                                               (* acc (aref data p))))
+                                 (setf (aref rdata p) (vt-cast acc dt))))))))
             (unless (eq res-flat res) (vt-copy-into res res-flat))))
       res)))
 
 (defun %cx-scan-run (src dst shape ax op)
-  "类型特化的前缀扫描：SRC/DST 元素类型一致（complex64 或 complex128）。"
+  "类型特化的前缀扫描：SRC/DST 元素类型一致（complex64 或 complex128）。
+
+   语义（对标 numpy 的 accumulate）：**每条 fiber 的首元素直接拷贝**，从第二个
+   元素起才做 OP。别图省事从单位元起算 —— 会引入两处静默差异：
+     · cumsum：`0 + (-0.0)` 得 `+0.0`，把输入的 -0.0 洗成正零
+       （numpy.cumsum([-0.]) = [-0.]）；
+     · cumprod：`1 * (inf+0i)` 走复数乘法公式 `(1·inf − 0·0, 1·0 + 0·inf)`
+       = `inf+nan i`，凭空多出一个虚部 NaN，且该 NaN 会污染后续全部元素
+       （numpy.cumprod([inf+0j, 2+0j]) = [inf+0j, inf+nanj]，首元素是干净的）。
+   注意这与**归约**方向相反：numpy 的 sum/prod 确实从单位元起算
+   （np.prod([inf+0j]) = inf+nanj），那条路径在 %CX-REDUCE 里，不要一起改。"
   (%cx-dispatch src s zero
     (%cx-dispatch dst d zero2
-      (declare (ignore zero2))
+      (declare (ignore zero2)
+               (ignorable zero))
       (if (null ax)
-          (let ((acc (if (eq op :sum) zero (+ zero 1)))   ; prod 单位元 = 1+0i
-                (n (the fixnum (length s))))
+          (let ((n (the fixnum (length s))))
             (declare (type fixnum n))
-            (dotimes (i n)
-              (declare (type fixnum i))
-              (setf acc (if (eq op :sum) (+ acc (aref s i)) (* acc (aref s i))))
-              (setf (aref d i) acc)))
+            (when (plusp n)
+              ;; 首元素直拷（理由见函数注释），从第二个起才累加
+              (let ((acc (aref s 0)))
+                (setf (aref d 0) acc)
+                (dotimes (i (the fixnum (1- n)))
+                  (declare (type fixnum i))
+                  (let ((p (the fixnum (1+ i))))
+                    (declare (type fixnum p))
+                    (setf acc (if (eq op :sum)
+                                  (+ acc (aref s p))
+                                  (* acc (aref s p))))
+                    (setf (aref d p) acc))))))
           (multiple-value-bind (head dim ax-stride) (%cx-fiber-geom shape ax)
             (declare (type fixnum head dim ax-stride))
             (dotimes (h head)
@@ -1211,16 +1243,20 @@
                 ;; 一直是对的，它们都有这层 TI 循环，只有扫描内核漏了。
                 (dotimes (ti ax-stride)
                   (declare (type fixnum ti))
-                  (let ((acc (if (eq op :sum) zero (+ zero 1)))
-                        (p (the fixnum (+ hb ti))))
+                  (let ((p (the fixnum (+ hb ti))))
                     (declare (type fixnum p))
-                    (dotimes (j dim)
-                      (declare (type fixnum j))
-                      (setf acc (if (eq op :sum)
-                                    (+ acc (aref s p))
-                                    (* acc (aref s p))))
-                      (setf (aref d p) acc)
-                      (incf p ax-stride)))))))))))
+                    (when (plusp dim)
+                      ;; 首元素直拷（理由见函数注释），此后沿轴累加
+                      (let ((acc (aref s p)))
+                        (setf (aref d p) acc)
+                        (incf p ax-stride)
+                        (dotimes (j (the fixnum (1- dim)))
+                          (declare (ignore j))
+                          (setf acc (if (eq op :sum)
+                                        (+ acc (aref s p))
+                                        (* acc (aref s p))))
+                          (setf (aref d p) acc)
+                          (incf p ax-stride)))))))))))))
 
 (defun vt-cumsum (tensor &key axis dtype out)
   "沿 AXIS 的累积和（对标 numpy.cumsum）。AXIS=NIL 展平扫描。
@@ -1427,36 +1463,109 @@
       (%cx-sort-axis (ensure-vt tensor) axis :index t)
       (funcall (%cx-orig 'vt-argsort) tensor :axis axis)))
 
+(declaim (inline %cx-elem-nan-p))
+(defun %cx-elem-nan-p (z)
+  "复数元素是否含 NaN（任一分量为 NaN 即为真）。与 numpy 一致：复数里
+   只要有一个分量是 NaN，整个元素按「NaN」对待（median 要传播、nanmedian 要跳过）。"
+  (or (%cx-nan-p (%creal z)) (%cx-nan-p (%cimag z))))
+
+(defun %cx-has-nan-p (data off stride count)
+  "沿 DATA 从 OFF 起、步长 STRIDE 取 COUNT 个元素，判断是否有 NaN。
+   ⚠ 内部用 `(= x x)` 判 NaN（%CX-NAN-P），调用方**必须**在
+   WITH-FLOAT-SAFE 里调用，否则开着 FP 陷阱时会抛 FLOAT-INVALID。"
+  (declare (type fixnum off stride count))
+  (with-float-safe
+    (loop for i of-type fixnum below count
+          for p of-type fixnum = (+ off (* i stride))
+          thereis (%cx-elem-nan-p (aref data p)))))
+
 (defun vt-median (tensor &key axis keepdims)
   "中位数（对标 numpy.median）。复数按字典序排序后取中位；
-   偶数长度取两中位的复数均值（与 numpy 一致）。"
+   偶数长度取两中位的复数均值（与 numpy 一致）。
+
+   AXIS=NIL 时与实数路径 / numpy 一致：**先展平再取全局中位**（0 维标量），
+   KEEPDIMS 时形状为全 1（3×4 → (1 1)）。
+   轴长（或总元素数）为 0 → NaN+NaN i（numpy 同）。
+
+   v1.3 修复两处与实数路径的分叉（都是静默错值，不报错）：
+   1. AXIS=NIL 时原实现取 `(1- rank)`，即偷偷按**末轴**归约 ——
+      (3 4) 输入返回 3 个中位、形状 (3)，而实数路径与 numpy 都返回 1 个标量；
+   2. 空 fiber 时 `lo=(floor -1 2)=-1`，配合 (safety 1) 静默读出 0，
+      返回 0+0i 而非 NaN（实数路径这边是显式的 nanv）。"
   (if (not (%cx-tensor-p tensor))
       (funcall (%cx-orig 'vt-median) tensor :axis axis :keepdims keepdims)
-      (let* ((in (ensure-vt tensor))
-             (rank (length (vt-shape in)))
-             (ax (if axis (vt-normalize-axis axis rank) (1- rank)))
-             (sorted (vt-sort in :axis ax))
-             (n (nth ax (vt-shape sorted)))
-             (lo (floor (1- n) 2))
-             (hi (floor n 2))
-             (out-shape (%cx-keepdims-shape (vt-shape in) (list ax) keepdims))
-             (res (make-vt out-shape 0 :dtype (vt-dtype in)))
-             (flat (%cx-flat sorted))
-             (data (vt-data flat))
-             (shape (vt-shape flat)))
-        (multiple-value-bind (starts ax-stride dim-ax)
-            (%cx-fiber-starts shape ax)
-          (declare (ignore dim-ax))
-          (let ((vals (make-array (length starts))))
-            (loop for s across starts
-                  for i from 0
-                  do (setf (aref vals i)
-                           (if (= lo hi)
-                               (aref data (+ s (* lo ax-stride)))
-                               (* 0.5d0 (+ (aref data (+ s (* lo ax-stride)))
-                                           (aref data (+ s (* hi ax-stride))))))))
-            (%cx-write-flat res vals (vt-dtype in))))
-        res)))
+      ;; 与实数实现保持一致：整段包 with-float-safe。-0.0/inf 参与的中位数会
+      ;; 触发 FLOAT-INVALID（nan 判定、inf + -inf），用户开着 FP 陷阱时不能抛。
+      (with-float-safe
+       (let* ((in (ensure-vt tensor))
+              (rank (length (vt-shape in)))
+              (dt (vt-dtype in)))
+        (labels ((nan-elem ()
+                   ;; 与输入同精度的 NaN+NaNj
+                   (let ((nv (coerce +vt-dfloat-nan+
+                                     (vt-dtype->lisp-type
+                                      (vt-complex-real-dtype dt)))))
+                     (complex nv nv))))
+          (if (null axis)
+              ;; ---------------- 全局归约（axis=nil ≡ 先 ravel）----------------
+              (let* ((flat (vt-ravel in))
+                     (n (the fixnum (vt-size flat)))
+                     (out-shape (when keepdims (make-list rank :initial-element 1)))
+                     (res (make-vt out-shape 0 :dtype dt)))
+                (let ((sd (vt-data flat))
+                      (so (the fixnum (vt-offset flat))))
+                  (if (or (zerop n) (%cx-has-nan-p sd so 1 n))
+                      ;; numpy：整表含 NaN → 结果 NaN（不忽略）；本库实数路径同样返回 NaN
+                      (setf (aref (vt-data res) (vt-offset res)) (nan-elem))
+                      (let* ((sorted (vt-sort flat))
+                             (data (vt-data sorted))
+                             (o (the fixnum (vt-offset sorted)))
+                             (lo (the fixnum (floor (1- n) 2)))
+                             (hi (the fixnum (floor n 2))))
+                        ;; 平均值在 double 下算完再 cast：c64 的 res 元素类型是
+                      ;; (complex single-float)，直接 setf 会撞类型断言。
+                      (setf (aref (vt-data res) (vt-offset res))
+                              (if (= lo hi)
+                                  (aref data (+ o lo))
+                                  (vt-cast (* 0.5d0 (+ (aref data (+ o lo))
+                                                       (aref data (+ o hi))))
+                                           dt))))))
+                res)
+              ;; ---------------- 轴归约 ----------------
+              (let* ((ax (vt-normalize-axis axis rank))
+                     (sorted (vt-sort in :axis ax))
+                     (n (nth ax (vt-shape sorted)))
+                     (out-shape (%cx-keepdims-shape (vt-shape in) (list ax) keepdims))
+                     (res (make-vt out-shape 0 :dtype dt))
+                     (flat (%cx-flat sorted))
+                     (data (vt-data flat))
+                     (shape (vt-shape flat)))
+                (if (zerop n)
+                    ;; 空 fiber：numpy 给 NaN+NaN i，不是 0
+                    (let ((rd (vt-data res))
+                          (ro (the fixnum (vt-offset res)))
+                          (nanv (nan-elem)))
+                      (dotimes (k (vt-size res))
+                        (setf (aref rd (+ ro k)) nanv))
+                      res)
+                    (multiple-value-bind (starts ax-stride dim-ax)
+                        (%cx-fiber-starts shape ax)
+                      (declare (ignore dim-ax))
+                      (let ((vals (make-array (length starts)))
+                            (lo (the fixnum (floor (1- n) 2)))
+                            (hi (the fixnum (floor n 2))))
+                        (let ((nanv (nan-elem)))
+                          (loop for s across starts
+                                for i from 0
+                                do (setf (aref vals i)
+                                         (if (%cx-has-nan-p data s ax-stride n)
+                                             nanv   ; numpy：该 fiber 含 NaN → 该处 NaN
+                                             (if (= lo hi)
+                                                 (aref data (+ s (* lo ax-stride)))
+                                                 (* 0.5d0
+                                                    (+ (aref data (+ s (* lo ax-stride)))
+                                                       (aref data (+ s (* hi ax-stride))))))))))
+                        (%cx-write-flat res vals dt)))))))))))
 
 ;;; ==================================================================
 ;;; 11.5 矩阵乘法 / 点积 / 外积（专用内核）

@@ -2516,7 +2516,105 @@ det/inv/solve/pinv/cholesky/matrix_power/cond/svd-qr 的数值、复数比较与
 
 ---
 
-### 16.20 累计变更文件清单（第一～九轮）
+### 16.30 第十轮：NaN/Inf 语义、median 契约与 `:out` 非连续
+
+#### 16.30.1 方法：从「dtype 保真」走到「数值对拍」
+
+前几轮的扫描都在查「复数入参会不会掉回实数实现」，查不出「dtype 对、数值错」。
+本轮沿用第九轮的数值对拍，并把覆盖面从 190 条扩到 **262 条**，新增四个方向：
+
+| 方向 | 条数 | 结果 |
+|---|---:|---|
+| NaN / Inf 全组合（nan* 家族、掩码、`nan_to_num`、含 NaN 排序、全 NaN 切片） | 37 | 抓到 **median 不传播 NaN** |
+| `axis` 元组（`(0 1)`/`(1 2)`/`(0 2)`/负元组 × keepdims） | 17 | 全部一致 |
+| `:out` × 非连续（列切片 / 转置视图 / 原地别名 / matmul） | 7 | 全部一致 |
+| einsum 补全（`...i,...i->...`、`ii->`、`ijk,jk->i`、`ijk->kji` 等 11 种） | 11 | 全部一致 |
+
+结论：**除 median 外，`axis` 元组、`:out` 非连续、einsum 都没有静默错值**。
+
+#### 16.30.2 缺陷一：`vt-median` 的复数版有三处与自家实数版分叉
+
+三处都**不报错**，都是静默错值：
+
+| # | 症状 | 根因 |
+|---|---|---|
+| 1 | `(vt-median a)` 对 `(3 4)` 输入返回 **3 个中位、形状 (3)** | `(ax (if axis (vt-normalize-axis axis rank) (1- rank)))` —— `axis=nil` 被写成「末轴」，而 numpy 与**本库实数版**都是「先 ravel 再取全局中位」，返回 0 维标量。连带 `:keepdims t` 给出 `(3 1)` 而不是 `(1 1)` |
+| 2 | 空 fiber（轴长 0）返回 **0+0i** | `lo = (floor (1- 0) 2) = -1`，`%cx-fiber-starts` 在 size=0 时返回 0 条，循环不进 → 结果保持 `make-vt` 的 0。实数版这边是显式 `nanv` |
+| 3 | 含 NaN 时返回**某个真实元素**而不是 NaN | 复数版按字典序排序后直接取中位，没有 NaN 检查；numpy 与实数版都传播 NaN |
+
+修法：`axis=nil` 走独立的全局分支（ravel → sort → 取中位，keepdims 用全 1 形状）；
+空 fiber / 含 NaN 一律写 `NaN+NaN i`；逐 fiber 判断用新助手
+`%CX-ELEM-NAN-P` / `%CX-HAS-NAN-P`。
+
+> 顺带补了一个洞：**复数 `vt-median` 原本没包 `WITH-FLOAT-SAFE`**（实数版包了）。
+> SBCL 默认开着 `OVERFLOW/INVALID/DIVIDE-BY-ZERO` 陷阱，于是 NaN 判定
+> `(= x x)`、`inf + (-inf)` 都会直接抛 `FLOATING-POINT-INVALID-OPERATION`。
+> 现在整个函数体与实数版一致地包在 `WITH-FLOAT-SAFE` 里。
+
+#### 16.30.3 缺陷二：前缀扫描用「单位元」而非「首元素直拷」
+
+numpy 的 **accumulate**（`cumsum`/`cumprod`）与 **reduce**（`sum`/`prod`）在这一点上
+**方向相反**，容易抄错：
+
+```python
+np.prod([inf+0j])            # (inf+nanj)   ← reduce 从单位元 1 起算，0*inf → nan
+np.cumprod([inf+0j, 2+0j])   # [inf+0j, inf+nanj]  ← accumulate 首元素是**直拷**的
+np.sum([-0.0+0j])            # 0j           ← 0 + (-0.0) = +0.0
+np.cumsum([-0.0+0j])         # [-0.+0.j]    ← 首元素直拷，符号位保留
+```
+
+`%CX-SCAN-RUN` 原来两条路径都从单位元起算，于是：
+
+- `cumsum` 把输入的 `-0.0` 洗成 `+0.0`（符号位丢失）；
+- `cumprod` 的首元素经 `1 * (inf+0i)` → 复数乘法 `(1·inf − 0·0, 1·0 + 0·inf)`
+  = `inf + nan i`，凭空多出一个虚部 NaN，**并且这个 NaN 会污染后续所有元素**。
+
+修法：两条路径（连续 + dtype 转换回退）都改成「首元素直拷，从第二个起才 `OP`」。
+正常数据下与旧实现逐位相同（`0+x`、`1*x` 对有限值精确），只在 -0.0 / Inf 上有别 ——
+这正是本轮测试锁的点。
+
+> **遗留（非复数问题）**：实数线的 `vt-cumsum`/`vt-cumprod` 走通用
+> `VT-CUMULATIVE`（`acc` 从 0/1 起算），因此实数 `cumsum([-0.0])` 仍给 `+0.0`。
+> 修它要动快路径 + 通用路径 + 轴分支共四处循环，风险与本轮主题（复数）无关，
+> 故列为下一轮候选，不在本轮夹带。
+
+#### 16.30.4 已核实「不是 bug」的三类差异
+
+数值对拍剩下的 7 项不一致，逐项归因后都不是缺陷：
+
+| 项 | 现象 | 归因 |
+|---|---|---|
+| `vt-qr` 的 Q/R | 与 numpy 差一个单位模相位 | QR 列可乘任意单位模相位；用重构恒等式判：`‖QᴴQ−I‖ = 1.1e-16`、`‖QR−A‖ = 6.7e-16` |
+| `vt-lu` 的置换 | 返回 `(lu perm sign)`，约定不同 | 重构由 `complex-linalg-test` 覆盖 |
+| `mean`/`nanmean` 含 ±Inf | numpy 的**另一分量**变 NaN，clvt 保持 0 | numpy 用 `sum × (1/n)` 做复数除法，`0 * Inf` / `NaN * 0` 会污染另一分量；clvt 逐分量除。clvt 的行为更符合直觉，且 `isnan` 判定一致 |
+| 全 NaN 切片的 `nanmin` / 含 NaN 的 `median` | NaN 出现在哪个分量不同（`NaN+0i` vs `NaN+NaN i`） | 两者 `CZ-NAN-P` 都为真；属「用哪个 NaN」的表示差异 |
+
+这条经验值得记住：**对拍不一致 ≠ 缺陷**。先把「是不是约定差异 / 是不是对方实现里的
+浮点副作用」排除掉，再决定改不改。
+
+#### 16.30.5 测试
+
+`test/complex-nan-inf-test.lisp`（**77 断言**，已接入 `run-tests.sh`，共 49 套件）：
+
+- **A. median 契约**（15）：`axis=nil` 的 0 维/值/keepdims 形状、与实数路径形状一致、
+  轴归约值、c64 保持 dtype、NaN 全局/逐 fiber 传播、空轴与空输入 → NaN、`nanmedian` 对照；
+- **B. 前缀扫描**（8）：`-0.0` 符号位、`cumprod` 首元素 `inf+0i` 无虚部 NaN、
+  第二元素 `inf+nanj`、`nancumprod`、`axis=0` 每列首元素、c64、`axis=nil` 展平形状；
+- **C. NaN/Inf 归约**（17）：`nan*` 家族含 ±Inf 与全 NaN 切片、`inf + (-inf)` 相消、
+  掩码三兄弟、`nan_to_num` 三替换、含 NaN 排序、`nancumsum`；
+- **D1. axis 元组**（12）：形状 + **逐元素手算对照**（fiber 和/积/字典序极值/norm），
+  不借道任何库函数；
+- **D2. `:out`**（7）：列切片落点**逐位置**核对（含「其余位置不动」）、转置视图、
+  reduce keepdims 列视图、matmul、原地别名；
+- **D3. einsum**（9）：`...i,...i->...`、`ii->`、`ij->ji`、`ijk->ik`、`ijk,jk->i`、
+  `i,j->ij`、`ab,bc,cd->ad`、`ijk->kji`、`...ij->...i`。
+
+> 测试进程**故意不关 FP 陷阱**（SBCL 默认全开）：既验证这些函数在用户开着陷阱时
+> 也能安全产出 NaN，也顺带抓到了 16.30.2 提到的 `WITH-FLOAT-SAFE` 缺失。
+
+---
+
+### 16.20 累计变更文件清单（第一～十轮）
 
 | 文件 | 改动 |
 |---|---|
@@ -2566,6 +2664,8 @@ det/inv/solve/pinv/cholesky/matrix_power/cond/svd-qr 的数值、复数比较与
 | `test/complex-gap-test.lisp` | **第八轮新增** 50 断言（dtype 契约 / numpy 数值对照 / 报错契约 / layer-norm 自洽性 / 回归网），注册后共 47 套件 |
 | `src/complex.lisp` | **第九轮**：`%cx-scan-run` 的 axis 分支补 `AX-STRIDE` 层遍历（cumsum/cumprod/nancumsum/nancumprod 沿非末轴只算第一条 fiber 的静默错值，§16.29） |
 | `test/complex-scan-axis-test.lisp` | **第九轮新增** 26 断言（2-D 两轴 / 3-D 三轴 / 负轴 / 转置视图 / c64 / 退化 / `:out` 连续与非连续 / 实数回归），注册后共 48 套件 |
+| `src/complex.lisp` | **第十轮**：`%cx-scan-run` 与 dtype 回退分支改为「首元素直拷」（§16.30.3）；`vt-median` 复分支重写 `axis=nil` 全局路径 / 空 fiber 与 NaN 传播 / 补 `with-float-safe`；新增 `%cx-elem-nan-p`、`%cx-has-nan-p` |
+| `test/complex-nan-inf-test.lisp` | **第十轮新增** 77 断言（median 契约 / 扫描首元素 / NaN·Inf 归约 / axis 元组 / `:out` 非连续 / einsum 补全），注册后共 49 套件 |
 
 ---
 
