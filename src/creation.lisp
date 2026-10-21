@@ -14,9 +14,15 @@
   "创建以 VALUE 填充的张量。等价 numpy.full(shape, value)。"
   (make-vt shape value :dtype dtype))
 
-(defun vt-full (shape fill-value &key (dtype :float64))
-  "创建以 FILL-VALUE 填充的张量（对标 numpy.full）。"
-  (make-vt shape fill-value :dtype dtype))
+(defun vt-full (shape fill-value &key (dtype nil))
+  "创建以 FILL-VALUE 填充的张量（对标 numpy.full）。
+
+   DTYPE 缺省时（v0.5.x 修复）：FILL-VALUE 是复数 → :complex128，否则
+   :float64（保持原有「实数填充默认 float64」的行为，不按整数推断，
+   以免 (vt-full s 3) 从 float64 变成 int64）。
+   旧实现把缺省值写死成 :float64，于是 (vt-full s #C(3 1)) 静默丢虚部。"
+  (make-vt shape fill-value
+           :dtype (or dtype (if (complexp fill-value) :complex128 :float64))))
 
 (defun vt-empty (shape &key (dtype :float64))
   "创建「未初始化」张量（对标 numpy.empty）。本库以 0 填充，故与 vt-zeros 等价。"
@@ -190,6 +196,13 @@
          (size (vt-shape-to-size shape))
          (cl-etype (array-element-type arr))
          (infer (cond
+                  ;; 复数数组（v0.5.x 修复）：旧实现的 cond 里没有 complex 分支，
+                  ;; `(complex double-float)` 一路落到最后的 (t :float64)，
+                  ;; 于是 (vt-from-array <复数数组>) 把虚部静默丢掉 ——
+                  ;; 这是「数据入口」上的静默错值，比报错危险得多。
+                  ;; 复数类型不是 double-float 的子类型，故顺序无关，但放最前更清楚。
+                  ((subtypep cl-etype '(complex double-float)) :complex128)
+                  ((subtypep cl-etype '(complex single-float)) :complex64)
                   ;; 窄类型优先：signed-byte 8 ⊂ 16 ⊂ 32 ⊂ 64，
                   ;; subtypep 判定"数组元素类型是某 dtype 值域的子集"，
                   ;; 最先匹配者即最小精确 dtype。

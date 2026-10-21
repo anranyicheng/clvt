@@ -482,6 +482,30 @@
 ;;; 5. 幂（§16.10）
 ;;; ==================================================================
 
+(defun %cx-pow-2 (x y)
+  "复数逐元素幂 x^y（主值分支），含极点与 NaN 的边界处理。
+   vt-pow 与 vt-float-power 共用同一份内核 —— 两者的复数语义完全相同
+   （都按 CL 复指数 expt 的主值分支），差别只在实数路径：
+   vt-pow 对整数保留精确整数幂，vt-float-power 一律按浮点算。"
+  (let ((base (if (complexp x) x (complex x 0)))
+        (e (if (complexp y) y (complex y 0))))
+    (cond
+          ;; 指数为 0（含 0+0i）→ 1+0i，**先于** NaN/极点判定
+          ;; （对标 numpy 与 C99 pow：nan**0 = 1、0**0 = 1；
+          ;;  实数路径本来就是 1，旧复数路径却先判 NaN 给出 NaN，
+          ;;  与自身实数路径都不一致，这里一并修掉）
+          ((%cis-zero e)
+           (complex (float 1 (%creal base))
+                    (* 0 (%cimag base))))
+          ((%cx-nan-p base) (%cx-nan-complex base))
+          ((and (%cis-zero base)
+                (plusp (%creal e))
+                (zerop (%cimag e)))
+           (complex (* 0 (%creal base)) (* 0 (%cimag base))))
+          ((%cis-zero base) (%cx-nan-complex base))
+          (t (handler-case (expt base e)
+               (error () (%cx-nan-complex base)))))))
+
 (defun vt-pow (vt power &key out dtype)
   "逐元素幂 VT**POWER（对标 numpy.power）。
 
@@ -495,28 +519,37 @@
                (promoted (or dtype (vt-promote-type (vt-dtype in) (vt-dtype pw))))
                (dt (if (vt-complex-dtype-p promoted) promoted :complex128))
                (dt (%cx-result-complex-dtype dt (and dtype dtype) "VT-POW")))
-          (vt-map (lambda (x y)
-                    (let ((base (if (complexp x) x (complex x 0)))
-                          (e (if (complexp y) y (complex y 0))))
-                      (cond ((%cx-nan-p base) (%cx-nan-complex base))
-                            ;; 指数为 0（含 0+0i）→ 1+0i，先于极点判定
-                            ;; （对标 numpy：0**0 = 1、nan**0 = 1）
-                            ((%cis-zero e)
-                             (complex (float 1 (%creal base))
-                                      (* 0 (%cimag base))))
-                            ((and (%cis-zero base)
-                                  (plusp (%creal e))
-                                  (zerop (%cimag e)))
-                             (complex (* 0 (%creal base)) (* 0 (%cimag base))))
-                            ((%cis-zero base) (%cx-nan-complex base))
-                            (t (handler-case (expt base e)
-                                 (error () (%cx-nan-complex base)))))))
-                  in pw :out out :dtype dt))
+          (vt-map (function %cx-pow-2) in pw :out out :dtype dt))
         (funcall (%cx-orig 'vt-pow) vt power :out out :dtype dtype))))
 
 (defun vt-expt (vt power &key out dtype)
   "vt-pow 的别名（CL 习惯命名）。"
   (vt-pow vt power :out out :dtype dtype))
+
+;;; ------------------------------------------------------------------
+;;; 5.1 vt-float-power（numpy.float_power）
+;;;
+;;; 实数路径的实现是 (coerce a 'double-float)/(coerce b 'double-float) 后
+;;; expt —— 对复数入参就是**静默取实部**（实测 (vt-float-power #C(2 1)
+;;; #C(2 0)) 得 4.0，而 numpy 给 3+4j）。复数分支直接复用 %CX-POW-2：
+;;; numpy.float_power 与 numpy.power 在复数域是同一个 pow 主值分支
+;;; （实测 (2+1j)**(0.5+0j) 两者都是 1.4553+0.3436j），只是 float_power
+;;; 对实数也强制浮点。
+;;; ------------------------------------------------------------------
+(let ((orig (%cx-orig 'vt-float-power)))
+  (setf (symbol-function 'vt-float-power)
+        (lambda (x y &rest keys &key (out nil) (dtype nil) &allow-other-keys)
+          (declare (ignore keys))
+          (if (or (%cx-deep-p x) (%cx-deep-p y))
+              (let* ((xe (ensure-vt x))
+                     (ye (ensure-vt y))
+                     (promoted (or dtype (vt-promote-type (vt-dtype xe)
+                                                          (vt-dtype ye))))
+                     (dt (if (vt-complex-dtype-p promoted) promoted :complex128))
+                     (dt (%cx-result-complex-dtype dt (and dtype dtype)
+                                                  "VT-FLOAT-POWER")))
+                (vt-map (function %cx-pow-2) xe ye :out out :dtype dt))
+              (funcall orig x y :out out :dtype dtype)))))
 
 ;;; ==================================================================
 ;;; 6. 比较与极值（字典序，§16.8）
@@ -1865,6 +1898,9 @@
 
 (%cx-def-unsupported (vt-atan2)
   "atan2 只接受实数（numpy 抛 TypeError）；复数请用 vt-angle")
+
+(%cx-def-unsupported (vt-cbrt)
+  "numpy：ufunc 'cbrt' 不接受复数；复数立方根请用 (vt-pow z 1/3)。旧实现会把复数入参静默取实部后返回实数（(vt-cbrt #C(8 0)) → 2.0）")
 
 (%cx-def-unsupported (vt-even-p vt-odd-p)
   "奇偶性对复数无定义")

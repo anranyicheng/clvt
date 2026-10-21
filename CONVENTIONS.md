@@ -2327,8 +2327,105 @@ n=256、单线程、预分配缓冲区、只计内核本身（不含 `make-vt`/`
 
 ---
 
-### 16.20 累计变更文件清单（第一～六轮）
+### 16.28 第八轮：复数缺口扫描与补齐（入口 / 幂 / 归一化）
 
+#### 16.28.1 怎么扫（这套方法请沿用）
+
+「哪些函数没支持复数」不能靠读代码猜 —— 复数层是**前置分派**（§16.12）：
+没被包过的函数会静默落到实数实现，可能报错，也可能**悄悄取实部**。
+所以按三层扫：
+
+| 层 | 做法 | 能发现什么 |
+|---|---|---|
+| ① 静态差集 | 从 `package.lisp` 抽 `#:vt-*` 导出清单，减去 `complex*.lisp` 里出现过的符号 | 「完全没被复数层碰过」的函数（367 个导出里 202 个被碰过、165 个没有） |
+| ② 动态探针 | 对每个候选按真实签名喂复数入参，分 `:ok / :reject / :type / :other` | ② 剩下的差异：`%cx-def-unsupported` 的显式拒绝 vs 实数实现的类型断言崩 |
+| ③ dtype 保真扫描 | 对**所有**可调用导出符号统一喂 `complex128`，看结果 dtype 是否变成实数 | **静默丢虚部**（最危险的一类），三层里只有这一层能抓 |
+
+③ 的实现要点：把「按定义就该返回实数」的函数（`abs/angle/isnan/argmax/norm/
+var/std/det/matrix-rank/…`）列成白名单，其余出现「复数入 → 实数出」一律当嫌疑。
+本轮 ③ 报了 24 个，其中 19 个是白名单漏项（比较运算、`argsort`、`nanvar` 等），
+真问题 5 个。
+
+#### 16.28.2 本轮修掉的 6 个缺口
+
+| # | 函数 | 症状 | 根因 |
+|---|---|---|---|
+| 1 | `vt-from-array` | `(complex double-float)` 数组 → **float64**（虚部丢） | `infer` 的 `cond` 里没有 complex 分支，落到末尾 `(t :float64)` |
+| 2 | `vt-from-sequence` | 含复数的 list → **float64** | `:dtype` 缺省值写死 `:float64`（填充路径已支持复数，是 dtype 拖累的） |
+| 3 | `vt-full` | `(vt-full s #C(3 1))` → **float64** | 同上，`:dtype` 缺省写死 `:float64` |
+| 4 | `vt-float-power` | 复数 → **float64**（只算实部） | 实现里 `(coerce a 'double-float)` |
+| 5 | `vt-cbrt` | 复数 → **float64** | `%float-map-pair` 强制实数内核 |
+| 6 | `vt-layer-norm` | 复数 → `#C(0 0) is not of type REAL` | `final-dtype` 写死「float32 或 float64」，`(vt-+ var eps :dtype :float64)` 撞断言 |
+
+1–3 是**数据入口**上的静默错值，4–5 是**数值算子**上的静默错值，6 是硬报错。
+
+#### 16.28.3 三个语义决策（不是「能跑就行」）
+
+1. **`vt-cbrt` 不改复数实现，改成拒绝。** numpy 2.3.5 实测
+   `np.cbrt(np.array([8+0j]))` → `TypeError: ufunc 'cbrt' not supported for the
+   input types`。所以正确行为是**确定性报错**（并入 `%cx-def-unsupported`），
+   而不是补一个「复数立方根」——那会造出一个 numpy 没有的语义。
+   需要复数立方根请写 `(vt-pow z 1/3)`（主值分支，与 `np.power` 一致）。
+2. **`vt-float-power` 复用 `vt-pow` 的内核。** 两者在复数域是同一个 pow
+   主值分支（实测 `np.float_power(2+1j, 0.5+0j)` 与 `np.power` 逐位相同），
+   差别只在实数侧：`pow` 对整数保留精确整数幂、`float_power` 一律浮点。
+   于是把原来内联在 `vt-pow` 里的 lambda 提成 `%CX-POW-2`，两处共用 ——
+   边界（`x^0=1`、`0^负数=NaN`、`0^0=1`、NaN 传播）只有一份实现。
+3. **`vt-layer-norm` 的复数定义**：沿归一化轴取**复数均值**、
+   **实数方差**（`mean(|x-mean|²)`，与 numpy 的 `var(complex)` 一致）、
+   实数 `std = sqrt(var+eps)`，再 `(x-mean)/std` → 复数。
+   实现上只要不把中间量 `:dtype` 强制成实数即可（`final-dtype` 跟随输入
+   的复数 dtype，`var/std/eps` 走对应的实 dtype）。
+   torch 的 `layer_norm` 只定义在实数域，所以这一条是**本库的扩展语义**，
+   用「虚部为 0 时退化为实数路径」+「归一化后 fiber 均值为 0、var≈1」
+   两条自洽性断言来锁（§16.28.5）。
+
+#### 16.28.4 顺带修掉的一个不一致
+
+`vt-pow` 的复数路径里 NaN 判定排在「指数为 0」之前，于是
+`(vt-pow #C(nan 0) 0)` → `NaN+NaNj`，而**实数路径**给 `1.0`、numpy 也给 1
+（C99 的 `pow` 约定）。`%CX-POW-2` 里把零指数判定提到最前，两条路径
+与 numpy 三者一致。
+
+#### 16.28.5 测试
+
+新增 `test/complex-gap-test.lisp`（50 断言，已接入 `run-tests.sh`，现共 47 套件）：
+
+- **dtype 契约**：`from-array` 的 `(complex double-float)`/`(complex
+  single-float)`/2D/`:fast t`；`from-sequence` 的 1D/嵌套/空序列/显式
+  `:dtype`；`vt-full` 的复数/实数/整数填充；显式 `:dtype :float64` 仍按
+  §16.5 取实部（不回归）；
+- **数值契约**：`float_power` 用 numpy 实测值对照
+  （`(2+1j)^(2+0j)=3+4j`、`(-1+0j)^0.5=6.12e-17+1j`）+ 四个边界
+  （`nan^0=1`、`0^0=1`、`0^-1=NaN`）+ 实数路径回归；
+- **报错契约**：`cbrt` 复数 → 报错且消息含「不支持复数」；`float_power`
+  显式非复数 `:dtype` → safe-casting 拒绝；
+- **layer-norm**：dtype/形状、归一化后 fiber 均值 0 与 var≈1
+  （容差含 `eps`：`var/(var+eps) ≈ 1-1e-5`）、虚部为 0 时与实数路径
+  数值一致、复数 `gamma`/`beta`、`:out` 契约；
+- **回归网**：`conj/abs/pow/sqrt/sum/norm/matmul/take-along-axis/
+  compress/kron` 的复数 dtype 抽查。
+
+> 测试里的一个坑：**别用 `(= x x)` 判 NaN**。测试进程没有屏蔽浮点陷阱
+> （库内部才有 `with-float-safe`），NaN 比较会直接抛
+> `FLOATING-POINT-INVALID-OPERATION`。改用 `sb-ext:float-nan-p`（位级判定）。
+
+#### 16.28.6 扫描结论：仍然「不支持复数」的清单（都是**有意**的）
+
+`%cx-def-unsupported` 现在包含：`floor/ceil/trunc/rint`、`div/mod/rem`、
+位运算族、`atan2`、`even-p/odd-p`、`percentile/quantile`、`hypot`、
+**`cbrt`（本轮新增）**、激活函数族（`sigmoid/relu/leaky-relu/swish/
+softplus/gelu/mish/hard-tanh/hard-sigmoid`）。依据都是「numpy 同样拒绝」
+或「数学上无定义（复数无全序）」，不是实现偷懒。
+
+另外 `vt-eig`/`vt-eigvals` 返回**实数**特征值**不是 bug**：本库的 `vt-eig`
+是 `eigh` 语义（只吃 Hermitian/对称，用 UPLO 指定三角 + 镜像，见其 docstring），
+厄米特矩阵的特征值本来就是实数。要一般复矩阵的复特征值，那需要另一套
+（Hessenberg + QR 迭代）实现，属未来工作。
+
+---
+
+### 16.20 累计变更文件清单（第一～八轮）
 
 | 文件 | 改动 |
 |---|---|
@@ -2371,6 +2468,11 @@ n=256、单线程、预分配缓冲区、只计内核本身（不含 `make-vt`/`
 | `test/gen_setops_axis_expected.py` | **第五轮新增** 期望值生成器 |
 | `test/setops-axis-expected.sexp` | **第五轮新增** 生成产物（numpy 2.4.6 实测） |
 | `test/run-tests.sh` | 第五轮：注册 `setops-axis-trace-test`（当前共 44 个套件） |
+| `src/creation.lisp` | **第八轮**：`vt-from-array` 的 dtype 推断补 complex 两格；`vt-full` 的 `:dtype` 缺省改为「复数填充 → :complex128，否则 :float64」（§16.28） |
+| `src/io.lisp` | **第八轮**：`vt-from-sequence` 的 `:dtype` 缺省改为「含复数叶子 → :complex128，否则 :float64」（§16.28） |
+| `src/complex.lisp` | **第七轮**：`%def-cx-matmul-rows` 行内核 / `%cx-matmul-run` 重写 / `%cx-gemm-strided` 委托（§16.27）。**第八轮**：抽出 `%cx-pow-2` 供 `vt-pow` 与 `vt-float-power` 共用（零指数判定提到 NaN 之前）；新增 `vt-float-power` 复数分派；`vt-cbrt` 并入 `%cx-def-unsupported`（§16.28） |
+| `src/extensions2.lisp` | **第八轮**：`vt-layer-norm` 新增复数分支（复数均值 + 实数方差/标准差） |
+| `test/complex-gap-test.lisp` | **第八轮新增** 50 断言（dtype 契约 / numpy 数值对照 / 报错契约 / layer-norm 自洽性 / 回归网），注册后共 47 套件 |
 
 ---
 

@@ -335,6 +335,39 @@
         (error "vt-layer-norm: beta 形状 ~a 与 normalized-shape ~a 不匹配"
                (vt-shape beta) normalized-shape)))
 
+    ;; ── 复数分支（v0.5.x 新增）──────────────────────────────────
+    ;;
+    ;; 语义：沿 NORM-AXES 把每个 fiber 归一化到「均值 0、L2 离散度 1」。
+    ;;   mean = vt-mean（复数，逐分量平均）
+    ;;   var  = vt-var （**实数**：numpy 对复数取 mean(|x-mean|²)，§16.10）
+    ;;   std  = sqrt(var + eps)（实数）
+    ;;   normed = (x - mean) / std（复数 / 实数 → 复数）
+    ;; 因此只要不让 :dtype 把中间量强制成实数，整条链路就是复数安全的。
+    ;; 旧实现把 FINAL-DTYPE 写死成「float32 或 float64」，于是
+    ;; (vt-layer-norm 复数) 在 (vt-+ var eps :dtype :float64) 处撞上
+    ;; 「#C(0 0) is not of type REAL」。
+    (when (vt-complex-dtype-p (vt-dtype vt))
+      (let* ((norm-axes (loop for i from (- rank ndim) below rank collect i))
+             (cx-dtype (or dtype (vt-dtype vt)))
+             (real-dtype (vt-complex-real-dtype (vt-dtype vt)))
+             (mean (vt-mean vt :axis norm-axes :keepdims t :dtype cx-dtype))
+             (var (vt-var vt :axis norm-axes :keepdims t :dtype real-dtype))
+             (eps-typed (coerce eps (if (eq real-dtype :float32)
+                                        'single-float
+                                        'double-float)))
+             (std (vt-sqrt (vt-+ var eps-typed :dtype real-dtype)
+                           :dtype real-dtype))
+             (normed (vt-/ (vt-- vt mean :dtype cx-dtype) std :dtype cx-dtype)))
+        (let ((result (if gamma
+                          (vt-* normed gamma :dtype cx-dtype :out out)
+                          (if out
+                              (progn (vt-copy-into normed out) out)
+                              normed))))
+          (return-from vt-layer-norm
+            (if beta
+                (vt-+ result beta :dtype cx-dtype :out result)
+                result)))))
+
     (let* ((norm-axes (loop for i from (- rank ndim) below rank collect i))
            (mean (vt-mean vt :axis norm-axes :keepdims t :dtype dtype))
            (var (vt-var vt :axis norm-axes :keepdims t :dtype dtype))

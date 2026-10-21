@@ -39,10 +39,17 @@
                   (t (error "~s 不是序列" s)))))
             (nreverse result))))))
 
-(defun vt-from-sequence (contents &key (dtype :float64) (fast nil))
+(defun vt-from-sequence (contents &key (dtype nil) (fast nil))
   "从嵌套序列创建张量（行主序）。支持任意维度规则嵌套；空序列 -> 形状 (0)。
    fast t 意味着直接使用 coerce 转换，可能报错
-        nil 则用 vt-cast 安全转换 (默认)"
+        nil 则用 vt-cast 安全转换 (默认)
+
+   未显式给 :dtype 时（v0.5.x 修复）：序列含复数叶子 → :complex128，
+   否则 → :float64（保持旧行为）。旧实现把缺省值写死成 :float64，
+   于是 (vt-from-sequence (list #C(1 2))) 静默丢虚部 —— 与
+   ensure-vt / vt-fromiter 的推断（§16.2：含复数即 complex128）不一致。"
+  (when (null dtype)
+    (setf dtype (if (%any-complex-in-sequence-p contents) :complex128 :float64)))
   (with-float-safe
     (labels
         ((infer-shape (seq)

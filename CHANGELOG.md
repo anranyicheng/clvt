@@ -4,6 +4,88 @@
 
 ---
 
+## 2026-10-21（八）— 第八轮：复数缺口扫描 + 6 个补丁（3 个静默错值）
+
+上一轮把复数 matmul 的内核修好之后，做了一次**系统性扫描**：导出清单 367 个
+`vt-*` 里 202 个已被复数层碰过，剩下 165 个逐个用复数入参探针跑；
+再加一层「所有可调用导出符号统一喂 complex128，看结果 dtype 是否变实数」的
+保真扫描（唯一能抓「静默丢虚部」的手段）。
+
+结论：**6 个缺口**，其中 3 个是静默错值（不报错、悄悄丢虚部）：
+
+| 函数 | 改前 | 改后 |
+|---|---|---|
+| `vt-from-array` | `(complex double-float)` 数组 → **float64** | **complex128**（complex-single → complex64） |
+| `vt-from-sequence` | 含复数的 list → **float64** | **complex128** |
+| `vt-full` | `#C(3 1)` 填充 → **float64** | **complex128** |
+| `vt-float-power` | 复数 → **float64**（只算实部） | 复数主值幂（`(2+1j)^2 = 3+4j`） |
+| `vt-cbrt` | 复数 → **float64** | **确定性报错**（numpy 亦拒绝） |
+| `vt-layer-norm` | 复数 → `#C(0 0) is not of type REAL` | **complex128**（复数均值 + 实数方差） |
+
+### 三个语义决策
+
+1. **`cbrt` 不做复数实现，改成拒绝**：numpy 2.3.5 实测
+   `np.cbrt(np.array([8+0j]))` 直接 `TypeError: ufunc 'cbrt' not supported`。
+   补一个 numpy 没有的「复数立方根」是造语义，不如对齐；
+   要用请 `(vt-pow z 1/3)`。
+2. **`float_power` 复用 `pow` 的内核**：两者在复数域是同一个主值分支
+   （实测 `np.float_power` 与 `np.power` 逐位相同），差别只在实数侧。
+   把 `vt-pow` 里内联的 lambda 提成 `%CX-POW-2` 两处共用，
+   边界（`x^0=1` / `0^负=NaN` / `0^0=1` / NaN 传播）只留一份。
+3. **`layer_norm` 的复数语义**（本库扩展，torch 只定义实数域）：
+   复数均值 + 实数方差（`mean(|x-mean|²)`，与 `np.var(complex)` 一致）
+   + 实数 `std = sqrt(var+eps)`，结果复数。用「虚部为 0 时退化为实数路径」
+   与「归一化后 fiber 均值 0、var≈1」两条自洽性断言锁住。
+
+### 顺带修掉的不一致
+
+`vt-pow` 的复数路径把 NaN 判定排在「指数为 0」之前，于是
+`(vt-pow #C(nan 0) 0)` → `NaN`，而**同一函数的实数路径**给 `1.0`、numpy 也给 1。
+`%CX-POW-2` 里把零指数判定提到最前，三条路径一致。
+
+### 改动
+
+- `src/creation.lisp`：`vt-from-array` 的 dtype 推断补 complex 两格；
+  `vt-full` 的 `:dtype` 缺省改为「复数填充 → :complex128，否则 :float64」
+  （不按整数推断，避免 `(vt-full s 3)` 从 float64 变 int64）；
+- `src/io.lisp`：`vt-from-sequence` 的 `:dtype` 缺省同理
+  （复用已有的 `%any-complex-in-sequence-p`）；显式 `:dtype` 优先级不变；
+- `src/complex.lisp`：抽出 `%cx-pow-2`、新增 `vt-float-power` 复数分派、
+  `vt-cbrt` 并入 `%cx-def-unsupported`；
+- `src/extensions2.lisp`：`vt-layer-norm` 新增复数分支（提前 return，
+  实数路径逐字不动）；
+- `test/complex-gap-test.lisp`：**新增套件（50 断言）**，已接入
+  `test/run-tests.sh`（现共 47 套件）。
+
+### 测试
+
+- dtype 契约：`from-array`（c128/c64/2D/`:fast t`/显式 `:dtype :float64`
+  仍取实部）、`from-sequence`（1D/嵌套/空/显式 dtype）、`vt-full`
+  （复数/实数/整数填充）；
+- 数值契约：`float_power` 用 numpy 实测值（`(2+1j)^(2+0j)=3+4j`、
+  `(-1+0j)^0.5=6.12e-17+1j`）+ 边界（`nan^0=1`、`0^0=1`、`0^-1=NaN`）；
+- 报错契约：`cbrt` 复数报错且消息含「不支持复数」；显式非复数 `:dtype` →
+  safe-casting 拒绝；
+- `layer-norm`：dtype/形状、均值 0、var≈1（容差含 eps）、虚部 0 时与实数
+  路径一致、复数 gamma/beta、`:out`；
+- 回归网：`conj/abs/pow/sqrt/sum/norm/matmul/take-along-axis/compress/kron`；
+- 全量 **47 个套件全绿**。
+
+> 踩坑记录：测试里**别用 `(= x x)` 判 NaN** —— 测试进程没有屏蔽浮点陷阱，
+> NaN 比较会抛 `FLOATING-POINT-INVALID-OPERATION`；用 `sb-ext:float-nan-p`。
+
+### 扫描结论：仍然「不支持复数」的清单（都是有意为之）
+
+`floor/ceil/trunc/rint`、`div/mod/rem`、位运算族、`atan2`、`even-p/odd-p`、
+`percentile/quantile`、`hypot`、`cbrt`（本轮新增）、激活函数族 —— 依据都是
+「numpy 同样拒绝」或「复数无全序」。
+
+另外 `vt-eig`/`vt-eigvals` 返回**实数**特征值是**契约**（本库 `vt-eig` 是
+`eigh` 语义：只吃 Hermitian/对称，用 UPLO 指定三角 + 镜像），不是 bug；
+一般复矩阵的复特征值需要另一套 Hessenberg + QR 实现，属未来工作。
+
+---
+
 ## 2026-10-21（七）— 第七轮：复数 matmul 内核对齐实数线（标量形态，1.9×）
 
 `vt-matmul` 的复数 2D 路径一直是**教科书三重循环**：每个元素都从 `(i,j,p)`

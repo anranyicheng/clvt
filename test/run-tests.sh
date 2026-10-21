@@ -73,6 +73,7 @@ SUITES[complex-linalg-test]="216 复数线性代数测试 (46 项 numpy 2.4.6 �
 SUITES[setops-axis-trace-test]="56 按轴去重/迹 测试 (37 项 numpy 2.4.6 差分对照: vt-unique :axis 含 return-index/inverse/counts、NaN 行不折叠、非连续视图、退化形状 + vt-trace :offset/:axis1/:axis2 含高维收缩 + 契约断言 + 实数回归网; 期望由 test/gen_setops_axis_expected.py 生成)"
 SUITES[einsum-gemm-layout-test]="36 einsum GEMM 布局归一化 (§16.26: NN/NT/C-转置/兜底 四条路径各档尺寸 + 批量含广播与批量NT + f32/i32/i64/c128/c64 + 转置输入/切片/非连续 :out/小矩阵 + SIMD关与单线程不变; 主断言 = 与 vt-matmul 逐位相等)"
 SUITES[complex-ops-test]="128 复数数据搬运层测试 (97 项 numpy 2.4.6 差分对照: 转换/拼接/剪切/集合/nan 族/缩并/卷积 + dtype&shape 契约 + :out 硬契约 + 未支持组合报错 + 实数回归网; 期望由 test/gen_complex_ops_expected.py 生成)"
+SUITES[complex-gap-test]="50 复数缺口回归（第八轮 §16.28: from-array/from-sequence/full 的 dtype 推断保住虚部 · float_power 复数主值分支与 NaN 边界 · cbrt 对齐 numpy 的确定性拒绝 · layer-norm 复数分支（复数均值+实数方差）· 已支持函数抽查）"
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
 SUITES[test-all]="641 绝大多数函数的测试"
@@ -132,6 +133,7 @@ DEFAULT_ORDER=(
     uncovered-coverage-test
     extensions3-test
     fastmap-invariant-test
+    complex-gap-test
     complex-matmul-perf-test
     complex-test
     complex-ops-test
