@@ -2423,9 +2423,100 @@ softplus/gelu/mish/hard-tanh/hard-sigmoid`）。依据都是「numpy 同样拒�
 厄米特矩阵的特征值本来就是实数。要一般复矩阵的复特征值，那需要另一套
 （Hessenberg + QR 迭代）实现，属未来工作。
 
+### 16.29 第九轮：沿轴扫描的静默错值（cumsum/cumprod 只算第一条 fiber）
+
+#### 16.29.1 症状
+
+```lisp
+(vt-cumsum a :axis 0)   ; a 是 (3 4) complex128
+;; => [[-1.5-0.5j, 0+0j, 0+0j, 0+0j],
+;;     [-1.0+0j,   0+0j, 0+0j, 0+0j],
+;;     [-2.0+0.25j,0+0j, 0+0j, 0+0j]]     ; ← 只有第 0 列对，其余全 0
+```
+
+`axis` 取**最后一维**时正确，取任何更靠前的维度时**只算出第一条 fiber**，
+其余位置保持 `make-vt` 的 0。受影响的函数：
+`vt-cumsum` / `vt-cumprod` / `vt-nancumsum` / `vt-nancumprod`（后两个复用
+同一个扫描内核）。
+
+#### 16.29.2 根因：少了一层 `AX-STRIDE` 遍历
+
+`%CX-SCAN-RUN` 的 axis 分支用 `%CX-FIBER-GEOM` 拿到 `(head dim ax-stride)`，
+然后只做了：
+
+```
+for h in 0..head:                        ; 前导块
+  for j in 0..dim:                       ; 沿轴前进
+    p = h*dim*ax-stride + j*ax-stride
+```
+
+漏掉了 **`ax-stride` 那一层** —— 轴之后的每个位置（如 `axis=0` 时的其余各列）
+都是一条**独立 fiber**。正确形式是三层：
+
+```
+for h in 0..head:
+  for ti in 0..ax-stride:                ; ← 漏的就是这层
+    acc = 单位元;  p = h*dim*ax-stride + ti
+    for j in 0..dim:
+      acc = op(acc, s[p]);  d[p] = acc;  p += ax-stride
+```
+
+对照证据：同一份 `%CX-FIBER-GEOM` 的其它六个调用点
+（`%DEF-CX-REDUCER` 家族、`%CX-ARG-REDUCE-RUN`、`nanarg`、`sort-axis`、
+`nanmedian`）**都有** `ti` 循环，所以 `sum/prod/amax/median/sort/...` 沿轴
+一直是对的 —— 只有扫描内核漏了。这也解释了为什么 bug 能活这么久：
+
+- 既有测试的 `cumsum` 用例全是 1-D（`axis` 缺省或唯一位），而 1-D 时
+  `ax-stride = 1`，`ti` 层退化成一次迭代，**看不出差别**；
+- 复数层此前没有「沿轴扫描」的差分测试。
+
+#### 16.29.3 修法
+
+在 `%CX-SCAN-RUN` 的 axis 分支补上 `ti` 层（见上），并把注释写成
+「为什么必须有这一层」，避免下次重构再删掉。同时保持
+`(safety 1)`（§16.14.1 的分级：接受任意 axis 的通用内核不享受 safety 0）。
+
+#### 16.29.4 本轮怎么找到它的（两层扫描，可复用）
+
+第八轮的扫描是「dtype 保真」（复数入参 → 实数出），查不出「dtype 对、数值错」。
+本轮补两层：
+
+| 层 | 做法 | 结果 |
+|---|---|---|
+| A. 同形调用对照 | 对**每个**导出 `vt-*`，用同一组 20 种调用形态分别喂**实数**与**复数**镜像（形状/dtype 宽度一致），比较「实数能调通而复数报错/降级」 | 0 处（第八轮已把这类清完；`(complex in → real out)` 的 96 个原始命中全部来自一个不含复数入参的形态，属扫描自身的假阳性，已剔除） |
+| B. 数值对拍 | 190 条复数表达式在 clvt 侧求值、numpy 侧复算，逐元素比对（rtol 1e-9） | 188 项一致；1 项不一致 = **本节的 cumsum/cumprod**；2 项是 QR/LU 的**约定差异**（见下） |
+
+B 的覆盖面：逐元素/超越、归约（含 axis 元组与 keepdims）、沿轴扫描、
+排序/argsort/unique（含 counts/inverse）、searchsorted、diff/gradient/trapz、
+拼接/堆叠/切分/insert/delete/repeat/tile/pad/rot90/flip/roll、take/compress/
+extract/take-along-axis/put-along-axis、diag/tril/triu/trace/diagonal、
+matmul/dot/outer/inner/vdot/kron/cross/tensordot/multi-dot、einsum 五种模式、
+det/inv/solve/pinv/cholesky/matrix_power/cond/svd-qr 的数值、复数比较与 where，
+以及 complex64 一整组镜像。
+
+> QR/LU 的两处「不一致」不是 bug：QR 分解在列上可乘任意单位模相位，
+> numpy 与 clvt 的相位约定不同；用重构恒等式判：`‖QᴴQ − I‖ = 1.1e-16`、
+> `‖QR − A‖ = 6.7e-16`。LU 的置换约定也不同，重构由
+> `complex-linalg-test` 的恒等式覆盖。
+
+#### 16.29.5 测试
+
+`test/complex-scan-axis-test.lisp`（26 断言，已接入 `run-tests.sh`，共 48 套件）。
+期望值由 numpy 2.3.5 实测**硬编码**（数据是二进制可精确表示的小数，
+累加也精确，故要求**逐位相等**）：
+
+- `cumsum`/`cumprod` 的 axis=0/1（3×4）+ 负轴 `-1`/`-2`；
+- 3-D（2,3,4）三个轴各一组 —— 这是最能暴露「只算第一条 fiber」的形态；
+- 非连续输入（转置视图）沿 axis=0；
+- `nancumsum`/`nancumprod` 无 NaN 时与普通扫描逐位相同；
+- complex64 与 complex128 数值一致、dtype 保持；
+- 退化：轴长 1、轴长 0、`axis=nil` 展平；
+- `:out`：连续目标 + **非连续目标（列切片）**；
+- 实数路径回归。
+
 ---
 
-### 16.20 累计变更文件清单（第一～八轮）
+### 16.20 累计变更文件清单（第一～九轮）
 
 | 文件 | 改动 |
 |---|---|
@@ -2473,6 +2564,8 @@ softplus/gelu/mish/hard-tanh/hard-sigmoid`）。依据都是「numpy 同样拒�
 | `src/complex.lisp` | **第七轮**：`%def-cx-matmul-rows` 行内核 / `%cx-matmul-run` 重写 / `%cx-gemm-strided` 委托（§16.27）。**第八轮**：抽出 `%cx-pow-2` 供 `vt-pow` 与 `vt-float-power` 共用（零指数判定提到 NaN 之前）；新增 `vt-float-power` 复数分派；`vt-cbrt` 并入 `%cx-def-unsupported`（§16.28） |
 | `src/extensions2.lisp` | **第八轮**：`vt-layer-norm` 新增复数分支（复数均值 + 实数方差/标准差） |
 | `test/complex-gap-test.lisp` | **第八轮新增** 50 断言（dtype 契约 / numpy 数值对照 / 报错契约 / layer-norm 自洽性 / 回归网），注册后共 47 套件 |
+| `src/complex.lisp` | **第九轮**：`%cx-scan-run` 的 axis 分支补 `AX-STRIDE` 层遍历（cumsum/cumprod/nancumsum/nancumprod 沿非末轴只算第一条 fiber 的静默错值，§16.29） |
+| `test/complex-scan-axis-test.lisp` | **第九轮新增** 26 断言（2-D 两轴 / 3-D 三轴 / 负轴 / 转置视图 / c64 / 退化 / `:out` 连续与非连续 / 实数回归），注册后共 48 套件 |
 
 ---
 

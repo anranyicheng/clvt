@@ -1200,17 +1200,27 @@
             (declare (type fixnum head dim ax-stride))
             (dotimes (h head)
               (declare (type fixnum h))
-              (let ((row (the fixnum (* h dim ax-stride))))
-                (declare (type fixnum row))
-                (let ((acc (if (eq op :sum) zero (+ zero 1))))
-                  (dotimes (j dim)
-                    (declare (type fixnum j))
-                    (let ((p (the fixnum (+ row (the fixnum (* j ax-stride))))))
-                      (declare (type fixnum p))
+              ;; H 个「前导块」，每块 DIM*AX-STRIDE 个元素（前导维已全展开）
+              (let ((hb (the fixnum (* h dim ax-stride))))
+                (declare (type fixnum hb))
+                ;; ⚠ 必须再遍历 AX 轴之后的 AX-STRIDE 个位置 —— 它们是**另外
+                ;; AX-STRIDE 条**互不相交的 fiber（如 axis=0 的其余各列）。
+                ;; v0.5.x 修复：原实现少了这一层，axis < rank-1 时只算了第一条
+                ;; fiber，其余位置保持 make-vt 的 0 → 静默错值（§16.29）。
+                ;; 归约内核（%def-cx-reducer / nanarg / sort-axis / nanmedian）
+                ;; 一直是对的，它们都有这层 TI 循环，只有扫描内核漏了。
+                (dotimes (ti ax-stride)
+                  (declare (type fixnum ti))
+                  (let ((acc (if (eq op :sum) zero (+ zero 1)))
+                        (p (the fixnum (+ hb ti))))
+                    (declare (type fixnum p))
+                    (dotimes (j dim)
+                      (declare (type fixnum j))
                       (setf acc (if (eq op :sum)
                                     (+ acc (aref s p))
                                     (* acc (aref s p))))
-                      (setf (aref d p) acc)))))))))))
+                      (setf (aref d p) acc)
+                      (incf p ax-stride)))))))))))
 
 (defun vt-cumsum (tensor &key axis dtype out)
   "沿 AXIS 的累积和（对标 numpy.cumsum）。AXIS=NIL 展平扫描。

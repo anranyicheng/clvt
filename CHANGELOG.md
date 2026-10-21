@@ -4,6 +4,79 @@
 
 ---
 
+## 2026-10-21（九）— 第九轮：沿轴扫描的静默错值（cumsum/cumprod 只算第一条 fiber）
+
+上一轮修的是「dtype 静默降级」，这一轮补上「**数值静默错值**」这条线 ——
+两层新扫描（同形调用对照 + 与 numpy 的数值对拍）跑下来，抓到 1 个真 bug。
+
+### 症状
+
+```lisp
+(vt-cumsum a :axis 0)     ; a = (3 4) complex128
+;; => [[-1.5-0.5j,   0+0j,  0+0j, 0+0j],
+;;     [-1.0+0j,      0+0j,  0+0j, 0+0j],
+;;     [-2.0+0.25j,   0+0j,  0+0j, 0+0j]]   ; 只有第 0 列对
+```
+
+`axis` 是**最后一维**时正确，任何更靠前的轴都只算第一条 fiber，其余留 0。
+受影响：`vt-cumsum` / `vt-cumprod` / `vt-nancumsum` / `vt-nancumprod`。
+
+### 根因
+
+`%CX-SCAN-RUN` 的 axis 分支拿到 `(head dim ax-stride)` 后只循环了
+`head × dim`，**漏掉 `ax-stride` 那一层** —— 轴之后的每个位置（`axis=0`
+时的其余各列）都是一条独立 fiber。
+
+同一份 `%CX-FIBER-GEOM` 的另外六个调用点（`%DEF-CX-REDUCER` 家族、
+`argmax/argmin`、`nanarg`、`sort-axis`、`nanmedian`）**都有**这层循环，
+所以 `sum/prod/amax/median/sort/diff/...` 沿轴一直是对的，只有扫描内核漏了。
+
+**为什么一直没被发现**：所有既有 `cumsum` 测试都是 1-D，而 1-D 时
+`ax-stride = 1`，漏掉的那层退化成一次迭代，数值完全一样。
+
+### 修法
+
+补上 `ti` 层遍历（三层循环：前导块 → ax-stride 内偏移 → 沿轴），
+并在注释里写明「这层不能删」的原因。
+
+### 本轮的两层扫描方法（已写入 CONVENTIONS §16.29.4）
+
+| 层 | 做法 | 结果 |
+|---|---|---|
+| A. 同形调用对照 | 对每个导出 `vt-*`，用同一组 20 种调用形态分别喂实数/复数镜像，比「实数通、复数失败/降级」 | 0 处（第八轮已清完；上一轮报的 96 个 `complex→real` 全是某个不含复数入参的形态造成的假阳性） |
+| B. 数值对拍 | 190 条复数表达式 clvt 求值 vs numpy 复算，逐元素比对 | 188 一致，1 不一致（= 本 bug），2 项是 QR/LU 约定差异 |
+
+B 覆盖：逐元素/超越、归约（axis 元组/keepdims）、沿轴扫描、排序/argsort/
+unique（含 counts/inverse）、searchsorted、diff/gradient/trapezoid、
+拼接/堆叠/切分/insert/delete/repeat/tile/pad/rot90/flip/roll、take/compress/
+extract/take-along-axis/put-along-axis、diag/tril/triu/trace/diagonal、
+matmul/dot/outer/inner/vdot/kron/cross/tensordot/multi-dot、einsum 五种模式、
+det/inv/solve/pinv/cholesky/matrix_power/cond/svd-qr、复数比较与 where，
+外加 complex64 一整组镜像。
+
+> QR/LU 的两处「不一致」**不是 bug**：QR 的列可乘任意单位模相位，
+> 验证用重构恒等式（‖QᴴQ−I‖ = 1.1e-16、‖QR−A‖ = 6.7e-16）；
+> LU 的置换约定不同，重构由 `complex-linalg-test` 覆盖。
+
+### 测试
+
+新增 `test/complex-scan-axis-test.lisp`（**26 断言**，已接入 `run-tests.sh`，
+现共 **48 套件**）。期望值由 numpy 2.3.5 实测硬编码，数据是二进制可精确
+表示的小数、累加也精确，故要求**逐位相等**：
+
+- `cumsum`/`cumprod` 的 axis=0/1 + 负轴 `-1`/`-2`；
+- 3-D（2,3,4）三个轴各一组（最能暴露「只算第一条 fiber」）；
+- 非连续输入（转置视图）沿 axis=0；
+- `nancumsum`/`nancumprod` 无 NaN 时与普通扫描逐位相同；
+- complex64 与 complex128 一致、dtype 保持；
+- 退化：轴长 1 / 轴长 0 / `axis=nil` 展平；
+- `:out`：连续目标 + 非连续目标（列切片）；
+- 实数路径回归。
+
+全量 **48 个套件全绿**。
+
+---
+
 ## 2026-10-21（八）— 第八轮：复数缺口扫描 + 6 个补丁（3 个静默错值）
 
 上一轮把复数 matmul 的内核修好之后，做了一次**系统性扫描**：导出清单 367 个
