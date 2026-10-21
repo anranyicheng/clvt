@@ -204,6 +204,16 @@
                    2.302585092994046d0)))
     (complex (/ (%creal l) ln10) (/ (%cimag l) ln10))))
 
+;;; 性能（叶子内核必须 INLINE）：这一批都是「一条复数运算」的叶子。
+;;; 不内联时，调用点看不到它们的入参类型，SBCL 对 `(* z z)` / `(- z)` /
+;;; `(/ z)` 只能推出 NUMBER / (OR (COMPLEX SINGLE) (COMPLEX DOUBLE))，
+;;; 于是 map-reduce.lisp 的 %CAST-TO 落到复数目标时只能走泛型 COERCE，
+;;; 并且每个元素多构造一个复数对象（实测 2M 元素：square 478ms，
+;;; 内联后 13.5ms；c64 241ms → 10ms）。
+;;; 内联后类型随实参精确流动，"取实部/虚部 + 写回 specialized-array"
+;;; 全部退化成寄存器操作，与 (vt-+ z z) 同级。
+(declaim (inline %cop-square %cop-neg %cconj %cop-recip %cop-signum))
+
 (defun %cop-square (z) (* z z))
 
 (defun %cop-recip (z)
@@ -644,21 +654,45 @@
 
 (defmacro %cx-dispatch (data arr zero &body body)
   "把 DATA 按复数元素类型绑定为 ARR（simple-array）与 ZERO（该精度复数零），
-   在 BODY 中执行。调用方保证 DATA 是复数缓冲区。"
-  `(let ((et (array-element-type ,data)))
-     (cond ((equal et '(complex double-float))
-            (let ((,arr (the (simple-array (complex double-float) (*)) ,data))
-                  (,zero (complex 0.0d0 0.0d0)))
-              (declare (type (simple-array (complex double-float) (*)) ,arr)
-                       (optimize (speed 3) (safety 1)))
-              ,@body))
-           ((equal et '(complex single-float))
-            (let ((,arr (the (simple-array (complex single-float) (*)) ,data))
-                  (,zero (complex 0.0s0 0.0s0)))
-              (declare (type (simple-array (complex single-float) (*)) ,arr)
-                       (optimize (speed 3) (safety 1)))
-              ,@body))
-           (t (error "%cx-dispatch: 非复数缓冲区 ~a" et)))))
+   在 BODY 中执行。调用方保证 DATA 是复数缓冲区。
+
+   **嵌套即同精度**（本宏的关键约定）：BODY 里再写 (%cx-dispatch data2 …)
+   时，内层**不再二次分派**，而是被就地改写成「按外层已选定的精度绑定」。
+   原因是 717990d 之后出现的编译失败：三缓冲区内核（matmul）展开成 2^3=8
+   条分支，其中 6 条精度互不一致（例如把 complex-double 的累加结果写进
+   complex-single 缓冲区）。这些分支**运行期永不成立**（上游已保证同精度），
+   但编译期它们是实打实的代码：SBCL 推出 `(+ cs cs)` 为 (complex
+   double-float)，再撞上目标缓冲区的 (complex single-float) 元素类型断言，
+   于是每条死分支都产出一条 WARNING，COMPILE-FILE 返回 failure-p=T，
+   ASDF 报 COMPILE-FILE-ERROR —— 整个库编译失败。
+
+   改为「分派一次 + 其余 THE 断言」后：
+     · 分支数 2^N → 2，代码量、编译时间、镜像体积同步下降；
+     · 不留静态不一致的死代码，WARNING 归零；
+     · 精度不一致从「静默读错内存」变成 (safety 1) 下 THE 的即时类型错误。"
+  (flet ((bind (ctype zero-form)
+           ;; 内层 %CX-DISPATCH 的同精度替身：只绑定，不再 COND。
+           `(macrolet ((%cx-dispatch (data2 arr2 zero2 &body body2)
+                         `(let ((,arr2 (the (simple-array ,',ctype (*)) ,data2))
+                                (,zero2 ,',zero-form))
+                            (declare (type (simple-array ,',ctype (*)) ,arr2)
+                                     (optimize (speed 3) (safety 1)))
+                            ,@body2)))
+              ,@body)))
+    `(let ((et (array-element-type ,data)))
+       (cond ((equal et '(complex double-float))
+              (let ((,arr (the (simple-array (complex double-float) (*)) ,data))
+                    (,zero (complex 0.0d0 0.0d0)))
+                (declare (type (simple-array (complex double-float) (*)) ,arr)
+                         (optimize (speed 3) (safety 1)))
+                ,(bind '(complex double-float) '(complex 0.0d0 0.0d0))))
+             ((equal et '(complex single-float))
+              (let ((,arr (the (simple-array (complex single-float) (*)) ,data))
+                    (,zero (complex 0.0s0 0.0s0)))
+                (declare (type (simple-array (complex single-float) (*)) ,arr)
+                         (optimize (speed 3) (safety 1)))
+                ,(bind '(complex single-float) '(complex 0.0s0 0.0s0))))
+             (t (error "%cx-dispatch: 非复数缓冲区 ~a" et))))))
 
 (defun %cx-fiber-geom (shape ax)
   "C 连续布局下沿 AX 的几何量：返回 (values head dim-ax ax-stride)：

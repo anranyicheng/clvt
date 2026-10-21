@@ -65,30 +65,99 @@
      作用在 (complex double-float) 槽位上。未列入的算子仍走 vt-map 兜底
      （语义相同，仅性能差异，铁律 2）。")
 
-  (defun %cx-inline-op-p (op)
-    (and op (symbolp op) (member op +cx-inline-ops+ :test #'eq)))
+  (defparameter +cx-real-only-arities+
+    '((atan . (2)))
+    "「某些实参个数下只接受实数」的算子表：OP → 实数专用实参个数列表。
 
-  (defun %elem-type-cond (res-form kernel-name args &key complex)
+     CL 的 ATAN 有两个身份：一元 (atan z) 对复数有定义（主值），
+     二元 (atan y x) 是 arctan2，**只对实数定义**（numpy.arctan2 亦然）。
+     白名单按算子名放行复数分支，若不按 ARITY 细分，二元用法就会被内联成
+     `(atan (aref 复数数组) (aref 复数数组))` —— SBCL 的 arctan2 派生器
+     把两个实参断言为 REAL，与实参的复数类型冲突，于是编译期 WARNING、
+     COMPILE-FILE 返回 failure-p=T。")
+
+  (defun %cx-inline-op-p (op &optional arity)
+    "OP 是否允许生成复数内联分支。ARITY 为实参个数（省略则不按 arity 过滤）。"
+    (and op (symbolp op)
+         (member op +cx-inline-ops+ :test #'eq)
+         (not (and arity (member arity (cdr (assoc op +cx-real-only-arities+)))))))
+
+  (defparameter +cx-only-ops+
+    '(;; 复数数学核：%cx-def-unary 生成的分派只在输入为复数时才进快路径
+      %cop-sqrt %cop-log %cop-log2 %cop-log10 %cop-square %cop-recip
+      %cop-signum %cop-abs %cop-neg
+      %cop-expm1 %cop-log1p %cop-sinc %cop-sign
+      ;; 复数比较 / 谓词核：%cx-def-compare / %cx-def-predicate 的守卫是
+      ;; %cx-tensor-p，实数输入根本进不来
+      %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
+      %cx-nan-flag %cx-inf-flag %cx-finite-flag)
+    "**只接受复数实参**的内核集合（语义白名单，不是名字前缀）。
+
+     对它们生成「实数元素类型分支」是错的，也是 717990d 之后编译失败的
+     根因之一：这些内核恒返回复数，实数分支会把复数结果交给只接受 REAL 的
+     %COERCE-INT* 或 `coerce` 到 FLOAT —— 编译期类型断言冲突 → WARNING →
+     COMPILE-FILE failure-p=T。语义上这些分支也是死代码（上游守卫保证只有
+     复数输入才进快路径）。
+
+     为什么必须逐个列名字、不能用 `%COP-` / `%CX-` 前缀判：
+       **%CCONJ 不在此表**。vt-conj 对**实数**输入是活路径
+       （complex.lisp: `(vt-fast-map #'%cconj in ...)`，实数原样返回），
+       用前缀规则会把它的 8 个实数分支整个砍掉、退化成 vt-map 的 funcall ——
+       实测 2M float64：2.4 ns/元素 → 11.2 ns/元素（4.6×）。
+       新增内核必须手工登记：漏登记的后果是编译期 WARNING（构建门禁立刻
+       抓到），而不是静默错误。")
+
+  (defun %cx-only-op-p (op)
+    (and op (symbolp op) (member op +cx-only-ops+ :test #'eq)))
+
+  (defun %cx-element-type-p (lt)
+    "LT 是否为复数元素类型（(complex double-float) / (complex single-float)）。"
+    (and (consp lt) (eq (car lt) 'complex)))
+
+  (defun %cx-arity (args)
+    "ARGS=(OP 输入… RES) → 实参个数。"
+    (- (length args) 2))
+
+  (defun %cx-branches-p (args)
+    "由 ARGS=(OP 输入… RES) 推出「是否生成复数分支」：按算子 + 实参个数判定。"
+    (%cx-inline-op-p (first args) (%cx-arity args)))
+
+  (defun %elem-type-cond (res-form kernel-name args &key)
     "生成按 RES 元素类型分派的 COND 子句列表（连续快路径）。
 
-     COMPLEX 为真时追加 2 个复数分支（顺序在实数之后：复数命中率低，
-     且实数分支更短、预测更友好）。"
+     分支生成规则（两条，都是为了让 717990d 之后的代码既正确又编得过）：
+       1. 复数专用内核（%cx-only-op-p）**不生成实数分支** —— 它们的函数体
+          对参数带 COMPLEX 断言，塞进实数分支就是静态类型冲突，编译期
+          WARNING → ASDF 直接失败。
+       2. 复数分支只在 %cx-branches-p 为真时追加（白名单 + 实参个数），
+          顺序在实数之后（复数命中率低，实数分支更短、预测更友好）。
+
+     判定条件**只看 RES 的元素类型，不校验输入**：能进这条内联路径的
+     前置条件是 vt-fast-map 的 dtype-check（全部输入与结果的 VT-DTYPE
+     相等），而 dtype 与物理元素类型在本库一一对应，所以输入的元素类型
+     必然也是 LT，内核里的 `(the (simple-array LT (*)) (vt-data 输入))`
+     断言恒真。再把输入类型也判一遍是纯冗余（实测给 vt-< 多加约 120 条
+     指令、零收益），真正需要校验输入的是 %VT-MASK*-FAST —— 那两条路的
+     输入/输出 dtype 本来就可以不同。"
     (append
-     (loop for lt in +vt-elem-types+
-           collect `((equal (array-element-type ,res-form) ',lt)
-                     (,kernel-name ,lt ,@args)))
-     (when complex
+     (unless (%cx-only-op-p (first args))
+       (loop for lt in +vt-elem-types+
+             collect `((equal (array-element-type ,res-form) ',lt)
+                       (,kernel-name ,lt ,@args))))
+     (when (%cx-branches-p args)
        (loop for lt in +cx-elem-types+
              collect `((equal (array-element-type ,res-form) ',lt)
                        (,kernel-name ,lt ,@args))))))
 
-  (defun %elem-type-cond-strided (res-form kernel-name args &key complex)
-    "生成按 RES 元素类型分派的 COND 子句列表（非连续/广播快路径）。"
+  (defun %elem-type-cond-strided (res-form kernel-name args &key)
+    "生成按 RES 元素类型分派的 COND 子句列表（非连续/广播快路径）。
+     分支生成规则与判定条件同 %elem-type-cond。"
     (append
-     (loop for lt in +vt-strided-elem-types+
-           collect `((equal (array-element-type ,res-form) ',lt)
-                     (,kernel-name ,lt ,@args)))
-     (when complex
+     (unless (%cx-only-op-p (first args))
+       (loop for lt in +vt-strided-elem-types+
+             collect `((equal (array-element-type ,res-form) ',lt)
+                       (,kernel-name ,lt ,@args))))
+     (when (%cx-branches-p args)
        (loop for lt in +cx-elem-types+
              collect `((equal (array-element-type ,res-form) ',lt)
                        (,kernel-name ,lt ,@args)))))))
@@ -336,9 +405,24 @@
 ;;; 编译期内联逐元素映射（对标原 vt-fast-map，消除 funcall 装箱）
 ;;; ------------------------------------------------------------------
 
-(defmacro %cast-to (lt form)
+(defmacro %cast-to (lt form &optional from-lt)
   ;; "内联类型转换：整数截断，浮点 coerce。"
   "内联类型转换：整数类型走安全 coerce/回绕，浮点 coerce。
+
+   FROM-LT 是 FORM 的**静态**元素类型（只在宏展开期已知时才给）：
+     · FROM-LT 为复数、LT 为实数/整数 → 先 REALPART（CONVENTIONS §16.5
+       astype 语义：静默丢弃虚部）。这是唯一能同时满足「语义正确」与
+       「无类型冲突 WARNING」的写法：直接 `(truncate <complex>)` 会让
+       SBCL 报 COMPLEX vs REAL 断言冲突。
+       用 REALPART 而不是运行期 `(if (complexp v) (realpart v) v)`：
+         - REALPART 对**任何** number 都合法（实数原样返回），所以同一条
+           分支里「算术内核返回复数」与「布尔内核（%cx-nan-flag 等）返回
+           0/1 实数」两种情形都能覆盖；
+         - 写成 COMPLEXP 分支反而会踩 SBCL 的派生类型检查：实参已被推出
+           是复数时，else 分支（断言 REAL）不可达，编译器会对 init 形式
+           报「Derived type … conflicting with its asserted type REAL」。
+     · 其它情况 FORM 原样使用（LT 为复数时走 COERCE，实数目标仍是
+       原来的 TRUNCATE/COERCE，**热路径零改动**）。
 
    类型声明（性能）：必须覆盖**全部 6 种**整数存储类型。此前只特化
    (signed-byte 64)/32，其余整数（int8/int16/uint8/uint16）落到
@@ -347,14 +431,31 @@
    （结果 :int8 布尔掩码）比同类算术慢 20x 的根因。改为走
    dtype.lisp 里已声明返回类型的 %coerce-* 后，写回点可直接证出
    元素类型，bounds/范围检查与装箱一并消失。"
-  (cond ((equal lt '(signed-byte 64))   `(%coerce-int64  ,form))
-        ((equal lt '(signed-byte 32))   `(%coerce-int32  ,form))
-        ((equal lt '(signed-byte 16))   `(%coerce-int16  ,form))
-        ((equal lt '(signed-byte 8))    `(%coerce-int8   ,form))
-        ((equal lt '(unsigned-byte 16)) `(%coerce-uint16 ,form))
-        ((equal lt '(unsigned-byte 8))  `(%coerce-uint8  ,form))
-        ((subtypep lt 'integer)         `(truncate ,form))
-        (t                              `(coerce ,form ',lt))))
+  (let ((form (if (and from-lt
+                       (%cx-element-type-p from-lt)
+                       (not (%cx-element-type-p lt)))
+                  `(realpart ,form)
+                  form)))
+    (cond ((equal lt '(signed-byte 64))   `(%coerce-int64  ,form))
+          ((equal lt '(signed-byte 32))   `(%coerce-int32  ,form))
+          ((equal lt '(signed-byte 16))   `(%coerce-int16  ,form))
+          ((equal lt '(signed-byte 8))    `(%coerce-int8   ,form))
+          ((equal lt '(unsigned-byte 16)) `(%coerce-uint16 ,form))
+          ((equal lt '(unsigned-byte 8))  `(%coerce-uint8  ,form))
+          ((subtypep lt 'integer)         `(truncate ,form))
+          ;; 复数目标：分量式构造，**不用 COERCE**。
+          ;; SBCL 的 coerce 到 (complex T) 会退化成「先试着 coerce 成实数分量
+          ;; 类型、再补虚部」的链式变换，实参类型是 (or cs cd) 时直接报
+          ;;   Cannot coerce (OR (COMPLEX SINGLE-FLOAT) (COMPLEX DOUBLE-FLOAT))
+          ;;   to DOUBLE-FLOAT
+          ;; （冤枉 —— 复数→复数本来就该成功）。CONVENTIONS 允许位级等价改写，
+          ;; 分量式写法语义完全相同（实数入参虚部补 +0.0，与 coerce 一致），
+          ;; 且省掉一次泛型 coerce 的类型分派。
+          ((consp lt)
+           (let ((part (second lt)))
+             `(complex (coerce (realpart ,form) ',part)
+                       (coerce (imagpart ,form) ',part))))
+          (t                              `(coerce ,form ',lt)))))
 
 (defmacro %inline1-loop (lt op a res)
   (declare (optimize (speed 3) (safety 0)))
@@ -559,48 +660,42 @@
   "一元非连续/广播快路径（实数 4 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond-strided rd '%inline1-strided (list op a res)
-                                        :complex (%cx-inline-op-p op))
+       (cond ,@(%elem-type-cond-strided rd '%inline1-strided (list op a res))
              (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline2-strided-fast (op a b res)
   "二元非连续/广播快路径（实数 4 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond-strided rd '%inline2-strided (list op a b res)
-                                        :complex (%cx-inline-op-p op))
+       (cond ,@(%elem-type-cond-strided rd '%inline2-strided (list op a b res))
              (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline3-fast (op a b c res)
   "三元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond rd '%inline3-loop (list op a b c res)
-                                :complex (%cx-inline-op-p op))
+       (cond ,@(%elem-type-cond rd '%inline3-loop (list op a b c res))
              (t (vt-map (function ,op) ,a ,b ,c :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline3-strided-fast (op a b c res)
   "三元非连续/广播快路径（实数 4 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond-strided rd '%inline3-strided (list op a b c res)
-                                        :complex (%cx-inline-op-p op))
+       (cond ,@(%elem-type-cond-strided rd '%inline3-strided (list op a b c res))
              (t (vt-map (function ,op) ,a ,b ,c :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline1-fast (op a res)
   "一元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond rd '%inline1-loop (list op a res)
-                                :complex (%cx-inline-op-p op))
+       (cond ,@(%elem-type-cond rd '%inline1-loop (list op a res))
              (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline2-fast (op a b res)
   "二元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond rd '%inline2-loop (list op a b res)
-                                :complex (%cx-inline-op-p op))
+       (cond ,@(%elem-type-cond rd '%inline2-loop (list op a b res))
              (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 ;;; ==================================================================
@@ -631,7 +726,7 @@
               (type fixnum p0 s0 n op))
      (dotimes (i n)
        (declare (type fixnum i))
-       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0))))
+       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0)) ,in-lt))
        (incf op) (incf p0 s0))))
 
 (defmacro %mask2-loop (out-lt in-lt op a b res)
@@ -649,7 +744,7 @@
               (type fixnum p0 p1 s0 s1 n op))
      (dotimes (i n)
        (declare (type fixnum i))
-       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1))))
+       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))
        (incf op) (incf p0 s0) (incf p1 s1))))
 
 (defmacro %mask2-strided (out-lt in-lt op a b res)
@@ -673,14 +768,14 @@
               (type simple-vector rs s0 s1 dims)
               (type fixnum rank p0 p1 op))
      (if (= rank 0)
-         (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1))))
+         (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))
          (unless (= (the fixnum (vt-size ,res)) 0)
            (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
              (declare (type (simple-array fixnum (*)) idx))
              (block outer
                (loop
                  (setf (aref od op)
-                       (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1))))
+                       (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))
                  (let ((d (1- rank)))
                    (declare (type fixnum d))
                    (loop
@@ -704,9 +799,10 @@
             (,ea (array-element-type (vt-data ,a))))
        (cond
          ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in (if (%cx-inline-op-p op)
-                                             (append +vt-mask-in-types+ +cx-elem-types+)
-                                             +vt-mask-in-types+)
+                 nconc (loop for ilt in (append (unless (%cx-only-op-p op)
+                                                  +vt-mask-in-types+)
+                                                (when (%cx-inline-op-p op 1)
+                                                  +cx-elem-types+))
                              collect
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt))
@@ -721,9 +817,10 @@
             (,eb (array-element-type (vt-data ,b))))
        (cond
          ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in (if (%cx-inline-op-p op)
-                                             (append +vt-mask-in-types+ +cx-elem-types+)
-                                             +vt-mask-in-types+)
+                 nconc (loop for ilt in (append (unless (%cx-only-op-p op)
+                                                  +vt-mask-in-types+)
+                                                (when (%cx-inline-op-p op 2)
+                                                  +cx-elem-types+))
                              collect
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt)
@@ -739,9 +836,10 @@
             (,eb (array-element-type (vt-data ,b))))
        (cond
          ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in (if (%cx-inline-op-p op)
-                                             (append +vt-mask-in-types+ +cx-elem-types+)
-                                             +vt-mask-in-types+)
+                 nconc (loop for ilt in (append (unless (%cx-only-op-p op)
+                                                  +vt-mask-in-types+)
+                                                (when (%cx-inline-op-p op 2)
+                                                  +cx-elem-types+))
                              collect
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt)

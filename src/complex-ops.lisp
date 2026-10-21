@@ -1102,11 +1102,20 @@
    0.5^12/13! ≈ 1e-13，远低于 double 的 eps 累积）。"
   (cond ((%cx-nan-p z) (%cx-nan-complex z))
         ((< (abs z) 0.5)
-         (let ((term z)
-               (sum z))
-           (declare (type (complex double-float) term sum))
+         ;; 级数**固定用 double 算**（12 项 1.0d0/(k+2) 的系数都是 double，
+         ;; 强行降到 single 只会掉精度）。因此这里把 z 显式提升成 d0 再声明类型：
+         ;; 原写法直接 `(declare (type (complex double-float) term sum))` 而
+         ;; init 是 z —— 对 complex64 输入这是**谎报**：SBCL 不仅报编译期
+         ;; 「Derived type (complex single-float) conflicting with asserted
+         ;; (complex double-float)」让整个库编译失败，运行期 (safety 1) 还会
+         ;; 在 |z|<0.5 的 complex64 上直接抛类型错误。
+         (let* ((zd (complex (coerce (realpart z) 'double-float)
+                             (coerce (imagpart z) 'double-float)))
+                (term zd)
+                (sum zd))
+           (declare (type (complex double-float) zd term sum))
            (dotimes (k 12 sum)
-             (setf term (* term z (/ 1.0d0 (+ k 2))))
+             (setf term (* term zd (/ 1.0d0 (+ k 2))))
              (incf sum term))))
         (t (- (exp z) 1))))
 
@@ -1114,15 +1123,27 @@
   "log(1 + z)（对标 numpy.log1p 的复数分支）。
 
    与 expm1 同源：|z| 小时 1+z 的有效位被吃掉，必须走级数
-   log1p(z) = z·Σ_{k≥0} (-z)^k/(k+1)（交替级数，|z|<0.5 时 12 项足够）。
-   z = -1 时 1+z = 0，交给 %COP-LOG 处理极点（-inf + 0i）。"
+   log1p(z) = z - z²/2 + z³/3 - … = z·Σ_{k≥0} (-z)^k/(k+1)。
+   z = -1 时 1+z = 0，交给 %COP-LOG 处理极点（-inf + 0i）。
+
+   两个数值细节（与 numpy 2.4.6 逐点核对过）：
+     · 分母是**调和**的 k，不是阶乘 k!。写成 `term *= (-z)/(k+2)` 得到的是
+       z·Σ(-z)^k/(k+1)!，那是另一个函数 —— 实测 |z|=0.112 时虚部偏 0.4%
+       （numpy: 0.09634224+0.04542328i，错版: 0.0962934+0.045223i）。
+     · 线性分母收敛慢（|z|^n/n），窗口收到 |z|<0.25 并取 24 项：第 24 项
+       量级 0.25^24/24 ≈ 1.5e-16，相对误差已达 double 的 eps。|z|≥0.25 时
+       1+z 不存在抵消问题，直接走 %COP-LOG（与 numpy 分支切割一致）。"
   (cond ((%cx-nan-p z) (%cx-nan-complex z))
-        ((< (abs z) 0.5)
-         (let ((term z)
-               (sum z))
-           (declare (type (complex double-float) term sum))
-           (dotimes (k 12 sum)
-             (setf term (* term (- z) (/ 1.0d0 (+ k 2))))
+        ((< (abs z) 0.25)
+         ;; 同 %COP-EXPM1：级数固定 double（见那里的说明），z 先显式提升。
+         (let* ((zd (complex (coerce (realpart z) 'double-float)
+                             (coerce (imagpart z) 'double-float)))
+                (term zd)
+                (sum zd))
+           (declare (type (complex double-float) zd term sum))
+           (dotimes (k 23 sum)
+             (setf term (* term (- zd)
+                           (/ (float (1+ k) 1d0) (float (+ k 2) 1d0))))
              (incf sum term))))
         (t (%cop-log (+ 1 z)))))
 
@@ -1194,15 +1215,20 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
                     &key out dtype)
   "vt-clip 的别名（对标 torch.clamp）。复数语义同 vt-clip（字典序）。"
   (let ((v (ensure-vt vt)))
+    ;; VT-CLIP 的 lambda list 是 (&optional min-val max-val &key out dtype)：
+    ;; &OPTIONAL 在 &KEY 之前，转发时**必须把位置参数填满到 max-val**，否则
+    ;; 第一个关键字会被当成 max-val 绑走（SBCL 报 "called with odd number of
+    ;; keyword arguments"，运行期直接报错；这也是编译期 WARNING → ASDF 编译失败
+    ;; 的一条来源）。缺少 max-val 时显式填 NIL 占位。
     (if (vt-complex-dtype-p (vt-dtype v))
         (cond ((and min-p max-p) (vt-clip v min-val max-val :out out :dtype dtype))
-              (min-p (vt-clip v min-val :out out :dtype dtype))
-              (t (vt-clip v :out out :dtype dtype)))
-        ;; 同 vt-clip：&optional 在 &key 之前，转发时必须填满位置参数
+              (min-p (vt-clip v min-val nil :out out :dtype dtype))
+              (t (vt-clip v nil nil :out out :dtype dtype)))
+        ;; 实数分支同样处理；顺带修 min-p 分支静默丢弃 :out/:dtype 的 bug。
         (cond ((and min-p max-p)
                (funcall (%cx-orig 'vt-clamp) vt min-val max-val :out out :dtype dtype))
               (min-p
-               (funcall (%cx-orig 'vt-clamp) vt min-val))
+               (funcall (%cx-orig 'vt-clamp) vt min-val nil :out out :dtype dtype))
               (t
                (funcall (%cx-orig 'vt-clamp) vt nil nil :out out :dtype dtype))))))
 

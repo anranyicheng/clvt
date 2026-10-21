@@ -481,8 +481,11 @@
    的 m×m，碰巧不受影响。
    正确做法是把 Q 写成 H_0·H_1···H_{k-1}·I_{m×k}，从 **i = k-1 递减**
    到 0 依次左乘：每次只改行 i..m-1，这些行在截断的 Q 里都存在。"
+  ;; 注意：这里原先还声明了 (type (simple-array double-float (*)) v)，但
+  ;; 形参表里**没有** V（反射器存在 VBUF 里，复数值），该声明是一个
+  ;; undefined-variable WARNING 的来源；SBCL 因此把本文件编译成
+  ;; 「1 个 warning 条件」的文件，进而影响 ASDF 的 failure-p 判定。
   (declare (type (simple-array (complex double-float) (*)) q vbuf)
-           (type (simple-array double-float (*)) v)
            (type (simple-array fixnum (*)) voffs)
            (type fixnum qld rows ncols i)
            (type double-float beta)
