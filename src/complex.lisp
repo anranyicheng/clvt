@@ -1449,12 +1449,93 @@
                       m k n))
     res))
 
+;;; ------------------------------------------------------------------
+;;; 11.5.1 复数 GEMM 的「行内核」（对照 linalg.lisp 的 %MATMUL-DF-ROWS）
+;;;
+;;; 旧内核（第一轮）是 i-p-j 三重循环，但每个元素都由 (i,j,p) **重算**
+;;; 扁平下标，并且整段落在 %CX-DISPATCH 的 (safety 1) 里。实测（n=256，
+;;; 单线程，只计内核本身、不含 make-vt/contiguous，见 §16.27 消融表）：
+;;;
+;;;     旧内核（safety 1 + 下标重算 + 无展开）        24.2 ms
+;;;     + safety 0（索引可证不越界，§16.14.1 第 2 类）  22.0 ms
+;;;     + 指针递推（行起点只算一次，内层只 incf）        14.1 ms
+;;;     + j 维 4 路展开                                13.5 ms
+;;;
+;;; 三项收益互不重叠，且**全部来自代码形态**，与「复数」无关 —— 实数
+;;; 内核 %MATMUL-DF-ROWS 一开始就是这三件事（safety 0 / 指针递推 /
+;;; 4 路展开），差距的根因就在这里，而不是复数算术本身。
+;;;
+;;; 为什么**不**做 SoA（拆成 re/im 两个 double 数组）或 B 打包：
+;;; 实测更慢（SoA+打包 22.9ms、SoA 单累加器 75.2ms，均劣于 13.5ms）。
+;;; SBCL 的复数 * / + 是开码的：specialized 数组里的 (complex double-float)
+;;; 按 16 字节就地读写，不装箱、不 GC 分配；反倒是拆出来的索引运算更贵。
+;;; 因此这里保留「boxed complex 缓冲区 + * 算子」，只对齐循环形态。
+;;;
+;;; 索引安全性：a-row/c-row 由 i 维推出，b-ptr 由 p 维推出，c-ptr/b-ptr
+;;; 与 j 维同步 +1 —— 上界分别是 a-off+m*k / c-off+m*n / b-off+k*n，
+;;; 与缓冲区长度完全一致，故可用 (safety 0)（与 %MATMUL-DF-ROWS 同级）。
+;;; ⚠ 本函数**不清零也不重置** C：调用方负责，语义是「C += A@B」。
+;;;   这样 vt-matmul（先清零）与 einsum 的增量累加（§16.21）能共用一份内核。
+;;; ------------------------------------------------------------------
+
+(defmacro %def-cx-matmul-rows (name ctype)
+  "生成一个复数 GEMM 行内核 NAME（元素类型 CTYPE，如 (complex double-float)）。
+   签名与 %MATMUL-*-ROWS 一致：(A B C K N A-OFF B-OFF C-OFF I-START I-END)。"
+  `(progn
+     (declaim (inline ,name))
+     (defun ,name (a b c k n a-off b-off c-off i-start i-end)
+       (declare (type (simple-array ,ctype (*)) a b c)
+                (type fixnum k n a-off b-off c-off i-start i-end)
+                (optimize (speed 3) (safety 0) (debug 0) (compilation-speed 0)))
+       (let ((n4 (the fixnum (* (floor n 4) 4))))
+         (declare (type fixnum n4))
+         (loop for i of-type fixnum from i-start below i-end do
+           (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
+                 (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
+             (declare (type fixnum a-row c-row))
+             (loop for p of-type fixnum from 0 below k do
+               (let ((av (aref a (the fixnum (+ a-row p))))
+                     (b-ptr (the fixnum (+ b-off (the fixnum (* p n)))))
+                     (c-ptr c-row))
+                 (declare (type ,ctype av) (type fixnum b-ptr c-ptr))
+                 ;; 主循环：j 维 4 路展开，c-ptr/b-ptr 与 j 同步 +1（不重算下标）
+                 (loop for j of-type fixnum from 0 below n4 by 4 do
+                   (incf (aref c c-ptr)
+                         (the ,ctype (* av (aref b b-ptr))))
+                   (incf (aref c (the fixnum (1+ c-ptr)))
+                         (the ,ctype (* av (aref b (the fixnum (1+ b-ptr))))))
+                   (incf (aref c (the fixnum (+ c-ptr 2)))
+                         (the ,ctype (* av (aref b (the fixnum (+ b-ptr 2))))))
+                   (incf (aref c (the fixnum (+ c-ptr 3)))
+                         (the ,ctype (* av (aref b (the fixnum (+ b-ptr 3))))))
+                   (incf c-ptr 4)
+                   (incf b-ptr 4))
+                 ;; 尾部（n 不是 4 的倍数）
+                 (loop for j of-type fixnum from n4 below n do
+                   (incf (aref c c-ptr)
+                         (the ,ctype (* av (aref b b-ptr))))
+                   (incf c-ptr)
+                   (incf b-ptr))))))))))
+
+(%def-cx-matmul-rows %cx-matmul-cdd-rows (complex double-float))
+(%def-cx-matmul-rows %cx-matmul-css-rows (complex single-float))
+
 (defun %cx-matmul-run (ad bd rd a-off b-off c-off m k n)
-  "C[m,n] = A[m,k] @ B[k,n]（C 连续、复数同精度；三者的 offset 由调用方给出）。"
+  "C[m,n] = A[m,k] @ B[k,n]（C 连续、复数同精度；三者的 offset 由调用方给出）。
+
+   三步：① 按元素类型选定行内核；② 清零 C；③ 按 *ENABLE-PARALLEL-MATMUL*
+   与 *MATMUL-PARALLEL-THRESHOLD* 决定单线程还是按行切块多线程 ——
+   这段调度**直接复用实数线的 CALL-PARALLEL-GEMM**（linalg.lisp），
+   因此复数与实数的并行语义（阈值、线程数、行切法）完全一致。
+
+   清零与累加**刻意分成两趟**：实测「把 p=0 折进内核直接写 C」反而更慢
+   （n=256: 14.6ms vs 13.5ms），因为写了 4 份 j 展开的初始化代码、
+   挤掉了内层循环的寄存器分配。"
   (%cx-dispatch ad a zero
     (%cx-dispatch bd b zero2
       (%cx-dispatch rd c zero3
         (declare (ignorable zero2 zero3))
+        ;; ① 清零（整块一趟，连续访存）
         (dotimes (i m)
           (declare (type fixnum i))
           (let ((c-row (the fixnum (+ c-off (the fixnum (* i n))))))
@@ -1462,20 +1543,12 @@
             (dotimes (j n)
               (declare (type fixnum j))
               (setf (aref c (the fixnum (+ c-row j))) zero))))
-        (dotimes (i m)
-          (declare (type fixnum i))
-          (let ((a-row (the fixnum (+ a-off (the fixnum (* i k)))))
-                (c-row (the fixnum (+ c-off (the fixnum (* i n))))))
-            (declare (type fixnum a-row c-row))
-            (dotimes (p k)
-              (declare (type fixnum p))
-              (let ((av (aref a (the fixnum (+ a-row p))))
-                    (b-row (the fixnum (+ b-off (the fixnum (* p n))))))
-                (declare (type fixnum b-row))
-                (dotimes (j n)
-                  (declare (type fixnum j))
-                  (incf (aref c (the fixnum (+ c-row j)))
-                        (* av (aref b (the fixnum (+ b-row j))))))))))))))
+        ;; ②③ 选内核 + 调度
+        (if (equal (array-element-type ad) '(complex double-float))
+            (call-parallel-gemm #'%cx-matmul-cdd-rows
+                                a b c m k n a-off b-off c-off)
+            (call-parallel-gemm #'%cx-matmul-css-rows
+                                a b c m k n a-off b-off c-off))))))
 
 (defun %cx-dot-1d (a b)
   "复数向量点积 → 0 维张量（不取共轭，对标 numpy.dot）。"
@@ -1514,41 +1587,57 @@
    SA-J、SB-K、SC-K 全为 1 时（A 行内连续 + C 连续，即 `ij,jk->ik`
    的常规情形）走 i-p-j 特化循环，内层连续访存 —— 与 vt-matmul 同款
    内核；否则（转置 / 广播 / 非连续 :out）走通用 strided 循环，
-   仍是元素类型特化代码，比通用状态机快一个数量级。"
+   仍是元素类型特化代码，比通用状态机快一个数量级。
+
+   若布局**进一步**与「连续 NN」逐项相同（SA-I=k、SB-J=n、SC-I=n，
+   即 A 行距 = k、B 行距 = n、C 行距 = n），则直接委托给
+   %CX-MATMUL-*-ROWS —— 与 vt-matmul 用的是**同一份行内核**（4 路展开
+   + 指针递推）。这样两边的累加次序（i→p→j 递增）逐位一致，
+   einsum 与 vt-matmul 的结果仍然 bit-for-bit 相等（§16.21.5 的验收项）。"
   (%cx-dispatch ad a zero
     (%cx-dispatch bd b zero2
       (%cx-dispatch rd c zero3
         (declare (ignorable zero2 zero3))
-        (if (and (= sa-j 1) (= sb-k 1) (= sc-k 1))
-            (dotimes (ii m)
-              (declare (type fixnum ii))
-              (let ((a-row (the fixnum (+ a-off (the fixnum (* ii sa-i)))))
-                    (c-row (the fixnum (+ c-off (the fixnum (* ii sc-i))))))
-                (declare (type fixnum a-row c-row))
-                (dotimes (pp k)
-                  (declare (type fixnum pp))
-                  (let ((av (aref a (the fixnum (+ a-row pp))))
-                        (b-row (the fixnum (+ b-off (the fixnum (* pp sb-j))))))
-                    (declare (type fixnum b-row))
-                    (dotimes (jj n)
-                      (declare (type fixnum jj))
-                      (incf (aref c (the fixnum (+ c-row jj)))
-                            (* av (aref b (the fixnum (+ b-row jj))))))))))
-            (dotimes (ii m)
-              (declare (type fixnum ii))
-              (let ((a-row (the fixnum (+ a-off (the fixnum (* ii sa-i)))))
-                    (c-row (the fixnum (+ c-off (the fixnum (* ii sc-i))))))
-                (declare (type fixnum a-row c-row))
-                (dotimes (pp k)
-                  (declare (type fixnum pp))
-                  (let ((av (aref a (the fixnum (+ a-row (the fixnum (* pp sa-j))))))
-                        (b-row (the fixnum (+ b-off (the fixnum (* pp sb-j))))))
-                    (declare (type fixnum b-row))
-                    (dotimes (jj n)
-                      (declare (type fixnum jj))
-                      (incf (aref c (the fixnum (+ c-row (the fixnum (* jj sc-k)))))
-                            (* av (aref b (the fixnum (+ b-row
-                                                         (the fixnum (* jj sb-k)))))))))))))))))
+        (cond
+          ;; (a) 连续 NN：与 vt-matmul 共用行内核（最快）
+          ((and (= sa-j 1) (= sb-k 1) (= sc-k 1)
+                (= sa-i k) (= sb-j n) (= sc-i n))
+           (if (equal (array-element-type ad) '(complex double-float))
+               (%cx-matmul-cdd-rows a b c k n a-off b-off c-off 0 m)
+               (%cx-matmul-css-rows a b c k n a-off b-off c-off 0 m)))
+          ;; (b) A 行内连续 + C 连续，但行距不同（切片/子块/非连续 :out）
+          ((and (= sa-j 1) (= sb-k 1) (= sc-k 1))
+           (dotimes (ii m)
+             (declare (type fixnum ii))
+             (let ((a-row (the fixnum (+ a-off (the fixnum (* ii sa-i)))))
+                   (c-row (the fixnum (+ c-off (the fixnum (* ii sc-i))))))
+               (declare (type fixnum a-row c-row))
+               (dotimes (pp k)
+                 (declare (type fixnum pp))
+                 (let ((av (aref a (the fixnum (+ a-row pp))))
+                       (b-row (the fixnum (+ b-off (the fixnum (* pp sb-j))))))
+                   (declare (type fixnum b-row))
+                   (dotimes (jj n)
+                     (declare (type fixnum jj))
+                     (incf (aref c (the fixnum (+ c-row jj)))
+                           (* av (aref b (the fixnum (+ b-row jj)))))))))))
+          ;; (c) 通用 strided（转置 / 广播）
+          (t
+           (dotimes (ii m)
+             (declare (type fixnum ii))
+             (let ((a-row (the fixnum (+ a-off (the fixnum (* ii sa-i)))))
+                   (c-row (the fixnum (+ c-off (the fixnum (* ii sc-i))))))
+               (declare (type fixnum a-row c-row))
+               (dotimes (pp k)
+                 (declare (type fixnum pp))
+                 (let ((av (aref a (the fixnum (+ a-row (the fixnum (* pp sa-j))))))
+                       (b-row (the fixnum (+ b-off (the fixnum (* pp sb-j))))))
+                   (declare (type fixnum b-row))
+                   (dotimes (jj n)
+                     (declare (type fixnum jj))
+                     (incf (aref c (the fixnum (+ c-row (the fixnum (* jj sc-k)))))
+                           (* av (aref b (the fixnum (+ b-row
+                                                        (the fixnum (* jj sb-k))))))))))))))))))
 
 (defun %cx-einsum-dot (a b)
   "einsum \"i,i->\" 的复数全收缩内积，返回复数**标量**（不取共轭）。

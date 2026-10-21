@@ -10,6 +10,7 @@
 (in-package :clvt)
 
 (defparameter *n* 1000000)
+(defparameter *matmul-bench-sizes* '(128 256 512))
 
 (defmacro bench (label form &key (runs 3))
   "跑 RUNS 次取最好（ms）。GC 前置，减少噪声。"
@@ -59,6 +60,19 @@
                           (list 256 256)))
           (dr (vt-reshape (vt-+ (vt-zeros (list 65536)) 1.5d0) (list 256 256))))
       (bench-pair "matmul 256x256" (vt-matmul dr dr) (vt-matmul zr zr)))
+    ;; 多尺寸 matmul：只看「复数/实数」比值（§16.27；绝对毫秒随机器负载波动）
+    (format t "~&--- matmul 多尺寸（端到端）---~%")
+    (dolist (n *matmul-bench-sizes*)
+      (let* ((nn (* n n))
+             (z (vt-reshape (vt-+ (vt-zeros (list nn) :dtype :complex128)
+                                  #C(1.0d0 0.5d0)) (list n n)))
+             (d (vt-reshape (vt-+ (vt-zeros (list nn)) 1.5d0) (list n n))))
+        (dolist (par '(nil t))
+          (let ((r (bench (format nil "matmul ~dx~d f64  ~:[串行~;并行~]" n n par)
+                          (let ((*enable-parallel-matmul* par)) (vt-matmul d d))))
+                (c (bench (format nil "matmul ~dx~d c128 ~:[串行~;并行~]" n n par)
+                          (let ((*enable-parallel-matmul* par)) (vt-matmul z z)))))
+            (format t "    → 复数/实数 = ~,1f x~%" (if (zerop r) 0.0 (/ (float c) r)))))))
     (format t "~&--- 归约 argmax/median ---~%")
     (bench-pair "argmax" (vt-argmax d1) (vt-argmax z1))
     (bench-pair "median" (vt-median d1) (vt-median z1))))
