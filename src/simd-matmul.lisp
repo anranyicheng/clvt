@@ -237,6 +237,54 @@
 ;; *simd-matmul-2d-fn* 在 linalg.lisp 文件中定义，这里注册
 (setf *simd-matmul-2d-fn* #'%simd-matmul-2d)
 
+;;; ============================================================
+;;; 裸数据 2D GEMM（供 linalg.lisp 的 einsum 批量 GEMM 通道调用）
+;;; ============================================================
+;;; 背景（§16.26）：einsum 的批量 GEMM 快通道原先只调 linalg.lisp 的标量
+;;; 内核（%MATMUL-DF-FAST-KERNEL 家族：4 路手写展开、无 SIMD、无分块），
+;;; 而 VT-MATMUL 走本文件的 AVX/FMA + 64×256×256 分块内核。两条路径互不
+;;; 相通，于是同一台机器上
+;;;     (vt-einsum "ij,jk->ik" a b)   比   (vt-matmul a b)   慢 5.7~6.4×
+;;; （1024² float64，单线程；多线程下内存带宽掩盖一部分，实测 1.74×）。
+;;;
+;;; 这里提供一个「裸数据」入口：只做 SAP 换算 + 阈值判定，其余全部复用
+;;; 已有内核与 %SIMD-MATMUL-PARALLEL 的线程调度，因此两条路径的数值行为
+;;; 逐位一致（同一内核、同一分块顺序）。
+;;;
+;;; 约定：A/B/C 均为行主序连续、互不重叠；偏移是**元素**下标（非字节）；
+;;; 语义是累加 C += A·B（与 einsum 的 incf 语义一致，调用方负责清零）。
+(defun %simd-gemm-raw (a-data b-data c-data m k n
+                       a-off b-off c-off elem-kind)
+  (declare (type (simple-array * (*)) a-data b-data c-data)
+           (type fixnum m k n a-off b-off c-off)
+           (type symbol elem-kind)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (when (or (not *simd-matmul-enabled*)
+            (< (* m k n) *simd-matmul-threshold*))
+    (return-from %simd-gemm-raw nil))
+  (multiple-value-bind (rows-fn elem-size)
+      (case elem-kind
+        (:float64 (values #'%simd-matmul-f64-rows 8))
+        (:float32 (values #'%simd-matmul-f32-rows 4))
+        (:int64   (values #'%simd-matmul-i64-rows 8))
+        (:int32   (values #'%simd-matmul-i32-rows 4))
+        (t        (values nil 0)))
+    (unless rows-fn
+      (return-from %simd-gemm-raw nil))
+    (let ((rows (the function rows-fn))
+          (esize (the fixnum elem-size)))
+      (declare (type function rows) (type fixnum esize))
+      (sb-sys:with-pinned-objects (a-data b-data c-data)
+        (let ((pa (sb-sys:sap+ (sb-sys:vector-sap a-data) (the fixnum (* a-off esize))))
+              (pb (sb-sys:sap+ (sb-sys:vector-sap b-data) (the fixnum (* b-off esize))))
+              (pc (sb-sys:sap+ (sb-sys:vector-sap c-data) (the fixnum (* c-off esize)))))
+          (declare (type sb-sys:system-area-pointer pa pb pc))
+          (%simd-matmul-parallel rows pa pb pc m k n))))
+    t))
+
+;; *simd-gemm-raw-fn* 在 linalg.lisp 中定义（它先于本文件编译），这里注册。
+(setf *simd-gemm-raw-fn* #'%simd-gemm-raw)
+
 ;;;; 批量矩阵乘法的 SIMD 快速路径
 ;;;;
 ;;;; 支持：

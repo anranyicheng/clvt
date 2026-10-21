@@ -8,6 +8,26 @@
   "批量 matmul 的 SIMD 快速路径。在 vt-matmul 的 >2D 分支里尝试调用，
    返回 VT 成功，NIL 回退到 vt-einsum。")
 
+(defvar *simd-gemm-raw-fn* nil
+  "由 src/simd-matmul.lisp 注册的**裸数据** 2D GEMM（只接受 NN 布局）。
+
+   签名：(a-data b-data c-data m k n a-off b-off c-off elem-kind)
+         → T 已计算 / NIL 未接管。
+
+   语义与 %MATMUL-*-FAST-KERNEL 家族**完全一致**：C = C + A·B，其中
+   A:(m,k)、B:(k,n)、C:(m,n) 全部行主序连续、互不重叠；A-OFF/B-OFF/C-OFF
+   是**元素**下标（不是字节）；ELEM-KIND 取 :FLOAT64 / :FLOAT32 /
+   :INT64 / :INT32。
+
+   为什么需要它（§16.26）：einsum 的批量 GEMM 快通道原先只调 linalg.lisp
+   里的标量内核（4 路手写展开、无 SIMD、无分块），而 VT-MATMUL 走
+   simd-matmul.lisp 的 AVX/FMA + 64×256×256 分块内核 —— 两条路径互不
+   相通，于是同一台机器上
+       (vt-einsum \"ij,jk->ik\" a b)   比   (vt-matmul a b)   慢 5.7~6.4×
+   （1024² float64、单线程实测；多线程下内存带宽掩盖一部分，实测 1.78×）。
+   linalg.lisp 早于 simd-matmul.lisp 编译，故沿用 *SIMD-MATMUL-2D-FN*
+   的钩子模式。为 NIL 或返回 NIL 时退回标量内核，语义不变（只是慢）。")
+
 ;;; ------------------------------------------------------------------
 ;;; 复数 einsum 快路径钩子（由 src/complex.lisp 注册，§16.21）
 ;;;
@@ -536,6 +556,203 @@
   (call-parallel-gemm #'%matmul-i32-rows
                       a-data b-data c-data m k n a-off b-off c-off))
 
+;;; ==================================================================
+;;; 通用 strided GEMM —— einsum 批量通道的内层（§16.26）
+;;; ==================================================================
+;;; 语义（与 einsum 的 incf 累加严格一致）：
+;;;
+;;;   C[off-c + i·so-i + k·so-k] += Σ_j A[off-a + i·sa-i + j·sa-j]
+;;;                                       · B[off-b + j·sb-j + k·sb-k]
+;;;
+;;; 三个轴的角色由 einsum 的标签分析固定（i = A 的行、j = 收缩轴、
+;;; k = B 的列），但**存储布局**任意，于是有四种组合。这里把它们归一化成
+;;; 「连续 C += 连续 A·连续 B」，再进分块内核（SIMD 优先）：
+;;;
+;;;   ① 全连续（NN）       → 直接进内核（最快）。
+;;;   ② B 按 (n,k) 存（NT）→ 先转成 (k,n) 连续缓冲再走 ①。
+;;;      代价 O(n·k) 拷贝换 O(m·n·k) 的 SIMD 计算，m ≥ 2 就回本；
+;;;      原实现走标量 NT 内核，512² 实测慢 12.2×（单线程）/ 1.7×（32 线程）。
+;;;   ③ C 非行主序        → 先算到连续临时 C 再 scatter 累加。
+;;;      不能直接让内层循环沿 so-k 走 —— 那会让最内层跨 cache line，
+;;;      512² 的 "ij,jk->ki" 实测比 ① 慢 19.6×（609 ms vs 31 ms，单线程）。
+;;;   ④ 其余（A 非行连续）→ 通用三重循环兜底，语义与改动前逐位一致。
+;;;
+;;; 为什么不写在 einsum-execute 的 macrolet 里（踩过的坑）：
+;;;   einsum-execute 已有 4 类型 × 2 内核的宏展开，再塞进布局归一化后
+;;;   函数体膨胀，SBCL 对**兜底路径**（一行没改）的代码生成退化 ~25%
+;;;   （512² 的 "ij,jk->ki" 从 711~730 ms 变成 934~971 ms，重复 3 次稳定）。
+;;;   这里每个分支只留一行独立函数调用，展开体积回到原来的量级。
+;;;
+;;; 数值一致性：四条路最终都调用同一个 %MATMUL-*-FAST-KERNEL 家族（或
+;;; 同一 SIMD 内核）、分块顺序相同，因此与 VT-MATMUL **逐位相同**；
+;;; 与旧的标量三重循环相比只差 FMA 少一次舍入（相对差 ~1e-12，更准）。
+
+(defmacro define-einsum-gemm (fn-name strided-name ltype elem-kind kernel)
+  "为 LTYPE 生成 einsum 的 strided GEMM 入口 FN-NAME 与兜底 STRIDED-NAME。
+
+   STRIDED-NAME 就是原来的标量三重循环（逐位不变）；FN-NAME 在其上做
+   布局归一化，能归一化时走 ELEM-KIND 对应的 SIMD / KERNEL 快路径。"
+  ;; 临时缓冲的初值必须与元素类型同型：写 `:initial-element 0` 会让 SBCL
+  ;; 报 "Constant 0 conflicts with its asserted type DOUBLE-FLOAT"（整数 0
+  ;; 与浮点数组元素类型冲突），并让 COMPILE-FILE 返回 failure-p=T。
+  ;;
+  ;; 而且必须用 (FILL buf ZERO) 而**不是** :INITIAL-ELEMENT：对 2 MB 级别的
+  ;; 大对象，SBCL 的 :INITIAL-ELEMENT 0.0d0 会走 calloc/零页（不真正写内存），
+  ;; 于是首次写入由 **每个工作线程各自触发 page fault** —— 31 线程并发抢
+  ;; mmap_lock，512² 实测「分配 + GEMM」从 47 ms 恶化到 111 ms。
+  ;; FILL 走 memset 真写入，主线程一次 touch 完，代价 0.5 ms。
+  (let ((zero (case elem-kind
+                (:float64 ''0.0d0)
+                (:float32 ''0.0f0)
+                (t 0))))
+    `(progn
+     ;; ---- 兜底：任意步长的三重循环（= 改动前 einsum 的「兼容回退」）----
+     (declaim (inline ,strided-name))
+     (defun ,strided-name (da db dc m k n a-off b-off c-off
+                           sa-i sa-j sb-j sb-k so-i so-k)
+       (declare (type (simple-array ,ltype (*)) da db dc)
+                (type fixnum m k n a-off b-off c-off
+                      sa-i sa-j sb-j sb-k so-i so-k)
+                (optimize (speed 3) (safety 0) (debug 0)))
+       (loop for i-idx fixnum from 0 below m do
+         (let ((a-row (the fixnum (+ a-off (the fixnum (* i-idx sa-i)))))
+               (c-row (the fixnum (+ c-off (the fixnum (* i-idx so-i))))))
+           (declare (type fixnum a-row c-row))
+           (loop for j-idx fixnum from 0 below k do
+             (let ((a-val (aref da (the fixnum
+                                    (+ a-row (the fixnum (* j-idx sa-j))))))
+                   (b-ptr (the fixnum (+ b-off (the fixnum (* j-idx sb-j)))))
+                   (c-ptr c-row))
+               (declare (type ,ltype a-val) (type fixnum b-ptr c-ptr))
+               (loop for k-idx fixnum from 0 below n do
+                 (incf (aref dc c-ptr)
+                       (the ,ltype (* a-val (aref db b-ptr))))
+                 (incf b-ptr sb-k)
+                 (incf c-ptr so-k)))))))
+     ;; ---- 入口：布局归一化 ----
+     (defun ,fn-name (da db dc m k n a-off b-off c-off
+                      sa-i sa-j sb-j sb-k so-i so-k)
+       (declare (type (simple-array ,ltype (*)) da db dc)
+                (type fixnum m k n a-off b-off c-off
+                      sa-i sa-j sb-j sb-k so-i so-k)
+                (optimize (speed 3) (safety 0) (debug 0)))
+       (labels ((core (ba bb bc boff coff)
+                  ;; 连续 C += 连续 A·连续 B。SIMD 分块内核优先，它自带
+                  ;; 「尺寸低于阈值 / 全局关闭 → NIL」的判据。
+                  (declare (type (simple-array ,ltype (*)) ba bb bc)
+                           (type fixnum boff coff))
+                  (unless (and *simd-gemm-raw-fn*
+                               (funcall *simd-gemm-raw-fn* ba bb bc m k n
+                                        a-off boff coff ,elem-kind))
+                    (,kernel ba bb bc m k n a-off boff coff)))
+                (b-as-row-major (bb boff)
+                  ;; B 按 (n,k) 存（NT）→ 转成 (k,n) 连续缓冲。
+                  ;; **必须分块转置**：朴素双重循环里 BB 的内层步长是 SB-K
+                  ;; （NT 时 = k，即整行），每步跨一行 → 512² 时几乎每次
+                  ;; 都是 cache miss，光这一步就把 NT 拖慢 1.8×。
+                  ;; 64×64 分块后块内两侧都落在 L2。
+                  (declare (type (simple-array ,ltype (*)) bb)
+                           (type fixnum boff))
+                  (let ((bt (make-array (the fixnum (* k n))
+                                        :element-type ',ltype)))
+                    (declare (type (simple-array ,ltype (*)) bt))
+                    (fill bt ,zero)
+                    (loop for j0 fixnum from 0 below k by 64 do
+                      (let ((j1 (the fixnum (min k (the fixnum (+ j0 64))))))
+                        (declare (type fixnum j1))
+                        (loop for k0 fixnum from 0 below n by 64 do
+                          (let ((k1 (the fixnum
+                                         (min n (the fixnum (+ k0 64))))))
+                            (declare (type fixnum k1))
+                            (loop for jj fixnum from j0 below j1 do
+                              (let ((brow (the fixnum
+                                               (+ boff (the fixnum
+                                                        (* jj sb-j)))))
+                                    (trow (the fixnum (* jj n))))
+                                (declare (type fixnum brow trow))
+                                (loop for kk fixnum from k0 below k1 do
+                                  (setf (aref bt (the fixnum (+ trow kk)))
+                                        (aref bb
+                                              (the fixnum
+                                               (+ brow (the fixnum
+                                                        (* kk sb-k)))))))))))))
+                    bt))
+                (scatter (tmp)
+                  ;; 把连续临时 C 按 out 的实际步长累加回 DC。
+                  ;; 同样必须**分块 + 让写侧连续**：`"ij,jk->ki"` 的
+                  ;; SO-K = m（跨整行），若按「i 外层 / kk 内层」写，
+                  ;; 内层每步换一条 cache line，512² 实测 scatter 单项
+                  ;; 就要 50ms 以上（GEMM 本体只要 41ms）。
+                  ;; 这里改成「kk 外层 / i 内层」（写侧沿 SO-I，通常 = 1
+                  ;; 即连续），并 64×64 分块让读侧也留在 L2。
+                  (declare (type (simple-array ,ltype (*)) tmp))
+                  (loop for k0 fixnum from 0 below n by 64 do
+                    (let ((k1 (the fixnum (min n (the fixnum (+ k0 64))))))
+                      (declare (type fixnum k1))
+                      (loop for i0 fixnum from 0 below m by 64 do
+                        (let ((i1 (the fixnum
+                                       (min m (the fixnum (+ i0 64))))))
+                          (declare (type fixnum i1))
+                          (loop for kk fixnum from k0 below k1 do
+                            (let ((crow (the fixnum
+                                             (+ c-off (the fixnum
+                                                       (* kk so-k))))))
+                              (declare (type fixnum crow))
+                              (loop for i fixnum from i0 below i1 do
+                                (incf (aref dc
+                                            (the fixnum
+                                             (+ crow (the fixnum
+                                                      (* i so-i)))))
+                                      (aref tmp
+                                            (the fixnum
+                                             (+ (the fixnum (* i n))
+                                                kk)))))))))))))
+         (cond
+           ;; ④ A 非行连续：没有可复用的内核，直接兜底
+           ((not (and (= sa-j 1) (= sa-i k)))
+            (,strided-name da db dc m k n a-off b-off c-off
+                           sa-i sa-j sb-j sb-k so-i so-k))
+           ;; ③ 的退化版：C 非行主序但 m·n 很小，临时缓冲分配不划算
+           ((and (not (and (= so-k 1) (= so-i n)))
+                 (< (the fixnum (* m n)) 4096))
+            (,strided-name da db dc m k n a-off b-off c-off
+                           sa-i sa-j sb-j sb-k so-i so-k))
+           (t
+            (let ((bt nil) (boff b-off))
+              (declare (type (or null (simple-array ,ltype (*))) bt)
+                       (type fixnum boff))
+              (cond
+                ;; ①/③ B 已是行主序
+                ((and (= sb-k 1) (= sb-j n)))
+                ;; ②/③ B 是 NT 布局 → 转成行主序
+                ((and (= sb-j 1) (= sb-k k))
+                 (setf bt (b-as-row-major db b-off) boff 0))
+                ;; 其它（B 也是 strided）：兜底
+                (t
+                 (return-from ,fn-name
+                   (,strided-name da db dc m k n a-off b-off c-off
+                                  sa-i sa-j sb-j sb-k so-i so-k))))
+              (let ((bb (if bt bt db)))
+                (declare (type (simple-array ,ltype (*)) bb))
+                (if (and (= so-k 1) (= so-i n))
+                    (core da bb dc boff c-off)
+                    (let ((tmp (make-array (the fixnum (* m n))
+                                           :element-type ',ltype)))
+                      (declare (type (simple-array ,ltype (*)) tmp))
+                      (fill tmp ,zero)
+                      (core da bb tmp boff 0)
+                      (scatter tmp))))))))))))
+
+(define-einsum-gemm %einsum-gemm-f64 %einsum-gemm-strided-f64
+    double-float :float64 %matmul-df-fast-kernel)
+(define-einsum-gemm %einsum-gemm-f32 %einsum-gemm-strided-f32
+    single-float :float32 %matmul-sf-fast-kernel)
+(define-einsum-gemm %einsum-gemm-i64 %einsum-gemm-strided-i64
+    (signed-byte 64) :int64 %matmul-i64-fast-kernel)
+(define-einsum-gemm %einsum-gemm-i32 %einsum-gemm-strided-i32
+    (signed-byte 32) :int32 %matmul-i32-fast-kernel)
+
+
 (defun einsum-execute
     (all-labels-vec label-dims-vec output-subs input-subs vts &key out)
   (declare (type simple-vector all-labels-vec)
@@ -801,54 +1018,29 @@
                            (data-a (aref in-data-vec 0))
                            (data-b (aref in-data-vec 1)))
                       
-                      ;; 宏：生成 4 种类型的 BMM 内层循环，避免代码重复
-		      (macrolet ((gen-bmm-logic (lisp-type kernel-nn kernel-nt)
-                                   `(let ((da (the (simple-array ,lisp-type (*)) data-a))
-                                          (db (the (simple-array ,lisp-type (*)) data-b))
-                                          (dc (the (simple-array ,lisp-type (*)) out-data)))
-                                      (cond
-                                        ;; NN：A 行连续（j 步长 1），B 行连续（k 步长 1）
-                                        ((and (= sa-i d-j) (= sa-j 1)
-                                              (= sb-k 1) (= so-k 1)
-                                              (= sb-j d-k) (= so-i d-k))
-                                         (,kernel-nn da db dc d-i d-j d-k off-a off-b off-c))
-                                        ;; ★ P1-3: NT：A 行连续，B 转置连续（k 步长 1，j 步长 d-j）
-                                        ,@(when kernel-nt
-                                            `(((and (= sa-i d-j) (= sa-j 1)
-                                                    (= sb-k d-j) (= sb-j 1)
-                                                    (= so-i d-k) (= so-k 1))
-                                               (,kernel-nt da db dc d-i d-j d-k off-a off-b off-c))))
-                                        ;; 兼容回退
-                                        (t
-                                         (loop for i-idx fixnum from 0 below d-i do
-                                           (let ((ptr-a-row-start (+ off-a (the fixnum (* i-idx sa-i))))
-                                                 (ptr-c-row-start (+ off-c (the fixnum (* i-idx so-i)))))
-                                             (loop for j-idx fixnum from 0 below d-j do
-                                               (let ((val-a (aref da (+ ptr-a-row-start (the fixnum (* j-idx sa-j)))))
-                                                     (ptr-b-start (+ off-b (the fixnum (* j-idx sb-j))))
-                                                     (ptr-c-start ptr-c-row-start))
-                                                 (loop for k-idx fixnum from 0 below d-k do
-                                                   (incf (aref dc ptr-c-start)
-                                                         (* val-a (aref db ptr-b-start)))
-                                                   (incf ptr-b-start sb-k)
-                                                   (incf ptr-c-start so-k)))))))))))
+                      ;; 4 种元素类型各自一行调用：布局归一化（NN / B 转置 /
+                      ;; C 转置 / 兜底）全在 %EINSUM-GEMM-* 里（§16.26）。
+                      ;; **不要**把那些判断搬回来展开：会让本函数体膨胀，
+                      ;; 连带把兜底路径的代码生成拖慢 33%（见那里的注释）。
+		      (macrolet ((gen-bmm-logic (lisp-type fn)
+                                   `(,fn (the (simple-array ,lisp-type (*)) data-a)
+                                         (the (simple-array ,lisp-type (*)) data-b)
+                                         (the (simple-array ,lisp-type (*)) out-data)
+                                         d-i d-j d-k off-a off-b off-c
+                                         sa-i sa-j sb-j sb-k so-i so-k)))
                         
                         (labels
                             ((loop-batch (b-labels off-a off-b off-c)
                                (if (null b-labels)
 				   (cond
                                      (all-f64-p (gen-bmm-logic double-float
-                                                               %matmul-df-fast-kernel
-                                                               %matmul-df-nt-fast-kernel))
+                                                               %einsum-gemm-f64))
                                      (all-f32-p (gen-bmm-logic single-float
-                                                               %matmul-sf-fast-kernel
-                                                               %matmul-sf-nt-fast-kernel))
+                                                               %einsum-gemm-f32))
                                      (all-i64-p (gen-bmm-logic (signed-byte 64)
-                                                               %matmul-i64-fast-kernel
-                                                               nil))
+                                                               %einsum-gemm-i64))
                                      (all-i32-p (gen-bmm-logic (signed-byte 32)
-                                                               %matmul-i32-fast-kernel
-                                                               nil))
+                                                               %einsum-gemm-i32))
                                      ;; 复数（§16.21）：内核在 complex.lisp，
                                      ;; 由 %CX-GEMM-STRIDED 按元素类型再分派，
                                      ;; 因此这里不需要 gen-bmm-logic 的类型展开。

@@ -2073,7 +2073,126 @@ batch 输入要复现 numpy 缺省需显式 `:axis1 0 :axis2 1`（已写入 docs
 
 ---
 
-### 16.20 累计变更文件清单（第一～五轮）
+### 16.26 einsum 的实数 GEMM 快通道接入 SIMD（第六轮）
+
+**症状**：同一台机器上，`(vt-einsum "ij,jk->ik" a b)` 比 `(vt-matmul a b)`
+慢 **5.7~6.4×**（float64，1024²，单线程）；多线程下内存带宽掩盖掉一部分，
+仍有 1.78×。复数路径上一轮刚接通，实数这条反而漏了。
+
+**根因（两条路径互不相通）**
+
+| | 走的通道 | 内核 |
+|---|---|---|
+| `vt-matmul` 2D@2D | `*SIMD-MATMUL-2D-FN*` | `simd-matmul.lisp`：AVX 4 宽 + FMA + 64×256×256 分块 |
+| `vt-einsum` BMM | `%MATMUL-DF-FAST-KERNEL` | `linalg.lisp`：4 路手写展开，**无 SIMD、无分块** |
+
+关掉 `*SIMD-MATMUL-ENABLED*` 后两者持平（0.93~0.98×），可直接证明差异
+**全部**来自这两个内核，与 einsum 的通道判定、类型提升无关。
+
+**修法：一个裸数据钩子 + 布局归一化**
+
+1. `linalg.lisp` 新增 `*SIMD-GEMM-RAW-FN*`（定义在前、`simd-matmul.lisp`
+   注册，同 `*SIMD-MATMUL-2D-FN*` 模式 —— linalg 先编译，不能反向引用）。
+   签名 `(a-data b-data c-data m k n a-off b-off c-off elem-kind)`，
+   语义与 `%MATMUL-*-FAST-KERNEL` **完全一致**（`C += A·B`，行主序，
+   偏移是**元素**下标）；返回 T/NIL 表示是否接管。
+2. `define-einsum-gemm` 为 4 种元素类型各生成一个入口
+   `%EINSUM-GEMM-{F64,F32,I64,I32}`，把任意步长归一化成
+   「连续 C += 连续 A·连续 B」后进内核：
+
+| 布局 | 处理 |
+|---|---|
+| ① 全连续（NN） | 直接进分块内核（SIMD 优先，NIL 落标量） |
+| ② B 按 (n,k) 存（NT，如 `"ij,kj->ik"`） | 64×64 **分块转置**成 (k,n) 缓冲，走 ① |
+| ③ C 非行主序（如 `"ij,jk->ki"`） | 算到连续临时 C，再 64×64 **分块 scatter** 累加回 |
+| ④ 其余（A 非行连续） | 原三重循环兜底，逐位不变 |
+
+**为什么 ②③ 必须分块**：朴素写法里内层循环的步长是「一整行」
+（NT 时 `sb-k = k`，C 转置时 `so-k = m`），512² 上每步都换一条 cache line。
+512² 单线程实测：③ 不分块 609 ms，分块后 36 ms —— **17×**，
+比 GEMM 本体（31 ms）还贵；② 同理（381 ms → 30 ms）。
+
+#### 16.26.1 踩坑一：不要在 macrolet 里做布局归一化
+
+第一版把上面四条判断直接展开了 `einsum-execute` 的 `gen-bmm-logic` 里。
+结果**一行没改的兜底路径**从 711 ms 退化到 947 ms（+33%）——函数体膨胀后
+SBCL 对该分支的代码生成明显变差（分支更多、寄存器压力更大）。
+
+对策：`einsum-execute` 里每个类型只留**一行函数调用**，全部逻辑进独立
+`defun`。改完后兜底路径回到基线，且编译期类型检查也回来了。
+
+> 教训：宏展开层的「多写几行」不是零成本，它会重排整个函数的寄存器分配。
+> 判断标准应该是 **生成的机器码/展开体积**，不是源码行数。
+
+#### 16.26.2 踩坑二：大对象的 `:initial-element` 是 calloc，不是 memset
+
+临时缓冲最初写 `(make-array n :element-type 'double-float :initial-element 0.0d0)`。
+512² 只有 2 MB，但「分配 + GEMM」要 **111 ms**（对照：复用缓冲 46 ms）。
+
+原因：SBCL 对 large object 的 `:INITIAL-ELEMENT` 走 calloc/零页，**并不真正
+写内存**；真正的写入由 31 个工作线程各自首次触达时触发 page fault，全部
+并发抢 `mmap_lock` → 串行化。
+
+对策：`(make-array n :element-type 'double-float)` + `(fill buf 0.0d0)`。
+`FILL` 走 memset 在主线程一次 touch 完，代价 0.5 ms，总时间回到 47 ms。
+
+（顺带：`:initial-element 0`（整数 0）还会因为与 `double-float` 元素类型
+冲突而报 `Constant 0 conflicts with its asserted type`，让 COMPILE-FILE
+返回 failure-p=T。所以临时缓冲的零值也按类型分别写 `0.0d0` / `0.0f0` / `0`。）
+
+#### 16.26.3 数值一致性
+
+四条路最终都调用同一个 `%MATMUL-*-FAST-KERNEL` 家族（或同一 SIMD 内核）、
+同一分块顺序，因此 **`vt-einsum` 与 `vt-matmul` 逐位相同**（20 项差分脚本，
+maxabs = 0）。与 numpy `@` 的相对差 ≤ 7.7e-15。
+
+相对上一版（标量三重循环）的差异只有 FMA 少一次舍入：相对差
+~1e-12（512²，比旧值更接近精确解），属于**改善**而非退化。
+
+唯一非逐位相同的是批量广播 `"bij,jk->bik"`：`vt-matmul` 走
+`*SIMD-BATCHED-MATMUL-FN*`（批间并行），einsum 走逐 batch GEMM，
+累加顺序不同 → 相对差 2.5e-12，属正常浮点差异。
+
+#### 16.26.4 实测（512² float64，µs，3 次最好值）
+
+512² float64 **单线程**（µs，3 次最好值；单线程最接近核数少的机器）：
+
+| 表达式 | 改前 | 改后 | 改前/`vt-matmul` | 改后/`vt-matmul` |
+|---|---:|---:|---:|---:|
+| `vt-matmul`（基准） | 31,141 | 35,596 | 1.00× | 1.00× |
+| `"ij,jk->ik"`（NN） | 196,033 | **32,485** | **6.30×** | **0.91×** |
+| `"ij,kj->ik"`（NT） | 381,070 | **29,818** | **12.24×** | **0.84×** |
+| `"ij,jk->ki"`（转置输出） | 609,077 | **36,112** | **19.56×** | **1.01×** |
+
+2048² **多线程**（32 核，µs）—— 规模放大后差距同样消失：
+
+| 表达式 | 改前/`vt-matmul` | 改后/`vt-matmul` |
+|---|---:|---:|
+| `"ij,jk->ik"` | 1.78×（6,210,809） | **0.99×**（3,439,937） |
+| `"ij,kj->ik"` | 1.71×（5,985,129） | **0.99×**（3,447,156） |
+| `"ij,jk->ki"` | 13.82×（48,326,644） | **0.99×**（3,459,113） |
+
+1024² 多线程 0.93~1.02×；256²（1.67e7，刚过 SIMD 阈值）0.95~1.02×。
+小矩阵（8/16/32²，低于 `*SIMD-MATMUL-THRESHOLD*` = 50000）两者都走标量，无退化。
+
+> 注：`"ij,jk->ki"` 的「改前」是**改动前就已经存在**的老问题（通用三重循环
+> 内层跨行），不是上一轮引入的；本轮顺手按 ③ 修掉。
+
+#### 16.26.5 回归网
+
+`test/einsum-gemm-layout-test.lisp`（36 条断言，接入 `test/run-tests.sh`）。
+**主断言写成「与 `vt-matmul` 逐位相等」**而不是硬编码期望值 —— 后者要跟着
+机器/编译器变，前者同时锁住三件事：语义没变、四条布局路径一致、两条入口
+最终落到同一内核。只有两处用容差（1e-10）并注明原因：
+
+- 批量 `"bij,bjk->bik"`（每 batch 的 `m·k·n` 低于 SIMD 阈值）：einsum 逐
+  batch 走标量、`vt-matmul` 的批量版按总工作量走 SIMD，累加顺序不同；
+- SIMD 开/关的 A/B：FMA 与 mul+add 的舍入不同（这条对 `vt-matmul` 本来
+  就成立，不是本轮引入）。
+
+---
+
+### 16.20 累计变更文件清单（第一～六轮）
 
 
 | 文件 | 改动 |
@@ -2106,9 +2225,12 @@ batch 输入要复现 numpy 缺省需显式 `:axis1 0 :axis2 1`（已写入 docs
 | `test/complex-linalg-test.lisp` | **新增** 216 断言（46 差分 + 结构恒等式 + 108 压测 + 契约） |
 | `test/complex-ops-test.lisp` | 第四轮扩到 **149 断言**（新增 outer / any / all / take-along-axis） |
 | `test/run-tests.sh` | 注册 `complex-test` / `complex-ops-test` / `complex-linalg-test`（SUITES + DEFAULT_ORDER，防止漏接线） |
-| `src/linalg.lisp` | **第五轮**：`vt-einsum` 的 P1-1/P1-2/BMM 三条通道放开复数（走 `*CX-EINSUM-GEMM-FN*` / `*CX-EINSUM-DOT-FN*` 钩子，见 §16.21）；`vt-trace` 补 `:offset` / `:axis1` / `:axis2`，收缩轴改 `-1`（§16.24） |
+| `src/linalg.lisp` | **第五轮**：`vt-einsum` 的 P1-1/P1-2/BMM 三条通道放开复数（走 `*CX-EINSUM-GEMM-FN*` / `*CX-EINSUM-DOT-FN*` 钩子，见 §16.21）；`vt-trace` 补 `:offset` / `:axis1` / `:axis2`，收缩轴改 `-1`（§16.24）。**第六轮**：新增 `*SIMD-GEMM-RAW-FN*` 钩子与 `define-einsum-gemm`（`%EINSUM-GEMM-{F64,F32,I64,I32}`），BMM 通道接入 SIMD 分块内核并做布局归一化（NN / NT 转置 / C 转置 scatter / 兜底），见 §16.26 |
 | `src/complex.lisp` | **第五轮**：新增 `%cx-gemm-strided`（带 strides 的复数 GEMM 内核）与 `%cx-einsum-dot`，并注册两个 einsum 钩子；`%cx-matmul-run` 增加 offset 形参、`%cx-batched-matmul` 改按 strides 递推（支持 batch 广播）、`%cx-dot-1d` 补 offset（§16.22）；复数 `vt-trace` 透传新参数 |
 | `src/setops.lisp` | **第五轮**：新增 `%unique-axis` 及比较原语 `%axis-elem-lessp` / `%axis-elem-eq`；`vt-unique` 原实现改名 `%unique-flat` 并加 `:axis` 分发（§16.23） |
+| `src/simd-matmul.lisp` | **第六轮**：新增 `%simd-gemm-raw`（裸数据 2D GEMM 入口，复用已有 AVX/FMA 内核与线程调度）并注册到 `*SIMD-GEMM-RAW-FN*`，供 einsum 的批量 GEMM 通道调用（§16.26） |
+| `test/einsum-gemm-layout-test.lisp` | **第六轮新增** 36 断言：四条布局路径 × 各档尺寸、批量（含广播/批量 NT）、f32/i32/i64/c128/c64、转置输入/切片/非连续 `:out`/小矩阵、SIMD 关与单线程不变性；主断言 = 与 `vt-matmul` 逐位相等（§16.26.5） |
+| `test/run-tests.sh` | **第六轮**：注册 `einsum-gemm-layout-test`（SUITES + DEFAULT_ORDER），现共 45 个套件 |
 | `src/complex-ops.lisp` | **第五轮**：复数 `vt-unique` 增加 `:axis`（axis 路径复用实数层实现） |
 | `test/setops-axis-trace-test.lisp` | **第五轮新增** 56 断言（37 项差分 + 契约 + 实数回归） |
 | `test/gen_setops_axis_expected.py` | **第五轮新增** 期望值生成器 |
