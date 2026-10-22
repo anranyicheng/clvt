@@ -654,24 +654,6 @@
                 (nanv (%cx-complex-nan-of dt)))
            (%cx-to-out (vt-where empty nanv avg :dtype dt) out name)))))))
 
-(defmacro %cx-def-nan-reduce (name op)
-  "为 nan 族生成 (tensor &key axis keepdims dtype out) 包装。"
-  `(let ((orig (%cx-orig ',name)))
-     (setf (symbol-function ',name)
-           (lambda (tensor &rest keys &key (axis nil) (keepdims nil)
-                                    (dtype nil) (out nil) &allow-other-keys)
-             (declare (ignore keys))
-             (if (%cx-tensor-p tensor)
-                 (%cx-nan-reduce ,(string name) tensor axis keepdims dtype out ,op)
-                 (apply orig tensor
-                        (append (list :axis axis :keepdims keepdims
-                                      :dtype dtype :out out))))))))
-
-(%cx-def-nan-reduce vt-nansum  :sum)
-(%cx-def-nan-reduce vt-nanprod :prod)
-(%cx-def-nan-reduce vt-nanmax  :max)
-(%cx-def-nan-reduce vt-nanmin  :min)
-
 ;;; ---- nanmean ------------------------------------------------------
 (defun vt-nanmean (tensor &key axis keepdims dtype out)
   "忽略 NaN 的算术平均（对标 numpy.nanmean）。
@@ -792,22 +774,6 @@
                       (make-vt out-shape 0 :dtype :int64)))
              (vals (%cx-nan-arg-run (vt-data flat) shape ax op)))
         (%cx-write-flat res vals :int64)))))
-
-(defun vt-nanargmax (tensor &key axis keepdims dtype out)
-  "忽略 NaN 的最大值下标（对标 numpy.nanargmax）。全 NaN 切片 → 报错。"
-  (declare (ignore dtype))
-  (if (%cx-tensor-p tensor)
-      (%cx-nan-arg "VT-NANARGMAX" tensor axis keepdims out :nanargmax)
-      (funcall (%cx-orig 'vt-nanargmax) tensor :axis axis :keepdims keepdims
-               :dtype nil :out out)))
-
-(defun vt-nanargmin (tensor &key axis keepdims dtype out)
-  "忽略 NaN 的最小值下标（对标 numpy.nanargmin）。全 NaN 切片 → 报错。"
-  (declare (ignore dtype))
-  (if (%cx-tensor-p tensor)
-      (%cx-nan-arg "VT-NANARGMIN" tensor axis keepdims out :nanargmin)
-      (funcall (%cx-orig 'vt-nanargmin) tensor :axis axis :keepdims keepdims
-               :dtype nil :out out)))
 
 ;;; ---- nanmedian ----------------------------------------------------
 (defun %cx-nan-median-fiber (data base stride n dt)
@@ -1176,11 +1142,6 @@
         ((zerop z) (%cx-complex-zero-of :complex128))
         (t (/ z (abs z)))))
 
-(%cx-def-unary vt-expm1 %cop-expm1)
-(%cx-def-unary vt-log1p %cop-log1p)
-(%cx-def-unary vt-sinc %cop-sinc)
-(%cx-def-unary vt-sign %cop-sign)
-
 ;;; ---- 12.2 clip / clamp：字典序夹取（numpy 语义）-------------------
 ;;; numpy 的 clip 实现是 `np.minimum(np.maximum(a, lo), hi)`，
 ;;; 而 maximum/minimum 对复数走字典序（§16.8）—— 所以复数的 clip
@@ -1393,19 +1354,6 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 ;;;
 ;;; 判据：只要**任一参数**含复数就拒绝 —— 与 %CX-DEF-UNSUPPORTED 一致。
 
-(%cx-def-unsupported (vt-nextafter vt-spacing vt-logaddexp
-                      vt-hypot vt-copysign vt-signbit
-                      vt-deg2rad vt-rad2deg)
-  "这些 ufunc 只对实数有定义（numpy 2.4.6 实测：ufunc not supported for the input types）")
-
-(%cx-def-unsupported (vt-bincount vt-histogram)
-  "分箱类函数需要实数全序（numpy：bincount 抛 Cannot cast complex to int64；
-   histogram 虽会「跑通」，但那是对复平面做线性插值分箱，语义无意义，本库拒绝）")
-
-(%cx-def-unsupported (vt-nanpercentile vt-nanquantile vt-interp)
-  "需要实数全序 / 实数插值（numpy 实测：a must be an array of real numbers /
-   Cannot cast complex128 to float64）")
-
 ;;; ---- 12.6 any / all：复数按「非零」判定真值 ----------------------
 ;;; numpy 对复数的布尔语义就是「任一分量非零即为真」（`bool(0+0j)` 为 False，
 ;;; `bool(nan+0j)` 为 True）。clvt 的 vt-any / vt-all 是 8 路实数元素类型
@@ -1420,17 +1368,3 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
   "复数张量 → int8 的 0/1 真值掩码。NaN 视为真（numpy 一致）。"
   (vt-nonzero-p v))
 
-(defmacro %cx-def-bool-reduce (name)
-  "为 vt-any / vt-all 生成「复数 → 掩码 → 原实现」的分派包装。"
-  `(let ((orig (%cx-orig ',name)))
-     (setf (symbol-function ',name)
-           (lambda (tensor &key axis keepdims dtype out)
-             (let ((v (ensure-vt tensor)))
-               (if (vt-complex-dtype-p (vt-dtype v))
-                   (funcall orig (%cx-bool-mask v)
-                            :axis axis :keepdims keepdims :dtype dtype :out out)
-                   (funcall orig tensor
-                            :axis axis :keepdims keepdims :dtype dtype :out out)))))))
-
-(%cx-def-bool-reduce vt-any)
-(%cx-def-bool-reduce vt-all)

@@ -1021,7 +1021,11 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
 
 (defun vt-bincount (x &key (minlength 0))
   "统计非负整数出现次数。"
-  (let* ((flat (vt-flatten x))
+      (when (%cx-reject x)
+    (error "vt-bincount: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject x)
+    (error "vt-bincount: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let* ((flat (vt-flatten x))
          (maxval (if (zerop (vt-size flat))
                      -1
                      (vt-item (vt-amax flat))))

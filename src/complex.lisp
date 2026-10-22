@@ -58,20 +58,9 @@
                   vt-sum vt-prod vt-amax vt-amin))
     (%cx-orig name)))
 
-(defun %cx-deep-p (x)
-  "递归判定 X 是否「含复数」：vt → 看 dtype；数 → complexp；容器 → 递归。
-   这是全部复数分派的唯一判据（§16.12）。"
-  (cond
-    ((vt-p x) (not (null (vt-complex-dtype-p (vt-dtype x)))))
-    ((complexp x) t)
-    ((consp x) (some #'%cx-deep-p x))
-    ((vectorp x) (some #'%cx-deep-p x))
-    (t nil)))
-
-(defun %cx-tensor-p (x)
-  "判定 X（vt 或标量）是否为复数张量/复数标量。"
-  (cond ((vt-p x) (not (null (vt-complex-dtype-p (vt-dtype x)))))
-        (t (complexp x))))
+;;; %CX-DEEP-P / %CX-TENSOR-P 已迁至 src/dispatch.lisp（第十二轮）：
+;;; 它们必须在 elementwise / reduce-stats / linalg 之前就可用，否则那些
+;;; 归属文件无法在自己体内分派，只能靠事后覆盖 —— 见 CONVENTIONS §16.32。
 
 ;;; ------------------------------------------------------------------
 ;;; 通用小工具：C 连续落地 / 步长 / fiber 起点
@@ -111,14 +100,6 @@
 ;;; ==================================================================
 ;;; 1. 结果 dtype 规则（§16.5）
 ;;; ==================================================================
-
-(defun %cx-result-complex-dtype (in-dtype dtype op-name)
-  "复数输入的数学函数结果 dtype：缺省保持输入复数 dtype；
-   显式非复数 dtype 报错（对标 numpy ufunc 的 safe-casting 拒绝 complex→real）。"
-  (cond ((null dtype) in-dtype)
-        ((vt-complex-dtype-p dtype) dtype)
-        (t (error "~a: 复数输入的结果 dtype 必须是复数类型，收到 ~a（CONVENTIONS §16.5）"
-                  op-name dtype))))
 
 (defun %cx-map1 (fn tensor out dtype op-name)
   "复数一元逐元素映射（通用 strides 路径，支持任意视图）。"
@@ -249,26 +230,6 @@
 ;;; 3. 一元函数分派包装
 ;;; ==================================================================
 
-(defmacro %cx-def-unary (name &optional (kernel name))
-  "为 (vt &key out dtype) 形式的一元函数生成复数分派包装。
-
-   性能（v1.1）：复数分支**必须**走 `vt-fast-map` 宏而不是 `vt-map` 函数。
-   二者语义相同，但只有宏在编译期拿得到 `(function <sym>)` 字面量，从而
-   展开成「按元素类型分派 + 类型声明驱动」的内联循环；`vt-map` 是函数，
-   `fn` 到手时已是函数对象，只能逐元素 `funcall` + 泛型 `aref`（实测
-   1M 元素 sqrt：泛型 453ms → 内联 12ms）。"
-  `(let ((orig (%cx-orig ',name)))
-     (setf (symbol-function ',name)
-           (lambda (tensor &rest keys &key (out nil) (dtype nil) &allow-other-keys)
-             (declare (ignore keys))
-             (if (%cx-tensor-p tensor)
-                 (let* ((in (ensure-vt tensor))
-                        (dt (%cx-result-complex-dtype (vt-dtype in) dtype ,(string name))))
-                   (vt-fast-map (function ,kernel) in :out out :dtype dt))
-                 (funcall orig tensor :out out :dtype dtype))))))
-
-(%cx-def-unary vt-sqrt %cop-sqrt)
-(%cx-def-unary vt-exp exp)
 ;;; vt-log 不能用 %cx-def-unary：它多一个 :base 关键字，宏只转发 out/dtype
 ;;; 会把 :base 静默丢掉（实测：log(8, base=2) 退化成 ln(8)=2.079）。
 (defun %cop-log-base (z base)
@@ -291,25 +252,6 @@
                     (vt-map (lambda (z) (%cop-log-base z base)) in :out out :dtype dt)
                     (vt-map #'%cop-log in :out out :dtype dt)))
               (funcall orig tensor :base base :out out :dtype dtype)))))
-(%cx-def-unary vt-log2 %cop-log2)
-(%cx-def-unary vt-log10 %cop-log10)
-(%cx-def-unary vt-sin sin)
-(%cx-def-unary vt-cos cos)
-(%cx-def-unary vt-tan tan)
-(%cx-def-unary vt-atan atan)
-(%cx-def-unary vt-sinh sinh)
-(%cx-def-unary vt-cosh cosh)
-(%cx-def-unary vt-tanh tanh)
-(%cx-def-unary vt-asin asin)
-(%cx-def-unary vt-acos acos)
-(%cx-def-unary vt-asinh asinh)
-(%cx-def-unary vt-acosh acosh)
-(%cx-def-unary vt-atanh atanh)
-(%cx-def-unary vt-square %cop-square)
-(%cx-def-unary vt-reciprocal %cop-recip)
-(%cx-def-unary vt-signum %cop-signum)
-(%cx-def-unary vt-negative %cop-neg)
-
 ;;; ==================================================================
 ;;; 4. 实部 / 虚部 / 共轭 / 幅角 / 模（§16.6）
 ;;; ==================================================================
@@ -559,18 +501,6 @@
 ;;; 6. 比较与极值（字典序，§16.8）
 ;;; ==================================================================
 
-(defmacro %cx-def-compare (name kernel)
-  "生成比较函数的复数分派包装（结果 :int8，1/0）。"
-  `(let ((orig (%cx-orig ',name)))
-     (setf (symbol-function ',name)
-           (lambda (t1 t2 &key (dtype :int8) out)
-             (if (or (%cx-tensor-p t1) (%cx-tensor-p t2))
-                 ;; vt-fast-map：复数输入 + int8 输出命中「窄整型输出」快路径
-                 ;; （%vt-mask*-fast 的复数输入格），避免泛型 walker
-                 (vt-fast-map (function ,kernel) (ensure-vt t1) (ensure-vt t2)
-                              :out out :dtype dtype)
-                 (funcall orig t1 t2 :dtype dtype :out out))))))
-
 ;; 性能：这一组在比较/谓词内核里每元素调用一次，必须内联。
 ;; 注意 declaim 必须出现在 **defun 之前**：SBCL 只在定义时可见
 ;; inline 声明才记录可内联展开，事后补 declaim 不生效（实测 78ns/次）。
@@ -595,13 +525,6 @@
 
 (defun %cx-ne-flag (a b) (- 1 (%cx-eq-flag a b)))
 
-(%cx-def-compare vt-= %cx-eq-flag)
-(%cx-def-compare vt-/= %cx-ne-flag)
-(%cx-def-compare vt-< %cx-lt-flag)
-(%cx-def-compare vt-<= %cx-le-flag)
-(%cx-def-compare vt-> %cx-gt-flag)
-(%cx-def-compare vt->= %cx-ge-flag)
-
 (defun %cop-max (a b)
   "maximum 的复数语义：字典序取大，NaN 传播。"
   (cond ((%cisnan a) a) ((%cisnan b) b) ((%clt a b) b) (t a)))
@@ -618,27 +541,6 @@
   "fmin 的复数语义：字典序取小，忽略 NaN。"
   (cond ((%cisnan a) b) ((%cisnan b) a) ((%cgt a b) b) (t a)))
 
-(defmacro %cx-def-minmax (name kernel)
-  "生成 maximum/minimum/fmax/fmin 的复数分派包装（结果保持复数 dtype）。"
-  `(let ((orig (%cx-orig ',name)))
-     (setf (symbol-function ',name)
-           (lambda (t1 t2 &key out dtype)
-             (if (or (%cx-tensor-p t1) (%cx-tensor-p t2))
-                 (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
-                        (p (%op-final-dtype (list (%scalar-kind t1) (%scalar-kind t2))
-                                             (list (vt-dtype a) (vt-dtype b))))
-                        (dt (or dtype p)))
-                   (unless (vt-complex-dtype-p dt)
-                     (error "~a: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
-                            ,(string name) dt))
-                   (vt-map (function ,kernel) a b :out out :dtype dt))
-                 (funcall orig t1 t2 :out out :dtype dtype))))))
-
-(%cx-def-minmax vt-maximum %cop-max)
-(%cx-def-minmax vt-minimum %cop-min)
-(%cx-def-minmax vt-fmax %cop-fmax)
-(%cx-def-minmax vt-fmin %cop-fmin)
-
 ;;; ==================================================================
 ;;; 7. 判定族 isnan / isinf / isfinite（§16.7）
 ;;; ==================================================================
@@ -649,20 +551,6 @@
 (defun %cx-nan-flag (x) (if (%cx-nan-p x) 1 0))
 (defun %cx-inf-flag (x) (if (%cx-inf-p x) 1 0))
 (defun %cx-finite-flag (x) (if (%cx-finite-p x) 1 0))
-
-(defmacro %cx-def-predicate (name kernel)
-  "生成 isnan/isinf/isfinite 的复数分派包装（结果 :int8，1/0）。"
-  `(let ((orig (%cx-orig ',name)))
-     (setf (symbol-function ',name)
-           (lambda (tensor &key out)
-             (if (%cx-tensor-p tensor)
-                 (vt-fast-map (function ,kernel) (ensure-vt tensor)
-                              :out out :dtype :int8)
-                 (funcall orig tensor :out out))))))
-
-(%cx-def-predicate vt-isnan %cx-nan-flag)
-(%cx-def-predicate vt-isinf %cx-inf-flag)
-(%cx-def-predicate vt-isfinite %cx-finite-flag)
 
 ;;; ==================================================================
 ;;; 8. 归约内核（sum / prod / max / min）
@@ -966,23 +854,6 @@
           (values (%cx-reduce-values (vt-data flat) in-shape axes op)))
      (%cx-write-flat res values res-dtype))))
 
-(defmacro %cx-def-reduce (name op)
-  "生成归约函数的复数分派包装。"
-  `(let ((orig (%cx-orig ',name)))
-     (setf (symbol-function ',name)
-           (lambda (tensor &rest keys &key (axis nil) (keepdims nil)
-                                    (dtype nil) (out nil) &allow-other-keys)
-             (declare (ignore keys))
-             (if (%cx-tensor-p tensor)
-                 (%cx-reduce ,(string name) tensor axis keepdims dtype out ,op)
-                 (funcall orig tensor :axis axis :keepdims keepdims
-                          :dtype dtype :out out))))))
-
-(%cx-def-reduce vt-sum :sum)
-(%cx-def-reduce vt-prod :prod)
-(%cx-def-reduce vt-amax :max)
-(%cx-def-reduce vt-amin :min)
-
 ;;; argmax / argmin（单轴或展平；多轴与 numpy 一样不支持）---------------
 
 (defun %cx-arg-reduce (name tensor axis keepdims out op)
@@ -1006,23 +877,6 @@
                       (make-vt out-shape 0 :dtype :int64)))
              (vals (%cx-arg-reduce-run (vt-data flat) in-shape ax op)))
         (%cx-write-flat res vals :int64)))))
-
-(defun vt-argmax (tensor &key axis keepdims dtype out)
-  "最大值的下标（对标 numpy.argmax）。复数按字典序（§16.8）。
-   NaN 分量的元素胜出（首个 NaN 下标）；空序列报错。"
-  (declare (ignore dtype))
-  (if (%cx-tensor-p tensor)
-      (%cx-arg-reduce "VT-ARGMAX" tensor axis keepdims out :argmax)
-      (funcall (%cx-orig 'vt-argmax) tensor :axis axis :keepdims keepdims
-               :dtype nil :out out)))
-
-(defun vt-argmin (tensor &key axis keepdims dtype out)
-  "最小值的下标（对标 numpy.argmin）。复数按字典序（§16.8）。"
-  (declare (ignore dtype))
-  (if (%cx-tensor-p tensor)
-      (%cx-arg-reduce "VT-ARGMIN" tensor axis keepdims out :argmin)
-      (funcall (%cx-orig 'vt-argmin) tensor :axis axis :keepdims keepdims
-               :dtype nil :out out)))
 
 ;;; ==================================================================
 ;;; 9. 统计量（mean / var / std / average）
@@ -1999,39 +1853,6 @@
 ;;; 13. 未覆盖函数的确定性报错（§16.11）
 ;;; ==================================================================
 
-(defmacro %cx-def-unsupported (names reason)
-  "为 NAMES 中的函数生成「含复数入参即报错」的包装，其余调用原样转发。"
-  `(dolist (name (list ,@(mapcar (lambda (n) `',n) names)))
-     (let ((orig (%cx-orig name)))
-       (setf (symbol-function name)
-             (lambda (&rest args)
-               (when (some (lambda (a) (or (%cx-deep-p a) (%cx-tensor-p a))) args)
-                 (error "~a: 第一轮不支持复数输入（~a）。见 CONVENTIONS §16.11"
-                        name ,reason))
-               (apply orig args))))))
-
-(%cx-def-unsupported (vt-floor vt-ceiling vt-truncate vt-rint)
-  "复数没有分量取整的全序，numpy 同样不提供 floor/ceil/trunc")
-
-(%cx-def-unsupported (vt-div vt-mod vt-rem)
-  "floor_divide / remainder 对复数无定义（numpy 抛 TypeError）")
-
-(%cx-def-unsupported (vt-bit-and vt-bit-ior vt-bit-xor vt-bit-not
-                     vt-left-shift vt-right-shift)
-  "位运算对复数无定义（numpy 抛 TypeError）")
-
-(%cx-def-unsupported (vt-atan2)
-  "atan2 只接受实数（numpy 抛 TypeError）；复数请用 vt-angle")
-
-(%cx-def-unsupported (vt-cbrt)
-  "numpy：ufunc 'cbrt' 不接受复数；复数立方根请用 (vt-pow z 1/3)。旧实现会把复数入参静默取实部后返回实数（(vt-cbrt #C(8 0)) → 2.0）")
-
-(%cx-def-unsupported (vt-even-p vt-odd-p)
-  "奇偶性对复数无定义")
-
-(%cx-def-unsupported (vt-percentile vt-quantile)
-  "分位数需要实数全序（numpy: a must be an array of real numbers）")
-
 ;; 复数线代（det/inv/solve/lu/cholesky/qr/svd/eig/pinv/lstsq/
 ;; matrix-rank/matrix-power）已由 src/complex-linalg.lisp 实现（第三轮）。
 ;; vt-cond 复用 vt-svd + vt-inv，随之自动可用，故也不再列入拒绝清单。
@@ -2044,10 +1865,6 @@
 ;;   · GEMM/BMM "...ij,...jk->...ik" → %CX-GEMM-STRIDED
 ;; 全部通过 *CX-EINSUM-GEMM-FN* / *CX-EINSUM-DOT-FN* 钩子注册（linalg.lisp
 ;; 先编译，不能直接引用复数层）。钩子为 NIL 时自动回落到通用累加状态机。
-
-(%cx-def-unsupported (vt-sigmoid vt-relu vt-leaky-relu vt-swish vt-softplus
-                     vt-gelu vt-mish vt-hard-tanh vt-hard-sigmoid)
-  "神经网络激活函数定义在实数域；复数激活需先取模或实部")
 
 ;;; ==================================================================
 ;;; 14. 加载期自检（§10.1 L1/L2）

@@ -463,6 +463,12 @@
    小整型逻辑 dtype（4 种）→ %kernel-small-general 通用内核（路径 3 结构）。
    路径 1/2/3 的输出对同一语义必须一致；连续性只影响性能。"
   (let ((fn-name (intern (format nil "VT-~a" name)))
+        ;; 第十二轮：生成的函数体改名为内部实现，公开名由 DEF-VT-REDUCE-FACADE
+        ;; 生成（唯一的一个 DEFUN），复数分派就在那个门面里。这样
+        ;;   · 公开符号只有一个定义，重载任何单个文件都不会丢复数支持；
+        ;;   · 复数分支需要「把变换后的实参再喂给实数实现」（all/any 走
+        ;;     掩码）时，可以直接调 %REDUCE-<NAME>，不需要 %CX-ORIG 快照。
+        (impl-name (intern (format nil "%%REDUCE-~a" name)))
         (arg-p   (%op-arg-p op)))
     (flet ((dispatch (kernel-macro &key small-int-p)
              `(cond
@@ -487,7 +493,7 @@
                              (,kernel-macro ,op ,lt (signed-byte 8)))
                             (t (error "unsupported output dtype ~a" res-lt)))))
                 (t (error "unsupported input dtype ~a" in-et)))))
-      `(defun ,fn-name (tensor &key axis keepdims dtype out)
+      `(defun ,impl-name (tensor &key axis keepdims dtype out)
          ,(format nil "沿 AXIS 归约（~a 算子）；AXIS 为 NIL 时归约全部元素。
   dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 显式 :dtype，否则按输入提升
   （含 init-val 类型影响）；**不由 out 决定**，out 必须精确匹配结果 shape/dtype。
@@ -565,7 +571,7 @@
                  (cond
                    ;; 1) 输出为空：直接返回空结果
                    ((zerop (vt-shape-to-size out-shape))
-                    (return-from ,fn-name res))
+                    (return-from ,impl-name res))
                    ;; 2) arg 族：输出非空 → 报错（numpy 语义）
                    ,@(when arg-p
                        `((t (error "vt-~a: attempt to get arg~a of an empty sequence（numpy 语义：输出非空且归约区为空）"
@@ -601,7 +607,7 @@
                                               ,(%op-init op l '(signed-byte 64))))
                                     (t 0)))
                                  (t 0)))
-                      (return-from ,fn-name res)))))
+                      (return-from ,impl-name res)))))
                ;; ---- 主分派 ----
                ;; 小整型（逻辑级 dtype）不进入类型特化内核：路径 1/2 以
                ;; wide-et 守卫排除，统一由路径 3 的 %kernel-small-general 兜底。
@@ -670,22 +676,54 @@
 ;;; 归约族定义
 ;;; ============================================================
 
+(defmacro def-vt-reduce-facade (name op)
+  "为 DEF-VT-REDUCE 生成的 %REDUCE-<NAME> 补一个**唯一**的公开 DEFUN。
+   复数入参在此分派；实数路径原样转给实现函数。"
+  (let ((fn-name (intern (format nil "VT-~a" name)))
+        (impl-name (intern (format nil "%%REDUCE-~a" name))))
+    `(defun ,fn-name (tensor &key axis keepdims dtype out)
+       ,(format nil "沿 AXIS 归约；复数输入的分派入口（实现在 %REDUCE-~a）。"
+                name)
+       (declare (type vt tensor)
+                (type (or null fixnum list) axis)
+                (type (or null vt) out))
+       (when (%cx-any-p tensor)
+         (return-from ,fn-name
+           (%cx-reduce-dispatch ,op ,(string fn-name) (function ,impl-name)
+                                tensor axis keepdims dtype out)))
+       (,impl-name tensor :axis axis :keepdims keepdims
+                   :dtype dtype :out out))))
+
 (def-vt-reduce sum  :sum)
+(def-vt-reduce-facade sum :sum)
 (def-vt-reduce prod :prod)
+(def-vt-reduce-facade prod :prod)
 (def-vt-reduce amax :max)
+(def-vt-reduce-facade amax :max)
 (def-vt-reduce amin :min)
+(def-vt-reduce-facade amin :min)
 (def-vt-reduce all  :all)
+(def-vt-reduce-facade all :all)
 (def-vt-reduce any  :any)
+(def-vt-reduce-facade any :any)
 
 (def-vt-reduce nansum  :nansum)
+(def-vt-reduce-facade nansum :nansum)
 (def-vt-reduce nanprod :nanprod)
+(def-vt-reduce-facade nanprod :nanprod)
 (def-vt-reduce nanmax  :nanmax)
+(def-vt-reduce-facade nanmax :nanmax)
 (def-vt-reduce nanmin  :nanmin)
+(def-vt-reduce-facade nanmin :nanmin)
 
 (def-vt-reduce argmax    :argmax)
+(def-vt-reduce-facade argmax :argmax)
 (def-vt-reduce argmin    :argmin)
+(def-vt-reduce-facade argmin :argmin)
 (def-vt-reduce nanargmax :nanargmax)
+(def-vt-reduce-facade nanargmax :nanargmax)
 (def-vt-reduce nanargmin :nanargmin)
+(def-vt-reduce-facade nanargmin :nanargmin)
 
 
 ;;; ------------------------------------------------------------------
@@ -781,14 +819,26 @@
 (defun vt-isfinite (vt &key out)
   "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回 int8 布尔张量（1/0）。
       dtype 固定 :int8（承载布尔语义，CONVENTIONS §3.1）。"
+  (when (%cx-any-p vt)
+    (return-from vt-isfinite
+      (vt-fast-map (function %cx-finite-flag) (ensure-vt vt)
+                   :out out :dtype :int8)))
   (vt-fast-map #'%op-isfinite vt :dtype :int8 :out out))
 
 (defun vt-isinf (vt &key out)
   "逐元素判断是否为 ±Inf，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
+  (when (%cx-any-p vt)
+    (return-from vt-isinf
+      (vt-fast-map (function %cx-inf-flag) (ensure-vt vt)
+                   :out out :dtype :int8)))
   (vt-fast-map #'%op-isinf vt :dtype :int8 :out out))
 
 (defun vt-isnan (vt &key out)
   "逐元素判断是否为 NaN，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
+  (when (%cx-any-p vt)
+    (return-from vt-isnan
+      (vt-fast-map (function %cx-nan-flag) (ensure-vt vt)
+                   :out out :dtype :int8)))
   (vt-fast-map #'%op-isnan vt :dtype :int8 :out out))
 
 ;;; ------------------------------------------------------------------
@@ -1634,7 +1684,11 @@
      与 numpy 的 keepdims=True 一致。
    返回：0 维张量（当 axis=nil 且 keepdims=nil）、形状 (1 1 ... 1)
          的张量（当 axis=nil 且 keepdims=t）、或降维后的张量。"
-  (with-float-safe
+      (when (%cx-reject tensor percentile)
+    (error "vt-percentile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject tensor percentile)
+    (error "vt-percentile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(with-float-safe
     (unless (realp percentile)
       (error "vt-percentile: percentile 必须为实数，得到 ~a (type ~a)"
              percentile (type-of percentile)))
@@ -1712,7 +1766,11 @@
      越界（<0 或 >1）报错；NaN 亦报错（NaN 不满足 <= 比较）。
    等价于 (vt-percentile tensor (* q 100) ...)。
    INTERPOLATION 含义见 vt-percentile；KEEPDIMS 语义见 vt-percentile。"
-  (unless (realp q)
+      (when (%cx-reject tensor q)
+    (error "vt-quantile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject tensor q)
+    (error "vt-quantile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(unless (realp q)
     (error "vt-quantile: q 必须为实数，得到 ~a (type ~a)"
            q (type-of q)))
   (unless (<= 0 q 1)
@@ -1729,7 +1787,11 @@
 
 (defun vt-histogram (tensor &key bins range density)
   "直方图统计（对标 numpy.histogram）。返回 (values counts edges)。"
-  (with-float-safe
+      (when (%cx-reject tensor)
+    (error "vt-histogram: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject tensor)
+    (error "vt-histogram: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(with-float-safe
     (let* ((flat (vt-flatten tensor))
            (data (vt-data flat))
            (size (vt-size flat))
@@ -2419,7 +2481,11 @@
      (vt-interp 2.5d0 #(1d0 3d0) #(10d0 30d0))  => 25.0d0
      (vt-interp #(0d0 5d0) #(1d0 3d0) #(10d0 30d0) :left -1d0 :right -2d0)
        => #(-1.0d0 -2.0d0)"
-  (with-float-safe
+      (when (%cx-reject x xp fp)
+    (error "vt-interp: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject x xp fp)
+    (error "vt-interp: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(with-float-safe
     ;; v0.4.8：%FLAT-OFFSET0 保证 offset=0 —— 主循环用裸 AREF 取数，而
     ;; vt-contiguous 对「已连续」输入是**原样返回**（保留 offset），于是 xp/fp
     ;; 若是切片视图，读到的就是基数组开头的数据（静默错答案）。

@@ -65,7 +65,11 @@
 
   dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 显式 :dtype，否则按输入
   浮点提升（非浮点 → :float64）。out 必须精确匹配结果 shape/dtype。"
-  (with-float-safe
+      (when (%cx-reject vt)
+    (error "vt-sigmoid: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-sigmoid: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(with-float-safe
     (let* ((dt (or dtype (if (eq (vt-dtype vt) :float32) :float32 :float64)))
            (a (ensure-vt vt))
            ;; 统一硬契约前置：形状/dtype 严格相等/可写（非连续 out 允许，
@@ -103,7 +107,11 @@
   "ReLU 激活。连续 float 张量走特化快路径（消除 funcall 开销）。
   v0.4.1（差分测试 R8）：整数输入保持整数 dtype（对标 numpy.maximum
   与 torch.relu）；浮点输入保持自身精度；显式 :dtype 仍生效。"
-  (with-float-safe
+      (when (%cx-reject vt)
+    (error "vt-relu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-relu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(with-float-safe
     (let* ((in-dt (vt-dtype vt))
            (dt (or dtype
                    (if (member in-dt '(:int8 :int16 :int32 :int64 :uint8 :uint16))
@@ -151,7 +159,11 @@
    dtype 语义：缺省按输入推导——float32 进 float32 出、其余（含整数）
    进 float64 出。整数输入必须提升，否则 alpha*x 的浮点结果会被截断
    写回整数存储（如 (-2 3 -4) 会静默变成 (0 3 0)）。"
-  (let ((dt (%nn-float-dtype vt dtype)))
+      (when (%cx-reject vt)
+    (error "vt-leaky-relu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-leaky-relu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((dt (%nn-float-dtype vt dtype)))
     (vt-map (lambda (x) (if (> x 0.0d0)
 			    x
 			    (* alpha x)))
@@ -159,14 +171,22 @@
 
 (defun vt-swish (vt &key dtype out)
   "Swish / SiLU 激活：x * sigmoid(x)。"
-  (let ((sig (vt-sigmoid vt :dtype dtype)))
+      (when (%cx-reject vt)
+    (error "vt-swish: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-swish: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((sig (vt-sigmoid vt :dtype dtype)))
     (vt-map #'* vt sig :dtype dtype :out out)))
 
 (defun vt-softplus (vt &key dtype out)
   "Softplus 激活：log(1 + exp(x))。x > 20 时直接返回 x 以避免 exp 溢出。
    dtype 语义（对标 numpy）: 缺省按输入推导——float32 进 float32 出、
    其余（含整数）进 float64 出。"
-  (let ((dt (%nn-float-dtype vt dtype)))
+      (when (%cx-reject vt)
+    (error "vt-softplus: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-softplus: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((dt (%nn-float-dtype vt dtype)))
     (vt-map (lambda (x)
               (if (> x 20.0d0)
                   x
@@ -177,7 +197,11 @@
   "GELU 激活（tanh 近似式，对标 PyTorch F.gelu 默认近似）。
    dtype 语义（对标 numpy）: 缺省按输入推导——float32 进 float32 出、
    其余（含整数）进 float64 出。"
-  (let ((c (sqrt (/ 2.0d0 (coerce pi 'double-float))))
+      (when (%cx-reject vt)
+    (error "vt-gelu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-gelu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((c (sqrt (/ 2.0d0 (coerce pi 'double-float))))
         (dt (%nn-float-dtype vt dtype)))
     (vt-map (lambda (x)
               (let* ((x3 (* x x x))
@@ -188,16 +212,28 @@
 
 (defun vt-mish (vt &key dtype out)
   "Mish 激活：x * tanh(softplus(x))。"
-  (let ((sp (vt-softplus vt :dtype dtype)))
+      (when (%cx-reject vt)
+    (error "vt-mish: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-mish: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((sp (vt-softplus vt :dtype dtype)))
     (vt-* vt (vt-tanh sp) :dtype dtype :out out)))
 
 (defun vt-hard-tanh (vt &key dtype out)
   "HardTanh 激活：把输入截断到 [-1, 1]。"
-  (vt-clip vt -1.0d0 1.0d0 :dtype dtype :out out))
+      (when (%cx-reject vt)
+    (error "vt-hard-tanh: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-hard-tanh: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-clip vt -1.0d0 1.0d0 :dtype dtype :out out))
 
 (defun vt-hard-sigmoid (vt &key dtype out)
   "HardSigmoid 激活：clip(x/5 + 0.5, 0, 1)。"
-  (let ((scaled (vt-+ (vt-scale vt 0.2d0) 0.5d0 :dtype dtype)))
+      (when (%cx-reject vt)
+    (error "vt-hard-sigmoid: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(when (%cx-reject vt)
+    (error "vt-hard-sigmoid: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((scaled (vt-+ (vt-scale vt 0.2d0) 0.5d0 :dtype dtype)))
     (vt-clip scaled 0.0d0 1.0d0 :dtype dtype :out out)))
 
 (defun vt-softmax (vt &key (axis -1) dtype out)

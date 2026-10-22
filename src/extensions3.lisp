@@ -673,6 +673,11 @@
    语义逐位不变 —— vt-sign 与 vt-signum 的差异只在「输出 dtype 的来源」。
    %sign1 用 (float 1 x) 而非字面 1.0d0，故 float32 输入写 single-float
    数组不会触发 specialized-array 类型错误。"
+  (when (%cx-any-p tensor)
+    (return-from vt-sign
+      (let* ((in (ensure-vt tensor))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SIGN")))
+        (vt-fast-map (function %cop-sign) in :out out :dtype dt))))
   (let* ((v (ensure-vt tensor))
          (res-dtype (or dtype (vt-dtype v))))
     (vt-fast-map #'%sign1 v :out out :dtype res-dtype)))
@@ -701,6 +706,11 @@
   "逐元素 exp(x) - 1（对标 numpy.expm1）。
    小量下保留精度（1e-10 → 1.00000000005e-10）；整数输入输出 float64。
    :out 契约同 vt-abs。"
+  (when (%cx-any-p tensor)
+    (return-from vt-expm1
+      (let* ((in (ensure-vt tensor))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-EXPM1")))
+        (vt-fast-map (function %cop-expm1) in :out out :dtype dt))))
   (let ((v (ensure-vt tensor)))
     (%float-map #'%e3-expm1 v out (%e3-float-prefer-dtype dtype (vt-dtype v)))))
 
@@ -726,13 +736,20 @@
   "逐元素 log(1 + x)（对标 numpy.log1p）。
    x = -1 → -Inf；x < -1 → NaN；小量下保留精度（1e-10 → 9.999999999500001e-11）。
    整数输入输出 float64。:out 契约同 vt-abs。"
+  (when (%cx-any-p tensor)
+    (return-from vt-log1p
+      (let* ((in (ensure-vt tensor))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-LOG1P")))
+        (vt-fast-map (function %cop-log1p) in :out out :dtype dt))))
   (let ((v (ensure-vt tensor)))
     (%float-map #'%e3-log1p v out (%e3-float-prefer-dtype dtype (vt-dtype v)))))
 
 (defun vt-logaddexp (x y &key out dtype)
   "逐元素 log(exp(x) + exp(y))，数值稳定（对标 numpy.logaddexp）。
    整数输入输出 float64。:out 契约同 vt-abs（支持广播）。"
-  (let ((fn (lambda (a b)
+    (when (%cx-reject x y)
+    (error "vt-logaddexp: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((fn (lambda (a b)
               (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
                 (cond ((%nan-p af) af)
                       ((%nan-p bf) bf)
@@ -768,7 +785,9 @@
   "逐元素赋予 X 的绝对值与 Y 的符号（对标 numpy.copysign）。
    结果恒为浮点；NaN 符号位处理与 numpy 一致（copysign(1, nan) → 1）。
    :out 契约同 vt-abs（支持广播）。"
-  (vt-map (lambda (a b)
+    (when (%cx-reject x y)
+    (error "vt-copysign: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map (lambda (a b)
             ;; v0.4.1 修复（差分测试 R4）：符号取自 y 的 IEEE 符号位，
             ;; minusp 无法识别 -0.0（copysign(1,-0.0) 应为 -1.0）。
             (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
@@ -779,7 +798,9 @@
 (defun vt-signbit (tensor &key out)
   "逐元素符号位判定，返回 1/0，dtype 为 :int8（对标 numpy.signbit）。
    x < 0 或为负零（-0.0）→ 1，否则 0。:out 契约同 vt-=（dtype :int8）。"
-  (vt-map (lambda (x)
+    (when (%cx-reject tensor)
+    (error "vt-signbit: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map (lambda (x)
             ;; v0.4.1 修复（差分测试 R5）：按 IEEE 符号位判定；正 NaN 符号位
             ;; 为 0（numpy.signbit(+nan)=0），负 NaN/-0.0/负数为 1。
             (if (%e3-sign-bit-p (coerce x 'double-float)) 1 0))
@@ -807,7 +828,9 @@
   "逐元素「朝 Y 方向的最近可表示浮点数」（对标 numpy.nextafter）。
    以 double-float 精度计算。:out 契约同 vt-abs（支持广播）。
    示例：(vt-nextafter 1.0 2.0) => 1.0000000000000002"
-  ;; 性能：原来是 (lambda (a b) ...) → vt-map 的 funcall 路径（1M 元素
+    (when (%cx-reject x y)
+    (error "vt-nextafter: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+;; 性能：原来是 (lambda (a b) ...) → vt-map 的 funcall 路径（1M 元素
   ;; 实测 270ms）。%e3-nextafter 已是 inline 函数，直接用 vt-fast-map
   ;; 内联成二元特化循环；仅显式 :dtype :float32（需要先降精度）保留
   ;; 通用路径，保证「double 精度计算、输出降精度」的既有语义不变。
@@ -837,7 +860,9 @@
   "逐元素返回与该值相邻浮点数之间的距离（对标 numpy.spacing）。
    以 double-float 精度计算。:out 契约同 vt-abs。
    示例：(vt-spacing 1.0) => 2.220446049250313e-16；(vt-spacing 0.0) => 5e-324"
-  ;; 性能：原实现对每个元素做一次 lambda 调用 + 一次 with-float-safe
+    (when (%cx-reject tensor)
+    (error "vt-spacing: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+;; 性能：原实现对每个元素做一次 lambda 调用 + 一次 with-float-safe
   ;; （读写 FP 控制字，约 20ns/元素）+ 一次 %e3-nextafter 全分支比较，
   ;; 1M 元素实测 309ms。这里把三者摊平：
   ;;   1. 外层 vt-fast-map 已用 with-float-safe 包住整个循环，逐元素
@@ -1188,7 +1213,9 @@
   "忽略 NaN 的百分位数（对标 numpy.nanpercentile）。
    PERCENTILE ∈ [0,100]；INTERPOLATION 同 vt-percentile；
    全 NaN/空切片 → NaN。AXIS/KEEPDIMS 语义同 vt-percentile。"
-  (unless (and (realp percentile) (<= 0 percentile 100))
+    (when (%cx-reject tensor percentile)
+    (error "vt-nanpercentile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(unless (and (realp percentile) (<= 0 percentile 100))
     (error "vt-nanpercentile: percentile 必须在 [0,100] 内，收到 ~a" percentile))
   (%e3-nan-percentile tensor (/ percentile 100.0d0)
                       :axis axis :keepdims keepdims
@@ -1197,7 +1224,9 @@
 (defun vt-nanquantile (tensor q &key axis keepdims (interpolation :linear))
   "忽略 NaN 的分位数（对标 numpy.nanquantile）。Q ∈ [0,1]；
    全 NaN/空切片 → NaN。AXIS/KEEPDIMS 语义同 vt-quantile。"
-  (unless (and (realp q) (<= 0 q 1))
+    (when (%cx-reject tensor q)
+    (error "vt-nanquantile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(unless (and (realp q) (<= 0 q 1))
     (error "vt-nanquantile: q 必须在 [0,1] 内，收到 ~a" q))
   (%e3-nan-percentile tensor (coerce q 'double-float)
                       :axis axis :keepdims keepdims

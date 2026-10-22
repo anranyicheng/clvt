@@ -2749,7 +2749,124 @@ float32 内算仍是 1.5、`c64+#C(1 2)` 正确、`i8+1` 不溢出）。
 
 ---
 
-### 16.20 累计变更文件清单（第一～十一轮）
+### 16.32 第十二轮：拆掉覆盖式复数层（单一 DEFUN 分派）
+
+#### 16.32.1 为什么必须拆
+
+第十二轮之前，367 个导出里有 **159 个（43.3%）** 在运行期被替换。三处实证：
+
+| # | 现象 | 数据 |
+|---|---|---|
+| 1 | 规模 | `*cx-originals*` 159 条，**全部是导出符号**，内部符号 0 条 |
+| 2 | 静态不可分析 | 静态扫描（重名 `defun` ∪ 宏调用）只找到 155；`vt-argmax`/`vt-argmin`/`vt-nanargmax`/`vt-nanargmin` 的实数实现是**宏生成的**，源码里没有字面 `defun`，只能问运行时注册表 |
+| 3 | **重载即静默丢复数** | 只重载 `src/elementwise.lisp`（改实数实现时最常见的动作）：`(vt-sqrt #C(-1 0))` 从 `complex128 #C(-0.0d0 1.0d0)` 变成 `float64 NaN`，**不报错** |
+
+第 3 条是根因：`(setf (symbol-function 'vt-sqrt) <匿名 lambda>)` 装的包装，会被重载的实数 `defun` 整体覆盖；覆盖之后符号直接指向实数实现，复数分支永久消失。
+
+#### 16.32.2 三种机制（现已拆掉两种）
+
+| 机制 | 位置 | 形态 | 影响面 |
+|---|---|---|---|
+| M1 宏生成包装 | `complex.lisp` / `complex-ops.lisp` | `(setf (symbol-function ',name) (lambda (&rest keys &key ...)))` | 90 个；匿名 lambda → `declaim inline` 失效 |
+| M2 `defun` 重定义 | 三个 `complex*.lisp` | 同名字再写一遍 `defun`，体内 `(%cx-orig 'name)` 转发 | 65 个；语义取决于加载顺序 |
+| M3 时序预捕获 | 三个文件的 `eval-when` | 手写 63 条清单，漏写即「转发给自己」挂死 | 无机械约束 |
+
+#### 16.32.3 目标形态
+
+```lisp
+(defun vt-sqrt (vt &key out dtype)
+  "逐元素平方根。"
+  (when (%cx-any-p vt)                    ; ← 唯一新增
+    (return-from vt-sqrt
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SQRT")))
+        (vt-fast-map (function %cop-sqrt) in :out out :dtype dt))))
+  (%float-map #'sin-impl vt out (%infer-float-dtype vt dtype)))   ; 原 body 逐字不动
+```
+
+三个理由（决定了它是 `when` + `return-from` 而不是把 body 包进 `if`）：
+
+1. `defun` 自带同名 block，`return-from` 天然可用 —— **原 body 的缩进与括号完全不动**，159 处改造可脚本化，diff 只增不减；
+2. 单一 `defun` / 单一 lambda-list / 单一 docstring，**不存在「两处 lambda-list 漂移」**（见 16.32.5 的实证）；
+3. 实数路径的代价是一次内联的 dtype 判断，比原来「funcall 匿名包装 + 同样一次判断」**净减少**。
+
+三个新增的公共件都在 `src/dispatch.lisp`（`clvt.asd` 里紧随 `core`，早于所有归属文件）：
+
+| 名字 | 作用 |
+|---|---|
+| `%cx-arg-complex-p` / `%cx-any-p` | 分派判据。VT 走内联两步判断，**list/vector 进 `%cx-deep-p` 递归** |
+| `%cx-result-complex-dtype` | 复数数学函数的结果 dtype 规则（原在 complex.lisp，24 处归属文件要用，必须前置） |
+| `%cx-reduce-dispatch` | 归约族的算子路由（14 个符号共用一个入口） |
+
+> 判据为什么必须认 list：`(vt-cbrt (list #C(8 0)))` 是既有测试用例。浅判据
+> （只看 VT）会把它送进实数路径 —— 那是 `%cx-tensor-p` 的老问题，本轮把分派
+> 判据与「VT 快判」正式分开。
+
+#### 16.32.4 本轮完成的范围（92 / 159）
+
+| 阶段 | 内容 | 符号数 | 落地方式 |
+|---|---|---:|---|
+| S0 | `src/dispatch.lisp` + `%cx-any-p` / `%cx-deep-p` / `%cx-result-complex-dtype` / `%cx-reduce-dispatch` | 0 | 新建文件；`%cx-deep-p`/`%cx-tensor-p` 从 complex.lisp 前移 |
+| S1 | 拒绝型（41） | 41 | 归属 defun 插 `(when (%cx-reject …) (error "…不支持复数…"))`；删 `%cx-def-unsupported` |
+| S2 | 一元超越（24） | 24 | `return-from` + `vt-fast-map`；删 `%cx-def-unary` |
+| S3 | 比较 6 / 谓词 3 / 极值 4 | 13 | 同上；删三个宏 |
+| S4 | 归约族（14） | 14 | **`def-vt-reduce` 拆成「`%REDUCE-<NAME>` 实现 + `def-vt-reduce-facade` 门面」**，一个门面覆盖 14 个符号 |
+
+S4 的拆分是必须的：`all`/`any` 的复数语义是「先把复数转成 int8 真值掩码，再喂回同一个实现」。
+单一定义下没有 `%cx-orig` 可以回调，只能调实现函数 —— 这就是「实现 + 门面」两层的由来
+（公开符号仍然只有一个 `defun`，`%REDUCE-*` 是内部名）。
+
+#### 16.32.5 迁移中发现的 9 处 lambda-list 漂移（新 bug 类）
+
+对比「同一符号的两处 `defun`」的 lambda-list，9 个不一致：
+
+| 符号 | 实数版 | 复数版 | 后果 |
+|---|---|---|---|
+| `vt-svd` | `:max-sweeps 50 :tol 1e-14` | `:max-sweeps 60 :tol 1e-15` | **实数路径一直在用复数版的容差**（后加载者胜），且无人察觉 |
+| `vt-matrix-rank` | `(tol 1e-10)` | `(tol nil)` | 默认判秩阈值不同 |
+| `vt-clamp` | `(tensor vmin vmax &key …)` | `(vt &optional min-val max-val &key …)` | 签名根本不同，按哪个调用决定行为 |
+| `vt-view` | `(vt &rest args)` | `(vt new-shape)` | 前者能吃位置参数，后者不能 |
+| `vt-fromiter` | `(… (dtype :float64) …)` | `(… (dtype nil dtype-p) …)` | 缺省 dtype 不同 |
+| `vt-nanmedian` | 无 `dtype` | 有 `dtype` | 传 `:dtype` 时一边报错一边接受 |
+| `vt-angle` / `vt-round` / `vt-@` | 参数名不同 | 参数名不同 | 仅影响关键词名一致性 |
+
+这是覆盖机制的第二个代价：**两处定义没有任何机制强制它们签名一致**。
+16.32.3 的单一 `defun` 从结构上消灭这一类（只有一个 lambda-list，改不到别处去）。
+
+> `vt-svd` 那一条建议单独处理：需要确认期望的默认容差，不能靠「谁后加载谁赢」。
+
+#### 16.32.6 测试
+
+`test/complex-dispatch-test.lisp`（**15 断言**，已接入 `run-tests.sh`，共 **51 套件**）。
+它断言的不是数值而是**结构契约**：
+
+- 92 个已迁移符号的 `(symbol-function …)` 解析出的**定义名必须等于符号本身**
+  （即具名 `defun`，不是 `setf` 装的匿名 lambda）—— 这一条是「重载安全」的充分必要条件；
+- list 入参走复数路径（`(vt-sqrt (list #C(-1 0)))` → `complex128` 的 `i`）；
+- 拒绝型守卫对 list 也生效；
+- 实数路径抽样不回归（`sqrt`/`sum`/比较/`maximum` 语义）；
+- 复数语义抽样（字典序极值、`any` 的真值规则、`argmax` 的 `:int64`、`c64` 不被提升、`any` 的 NaN 规则）；
+- 复数归约的 `:out` 契约。
+
+#### 16.32.7 剩余工作（65 个，S5）
+
+65 个 M2 符号尚未迁移，其中：
+
+| 类别 | 数量 | 说明 |
+|---|---:|---|
+| 纯新增符号（无 `%cx-orig`） | 6 | `vt-@ vt-angle vt-conj vt-expt vt-imag vt-real` —— 不是覆盖，是**重复实现**（两处 `defun`，后者生效，前者是死代码），应删一处 |
+| lambda-list 漂移 | 9 | 见 16.32.5，需先裁决语义 |
+| 机械可迁移 | 50 | 形状统一：`(if (%cx-tensor-p …) <complex> (funcall (%cx-orig …) …))` → 抽出 complex 臂做 `%cx-*`，实数文件插守卫 |
+
+迁移顺序建议按「历史 bug 密度」：`median`/`sort`/`argsort`/`cumsum`/`cumprod`/`mean`/`var`/`std`/`average`（第九、十轮的病灶）→ 集合族 → 线代 11 个。
+
+**验收口径**：`grep -c "setf (symbol-function" src/*.lisp` 全为 0、`*cx-originals*` 删除、
+`%cx-orig` 删除、三个文件的 `eval-when` 预捕获清单删除，然后把 `complex-dispatch-test`
+的 92 个名字扩到 159。
+
+---
+
+### 16.20 累计变更文件清单（第一～十二轮）
 
 | 文件 | 改动 |
 |---|---|
@@ -2806,6 +2923,15 @@ float32 内算仍是 1.5、`c64+#C(1 2)` 正确、`i8+1` 不溢出）。
 | `src/elementwise.lisp` | **第十一轮**：`vt-/` 的浮点目标只看张量 dtype，并显式下传 natural-dtype |
 | `src/complex.lisp` | **第十一轮**：`vt-pow`（复数分支 / float-power）、`maximum/minimum/fmax/fmin` 换 `%op-final-dtype` |
 | `test/dtype-weak-scalar-test.lisp` | **第十一轮新增** 14 断言（只收录修复前确实错的 11 个 dtype 用例 + 3 个值正确性），注册后共 50 套件 |
+| `src/dispatch.lisp` | **第十二轮新增**：复数分派的单一入口（`%cx-arg-complex-p` / `%cx-any-p` / `%cx-deep-p` / `%cx-result-complex-dtype` / `%cx-reduce-dispatch`），在 `clvt.asd` 里紧随 `core` |
+| `clvt.asd` | **第十二轮**：`(:file "src/dispatch")` 插在 `core` 之后 |
+| `src/elementwise.lisp` | **第十二轮**：20 个拒绝型 + 10 个比较/极值 + 18 个一元，改为体内 `when`+`return-from` 分派（§16.32.3） |
+| `src/nn.lisp` | **第十二轮**：9 个激活函数加拒绝型守卫 |
+| `src/extensions3.lisp` | **第十二轮**：7 个拒绝型 + 3 个一元（`expm1`/`log1p`/`sign`）加守卫 |
+| `src/reduce-stats.lisp` | **第十二轮**：4 个拒绝型（`histogram`/`interp`/`percentile` 族）+ 3 个谓词（`isnan` 族）；`def-vt-reduce` 拆成 `%REDUCE-<NAME>` 实现 + `def-vt-reduce-facade` 门面（14 个符号） |
+| `src/indexing.lisp` | **第十二轮**：`vt-bincount` 加拒绝型守卫 |
+| `src/complex.lisp` / `src/complex-ops.lisp` | **第十二轮**：删 `%cx-def-unsupported`/`-unary`/`-compare`/`-minmax`/`-predicate`/`-reduce`/`-nan-reduce`/`-bool-reduce` 八个宏与全部调用；`%cx-deep-p`/`%cx-tensor-p`/`%cx-result-complex-dtype` 迁出 |
+| `test/complex-dispatch-test.lisp` | **第十二轮新增** 15 断言（结构契约：具名 DEFUN / list 入参 / 实数不回归 / 复数抽样 / `:out`），注册后共 51 套件 |
 
 ---
 

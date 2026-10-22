@@ -40,6 +40,7 @@
                (:file "src/nan")
                (:file "src/dtype")
                (:file "src/core")
+               (:file "src/dispatch")
                (:file "src/parcontract")
                (:file "src/map-reduce")
                (:file "src/io")

@@ -195,7 +195,9 @@
       浮点输入同样做 floor（v0.4.x 修复：原实现误用真除，未 floor），
       除数 ±0.0 按 IEEE 得 ±Inf/NaN。
       需要 numpy true_divide 语义（恒浮点、不 floor）请用 vt-/。"
-  (vt-map #'%floor-div-op
+    (when (%cx-reject a b)
+    (error "vt-div: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map #'%floor-div-op
           (ensure-vt a) (ensure-vt b)
           :dtype dtype :out out))
 
@@ -313,6 +315,11 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-sin (vt &key out dtype)
   "逐元素正弦。整数输入输出按 :dtype 或 float64（对标 numpy，
       整数进 float64 出）；float32 进 float32 出。:out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-sin
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SIN")))
+        (vt-fast-map (function sin) in :out out :dtype dt))))
   (%float-map #'sin vt out (%infer-float-dtype vt dtype)))
 
 ;;; ==================================================================
@@ -456,60 +463,110 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-cos (vt &key out dtype)
   "逐元素余弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-cos
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-COS")))
+        (vt-fast-map (function cos) in :out out :dtype dt))))
   (%float-map #'cos vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-tan (vt &key out dtype)
   "逐元素正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-tan
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-TAN")))
+        (vt-fast-map (function tan) in :out out :dtype dt))))
   (%float-map #'tan vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-atan (vt &key out dtype)
   "逐元素反正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-atan
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ATAN")))
+        (vt-fast-map (function atan) in :out out :dtype dt))))
   (%float-map #'atan vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-sinh (vt &key out dtype)
   "逐元素双曲正弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-sinh
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SINH")))
+        (vt-fast-map (function sinh) in :out out :dtype dt))))
   (%float-map #'sinh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-cosh (vt &key out dtype)
   "逐元素双曲余弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-cosh
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-COSH")))
+        (vt-fast-map (function cosh) in :out out :dtype dt))))
   (%float-map #'cosh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-tanh (vt &key out dtype)
   "逐元素双曲正切。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-tanh
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-TANH")))
+        (vt-fast-map (function tanh) in :out out :dtype dt))))
   (%float-map #'tanh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-asin (vt &key out dtype)
   "逐元素反正弦。|x|>1 返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-asin
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ASIN")))
+        (vt-fast-map (function asin) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-asin-df %op-asin-sf vt out dt)))
 
 (defun vt-acos (vt &key out dtype)
   "逐元素反余弦。|x|>1 返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-acos
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ACOS")))
+        (vt-fast-map (function acos) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-acos-df %op-acos-sf vt out dt)))
 
 (defun vt-asinh (vt &key out dtype)
   "逐元素反双曲正弦。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-asinh
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ASINH")))
+        (vt-fast-map (function asinh) in :out out :dtype dt))))
   (%float-map #'asinh vt out (%infer-float-dtype vt dtype)))
 
 
 (defun vt-acosh (vt &key out dtype)
   "逐元素反双曲余弦。x<1 返回 NaN（对标 numpy）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-acosh
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ACOSH")))
+        (vt-fast-map (function acosh) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-acosh-df %op-acosh-sf vt out dt)))
 
@@ -517,12 +574,22 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素反双曲正切，对标 numpy.arctanh。
       |x|>1 返回 NaN；x=+1 返回 +Inf、x=-1 返回 -Inf（IEEE 极限，非 NaN）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-atanh
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ATANH")))
+        (vt-fast-map (function atanh) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-atanh-df %op-atanh-sf vt out dt)))
 
 (defun vt-exp (vt &key out dtype)
   "逐元素指数。整数输入输出 float64，float32 进 float32 出。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-exp
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-EXP")))
+        (vt-fast-map (function exp) in :out out :dtype dt))))
   (%float-map #'exp vt out (%infer-float-dtype vt dtype)))
 
 
@@ -627,6 +694,11 @@ lambda 算子请使用 %%float-map-fn"))
 
 (defun vt-square (vt &key out dtype)
   "逐元素平方。特化为 vt-fast-map #'* 以避免 vt-pow 的 handler-case/expt/realp 开销。"
+  (when (%cx-any-p vt)
+    (return-from vt-square
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SQUARE")))
+        (vt-fast-map (function %cop-square) in :out out :dtype dt))))
   (vt-fast-map #'* vt vt :out out :dtype dtype))
   "逐元素平方。特化为 vt-fast-map #'* 以避免 vt-pow 的
       handler-case/expt/realp 开销。:out 契约同 vt-+。"
@@ -634,6 +706,11 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-sqrt (vt &key out dtype)
   "逐元素平方根。负数输入返回 NaN（对标 numpy，不抛条件）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-sqrt
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SQRT")))
+        (vt-fast-map (function %cop-sqrt) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-sqrt-df %op-sqrt-sf vt out dt)))
 
@@ -673,12 +750,22 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-log10 (vt &key out dtype)
   "逐元素常用对数（底 10）。语义等价 (vt-log vt :base 10)。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-log10
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-LOG10")))
+        (vt-fast-map (function %cop-log10) in :out out :dtype dt))))
   (%float-map-pair %op-log10-df %op-log10-sf vt out
                    (%infer-float-dtype vt dtype)))
 
 (defun vt-log2 (vt &key out dtype)
   "逐元素二进制对数（底 2）。语义等价 (vt-log vt :base 2)。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-log2
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-LOG2")))
+        (vt-fast-map (function %cop-log2) in :out out :dtype dt))))
   (%float-map-pair %op-log2-df %op-log2-sf vt out
                    (%infer-float-dtype vt dtype)))
 
@@ -704,6 +791,11 @@ lambda 算子请使用 %%float-map-fn"))
       统一返回 +0.0（对标 numpy.sign：sign(-0.0)=0.0）。
       v0.4.3：改用内联字面算子 %sign1（原匿名 lambda 让 vt-map 退回
       funcall + 泛型 aref，1M 元素 69ms）。"
+  (when (%cx-any-p vt)
+    (return-from vt-signum
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SIGNUM")))
+        (vt-fast-map (function %cop-signum) in :out out :dtype dt))))
   (vt-fast-map #'%sign1 vt :out out :dtype dtype))
 
 (defun vt-positive-p (vt &key out (dtype :int8))
@@ -738,7 +830,9 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素偶数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
       NaN/±Inf 视为非偶数 → 0；非整数值视为非偶数 → 0
       （对标模拟基准 v%2==0）。:out 契约同 vt-=。"
-  (vt-map (lambda (v)
+    (when (%cx-reject vt)
+    (error "vt-even-p: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map (lambda (v)
             (cond ((or (%nan-p v) (%inf-p v)) 0)
                   ((and (floatp v) (/= v (floor v))) 0)
                   (t (if (evenp (floor v)) 1 0))))
@@ -748,7 +842,9 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素奇数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
       NaN/±Inf 视为非奇数 → 0；非整数值视为非奇数 → 0
       （对标模拟基准 v%2==1）。:out 契约同 vt-=。"
-  (vt-map (lambda (v)
+    (when (%cx-reject vt)
+    (error "vt-odd-p: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map (lambda (v)
             (cond ((or (%nan-p v) (%inf-p v)) 0)
                   ((and (floatp v) (/= v (floor v))) 0)
                   (t (if (oddp (floor v)) 1 0))))
@@ -816,7 +912,9 @@ lambda 算子请使用 %%float-map-fn"))
    除数为 0 时按 numpy dtype 语义（v0.3.6 起）：
    浮点语境（任一操作数为浮点）→ NaN；整型语境 → 0；
    NaN 任一侧出现 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
-  (flet ((zero-div (x)
+    (when (%cx-reject vt divisor)
+    (error "vt-mod: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(flet ((zero-div (x)
            ;; numpy 语义：浮点语境零除 → NaN，整型语境 → 0
            (if (floatp x) (%mod-float-nan x) 0)))
     (if (numberp divisor)
@@ -842,7 +940,9 @@ lambda 算子请使用 %%float-map-fn"))
    除数为 0 时按 numpy dtype 语义（v0.3.6 起）：
    浮点语境（任一操作数为浮点）→ NaN；整型语境 → 0；
    NaN 任一侧 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
-  (flet ((zero-div (x)
+    (when (%cx-reject vt divisor)
+    (error "vt-rem: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(flet ((zero-div (x)
            ;; numpy 语义：浮点语境零除 → NaN，整型语境 → 0
            (if (floatp x) (%mod-float-nan x) 0)))
     (if (numberp divisor)
@@ -864,7 +964,9 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-atan2 (vty vtx &key out dtype)
   "逐元素双参数反正切 atan2(y, x)。参数顺序 VTY, VTX。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
-  (vt-fast-map #'atan vty vtx :out out :dtype dtype))
+    (when (%cx-reject vty vtx)
+    (error "vt-atan2: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-fast-map #'atan vty vtx :out out :dtype dtype))
 
 ;; floor 族对 NaN/±Inf 统一传播本身（对标 numpy：floor/ceil/trunc/round(nan)=nan，
 ;; floor(±inf)=±inf）。SBCL 对非有限值直接调用 floor/round 会 signal
@@ -919,7 +1021,9 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素向下取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.floor）；整数输入保持整数 dtype。
       :out 契约同 vt-+。"
-  (if (eql divisor 1)
+    (when (%cx-reject vt)
+    (error "vt-floor: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(if (eql divisor 1)
       (vt-fast-map #'%floor1 vt :out out :dtype dtype)
       (vt-map (lambda (x) (%floor-family-body x floor))
               vt :out out :dtype dtype)))
@@ -928,7 +1032,9 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素向上取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.ceil）；整数输入保持整数 dtype。
       :out 契约同 vt-+。"
-  (if (eql divisor 1)
+    (when (%cx-reject vt)
+    (error "vt-ceiling: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(if (eql divisor 1)
       (vt-fast-map #'%ceiling1 vt :out out :dtype dtype)
       (vt-map (lambda (x) (%floor-family-body x ceiling))
               vt :out out :dtype dtype)))
@@ -946,7 +1052,9 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素向零取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.trunc）；整数输入保持整数 dtype。
       :out 契约同 vt-+。"
-  (if (eql divisor 1)
+    (when (%cx-reject vt)
+    (error "vt-truncate: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(if (eql divisor 1)
       (vt-fast-map #'%truncate1 vt :out out :dtype dtype)
       (vt-map (lambda (x) (%floor-family-body x truncate))
               vt :out out :dtype dtype)))
@@ -954,7 +1062,9 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-rint (vt &key out dtype)
   "逐元素取整到最近偶数（对标 numpy.rint）。
       NaN/±Inf 原样传播；整数输入保持整数 dtype。:out 契约同 vt-+。"
-  (vt-map (lambda (x)
+    (when (%cx-reject vt)
+    (error "vt-rint: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map (lambda (x)
             (if (and (floatp x) (%nan-or-inf-p x))
                 x
                 (let ((res (nth-value 0 (round x))))
@@ -982,43 +1092,69 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素相等判定，返回值 1/0，dtype 默认 :int8（承载布尔语义，CONVENTIONS §3.1）。
       NaN 与任何值比较恒假 → 0（含 NaN == NaN）。
       :out dtype 必须精确等于结果 dtype（§4.2 H3，默认 :int8）。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-=
+      (vt-fast-map (function %cx-eq-flag) (ensure-vt t1) (ensure-vt t2)
+                   :out out :dtype dtype)))
   (vt-fast-map #'%op-eq (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
 (defun vt-/= (t1 t2 &key (dtype :int8) out)
   "逐元素不等判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
       NaN 与任何值比较恒真 → 1（含 NaN != NaN）。:out 契约同 vt-=。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-/=
+      (vt-fast-map (function %cx-ne-flag) (ensure-vt t1) (ensure-vt t2)
+                   :out out :dtype dtype)))
   (vt-fast-map #'%op-ne (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
 (defun vt-< (t1 t2 &key (dtype :int8) out)
   "逐元素小于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
       NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-<
+      (vt-fast-map (function %cx-lt-flag) (ensure-vt t1) (ensure-vt t2)
+                   :out out :dtype dtype)))
   (vt-fast-map #'%op-lt (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
 (defun vt-<= (t1 t2 &key (dtype :int8) out)
   "逐元素小于等于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
       NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-<=
+      (vt-fast-map (function %cx-le-flag) (ensure-vt t1) (ensure-vt t2)
+                   :out out :dtype dtype)))
   (vt-fast-map #'%op-le (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
 (defun vt-> (t1 t2 &key (dtype :int8) out)
   "逐元素大于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
       NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt->
+      (vt-fast-map (function %cx-gt-flag) (ensure-vt t1) (ensure-vt t2)
+                   :out out :dtype dtype)))
   (vt-fast-map #'%op-gt (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
 (defun vt->= (t1 t2 &key (dtype :int8) out)
   "逐元素大于等于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
       NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt->=
+      (vt-fast-map (function %cx-ge-flag) (ensure-vt t1) (ensure-vt t2)
+                   :out out :dtype dtype)))
   (vt-fast-map #'%op-ge (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
 (defun vt-rad2deg (vt &key out dtype)
   "弧度转角度（×180/π）。整数输入输出 float64，
       float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
+    (when (%cx-reject vt)
+    (error "vt-rad2deg: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let* ((dt (%infer-float-dtype vt dtype))
          (factor (if (eq dt :float32) (/ 180.0s0 (coerce pi 'single-float))
                      (/ 180.0d0 pi))))
     (vt-map (lambda (x) (* x factor)) vt :out out :dtype dt)))
@@ -1026,7 +1162,9 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-deg2rad (vt &key out dtype)
   "角度转弧度（×π/180）。整数输入输出 float64，
       float32 进 float32 出。:out 契约同 vt-+。"
-  (let* ((dt (%infer-float-dtype vt dtype))
+    (when (%cx-reject vt)
+    (error "vt-deg2rad: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let* ((dt (%infer-float-dtype vt dtype))
          (factor (if (eq dt :float32) (/ (coerce pi 'single-float) 180.0s0)
                      (/ pi 180.0d0))))
     (vt-map (lambda (x) (* x factor)) vt :out out :dtype dt)))
@@ -1083,21 +1221,61 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-maximum (t1 t2 &key out dtype)
   "逐元素取较大值，**NaN 传播**（任一为 NaN → NaN，且优先取左）
       对标 numpy.maximum。:out 契约同 vt-+。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-maximum
+      (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
+             (p (%op-final-dtype (list (%scalar-kind t1) (%scalar-kind t2))
+                                 (list (vt-dtype a) (vt-dtype b))))
+             (dt (or dtype p)))
+        (unless (%cx-complex-dtype-p* dt)
+          (error "vt-maximum: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
+                 dt))
+        (vt-map (function %cop-max) a b :out out :dtype dt))))
   (vt-fast-map #'%op-maximum t1 t2 :out out :dtype dtype))
 
 (defun vt-minimum (t1 t2 &key out dtype)
   "逐元素取较小值，**NaN 传播**（任一为 NaN → NaN，且优先取左）
       对标 numpy.minimum。:out 契约同 vt-+。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-minimum
+      (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
+             (p (%op-final-dtype (list (%scalar-kind t1) (%scalar-kind t2))
+                                 (list (vt-dtype a) (vt-dtype b))))
+             (dt (or dtype p)))
+        (unless (%cx-complex-dtype-p* dt)
+          (error "vt-minimum: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
+                 dt))
+        (vt-map (function %cop-min) a b :out out :dtype dt))))
   (vt-fast-map #'%op-minimum t1 t2 :out out :dtype dtype))
 
 (defun vt-fmax (t1 t2 &key out dtype)
   "逐元素取较大值，**忽略 NaN**（仅两侧皆 NaN 时返回 NaN）
       对标 numpy.fmax。:out 契约同 vt-+。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-fmax
+      (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
+             (p (%op-final-dtype (list (%scalar-kind t1) (%scalar-kind t2))
+                                 (list (vt-dtype a) (vt-dtype b))))
+             (dt (or dtype p)))
+        (unless (%cx-complex-dtype-p* dt)
+          (error "vt-fmax: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
+                 dt))
+        (vt-map (function %cop-fmax) a b :out out :dtype dt))))
   (vt-fast-map #'%op-fmax t1 t2 :out out :dtype dtype))
 
 (defun vt-fmin (t1 t2 &key out dtype)
   "逐元素取较小值，**忽略 NaN**（仅两侧皆 NaN 时返回 NaN）
       对标 numpy.fmin。:out 契约同 vt-+。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-fmin
+      (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
+             (p (%op-final-dtype (list (%scalar-kind t1) (%scalar-kind t2))
+                                 (list (vt-dtype a) (vt-dtype b))))
+             (dt (or dtype p)))
+        (unless (%cx-complex-dtype-p* dt)
+          (error "vt-fmin: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
+                 dt))
+        (vt-map (function %cop-fmin) a b :out out :dtype dt))))
   (vt-fast-map #'%op-fmin t1 t2 :out out :dtype dtype))
 
 (defun vt-logical-and (t1 t2 &key out (dtype :int8))
@@ -1120,30 +1298,42 @@ lambda 算子请使用 %%float-map-fn"))
 
 (defun vt-bit-and (t1 t2 &key out dtype)
   "逐元素按位与 logand。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'logand (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+    (when (%cx-reject t1 t2)
+    (error "vt-bit-and: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map #'logand (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-ior (t1 t2 &key out dtype)
   "逐元素按位或 logior。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'logior (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+    (when (%cx-reject t1 t2)
+    (error "vt-bit-ior: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map #'logior (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-xor (t1 t2 &key out dtype)
   "逐元素按位异或 logxor。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'logxor (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
+    (when (%cx-reject t1 t2)
+    (error "vt-bit-xor: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map #'logxor (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-not (vt &key out dtype)
   "逐元素按位取反 lognot。输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map #'lognot vt :dtype dtype :out out))
+    (when (%cx-reject vt)
+    (error "vt-bit-not: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map #'lognot vt :dtype dtype :out out))
 
 (defun vt-left-shift (vt shift &key out dtype)
   "逐元素左移 SHIFT 位（ash x shift）。SHIFT 为整数标量。
       输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map (lambda (x) (ash x shift))
+    (when (%cx-reject vt shift)
+    (error "vt-left-shift: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map (lambda (x) (ash x shift))
           vt :dtype dtype :out out))
 
 (defun vt-right-shift (vt shift &key out dtype)
   "逐元素右移 SHIFT 位（ash x -shift，算术右移）。SHIFT 为整数标量。
       输入应为整数 dtype；:out 契约同 vt-+。"
-  (vt-map (lambda (x) (ash x (- shift)))
+    (when (%cx-reject vt shift)
+    (error "vt-right-shift: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(vt-map (lambda (x) (ash x (- shift)))
           vt :dtype dtype :out out))
 
 (declaim (inline %op-clip))
@@ -1206,7 +1396,9 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
       类型错误，现显式拦截：NaN → NaN、±Inf → ±Inf（numpy 对齐）。
   性能：改用符号算子 %OP-CBRT-Df/SF，编译期内联（原 lambda 走 vt-map
   的 funcall 路径，1M 元素实测 143ms）。"
-  (let ((dt (%infer-float-dtype vt dtype)))
+    (when (%cx-reject vt)
+    (error "vt-cbrt: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-cbrt-df %op-cbrt-sf vt out dt)))
 
 ;;; v0.4.3 性能修复：vt-hypot / vt-lerp / vt-cbrt 等原本一律写成
@@ -1247,7 +1439,9 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 
 (defun vt-hypot (t1 t2 &key out dtype)
   "逐元素直角三角斜边 sqrt(x² + y²)（对标 numpy.hypot）。任一输入为 ±Inf → 结果 +Inf；NaN 传播。"
-  (let* ((v1 (ensure-vt t1))
+    (when (%cx-reject t1 t2)
+    (error "vt-hypot: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+(let* ((v1 (ensure-vt t1))
          (v2 (ensure-vt t2))
          (dt (or dtype (if (or (eq (vt-dtype v1) :float32)
                                (eq (vt-dtype v2) :float32))
@@ -1265,6 +1459,11 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
      显式 :dtype 优先。
    零除：浮点 → ±Inf（IEEE 754）；整数 → 确定性报错，与 numpy
      整数零除行为一致。"
+  (when (%cx-any-p vt)
+    (return-from vt-reciprocal
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-RECIPROCAL")))
+        (vt-fast-map (function %cop-recip) in :out out :dtype dt))))
   (let* ((in-dt (vt-dtype (ensure-vt vt)))
          (dt (or dtype in-dt)))
     (if (vt-int-dtype-p dt)
@@ -1277,11 +1476,21 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 (defun vt-negative (vt &key out dtype)
   "逐元素取负（-x）。这是一元 vt-- 的具名入口，
       NaN/±Inf 原样传播（对标 numpy.negative）。:out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-negative
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-NEGATIVE")))
+        (vt-fast-map (function %cop-neg) in :out out :dtype dt))))
   (vt-fast-map #'- vt :dtype dtype :out out))
 
 (defun vt-sinc (tensor &key out dtype)
   "逐元素归一化 sinc 函数 sin(πx)/(πx)，且 sinc(0)=1（对标 numpy.sinc）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
+  (when (%cx-any-p tensor)
+    (return-from vt-sinc
+      (let* ((in (ensure-vt tensor))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-SINC")))
+        (vt-fast-map (function %cop-sinc) in :out out :dtype dt))))
   (let* ((dt (%infer-float-dtype tensor dtype))
          (x-pi (vt-scale tensor pi :dtype dt)))
     (vt-map (lambda (x)
