@@ -73,6 +73,7 @@ SUITES[complex-linalg-test]="216 复数线性代数测试 (46 项 numpy 2.4.6 �
 SUITES[setops-axis-trace-test]="56 按轴去重/迹 测试 (37 项 numpy 2.4.6 差分对照: vt-unique :axis 含 return-index/inverse/counts、NaN 行不折叠、非连续视图、退化形状 + vt-trace :offset/:axis1/:axis2 含高维收缩 + 契约断言 + 实数回归网; 期望由 test/gen_setops_axis_expected.py 生成)"
 SUITES[einsum-gemm-layout-test]="36 einsum GEMM 布局归一化 (§16.26: NN/NT/C-转置/兜底 四条路径各档尺寸 + 批量含广播与批量NT + f32/i32/i64/c128/c64 + 转置输入/切片/非连续 :out/小矩阵 + SIMD关与单线程不变; 主断言 = 与 vt-matmul 逐位相等)"
 SUITES[complex-ops-test]="128 复数数据搬运层测试 (97 项 numpy 2.4.6 差分对照: 转换/拼接/剪切/集合/nan 族/缩并/卷积 + dtype&shape 契约 + :out 硬契约 + 未支持组合报错 + 实数回归网; 期望由 test/gen_complex_ops_expected.py 生成)"
+SUITES[dtype-weak-scalar-test]="14 弱标量提升回归（第十一轮 §16.31: Lisp 标量按 numpy NEP 50 只贡献种类不贡献宽度 —— f32/c64/i32/i8/u8 的「+标量」不再静默升宽; 覆盖 vt-+ / vt-/ / vt-pow / vt-maximum 与值正确性）"
 SUITES[complex-nan-inf-test]="77 复数 NaN/Inf 与 median 契约（第十轮 §16.30: median 在 axis=nil/空 fiber/NaN 传播三处与实数路径分叉 · 前缀扫描首元素直拷（-0.0 符号位、Inf 元素）· nan* 家族含 ±Inf 与全 NaN 切片 · isnan/isinf/isfinite/nan_to_num/含 NaN 排序 · axis 元组归约 · :out 非连续/转置/原地 · einsum 九种模式）"
 SUITES[complex-scan-axis-test]="26 复数沿轴扫描回归（第九轮 §16.29: cumsum/cumprod/nancumsum/nancumprod 在 axis<rank-1 时只算第一条 fiber 的静默错值 · 2D 两轴 + 3D 三轴 + 负轴 + 转置视图 + c64 + 退化/空轴 + :out 连续与非连续 · 期望值取自 numpy 2.3.5 逐位相等 · 实数路径回归）"
 SUITES[complex-gap-test]="50 复数缺口回归（第八轮 §16.28: from-array/from-sequence/full 的 dtype 推断保住虚部 · float_power 复数主值分支与 NaN 边界 · cbrt 对齐 numpy 的确定性拒绝 · layer-norm 复数分支（复数均值+实数方差）· 已支持函数抽查）"
@@ -135,6 +136,7 @@ DEFAULT_ORDER=(
     uncovered-coverage-test
     extensions3-test
     fastmap-invariant-test
+    dtype-weak-scalar-test
     complex-nan-inf-test
     complex-scan-axis-test
     complex-gap-test

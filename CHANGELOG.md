@@ -4,6 +4,101 @@
 
 ---
 
+## 2026-10-21（十一）— 第十一轮：弱标量提升（窄 dtype 不再被标量带宽）
+
+前十轮都在比**值**和「复数会不会掉回实数实现」。本轮换成**只比 dtype**：
+119 条表达式全喂 `complex64`（外加实数 dtype 对照），逐项与 numpy 的**结果 dtype**
+比对。值的正确性前几轮已覆盖，这一维是空白 —— 结果抓到一整类问题。
+
+### 症状：窄 dtype 遇到标量就静默升宽
+
+| 表达式（`*` = 张量） | 修复前 | 修复后 = numpy |
+|---|---|---|
+| `f32* + 1.5` / `f32* + 1` | float64 | **float32** |
+| `i32* + 1` / `i8* + 1` / `u8* + 1` | int64 | **int32 / int8 / uint8** |
+| `c64* + #C(1 2)` / `c64* + 1.5` | complex128 | **complex64** |
+| `f32* + #C(1 2)` | complex128 | **complex64** |
+| `f32* / 2` | float64 | **float32** |
+| `c64* ** 2`、`maximum(c64*, 标量)` | complex128 | **complex64** |
+
+不是算错，而是**分配了双倍内存、带宽翻倍、SIMD 通道白丢一半**，且完全不报错。
+顺带把 `vt-gradient(c64)` 也带回了 complex64（它是自然提升的函数，之前被标量带宽）。
+
+### 根因
+
+逐元素运算的 dtype 一律走
+
+```lisp
+(apply #'vt-promote-type (mapcar #'vt-dtype inputs))   ; inputs 已全部 ensure-vt
+```
+
+而 `(ensure-vt 1.5d0)` 是 **float64 的 0 维张量**、`(ensure-vt #C(1 2))` 是
+**complex128** —— 「谁是标量」在 ensure 之后已经没了，标量于是以全强度参与提升。
+
+numpy 2.x（NEP 50）里 Python 标量是**弱**类型：只贡献种类（int/float/complex），
+不贡献宽度；宽度由张量决定，只有「整型张量 + 浮点标量」才落到该种类的默认宽度。
+CL 的 `1.5d0` 对应 Python 的 `1.5`，语义正好对齐，故按 NEP 50 修
+（CONVENTIONS §0：与 NumPy 冲突以 NumPy 为准）。
+
+### 修法
+
+`src/dtype.lisp` 新增 `%SCALAR-KIND`（张量→NIL，Lisp 数→:INT/:FLOAT/:COMPLEX）
+与 `%OP-FINAL-DTYPE`（张量之间仍走原 100 格 promote 表，弱标量只按种类并入）。
+接进 `vt-map`、`vt-fast-map` 宏、`vt-/`、`vt-pow`（含 float-power）、
+`maximum/minimum/fmax/fmin`。
+
+一处关键细节：**标量身份只能沿着「原始实参」传**。`vt-/` 第一版只改了自身判定，
+随后又把已 ensure 的值传给 `vt-fast-map`，标量身份二次丢失，`f32/2` 依旧 float64。
+`vt-fast-map` 宏因此改成「先绑原始实参、再 ensure-vt」。
+
+### 附带优化：单元素输入预转（让内联快路径回来）
+
+改完 dtype 先测性能，发现 c64 数组 + 标量反而慢 27% —— 因为「弱标量」在 ensure-vt
+之后是**另一种 dtype 的 0 维张量**，`%VT-INLINE*-FAST` 的「输入与输出同元素类型」
+前置条件不成立，整个运算掉进 funcall + 泛型 aref 兜底。
+
+修法：对满足五个条件的**单元素**输入预转成结果 dtype（`%WEAK-CAST1`）：
+SIZE=1、dtype 与结果不同、种类秩 `源 ≤ 目标`（int<float<complex 只走无损方向）、
+整数值要装得下、**这组输入里至少有一个真张量**。不整体预转大数组。
+
+后三个条件是踩出来的，每一条都对应一次「预转把语义前提悄悄改掉」：
+* 只按「单元素 + dtype 不同」转 → 比较运算的标量进了 int8 掩码，`nan<1` 判错；
+* 加上「同大类」→ 仍会把 `999000` 转进 int8（变成 -8），argwhere 数出 999911；
+* 加上「值装得下」→ 全标量的 `(vt-complex 1.0 2.0)` 把实参转成复数，
+  构造函数收到 `#C(1 0)` 报 `is not of type REAL`。
+三次都是跑全量套件才发现的 —— 局部看都对。
+
+实测 2M 元素（min-of-7）：
+
+| 表达式 | 第十轮 | 第十一轮 |
+|---|---:|---:|
+| `f32 数组 + 1.5` | 77 ms | **4.1 ms**（19×）|
+| `c64 数组 + 1.5` | 163 ms | **5.4 ms**（30×）|
+
+旧实现慢正是因为升宽导致输入/结果类型不一致、一直在跑兜底路径。
+
+### 有意保留的三处差异
+
+* `det/inv/solve/pinv/cholesky/qr/matrix-power/svd/eigvalsh` 的 c64 输入仍返回
+  complex128 / float64：复数线代**恒在 double 下计算**（`vt-det` 文档已写明），
+  精度更高，改回单精度是降级；
+* `ptp` / `cond` 返回 Lisp 标量而非张量（§5 既定风格），原生数没有 dtype；
+* 弱整数越界（`i8* + 300`）本库回绕，numpy 抛 OverflowError。
+
+### 测试
+
+`test/dtype-weak-scalar-test.lisp`（**14 断言**，已接入 `run-tests.sh`，共 50 套件）。
+按要求**只收录修复前确实错的用例**：11 个 dtype 断言（每一个都在修复前的构建上
+复验过「当时真的是错的」）+ 3 个值正确性断言（确认不再升宽没把值算错）。
+张量×张量的 promote 100 格与 c64 其余 dtype 契约由既有套件覆盖，不重复。
+
+全量 **50 套件全绿**；`manip-interop-test` 的 195 例 Lisp↔numpy 逐位对照 0 差异。
+
+文档：CONVENTIONS §16.31（方法 / 症状 / 根因 / 修法 / 保留差异）、
+§16.20 变更清单。
+
+---
+
 ## 2026-10-21（十）— 第十轮：median 契约、前缀扫描首元素与 NaN/Inf 语义
 
 第九轮补了「数值对拍」这条扫描线，本轮把表达式从 190 条扩到 **262 条**，

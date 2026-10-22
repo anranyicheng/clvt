@@ -92,28 +92,43 @@
                  (or (vt-int-dtype-p (vt-dtype x))
                      (member (vt-dtype x) '(:uint8 :uint16)))))
              (dts (mapcar #'vt-dtype all))
+             ;; 弱标量（NEP 50）：Lisp 标量只贡献「种类」，不参与宽度判定。
+             ;; 于是 (vt-/ f32-数组 2) 保持 float32（numpy 同），而
+             ;; (vt-/ int-数组 2) 仍是 float64（数组本身是整型）。
+             (tensor-dts (loop for raw in (cons vt tensors) for x in all
+                               unless (%scalar-kind raw) collect (vt-dtype x)))
+             ;; dtype 版谓词（上面那个 INT-FAMILY-P 吃的是张量对象）
+             (dt-int-p (lambda (dt)
+                         (or (vt-int-dtype-p dt) (member dt '(:uint8 :uint16)))))
              (float-target
                (cond (dtype
                       ;; 显式整型目标：保持截断语义，零除确定性报错
                       nil)
-                     ((every int-family-p all)
-                      ;; 整型（含无符号）→ float64（true_divide 恒浮点）
+                     ((or (null tensor-dts) (every dt-int-p tensor-dts))
+                      ;; 整型（含无符号）张量 → float64（true_divide 恒浮点）；
+                      ;; 全是标量时也落 float64（numpy: 1/2 = 0.5）
                       :float64)
-                     ((some int-family-p all)
+                     ((some dt-int-p tensor-dts)
                       ;; numpy promote：int8/int16/uint8/uint16 与 float32 混合
                       ;; → float32；int32/int64 或 float64 参与 → float64
                       ;; （v0.4.x 修复：原实现对 int32/int64+float32 误返 float32）
                       (if (every (lambda (dt)
                                    (member dt '(:float32 :int8 :int16
                                                 :uint8 :uint16)))
-                                 dts)
+                                 tensor-dts)
                           :float32
                           :float64))
                      ;; 纯浮点混合：自然提升（float64 优先于 float32，对齐
                      ;; numpy promote(float32,float64)=float64。v0.4.x 修复：
                      ;; 原实现强行取 float32，精度被降级）
                      (t nil)))
-             (effective-dtype (or dtype float-target)))
+             ;; 自然提升（含弱标量语义）。必须在这里算定并显式下传：
+             ;; 下面的 (first all)/(second all) 是**已 ensure-vt** 的值，
+             ;; 再交给 vt-fast-map 时「谁是标量」已经认不出来了。
+             (natural-dtype (%op-final-dtype
+                             (mapcar #'%scalar-kind (cons vt tensors))
+                             (mapcar #'vt-dtype all)))
+             (effective-dtype (or dtype float-target natural-dtype)))
         ;; 计算前把整型输入预转换为浮点（numpy true_divide 语义）：
         ;; 避免 CL 整数除零信号 division-by-zero（numpy 为 ±Inf），
         ;; 也避免 (/ int 0) 混合类型除法在浮点目标下的类型错误。

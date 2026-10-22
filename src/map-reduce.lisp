@@ -166,6 +166,60 @@
 ;;; 逐元素映射：vt-map
 ;;; ------------------------------------------------------------------
 
+(defun %scalar-fits-p (value dtype)
+  "VALUE（Lisp 数）放进 DTYPE 是否**不改变值**。
+   整数要查区间（999000 塞进 int8 会变成 -8，比较结果全错）；
+   浮点/复数只关心舍入，而循环本来就要按结果 dtype 存，故一律放行。"
+  (if (not (integerp value))
+      t
+      (case dtype
+        (:int8   (<= -128 value 127))
+        (:int16  (<= -32768 value 32767))
+        (:int32  (<= (- (expt 2 31)) value (1- (expt 2 31))))
+        (:uint8  (<= 0 value 255))
+        (:uint16 (<= 0 value 65535))
+        (t t))))
+
+(declaim (inline %weak-cast-needed-p))
+(defun %weak-cast-needed-p (x final-dtype others)
+  "X 是否应当预转成 FINAL-DTYPE。五个条件：
+
+   1. SIZE = 1（只处理广播标量，大数组预转会多一次全量拷贝）；
+   2. dtype 与结果不同（否则无事可做）；
+   3. 种类秩 源 ≤ 目标（int< float< complex，只走无损方向；float→int
+      会截断，把 `(vt-< f64数组 1.5)` 的 int8 掩码运算算错）；
+   4. 整数值装得下（999000 塞进 int8 变成 -8，argwhere 会数出 999911）；
+   5. 这一组输入里**至少有一个真张量**（SIZE>1）。全标量时没有「要对齐的
+      大数组」，预转纯属添乱 —— `(vt-complex 1.0d0 2.0d0)` 内部就是
+      `(vt-map #'complex 1.0 2.0 :dtype :complex128)`，把实参转成复数会让
+      构造函数收到 #C(1 0) 而报 "is not of type REAL"。"
+  (and (= (vt-size x) 1)
+       (not (eq (vt-dtype x) final-dtype))
+       (<= (%dtype-kind-rank (vt-dtype x)) (%dtype-kind-rank final-dtype))
+       (%scalar-fits-p (vt-item x) final-dtype)
+       (some (lambda (y) (> (vt-size y) 1)) others)))
+
+(declaim (inline %weak-cast1))
+(defun %weak-cast1 (x final-dtype others)
+  "把「单元素且 dtype 与结果不同」的输入转成结果 dtype，其余原样返回。
+
+   为什么需要：弱标量（NEP 50）在 ensure-vt 之后是**另一种 dtype 的 0 维张量**，
+   于是 `%VT-INLINE*-FAST` 的 DMA 前置条件「全部输入与输出同元素类型」不成立，
+   整个运算掉进 vt-map 的 funcall + 泛型 aref 兜底。实测 2M 元素：
+     c64 数组 + complex128 标量   196 ms  →  5.8 ms（约 34×）
+     f32 数组 + float64 标量       77 ms  →  同量级改善
+   语义等价：循环本来就要按结果 dtype 写，单元素输入先转一次不改变结果，
+   只是让类型检查通过。只处理 SIZE=1 的输入，绝不整体预转大数组。"
+  (if (%weak-cast-needed-p x final-dtype others)
+      (vt-astype x final-dtype)
+      x))
+
+(defun %weak-cast-inputs (inputs final-dtype)
+  "对 INPUTS 逐个 %WEAK-CAST1；全部无需转换时原样返回（不 cons）。"
+  (if (some (lambda (x) (%weak-cast-needed-p x final-dtype inputs)) inputs)
+      (mapcar (lambda (x) (%weak-cast1 x final-dtype inputs)) inputs)
+      inputs))
+
 (defun vt-map (fn &rest args)
   "高效逐元素映射：支持标量/列表/张量混合输入并自动广播。
 
@@ -192,14 +246,17 @@
              (out-shape (reduce #'vt-broadcast-shapes (mapcar #'vt-shape inputs)))
              ;; 结果 dtype 由「输入提升 + 显式 :dtype」决定，**不由 out 决定**；
              ;; out 的 dtype 必须与之精确相等（§4.2 H3 严格相等契约）。
+             ;; 结果 dtype：张量之间走 VT-PROMOTE-TYPE，Lisp 标量按 NEP 50
+             ;; 的「弱」规则并入（§3.2 末尾）。注意用 TENSORS（原始实参）
+             ;; 判断谁是标量 —— INPUTS 已被 ensure-vt 抹掉这个信息。
              (final-dtype (or dtype
-                              (apply #'vt-promote-type
-                                     (mapcar #'vt-dtype inputs))))
+                              (%op-final-dtype (mapcar #'%scalar-kind tensors)
+                                               (mapcar #'vt-dtype inputs))))
              ;; 硬契约：形状 + dtype + 可写（含只读广播视图）
              (res (if out
                       (vt-check-out out out-shape final-dtype :op-name "vt-map")
                       (make-vt out-shape 0 :dtype final-dtype))))
-	(%vt-map-run fn inputs res out-shape)
+	(%vt-map-run fn (%weak-cast-inputs inputs final-dtype) res out-shape)
 	res))))
 
 (defun %vt-map-run (fn inputs res out-shape)
@@ -866,12 +923,16 @@
             (parse-vt-op-args args)
           (declare (list tensors))
           (let* ((n (length tensors))
-                 (tvs (loop repeat n collect (gensym "TV"))))
+                 (tvs (loop repeat n collect (gensym "TV")))
+                 ;; 原始实参：用来判断「是不是弱标量」（ensure-vt 之后就没这信息了）
+                 (raws (loop repeat n collect (gensym "RAW"))))
             (if (not (or (= n 1) (= n 2) (= n 3)))
                 `(apply #'vt-map ,fn ,@args)
                 `(with-float-safe                                 
-                   (let (,@(loop for tv in tvs for tf in tensors
-                                 collect `(,tv (ensure-vt ,tf))))
+                   (let* (,@(loop for ra in raws for tf in tensors
+                                  collect `(,ra ,tf))
+                          ,@(loop for tv in tvs for ra in raws
+                                  collect `(,tv (ensure-vt ,ra))))
                      ;; H5：:dtype 与 :out 冲突（统一入口）
                      (vt-check-out-dtype-consistency "vt-fast-map" ,dtype ,out)
                      (let* ((out-shape (reduce #'vt-broadcast-shapes
@@ -881,9 +942,16 @@
                             ;; 杜绝 float64 结果静默降精度写入 float32 out
                             ;; （§4.2 H3「严格相等」契约）。
                             (final-dtype (or ,dtype
-                                             (apply #'vt-promote-type
-                                                    (mapcar #'vt-dtype
-                                                            (list ,@tvs)))))
+                                             (%op-final-dtype
+                                              (list ,@(loop for ra in raws
+                                                            collect `(%scalar-kind ,ra)))
+                                              (list ,@(loop for tv in tvs
+                                                            collect `(vt-dtype ,tv))))))
+                            ;; 单元素输入预转成结果 dtype（见 %WEAK-CAST1）：
+                            ;; let* 允许同名重绑，下面的 RES 与派发都看到新值。
+                            ,@(loop for tv in tvs
+                                    collect `(,tv (%weak-cast1 ,tv final-dtype
+                                                               (list ,@tvs))))
                             ;; 硬契约 H1–H4：形状/dtype/可写（统一入口）
                             (res (if ,out
                                      (vt-check-out ,out out-shape final-dtype

@@ -88,6 +88,77 @@
    的函数推导结果 dtype（§16.6）。"
   (vt-complex-real-dtype dtype))
 
+;;; ------------------------------------------------------------------
+;;; 弱标量提升（numpy NEP 50）
+;;;
+;;; numpy 2.x 起，**Lisp 侧的字面数/标量**（对应 Python 的 int/float/complex）
+;;; 是「弱」类型：它们只贡献「种类」，不贡献宽度。于是
+;;;     f32 数组 + 1.5   → float32      （不是 float64）
+;;;     c64 数组 + 1+2j  → complex64    （不是 complex128）
+;;;     int32 数组 + 1   → int32        （不是 int64）
+;;;     int32 数组 + 1.5 → float64      （整型装不下浮点种类 → 落到默认浮点）
+;;; 而 **张量与张量** 之间仍是完整的 promote 表（§3.2 / §16.3）。
+;;;
+;;; 本库此前把标量先 ensure-vt 成 float64/complex128 再 promote，于是
+;;; f32/c64 的每个「+标量」都静默升宽（内存翻倍、速度减半），且与 numpy 不符。
+;;; CONVENTIONS §0「与 NumPy 冲突以 NumPy 为准」，故在此按 NEP 50 修正。
+;;;
+;;; 唯一有意保留的差异：弱整数越界（int8 + 300）本库按回绕处理，
+;;; numpy 抛 OverflowError；回绕是既有语义，不在本次改动范围。
+;;; ------------------------------------------------------------------
+
+(declaim (inline %scalar-kind))
+(defun %scalar-kind (x)
+  "操作数分类：张量 → NIL；Lisp 数 → :INT / :FLOAT / :COMPLEX（弱标量）。"
+  (cond ((vt-p x) nil)
+        ((complexp x) :complex)
+        ((integerp x) :int)
+        ((floatp x) :float)
+        (t nil)))
+
+(declaim (inline %dtype-kind))
+(defun %dtype-kind (dtype)
+  "dtype 的大类：:COMPLEX / :FLOAT / :INT。"
+  (cond ((member dtype '(:complex64 :complex128)) :complex)
+        ((member dtype '(:float32 :float64)) :float)
+        (t :int)))
+
+(declaim (inline %dtype-kind-rank))
+(defun %dtype-kind-rank (dtype)
+  "种类的「宽度秩」：int=0 < float=1 < complex=2。
+   单元素预转只允许 **源 ≤ 目标**（int→float→complex 是精确/无损方向）；
+   反向（float→int）会截断，把 `nan < 1` 这类比较直接算错。"
+  (case (%dtype-kind dtype) (:int 0) (:float 1) (t 2)))
+
+(defun %int-family-dtype-p (dtype)
+  "整数族（含无符号）。注意与 VT-INT-DTYPE-P 不同，后者只有有符号。"
+  (declare (optimize (speed 3) (safety 0)))
+  (member dtype '(:int8 :int16 :int32 :int64 :uint8 :uint16)))
+
+(defun %op-final-dtype (kinds dtypes)
+  "逐元素运算的结果 dtype。KINDS 每项来自 %SCALAR-KIND（NIL=张量），
+   DTYPES 是各操作数（张量）的 dtype。张量之间走 VT-PROMOTE-TYPE，
+   弱标量按 NEP 50 只贡献种类。"
+  (let ((base nil))
+    (loop for k in kinds for d in dtypes
+          do (unless k
+               (setf base (if base (vt-promote-type base d) d))))
+    (loop for k in kinds
+          when k do
+            (setf base
+                  (cond ((null base)
+                         (ecase k (:int :int64) (:float :float64) (:complex :complex128)))
+                        ((eq k :int) base)          ; 整数标量：不改变任何 base
+                        ((eq k :float)
+                         ;; 整型 base 装不下浮点种类 → 默认浮点；否则保持宽度
+                         (if (%int-family-dtype-p base) :float64 base))
+                        ((eq k :complex)
+                         (cond ((%int-family-dtype-p base) :complex128)
+                               ((eq base :float32) :complex64)
+                               ((eq base :float64) :complex128)
+                               (t base))))))
+    (or base :float64)))
+
 (defun vt-int-dtype-p (dtype)
   "判定 DTYPE 是否为有符号整数类型（:int8/:int16/:int32/:int64）。"
   (declare (optimize (speed 3) (safety 0)))

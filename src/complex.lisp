@@ -516,7 +516,10 @@
   (let ((in (ensure-vt vt)))
     (if (or (vt-complex-dtype-p (vt-dtype in)) (%cx-deep-p power))
         (let* ((pw (if (vt-p power) power (ensure-vt power)))
-               (promoted (or dtype (vt-promote-type (vt-dtype in) (vt-dtype pw))))
+               ;; 弱标量：c64 ** 2 / c64 ** #C(..) 保持 complex64（NEP 50）
+               (promoted (or dtype (%op-final-dtype
+                                    (list (%scalar-kind vt) (%scalar-kind power))
+                                    (list (vt-dtype in) (vt-dtype pw)))))
                (dt (if (vt-complex-dtype-p promoted) promoted :complex128))
                (dt (%cx-result-complex-dtype dt (and dtype dtype) "VT-POW")))
           (vt-map (function %cx-pow-2) in pw :out out :dtype dt))
@@ -543,8 +546,9 @@
           (if (or (%cx-deep-p x) (%cx-deep-p y))
               (let* ((xe (ensure-vt x))
                      (ye (ensure-vt y))
-                     (promoted (or dtype (vt-promote-type (vt-dtype xe)
-                                                          (vt-dtype ye))))
+                     (promoted (or dtype (%op-final-dtype
+                                          (list (%scalar-kind x) (%scalar-kind y))
+                                          (list (vt-dtype xe) (vt-dtype ye)))))
                      (dt (if (vt-complex-dtype-p promoted) promoted :complex128))
                      (dt (%cx-result-complex-dtype dt (and dtype dtype)
                                                   "VT-FLOAT-POWER")))
@@ -621,7 +625,8 @@
            (lambda (t1 t2 &key out dtype)
              (if (or (%cx-tensor-p t1) (%cx-tensor-p t2))
                  (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
-                        (p (vt-promote-type (vt-dtype a) (vt-dtype b)))
+                        (p (%op-final-dtype (list (%scalar-kind t1) (%scalar-kind t2))
+                                             (list (vt-dtype a) (vt-dtype b))))
                         (dt (or dtype p)))
                    (unless (vt-complex-dtype-p dt)
                      (error "~a: 复数输入的结果 dtype 必须是复数类型，收到 ~a"

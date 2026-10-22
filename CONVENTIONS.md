@@ -2614,7 +2614,142 @@ np.cumsum([-0.0+0j])         # [-0.+0.j]    ← 首元素直拷，符号位保�
 
 ---
 
-### 16.20 累计变更文件清单（第一～十轮）
+### 16.31 第十一轮：弱标量提升（numpy NEP 50）
+
+#### 16.31.1 方法：换个角度扫 —— 只比 dtype
+
+前十轮都在比**值**与「复数会不会掉回实数实现」。本轮换成**只比 dtype**：
+119 条表达式全喂 `complex64`（外加若干实数 dtype 对照），逐项与 numpy 的
+结果 dtype 比对。值的正确性前几轮已覆盖，这一维是空白。
+
+结果抓到一整类问题：**窄 dtype 遇到标量就静默升宽**。
+
+#### 16.31.2 症状
+
+| 表达式（`*` 表示张量） | 修复前 | 修复后 = numpy | 代价 |
+|---|---|---|---|
+| `f32* + 1.5` | float64 | **float32** | 内存 ×2、带宽 ×2、SIMD 通道白丢 |
+| `f32* + 1` | float64 | **float32** | 同上 |
+| `i32* + 1` | int64 | **int32** | 同上 |
+| `i8* + 1` | int64 | **int8** | 同上 |
+| `u8* + 1` | int64 | **uint8** | 同上 |
+| `c64* + #C(1 2)` | complex128 | **complex64** | 内存 ×2 |
+| `c64* + 1.5` | complex128 | **complex64** | 同上 |
+| `f32* + #C(1 2)` | complex128 | **complex64** | 同上 |
+| `f32* / 2` | float64 | **float32** | 同上 |
+| `c64* ** 2` | complex128 | **complex64** | 同上 |
+| `maximum(c64*, 标量)` | complex128 | **complex64** | 同上 |
+
+这批都不是「算错」，而是**分配了双倍内存、跑了一半的有效通道**，而且完全不报错 ——
+用户只有在自己 print dtype 时才会发现。
+
+#### 16.31.3 根因：`ensure-vt` 抹掉了「谁是标量」
+
+逐元素运算的 dtype 推断是：
+
+```lisp
+(apply #'vt-promote-type (mapcar #'vt-dtype inputs))   ; inputs 已全部 ensure-vt
+```
+
+`(ensure-vt 1.5d0)` 得到 **float64 的 0 维张量**，`(ensure-vt #C(1 2))` 得到
+**complex128**。于是标量以「全强度」参与 promote，`f32 ⊔ f64 = f64`。
+
+numpy 2.x（NEP 50）的规定相反：Python 标量是**弱**类型 —— 只贡献种类
+（int / float / complex），不贡献宽度；宽度由**张量**决定。若张量是整型而标量是
+浮点（整型装不下该种类），才落到该种类的默认宽度（float64 / complex128）。
+
+CL 的 `1.5d0` 对应 Python 的 `1.5`，语义正好对齐，所以按 NEP 50 修是**对的**，
+不是「为了迁就某个实现」。
+
+#### 16.31.4 修法
+
+新增两个小函数（`src/dtype.lisp`）：
+
+```lisp
+(%scalar-kind x)        ; 张量 → NIL；Lisp 数 → :INT / :FLOAT / :COMPLEX
+(%op-final-dtype kinds dtypes)
+;; 张量之间仍走 VT-PROMOTE-TYPE（100 格表不动）；
+;; 弱标量只按种类并入：
+;;   :int     → base 不变
+;;   :float   → base 是整型族 ? :float64 : base
+;;   :complex → base 整型族 ? :complex128 : f32→c64 / f64→c128 / 已是复数保持
+```
+
+接进四处（都遵循「用**原始实参**判断，不能用 ensure 之后的值」）：
+
+| 位置 | 说明 |
+|---|---|
+| `vt-map` | 通用路径；有 `tensors`（原始）与 `inputs`（已 ensure）两份，直接配对 |
+| `vt-fast-map` 宏 | 展开时先绑 `raws`（原始）再 `(ensure-vt raw)`；顺带把 `let` 改 `let*` |
+| `vt-/` | 它自己算 true_divide 的浮点目标，改成只看**张量** dtype；并把 natural-dtype 显式下传（否则下游再 ensure 一次又丢标量身份）|
+| `vt-pow` / `maximum` 家族 | 各自内联的 promote 换成 `%op-final-dtype` |
+
+`vt-/` 那处踩过一次坑：第一版只改了 `float-target` 的判定，但随后仍把
+**已 ensure** 的 `(first all)` 传给 `vt-fast-map`，标量身份二次丢失 →
+`f32/2` 依旧 float64。教训：**这个信息只能沿着「原始实参」传**。
+
+##### 附带优化：单元素输入预转（`%WEAK-CAST1`）
+
+改完 dtype 后先测了一遍性能，发现 **c64 数组 + 标量慢了 27%**。原因不是新逻辑本身，
+而是「弱标量」在 ensure-vt 之后是个**另一种 dtype 的 0 维张量**：
+
+```
+结果 c64，输入是 c64 数组 + c128 标量 → %VT-INLINE*-FAST 的前置条件
+「全部输入与输出同元素类型」不成立 → 整个运算掉进 vt-map 的 funcall + 泛型 aref
+```
+
+修法：在 `vt-map` / `vt-fast-map` 里，把所有条件都满足的**单元素**输入先转成结果
+dtype（`%WEAK-CAST1`）。代价 O(1)，类型检查能过、内联快路径回来；
+**绝不整体预转大数组**。三个条件缺一不可：
+
+| 条件 | 为什么 |
+|---|---|
+| `SIZE = 1` | 只处理广播标量；大数组预转会多一次全量拷贝 |
+| dtype 与结果不同 | 否则无事可做 |
+| 种类秩 `源 ≤ 目标`（int< float< complex） | 只允许无损方向。反过来 `float → int` 会截断：`(vt-< f64数组 1.5)` 的结果是 **int8 掩码**，把 `1.5` 转成 int8 变成 1，`nan<1` 直接判错 |
+| 整数值装得下（`%SCALAR-FITS-P`） | `(vt-> 大数组 999000)` 的标量若转进 int8 掩码会变成 -8 —— 实测让 `argwhere(gt 999000)` 从 999 变成 999911 |
+| 这组输入里至少有一个真张量（`SIZE>1`） | 全标量时没有「要对齐的大数组」，预转纯属添乱：`(vt-complex 1.0d0 2.0d0)` 内部就是 `(vt-map #'complex 1.0 2.0 :dtype :complex128)`，把实参转成复数会让构造函数收到 `#C(1 0)` 而报 `is not of type REAL` |
+
+后三道保护全是踩出来的 —— 第一版只按「单元素 + dtype 不同」转，依次挂了
+`robustness-test`（`nan<1`）、`manip-interop-test`（三个 argwhere oracle）、
+`complex-test`（construct 组）。每次都是「预转把一个语义前提悄悄改掉了」，
+而只有跑全量套件才看得见。
+
+实测（2M 元素，min-of-7，同机同进程内对比）：
+
+| 表达式 | 第十轮（升宽） | 第十一轮（弱标量） | 变化 |
+|---|---:|---:|---|
+| `f32 数组 + 1.5` | 77 ms | **4.1 ms** | **19×** |
+| `c64 数组 + 1.5` | 163 ms | **5.4 ms** | **30×** |
+| `c64 数组 + c64 标量张量` | 5.9 ms | 5.9 ms | 不变（本来就同类型） |
+
+也就是说：这一改不只是「省一半内存」，还把窄 dtype 的「+标量」从**兜底路径**
+拉回了内联路径。旧实现的 78/163 ms 恰恰是因为它把结果升成 f64/c128，
+输入与结果类型不一致，一直在跑 funcall 兜底。
+
+#### 16.31.5 有意保留的三处差异（都不是本轮的问题）
+
+| 项 | clvt | numpy | 理由 |
+|---|---|---|---|
+| `det/inv/solve/pinv/cholesky/qr/matrix-power/svd/eigvalsh` 的 c64 输入 | complex128 / float64 | complex64 / float32 | 复数线代**恒在 double 下计算**（`vt-det` 文档已写明「返回 0 维 complex128 张量」），精度更高；改回单精度是**降级**，不做 |
+| `ptp` / `cond` | Lisp 标量（complex / double） | numpy 标量（c64 / f32） | 这两个函数返回**原生数**而非张量（§5 的既定风格），原生数没有 dtype |
+| 弱整数越界（`i8* + 300`） | 回绕 | `OverflowError` | 回绕是本库既有语义，改它会牵动所有整型路径 |
+
+#### 16.31.6 测试
+
+`test/dtype-weak-scalar-test.lisp`（**14 断言**，已接入 `run-tests.sh`，共 50 套件）。
+dtype 断言之外，值断言同时覆盖「预转不改变结果」这一点。
+
+按要求**只收录修复前确实错的用例**（11 个 dtype 断言，逐个在修复前的构建上复验过
+「当时真的是错的」）+ 3 个值正确性断言（确认「不再升宽」没把值算错：`f32+1.5` 在
+float32 内算仍是 1.5、`c64+#C(1 2)` 正确、`i8+1` 不溢出）。
+
+张量×张量的 promote 100 格、c64 的其余 dtype 契约由既有套件覆盖，此处不重复 ——
+测试只用来钉住**本次修掉的行为**，不是把扫描脚本搬进仓库。
+
+---
+
+### 16.20 累计变更文件清单（第一～十一轮）
 
 | 文件 | 改动 |
 |---|---|
@@ -2666,6 +2801,11 @@ np.cumsum([-0.0+0j])         # [-0.+0.j]    ← 首元素直拷，符号位保�
 | `test/complex-scan-axis-test.lisp` | **第九轮新增** 26 断言（2-D 两轴 / 3-D 三轴 / 负轴 / 转置视图 / c64 / 退化 / `:out` 连续与非连续 / 实数回归），注册后共 48 套件 |
 | `src/complex.lisp` | **第十轮**：`%cx-scan-run` 与 dtype 回退分支改为「首元素直拷」（§16.30.3）；`vt-median` 复分支重写 `axis=nil` 全局路径 / 空 fiber 与 NaN 传播 / 补 `with-float-safe`；新增 `%cx-elem-nan-p`、`%cx-has-nan-p` |
 | `test/complex-nan-inf-test.lisp` | **第十轮新增** 77 断言（median 契约 / 扫描首元素 / NaN·Inf 归约 / axis 元组 / `:out` 非连续 / einsum 补全），注册后共 49 套件 |
+| `src/dtype.lisp` | **第十一轮**：新增 `%scalar-kind` / `%int-family-dtype-p` / `%op-final-dtype`（弱标量提升，NEP 50，§16.31） |
+| `src/map-reduce.lisp` | **第十一轮**：`vt-map` 与 `vt-fast-map` 宏改用 `%op-final-dtype`（宏展开先绑原始实参） |
+| `src/elementwise.lisp` | **第十一轮**：`vt-/` 的浮点目标只看张量 dtype，并显式下传 natural-dtype |
+| `src/complex.lisp` | **第十一轮**：`vt-pow`（复数分支 / float-power）、`maximum/minimum/fmax/fmin` 换 `%op-final-dtype` |
+| `test/dtype-weak-scalar-test.lisp` | **第十一轮新增** 14 断言（只收录修复前确实错的 11 个 dtype 用例 + 3 个值正确性），注册后共 50 套件 |
 
 ---
 
