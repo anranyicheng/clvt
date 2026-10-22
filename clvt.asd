@@ -53,6 +53,8 @@
                (:file "src/indexing")
                (:file "src/join")
                (:file "src/elementwise")
+	       (:file "src/elementwise1")
+	       (:file "src/elementwise2")
                (:file "src/reduce-stats")
                (:file "src/setops")
                (:file "src/random")
