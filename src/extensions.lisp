@@ -27,8 +27,22 @@
 ;;; pytorch 风格别名
 ;;; ------------------------------------------------------------------
 
-(defun vt-clamp (tensor vmin vmax &key out dtype)
-  "vt-clip 的 pytorch 风格别名。"
+(defun vt-clamp (tensor &optional (vmin nil vmin-p) (vmax nil vmax-p)
+                         &key out dtype)
+  "vt-clip 的 pytorch 风格别名（对标 torch.clamp）。
+
+   与 vt-clip 的差异（pytorch 语义）：**允许只给下限** ——
+   `(vt-clamp a 1)` 等价 `max(x, 1)`，而 `(vt-clip a 1)` 报错
+   （numpy 的 clip() missing a_max）。实现上总是把两个位置参数填满，
+   于是 clip 看到的是「显式给了 MAX-VAL=nil」，走「仅下限」分支。
+
+   签名用 &OPTIONAL 而不是 (tensor vmin vmax &key …)：后者把 vmin/vmax
+   定为必填，`(vt-clamp a)` 会报 invalid number of arguments。
+   第十三轮之前 complex-ops.lisp 里还有一份同名的 &OPTIONAL 版本靠加载
+   顺序覆盖本函数，现在只有这一份。
+
+   `:out` / `:dtype` 契约同 vt-clip（复数走字典序整元素夹取）。"
+  (declare (ignore vmin-p vmax-p))
   (vt-clip tensor vmin vmax :out out :dtype dtype))
 
 (defun vt-copy-to! (dst src)

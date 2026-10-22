@@ -365,13 +365,20 @@
      · return-index 是沿 AXIS 的原始下标；return-inverse 是长度 = 该轴长度
        的一维数组（可用 (vt-take u inv :axis axis) 重建输入）；
        return-counts 是每个唯一行的出现次数。
-   秩为 1 时 AXIS 被忽略（numpy 同样走展平分支）。"
+   秩为 1 时 AXIS 被忽略（numpy 同样走展平分支）。
+
+   复数（§16.8）：展平路径按 (实部, 虚部) 字典序，NaN 折叠为一个；
+   AXIS 路径无需第二份实现 —— %AXIS-ELEM-LESSP / %AXIS-ELEM-EQ 本身
+   与元素类型无关。第十三轮之前复数分支在 complex-ops.lisp 用同名 defun
+   覆盖本函数，重载本文件就会把复数静默送进实数内核。"
   (let* ((in (ensure-vt tensor))
          (rank (length (vt-shape in))))
     (if (and axis (> rank 1))
         (%unique-axis in (vt-normalize-axis axis rank)
                       return-index return-inverse return-counts)
-        (%unique-flat tensor return-index return-inverse return-counts))))
+        (if (%cx-complex-dtype-p* (vt-dtype in))
+            (%cx-op-unique in return-index return-inverse return-counts axis)
+            (%unique-flat tensor return-index return-inverse return-counts)))))
 
 (defun %set-filter (u keep-table invert)
   "按 KEEP-TABLE 过滤已升序的 U（保持顺序），返回与 U 同 dtype 的新张量。

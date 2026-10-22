@@ -20,43 +20,23 @@
 (in-package :clvt)
 
 ;;; ==================================================================
-;;; 0. 原实现登记与复数参数探测
+;;; 0. （空）原实现登记表已删除 —— 见下
 ;;; ==================================================================
-
-(defvar *cx-originals* (make-hash-table :test #'eq)
-  "实数路径原实现表。首次加载时捕获；重复加载不会自我覆盖
-   （否则包装器会转发给自己，造成无限递归）。")
-
-(defun %cx-orig (name)
-  "取 NAME 的**原实现**；首次调用时捕获并登记。"
-  (or (gethash name *cx-originals*)
-      (setf (gethash name *cx-originals*) (symbol-function name))))
-
-;;; 加载期**预捕获**：用显式 defun 重新定义的那些函数（vt-abs / vt-sort /
-;;; vt-matmul / vt-mean …）在函数体里通过 (%cx-orig 'name) 取原实现，
-;;; 若等到运行时才捕获，此时 symbol-function 已经是新定义本身 ——
-;;; 包装器转发给自己，形成无限递归（实测：实数路径 vt-sort 直接挂死）。
-;;; 因此必须在**本文件任何 defun 之前**把所有将被覆盖的名字登记一次。
-(eval-when (:load-toplevel :execute)
-  (dolist (name '(vt-abs vt-real vt-imag vt-conj vt-angle
-                  vt-round
-                  vt-pow vt-expt vt-negative
-                  vt-mean vt-var vt-std vt-average
-                  vt-cumsum vt-cumprod
-                  vt-sort vt-argsort vt-median
-                  vt-norm vt-matmul vt-@ vt-dot vt-outer vt-trace
-                  vt-argmax vt-argmin
-                  ;; 宏包装的同名函数：这里先抓一遍，表里已有记录时
-                  ;; %cx-orig 直接返回缓存，不会覆盖。
-                  vt-sqrt vt-exp vt-log vt-log2 vt-log10
-                  vt-sin vt-cos vt-tan vt-atan vt-sinh vt-cosh vt-tanh
-                  vt-asin vt-acos vt-asinh vt-acosh vt-atanh
-                  vt-square vt-reciprocal vt-signum
-                  vt-= vt-/= vt-< vt-<= vt-> vt->=
-                  vt-maximum vt-minimum vt-fmax vt-fmin
-                  vt-isnan vt-isinf vt-isfinite
-                  vt-sum vt-prod vt-amax vt-amin))
-    (%cx-orig name)))
+;;; 第十二轮之前这里是 *CX-ORIGINALS* 哈希表 + %CX-ORIG 函数 + 一份 63 个名字的
+;;; EVAL-WHEN 预捕获清单。三者的作用是「先存下实数实现，再用同名 DEFUN 覆盖它，
+;;; 复数分支里回调存下来的那份」。
+;;;
+;;; 第十三轮把最后 16 个公开符号也改成单一 DEFUN 体内分派后，覆盖式架构不存在
+;;; 了，这三者一并删除。删除顺序有讲究：
+;;;   1. 先清掉所有 (%CX-ORIG 'vtx) 调用点（2 处 vt-sum）；
+;;;   2. 再删三个文件的 EVAL-WHEN 预捕获清单；
+;;;   3. 最后删表与函数 —— 顺序颠倒会让「忘记删的调用点」在运行期变成
+;;;      「symbol-function 返回 NIL」而不是编译期就报错。
+;;;
+;;; 判据（可脚本校验，全部应为 0）：
+;;;   grep -c "setf (symbol-function" src/*.lisp
+;;;   grep -c "(%cx-orig"              src/*.lisp
+;;;   grep -c "eval-when.*cx-orig"     src/*.lisp
 
 ;;; %CX-DEEP-P / %CX-TENSOR-P 已迁至 src/dispatch.lisp（第十二轮）：
 ;;; 它们必须在 elementwise / reduce-stats / linalg 之前就可用，否则那些
@@ -66,10 +46,7 @@
 ;;; 通用小工具：C 连续落地 / 步长 / fiber 起点
 ;;; ------------------------------------------------------------------
 
-(defun %cx-flat (tensor)
-  "把张量落地为 C 连续、offset=0 的视图（已连续则零拷贝返回）。"
-  (vt-contiguous (ensure-vt tensor)))
-
+;;; %CX-FLAT 已迁至 src/complex-kernels.lisp（第十三轮）
 (defun %cx-strides-vec (shape)
   "C 连续布局的步长向量。"
   (coerce (vt-compute-strides shape) 'simple-vector))
@@ -117,141 +94,18 @@
 ;;; 故 sqrt/log/三角/双曲/反函数直接复用 CL，只需补齐极点与非有限值
 ;;; 的返回约定（CL 在这些点抛条件，numpy 返回 Inf/NaN）。
 
-(defun %cx-nan-of (x)
-  "与 X 同精度的 NaN。"
-  (if (typep (%creal x) 'single-float) +vt-sfloat-nan+ +vt-dfloat-nan+))
+;;; %CX-NAN-OF / %CX-INF-OF / %CX-NAN-COMPLEX / %CX-HYPOT 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %COP-SQRT / LOG / LOG2 / LOG10 / SQUARE / RECIP / SIGNUM / ABS 已迁至 src/complex-kernels.lisp（第十三轮）
 
-(defun %cx-inf-of (x sign)
-  "与 X 同精度的 ±Inf。"
-  (if (typep (%creal x) 'single-float)
-      (if (minusp sign) +vt-sfloat-neg-inf+ +vt-sfloat-pos-inf+)
-      (if (minusp sign) +vt-dfloat-neg-inf+ +vt-dfloat-pos-inf+)))
-
-(defun %cx-nan-complex (x)
-  "与 X 同精度的 NaN+NaNj。"
-  (let ((n (%cx-nan-of x)))
-    (complex n n)))
-
-(declaim (inline %cx-hypot %cop-abs %cop-sqrt))
-(defun %cx-hypot (x y)
-  "无溢出的 hypot（|x|、|y| 极值时不溢出）。x/y 为实数。"
-  (let ((ax (abs x)) (ay (abs y)))
-    (cond ((zerop ax) ay)
-          ((zerop ay) ax)
-          ((> ax ay) (let ((r (/ ay ax))) (* ax (sqrt (+ 1.0s0 (* r r))))))
-          (t (let ((r (/ ax ay))) (* ay (sqrt (+ 1.0s0 (* r r)))))))))
-
-(defun %cop-sqrt (z)
-  "复数平方根（主值，C99 csqrt 分支切割）。
-   sqrt(-4+0i)=+2i、sqrt(-4-0i)=-2i（尊重虚部 -0.0 的符号）。
-
-   为什么不用 `(sqrt z)`：SBCL 的复数 sqrt 走通用复数算术，实测
-   **350ns/元素**（1M = 350ms）；而 C99 的标准公式只用 hypot + 1 次
-   实数 sqrt + 2 次除法，约 20ns。二者在本库被测的全部点上逐位一致
-   （complex-test 的 8 个分支切割用例 + numpy 差分）。"
-  (let ((x (%creal z)) (y (%cimag z)))
-    (cond ((%cx-nan-p z) (%cx-nan-complex z))
-          ;; 实轴：虚部保持原符号（含 -0.0），必须走特例，否则 ±0 会被抹平
-          ((and (zerop y) (>= x 0)) (complex (sqrt x) y))
-          ((and (zerop y) (minusp x))
-           (complex (* 0 x)
-                    (if (minusp (float-sign y)) (- (sqrt (- x))) (sqrt (- x)))))
-          (t
-           (let* ((r (%cx-hypot x y))
-                  (s (sqrt (* 0.5s0 (+ r (abs x))))))
-             (if (>= x 0)
-                 (complex s (/ y (* 2.0s0 s)))
-                 (complex (/ (abs y) (* 2.0s0 s))
-                          (if (minusp (float-sign y)) (- s) s))))))))
-
-(defun %cop-log (z)
-  "复数自然对数 log|z| + i·arg(z)。极点 log(0) → -Inf + 0i（对标 numpy）。"
-  (let ((x (%creal z)) (y (%cimag z)))
-    (cond ((%cx-nan-p z) (%cx-nan-complex z))
-          ((and (zerop x) (zerop y))
-           (complex (%cx-inf-of z -1) y))
-          (t (log z)))))
-
-(defun %cop-log2 (z)
-  "复数 log2 = log(z)/ln2。极点 0 → -Inf + 0i。"
-  (let* ((l (%cop-log z))
-         (ln2 (if (typep (%creal l) 'single-float) 0.6931472s0 0.6931471805599453d0)))
-    (complex (/ (%creal l) ln2) (/ (%cimag l) ln2))))
-
-(defun %cop-log10 (z)
-  "复数 log10 = log(z)/ln10。极点 0 → -Inf + 0i。"
-  (let* ((l (%cop-log z))
-         (ln10 (if (typep (%creal l) 'single-float) 2.3025851s0
-                   2.302585092994046d0)))
-    (complex (/ (%creal l) ln10) (/ (%cimag l) ln10))))
-
-;;; 性能（叶子内核必须 INLINE）：这一批都是「一条复数运算」的叶子。
-;;; 不内联时，调用点看不到它们的入参类型，SBCL 对 `(* z z)` / `(- z)` /
-;;; `(/ z)` 只能推出 NUMBER / (OR (COMPLEX SINGLE) (COMPLEX DOUBLE))，
-;;; 于是 map-reduce.lisp 的 %CAST-TO 落到复数目标时只能走泛型 COERCE，
-;;; 并且每个元素多构造一个复数对象（实测 2M 元素：square 478ms，
-;;; 内联后 13.5ms；c64 241ms → 10ms）。
-;;; 内联后类型随实参精确流动，"取实部/虚部 + 写回 specialized-array"
-;;; 全部退化成寄存器操作，与 (vt-+ z z) 同级。
-(declaim (inline %cop-square %cop-neg %cconj %cop-recip %cop-signum))
-
-(defun %cop-square (z) (* z z))
-
-(defun %cop-recip (z)
-  "复数倒数 1/z。零 → NaN+NaNj（对标 numpy：0 的倒数无定义）。"
-  (if (%cis-zero z) (%cx-nan-complex z) (/ z)))
-
-(defun %cop-signum (z)
-  "复数符号 z/|z|（对标 numpy.sign 的复数语义）；零 → 0+0i。"
-  (if (%cis-zero z)
-      (complex (* 0 (%creal z)) (* 0 (%cimag z)))
-      (/ z (abs z))))
-
-(defun %cop-abs (z)
-  "复数模（实数输出）。abs(inf+nan·i)=inf，与 numpy 的 hypot 语义一致。
-
-   快路径：|x|、|y| 都在 [1e-150, 1e150] 内时直接 sqrt(x²+y²)
-   （1 sqrt + 2 mul，约 5ns）；只有可能上溢/下溢的极端量级才走
-   带缩放的 %CX-HYPOT。numpy 恒用 hypot（每元素 2 次除法），
-   1M 元素比这里慢约 3 倍。"
-  (cond ((%cx-inf-p z) (%cx-inf-of z 1))
-        ((%cx-nan-p z) (%cx-nan-of z))
-        (t
-         (let ((x (%creal z)) (y (%cimag z)))
-           (if (and (< (abs x) 1d150) (< (abs y) 1d150)
-                    (or (zerop x) (> (abs x) 1d-150))
-                    (or (zerop y) (> (abs y) 1d-150)))
-               (sqrt (+ (* x x) (* y y)))
-               (%cx-hypot x y))))))
-
-(defun %cop-neg (z) (- z))
+;;; %COP-NEG 已迁至 src/complex-kernels.lisp（第十三轮）
 
 ;;; ==================================================================
 ;;; 3. 一元函数分派包装
 ;;; ==================================================================
 
-;;; vt-log 不能用 %cx-def-unary：它多一个 :base 关键字，宏只转发 out/dtype
-;;; 会把 :base 静默丢掉（实测：log(8, base=2) 退化成 ln(8)=2.079）。
-(defun %cop-log-base (z base)
-  "复数换底对数 log_base(z)。base 必须为正实数（numpy：非法 base → NaN）。"
-  (if (and (realp base) (plusp base) (/= base 1))
-      (let ((l (%cop-log z)))
-        (complex (/ (realpart l) (log base 1.0d0))
-                 (/ (imagpart l) (log base 1.0d0))))
-      (%cx-nan-complex z)))
+;;; %COP-LOG-BASE 已迁至 src/complex-kernels.lisp（第十三轮）
 
-(let ((orig (%cx-orig 'vt-log)))
-  (setf (symbol-function 'vt-log)
-        (lambda (tensor &rest keys &key (base nil) (out nil) (dtype nil)
-                                 &allow-other-keys)
-          (declare (ignore keys))
-          (if (%cx-tensor-p tensor)
-              (let* ((in (ensure-vt tensor))
-                     (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-LOG")))
-                (if base
-                    (vt-map (lambda (z) (%cop-log-base z base)) in :out out :dtype dt)
-                    (vt-map #'%cop-log in :out out :dtype dt)))
-              (funcall orig tensor :base base :out out :dtype dtype)))))
+;;; vt-log 的 M1 匿名包装已拆除：分派移入 elementwise.lisp 的单一 DEFUN（第十三轮）
 ;;; ==================================================================
 ;;; 4. 实部 / 虚部 / 共轭 / 幅角 / 模（§16.6）
 ;;; ==================================================================
@@ -272,54 +126,7 @@
 ;;;   循环上界逐元素推进，编译器可完全证明）。
 ;;; ------------------------------------------------------------------
 
-(defmacro %def-cx-to-real-run (name kernel)
-  "生成 (IN RES)：复数 IN → 实数 RES 的逐元素内核，按元素类型 2 路特化。
-
-   代码生成用宏展开期 FLET（不是嵌套 backquote 里的 MACROLET）：
-   后者的内层 `,kernel` 属于第二层 quasiquote，符号不会被外层代入
-   （实测报 “The variable KERNEL is unbound”）。"
-  (flet ((run (ilt olt)
-           `(let ((src (the (simple-array ,ilt (*)) (vt-data in)))
-                  (dst (the (simple-array ,olt (*)) (vt-data res)))
-                  (n (the fixnum (vt-size res)))
-                  (p (the fixnum (vt-offset in)))
-                  (q (the fixnum (vt-offset res))))
-              (declare (type (simple-array ,ilt (*)) src)
-                       (type (simple-array ,olt (*)) dst)
-                       (type fixnum n p q)
-                       (optimize (speed 3) (safety 1)))
-              (dotimes (i n)
-                (declare (type fixnum i))
-                (setf (aref dst q) (,kernel (aref src p)))
-                (incf p)
-                (incf q)))))
-    `(defun ,name (in res)
-       (declare (type vt in res))
-       (flet ((fallback ()
-                (vt-map (function ,kernel) in :out res :dtype (vt-dtype res))))
-         (let ((et (array-element-type (vt-data in)))
-               (ot (array-element-type (vt-data res))))
-           (cond ((and (equal et '(complex double-float)) (equal ot 'double-float))
-                  ,(run '(complex double-float) 'double-float))
-                 ((and (equal et '(complex single-float)) (equal ot 'single-float))
-                  ,(run '(complex single-float) 'single-float))
-                 (t (fallback))))))))
-
-(%def-cx-to-real-run %cx-abs-run %cop-abs)
-(%def-cx-to-real-run %cx-real-run %creal)
-(%def-cx-to-real-run %cx-imag-run %cimag)
-(%def-cx-to-real-run %cx-angle-run %carg)
-
-(defun %cx-run-to-real (run-fn kernel in out dtype op-name)
-  "执行「复数 → 实数」映射：连续走特化内核，否则回退 vt-map（语义基准）。
-
-   RES 的 shape/dtype/可写性统一由 vt-check-out 把关（§4.2 H1–H4）。"
-  (let ((res (if out
-                 (vt-check-out out (vt-shape in) dtype :op-name op-name)
-                 (make-vt (vt-shape in) 0 :dtype dtype))))
-    (if (and (vt-contiguous-p in) (vt-contiguous-p res) (plusp (vt-size in)))
-        (progn (funcall run-fn in res) res)
-        (vt-map kernel in :out res :dtype dtype))))
+;;; %DEF-CX-TO-REAL-RUN / %CX-*-RUN / %CX-RUN-TO-REAL 已迁至 src/complex-kernels.lisp（第十三轮）
 
 (defun %cx-op-abs (vt &key out dtype)
   "逐元素绝对值 / 复数模。
@@ -337,60 +144,17 @@
     "VT-ABS")))
 
 
-(defun vt-real (tensor &key out dtype)
-  "取实部（对标 numpy.real）。复数 → 分量浮点 dtype 的实数张量；
-   实数输入原样返回（副本）。
+;;; VT-REAL 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
 
-   与 numpy 的差异（§16.6）：numpy 的 `.real` 是**零拷贝视图**（写实部会
-   改到原数组）；clvt 的 strided view 无法表达「同一缓冲的实数子集」
-   （缓冲元素类型是复数），故返回**副本**。需要写回请用 vt-complex 重组。"
-  (let* ((in (ensure-vt tensor))
-         (dt (or dtype (vt-real-dtype-of (vt-dtype in))))
-         (dt (if (vt-complex-dtype-p dt) (vt-real-dtype-of dt) dt)))
-    (if (vt-complex-dtype-p (vt-dtype in))
-        (%cx-run-to-real #'%cx-real-run #'%creal in out dt "VT-REAL")
-        (vt-map #'%creal in :out out :dtype dt))))
+;;; VT-IMAG 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
 
-(defun vt-imag (tensor &key out dtype)
-  "取虚部（对标 numpy.imag）。实数输入 → 全 0（与 numpy 一致）。
-   返回副本而非视图，原因同 vt-real。"
-  (let* ((in (ensure-vt tensor))
-         (in-dt (vt-dtype in))
-         (dt (or dtype (if (vt-complex-dtype-p in-dt)
-                           (vt-real-dtype-of in-dt)
-                           in-dt))))
-    (if (vt-complex-dtype-p in-dt)
-        (%cx-run-to-real #'%cx-imag-run #'%cimag in out dt "VT-IMAG")
-        (vt-map #'%cimag in :out out :dtype dt))))
-
-(defun vt-conj (tensor &key out dtype)
-  "逐元素共轭（对标 numpy.conj / numpy.conjugate）。实数输入原样返回。"
-  (let ((in (ensure-vt tensor)))
-    (vt-fast-map #'%cconj in :out out :dtype (or dtype (vt-dtype in)))))
+;;; VT-CONJ 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
 
 (defun vt-conjugate (tensor &key out dtype)
   "vt-conj 的 numpy 全名别名。"
   (vt-conj tensor :out out :dtype dtype))
 
-(defun vt-angle (tensor &key deg out dtype)
-  "逐元素幅角 atan2(im, re) ∈ (-π, π]（对标 numpy.angle）。
-   DEG 为真时返回角度制。结果恒为实数 dtype。
-   零值返回 0（保留 ±0.0 符号）。"
-  (let* ((in (ensure-vt tensor))
-         (in-dt (vt-dtype in))
-         (dt (or dtype (if (vt-complex-dtype-p in-dt)
-                           (vt-real-dtype-of in-dt)
-                           (if (eq in-dt :float32) :float32 :float64))))
-         (fn (if deg
-                 (lambda (z)
-                   (* (%carg z)
-                      (if (eq dt :float32) (/ 180.0s0 0.31415927s1) (/ 180.0d0 pi))))
-                 #'%carg)))
-    ;; 度数换算需要额外一次乘法（内核未参数化），deg 走通用路径；
-    ;; 默认弧度走 %CX-ANGLE-RUN 特化内核。
-    (if (and (not deg) (vt-complex-dtype-p in-dt))
-        (%cx-run-to-real #'%cx-angle-run #'%carg in out dt "VT-ANGLE")
-        (vt-map fn in :out out :dtype dt))))
+;;; VT-ANGLE 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
 
 (defun vt-iscomplexobj (x)
   "判定 X 是否含复数（对标 numpy.iscomplexobj）。"
@@ -423,29 +187,7 @@
 ;;; 5. 幂（§16.10）
 ;;; ==================================================================
 
-(defun %cx-pow-2 (x y)
-  "复数逐元素幂 x^y（主值分支），含极点与 NaN 的边界处理。
-   vt-pow 与 vt-float-power 共用同一份内核 —— 两者的复数语义完全相同
-   （都按 CL 复指数 expt 的主值分支），差别只在实数路径：
-   vt-pow 对整数保留精确整数幂，vt-float-power 一律按浮点算。"
-  (let ((base (if (complexp x) x (complex x 0)))
-        (e (if (complexp y) y (complex y 0))))
-    (cond
-          ;; 指数为 0（含 0+0i）→ 1+0i，**先于** NaN/极点判定
-          ;; （对标 numpy 与 C99 pow：nan**0 = 1、0**0 = 1；
-          ;;  实数路径本来就是 1，旧复数路径却先判 NaN 给出 NaN，
-          ;;  与自身实数路径都不一致，这里一并修掉）
-          ((%cis-zero e)
-           (complex (float 1 (%creal base))
-                    (* 0 (%cimag base))))
-          ((%cx-nan-p base) (%cx-nan-complex base))
-          ((and (%cis-zero base)
-                (plusp (%creal e))
-                (zerop (%cimag e)))
-           (complex (* 0 (%creal base)) (* 0 (%cimag base))))
-          ((%cis-zero base) (%cx-nan-complex base))
-          (t (handler-case (expt base e)
-               (error () (%cx-nan-complex base)))))))
+;;; %CX-POW-2 已迁至 src/complex-kernels.lisp（第十三轮）
 
 (defun %cx-op-pow (vt power &key out dtype)
   "逐元素幂 VT**POWER（对标 numpy.power）。
@@ -465,36 +207,8 @@
     (vt-map (function %cx-pow-2) in pw :out out :dtype dt))))
 
 
-(defun vt-expt (vt power &key out dtype)
-  "vt-pow 的别名（CL 习惯命名）。"
-  (vt-pow vt power :out out :dtype dtype))
-
-;;; ------------------------------------------------------------------
-;;; 5.1 vt-float-power（numpy.float_power）
-;;;
-;;; 实数路径的实现是 (coerce a 'double-float)/(coerce b 'double-float) 后
-;;; expt —— 对复数入参就是**静默取实部**（实测 (vt-float-power #C(2 1)
-;;; #C(2 0)) 得 4.0，而 numpy 给 3+4j）。复数分支直接复用 %CX-POW-2：
-;;; numpy.float_power 与 numpy.power 在复数域是同一个 pow 主值分支
-;;; （实测 (2+1j)**(0.5+0j) 两者都是 1.4553+0.3436j），只是 float_power
-;;; 对实数也强制浮点。
-;;; ------------------------------------------------------------------
-(let ((orig (%cx-orig 'vt-float-power)))
-  (setf (symbol-function 'vt-float-power)
-        (lambda (x y &rest keys &key (out nil) (dtype nil) &allow-other-keys)
-          (declare (ignore keys))
-          (if (or (%cx-deep-p x) (%cx-deep-p y))
-              (let* ((xe (ensure-vt x))
-                     (ye (ensure-vt y))
-                     (promoted (or dtype (%op-final-dtype
-                                          (list (%scalar-kind x) (%scalar-kind y))
-                                          (list (vt-dtype xe) (vt-dtype ye)))))
-                     (dt (if (vt-complex-dtype-p promoted) promoted :complex128))
-                     (dt (%cx-result-complex-dtype dt (and dtype dtype)
-                                                  "VT-FLOAT-POWER")))
-                (vt-map (function %cx-pow-2) xe ye :out out :dtype dt))
-              (funcall orig x y :out out :dtype dtype)))))
-
+;;; VT-EXPT 已迁出（第十三轮）：与归属文件同义，删冗余
+;;; vt-float-power 的 M1 匿名包装已拆除：分派移入 extensions3.lisp 的单一 DEFUN（第十三轮）
 ;;; ==================================================================
 ;;; 6. 比较与极值（字典序，§16.8）
 ;;; ==================================================================
@@ -931,8 +645,10 @@
              (mu (vt-mean in :axis axis :keepdims t))
              (dev (vt-- in mu))
              (sq (vt-square (vt-abs dev)))
-             (ss (funcall (%cx-orig 'vt-sum) sq :axis axis :keepdims keepdims
-                                                  :dtype dt))
+             ;; SQ 是实数张量（abs/square 的结果），直接走 vt-sum 的实数分支。
+             ;; 原先经 (%cx-orig 'vt-sum) 取「原实现」—— 那是覆盖式架构才需要的，
+             ;; 现在 vt-sum 自己就是单一 DEFUN，分派判据看到实数即原路返回。
+             (ss (vt-sum sq :axis axis :keepdims keepdims :dtype dt))
              (inv (if (eq dt :float32)
                       (/ 1.0s0 (float den 1.0s0))
                       (/ 1.0d0 (float den 1.0d0)))))
@@ -945,15 +661,8 @@
            (v (vt-var in :axis axis :keepdims keepdims :ddof ddof :dtype dt)))
       (vt-sqrt v :out out :dtype dt))))
 
-(defun vt-average (tensor &rest args)
-  "加权平均（对标 numpy.average）。复数走 vt-mean 语义；
-   第一轮**不支持 weights**（显式报错，避免静默忽略权重）。"
-  (let ((in (ensure-vt tensor)))
-    (if (and (vt-complex-dtype-p (vt-dtype in)) args)
-        (error "vt-average: 复数路径第一轮不支持参数 ~a（CONVENTIONS §16.11）" args)
-        ;; 注意：CL 的 (apply f (list x) args) 会把**列表 (x) 本身**当作第一个
-        ;; 实参传给 f（apply 只展开最后一个实参），必须用 cons 拼接。
-        (apply (%cx-orig 'vt-average) (cons (if (vt-p tensor) tensor in) args)))))
+;;; vt-average 已归位 reduce-stats.lisp（第十三轮）：原先是「同名 defun +
+;;; (%cx-orig 'vt-average) 转发」，重载 reduce-stats.lisp 就会静默丢掉复数分支。
 
 (defun %cx-op-round (tensor &key (divisor 1) out dtype)
   "逐元素四舍五入（对标 numpy.round）。
@@ -1749,9 +1458,7 @@
   (if out (progn (vt-copy-into out r) out) r)))
 
 
-(defun vt-@ (a b &key dtype out)
-  "vt-matmul 的运算符别名。"
-  (vt-matmul a b :dtype dtype :out out))
+;;; VT-@ 已迁出（第十三轮）：与归属文件同义，删冗余
 
 (defun %cx-op-dot (a b &key dtype out)
   "点积 / 内积（对标 numpy.dot）。复数：同 vt-matmul 语义，不取共轭。"
@@ -1813,8 +1520,10 @@
       (when (vt-complex-dtype-p dt)
         (error "vt-norm: 复数范数的结果 dtype 必须是实数类型，收到 ~a" dt))
       (let* ((sq (vt-square (vt-abs in)))
-             (ss (funcall (%cx-orig 'vt-sum) sq :axis axis :keepdims keepdims
-                                                  :dtype dt)))
+             ;; SQ 是实数张量（abs/square 的结果），直接走 vt-sum 的实数分支。
+             ;; 原先经 (%cx-orig 'vt-sum) 取「原实现」—— 那是覆盖式架构才需要的，
+             ;; 现在 vt-sum 自己就是单一 DEFUN，分派判据看到实数即原路返回。
+             (ss (vt-sum sq :axis axis :keepdims keepdims :dtype dt)))
         (vt-sqrt ss :out out :dtype dt)))))
 
 ;;; ==================================================================

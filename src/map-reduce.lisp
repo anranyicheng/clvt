@@ -83,12 +83,12 @@
          (not (and arity (member arity (cdr (assoc op +cx-real-only-arities+)))))))
 
   (defparameter +cx-only-ops+
-    '(;; 复数数学核：%cx-def-unary 生成的分派只在输入为复数时才进快路径
+    '(;; 复数标量内核（src/complex-kernels.lisp）：只被复数分派路径调用
       %cop-sqrt %cop-log %cop-log2 %cop-log10 %cop-square %cop-recip
       %cop-signum %cop-abs %cop-neg
       %cop-expm1 %cop-log1p %cop-sinc %cop-sign
-      ;; 复数比较 / 谓词核：%cx-def-compare / %cx-def-predicate 的守卫是
-      ;; %cx-tensor-p，实数输入根本进不来
+      ;; 复数比较 / 谓词内核：调用点全部在 `(when (%cx-any-p …) …)` 守卫之内，
+      ;; 实数输入根本进不来
       %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
       %cx-nan-flag %cx-inf-flag %cx-finite-flag)
     "**只接受复数实参**的内核集合（语义白名单，不是名字前缀）。

@@ -67,8 +67,14 @@
          (vt-asarray '(1 2 3) :dtype :float32) => [1.0 2.0 3.0] (float32)"
   (ensure-vt obj :dtype dtype))
 
-(defun vt-fromiter (iterable &key (dtype :float64) (count nil))
+(defun vt-fromiter (iterable &key (dtype nil dtype-p) (count nil))
   "从 Lisp 序列构建 1 维张量（对标 numpy.fromiter）。
+
+   DTYPE 缺省时**推断**：序列含复数 → :complex128，否则 :float64
+   （保持 v0.4 之前的默认，不破坏既有调用）。
+   显式传入实数 dtype 而序列含复数 → 报错，与 numpy 的
+   `TypeError: Cannot cast complex to real` 一致（绝不静默丢虚部）。
+
    COUNT 若给出必须是序列长度，用于前置校验（numpy 语义：count 应精确匹配）；
    纯语义构建时忽略 COUNT 的实际作用（本库一次性构建，无需预分配）。
    :out 契约：本函数为构建函数，无 :out。
@@ -76,7 +82,15 @@
   (declare (ignore count))
   (when (not (or (null iterable) (typep iterable 'sequence)))
     (error "vt-fromiter: 需要序列输入，收到 ~a" (type-of iterable)))
-  (vt-from-sequence (or iterable '()) :dtype dtype))
+  (let* ((seq (or iterable '()))
+         (has-complex (some (lambda (x) (or (complexp x) (%cx-deep-p x))) seq))
+         (dt (cond ((and dtype-p dtype)
+                    (when (and (not (vt-complex-dtype-p dtype)) has-complex)
+                      (error "vt-fromiter: 序列含复数，与显式 dtype ~a 冲突\
+（numpy 同样抛 TypeError: Cannot cast complex to real）" dtype))
+                    dtype)
+                   (t (if has-complex :complex128 :float64)))))
+    (vt-from-sequence seq :dtype dt)))
 
 (defun vt-tri (n &key (m nil) (k 0) (dtype :float64))
   "下三角布尔/数值矩阵（对标 numpy.tri）。
@@ -767,7 +781,21 @@
 (defun vt-float-power (x y &key out dtype)
   "逐元素幂运算，结果恒为浮点（对标 numpy.float_power）。
    整数基/指数亦按浮点计算：负底数配非整数指数 → NaN；
-   结果 dtype 缺省 float64。:out 契约同 vt-abs（支持广播）。"
+   结果 dtype 缺省 float64。:out 契约同 vt-abs（支持广播）。
+
+  复数（§16.10）：两个分量各自按复数幂算，与 vt-pow 共用 %CX-POW-2。
+  原先是 complex.lisp 的匿名包装，重载本文件后复数会被静默取实部
+  （实测 (vt-float-power #C(2 1) #C(2 0)) 得 4.0，numpy 是 3+4j）。"
+  (when (or (%cx-deep-p x) (%cx-deep-p y))
+    (return-from vt-float-power
+      (let* ((xe (ensure-vt x))
+             (ye (ensure-vt y))
+             (promoted (or dtype (%op-final-dtype
+                                  (list (%scalar-kind x) (%scalar-kind y))
+                                  (list (vt-dtype xe) (vt-dtype ye)))))
+             (dt (if (vt-complex-dtype-p promoted) promoted :complex128))
+             (dt (%cx-result-complex-dtype dt (and dtype dtype) "VT-FLOAT-POWER")))
+        (vt-map (function %cx-pow-2) xe ye :out out :dtype dt))))
   (vt-map (lambda (a b)
             (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
               (cond ((%nan-p af) af)
@@ -955,31 +983,61 @@
                       (t xf))))
             v :out out :dtype (%e3-float-prefer-dtype dt :float64))))
 
+;;; 第十三轮：这 4 个函数原先是「本库无复数 dtype，恒返回输入本身」的
+;;; 错误桩（complex.lisp 里另有一份完整实现靠加载顺序覆盖它）。现在只保留
+;;; complex.lisp 那一份权威实现，搬到归属文件，复数 / 实数都在本体内判定。
+
 (defun vt-real (tensor &key out dtype)
-  "逐元素实部（对标 numpy.real）。本库无复数 dtype，恒返回输入本身（数值不变）。
-   :out 契约同 vt-abs。"
-  (vt-map #'identity (ensure-vt tensor) :out out :dtype dtype))
+  "取实部（对标 numpy.real）。复数 → 分量浮点 dtype 的实数张量；
+   实数输入原样返回（副本）。
+
+   与 numpy 的差异（§16.6）：numpy 的 `.real` 是**零拷贝视图**（写实部会
+   改到原数组）；clvt 的 strided view 无法表达「同一缓冲的实数子集」
+   （缓冲元素类型是复数），故返回**副本**。需要写回请用 vt-complex 重组。"
+  (let* ((in (ensure-vt tensor))
+         (dt (or dtype (vt-real-dtype-of (vt-dtype in))))
+         (dt (if (vt-complex-dtype-p dt) (vt-real-dtype-of dt) dt)))
+    (if (vt-complex-dtype-p (vt-dtype in))
+        (%cx-run-to-real #'%cx-real-run #'%creal in out dt "VT-REAL")
+        (vt-map #'%creal in :out out :dtype dt))))
 
 (defun vt-imag (tensor &key out dtype)
-  "逐元素虚部（对标 numpy.imag）。本库无复数 dtype，恒返回全零。
-   :out 契约同 vt-abs。"
-  (vt-map (lambda (x) (declare (ignore x)) 0)
-          (ensure-vt tensor) :out out :dtype (or dtype (vt-dtype (ensure-vt tensor)))))
+  "取虚部（对标 numpy.imag）。实数输入 → 全 0（与 numpy 一致）。
+   返回副本而非视图，原因同 vt-real。"
+  (let* ((in (ensure-vt tensor))
+         (in-dt (vt-dtype in))
+         (dt (or dtype (if (vt-complex-dtype-p in-dt)
+                           (vt-real-dtype-of in-dt)
+                           in-dt))))
+    (if (vt-complex-dtype-p in-dt)
+        (%cx-run-to-real #'%cx-imag-run #'%cimag in out dt "VT-IMAG")
+        (vt-map #'%cimag in :out out :dtype dt))))
 
 (defun vt-conj (tensor &key out dtype)
-  "逐元素复共轭（对标 numpy.conj）。本库无复数 dtype，恒返回输入本身。
-   :out 契约同 vt-abs。"
-  (vt-map #'identity (ensure-vt tensor) :out out :dtype dtype))
+  "逐元素共轭（对标 numpy.conj / numpy.conjugate）。实数输入原样返回。"
+  (let ((in (ensure-vt tensor)))
+    (vt-fast-map #'%cconj in :out out :dtype (or dtype (vt-dtype in)))))
 
-(defun vt-angle (tensor &key (deg nil) out dtype)
-  "逐元素相位角（对标 numpy.angle）。对实数 z：z >= 0 → 0，z < 0 → π。
-   DEG=t 时以角度（度）表示。NaN → NaN。:out 契约同 vt-abs。"
-  (vt-map (lambda (x)
-            (let ((xf (coerce x 'double-float)))
-              (cond ((%nan-p xf) xf)
-                    ((minusp xf) (if deg 180.0d0 pi))
-                    (t 0.0d0))))
-          (ensure-vt tensor :dtype :float64) :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
+(defun vt-angle (tensor &key deg out dtype)
+  "逐元素幅角 atan2(im, re) ∈ (-π, π]（对标 numpy.angle）。
+   DEG 为真时返回角度制。结果恒为实数 dtype。
+   零值返回 0（保留 ±0.0 符号）。"
+  (let* ((in (ensure-vt tensor))
+         (in-dt (vt-dtype in))
+         (dt (or dtype (if (vt-complex-dtype-p in-dt)
+                           (vt-real-dtype-of in-dt)
+                           (if (eq in-dt :float32) :float32 :float64))))
+         (fn (if deg
+                 (lambda (z)
+                   (* (%carg z)
+                      (if (eq dt :float32) (/ 180.0s0 0.31415927s1) (/ 180.0d0 pi))))
+                 #'%carg)))
+    ;; 度数换算需要额外一次乘法（内核未参数化），deg 走通用路径；
+    ;; 默认弧度走 %CX-ANGLE-RUN 特化内核。
+    (if (and (not deg) (vt-complex-dtype-p in-dt))
+        (%cx-run-to-real #'%cx-angle-run #'%carg in out dt "VT-ANGLE")
+        (vt-map fn in :out out :dtype dt))))
+
 
 ;;; ==================================================================
 ;;; 5. 统计类（Statistics）

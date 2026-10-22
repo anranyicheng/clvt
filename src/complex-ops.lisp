@@ -25,31 +25,8 @@
 
 (in-package :clvt)
 
-;;; ==================================================================
-;;; 0. 原实现预捕获
-;;; ==================================================================
-;;; 与 complex.lisp 同一机制：必须在**本文件任何 defun 之前**登记，
-;;; 否则运行时捕获到的是包装器自身（无限递归）。
-(eval-when (:load-toplevel :execute)
-  (dolist (name '(vt-nan-to-num vt-view vt-repeat
-                  vt-unique vt-in1d vt-isin
-                  vt-intersect1d vt-setdiff1d vt-union1d vt-setxor1d
-                  vt-searchsorted
-                  vt-nansum vt-nanprod vt-nanmax vt-nanmin
-                  vt-nanargmax vt-nanargmin
-                  vt-nanmean vt-nanvar vt-nanstd vt-nanmedian
-                  vt-correlate vt-convolve vt-inner vt-tensordot
-                  vt-vdot vt-nancumsum vt-nancumprod vt-digitize
-                  ;; v1.3：补齐 numpy 支持复数的算子 + 明确拒绝清单
-                  vt-expm1 vt-log1p vt-sinc vt-sign
-                  vt-clip vt-clamp vt-standardize
-                  vt-cov vt-corrcoef vt-fromiter
-                  vt-nextafter vt-spacing vt-logaddexp vt-hypot vt-copysign
-                  vt-signbit vt-deg2rad vt-rad2deg vt-bincount vt-histogram
-                  vt-nanpercentile vt-nanquantile vt-interp vt-positive
-                  ;; 第四轮：any / all 的复数真值语义
-                  vt-any vt-all))
-    (%cx-orig name)))
+;;; （原「0. 原实现预捕获」段已删除：覆盖式架构拆除后不再需要，
+;;;   理由与判据见 complex.lisp 的「0.」小节点评。）
 
 ;;; ==================================================================
 ;;; 1. 值级小工具
@@ -145,105 +122,10 @@
 ;;; 这一偏差登记在 CONVENTIONS §16.18「已知差异 D-C7」，并写进 docstring，
 ;;; 避免使用者以为改视图能改原数组。
 
-(defun %cx-view-pair-p (from to)
-  "允许的 dtype 重解释对（只开放「分量宽度相同」的两对，保证逐位等价）。
-   complex128↔float64、complex64↔float32。"
-  (or (and (eq from :complex128) (eq to :float64))
-      (and (eq from :float64) (eq to :complex128))
-      (and (eq from :complex64) (eq to :float32))
-      (and (eq from :float32) (eq to :complex64))))
+;;; %CX-VIEW-PAIR-P / %CX-VIEW-DTYPE-SHAPE / %CX-REINTERPRET 已迁至 src/complex-kernels.lisp（第十三轮）
 
-(defun %cx-view-dtype-shape (shape from to)
-  "按 numpy 规则算重解释后的形状：只缩放**最后一维**。
-   complex128 (2 3) → float64 (2 6)；float64 (2 6) → complex128 (2 3)。"
-  (let* ((fi (vt-dtype-itemsize from))
-         (ti (vt-dtype-itemsize to))
-         (last (car (last shape)))
-         (new-last (if (> fi ti)
-                       (* last (floor fi ti))
-                       (if (zerop (mod last (floor ti fi)))
-                           (floor last (floor ti fi))
-                           (error "vt-view: 最后一维 ~a 不能按 ~a→~a 整除" last from to)))))
-    (append (butlast shape) (list new-last))))
-
-(defun %cx-reinterpret (v shape dtype)
-  "把 V 的内容按 DTYPE 重新解释（逐元素重建，语义等价 numpy.view）。
-   SHAPE 为 NIL 时自动按 numpy 规则缩放最后一维。"
-  (let* ((from (vt-dtype v))
-         (flat (%cx-flat v))
-         (n (vt-size flat))
-         (fi (vt-dtype-itemsize from))
-         (ti (vt-dtype-itemsize dtype))
-         (m (if (> fi ti) (* n (floor fi ti)) (floor n (floor ti fi))))
-         (out-shape (or shape (%cx-view-dtype-shape (vt-shape v) from dtype)))
-         (out-size (reduce #'* out-shape :initial-value 1)))
-    (unless (= out-size m)
-      (error "vt-view: 重解释后元素数不一致（~a 个 ~a = ~a 个 ~a，但 shape ~a 需要 ~a 个）"
-             n from m dtype out-shape out-size))
-    (let ((res (make-vt out-shape 0 :dtype dtype))
-          (src (vt-data flat)))
-      (let ((dst (vt-data res))
-            (off (vt-offset flat)))
-        (with-float-safe
-          (cond
-            ((and (eq from :complex128) (eq dtype :float64))
-             (dotimes (i n)
-               (let ((z (aref src (+ off i))))
-                 (setf (aref dst (* 2 i)) (%creal z)
-                       (aref dst (1+ (* 2 i))) (%cimag z)))))
-            ((and (eq from :complex64) (eq dtype :float32))
-             (dotimes (i n)
-               (let ((z (aref src (+ off i))))
-                 (setf (aref dst (* 2 i)) (%creal z)
-                       (aref dst (1+ (* 2 i))) (%cimag z)))))
-            ((and (eq from :float64) (eq dtype :complex128))
-             (dotimes (i (/ n 2))
-               (setf (aref dst i) (complex (aref src (+ off (* 2 i)))
-                                           (aref src (+ off (1+ (* 2 i))))))))
-            ((and (eq from :float32) (eq dtype :complex64))
-             (dotimes (i (/ n 2))
-               (setf (aref dst i) (complex (aref src (+ off (* 2 i)))
-                                           (aref src (+ off (1+ (* 2 i))))))))
-            (t (error "vt-view: 不支持 ~a → ~a 的重解释" from dtype)))))
-      res)))
-
-(defun vt-view (vt &rest args)
-  "零拷贝重塑视图（对标 pytorch tensor.view）；给出 :DTYPE 时按 numpy 语义重解释。
-
-  调用形式：
-    (vt-view a shape)                 ; 既有行为：零拷贝、元素总数必须一致
-    (vt-view a shape :dtype dt)       ; 重解释到 dt（形状需按字节数匹配）
-    (vt-view a :dtype dt)             ; 省略 shape：自动缩放最后一维
-                                      ; （对标 numpy 的 a.view(dt)）
-
-  :DTYPE 与输入不同时**重解释**：complex128 ↔ float64、complex64 ↔ float32
-  （只开放「分量宽度相同」的两对，保证逐位等价）。
-
-  ⚠ 与 numpy 的差异（§16.18 D-C7）：CL 数组无法跨元素类型做位移数组，
-  因此重解释返回**独立副本**，不共享内存；numpy 的 view 是共享的。
-
-  为什么用 &REST 而不是 (&optional shape &key dtype)：CL 无法在可选位置上
-  区分「关键字」与「形状」，`(vt-view a :dtype dt)` 会被解析成
-  shape=:DTYPE 然后报 odd number of &KEY arguments。这里手工分流：
-  首参是关键字 → 视为只有关键字；否则首参是形状。"
-  (let ((v (ensure-vt vt))
-        (shape nil)
-        (dtype nil))
-    (cond
-      ((null args) (setf shape nil))
-      ((keywordp (first args)) (setf dtype (getf args :dtype)))
-      (t (setf shape (first args)
-               dtype (getf (rest args) :dtype))))
-    (cond
-      ((or (null dtype) (eq dtype (vt-dtype v)))
-       (funcall (%cx-orig 'vt-view) v shape))
-      ((not (%cx-view-pair-p (vt-dtype v) dtype))
-       (error "vt-view: 不支持 ~a → ~a 的重解释（仅 complex128↔float64、complex64↔float32）"
-              (vt-dtype v) dtype))
-      (t (%cx-reinterpret v shape dtype)))))
-
-
-
+;;; vt-view 已归位 manip.lisp（第十三轮）：原先是「同名 defun 再写一遍 +
+;;; (%cx-orig 'vt-view) 转发」，重载 manip.lisp 就会静默丢掉 :dtype 重解释。
 ;;; ==================================================================
 ;;; 4. 转换：repeat（复数）
 ;;; ==================================================================
@@ -404,24 +286,21 @@
                       (when return-counts cnt-vt))
               uniq-vt))))))
 
-(defun vt-unique (tensor &key return-index return-inverse return-counts axis)
-  "返回展平后唯一元素（升序、NaN 折叠为一个）。复数按字典序（§16.8）。
+(defun %cx-op-unique (in return-index return-inverse return-counts axis)
+  "复数 vt-unique 的实现（IN 已 ENSURE-VT）。
 
    AXIS 给定时按轴去重（§16.23）。该路径的元素比较原语（%AXIS-ELEM-LESSP /
    %AXIS-ELEM-EQ）本身与元素类型无关，复数按 (实部, 虚部) 字典序参与比较，
-   因此直接复用实数层的 %UNIQUE-AXIS，无需第二份实现。"
-  (let* ((in (ensure-vt tensor))
-         (rank (length (vt-shape in))))
-    (cond ((and axis (> rank 1))
-           (%unique-axis in (vt-normalize-axis axis rank)
-                         return-index return-inverse return-counts))
-          ((vt-complex-dtype-p (vt-dtype in))
-           (%cx-unique in return-index return-inverse return-counts))
-          (t (funcall (%cx-orig 'vt-unique) in
-                      :return-index return-index
-                      :return-inverse return-inverse
-                      :return-counts return-counts
-                      :axis axis)))))
+   因此直接复用实数层的 %UNIQUE-AXIS，无需第二份实现。
+
+   第十三轮：原先是同名 DEFUN 覆盖 setops.lisp 的实现并 (%cx-orig) 转发，
+   重载 setops.lisp 就会把复数静默送进实数内核。现在只保留复数分支，
+   公开入口在 setops.lisp 的单一 DEFUN 里分派。"
+  (let ((rank (length (vt-shape in))))
+    (if (and axis (> rank 1))
+        (%unique-axis in (vt-normalize-axis axis rank)
+                      return-index return-inverse return-counts)
+        (%cx-unique in return-index return-inverse return-counts))))
 
 (defun %cx-key-table (test)
   "把 TEST 的元素装进 EQL 哈希表（键为 %CX-KEY）。"
@@ -571,13 +450,7 @@
 ;;; 一次拿到所有 axis/keepdims 组合，且**复用第一轮已优化的内核**
 ;;; （vt-sum / vt-amax 的复数快路径），不再写第二套 fiber 循环。
 
-(defun %cx-to-out (r out name)
-  "把已算好的 R 按 :out 硬契约写回（形状/dtype 严格相等由 vt-check-out 把关）。"
-  (if out
-      (let ((checked (vt-check-out out (vt-shape r) (vt-dtype r) :op-name name)))
-        (vt-copy-into checked r)
-        checked)
-      r))
+;;; %CX-TO-OUT 已迁至 src/complex-kernels.lisp（第十三轮）
 
 (defun %cx-nan-sentinel (dt sign)
   "全 ±Inf 的复数哨兵：SIGN 为 +1 → (+inf,+inf)，-1 → (-inf,-inf)。
@@ -769,14 +642,12 @@
                  (b (aref tmp (floor cnt 2))))
              (* 0.5s0 (+ a b))))))))
 
-(defun vt-nanmedian (tensor &key axis keepdims out dtype)
-  "忽略 NaN 的中位数（对标 numpy.nanmedian）。复数按字典序；偶数个取中间两值均值。
-   全 NaN 切片 → NaN+0j（numpy 语义）。"
+(defun %cx-op-nanmedian (tensor &key axis keepdims out dtype)
+  "忽略 NaN 的中位数（复数）：按字典序；偶数个取中间两值均值。
+   全 NaN 切片 → NaN+0j（numpy 语义）。
+   第十三轮：原先是同名 DEFUN 覆盖 reduce-stats.lisp 的实现并 (%cx-orig) 转发，
+   现在只做复数分支，公开入口在 reduce-stats.lisp 的单一 DEFUN 里分派。"
   (let ((in (ensure-vt tensor)))
-    (unless (vt-complex-dtype-p (vt-dtype in))
-      (return-from vt-nanmedian
-        (funcall (%cx-orig 'vt-nanmedian) tensor :axis axis :keepdims keepdims
-                 :out out)))
     (with-float-safe
       (let* ((shape (vt-shape in))
              (rank (length shape))
@@ -1104,59 +975,25 @@
 ;;;   v=[1+2j, 3-4j, 5+0j], clip(0, 2) → [1+2j, 2+0j, 2+0j]
 ;;; 第一项虚部 2 超出 2 却没被裁，正是因为比较的是 (1,2) 整体而不是 2。
 
-(defun vt-clip (vt &optional (min-val nil min-p) (max-val nil max-p)
-                   &key out dtype)
-  "逐元素裁剪（对标 numpy.clip）。复数按**字典序**整元素夹取，不按分量。"
-  (let ((v (ensure-vt vt)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        ;; 实数路径原样转发。
-        ;; ⚠ 不能写 `(funcall orig vt :out out :dtype dtype)`：orig 的签名是
-        ;; `(&optional min max &key out dtype)` —— **&optional 在前**，关键字
-        ;; 会被当成 min-val 的位置实参（`min-p = T, min-val = :OUT`），
-        ;; 于是「无界参数」这条最常用的路径整天报错。必须把两个位置参数
-        ;; 显式填满（nil nil 与「不传」在 orig 里等价：都走 copy 分支）。
-        (cond ((and min-p max-p)
-               (funcall (%cx-orig 'vt-clip) vt min-val max-val :out out :dtype dtype))
-              (min-p
-               ;; 只给下限：orig 会立刻报错（numpy 语义），不必带关键字
-               (funcall (%cx-orig 'vt-clip) vt min-val))
-              (t
-               (funcall (%cx-orig 'vt-clip) vt nil nil :out out :dtype dtype)))
-        (progn
-          (when (and min-p (not max-p))
-            (error "vt-clip: 只提供 MIN-VAL 而未提供 MAX-VAL（numpy 语义：\
-clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
-          (let* ((dt (%cx-result-complex-dtype (vt-dtype v) dtype "VT-CLIP"))
-                 (r (if (and (null min-val) (null max-val))
-                        (vt-copy v)
-                        (let ((acc v))
-                          (when min-val
-                            (setf acc (vt-maximum acc (vt-cast min-val dt) :dtype dt)))
-                          (when max-val
-                            (setf acc (vt-minimum acc (vt-cast max-val dt) :dtype dt)))
-                          acc))))
-            (%cx-to-out r out "VT-CLIP"))))))
+(defun %cx-op-clip (v min-val max-val min-p max-p out dtype)
+  "复数 vt-clip 的实现（V 已 ENSURE-VT）。按**字典序**整元素夹取，不按分量。
 
-(defun vt-clamp (vt &optional (min-val nil min-p) (max-val nil max-p)
-                    &key out dtype)
-  "vt-clip 的别名（对标 torch.clamp）。复数语义同 vt-clip（字典序）。"
-  (let ((v (ensure-vt vt)))
-    ;; VT-CLIP 的 lambda list 是 (&optional min-val max-val &key out dtype)：
-    ;; &OPTIONAL 在 &KEY 之前，转发时**必须把位置参数填满到 max-val**，否则
-    ;; 第一个关键字会被当成 max-val 绑走（SBCL 报 "called with odd number of
-    ;; keyword arguments"，运行期直接报错；这也是编译期 WARNING → ASDF 编译失败
-    ;; 的一条来源）。缺少 max-val 时显式填 NIL 占位。
-    (if (vt-complex-dtype-p (vt-dtype v))
-        (cond ((and min-p max-p) (vt-clip v min-val max-val :out out :dtype dtype))
-              (min-p (vt-clip v min-val nil :out out :dtype dtype))
-              (t (vt-clip v nil nil :out out :dtype dtype)))
-        ;; 实数分支同样处理；顺带修 min-p 分支静默丢弃 :out/:dtype 的 bug。
-        (cond ((and min-p max-p)
-               (funcall (%cx-orig 'vt-clamp) vt min-val max-val :out out :dtype dtype))
-              (min-p
-               (funcall (%cx-orig 'vt-clamp) vt min-val nil :out out :dtype dtype))
-              (t
-               (funcall (%cx-orig 'vt-clamp) vt nil nil :out out :dtype dtype))))))
+   `(vt-clip a min)` 只给下限 → 报错（numpy 语义：clip() missing a_max）。
+   第十三轮：原先是同名 DEFUN 覆盖 elementwise.lisp 的实现并用 (%cx-orig)
+   回调，重载 elementwise.lisp 后复数会被逐分量裁剪 —— 静默错答案。"
+  (when (and min-p (not max-p))
+    (error "vt-clip: 只提供 MIN-VAL 而未提供 MAX-VAL（numpy 语义：\
+clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
+  (let* ((dt (%cx-result-complex-dtype (vt-dtype v) dtype "VT-CLIP"))
+         (r (if (and (null min-val) (null max-val))
+                (vt-copy v)
+                (let ((acc v))
+                  (when min-val
+                    (setf acc (vt-maximum acc (vt-cast min-val dt) :dtype dt)))
+                  (when max-val
+                    (setf acc (vt-minimum acc (vt-cast max-val dt) :dtype dt)))
+                  acc))))
+    (%cx-to-out r out "VT-CLIP")))
 
 ;;; ---- 12.3 standardize：按复数均值居中、按实标准差缩放 --------------
 ;;; 复数的 std 恒为实数（§16.7），所以 (x-mean)/std 是「复数 / 实数」，
@@ -1264,28 +1101,9 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 ;;; 原实现默认 :float64，且显式传 :float64 时复数会被静默取实部。
 ;;; numpy 的 fromiter 必须显式给 dtype，给实数 dtype 遇复数直接 TypeError。
 
-(defun vt-fromiter (iterable &key (dtype nil dtype-p) (count nil))
-  "从 Lisp 序列构建 1 维张量（对标 numpy.fromiter）。
-
-   dtype 缺省时**推断**：序列含复数 → :complex128，否则保持既有的
-   :float64（兼容旧调用）。显式传入实数 dtype 而序列含复数 → 报错，
-   与 numpy 的 TypeError 一致（绝不静默丢虚部）。"
-  (when (not (or (null iterable) (typep iterable 'sequence)))
-    (error "vt-fromiter: 需要序列输入，收到 ~a" (type-of iterable)))
-  (let ((seq (or iterable '())))
-    (cond
-      ((and dtype-p dtype)
-       (when (and (not (vt-complex-dtype-p dtype))
-                  (some (lambda (x) (or (complexp x) (%cx-deep-p x))) seq))
-         (error "vt-fromiter: 序列含复数，与显式 dtype ~a 冲突\
-（numpy 同样抛 TypeError: Cannot cast complex to real）" dtype))
-       (funcall (%cx-orig 'vt-fromiter) seq :dtype dtype :count count))
-      (t
-       (funcall (%cx-orig 'vt-fromiter) seq
-                :dtype (if (some (lambda (x) (or (complexp x) (%cx-deep-p x))) seq)
-                           :complex128
-                           :float64)
-                :count count)))))
+;;; vt-fromiter 已归位 extensions3.lisp（第十三轮）：原先是同名 DEFUN +
+;;; (%cx-orig 'vt-fromiter) 转发，重载 extensions3.lisp 就会把复数序列
+;;; 静默按 :float64 构建（丢虚部）。
 
 (defun %cx-op-positive (tensor &key out dtype)
   "逐元素取正（一元 +，对标 numpy.positive）。复数恒等映射，保复数 dtype。"

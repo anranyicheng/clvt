@@ -726,6 +726,18 @@ lambda 算子请使用 %%float-map-fn"))
   `%float-map-pair` 的编译期内联循环（原实现对每种情形都用 lambda，
   一律回退 vt-map 的 funcall 路径，1M 元素实测 log 57ms / log2 103ms）；
   任意其它 base 仍是 lambda 路径（base 是运行期变量，无法内联）。"
+  ;; 复数分派（第十三轮）：原先是 complex.lisp 里 `(setf (symbol-function
+  ;; 'vt-log) (lambda (&rest ...)))` 装的匿名包装 —— 重载本文件就会静默
+  ;; 变回实数路径（log(-1+0i) 从 πi 变成 NaN）。
+  ;; 判据用 %CX-ANY-P 而非 %CX-TENSOR-P：后者对 list 返回 NIL，
+  ;; (vt-log (list #C(0 1))) 会掉进实数路径。
+  (when (%cx-any-p vt)
+    (return-from vt-log
+      (let* ((in (ensure-vt vt))
+             (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-LOG")))
+        (if base
+            (vt-map (lambda (z) (%cop-log-base z base)) in :out out :dtype dt)
+            (vt-map #'%cop-log in :out out :dtype dt)))))
   (let ((dt (%infer-float-dtype vt dtype)))
     (cond
       ((null base)
@@ -1364,7 +1376,18 @@ lambda 算子请使用 %%float-map-fn"))
       positional argument: 'a_max'`；numpy 不允许只给下限）。
 
   MIN-VAL / MAX-VAL 是标量，不是张量。:dtype / :out 契契约同 vt-map
-  （结果 dtype 由输入提升或显式 :dtype 决定，out 必须精确匹配）。"
+  （结果 dtype 由输入提升或显式 :dtype 决定，out 必须精确匹配）。
+
+  复数（§16.8）：按**字典序**整元素夹取，不按分量 —— numpy 的 clip 定义为
+  `minimum(maximum(a, lo), hi)`，而 maximum/minimum 对复数是字典序。
+  实测 v=[1+2j, 3-4j, 5+0j], clip(0, 2) → [1+2j, 2+0j, 2+0j]：第一项虚部 2
+  超出 2 却没被裁，因为比较的是 (1,2) 整体而不是分量 2。
+
+  第十三轮之前这段逻辑在 complex-ops.lisp 用同名 DEFUN 覆盖本函数并用
+  (%cx-orig) 回调，重载本文件后复数会被逐分量裁剪（静默错答案）。"
+  (when (%cx-any-p vt)
+    (return-from vt-clip
+      (%cx-op-clip (ensure-vt vt) min-val max-val min-p max-p out dtype)))
   (when (and min-p (not max-p))
     (error "vt-clip: 只提供 MIN-VAL 而未提供 MAX-VAL（numpy 语义：clip() \
 missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))

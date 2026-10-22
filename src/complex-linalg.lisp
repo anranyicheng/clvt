@@ -24,16 +24,8 @@
 
 (in-package :clvt)
 
-;;; ==================================================================
-;;; 0. 原实现预捕获
-;;; ==================================================================
-;;; 同前两轮：必须在**本文件任何 defun 之前**登记，否则运行时捕获到的
-;;; 是本文件的包装器自身（无限递归）。
-(eval-when (:load-toplevel :execute)
-  (dolist (name '(vt-lu vt-det vt-solve vt-inv vt-cholesky vt-qr
-                  vt-svd vt-eig vt-pinv vt-lstsq vt-matrix-rank
-                  vt-matrix-power))
-    (%cx-orig name)))
+;;; （原「0. 原实现预捕获」段已删除：覆盖式架构拆除后不再需要，
+;;;   理由与判据见 complex.lisp 的「0.」小节点评。）
 
 ;;; ==================================================================
 ;;; 1. 表示与工具
@@ -1001,35 +993,29 @@
                   (values xr res rank s)))))))))))
 
 
-(defun vt-matrix-rank (matrix &optional (tol nil))
-  "矩阵秩（复数版）：基于奇异值，判定阈值为
-   TOL 显式给出时用之，否则 s_max·max(m,n)·eps（numpy 的缺省口径）。
-   原实数实现走 `vt-astype :float64`（取实部）—— 对复数是**静默错答案**。"
-  (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        ;; TOL 是**新增的** &optional 参数：未传时必须不带它转发，
-        ;; 否则会把原实现的默认值 1e-10 覆盖成 NIL（实数路径回归，
-        ;; 差分探针 p0109/p0110 当场抓到）。
-        (if tol
-            (funcall (%cx-orig 'vt-matrix-rank) matrix tol)
-            (funcall (%cx-orig 'vt-matrix-rank) matrix))
-        (with-float-safe
-          (let ((shape (vt-shape v)))
-            (unless (= 2 (length shape))
-              (error "vt-matrix-rank: 要求 2 维矩阵，收到形状 ~a" shape))
-            (let* ((m (first shape))
-                   (n (second shape)))
-              (multiple-value-bind (u s vh) (%csvd-of v "vt-matrix-rank")
-                (declare (ignore u vh))
-                (let* ((k (vt-size s))
-                       (sd (vt-data s))
-                       (smax 0.0d0)
-                       (thr 0.0d0)
-                       (rank 0))
-                  (declare (type fixnum rank) (type double-float smax thr))
-                  (dotimes (i k) (setf smax (max smax (aref sd i))))
-                  (setf thr (if tol
-                                (coerce tol 'double-float)
-                                (* smax (max m n) double-float-epsilon)))
-                  (dotimes (i k) (when (> (aref sd i) thr) (incf rank)))
-                  rank))))))))
+(defun %cx-op-matrix-rank (v tol)
+  "复数矩阵秩（V 已 ENSURE-VT）：基于奇异值。
+   阈值 TOL 显式给出时用之，否则 s_max·max(m,n)·eps（numpy 的缺省口径）。
+
+   第十三轮：原先是同名 DEFUN 覆盖 linalg.lisp 的实现并用 (%cx-orig) 转发，
+   重载 linalg.lisp 后复数会掉进实数路径（vt-astype :float64 = 静默取实部）。"
+  (with-float-safe
+    (let ((shape (vt-shape v)))
+      (unless (= 2 (length shape))
+        (error "vt-matrix-rank: 要求 2 维矩阵，收到形状 ~a" shape))
+      (let* ((m (first shape))
+             (n (second shape)))
+        (multiple-value-bind (u s vh) (%csvd-of v "vt-matrix-rank")
+          (declare (ignore u vh))
+          (let* ((k (vt-size s))
+                 (sd (vt-data s))
+                 (smax 0.0d0)
+                 (thr 0.0d0)
+                 (rank 0))
+            (declare (type fixnum rank) (type double-float smax thr))
+            (dotimes (i k) (setf smax (max smax (aref sd i))))
+            (setf thr (if tol
+                          (coerce tol 'double-float)
+                          (* smax (max m n) double-float-epsilon)))
+            (dotimes (i k) (when (> (aref sd i) thr) (incf rank)))
+            rank))))))

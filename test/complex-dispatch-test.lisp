@@ -14,8 +14,13 @@
 ;;;;   3. 实数路径不得被复数分派改变语义（抽样对照）。
 
 (require :asdf)
-(push #p"/workspace/src/clvt-r12/" asdf:*central-registry*)
-(handler-bind ((warning #'muffle-warning)) (asdf:load-system :clvt))
+;; 独立运行（不经 run-tests.sh）时从本文件所在项目的根目录加载；由运行器
+;; 启动时 clvt 已在镜像里，这里不重复加载（否则可能拿到旧副本）。
+(unless (find-package :clvt)
+  (push (uiop:pathname-parent-directory-pathname
+           (uiop:pathname-directory-pathname *load-truename*))
+        asdf:*central-registry*)
+  (handler-bind ((warning #'muffle-warning)) (asdf:load-system :clvt)))
 (in-package :clvt)
 
 (defvar *pass* 0) (defvar *fail* 0)
@@ -64,15 +69,27 @@
     vt-mean vt-norm vt-std vt-var vt-nan-to-num
     ;; S5-C 线代（11）
     vt-cholesky vt-det vt-eig vt-inv vt-lstsq vt-lu vt-matrix-power
-    vt-pinv vt-qr vt-svd vt-solve))
+    vt-pinv vt-qr vt-svd vt-solve
+    ;; S6 收尾（16）：第十三轮
+    ;;   · 纯冗余删重（2）：与归属文件语义相同，删 complex 侧那份
+    vt-@ vt-expt
+    ;;   · 错误死桩搬迁（4）：extensions3 里写着「本库无复数 dtype」的桩，
+    ;;     complex.lisp 那份才是权威实现，搬到归属文件
+    vt-real vt-imag vt-conj vt-angle
+    ;;   · M1 匿名包装合并（2）
+    vt-log vt-float-power
+    ;;   · M2 同名覆盖 + 转发（8）
+    vt-view vt-average vt-clip vt-clamp vt-fromiter
+    vt-unique vt-nanmedian vt-matrix-rank))
 
-(report "S1–S5C 共 143 个符号已登记" (= 143 (length *migrated*)))
+(report "S1–S6 共 159 个符号已登记" (= 159 (length *migrated*)))
+(report "登记表无重名" (= 159 (length (remove-duplicates *migrated*))))
 
 (let (bad)
   (dolist (n *migrated*)
     (unless (eq (defined-name n) n)
       (push (list n (defined-name n)) bad)))
-  (report (format nil "143 个符号全部是具名 DEFUN（非匿名包装）；异常: ~a"
+  (report (format nil "159 个符号全部是具名 DEFUN（非匿名包装）；异常: ~a"
                   (if bad (length bad) 0))
           (null bad))
   (when bad

@@ -131,3 +131,19 @@
      (funcall impl (%cx-bool-mask tensor) :axis axis :keepdims keepdims
               :dtype dtype :out out))
     (t (error "~a: 复数归约尚未实现的算子 ~a（CONVENTIONS §16.32）" label op))))
+
+;;; ==================================================================
+;;; 4. 后加载实现的**前向声明**
+;;; ==================================================================
+;;; 归属文件（elementwise / setops / reduce-stats / linalg）先于 complex*.lisp
+;;; 加载，但它们的复数分支要调后者定义的内核。SBCL 在编译期看到未定义的
+;;; 函数会发 UNDEFINED-FUNCTION style-warning（编译仍成功，运行期也能解析），
+;;; 但那会让「编译无警告」这条基线失效 —— 以后真正的拼写错误就淹在噪声里。
+;;;
+;;; 这里显式声明：这些名字**保证**由 complex*.lisp 提供。声明同时起到
+;;; 「契约清单」的作用：任何人删除或改名内核，都能在这份清单上对账。
+(declaim (ftype function
+                 %cx-op-unique        ; setops     → complex-ops
+                 %cx-op-nanmedian     ; reduce-stats → complex-ops
+                 %cx-op-clip          ; elementwise  → complex-ops
+                 %cx-op-matrix-rank)) ; linalg       → complex-linalg

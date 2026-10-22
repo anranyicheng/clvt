@@ -3042,3 +3042,122 @@ a=np.arange(6.).reshape(2,3); base=np.zeros((2,6)); v=base[:, ::2]
 np.add(a,a,out=v); print(v)              # 非连续 out 生效
 "
 ```
+
+### 16.33 第十三轮：覆盖式复数层的收尾（159 / 159，S6 + S7）
+
+第十二轮把 143 / 159 改成单一 `DEFUN` 分派，留下 16 个「形状不规整」的。
+本轮把剩下的 16 个做完，并删掉整套覆盖机制（S6），补上验收断言（S7）。
+
+#### 16.33.1 16 个符号按「该怎么改」分四类
+
+| 类 | 数量 | 符号 | 处理方式 |
+|---|---:|---|---|
+| A 纯冗余 | 2 | `vt-@` `vt-expt` | 两处 `defun` 语义完全相同（都只是委托 `vt-matmul` / `vt-pow`），删 `complex.lisp` 那份 |
+| B 错误死桩搬迁 | 4 | `vt-real` `vt-imag` `vt-conj` `vt-angle` | `extensions3.lisp` 那份写着「本库无复数 dtype，恒返回输入本身」——**是错的**；把 `complex.lisp` 的权威实现搬到归属文件，删桩 |
+| C M1 匿名包装合并 | 2 | `vt-log` `vt-float-power` | 包装体（含 `:base` / 复数幂）并进归属文件的 `defun`，`return-from` 分派 |
+| D M2 同名覆盖 + `%cx-orig` 转发 | 8 | `vt-view` `vt-average` `vt-clip` `vt-clamp` `vt-fromiter` `vt-unique` `vt-nanmedian` `vt-matrix-rank` | 复数侧实现改名 `%cx-op-*`，归属文件插守卫；**同时把两处 lambda-list 合并成一份** |
+
+B 类是这一轮最值得记的一笔：那 4 个桩的正确性完全靠「后加载者胜」维持。
+有人调整 `clvt.asd` 的文件顺序，`(vt-conj #C(1 2))` 就会静默返回 `#C(1 2)`。
+**覆盖不仅掩盖重复，还会掩盖错误实现** —— 这是它比死代码更危险的地方。
+
+#### 16.33.2 结构变更：内核前移，新文件 `src/complex-kernels.lisp`
+
+D 类之所以拖到最后一轮，是因为复数分支依赖的内核住在 `complex*.lisp`（最后加载），
+而归属文件在前 —— 编译期只能前向引用。本轮把它们拆成两层：
+
+| 层 | 文件 | 加载位置 | 内容 |
+|---|---|---|---|
+| 标量内核 | `src/complex-kernels.lisp`（**新增**） | `dispatch` 之后、所有归属文件之前 | `%cop-*`（sqrt/log/pow/square/recip/signum/abs）、`%cx-nan-of`/`%cx-inf-of`/`%cx-nan-complex`、`%def-cx-to-real-run` + 4 个 `%cx-*-run`、`%cx-run-to-real`、`%cx-pow-2`、`%cx-to-out`、`%cx-flat`、view 的 3 个重解释内核 |
+| 张量逻辑 | `complex.lisp` / `complex-ops.lisp` / `complex-linalg.lisp` | 末尾（不变） | 需要 shape/axis/dtype 的算法 |
+
+依赖方向变成单向：**归属文件 → 标量内核**，不再有「归属文件要等复数层」的倒挂。
+`dispatch.lisp` 末尾补了一份 `declaim ftype` 清单（`%cx-op-unique` / `%cx-op-nanmedian` /
+`%cx-op-clip` / `%cx-op-matrix-rank`），把「这些名字由后面的文件提供」写成可对账的契约，
+编译期不再有 `UNDEFINED-FUNCTION` style-warning。
+
+#### 16.33.3 迁移中发现的新缺陷：`vt-log` 的 `:base` 一直在除零
+
+```
+原实现: (complex (/ (realpart l) (log base 1.0d0)) …)
+```
+
+CL 的 `(log x base)` 是**两参数对数** `log_x(base)`，于是这里算成了
+`ln(base) / ln(1) = 0.693 / 0`。浮点陷阱被 `with-float-safe` 屏蔽，除法得到 `Inf`，
+再乘进结果变成 `0+0i`：
+
+| 表达式 | 整改前 | 整改后 | numpy |
+|---|---|---|---|
+| `(vt-log #C(8 0) :base 2)` | `#C(0.0d0 0.0d0)` | `#C(3.0d0 0.0d0)` | `3+0j` |
+
+正确写法是 `(log base)`（自然对数）。**这个 bug 在覆盖式架构下活了整整五轮**，
+原因是没有任何测试覆盖「复数 + 非缺省 base」这一格 —— 而它属于最常用的换底调用。
+本轮把它补进 `complex-reload-test` 的探针，并修正实现。
+
+#### 16.33.4 S6 收尾：整套覆盖机制删除
+
+删除顺序（顺序颠倒会掩盖漏改的调用点）：
+
+1. 清掉 `(%cx-orig 'vt-sum)` 两处调用（`vt-var` / `vt-norm` 里对实数 `sq` 求和，
+   现在直接 `(vt-sum sq …)` —— 分派判据看到实数即走原路）；
+2. 删三个文件里的 `eval-when` 预捕获清单（`complex.lisp` 63 条、`complex-ops.lisp` 49 条、
+   `complex-linalg.lisp` 12 条）—— 这份清单以前**必须**手工与 `defun` 保持同步，漏写即无限递归；
+3. 删 `*cx-originals*` 哈希表与 `%cx-orig` 函数。
+
+判据（全部应输出 0，已写进 `complex-reload-test` 的最后一条断言）：
+
+```sh
+grep -c "setf (symbol-function" src/*.lisp    # 0（注释除外）
+grep -c "(%cx-orig"            src/*.lisp    # 0（注释除外）
+grep -c "eval-when.*cx-orig"   src/*.lisp    # 0
+```
+
+#### 16.33.5 S7 验收：重载单文件不丢复数（新套件）
+
+`test/complex-reload-test.lisp`（14 断言）—— 这是本轮**唯一真正的验收**。
+同一 image 里逐个 `load` 12 个源文件（`dispatch` / `complex-kernels` / `manip` /
+`elementwise` / `reduce-stats` / `setops` / `linalg` / `extensions` / `extensions3` /
+`complex` / `complex-ops` / `complex-linalg`），每轮跑 19 个探针：
+
+| 探针组 | 覆盖 |
+|---|---|
+| 第十二轮代表（3） | `sqrt(-1+0i)`、`sum`、`maximum` 字典序 |
+| 第十三轮 16 个符号 | `@` `expt` `real` `imag` `conj` `angle` `log`（含 `:base`）`float-power` `view` `average` `clip` `clamp` `fromiter` `unique` `nanmedian` `matrix-rank` |
+| 结构 | 全库无 `(setf (symbol-function …))` 代码行 |
+
+在整改前，这一条在「重载 `elementwise.lisp`」那一轮**必然失败**（`sqrt` 变 NaN float64）。
+现在 14/14 全过。
+
+#### 16.33.6 lambda-list 漂移的最终裁决
+
+第十二轮记录 9 处漂移，本轮的 8 个 D 类里含 5 处，逐一裁决：
+
+| 符号 | 整改前（两处） | 裁决 | 理由 |
+|---|---|---|---|
+| `vt-view` | `(vt new-shape)` / `(vt &rest args)` | 取 `&rest` + 手工分流 | 后者兼容前者调用形态，且能表达 `(vt-view a :dtype dt)` |
+| `vt-average` | 两处都是 `&rest args` | 保留 `&rest`，复数 + 带参 → 报错 | 复数 weights 路径未验收，显式报错优于猜（§16.11） |
+| `vt-clip` | 两处同签名 | 统一，`min-p`/`max-p` 显式传入内核 | `supplied-p` 语义必须原样保留 |
+| `vt-clamp` | `(tensor vmin vmax &key)` / `(vt &optional …)` | 取 `&optional`（更宽） | `(vt-clamp a)` 原先在必填签名下报错；pytorch 语义允许只给一侧 |
+| `vt-fromiter` | `(dtype :float64)` / `(dtype nil dtype-p)` | 取推断式：含复数 → `:complex128`，否则 `:float64` | 既保住旧默认，又不静默丢虚部 |
+| `vt-nanmedian` | 无 `dtype` / 有 `dtype` | 加 `dtype` | 向后兼容（可选关键字） |
+| `vt-matrix-rank` | `(tol 1e-10)` / `(tol nil)` | 统一 `(tol nil)`，实数分支内部回落 `1e-10` | 保持两条路径各自的缺省口径不变 |
+
+> `vt-svd` 的 `max-sweeps 50/tol 1e-14` vs `60/1e-15` 未在本轮处理：
+> 它已经在第十二轮随 S5-C 迁移成单一 `defun`，但**当时保留的是复数版参数**
+> （后加载者胜），需要单独确认期望值。记为待办，不在本轮扩大改动面。
+
+#### 16.33.7 结果
+
+| 项 | 第十二轮后 | 本轮后 |
+|---|---|---|
+| 单一 `DEFUN` 分派的公开符号 | 143 / 159 | **159 / 159** |
+| `(setf (symbol-function …))` 代码处 | 2 | **0** |
+| `%cx-orig` 调用点 | 16 | **0** |
+| `eval-when` 预捕获清单 | 3 个文件、124 条 | **0** |
+| 跨文件同名 `defun` | 14 对 | **0** |
+| `%cx-def-*` 宏 | 0 | 0 |
+| 测试套件 | 51 | **52**（新增 `complex-reload-test`） |
+| 源码行数 | 24,624 | 24,878 |
+
+导出符号数不变（367），`src/` 净增 254 行 —— 增量全部是注释与 docstring：
+删掉 659 行覆盖代码与死桩，新增 373 行分派守卫、内核文件与新测试。

@@ -881,6 +881,14 @@
   (let ((weights nil))
     (when (and args (not (keywordp (first args))))
       (setf weights (pop args)))
+    ;; 复数分派（第十三轮）：原先 complex.lisp 用同名 defun 覆盖本函数并转发
+    ;; 回来（%cx-orig），重载本文件就会把复数静默送进实数内核。
+    ;;
+    ;; 语义保持既有契约（CONVENTIONS §16.11）：无参数的复数 average 就是
+    ;; vt-mean（vt-mean 本身支持复数，走 %average-impl 的「等权」分支）；
+    ;; 带 weights/axis 的复数路径第一轮尚未验收，显式报错而不是猜。
+    (when (and (%cx-any-p tensor) args)
+      (error "vt-average: 复数路径第一轮不支持参数 ~a（CONVENTIONS §16.11）" args))
     (apply #'%average-impl tensor weights args)))
 
 (defun %average-impl (tensor weights &key axis keepdims dtype out)
@@ -2232,9 +2240,17 @@
                (vt-copy-into out var)
                out)))))
 
-(defun vt-nanmedian (tensor &key axis keepdims out)
+(defun vt-nanmedian (tensor &key axis keepdims out dtype)
   "忽略 NaN 的中位数（对标 numpy.nanmedian）。全为 NaN 的归约区结果为 NaN。
-  结果 dtype 恒为 :float64；out 必须形状/dtype 精确匹配。"
+  结果 dtype 恒为 :float64（复数入参时保持复数 dtype）；out 必须形状/dtype 精确匹配。
+
+   复数（§16.16）：按 (实部, 虚部) 字典序排序取中位，偶数个取中间两值均值；
+   任一分量为 NaN 的元素视为缺失。第十三轮之前这段逻辑在 complex-ops.lisp
+   用同名 defun 覆盖本函数，重载本文件后复数会掉进实数内核（静默取实部）。"
+  (when (%cx-any-p tensor)
+    (return-from vt-nanmedian
+      (%cx-op-nanmedian (ensure-vt tensor)
+                        :axis axis :keepdims keepdims :out out :dtype dtype)))
   (with-float-safe
     (let* ((nan (vt-get-nan :float64))
            (in-data (vt-data tensor))

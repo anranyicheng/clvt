@@ -2219,10 +2219,18 @@ w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=
                       (setf (aref v-data v-off) (- x0 sigma))
                       (values v beta sigma))))))))))
 
-(defun vt-matrix-rank (matrix &optional (tol 1e-10))
+(defun vt-matrix-rank (matrix &optional (tol nil))
   "计算矩阵的秩 (线性代数定义：线性无关的行/列数)。
-   基于带部分选主元的高斯消元法，统计非零主元的数量。
-   等价于 numpy.linalg.matrix_rank。"
+   实数路径：带部分选主元的高斯消元法，统计非零主元的数量，TOL 缺省 1e-10。
+   复数路径（§16.20）：基于奇异值，阈值 TOL 缺省 s_max·max(m,n)·eps
+   （numpy 口径）—— 原实数实现里的 `(vt-astype matrix :float64)` 对复数是
+   **静默取实部**，会给错答案。
+
+   第十三轮之前复数分支在 complex-linalg.lisp 用同名 DEFUN 覆盖本函数并用
+   (%cx-orig) 回调，重载本文件后复数会掉进实数路径。"
+  (when (%cx-any-p matrix)
+    (return-from vt-matrix-rank (%cx-op-matrix-rank (ensure-vt matrix) tol)))
+  (let ((tol (or tol 1e-10)))
   (assert (= 2 (length (vt-shape matrix))) 
           (matrix) "vt-matrix-rank requires a 2D tensor")
   (with-float-safe
@@ -2281,7 +2289,7 @@ w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=
                       (incf row))
 		    ;; 如果主元太小，说明该列线性相关，跳过该列，继续看下一列
 		    nil)))
-      rank)))
+      rank))))
 
 (defun extend-orthogonal-basis (u-econ &key (rng *vt-default-random-state*))
   "将 m×k 的 u_econ 通过随机向量 + gram-schmidt 补全为 m×m 正交矩阵。"

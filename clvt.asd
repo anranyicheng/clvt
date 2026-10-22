@@ -41,6 +41,10 @@
                (:file "src/dtype")
                (:file "src/core")
                (:file "src/dispatch")
+               ;; 复数**标量内核**（第十三轮）：纯函数，只吃数、吐数。
+               ;; 必须早于所有归属文件 —— elementwise / extensions3 /
+               ;; reduce-stats 的单一 DEFUN 分派直接调用这些内核。
+               (:file "src/complex-kernels")
                (:file "src/parcontract")
                (:file "src/map-reduce")
                (:file "src/io")

@@ -43,20 +43,55 @@
             (setf (nth neg-idx shape) (truncate total-size known))
             shape)))))))
 
-(defun vt-view (vt new-shape)
-  "零拷贝重塑视图（对标 pytorch tensor.view），要求输入连续。"
-  (let* ((new-shape (%resolve-minus-one
-                     new-shape
-                     (vt-shape-to-size (vt-shape vt))))
-         (old-size (vt-shape-to-size (vt-shape vt)))
-         (new-size (vt-shape-to-size new-shape)))
-    (unless (= old-size new-size)
-      (error "view 失败: 元素总数不一致 (旧 ~a, 新 ~a)" old-size new-size))
-    (unless (vt-contiguous-p vt)
-      (error "view 失败: 张量内存不连续，请使用 vt-reshape"))
-    (%make-vt :data (vt-data vt) :shape new-shape
-              :strides (vt-compute-strides new-shape)
-              :offset (vt-offset vt) :dtype (vt-dtype vt))))
+(defun vt-view (vt &rest args)
+  "零拷贝重塑视图（对标 pytorch tensor.view）；给出 :DTYPE 时按 numpy 语义重解释。
+
+  调用形式：
+    (vt-view a shape)                 ; 零拷贝、元素总数必须一致
+    (vt-view a shape :dtype dt)       ; 重解释到 dt（形状需按字节数匹配）
+    (vt-view a :dtype dt)             ; 省略 shape：自动缩放最后一维
+                                      ; （对标 numpy 的 a.view(dt)）
+
+  :DTYPE 与输入不同时**重解释**：complex128 ↔ float64、complex64 ↔ float32
+  （只开放「分量宽度相同」的两对，保证逐位等价）。
+
+  ⚠ 与 numpy 的差异（§16.18 D-C7）：CL 数组无法跨元素类型做位移数组，
+  因此重解释返回**独立副本**，不共享内存；numpy 的 view 是共享的。
+
+  为什么用 &REST 而不是 (&optional shape &key dtype)：CL 无法在可选位置上
+  区分「关键字」与「形状」，`(vt-view a :dtype dt)` 会被解析成
+  shape=:DTYPE 然后报 odd number of &KEY arguments。这里手工分流：
+  首参是关键字 → 视为只有关键字；否则首参是形状。
+
+  第十三轮：这段逻辑原先在 complex-ops.lisp，靠加载顺序覆盖本函数，
+  且内部用 (%cx-orig 'vt-view) 回调本文件的实数实现。现在只有这一份。"
+  (let ((v (ensure-vt vt))
+        (shape nil)
+        (dtype nil))
+    (cond
+      ((null args) (setf shape nil))
+      ((keywordp (first args)) (setf dtype (getf args :dtype)))
+      (t (setf shape (first args)
+               dtype (getf (rest args) :dtype))))
+    (cond
+      ;; 实数路径：零拷贝视图（要求连续、元素总数一致）
+      ((or (null dtype) (eq dtype (vt-dtype v)))
+       (let* ((new-shape (%resolve-minus-one
+                          shape
+                          (vt-shape-to-size (vt-shape v))))
+              (old-size (vt-shape-to-size (vt-shape v)))
+              (new-size (vt-shape-to-size new-shape)))
+         (unless (= old-size new-size)
+           (error "view 失败: 元素总数不一致 (旧 ~a, 新 ~a)" old-size new-size))
+         (unless (vt-contiguous-p v)
+           (error "view 失败: 张量内存不连续，请使用 vt-reshape"))
+         (%make-vt :data (vt-data v) :shape new-shape
+                   :strides (vt-compute-strides new-shape)
+                   :offset (vt-offset v) :dtype (vt-dtype v))))
+      ((not (%cx-view-pair-p (vt-dtype v) dtype))
+       (error "vt-view: 不支持 ~a → ~a 的重解释（仅 complex128↔float64、complex64↔float32）"
+              (vt-dtype v) dtype))
+      (t (%cx-reinterpret v shape dtype)))))
 
 (defun vt-reshape (vt new-shape)
   "重塑形状：连续则零拷贝视图，否则落地后重塑。"
