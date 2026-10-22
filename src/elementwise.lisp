@@ -650,6 +650,8 @@ lambda 算子请使用 %%float-map-fn"))
       numpy 整型语义返回 0。其余走浮点幂并按 C99 pow 特例表处理
       非有限值（pow(-8,1/3)=NaN、pow(0,-1)=+Inf、pow(1,NaN)=1 等）。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt power)
+    (return-from vt-pow (%cx-op-pow vt power :out out :dtype dtype)))
   (let ((vt (ensure-vt vt)))
     (if (vt-p power)
         ;; ---- 张量指数：逐元素广播幂（自然提升，与 numpy.power 一致）----
@@ -772,6 +774,8 @@ lambda 算子请使用 %%float-map-fn"))
 (defun vt-abs (vt &key out dtype)
   "逐元素绝对值。整数保持整数 dtype（对标 numpy.abs）。
       :out 契约同 vt-+。"
+  (when (%cx-any-p vt)
+    (return-from vt-abs (%cx-op-abs vt :out out :dtype dtype)))
   (vt-fast-map #'abs vt :out out :dtype dtype))
 
 (declaim (inline %sign1))
@@ -1043,6 +1047,8 @@ lambda 算子请使用 %%float-map-fn"))
   "逐元素四舍五入取整（可除 DIVISOR）。
       NaN/±Inf 原样传播（对标 numpy.round）；整数输入保持整数 dtype。
       注意：舍入策略为「最近偶数」，与 CL round 一致。"
+  (when (%cx-any-p vt)
+    (return-from vt-round (%cx-op-round vt :divisor divisor :out out :dtype dtype)))
   (if (eql divisor 1)
       (vt-fast-map #'%round1 vt :out out :dtype dtype)
       (vt-map (lambda (x) (%floor-family-body x round))

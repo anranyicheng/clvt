@@ -985,6 +985,8 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
   "在有序数组中查找插入点。返回形状与 VALUES 相同的 int64 张量（NumPy 语义）。
    SIDE 为 :left（默认，返回第一个 >= val 的位置）或 :right（第一个 > val）。
    v0.4.4 性能修复：改为按元素类型特化的二分内核（原 248ms → 见下）。"
+  (when (%cx-any-p tensor values)
+    (return-from vt-searchsorted (%cx-op-searchsorted tensor values :side side)))
   (let* ((flat (vt-contiguous (vt-flatten tensor)))
          (val-vt (ensure-vt values))
          (out-shape (vt-shape val-vt))
@@ -1109,6 +1111,8 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
    （此前返回 (vt-shape flat-x)，多维输入被展平为 1-D；bins 直接
    vt-flatten，传 Lisp list 会抛 \"The value (4 8) is not of type CLVT:VT\"；
    且线性扫描把递减 bins 当作递增处理，结果与 numpy 不符。）"
+  (when (%cx-any-p x bins)
+    (error "vt-digitize: 复数不可分箱（numpy 对复数同样报 TypeError: x may not be complex）"))
   (let* ((x-vt (ensure-vt x))
          (bins-vt (ensure-vt bins))
          (flat-x (vt-flatten x-vt))

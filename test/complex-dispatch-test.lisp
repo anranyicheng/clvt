@@ -51,15 +51,28 @@
     ;; S4 归约族（14，含宏生成的门面 10 个）
     vt-sum vt-prod vt-amax vt-amin
     vt-nansum vt-nanprod vt-nanmax vt-nanmin
-    vt-any vt-all vt-argmax vt-argmin vt-nanargmax vt-nanargmin))
+    vt-any vt-all vt-argmax vt-argmin vt-nanargmax vt-nanargmin
+    ;; S5-A 顶层单 IF 形态（29）
+    vt-convolve vt-corrcoef vt-correlate vt-digitize vt-in1d vt-inner
+    vt-intersect1d vt-isin vt-nancumprod vt-nancumsum vt-nanmean vt-nanstd
+    vt-nanvar vt-repeat vt-setdiff1d vt-setxor1d vt-tensordot vt-union1d
+    vt-vdot vt-argsort vt-cumprod vt-cumsum vt-dot vt-matmul vt-median
+    vt-outer vt-round vt-sort vt-trace
+    ;; S5-B1 LET 包裹形态（6）
+    vt-abs vt-pow vt-cov vt-positive vt-standardize vt-searchsorted
+    ;; S5-B2 LET + UNLESS 早退形态（5）
+    vt-mean vt-norm vt-std vt-var vt-nan-to-num
+    ;; S5-C 线代（11）
+    vt-cholesky vt-det vt-eig vt-inv vt-lstsq vt-lu vt-matrix-power
+    vt-pinv vt-qr vt-svd vt-solve))
 
-(report "S1–S4 共 92 个符号已登记" (= 92 (length *migrated*)))
+(report "S1–S5C 共 143 个符号已登记" (= 143 (length *migrated*)))
 
 (let (bad)
   (dolist (n *migrated*)
     (unless (eq (defined-name n) n)
       (push (list n (defined-name n)) bad)))
-  (report (format nil "92 个符号全部是具名 DEFUN（非匿名包装）；异常: ~a"
+  (report (format nil "143 个符号全部是具名 DEFUN（非匿名包装）；异常: ~a"
                   (if bad (length bad) 0))
           (null bad))
   (when bad

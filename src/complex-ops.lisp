@@ -108,7 +108,7 @@
                  (t v))))
     (complex (fix (%creal z)) (fix (%cimag z)))))
 
-(defun vt-nan-to-num (tensor &key (copy t) (nan 0.0d0) (posinf nil) (neginf nil) out dtype)
+(defun %cx-op-nan-to-num (tensor &key (copy t) (nan 0.0d0) (posinf nil) (neginf nil) out dtype)
   "把 NaN/±Inf 替换掉（对标 numpy.nan_to_num）。
 
    复数（§16.18）：**实部与虚部分别处理**，替换值 NAN/POSINF/NEGINF 是实数，
@@ -119,11 +119,6 @@
    例：(vt-nan-to-num #C(nan-inf i)) 的参数化版本见 test/complex-ops-test.lisp。"
   (declare (ignore copy))
   (let ((in (ensure-vt tensor)))
-    (unless (vt-complex-dtype-p (vt-dtype in))
-      (return-from vt-nan-to-num
-        (funcall (%cx-orig 'vt-nan-to-num) tensor
-                 :copy copy :nan nan :posinf posinf :neginf neginf
-                 :out out :dtype dtype)))
     (let* ((dt (or dtype (vt-dtype in)))
            (rdt (vt-complex-real-dtype dt))
            (lt (vt-dtype->lisp-type rdt))
@@ -327,11 +322,10 @@
                         do (incf ip (* (nth i idx) (nth i o-in)))
                            (incf op (* (nth i idx) (nth i o-out)))))))))))
 
-(defun vt-repeat (vt repeats &key axis)
+(defun %cx-op-repeat (vt repeats &key axis)
   "重复元素（对标 numpy.repeat）。复数走复数路径，实数转发原实现。"
-  (if (vt-complex-dtype-p (vt-dtype (ensure-vt vt)))
-      (%cx-repeat-complex vt repeats axis)
-      (funcall (%cx-orig 'vt-repeat) vt repeats :axis axis)))
+(%cx-repeat-complex vt repeats axis))
+
 
 ;;; ==================================================================
 ;;; 5. 集合运算（unique / in1d / isin / intersect / setdiff / setxor）
@@ -449,21 +443,16 @@
               (if invert (- 1 hit) hit)))
           (ensure-vt element) :dtype :int8))
 
-(defun vt-in1d (t1 t2)
+(defun %cx-op-in1d (t1 t2)
   "逐元素判定是否属于 T2（对标 numpy.in1d）。复数按值相等（NaN 与 NaN 视为相等）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt t1)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt t2))))
-      ;; 与实数路径一致：结果形状 = 输入形状（不是展平）
-      (%cx-lookup-flags (ensure-vt t1) (%cx-key-table t2) nil)
-      (funcall (%cx-orig 'vt-in1d) t1 t2)))
+(%cx-lookup-flags (ensure-vt t1) (%cx-key-table t2) nil))
 
-(defun vt-isin (element test-elements &key (invert nil) (assume-unique nil))
+
+(defun %cx-op-isin (element test-elements &key (invert nil) (assume-unique nil))
   "逐元素判定是否属于 TEST-ELEMENTS（对标 numpy.isin）。结果形状同 ELEMENT。"
   (declare (ignore assume-unique))
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt element)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt test-elements))))
-      (%cx-lookup-flags element (%cx-key-table test-elements) invert)
-      (funcall (%cx-orig 'vt-isin) element test-elements :invert invert)))
+(%cx-lookup-flags element (%cx-key-table test-elements) invert))
+
 
 (defun %cx-set-filter (u table invert)
   "按 KEEP-TABLE 过滤已升序的复数唯一值 U（保持顺序）。"
@@ -485,40 +474,32 @@
       (%make-vt :data (subseq (vt-data res) 0 k)
                 :shape (list k) :strides '(1) :offset 0 :dtype dt))))
 
-(defun vt-intersect1d (t1 t2)
+(defun %cx-op-intersect1d (t1 t2)
   "两个 1D 复数张量的交集，结果升序去重（对标 numpy.intersect1d）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt t1)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt t2))))
-      (%cx-set-filter (vt-unique (ensure-vt t1))
-                      (%cx-key-table (vt-unique (ensure-vt t2))) nil)
-      (funcall (%cx-orig 'vt-intersect1d) t1 t2)))
+(%cx-set-filter (vt-unique (ensure-vt t1))
+  (%cx-key-table (vt-unique (ensure-vt t2))) nil))
 
-(defun vt-setdiff1d (t1 t2)
+
+(defun %cx-op-setdiff1d (t1 t2)
   "差集 t1 \\ t2，结果升序去重（对标 numpy.setdiff1d）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt t1)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt t2))))
-      (%cx-set-filter (vt-unique (ensure-vt t1))
-                      (%cx-key-table (vt-unique (ensure-vt t2))) t)
-      (funcall (%cx-orig 'vt-setdiff1d) t1 t2)))
+(%cx-set-filter (vt-unique (ensure-vt t1))
+  (%cx-key-table (vt-unique (ensure-vt t2))) t))
 
-(defun vt-union1d (t1 t2)
+
+(defun %cx-op-union1d (t1 t2)
   "并集，结果升序去重（对标 numpy.union1d）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt t1)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt t2))))
-      (vt-unique (vt-concatenate 0 (vt-unique (ensure-vt t1))
-                                   (vt-unique (ensure-vt t2))))
-      (funcall (%cx-orig 'vt-union1d) t1 t2)))
+(vt-unique (vt-concatenate 0 (vt-unique (ensure-vt t1))
+  (vt-unique (ensure-vt t2)))))
 
-(defun vt-setxor1d (t1 t2)
+
+(defun %cx-op-setxor1d (t1 t2)
   "对称差，结果升序去重（对标 numpy.setxor1d）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt t1)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt t2))))
-      (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
-             (u1 (vt-unique a)) (u2 (vt-unique b))
-             (only1 (%cx-set-filter u1 (%cx-key-table u2) t))
-             (only2 (%cx-set-filter u2 (%cx-key-table u1) t)))
-        (vt-unique (vt-concatenate 0 only1 only2)))
-      (funcall (%cx-orig 'vt-setxor1d) t1 t2)))
+(let* ((a (ensure-vt t1)) (b (ensure-vt t2))
+       (u1 (vt-unique a)) (u2 (vt-unique b))
+       (only1 (%cx-set-filter u1 (%cx-key-table u2) t))
+       (only2 (%cx-set-filter u2 (%cx-key-table u1) t)))
+  (vt-unique (vt-concatenate 0 only1 only2))))
+
 
 ;;; ==================================================================
 ;;; 6. searchsorted（字典序二分）
@@ -554,28 +535,26 @@
                         (setf hi mid)))))
             (setf (aref out k) lo)))))))
 
-(defun vt-searchsorted (tensor values &key (side :left))
+(defun %cx-op-searchsorted (tensor values &key (side :left))
   "在有序张量中查找插入点（对标 numpy.searchsorted）。复数按字典序比较。
 
    :left  → 第一个 >= v 的位置；:right → 第一个 > v 的位置。
    NaN 参与比较时视为「不可比」：落在表尾 NaN 区之前（与排序的 NaN 末尾一致）。"
   (let ((tv (ensure-vt tensor))
         (vv (ensure-vt values)))
-    (if (or (vt-complex-dtype-p (vt-dtype tv))
-            (vt-complex-dtype-p (vt-dtype vv)))
-        (let* ((dt (vt-promote-type (vt-dtype tv) (vt-dtype vv)))
-               (dt (if (vt-complex-dtype-p dt) dt :complex128))
-               (tbl (%cx-flat (vt-astype tv dt)))
-               (val (%cx-flat (vt-astype vv dt)))
-               (nv (vt-size val))
-               (out (make-array nv :element-type '(signed-byte 64)))
-               (right (eq side :right)))
-          (with-float-safe
-            (%cx-searchsorted-run (vt-data tbl) (vt-data val) right out))
-          (%make-vt :data out :shape (vt-shape vv)
-                    :strides (vt-compute-strides (vt-shape vv))
-                    :offset 0 :dtype :int64))
-        (funcall (%cx-orig 'vt-searchsorted) tensor values :side side))))
+    (let* ((dt (vt-promote-type (vt-dtype tv) (vt-dtype vv)))
+         (dt (if (vt-complex-dtype-p dt) dt :complex128))
+         (tbl (%cx-flat (vt-astype tv dt)))
+         (val (%cx-flat (vt-astype vv dt)))
+         (nv (vt-size val))
+         (out (make-array nv :element-type '(signed-byte 64)))
+         (right (eq side :right)))
+    (with-float-safe
+      (%cx-searchsorted-run (vt-data tbl) (vt-data val) right out))
+    (%make-vt :data out :shape (vt-shape vv)
+              :strides (vt-compute-strides (vt-shape vv))
+              :offset 0 :dtype :int64))))
+
 
 ;;; ==================================================================
 ;;; 7. 缺失值归约（nan 族）
@@ -655,15 +634,13 @@
            (%cx-to-out (vt-where empty nanv avg :dtype dt) out name)))))))
 
 ;;; ---- nanmean ------------------------------------------------------
-(defun vt-nanmean (tensor &key axis keepdims dtype out)
+(defun %cx-op-nanmean (tensor &key axis keepdims dtype out)
   "忽略 NaN 的算术平均（对标 numpy.nanmean）。
 
    复数（§16.18）：结果为**复数**（complex64 → complex64）；
    全 NaN 切片 → NaN+NaNj（与 numpy 一致）。"
-  (if (%cx-tensor-p tensor)
-      (%cx-nan-reduce "VT-NANMEAN" tensor axis keepdims dtype out :mean)
-      (funcall (%cx-orig 'vt-nanmean) tensor :axis axis :keepdims keepdims
-               :dtype dtype :out out)))
+(%cx-nan-reduce "VT-NANMEAN" tensor axis keepdims dtype out :mean))
+
 
 ;;; ---- nanvar / nanstd（恒实数）--------------------------------------
 (defun %cx-nan-var (name tensor axis keepdims ddof dtype out std-p)
@@ -694,19 +671,15 @@
       (let ((r (vt-where bad nanv var :dtype rdt)))
         (%cx-to-out (if std-p (vt-sqrt r) r) out name)))))
 
-(defun vt-nanvar (tensor &key axis keepdims (ddof 0) dtype out)
+(defun %cx-op-nanvar (tensor &key axis keepdims (ddof 0) dtype out)
   "忽略 NaN 的方差（对标 numpy.nanvar）。复数结果为**实数**（|x-mean|² 的均值）。"
-  (if (%cx-tensor-p tensor)
-      (%cx-nan-var "VT-NANVAR" tensor axis keepdims ddof dtype out nil)
-      (funcall (%cx-orig 'vt-nanvar) tensor :axis axis :keepdims keepdims
-               :ddof ddof :dtype dtype :out out)))
+(%cx-nan-var "VT-NANVAR" tensor axis keepdims ddof dtype out nil))
 
-(defun vt-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
+
+(defun %cx-op-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
   "忽略 NaN 的标准差（对标 numpy.nanstd）。复数结果为**实数**。"
-  (if (%cx-tensor-p tensor)
-      (%cx-nan-var "VT-NANSTD" tensor axis keepdims ddof dtype out t)
-      (funcall (%cx-orig 'vt-nanstd) tensor :axis axis :keepdims keepdims
-               :ddof ddof :dtype dtype :out out)))
+(%cx-nan-var "VT-NANSTD" tensor axis keepdims ddof dtype out t))
+
 
 ;;; ---- nanargmax / nanargmin ----------------------------------------
 (defun %cx-nan-arg-run (data shape ax op)
@@ -902,27 +875,23 @@
         (:valid (slice (max 0 (1+ (- n m))) offset))
         (:same (slice (max n m) (floor (- full-len (max n m)) 2)))))))
 
-(defun vt-correlate (a v &key (mode :full))
+(defun %cx-op-correlate (a v &key (mode :full))
   "1D 互相关（对标 numpy.correlate）。复数走专用内核（累加器为复数）。
 
    复数语义（与 numpy 一致）：c[k] = Σ a[n+k]·conj(v[n])，即**第二个操作数取共轭**。
    注意默认值是 :full（与 numpy 的 :valid 不同，见原实现文档）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt a)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt v))))
-      (let ((mk (if (null mode) :full (%normalize-mode-keyword mode))))
-        (%cx-correlate a v mk :conj-p t))
-      (funcall (%cx-orig 'vt-correlate) a v :mode mode)))
+(let ((mk (if (null mode) :full (%normalize-mode-keyword mode))))
+  (%cx-correlate a v mk :conj-p t)))
 
-(defun vt-convolve (a v &key (mode :full))
+
+(defun %cx-op-convolve (a v &key (mode :full))
   "1D 卷积（对标 numpy.convolve）。复数：c[k] = Σ a[n]·v[k-n]，**不取共轭**。
 
    实数路径转发原实现；复数复用互相关内核（对 flip(v) 不共轭地相关），
    与 numpy 的 convolve/correlate 分工一致。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt a)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt v))))
-      (let ((mk (if (null mode) :full (%normalize-mode-keyword mode))))
-        (%cx-correlate a (vt-flip (ensure-vt v)) mk :conj-p nil))
-      (funcall (%cx-orig 'vt-convolve) a v :mode mode)))
+(let ((mk (if (null mode) :full (%normalize-mode-keyword mode))))
+  (%cx-correlate a (vt-flip (ensure-vt v)) mk :conj-p nil)))
+
 
 ;;; ==================================================================
 ;;; 9. 张量缩并（tensordot / inner）
@@ -984,28 +953,24 @@
                (r (vt-reshape r2 (append free-a-dims free-b-dims))))
           (%cx-to-out (if dtype (vt-astype r dtype) r) out "VT-TENSORDOT"))))))
 
-(defun vt-tensordot (a b &key (axes 2))
+(defun %cx-op-tensordot (a b &key (axes 2))
   "张量缩并（对标 numpy.tensordot）。复数走 transpose+reshape+matmul 专用路径。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt a)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt b))))
-      (%cx-tensordot a b axes nil nil)
-      (funcall (%cx-orig 'vt-tensordot) a b :axes axes)))
+(%cx-tensordot a b axes nil nil))
 
-(defun vt-inner (a b &key dtype out)
+
+(defun %cx-op-inner (a b &key dtype out)
   "内积（对标 numpy.inner）。复数**不取共轭**（numpy 亦如此；共轭点积见 vt-vdot）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt a)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt b))))
-      (let* ((av (ensure-vt a))
-             (bv (ensure-vt b))
-             (ar (length (vt-shape av)))
-             (br (length (vt-shape bv))))
-        (cond
-          ;; 0 维：numpy.inner 退化为广播乘法
-          ((or (zerop ar) (zerop br))
-           (%cx-to-out (vt-* av bv :dtype dtype) out "VT-INNER"))
-          (t
-           (%cx-tensordot av bv (list (list (1- ar)) (list (1- br))) dtype out))))
-      (funcall (%cx-orig 'vt-inner) a b :dtype dtype :out out)))
+(let* ((av (ensure-vt a))
+       (bv (ensure-vt b))
+       (ar (length (vt-shape av)))
+       (br (length (vt-shape bv))))
+  (cond
+    ;; 0 维：numpy.inner 退化为广播乘法
+    ((or (zerop ar) (zerop br))
+     (%cx-to-out (vt-* av bv :dtype dtype) out "VT-INNER"))
+    (t
+     (%cx-tensordot av bv (list (list (1- ar)) (list (1- br))) dtype out)))))
+
 
 ;;; ==================================================================
 ;;; 10. 缺失值累积 与 共轭点积（补第一轮的漏网）
@@ -1017,42 +982,32 @@
     (with-float-safe
       (vt-where (vt-isnan in) (vt-cast fill dt) in :dtype dt))))
 
-(defun vt-nancumsum (tensor &key axis dtype out)
+(defun %cx-op-nancumsum (tensor &key axis dtype out)
   "沿 AXIS 累积和，NaN 视为 0（对标 numpy.nancumsum）。
 
    复数：原实现走 `(vt-astype input :float64)`（取实部），会**静默丢掉虚部**。
    这里改为「NaN→0+0i 后调用复数 cumsum」，语义与 numpy 完全相同，
    且复用第一轮已优化的扫描内核。"
-  (if (vt-complex-dtype-p (vt-dtype (ensure-vt tensor)))
-      (vt-cumsum (%cx-nan-fill tensor 0) :axis axis :dtype dtype :out out)
-      (funcall (%cx-orig 'vt-nancumsum) tensor :axis axis :dtype dtype :out out)))
+(vt-cumsum (%cx-nan-fill tensor 0) :axis axis :dtype dtype :out out))
 
-(defun vt-nancumprod (tensor &key axis dtype out)
+
+(defun %cx-op-nancumprod (tensor &key axis dtype out)
   "沿 AXIS 累积积，NaN 视为 1（对标 numpy.nancumprod）。复数同 vt-nancumsum。"
-  (if (vt-complex-dtype-p (vt-dtype (ensure-vt tensor)))
-      (vt-cumprod (%cx-nan-fill tensor 1) :axis axis :dtype dtype :out out)
-      (funcall (%cx-orig 'vt-nancumprod) tensor :axis axis :dtype dtype :out out)))
+(vt-cumprod (%cx-nan-fill tensor 1) :axis axis :dtype dtype :out out))
 
-(defun vt-vdot (a b &key dtype out)
+
+(defun %cx-op-vdot (a b &key dtype out)
   "向量点积（对标 numpy.vdot）。复数：**第一个操作数取共轭**
    （vdot(a,b) = Σ conj(a)·b，与 numpy 一致；vt-dot 不取共轭）。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt a)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt b))))
-      (vt-dot (vt-conj (ensure-vt a)) (ensure-vt b) :dtype dtype :out out)
-      (funcall (%cx-orig 'vt-vdot) a b :dtype dtype :out out)))
+(vt-dot (vt-conj (ensure-vt a)) (ensure-vt b) :dtype dtype :out out))
+
 
 ;;; ------------------------------------------------------------------
 ;;; 11. 明确拒绝（与 numpy 一致，但给出可读错误）
 ;;; ------------------------------------------------------------------
 
-(defun vt-digitize (x bins &key (right nil))
-  "分箱（对标 numpy.digitize）。**复数不支持** —— numpy 自己也报
-   `TypeError: x may not be complex`（分箱要求全序，而复数的字典序不是数值序）。
-   这里给出确定性错误，取代原先从类型声明里冒出来的 TYPE-ERROR。"
-  (if (or (vt-complex-dtype-p (vt-dtype (ensure-vt x)))
-          (vt-complex-dtype-p (vt-dtype (ensure-vt bins))))
-      (error "vt-digitize: 复数不可分箱（numpy 对复数同样报 TypeError: x may not be complex）")
-      (funcall (%cx-orig 'vt-digitize) x bins :right right)))
+;;; 第十二轮：vt-digitize 的复数拒绝已并入归属 DEFUN 的守卫（CONVENTIONS §16.32）。
+
 
 ;;; ==================================================================
 ;;; 12. 补齐 numpy **支持**复数的算子（v1.3）
@@ -1208,24 +1163,22 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 ;;; 结果仍是复数。原实现把 final-dtype 定成 float64，导致 vt-mean 收到
 ;;; 复数输入 + 实数 dtype 而报错（我们第一版就撞上了这个）。
 
-(defun vt-standardize (vt &key axis (ddof 0) dtype out)
+(defun %cx-op-standardize (vt &key axis (ddof 0) dtype out)
   "Z-score 标准化 (x - mean) / std（对标 sklearn.preprocessing.scale）。
    复数：均值是复数、标准差是实数（|x-mean|² 的均值开方），结果保复数。"
   (let ((v (ensure-vt vt)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-standardize) vt :axis axis :ddof ddof
-                 :dtype dtype :out out)
-        (let* ((rdt (vt-complex-real-dtype (vt-dtype v)))
-               (cdt (%cx-result-complex-dtype (vt-dtype v) dtype "VT-STANDARDIZE"))
-               (mu (vt-mean v :axis axis :keepdims t :dtype cdt))
-               (sd (vt-std v :axis axis :keepdims t :ddof ddof :dtype rdt))
-               (centered (vt-- v mu :dtype cdt))
-               ;; sd 为 0（常量切片）时按 numpy/sklearn 惯例输出 0 而不是 NaN
-               (zero-sd (vt-< (vt-abs sd) (vt-cast 1d-12 rdt)))
-               (safe-sd (vt-where zero-sd (vt-cast 1 rdt) sd :dtype rdt))
-               (r (vt-/ centered safe-sd))
-               (r (vt-where zero-sd (vt-cast 0 cdt) r :dtype cdt)))
-          (%cx-to-out r out "VT-STANDARDIZE")))))
+    (let* ((rdt (vt-complex-real-dtype (vt-dtype v)))
+         (cdt (%cx-result-complex-dtype (vt-dtype v) dtype "VT-STANDARDIZE"))
+         (mu (vt-mean v :axis axis :keepdims t :dtype cdt))
+         (sd (vt-std v :axis axis :keepdims t :ddof ddof :dtype rdt))
+         (centered (vt-- v mu :dtype cdt))
+         ;; sd 为 0（常量切片）时按 numpy/sklearn 惯例输出 0 而不是 NaN
+         (zero-sd (vt-< (vt-abs sd) (vt-cast 1d-12 rdt)))
+         (safe-sd (vt-where zero-sd (vt-cast 1 rdt) sd :dtype rdt))
+         (r (vt-/ centered safe-sd))
+         (r (vt-where zero-sd (vt-cast 0 cdt) r :dtype cdt)))
+    (%cx-to-out r out "VT-STANDARDIZE"))))
+
 
 ;;; ---- 12.4 cov / corrcoef：厄米特协方差 ---------------------------
 ;;; numpy 的 np.cov 对复数用 X @ X.conj().T（不是 X @ X.T），
@@ -1279,36 +1232,33 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
               sym
               (vt-scale sym (/ 1.0d0 denom)))))))
 
-(defun vt-cov (m &key (y nil y-p) (rowvar t) (ddof nil ddof-p) (bias nil))
+(defun %cx-op-cov (m &key (y nil y-p) (rowvar t) (ddof nil ddof-p) (bias nil))
   "协方差矩阵（对标 numpy.cov）。复数得到**厄米特**矩阵（X·X^H）。"
   (declare (ignore y-p))
   (let ((ddof (if ddof-p ddof 1)))
-    (if (or (%cx-deep-p m) (%cx-deep-p y))
-        (%cx-cov m y rowvar ddof bias)
-        (funcall (%cx-orig 'vt-cov) m :y y :rowvar rowvar
-                 :ddof (if ddof-p ddof 1) :bias bias))))
+    (%cx-cov m y rowvar ddof bias)))
 
-(defun vt-corrcoef (m &key (y nil y-p) (rowvar t))
+
+(defun %cx-op-corrcoef (m &key (y nil y-p) (rowvar t))
   "相关系数矩阵（对标 numpy.corrcoef）。复数结果仍是厄米特矩阵，
    对角为 1.0+0.0j（实数 1）。"
   (declare (ignore y-p))
-  (if (or (%cx-deep-p m) (%cx-deep-p y))
-      (let* ((c (%cx-cov m y rowvar 1 nil))
-             (shape (vt-shape c)))
-        (if (null shape)
-            (vt-full nil (complex 1.0d0 0.0d0) :dtype :complex128)
-            (let* ((n (first shape))
-                   (diag (vt-diagonal c))
-                   ;; 方差在对角上是实数（虚部只有浮点噪声），取模开方
-                   (sd (vt-sqrt (vt-abs diag)))
-                   (den (vt-outer sd sd))
-                   (zero-d (vt-= den (vt-cast 0 (vt-dtype den))))
-                   (safe (vt-where zero-d (vt-cast 1 (vt-dtype den)) den
-                                   :dtype (vt-dtype den)))
-                   (r0 (vt-/ c safe))
-                   (ident (vt-eye n :dtype :complex128)))
-              (vt-where zero-d ident r0 :dtype :complex128))))
-      (funcall (%cx-orig 'vt-corrcoef) m :y y :rowvar rowvar)))
+(let* ((c (%cx-cov m y rowvar 1 nil))
+       (shape (vt-shape c)))
+  (if (null shape)
+      (vt-full nil (complex 1.0d0 0.0d0) :dtype :complex128)
+      (let* ((n (first shape))
+             (diag (vt-diagonal c))
+             ;; 方差在对角上是实数（虚部只有浮点噪声），取模开方
+             (sd (vt-sqrt (vt-abs diag)))
+             (den (vt-outer sd sd))
+             (zero-d (vt-= den (vt-cast 0 (vt-dtype den))))
+             (safe (vt-where zero-d (vt-cast 1 (vt-dtype den)) den
+                             :dtype (vt-dtype den)))
+             (r0 (vt-/ c safe))
+             (ident (vt-eye n :dtype :complex128)))
+        (vt-where zero-d ident r0 :dtype :complex128)))))
+
 
 ;;; ---- 12.5 fromiter：默认 dtype 推断含复数 -------------------------
 ;;; 原实现默认 :float64，且显式传 :float64 时复数会被静默取实部。
@@ -1337,13 +1287,12 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
                            :float64)
                 :count count)))))
 
-(defun vt-positive (tensor &key out dtype)
+(defun %cx-op-positive (tensor &key out dtype)
   "逐元素取正（一元 +，对标 numpy.positive）。复数恒等映射，保复数 dtype。"
   (let ((v (ensure-vt tensor)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-positive) tensor :out out :dtype dtype)
-        (vt-fast-map #'identity v :out out
-                     :dtype (%cx-result-complex-dtype (vt-dtype v) dtype "VT-POSITIVE")))))
+    (vt-fast-map #'identity v :out out
+    :dtype (%cx-result-complex-dtype (vt-dtype v) dtype "VT-POSITIVE"))))
+
 
 ;;; ==================================================================
 ;;; 13. 明确拒绝：numpy 同样不做，但当前实现会**静默丢虚部**

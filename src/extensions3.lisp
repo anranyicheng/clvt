@@ -685,6 +685,8 @@
 (defun vt-positive (tensor &key out dtype)
   "逐元素取正（一元 +，对标 numpy.positive）：数值恒等映射。
    :out 契约同 vt-abs。"
+  (when (%cx-any-p tensor)
+    (return-from vt-positive (%cx-op-positive tensor :out out :dtype dtype)))
   (vt-fast-map #'identity (ensure-vt tensor) :out out :dtype dtype))
 
 (defun %e3-expm1 (x)
@@ -939,6 +941,8 @@
    COPY 仅作 API 兼容（本库不改输入，恒返回新张量）。:out 契约同 vt-abs。
    示例：(vt-nan-to-num '(nan inf -inf 1.0)) => [0.0 1.797e308 -1.797e308 1.0]"
   (declare (ignore copy))
+  (when (%cx-any-p tensor)
+    (return-from vt-nan-to-num (%cx-op-nan-to-num tensor :copy copy :nan nan :posinf posinf :neginf neginf :out out :dtype dtype)))
   (let* ((v (ensure-vt tensor))
          (dt (or dtype (vt-dtype v)))
          (maxf (if (eq dt :float32) 3.4028235f38 most-positive-double-float))
@@ -1081,12 +1085,16 @@
 (defun vt-nancumsum (tensor &key axis dtype out)
   "沿 AXIS 累积和，NaN 视为 0（跳过，不改变累积值）（对标 numpy.nancumsum）。
    AXIS 为 nil 时展平。:out 契约同 vt-cumsum。"
+  (when (%cx-any-p tensor)
+    (return-from vt-nancumsum (%cx-op-nancumsum tensor :axis axis :dtype dtype :out out)))
   (%e3-cumulative-skip-nan tensor :sum 0 :axis axis :dtype dtype :out out
                                  :op-name "vt-nancumsum"))
 
 (defun vt-nancumprod (tensor &key axis dtype out)
   "沿 AXIS 累积积，NaN 视为 1（跳过）（对标 numpy.nancumprod）。
    AXIS 为 nil 时展平。:out 契约同 vt-cumprod。"
+  (when (%cx-any-p tensor)
+    (return-from vt-nancumprod (%cx-op-nancumprod tensor :axis axis :dtype dtype :out out)))
   (%e3-cumulative-skip-nan tensor :prod 1 :axis axis :dtype dtype :out out
                                   :op-name "vt-nancumprod"))
 
@@ -1245,6 +1253,8 @@
   (declare (ignore y-p))
   ;; numpy 的 ddof 缺省值为 1（不是 0）：np.cov(a) 除以 N-1，
   ;; 而 np.cov(a, ddof=0) 除以 N。用 DDOF-P 区分「未传」与「显式 0」。
+  (when (%cx-any-p m)
+    (return-from vt-cov (%cx-op-cov m :y y :rowvar rowvar :ddof ddof :bias bias)))
   (let ((ddof (if ddof-p ddof 1)))
     (let* ((mm (%e3-as-1d-float-transform m rowvar))
            (xx (if y (%e3-as-1d-float-transform y rowvar) nil)))
@@ -1296,6 +1306,8 @@
    对角线恒为 1（数值上）。输入按 float64 计算。
    示例：(vt-corrcoef (vt-from-array #2A((1 2 3)(4 5 6)))) => [[1 1][1 1]]"
   (declare (ignore y-p))
+  (when (%cx-any-p m)
+    (return-from vt-corrcoef (%cx-op-corrcoef m :y y :rowvar rowvar)))
   (let* ((c (vt-cov m :y y :rowvar rowvar))
          (n (first (vt-shape c))))
     (if (null (vt-shape c))
@@ -1376,6 +1388,8 @@
    :out 契约同 vt-dot（标量输出 → 0 维张量）。
    示例：(vt-vdot '(1 2 3) '(4 5 6)) => 32
         (vt-vdot (vt-from-array #2A((1 2)(3 4))) (vt-from-array #2A((5 6)(7 8)))) => 70"
+  (when (%cx-any-p a b)
+    (return-from vt-vdot (%cx-op-vdot a b :dtype dtype :out out)))
   (let ((af (vt-ravel (ensure-vt a)))
         (bf (vt-ravel (ensure-vt b))))
     (when (/= (vt-size af) (vt-size bf))
@@ -1408,6 +1422,8 @@
   "整数幂的方阵（对标 numpy.linalg.matrix_power）。
    N > 0：矩阵连乘 N 次；N = 0：单位阵；N < 0：先求逆再取 |N| 次幂。
    示例：(vt-matrix-power (vt-from-array #2A((1 2)(3 4))) 2) => [[7 10][15 22]]"
+  (when (%cx-any-p matrix n)
+    (return-from vt-matrix-power (%cx-op-matrix-power matrix n)))
   (assert (= 2 (vt-order matrix)) (matrix) "matrix_power 要求 2 维方阵")
   (let ((nrow (first (vt-shape matrix))))
     (assert (= nrow (second (vt-shape matrix))) (matrix) "matrix_power 要求方阵")
@@ -1545,6 +1561,8 @@
   (declare (ignore assume-unique))
   ;; v0.4.2 性能修复：与 vt-in1d 共用哈希会员判定（原 O(n×m) 线性 member，
   ;; 1M×1k 实测 87 秒）。
+  (when (%cx-any-p element test-elements)
+    (return-from vt-isin (%cx-op-isin element test-elements :invert invert :assume-unique assume-unique)))
   (let* ((elem (ensure-vt element))
          (test (ensure-vt test-elements))
          (fm (%membership-float-mode-p elem test)))

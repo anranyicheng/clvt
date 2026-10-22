@@ -287,6 +287,8 @@
   "Z-score 标准化：(x - mean) / std，对标 sklearn.preprocessing.scale。
    结果 dtype 永远是浮点：显式传入整数 dtype 会报错，
    未指定时按输入 dtype 提升到 :float32 / :float64。"
+  (when (%cx-any-p vt)
+    (return-from vt-standardize (%cx-op-standardize vt :axis axis :ddof ddof :dtype dtype :out out)))
   (when (and dtype (member dtype '(:int8 :int16 :int32 :int64
                                    :uint8 :uint16)))
     (error "vt-standardize: 标准化结果必须为浮点 dtype，收到 ~a" dtype))

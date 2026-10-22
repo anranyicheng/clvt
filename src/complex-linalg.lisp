@@ -229,7 +229,7 @@
       (let* ((c (vt-contiguous (vt-astype (vt-copy (ensure-vt v)) :complex128))))
         (values (vt-data c) nrhs one-d)))))
 
-(defun vt-lu (matrix)
+(defun %cx-op-lu (matrix)
   "部分选主元 LU 分解（复数版）。返回 (values a piv sign)：
    a    : 原地修改后的合并 LU 矩阵（complex128，非方阵亦可）
    piv  : fixnum 向量（行置换），满足 P·A = L·U，P[i, piv[i]] = 1
@@ -237,117 +237,111 @@
 
    与实数版的唯一差别是选主元用**模**（复数无全序）。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-lu) matrix)
-        (with-float-safe
-          (multiple-value-bind (a m n) (%cl-cplx-2d v "vt-lu")
-            (let ((piv (make-array m :element-type 'fixnum)))
-              (dotimes (i m) (setf (aref piv i) i))
-              ;; 行主序 m×n 的行距是列数 n（不是行数 m）—— 非方阵时写反会静默错位
-                (multiple-value-bind (sign singular) (%clu-factor! a n m n piv)
-                (declare (ignore singular))
-                (values (%cl-vt a (list m n) :complex128) piv sign))))))))
+    (with-float-safe
+    (multiple-value-bind (a m n) (%cl-cplx-2d v "vt-lu")
+      (let ((piv (make-array m :element-type 'fixnum)))
+        (dotimes (i m) (setf (aref piv i) i))
+        ;; 行主序 m×n 的行距是列数 n（不是行数 m）—— 非方阵时写反会静默错位
+          (multiple-value-bind (sign singular) (%clu-factor! a n m n piv)
+          (declare (ignore singular))
+          (values (%cl-vt a (list m n) :complex128) piv sign)))))))
 
-(defun vt-det (matrix &key out)
+
+(defun %cx-op-det (matrix &key out)
   "基于 LU 分解的行列式（复数版，返回 0 维 complex128 张量）。
    奇异矩阵 → 0+0i（不报错，与 numpy.linalg.det 一致）。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-det) matrix :out out)
-        (with-float-safe
-          (let ((shape (vt-shape v)))
-            (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
-              (error "vt-det: 行列式仅支持方阵，收到形状 ~a" shape))
-            (when out (vt-check-out out nil :complex128 :op-name "vt-det"))
-            (multiple-value-bind (a n n2) (%cl-cplx-2d v "vt-det")
-              (declare (ignore n2))
-              (let ((piv (make-array n :element-type 'fixnum)))
-                (dotimes (i n) (setf (aref piv i) i))
-                (multiple-value-bind (sign singular) (%clu-factor! a n n n piv)
-                  (let ((det (if singular
-                                 (%cl-c0)
-                                 (let ((acc (complex (coerce sign 'double-float) 0.0d0)))
-                                   (declare (type (complex double-float) acc))
-                                   (dotimes (i n acc)
-                                     (setf acc (* acc (aref a (%cl-i n i i)))))))))
-                    (if out
-                        (progn (vt-fill out det) out)
-                        (make-vt nil det :dtype :complex128)))))))))))
+    (with-float-safe
+    (let ((shape (vt-shape v)))
+      (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
+        (error "vt-det: 行列式仅支持方阵，收到形状 ~a" shape))
+      (when out (vt-check-out out nil :complex128 :op-name "vt-det"))
+      (multiple-value-bind (a n n2) (%cl-cplx-2d v "vt-det")
+        (declare (ignore n2))
+        (let ((piv (make-array n :element-type 'fixnum)))
+          (dotimes (i n) (setf (aref piv i) i))
+          (multiple-value-bind (sign singular) (%clu-factor! a n n n piv)
+            (let ((det (if singular
+                           (%cl-c0)
+                           (let ((acc (complex (coerce sign 'double-float) 0.0d0)))
+                             (declare (type (complex double-float) acc))
+                             (dotimes (i n acc)
+                               (setf acc (* acc (aref a (%cl-i n i i)))))))))
+              (if out
+                  (progn (vt-fill out det) out)
+                  (make-vt nil det :dtype :complex128))))))))))
 
-(defun vt-solve (a b &key out)
+
+(defun %cx-op-solve (a b &key out)
   "求解线性方程组 A X = B（复数版，支持多右端项）。
    B 为 1 维时返回 1 维解；为 2 维时返回 n×nrhs。
    奇异矩阵 → 报错（对标 numpy.linalg.LinAlgError）。"
   (let ((av (ensure-vt a))
         (bv (ensure-vt b)))
-    (if (not (or (vt-complex-dtype-p (vt-dtype av))
-                 (vt-complex-dtype-p (vt-dtype bv))))
-        (funcall (%cx-orig 'vt-solve) a b :out out)
-        (with-float-safe
-          (let ((a-shape (vt-shape av)))
-            (unless (and (= 2 (length a-shape)) (= (first a-shape) (second a-shape)))
-              (error "vt-solve: 线性方程组求解要求系数矩阵为方阵，收到形状 ~a" a-shape))
-            (multiple-value-bind (lu n n2) (%cl-cplx-2d av "vt-solve")
-              (declare (ignore n2))
-              (multiple-value-bind (bdata nrhs one-d) (%cl-plain-1d->2d bv n "vt-solve")
-                (let ((piv (make-array n :element-type 'fixnum)))
-                  (dotimes (i n) (setf (aref piv i) i))
-                  (multiple-value-bind (sign singular) (%clu-factor! lu n n n piv)
-                    (declare (ignore sign))
-                    (when singular
-                      (error "vt-solve: 系数矩阵奇异（LU 主元为零），无法求解"))
-                    (%clu-subst! lu n n piv bdata nrhs nrhs)
-                    (let ((res (if one-d
-                                   (%cl-vt bdata (list n) :complex128)
-                                   (%cl-vt bdata (list n nrhs) :complex128))))
-                      (if out
-                          (progn (vt-copy-into (vt-check-out
-                                                out (vt-shape res) :complex128
-                                                :op-name "vt-solve")
-                                               res)
-                                 out)
-                          res)))))))))))
+    (with-float-safe
+    (let ((a-shape (vt-shape av)))
+      (unless (and (= 2 (length a-shape)) (= (first a-shape) (second a-shape)))
+        (error "vt-solve: 线性方程组求解要求系数矩阵为方阵，收到形状 ~a" a-shape))
+      (multiple-value-bind (lu n n2) (%cl-cplx-2d av "vt-solve")
+        (declare (ignore n2))
+        (multiple-value-bind (bdata nrhs one-d) (%cl-plain-1d->2d bv n "vt-solve")
+          (let ((piv (make-array n :element-type 'fixnum)))
+            (dotimes (i n) (setf (aref piv i) i))
+            (multiple-value-bind (sign singular) (%clu-factor! lu n n n piv)
+              (declare (ignore sign))
+              (when singular
+                (error "vt-solve: 系数矩阵奇异（LU 主元为零），无法求解"))
+              (%clu-subst! lu n n piv bdata nrhs nrhs)
+              (let ((res (if one-d
+                             (%cl-vt bdata (list n) :complex128)
+                             (%cl-vt bdata (list n nrhs) :complex128))))
+                (if out
+                    (progn (vt-copy-into (vt-check-out
+                                          out (vt-shape res) :complex128
+                                          :op-name "vt-solve")
+                                         res)
+                           out)
+                    res))))))))))
 
-(defun vt-inv (matrix)
+
+(defun %cx-op-inv (matrix)
   "矩阵求逆（复数版）。奇异矩阵 → 报错。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-inv) matrix)
-        (with-float-safe
-          (let ((shape (vt-shape v)))
-            (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
-              (error "vt-inv: 求逆要求方阵，收到形状 ~a" shape))
-            (multiple-value-bind (lu n n2) (%cl-cplx-2d v "vt-inv")
-              (declare (ignore n2))
-              (let ((piv (make-array n :element-type 'fixnum))
-                    (eye (%cl-eye-buf n)))
-                (dotimes (i n) (setf (aref piv i) i))
-                (multiple-value-bind (sign singular) (%clu-factor! lu n n n piv)
-                  (declare (ignore sign))
-                  (when singular
-                    (error "vt-inv: 矩阵奇异，无法求逆"))
-                  (%clu-subst! lu n n piv eye n n)
-                  (%cl-vt eye (list n n) :complex128)))))))))
+    (with-float-safe
+    (let ((shape (vt-shape v)))
+      (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
+        (error "vt-inv: 求逆要求方阵，收到形状 ~a" shape))
+      (multiple-value-bind (lu n n2) (%cl-cplx-2d v "vt-inv")
+        (declare (ignore n2))
+        (let ((piv (make-array n :element-type 'fixnum))
+              (eye (%cl-eye-buf n)))
+          (dotimes (i n) (setf (aref piv i) i))
+          (multiple-value-bind (sign singular) (%clu-factor! lu n n n piv)
+            (declare (ignore sign))
+            (when singular
+              (error "vt-inv: 矩阵奇异，无法求逆"))
+            (%clu-subst! lu n n piv eye n n)
+            (%cl-vt eye (list n n) :complex128))))))))
 
-(defun vt-matrix-power (matrix n)
+
+(defun %cx-op-matrix-power (matrix n)
   "整数幂方阵（复数版转由 vt-matmul / vt-inv 组合；实数路径不变）。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-matrix-power) matrix n)
-        (with-float-safe
-          (let ((shape (vt-shape v)))
-            (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
-              (error "vt-matrix-power: 要求方阵，收到形状 ~a" shape))
-            ;; 快速幂：acc = A^k（n<0 时先求逆）。负幂下 base 就是 A^-1，
-            ;; 后续照样走平方-乘，与 numpy.linalg.matrix_power 的语义一致。
-            (let ((k (abs n))
-                  (acc (vt-eye (first shape) :dtype :complex128))
-                  (b (if (minusp n) (vt-inv v) (vt-astype v :complex128))))
-              (loop while (plusp k) do
-                (when (oddp k) (setf acc (vt-matmul acc b)))
-                (setf k (ash k -1))
-                (when (plusp k) (setf b (vt-matmul b b))))
-              acc))))))
+    (with-float-safe
+    (let ((shape (vt-shape v)))
+      (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
+        (error "vt-matrix-power: 要求方阵，收到形状 ~a" shape))
+      ;; 快速幂：acc = A^k（n<0 时先求逆）。负幂下 base 就是 A^-1，
+      ;; 后续照样走平方-乘，与 numpy.linalg.matrix_power 的语义一致。
+      (let ((k (abs n))
+            (acc (vt-eye (first shape) :dtype :complex128))
+            (b (if (minusp n) (vt-inv v) (vt-astype v :complex128))))
+        (loop while (plusp k) do
+          (when (oddp k) (setf acc (vt-matmul acc b)))
+          (setf k (ash k -1))
+          (when (plusp k) (setf b (vt-matmul b b))))
+        acc)))))
+
 
 ;;; ==================================================================
 ;;; 4. Cholesky（厄米特正定）
@@ -387,26 +381,25 @@
           (setf (aref l (%cl-i n i j)) (/ s ljj))))))
   l)
 
-(defun vt-cholesky (matrix &key (upper nil))
+(defun %cx-op-cholesky (matrix &key (upper nil))
   "厄米特正定矩阵的 Cholesky 分解（复数版）。返回 L（下三角）或 L^H。
    非正定 → 报错（对标 numpy.linalg.LinAlgError）。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-cholesky) matrix :upper upper)
-        (with-float-safe
-          (let ((shape (vt-shape v)))
-            (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
-              (error "vt-cholesky: 要求方阵，收到形状 ~a" shape))
-            (multiple-value-bind (a n n2) (%cl-cplx-2d v "vt-cholesky")
-              (declare (ignore n2))
-              (let ((l (%cl-make-buf (* n n))))
-                (%cchol-factor! a l n)
-                (let ((lt (%cl-vt l (list n n) :complex128)))
-                  ;; A = L·L^H，所以「上三角」是 L^H = conj-transpose(L)。
-                  ;; 实数下 L^T = L^H，写 transpose 看不出来；复数下写成
-                  ;; transpose 会返回 L^T —— 它满足的是 A = L·(L^T)^T，
-                  ;; 而不是厄米特分解，属于静默错答案。
-                  (if upper (vt-transpose (vt-conj lt)) lt)))))))))
+    (with-float-safe
+    (let ((shape (vt-shape v)))
+      (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
+        (error "vt-cholesky: 要求方阵，收到形状 ~a" shape))
+      (multiple-value-bind (a n n2) (%cl-cplx-2d v "vt-cholesky")
+        (declare (ignore n2))
+        (let ((l (%cl-make-buf (* n n))))
+          (%cchol-factor! a l n)
+          (let ((lt (%cl-vt l (list n n) :complex128)))
+            ;; A = L·L^H，所以「上三角」是 L^H = conj-transpose(L)。
+            ;; 实数下 L^T = L^H，写 transpose 看不出来；复数下写成
+            ;; transpose 会返回 L^T —— 它满足的是 A = L·(L^T)^T，
+            ;; 而不是厄米特分解，属于静默错答案。
+            (if upper (vt-transpose (vt-conj lt)) lt))))))))
+
 
 ;;; ==================================================================
 ;;; 5. QR（复 Householder）
@@ -507,50 +500,49 @@
                   (* w (aref vbuf (+ vo l)))))))))
   q)
 
-(defun vt-qr (matrix &key (mode :reduced))
+(defun %cx-op-qr (matrix &key (mode :reduced))
   "矩阵 QR 分解（复数版）。返回 (values q r)：
    mode = :reduced → q(m×k)、r(k×n)，k = min(m,n)；
    mode = :full    → q(m×m)、r(m×n)。
    Q 的列是复正交基（Q^H·Q = I）。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-qr) matrix :mode mode)
-        (with-float-safe
-          (multiple-value-bind (r m n) (%cl-cplx-2d v "vt-qr")
-            (let* ((k (min m n))
-                   (full (eq mode :full))
-                   (nq (if full m k))
-                   (q (%cl-make-buf (* m nq)))
-                   (vtotal (loop for i from 0 below k sum (- m i)))
-                   (vbuf (%cl-make-buf vtotal))
-                   (betas (make-array (max k 1) :element-type 'double-float
-                                               :initial-element 0.0d0))
-                   (voffs (make-array (max k 1) :element-type 'fixnum
-                                               :initial-element 0)))
-              (declare (type (simple-array double-float (*)) betas)
-                       (type (simple-array fixnum (*)) voffs))
-              (let ((acc 0))
-                (dotimes (i k)
-                  (setf (aref voffs i) acc)
-                  (incf acc (- m i))))
-              ;; Q 初始为单位阵的前 nq 列（m×nq，行距 nq）
-              (dotimes (i (min m nq))
-                (setf (aref q (%cl-i nq i i)) (complex 1.0d0 0.0d0)))
-              ;; 第一遍：逐列构造反射器，就地作用到 R（H_{k-1}···H_0·A = R）
-              (dotimes (i k)
-                (declare (type fixnum i))
-                (%cqr-householder! r n m n i betas vbuf voffs))
-              ;; 第二遍：Q = H_0···H_{k-1}·I_{m×nq}，**逆序左乘**
-              (dotimes (ii k)
-                (declare (type fixnum ii))
-                (let* ((i (- k 1 ii))
-                       (beta (aref betas i)))
-                  (when (plusp beta)
-                    (%cqr-apply-left! q nq m nq i beta vbuf voffs))))
-              ;; Q 实际形状 m×nq
-              (let ((qvt (%cl-vt q (list m nq) :complex128))
-                    (rvt (%cl-vt r (if full (list m n) (list k n)) :complex128)))
-                (values qvt rvt))))))))
+    (with-float-safe
+    (multiple-value-bind (r m n) (%cl-cplx-2d v "vt-qr")
+      (let* ((k (min m n))
+             (full (eq mode :full))
+             (nq (if full m k))
+             (q (%cl-make-buf (* m nq)))
+             (vtotal (loop for i from 0 below k sum (- m i)))
+             (vbuf (%cl-make-buf vtotal))
+             (betas (make-array (max k 1) :element-type 'double-float
+                                         :initial-element 0.0d0))
+             (voffs (make-array (max k 1) :element-type 'fixnum
+                                         :initial-element 0)))
+        (declare (type (simple-array double-float (*)) betas)
+                 (type (simple-array fixnum (*)) voffs))
+        (let ((acc 0))
+          (dotimes (i k)
+            (setf (aref voffs i) acc)
+            (incf acc (- m i))))
+        ;; Q 初始为单位阵的前 nq 列（m×nq，行距 nq）
+        (dotimes (i (min m nq))
+          (setf (aref q (%cl-i nq i i)) (complex 1.0d0 0.0d0)))
+        ;; 第一遍：逐列构造反射器，就地作用到 R（H_{k-1}···H_0·A = R）
+        (dotimes (i k)
+          (declare (type fixnum i))
+          (%cqr-householder! r n m n i betas vbuf voffs))
+        ;; 第二遍：Q = H_0···H_{k-1}·I_{m×nq}，**逆序左乘**
+        (dotimes (ii k)
+          (declare (type fixnum ii))
+          (let* ((i (- k 1 ii))
+                 (beta (aref betas i)))
+            (when (plusp beta)
+              (%cqr-apply-left! q nq m nq i beta vbuf voffs))))
+        ;; Q 实际形状 m×nq
+        (let ((qvt (%cl-vt q (list m nq) :complex128))
+              (rvt (%cl-vt r (if full (list m n) (list k n)) :complex128)))
+          (values qvt rvt)))))))
+
 
 ;;; ==================================================================
 ;;; 6. SVD（单边 Jacobi，复旋转）
@@ -739,42 +731,40 @@
                   (setf (aref vh (%cl-i n j i)) (%cconj (aref uc (%cl-i k i j))))))
               (values u sc vh k)))))))
 
-(defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 60) (tol 1e-15))
+(defun %cx-op-svd (matrix &key (full-matrices nil) (max-sweeps 60) (tol 1e-15))
   "奇异值分解 A = U·S·V^H（复数版）。返回 (values u s vh)：
    full-matrices = nil → u(m×k)、s(k)、vh(k×n)，k = min(m,n)
    full-matrices = t   → u(m×m)、s(k)、vh(n×n)
    奇异值**降序**，s 是实数（float64）。
    实现为单边 Jacobi（§ 本节注释里的复旋转推导）。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-svd) matrix
-                 :full-matrices full-matrices :max-sweeps max-sweeps :tol tol)
-        (with-float-safe
-          (multiple-value-bind (a m n) (%cl-cplx-2d v "vt-svd")
-            (multiple-value-bind (u s vh k)
-                (%csvd-core a m n :max-sweeps max-sweeps :tol tol)
-              (let* ((sv (%cl-vt s (list k) :float64))
-                     (uvt (%cl-vt u (list m k) :complex128))
-                     (vvt (%cl-vt vh (list k n) :complex128)))
-                (if full-matrices
-                    (let ((uf (%cl-orthonormal-complete u m k))
-                          (vhf (%cl-make-buf (* n n))))
-                      ;; V^H 补全 = (补全 V)^H：先补 V 的列（= VH 的行取共轭）
-                      (let ((vfull (%cl-make-buf (* n n))))
-                        ;; V 的列 j（j<k）= conj(vh 第 j 行)
-                        (dotimes (j k)
-                          (dotimes (i n)
-                            (setf (aref vfull (%cl-i n i j))
-                                  (%cconj (aref vh (%cl-i n j i))))))
-                        (let ((vcomp (%cl-orthonormal-complete vfull n k)))
-                          (dotimes (j n)
-                            (dotimes (i n)
-                              (setf (aref vhf (%cl-i n j i))
-                                    (%cconj (aref vcomp (%cl-i n i j))))))))
-                      (values (%cl-vt uf (list m m) :complex128)
-                              sv
-                              (%cl-vt vhf (list n n) :complex128)))
-                    (values uvt sv vvt)))))))))
+    (with-float-safe
+    (multiple-value-bind (a m n) (%cl-cplx-2d v "vt-svd")
+      (multiple-value-bind (u s vh k)
+          (%csvd-core a m n :max-sweeps max-sweeps :tol tol)
+        (let* ((sv (%cl-vt s (list k) :float64))
+               (uvt (%cl-vt u (list m k) :complex128))
+               (vvt (%cl-vt vh (list k n) :complex128)))
+          (if full-matrices
+              (let ((uf (%cl-orthonormal-complete u m k))
+                    (vhf (%cl-make-buf (* n n))))
+                ;; V^H 补全 = (补全 V)^H：先补 V 的列（= VH 的行取共轭）
+                (let ((vfull (%cl-make-buf (* n n))))
+                  ;; V 的列 j（j<k）= conj(vh 第 j 行)
+                  (dotimes (j k)
+                    (dotimes (i n)
+                      (setf (aref vfull (%cl-i n i j))
+                            (%cconj (aref vh (%cl-i n j i))))))
+                  (let ((vcomp (%cl-orthonormal-complete vfull n k)))
+                    (dotimes (j n)
+                      (dotimes (i n)
+                        (setf (aref vhf (%cl-i n j i))
+                              (%cconj (aref vcomp (%cl-i n i j))))))))
+                (values (%cl-vt uf (list m m) :complex128)
+                        sv
+                        (%cl-vt vhf (list n n) :complex128)))
+              (values uvt sv vvt))))))))
+
 
 ;;; ==================================================================
 ;;; 7. 厄米特特征值（Jacobi，复数）
@@ -894,26 +884,25 @@
           (complex (realpart (aref a (%cl-i n i i))) 0.0d0)))
   a)
 
-(defun vt-eig (matrix &key (max-iter 200) (tol 1e-10) (uplo :lower))
+(defun %cx-op-eig (matrix &key (max-iter 200) (tol 1e-10) (uplo :lower))
   "厄米特矩阵特征值分解（复数版，Jacobi 旋转）。
    与实数 vt-eig 的契约一致（numpy.linalg.eigh 的 UPLO 语义）：不校验
    厄米特性，只使用 UPLO 指定的三角，并**用共轭**镜像到另一三角。
    返回 (values vals vecs)：vals 为 float64（厄米特矩阵的特征值必为实数），
    降序；vecs 为 complex128 n×n，列是特征向量。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-eig) matrix :max-iter max-iter :tol tol :uplo uplo)
-        (with-float-safe
-          (let ((shape (vt-shape v)))
-            (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
-              (error "vt-eig: 特征值分解要求方阵，收到形状 ~a" shape))
-            (multiple-value-bind (a n n2) (%cl-cplx-2d v "vt-eig")
-              (declare (ignore n2))
-              (%cl-hermitian-mirror! a n uplo)
-              (multiple-value-bind (vals vecs)
-                  (%ceig-core a n :max-iter max-iter :tol tol)
-                (values (vt-from-sequence (coerce vals 'list) :dtype :float64)
-                        (%cl-vt vecs (list n n) :complex128)))))))))
+    (with-float-safe
+    (let ((shape (vt-shape v)))
+      (unless (and (= 2 (length shape)) (= (first shape) (second shape)))
+        (error "vt-eig: 特征值分解要求方阵，收到形状 ~a" shape))
+      (multiple-value-bind (a n n2) (%cl-cplx-2d v "vt-eig")
+        (declare (ignore n2))
+        (%cl-hermitian-mirror! a n uplo)
+        (multiple-value-bind (vals vecs)
+            (%ceig-core a n :max-iter max-iter :tol tol)
+          (values (vt-from-sequence (coerce vals 'list) :dtype :float64)
+                  (%cl-vt vecs (list n n) :complex128))))))))
+
 
 ;;; ==================================================================
 ;;; 8. pinv / lstsq / matrix-rank
@@ -929,91 +918,88 @@
     (declare (ignore what))
     (values u s vh)))
 
-(defun vt-pinv (matrix &key (rcond 1e-15))
+(defun %cx-op-pinv (matrix &key (rcond 1e-15))
   "Moore-Penrose 伪逆（复数版）：A⁺ = V·Σ⁺·U^H。"
   (let ((v (ensure-vt matrix)))
-    (if (not (vt-complex-dtype-p (vt-dtype v)))
-        (funcall (%cx-orig 'vt-pinv) matrix :rcond rcond)
-        (with-float-safe
-          (multiple-value-bind (u s vh) (%csvd-of v "vt-pinv")
-            (let* ((k (vt-size s))
-                   (sd (vt-data s))
-                   (smax 0.0d0)
-                   (cutoff 0.0d0))
-              (declare (type double-float smax cutoff))
-              (dotimes (i k) (setf smax (max smax (aref sd i))))
-              (setf cutoff (* rcond smax))
-              ;; Σ⁺：k×k 对角
-              (let ((sp (%cl-make-buf (* k k))))
-                (dotimes (i k)
-                  (when (> (aref sd i) cutoff)
-                    (setf (aref sp (%cl-i k i i))
-                          (complex (/ 1.0d0 (aref sd i)) 0.0d0))))
-                ;; A⁺ = V·Σ⁺·U^H = (vh)^H · sp · u^H
-                (let* ((vv (vt-transpose (vt-conj vh)))       ; n×k
-                       (spv (%cl-vt sp (list k k) :complex128))
-                       (uh (vt-transpose (vt-conj u))))       ; k×m
-                  (vt-matmul (vt-matmul vv spv) uh)))))))))
+    (with-float-safe
+    (multiple-value-bind (u s vh) (%csvd-of v "vt-pinv")
+      (let* ((k (vt-size s))
+             (sd (vt-data s))
+             (smax 0.0d0)
+             (cutoff 0.0d0))
+        (declare (type double-float smax cutoff))
+        (dotimes (i k) (setf smax (max smax (aref sd i))))
+        (setf cutoff (* rcond smax))
+        ;; Σ⁺：k×k 对角
+        (let ((sp (%cl-make-buf (* k k))))
+          (dotimes (i k)
+            (when (> (aref sd i) cutoff)
+              (setf (aref sp (%cl-i k i i))
+                    (complex (/ 1.0d0 (aref sd i)) 0.0d0))))
+          ;; A⁺ = V·Σ⁺·U^H = (vh)^H · sp · u^H
+          (let* ((vv (vt-transpose (vt-conj vh)))       ; n×k
+                 (spv (%cl-vt sp (list k k) :complex128))
+                 (uh (vt-transpose (vt-conj u))))       ; k×m
+            (vt-matmul (vt-matmul vv spv) uh))))))))
 
-(defun vt-lstsq (a b &key (rcond 1e-15))
+
+(defun %cx-op-lstsq (a b &key (rcond 1e-15))
   "最小二乘 min‖Ax-b‖₂（复数版）。返回 (values x residual rank s)。
    residual：仅当 m>n 且满列秩时给出；否则 0.0d0（与实数版一致）。"
   (let ((av (ensure-vt a))
         (bv (ensure-vt b)))
-    (if (not (or (vt-complex-dtype-p (vt-dtype av))
-                 (vt-complex-dtype-p (vt-dtype bv))))
-        (funcall (%cx-orig 'vt-lstsq) a b :rcond rcond)
-        (with-float-safe
-          (let* ((shape (vt-shape av)))
-            (unless (= 2 (length shape))
-              (error "vt-lstsq: 系数矩阵必须是 2 维，收到形状 ~a" shape))
-            (let* ((m (first shape))
-                   (n (second shape))
-                   (b-shape (vt-shape bv))
-                   (nrhs (if (or (null b-shape) (= 1 (length b-shape)))
-                             1
-                             (second b-shape)))
-                   (bmat (if (or (null b-shape) (= 1 (length b-shape)))
-                             (vt-reshape (vt-astype (vt-copy bv) :complex128) (list m 1))
-                             (vt-astype (vt-copy bv) :complex128))))
-              (multiple-value-bind (u s vh) (%csvd-of av "vt-lstsq")
-                (let* ((k (vt-size s))
-                       (sd (vt-data s))
-                       (smax 0.0d0)
-                       (cutoff 0.0d0)
-                       (rank 0))
-                  (declare (type fixnum rank) (type double-float smax cutoff))
-                  (dotimes (i k) (setf smax (max smax (aref sd i))))
-                  (setf cutoff (* rcond smax))
-                  (dotimes (i k) (when (> (aref sd i) cutoff) (incf rank)))
-                  ;; x = V·Σ⁺·U^H·b
-                  (let* ((sp (%cl-make-buf (* k k)))
-                         (uhb (vt-matmul (vt-transpose (vt-conj u)) bmat))  ; k×nrhs
-                         (scaled (%cl-make-buf (* k nrhs))))
-                    (declare (type (simple-array (complex double-float) (*)) scaled))
-                    (dotimes (i k)
-                      (when (> (aref sd i) cutoff)
-                        (setf (aref sp (%cl-i k i i))
-                              (complex (/ 1.0d0 (aref sd i)) 0.0d0))))
-                    (dotimes (i k)
-                      (dotimes (j nrhs)
-                        (setf (aref scaled (%cl-i nrhs i j))
-                              (* (aref (vt-data uhb) (%cl-i nrhs i j))
-                                 (aref sp (%cl-i k i i))))))
-                    (let* ((scaled-vt (%cl-vt scaled (list k nrhs) :complex128))
-                           (vv (vt-transpose (vt-conj vh)))
-                           (x (vt-matmul vv scaled-vt)))
-                      ;; residual 与实数版契约一致
-                      (let ((res (if (and (> m n) (= rank n))
-                                     (float (vt-item (vt-norm
-                                                      (vt-flatten
-                                                       (vt-- bmat (vt-matmul av x)))))
-                                            1.0d0)
-                                     0.0d0))
-                            (xr (if (= nrhs 1)
-                                    (vt-flatten (vt-slice x '(:all) '(0)))
-                                    x)))
-                        (values xr res rank s))))))))))))
+    (with-float-safe
+    (let* ((shape (vt-shape av)))
+      (unless (= 2 (length shape))
+        (error "vt-lstsq: 系数矩阵必须是 2 维，收到形状 ~a" shape))
+      (let* ((m (first shape))
+             (n (second shape))
+             (b-shape (vt-shape bv))
+             (nrhs (if (or (null b-shape) (= 1 (length b-shape)))
+                       1
+                       (second b-shape)))
+             (bmat (if (or (null b-shape) (= 1 (length b-shape)))
+                       (vt-reshape (vt-astype (vt-copy bv) :complex128) (list m 1))
+                       (vt-astype (vt-copy bv) :complex128))))
+        (multiple-value-bind (u s vh) (%csvd-of av "vt-lstsq")
+          (let* ((k (vt-size s))
+                 (sd (vt-data s))
+                 (smax 0.0d0)
+                 (cutoff 0.0d0)
+                 (rank 0))
+            (declare (type fixnum rank) (type double-float smax cutoff))
+            (dotimes (i k) (setf smax (max smax (aref sd i))))
+            (setf cutoff (* rcond smax))
+            (dotimes (i k) (when (> (aref sd i) cutoff) (incf rank)))
+            ;; x = V·Σ⁺·U^H·b
+            (let* ((sp (%cl-make-buf (* k k)))
+                   (uhb (vt-matmul (vt-transpose (vt-conj u)) bmat))  ; k×nrhs
+                   (scaled (%cl-make-buf (* k nrhs))))
+              (declare (type (simple-array (complex double-float) (*)) scaled))
+              (dotimes (i k)
+                (when (> (aref sd i) cutoff)
+                  (setf (aref sp (%cl-i k i i))
+                        (complex (/ 1.0d0 (aref sd i)) 0.0d0))))
+              (dotimes (i k)
+                (dotimes (j nrhs)
+                  (setf (aref scaled (%cl-i nrhs i j))
+                        (* (aref (vt-data uhb) (%cl-i nrhs i j))
+                           (aref sp (%cl-i k i i))))))
+              (let* ((scaled-vt (%cl-vt scaled (list k nrhs) :complex128))
+                     (vv (vt-transpose (vt-conj vh)))
+                     (x (vt-matmul vv scaled-vt)))
+                ;; residual 与实数版契约一致
+                (let ((res (if (and (> m n) (= rank n))
+                               (float (vt-item (vt-norm
+                                                (vt-flatten
+                                                 (vt-- bmat (vt-matmul av x)))))
+                                      1.0d0)
+                               0.0d0))
+                      (xr (if (= nrhs 1)
+                              (vt-flatten (vt-slice x '(:all) '(0)))
+                              x)))
+                  (values xr res rank s)))))))))))
+
 
 (defun vt-matrix-rank (matrix &optional (tol nil))
   "矩阵秩（复数版）：基于奇异值，判定阈值为

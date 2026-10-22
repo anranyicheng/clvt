@@ -101,6 +101,8 @@
    - 1D × 1D：标量内积。
    - ND × MD：a 的最后一维与 b 的最后一维收缩，
      输出形状 = a.shape[:-1] ++ b.shape[:-1]。"
+  (when (%cx-any-p a b)
+    (return-from vt-inner (%cx-op-inner a b :dtype dtype :out out)))
   (let* ((a-vt (ensure-vt a))
          (b-vt (ensure-vt b))
          (ar (length (vt-shape a-vt)))
@@ -130,6 +132,8 @@
    axes 为 (a-axes b-axes)：按指定轴列表收缩（两列表长度必须相等，
    支持负轴，按各自秩归一化——v0.3.5 修复：旧实现不归一化负轴，
    负轴被当作自由轴处理，产生错误结果或内部错误）。"
+  (when (%cx-any-p a b)
+    (return-from vt-tensordot (%cx-op-tensordot a b :axes axes)))
   (let* ((a-vt (ensure-vt a))
          (b-vt (ensure-vt b))
          (ar (length (vt-shape a-vt)))

@@ -933,6 +933,8 @@
   dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 显式 :dtype，否则按输入提升
   （:float32 → :float32，其余 → :float64，均值恒为浮点）。**不由 out 决定**；
   out 必须精确匹配结果 shape/dtype。空归约区结果为 NaN。"
+  (when (%cx-any-p tensor)
+    (return-from vt-mean (%cx-op-mean tensor :axis axis :keepdims keepdims :dtype dtype :out out)))
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (multiple-value-bind (axes count) (%get-axes-count axis rank shape)
@@ -979,6 +981,8 @@
   "方差（对标 numpy.var）。
   dtype 语义同 vt-mean（§4.2 H3「严格相等」）。DDOF 为自由度增量（缺省 0，
   即总体方差）。有效样本数 ≤ ddof 时结果为 NaN。"
+  (when (%cx-any-p tensor)
+    (return-from vt-var (%cx-op-var tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (multiple-value-bind (axes n) (%get-axes-count axis rank shape)
@@ -1021,6 +1025,8 @@
 
 (defun vt-std (tensor &key axis keepdims (ddof 0) dtype out)
   "标准差 sqrt(vt-var)（对标 numpy.std）。dtype 语义同 vt-var。"
+  (when (%cx-any-p tensor)
+    (return-from vt-std (%cx-op-std tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
   (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
          ;; 结果 dtype 同 vt-mean/vt-var：输入提升 + 显式 :dtype，不由 out 决定。
          (final-dtype (or dtype compute-dtype))
@@ -1192,10 +1198,14 @@
 
 (defun vt-cumsum (tensor &key axis dtype out)
   "沿 AXIS 的累积和（axis 缺省全展平）。等价 (vt-cumulative tensor #\+ 0 :axis axis)。"
+  (when (%cx-any-p tensor)
+    (return-from vt-cumsum (%cx-op-cumsum tensor :axis axis :dtype dtype :out out)))
   (vt-cumulative tensor #'+ 0 :axis axis :dtype dtype :out out))
 
 (defun vt-cumprod (tensor &key axis dtype out)
   "沿 AXIS 的累积积（axis 缺省全展平）。等价 (vt-cumulative tensor #\* 1 :axis axis)。"
+  (when (%cx-any-p tensor)
+    (return-from vt-cumprod (%cx-op-cumprod tensor :axis axis :dtype dtype :out out)))
   (vt-cumulative tensor #'* 1 :axis axis :dtype dtype :out out))
 
 ;;; ------------------------------------------------------------------
@@ -1583,6 +1593,8 @@
 
 (defun vt-median (tensor &key axis keepdims)
   "中位数（对标 numpy.median）。偶数个元素取中间两数平均。"
+  (when (%cx-any-p tensor)
+    (return-from vt-median (%cx-op-median tensor :axis axis :keepdims keepdims)))
   (with-float-safe
     (let ((nanv (vt-get-nan :float64)))
       (if axis
@@ -1854,6 +1866,8 @@
   "升序排序（对标 numpy.sort）。AXIS 缺省 -1；NaN 排在末尾。"
   ;; ===== 快路径：axis=nil 且输入连续 =====
   ;; 展平后就是一整段连续 run，直接原地排序；结果仍是一维（与原实现一致）。
+  (when (%cx-any-p tensor)
+    (return-from vt-sort (%cx-op-sort tensor :axis axis)))
   (when (and (null axis) (plusp (vt-size tensor)) (vt-contiguous-p tensor))
     (let ((r (vt-copy (vt-flatten tensor))))
       (when (%sort-fibers (vt-data r) (the fixnum (vt-size r)) 1)
@@ -1926,6 +1940,8 @@
 
 (defun vt-argsort (tensor &key (axis -1))
   "返回升序排序后的下标（对标 numpy.argsort）。AXIS 缺省 -1。"
+  (when (%cx-any-p tensor)
+    (return-from vt-argsort (%cx-op-argsort tensor :axis axis)))
   (with-float-safe
     (if (null axis)
         (let* ;; v0.4.4：改用 vt-contiguous 而不是 vt-ravel —— vt-ravel 对
@@ -2120,6 +2136,8 @@
 
   dtype 语义（§4.2 H3「严格相等」）：结果 dtype = 输入浮点提升 + 显式 :dtype，
   **不由 out 决定**；out 的 dtype 必须精确等于结果 dtype。"
+  (when (%cx-any-p tensor)
+    (return-from vt-nanmean (%cx-op-nanmean tensor :axis axis :keepdims keepdims :dtype dtype :out out)))
   (let* ((compute-dtype (if (eq (vt-dtype (ensure-vt tensor)) :float32) :float32 :float64))
          ;; 结果 dtype：输入提升 + 显式 :dtype（nan 族恒为浮点）
          (final-dtype (or dtype compute-dtype)))
@@ -2156,6 +2174,8 @@
 
   性能：axis=nil 走两趟特化内核（和+计数 → 离差平方和），
   原实现的 10+ 趟中间张量流水线在 1M double 上实测 331ms。"
+  (when (%cx-any-p tensor)
+    (return-from vt-nanvar (%cx-op-nanvar tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
   (let* ((compute-dtype (if (eq (vt-dtype (ensure-vt tensor)) :float32)
                             :float32 :float64))
          (final-dtype (or dtype compute-dtype)))
@@ -2199,6 +2219,8 @@
 
 (defun vt-nanstd (tensor &key axis keepdims (ddof 0) dtype out)
   "忽略 NaN 的标准差（sqrt(vt-nanvar)）。dtype 语义同 vt-nanvar。"
+  (when (%cx-any-p tensor)
+    (return-from vt-nanstd (%cx-op-nanstd tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
   (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
          (final-dtype (or dtype compute-dtype)))
     (let ((var (vt-nanvar tensor :axis axis :keepdims keepdims :ddof ddof
@@ -2378,6 +2400,8 @@
   三种模式本身与 numpy 逐值一致（:full/:valid/:same 均已对齐）；
   需要 numpy 默认行为时请显式写 :mode :valid。
   core-test 与 test-all 均以 :full 为约定，故此处只修正文档，不改默认。"
+  (when (%cx-any-p a v)
+    (return-from vt-correlate (%cx-op-correlate a v :mode mode)))
   (when (null mode) (setf mode :full))
   (let* ((mode-kw (%normalize-mode-keyword mode))
          (a-flat (vt-contiguous (vt-flatten a)))
@@ -2459,6 +2483,8 @@
 
 (defun vt-convolve (a v &key (mode :full))
   "1D 卷积，对标 np.convolve。mode 支持关键字(:full/:valid/:same)或字符串。"
+  (when (%cx-any-p a v)
+    (return-from vt-convolve (%cx-op-convolve a v :mode mode)))
   (vt-correlate (vt-contiguous a)
                 (vt-contiguous (vt-flip v))
                 :mode (%normalize-mode-keyword mode)))

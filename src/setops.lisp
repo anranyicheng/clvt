@@ -396,6 +396,8 @@
 
 (defun vt-intersect1d (t1 t2)
   "求两个 1D 张量的交集，结果升序去重（对标 numpy.intersect1d）。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-intersect1d (%cx-op-intersect1d t1 t2)))
   (let* ((v1 (ensure-vt t1))
          (v2 (ensure-vt t2))
          (u2 (vt-unique v2))
@@ -405,10 +407,14 @@
 
 (defun vt-union1d (t1 t2)
   "求两个 1D 张量的并集，结果升序去重（对标 numpy.union1d）。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-union1d (%cx-op-union1d t1 t2)))
   (vt-unique (vt-concatenate 0 (vt-unique (ensure-vt t1)) (vt-unique (ensure-vt t2)))))
 
 (defun vt-setdiff1d (t1 t2)
   "求差集 t1 \ t2（在 t1 中但不在 t2），结果升序去重（对标 numpy.setdiff1d）。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-setdiff1d (%cx-op-setdiff1d t1 t2)))
   (let* ((v1 (ensure-vt t1))
          (v2 (ensure-vt t2))
          (fm (%membership-float-mode-p v1 v2)))
@@ -416,6 +422,8 @@
 
 (defun vt-setxor1d (t1 t2)
   "求对称差（仅出现在其中一个集合中），结果升序去重（对标 numpy.setxor1d）。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-setxor1d (%cx-op-setxor1d t1 t2)))
   (let* ((v1 (ensure-vt t1))
          (v2 (ensure-vt t2))
          (dt (vt-dtype v1))
@@ -435,6 +443,8 @@
    dtype 为 :int8（F4：比较/逻辑结果一律 :int8）。
    v0.4.1 修复（差分测试 R7）：此前返回 :float64。
    v0.4.2 性能修复：哈希会员判定，O(n+m)（原 O(n×m)，1M×1k 需 87s）。"
+  (when (%cx-any-p t1 t2)
+    (return-from vt-in1d (%cx-op-in1d t1 t2)))
   (let* ((elem (ensure-vt t1))
          (test (ensure-vt t2))
          (fm (%membership-float-mode-p elem test)))

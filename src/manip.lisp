@@ -704,6 +704,8 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
   ;; 独立成 (when ... (return-from ...)) 是有意的：不改动下方既有分支
   ;; 的嵌套层次，回退/审查都只需看这一段。
   ;; ================================================================
+  (when (%cx-any-p vt repeats)
+    (return-from vt-repeat (%cx-op-repeat vt repeats :axis axis)))
   (when (and (null axis) (integerp repeats))
     (let* ((flat (vt-contiguous (vt-flatten vt)))
            (size (vt-size flat))

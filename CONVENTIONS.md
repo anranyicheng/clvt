@@ -2811,6 +2811,18 @@ float32 内算仍是 1.5、`c64+#C(1 2)` 正确、`i8+1` 不溢出）。
 | S2 | 一元超越（24） | 24 | `return-from` + `vt-fast-map`；删 `%cx-def-unary` |
 | S3 | 比较 6 / 谓词 3 / 极值 4 | 13 | 同上；删三个宏 |
 | S4 | 归约族（14） | 14 | **`def-vt-reduce` 拆成「`%REDUCE-<NAME>` 实现 + `def-vt-reduce-facade` 门面」**，一个门面覆盖 14 个符号 |
+| S5-A | 顶层单个 `IF` 形态 | 29 | 抽出复数臂做 `%CX-OP-<NAME>`，实数文件插守卫；脚本化（读器跳注释/字符串，按 lambda-list 做位置+关键字映射），结构检查 29/29 全过 |
+| S5-B1 | `LET` 包裹 `IF` 形态 | 6 | 同上，但把 `LET` 绑定一起搬进内部函数（绑定只依赖形参） |
+| S5-B2 | `LET` + `UNLESS` 早退形态 | 5 | 删掉 `unless` 早退块、改名、插守卫 |
+| S5-C | 线代（11） | 11 | 与 B1 同法 |
+
+合计 **143 / 159（90%）**。三种形态的判据：
+
+| 形态 | 形状 | 变换 |
+|---|---|---|
+| A | `(if TEST <orig枝> <复数臂>)` 是顶层唯一 form | 抽臂 → `%CX-OP-X`，守卫调用 |
+| B1 | `(let BIND (if TEST <orig枝> <复数臂>))` | 连 `BIND` 一起搬进 `%CX-OP-X` |
+| B2 | `(let BIND (unless … (return-from X (funcall orig…))) <复数代码>)` | 删 `unless` 块 → 改名 |
 
 S4 的拆分是必须的：`all`/`any` 的复数语义是「先把复数转成 int8 真值掩码，再喂回同一个实现」。
 单一定义下没有 `%cx-orig` 可以回调，只能调实现函数 —— 这就是「实现 + 门面」两层的由来
@@ -2848,21 +2860,35 @@ S4 的拆分是必须的：`all`/`any` 的复数语义是「先把复数转成 i
 - 复数语义抽样（字典序极值、`any` 的真值规则、`argmax` 的 `:int64`、`c64` 不被提升、`any` 的 NaN 规则）；
 - 复数归约的 `:out` 契约。
 
-#### 16.32.7 剩余工作（65 个，S5）
+#### 16.32.7 剩余 16 个（143 / 159 已完成）
 
-65 个 M2 符号尚未迁移，其中：
+口径：原始覆盖 159 = 已迁移 143 + 剩余 16，无统计偏差。
 
-| 类别 | 数量 | 说明 |
-|---|---:|---|
-| 纯新增符号（无 `%cx-orig`） | 6 | `vt-@ vt-angle vt-conj vt-expt vt-imag vt-real` —— 不是覆盖，是**重复实现**（两处 `defun`，后者生效，前者是死代码），应删一处 |
-| lambda-list 漂移 | 9 | 见 16.32.5，需先裁决语义 |
-| 机械可迁移 | 50 | 形状统一：`(if (%cx-tensor-p …) <complex> (funcall (%cx-orig …) …))` → 抽出 complex 臂做 `%cx-*`，实数文件插守卫 |
+| 类别 | 数量 | 符号 | 阻塞点 |
+|---|---:|---|---|
+| **重复实现**（两处 `defun`，都不调 `%cx-orig`） | 6 | `vt-@ vt-angle vt-conj vt-expt vt-imag vt-real` | 要**搬迁**而非覆盖：`complex.lisp` 那份是完整实现（实数+复数），归属文件那份是早期桩，应把前者搬到归属文件、删后者 |
+| 手写 `setf` 包装 | 2 | `vt-log`、`vt-float-power` | 各有额外关键字（`:base`、`:power`），需单独改成体内分派 |
+| `&optional` / `&rest` 形态 | 5 | `vt-clamp` `vt-clip` `vt-average` `vt-view` `vt-fromiter` | 带 `supplied-p` 变量（`min-p`/`max-p`），多一层转发会**改变 supplied 语义** —— 这正是 `vt-clip` 注释里记录过的陷阱，必须逐个人工写 |
+| lambda-list 漂移 | 2 | `vt-matrix-rank`（`tol 1e-10` vs `nil`）、`vt-nanmedian`（有无 `dtype`） | 先裁决语义 |
+| 形状不符 | 1 | `vt-unique` | 顶层不是「单 let 包单 if」，需人工 |
 
-迁移顺序建议按「历史 bug 密度」：`median`/`sort`/`argsort`/`cumsum`/`cumprod`/`mean`/`var`/`std`/`average`（第九、十轮的病灶）→ 集合族 → 线代 11 个。
+**关于那 6 个「重复实现」，搬迁比覆盖更值得做**：以 `vt-conj` 为例，
+`extensions3.lisp` 的版本写着「本库无复数 dtype，恒返回输入本身」——
+它是**错的**（对复数会把共轭算成恒等）。今天它之所以无害，纯粹因为
+`complex.lisp` 后加载把它盖掉了；一旦有人调整 `clvt.asd` 的文件顺序，
+`(vt-conj #C(1 2))` 就会静默返回 `#C(1 2)`。这是「覆盖掩盖了错误实现」的实例，
+比死代码更危险。
 
-**验收口径**：`grep -c "setf (symbol-function" src/*.lisp` 全为 0、`*cx-originals*` 删除、
-`%cx-orig` 删除、三个文件的 `eval-when` 预捕获清单删除，然后把 `complex-dispatch-test`
-的 92 个名字扩到 159。
+**验收口径（S6）**：
+
+```sh
+grep -c "setf (symbol-function" src/*.lisp   # 只剩 0（当前 2）
+grep -c "%cx-orig" src/*.lisp                # 全为 0（当前 76 处引用）
+grep -n "cx-orig" src/*.lisp | grep eval-when # 预捕获清单删除
+```
+
+然后把 `complex-dispatch-test` 的 143 个名字扩到 159 —— 那条「定义名必须等于符号本身」
+的断言会自动覆盖新增的每一个。
 
 ---
 
@@ -2931,7 +2957,13 @@ S4 的拆分是必须的：`all`/`any` 的复数语义是「先把复数转成 i
 | `src/reduce-stats.lisp` | **第十二轮**：4 个拒绝型（`histogram`/`interp`/`percentile` 族）+ 3 个谓词（`isnan` 族）；`def-vt-reduce` 拆成 `%REDUCE-<NAME>` 实现 + `def-vt-reduce-facade` 门面（14 个符号） |
 | `src/indexing.lisp` | **第十二轮**：`vt-bincount` 加拒绝型守卫 |
 | `src/complex.lisp` / `src/complex-ops.lisp` | **第十二轮**：删 `%cx-def-unsupported`/`-unary`/`-compare`/`-minmax`/`-predicate`/`-reduce`/`-nan-reduce`/`-bool-reduce` 八个宏与全部调用；`%cx-deep-p`/`%cx-tensor-p`/`%cx-result-complex-dtype` 迁出 |
-| `test/complex-dispatch-test.lisp` | **第十二轮新增** 15 断言（结构契约：具名 DEFUN / list 入参 / 实数不回归 / 复数抽样 / `:out`），注册后共 51 套件 |
+| `src/linalg.lisp` | **第十二轮**：`vt-dot`/`vt-matmul`/`vt-outer`/`vt-trace`/`vt-norm` 加体内分派；线代 9 个（`cholesky det eig inv lstsq lu pinv qr svd`）+ `vt-solve` 抽复数臂为 `%cx-op-*` |
+| `src/setops.lisp` | **第十二轮**：集合族（`in1d isin intersect1d setdiff1d setxor1d union1d`）加体内分派 |
+| `src/extensions.lisp` | **第十二轮**：`vt-inner`/`vt-tensordot` 加体内分派 |
+| `src/extensions2.lisp` | **第十二轮**：`vt-standardize` 加体内分派 |
+| `src/manip.lisp` | **第十二轮**：`vt-repeat` 加体内分派 |
+| `src/complex-linalg.lisp` | **第十二轮**：10 个公开 `defun` 抽成 `%cx-op-*` 内部实现（仅 `vt-matrix-rank` 因 `&optional` 未迁） |
+| `test/complex-dispatch-test.lisp` | **第十二轮新增** 15 断言（结构契约：143 个符号必须是具名 DEFUN / list 入参 / 实数不回归 / 复数抽样 / `:out`），注册后共 51 套件 |
 
 ---
 

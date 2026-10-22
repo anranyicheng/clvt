@@ -1273,6 +1273,8 @@
 
 (defun vt-matmul (a b &key dtype out)
   "矩阵乘法，兼容 1d 向量（对标 numpy 的 @ 运算符）。"
+  (when (%cx-any-p a b)
+    (return-from vt-matmul (%cx-op-matmul a b :dtype dtype :out out)))
   (let ((ra (vt-order a))
         (rb (vt-order b)))
     (cond
@@ -1315,6 +1317,8 @@
    - 若 a,b 均为 2d → 矩阵乘法 a @ b。 
    - 若 a,b 秩均 ≥2 → 批量矩阵乘法 '...ij,...jk->...ik'。 
    其他情况请直接使用 vt-einsum。"
+  (when (%cx-any-p a b)
+    (return-from vt-dot (%cx-op-dot a b :dtype dtype :out out)))
   (with-float-safe
     (let ((ra (length (vt-shape (ensure-vt a)))) 
           (rb (length (vt-shape (ensure-vt b)))))
@@ -1341,6 +1345,8 @@
   flatten = nil:
     保留输入的每个轴，将所有轴拼接形成新张量。
     例如：2d 与 3d 计算后得到 5d 张量；若包含标量(0维)，则直接广播相乘。"
+  (when (%cx-any-p a b)
+    (return-from vt-outer (%cx-op-outer a b :flatten flatten :dtype dtype :out out)))
   (with-float-safe
     (let* ((a-vt (ensure-vt a))
            (b-vt (ensure-vt b))
@@ -1382,6 +1388,8 @@
    —— 2 维时两者等价，batch 输入需显式给出才能复现 numpy 缺省行为。
 
    复数：结果保持复数 dtype（见 complex.lisp 的同名分派）。"
+  (when (%cx-any-p matrix)
+    (return-from vt-trace (%cx-op-trace matrix :offset offset :axis1 axis1 :axis2 axis2 :dtype dtype :out out)))
   (let ((rank (length (vt-shape (ensure-vt matrix)))))
     ;; 硬契约用 ERROR 而非 ASSERT：assert 可能被 (safety 0) 编译剔除
     (when (< rank 2)
@@ -1397,6 +1405,8 @@
   "l2 范数（欧几里得范数）
    - 整数输入按 NumPy 语义提升到 float64，避免整数 sqrt 截断。
    - 若提供 out，求和与开方将原地执行，零临时内存分配。"
+  (when (%cx-any-p vt)
+    (return-from vt-norm (%cx-op-norm vt :axis axis :keepdims keepdims :dtype dtype :out out)))
   (with-float-safe
     (let* ((in-dtype (vt-dtype vt))
            (effective-dtype (or dtype
@@ -1742,6 +1752,8 @@ wh: 连续工作矩阵句柄（通用: simple-array；AVX: SAP），行主序，
      用 sb-simd AVX/FMA 内核（FMA 乘加，舍入分组略有差异）；
   2. 通用路径：原实现的纯标量循环，逐元素位一致。
   *vt-linalg-simd-enabled* 控制路由，两条路径共享选主元/行交换语义。"
+  (when (%cx-any-p matrix)
+    (return-from vt-lu (%cx-op-lu matrix)))
   (let* ((a (ensure-contiguous-2d-vt (vt-astype matrix :float64)))
          (m (first (vt-shape a)))    ; 行数
          (n (second (vt-shape a)))   ; 列数
@@ -1772,6 +1784,8 @@ wh: 连续工作矩阵句柄（通用: simple-array；AVX: SAP），行主序，
 
 (defun vt-det (matrix &key out)
   "基于 lu 分解计算行列式，返回 0 维张量"
+  (when (%cx-any-p matrix)
+    (return-from vt-det (%cx-op-det matrix :out out)))
   (with-float-safe
     (let ((shape (vt-shape matrix)))
       ;; 校验方阵
@@ -1872,6 +1886,8 @@ lu/b/ob: 连续行主序句柄（通用: simple-array；AVX: SAP），s1=1。"
      O(n³) 主受益）；
   2. 通用路径：原实现的纯标量循环，逐元素位一致。
   *vt-linalg-simd-enabled* 控制路由，两条路径共享置换/阈值/奇异报错语义。"
+  (when (%cx-any-p a b)
+    (return-from vt-solve (%cx-op-solve a b :out out)))
   (with-float-safe
     (let* ((a-shape (vt-shape a)))
       ;; 校验系数矩阵为方阵
@@ -1953,6 +1969,8 @@ lu/b/ob: 连续行主序句柄（通用: simple-array；AVX: SAP），s1=1。"
 
 (defun vt-inv (matrix)
   "矩阵求逆。"
+  (when (%cx-any-p matrix)
+    (return-from vt-inv (%cx-op-inv matrix)))
   (with-float-safe
     (let* ((n (first (vt-shape matrix)))
            (identity (vt-eye n :dtype (vt-dtype matrix))))
@@ -2109,6 +2127,8 @@ w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=
   2. 通用路径：原算法 + 行 AXPY 重构（修复原实现按列跨行访问的
      性能缺陷，逐元素求和顺序不变），纯标量 aref，无 SIMD 依赖。
   两条路径共享 Householder 公式、迭代次序与输出形状契约。"
+  (when (%cx-any-p matrix)
+    (return-from vt-qr (%cx-op-qr matrix :mode mode)))
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
     (let* ((row (first  (vt-shape matrix)))
@@ -2683,6 +2703,8 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
   2. 通用路径：同一转置布局 + 纯标量内核（保留原实现的 Jacobi 算法与
      全部语义，修复其按列跨行访问的性能缺陷），无 SIMD 依赖。
   两条路径共享迭代次序、收敛判据、零奇异值补全与重建逻辑。"
+  (when (%cx-any-p matrix)
+    (return-from vt-svd (%cx-op-svd matrix :full-matrices full-matrices :max-sweeps max-sweeps :tol tol)))
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
     (let* ((mat (vt-astype matrix :float64))
@@ -2780,6 +2802,8 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
      sb-simd AVX/FMA 内核；
   2. 通用路径：原实现算法（逐元素顺序一致），纯标量 aref。
   *vt-linalg-simd-enabled* 控制路由，非正定报错与 upper 语义共享。"
+  (when (%cx-any-p matrix)
+    (return-from vt-cholesky (%cx-op-cholesky matrix :upper upper)))
   (assert (= 2 (vt-order matrix)))
   (let ((shape (vt-shape matrix)))
     (assert (= (first shape) (second shape))
@@ -2941,6 +2965,8 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
   2. 通用路径：原 vt-eig 算法逐元素一致（完善：vt-ref 函数调用开销
      → 直接 aref），纯标量，无 SIMD 依赖。
   两条路径共享旋转公式、收敛判据、特征值降序排序与输出契约。"
+  (when (%cx-any-p matrix)
+    (return-from vt-eig (%cx-op-eig matrix :max-iter max-iter :tol tol :uplo uplo)))
   (assert (= 2 (vt-order matrix)))
   (let ((shape (vt-shape matrix)))
     (assert (= (first shape) (second shape))
@@ -3008,6 +3034,8 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
 
 (defun vt-pinv (matrix &key (rcond 1e-15))
   "Moore-Penrose 伪逆。"
+  (when (%cx-any-p matrix)
+    (return-from vt-pinv (%cx-op-pinv matrix :rcond rcond)))
   (assert (= 2 (vt-order matrix)))
   (with-float-safe
     (multiple-value-bind (u s vt-mat) (vt-svd matrix)
@@ -3041,6 +3069,8 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
 
 (defun vt-lstsq (a b &key (rcond 1e-15))
   "最小二乘解 min ||Ax - b||_2。"
+  (when (%cx-any-p a b)
+    (return-from vt-lstsq (%cx-op-lstsq a b :rcond rcond)))
   (assert (= 2 (vt-order a)))
   (with-float-safe
     (let* ((m (first (vt-shape a)))
