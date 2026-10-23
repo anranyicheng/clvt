@@ -14,7 +14,7 @@
 
 ---
 
-## H.1 累计变更文件清单（第一～十六轮）
+## H.1 累计变更文件清单（第一～十七轮）
 
 ### 16.20 累计变更文件清单（第一～十二轮）
 
@@ -102,6 +102,12 @@
 | `test/cumulative-axis-test.lisp` | **第十五轮新增** 70 断言（沿轴累积的朴素参照对照 + 性能护栏 + nanmedian 多轴/复数/`:out` 契约） |
 | `src/reduce-stats.lisp` | **第十六轮**：`%vt-cumulative` 补 `vt-out-snapshot`（流式累积的 `:out` 错位重叠会把输入写坏，§16.36.1）；`vt-nanmedian` 入口拦截两处 dtype 静默降级（实数忽略 `:dtype`、复数取实部丢虚部，§16.36.2） |
 | `test/cumulative-axis-test.lisp` | **第十六轮**：70 → **78 断言**（新增 C 组：`:out` 偏移重叠 2 + 完全别名 1 + dtype 拦截 4 + 退化多轴 1） |
+| `src/core.lisp` | **第十七轮**：`%astype-cast-form` 增加源类型参数（复数→实取实部、实→复虚部补 0）；`vt-astype` 连续分支补 34 个复数子句（含同型 `replace` 块拷贝）；非连续回退改走新的 `%gather-contiguous`（§16.4.1） |
+| `CONVENTIONS.md` | **第十七轮**：新增 §16.4.1「转换必须落在按元素类型展开的循环里」+ 判据 |
+| `test/astype-cast-test.lisp` | **第十七轮新增** 663 断言（100 格矩阵 / 契约 / 非连续等价 / 倍率护栏），注册后共 55 套件 |
+| `test/gen_astype_cast_expected.py` | **第十七轮新增** 期望值生成器（100 用例，numpy 2.4.6 实测） |
+| `test/astype-cast-expected.sexp` | **第十七轮新增** 生成产物 |
+| `test/run-tests.sh` | **第十七轮**：注册 `astype-cast-test`（SUITES + DEFAULT_ORDER） |
 
 ---
 
@@ -135,7 +141,7 @@ LAMBDA，`declaim inline` 对调用点失效；哪些符号被覆盖无法静态
 
 ---
 
-## H.3 §16 后半章的详细叙事（第五～十六轮）
+## H.3 §16 后半章的详细叙事（第五～十七轮）
 
 > 为什么单独成节：这些内容原先住在 `CONVENTIONS.md` §16.21–§16.36，按
 > 「症状 → 根因 → 修法 → 实测」写，与 `CHANGELOG.md` 的对应条目是**同一件事
@@ -915,3 +921,120 @@ n=256、单线程、预分配缓冲区、只计内核本身（不含 `make-vt`/`
 > SBCL 默认开着 `OVERFLOW/INVALID/DIVIDE-BY-ZERO` 陷阱，于是 NaN 判定
 > `(= x x)`、`inf + (-inf)` 都会直接抛 `FLOATING-POINT-INVALID-OPERATION`。
 > 现在整个函数体与实数版一致地包在 `WITH-FLOAT-SAFE` 里。
+
+---
+
+### H.3.11 第十七轮：`vt-astype` 的复数转换为什么慢 8~15 倍
+
+#### 症状
+
+用户反馈「`vt-astype` 对复数的转换太慢」。基线（1M 元素，SBCL 2.6.8，同进程
+6 次取最优）：
+
+| 转换 | 耗时 | 同规模实数对照 |
+|---|---:|---:|
+| `c128→c128`（同 dtype！） | 17 ms | `f64→f64` 1 ms |
+| `c128→c64` | 31 ms | `f64→f32` 1 ms |
+| `c64→c128` | 26 ms | — |
+| `c128→f64` | 25 ms | — |
+| `c128→i64` | 34 ms | `f64→i64` 3 ms |
+| `f64→c128` | 27 ms | — |
+| `f64→c64` | 41 ms | — |
+| 1000×1000 转置视图 `c128T→c64` | 35 ms | `f64T` 同类 3~4 ms |
+
+numpy 2.4.6 同机同规模为 0.2~0.5 ms（内存带宽下限），但这不作为目标 ——
+目标是「与自家实数线同量级」。
+
+#### 根因：兜底分支吃掉了全部复数组合
+
+`vt-astype` 的连续视图分支是一条手写的 `cond`，按 `(源元素类型, 目标元素类型)`
+展开 `spec` 特化循环。它列了 8 种实数元素类型的组合，**一种复数都没有**：
+
+```lisp
+((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 64)))
+ (spec double-float (signed-byte 64)))
+...
+(t                                  ; ← 复数全部落在这里
+ (let ((conv (vt-cast-fun new-dtype)))
+   (dotimes (i size)
+     (setf (aref new-data i) (funcall conv (aref in-data p))))))
+```
+
+兜底分支有三个叠加的代价：`in-data` / `new-data` 没有类型声明（泛型 `aref`
+每次做数组分派）、`vt-cast-fun` 返回的是**闭包**（`funcall` 不可内联）、
+闭包体内每个元素都要 `complexp` 判断 + `realpart`/`imagpart` 解包再 `coerce`
+重组。1M 元素 = 1M 次装箱。
+
+顺带暴露的第二处：**同 dtype 的复数转换也没有块拷贝分支**，于是
+`(vt-astype z :complex128)` 这种「纯拷贝」比 `f64→f64` 慢 17 倍。
+
+#### 修法（三层，都在 `src/core.lisp`）
+
+1. **`%astype-cast-form` 增加源类型参数**，把 §16.4 的三条语义编进代码生成：
+   目标复数 + 源复数 → 分量各自 `coerce`；目标复数 + 源实数 → 虚部补 `0.0d0/0.0s0`；
+   目标实/整 + 源复数 → 先 `realpart` 再走原来的 `%coerce-int*` / `coerce`。
+   实数路径生成的代码逐字不变（`spec` 只多传一个 `in-lt`）。
+2. **补 34 个分支**：同型复数 2 个 `memcpy`（`replace` 块拷贝，interleaved 布局
+   逐位相同）、复数↔复数 2 个、复数→实/整 16 个、实/整→复数 16 个。
+3. **非连续视图新增 `%gather-contiguous`**：按 `strides` 做**同 dtype 特化收集**。
+   同 dtype 时它就是答案（一趟）；跨 dtype 时作为中间副本，交给连续 cast。
+   原来「逐元素 `funcall` + 泛型 aref」的游走只剩「未知元素类型」一条退路。
+
+> 为什么不是「先 `vt-contiguous` 再递归」：`vt-contiguous` 走 `vt-copy-into`，
+> 对非连续复数视图同样是泛型 aref —— 实测 `(vt-copy c128T)` 就要 17 ms，
+> 先物化再转换合计反而更慢。所以收集这一步必须自己特化。
+
+#### 实测（1M 元素，同进程 6 次取最优）
+
+| 转换 | 优化前 | 优化后 | 倍数 |
+|---|---:|---:|---:|
+| `c128→c128` | 17 ms | 3 ms | 5.7× |
+| `c128→c64` | 31 ms | 2 ms | 15.5× |
+| `c64→c128` | 26 ms | 3 ms | 8.7× |
+| `c64→c64` | 12 ms | 2 ms | 6.0× |
+| `c128→f64` | 25 ms | 2 ms | 12.5× |
+| `c128→f32` | 21 ms | 1 ms | 21× |
+| `c128→i64` | 34 ms | 3 ms | 11× |
+| `f64→c128` | 27 ms | 3 ms | 9.0× |
+| `f64→c64` | 41 ms | 2 ms | 20× |
+| `i64→c128` | 19 ms | 3 ms | 6.3× |
+| 转置 `c128T→c128` | 21 ms | 5 ms | 4.2× |
+| 转置 `c128T→c64` | 35 ms | 8 ms | 4.4× |
+| 转置 `c64T→c128` | 28 ms | 8 ms | 3.5× |
+
+实数线（`f64→f64` 1 ms、`f64→f32` 1 ms、`f64→i64` 3 ms）**不受影响**：
+新分支只按元素类型追加，实数组合命中的仍是原来那些子句。
+
+#### 一条负结果：转置视图的 16 MB 拷贝仍比 numpy 慢一个量级
+
+`c128T→c128` 现在 5 ms，numpy 0.44 ms。原因不是元素装箱（已消除），而是
+访存次序：转置视图按行主序走 = 读一个 16 B 元素跳 16 KB，每元素一次 cache line。
+手写实验（`test` 外的临时脚本）证实：同样 1M 元素，**列主序走（读连续、写跨行）
+0 ms 级、行主序走 2 ms**，而 `vt-copy` 的泛型 walker 17 ms —— 也就是
+「特化」解决了 8 倍，「循环次序」还压着 2~4 倍。
+
+后者要动 `vt-copy-into` 的循环次序选择（按 strides 选「读连续」的轴序，
+或分块转置），影响面覆盖全库所有 strided 拷贝，**本轮不做**，留在
+`§16.37` 的未完成项里。
+
+#### 顺带修掉的一处文档口径
+
+§16.4 原来写「`vt-astype` 的所有快/慢路径都经由此出口」—— 读者会理解成
+「运行期调用 `vt-cast-fun` 的闭包也行」。实际契约是**语义统一**、**执行特化**，
+已在 §16.4.1 写清，并给出判据（复数转换 ≤ 10× 实数线）。
+
+#### 测试
+
+新增 `test/astype-cast-test.lisp`（663 断言）：
+
+| 组 | 内容 |
+|---|---|
+| 矩阵 | 10 dtype × 10 dtype = 100 格，每格断言 dtype / shape / 连续性 / 独立缓冲 / 逐元素值 |
+| 契约 | 取实部、虚部补 +0.0、`-0.0` 保号、NaN 传播、NaN/Inf→整数 0、rank-0、空张量、广播视图 |
+| 非连续 | 转置 / 翻转 / 切片 / 广播 4 种视图 × 8 目标 dtype，与「先物化再转换」逐位一致 |
+| 护栏 | 复数转换 ≤ 8~10× 实数线（按倍率，不看绝对毫秒） |
+
+期望值由 `test/gen_astype_cast_expected.py` 从 numpy 2.4.6 实测生成
+（`test/astype-cast-expected.sexp`，100 条）；源值全部取 |v| ≤ 100 的整数/半整数，
+使窄整数目标的回绕在 numpy 与 CL 两侧同义；非有限值不进矩阵（numpy 对
+NaN/Inf→整数是平台相关的 C cast，本库契约为 0，用契约断言单独覆盖）。
