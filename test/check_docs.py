@@ -12,6 +12,7 @@
 本门禁把这三类问题变成**可机械检查**的断言：
 
   C1  代码注释里不得出现「第 N 轮」        → 编年史只允许在 HISTORY.md / CHANGELOG.md
+  C1b CONVENTIONS 正文不得出现「本轮」     → 契约不谈时序，读者不知道「本轮」是哪一轮
   C2  `§x.y` 引用必须能解析到真实小节       → 防锚点漂移（改编号后忘了改引用）
   C3  CONVENTIONS 的 §16.x 三级编号必须递增 → 防再次插入错位
   C4  HISTORY.md 必须存在且被 CONVENTIONS 引用 → 防契约与编年史再次合流
@@ -29,6 +30,7 @@ HIST = ROOT / "HISTORY.md"
 CODE_GLOBS = ["src/*.lisp", "test/*.lisp"]
 
 ROUND_RE = re.compile(r"第[一二三四五六七八九十]+轮")
+NOW_RE = re.compile(r"本轮|这一轮|上一轮|前几轮")
 HEAD_RE = re.compile(r"^#{2,4}\s+(\d+(?:\.\d+)*)\b", re.M)
 REF_RE = re.compile(r"§\s*(\d+\.\d+(?:\.\d+)?)")
 
@@ -53,6 +55,18 @@ def main():
             "代码注释里出现「第 N 轮」（编年史应只写在 HISTORY.md / CHANGELOG.md，"
             "代码注释请改写成无时序的现状陈述）：\n    " + "\n    ".join(hits[:10])
             + (f"\n    …共 {len(hits)} 处" if len(hits) > 10 else ""))
+
+    # ---------- C1b: CONVENTIONS 正文不得有「本轮」 ----------
+    # 跳过门禁自身的说明行（§0 的规则表里必须写出这些词才能描述规则）
+    now_hits = [f"CONVENTIONS.md:{i}: {l.strip()[:70]}"
+                for i, l in enumerate(conv.splitlines(), 1)
+                if NOW_RE.search(l) and "C1b" not in l]
+    if now_hits:
+        errors.append(
+            "CONVENTIONS.md 出现「本轮 / 这一轮 / 上一轮 / 前几轮」"
+            "（契约不写时序：改成「这里 / 这次改动」，或把过程移到 HISTORY.md）：\n    "
+            + "\n    ".join(now_hits[:8])
+            + (f"\n    …共 {len(now_hits)} 处" if len(now_hits) > 8 else ""))
 
     # ---------- C2: §x.y 引用必须可解析 ----------
     anchors = set(HEAD_RE.findall(conv))
@@ -100,7 +114,7 @@ def main():
 
     n_sections = len(anchors)
     print(f"[docs] OK: 代码注释无轮次编号；{n_sections} 个 §锚点全部可解析；"
-          f"§16.x 递增；HISTORY.md 已接入")
+          f"§16.x 递增；无时序用语；HISTORY.md 已接入")
     for w in warns:
         print("[docs] " + w)
     sys.exit(0)
