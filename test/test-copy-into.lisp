@@ -331,7 +331,93 @@
     (check t "空 (3,0) 拷贝")))
 
 ;;; ==================================================================
-;;; 10. 错误路径
+;;; 10.5 复数 × 非连续（%copy-generic 的 typed-walk 必须覆盖 16/8 字节复数）
+;;;
+;;; 教训：`%copy-generic` 的按元素类型展开的分派表若缺 `(complex double-float)`
+;;; / `(complex single-float)`，复数会掉进 `%copy-generic-slow` 的泛型 aref
+;;; （每元素装箱/解包），1000×1000 转置视图 17ms（特化后 6ms 以内）。
+;;; 这里既验正确性（与独立参照逐位相等），也验选路没有退化（倍率护栏）。
+;;; ==================================================================
+
+(defun test-copy-complex-strided ()
+  (format t "~&[complex x strided]~%")
+  ;; ---- 2-D 转置视图：c128 / c64 ----
+  (dolist (dt '(:complex128 :complex64))
+    (let* ((m (vt-from-sequence
+               (list (list #C(1 1) #C(2 2) #C(3 3))
+                     (list #C(4 4) #C(5 5) #C(6 6))
+                     (list #C(7 7) #C(8 8) #C(9 9)))
+               :dtype dt))
+           (tm (vt-transpose m)))
+      (check-equal (list (list (vt-cast #C(1 1) dt) (vt-cast #C(4 4) dt) (vt-cast #C(7 7) dt))
+                         (list (vt-cast #C(2 2) dt) (vt-cast #C(5 5) dt) (vt-cast #C(8 8) dt))
+                         (list (vt-cast #C(3 3) dt) (vt-cast #C(6 6) dt) (vt-cast #C(9 9) dt)))
+                   (vt-to-list (vt-copy tm))
+                   (format nil "~a 转置视图 vt-copy" dt))))
+
+  ;; ---- 负步长（翻转）视图 ----
+  (let* ((m (vt-from-sequence (list (list #C(1d0 0d0) #C(2d0 0d0))
+                                    (list #C(3d0 0d0) #C(4d0 0d0)))
+                              :dtype :complex128))
+         (fm (vt-flip m :axis 0)))
+    (check-equal (list (list #C(3d0 0d0) #C(4d0 0d0))
+                       (list #C(1d0 0d0) #C(2d0 0d0)))
+                 (vt-to-list (vt-copy fm))
+                 "c128 负步长视图 vt-copy"))
+
+  ;; ---- 3-D 置换视图：与「按定义逐点计算」的独立参照对比 ----
+  (let* ((d0 2) (d1 3) (d2 4)
+         (flat (loop for i below d0 append
+                     (loop for j below d1 append
+                           (loop for k below d2
+                                 collect (complex (float (+ (* 100 i) (* 10 j) k) 1d0)
+                                                  (float (- (+ (* 100 i) (* 10 j) k)) 1d0))))))
+         (base (vt-reshape (vt-from-sequence flat :dtype :complex128) (list d0 d1 d2)))
+         (perm (vt-transpose base '(1 2 0)))     ; view[j,k,i] = base[i,j,k]
+         (want (loop for j below d1 collect
+                     (loop for k below d2 collect
+                           (loop for i below d0
+                                 collect (complex (float (+ (* 100 i) (* 10 j) k) 1d0)
+                                                  (float (- (+ (* 100 i) (* 10 j) k)) 1d0)))))))
+    (check-equal want (vt-to-list (vt-copy perm)) "c128 3-D 置换视图 vt-copy"))
+
+  ;; ---- 非连续 dest：转置视图作目标，写入后按行主序读回 ----
+  (let* ((buf (vt-zeros (list 3 2) :dtype :complex128))
+         (dst (vt-transpose buf))               ; (2,3)，strides=(1,2)
+         (src (vt-from-sequence (list (list #C(1d0 1d0) #C(2d0 2d0) #C(3d0 3d0))
+                                      (list #C(4d0 4d0) #C(5d0 5d0) #C(6d0 6d0)))
+                                :dtype :complex128)))
+    (vt-copy-into dst src)
+    (check-equal (list (list #C(1d0 1d0) #C(4d0 4d0))
+                       (list #C(2d0 2d0) #C(5d0 5d0))
+                       (list #C(3d0 3d0) #C(6d0 6d0)))
+                 (vt-to-list buf)
+                 "c128 非连续 dest 写入"))
+
+  ;; ---- 性能护栏：复数转置拷贝 ≤ 8× 同形实数（2 倍字节数，实测约 2×）----
+  (let* ((n 1000000)
+         (z (vt-+ (vt-zeros (list n) :dtype :complex128) #C(1d0 0.5d0)))
+         (d (vt-+ (vt-zeros (list n)) 1.0d0))
+         (tz (vt-transpose (vt-reshape z (list 1000 1000))))
+         (td (vt-transpose (vt-reshape d (list 1000 1000)))))
+    (flet ((ms (fn)
+             (let ((best most-positive-fixnum))
+               (dotimes (_ 4)
+                 (sb-ext:gc :full t)
+                 (let ((t0 (get-internal-real-time)))
+                   (funcall fn)
+                   (setf best (min best (- (get-internal-real-time) t0)))))
+               (/ (* 1000.0d0 best) internal-time-units-per-second))))
+      (let ((tc (ms (lambda () (vt-copy tz))))
+            (tr (ms (lambda () (vt-copy td)))))
+        (format t "~&  [perf] c128T vt-copy ~,2f ms | f64T ~,2f ms | 倍率 ~,1f×~%"
+                tc tr (/ tc (max tr 0.001d0)))
+        (check (<= tc (* 8.0d0 (max tr 0.001d0)))
+               (format nil "c128T vt-copy ≤ 8× f64T（实测 ~,1f×）"
+                       (/ tc (max tr 0.001d0))))))))
+
+;;; ==================================================================
+;;; 11. 错误路径
 ;;; ==================================================================
 
 (defun test-copy-errors ()
@@ -369,6 +455,7 @@
   (test-copy-overlap)
   (test-copy-rank-cases)
   (test-copy-empty)
+  (test-copy-complex-strided)
   (test-copy-errors)
   (format t "~&=== 通过 ~d, 失败 ~d ===~%"
           *copy-test-passed* *copy-test-failed*)

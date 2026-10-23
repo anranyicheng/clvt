@@ -4,6 +4,41 @@
 
 ---
 
+## 2026-10-23（十八）— 第十八轮：转置视图的复数拷贝提速（`vt-copy` 17 → 6 ms）
+
+**行为变化**：无。只换遍历形态，落点、dtype、形状一律不变。
+
+**性能**（1M 元素，SBCL 2.6.8）：
+
+| 场景 | 修前 | 修后 | 同形实数对照 |
+|---|---:|---:|---:|
+| `vt-copy` 转置 c128T | 17 ms | **6 ms** | 3 ms |
+| `vt-contiguous` 转置 c128T | 17 ms | **6 ms** | 4 ms |
+| `vt-astype` 转置 c128T→c128 | 6 ms | **4 ms** | — |
+| `vt-astype` 转置 c128T→c64 | 9 ms | **7 ms** | — |
+
+两处根因，都不是上一轮猜的「访存次序」：
+
+1. `%gather-contiguous` 用全轴 odometer，每元素约 5 ns 的固定开销（1M = 5 ms）。
+   改成**末轴 `DOTIMES` 展开、其余轴走 odometer**后，转置收集 6 → 1 ms；
+2. `%copy-generic`（`vt-copy`/`vt-contiguous`/`vt-copy-into` 的公共内核）的
+   按元素类型分派表里**缺复数两格**，复数整片掉进泛型 `aref`。补两格即回到实数线。
+
+**同时更正上一轮的一条错误结论**：`c128T→c128` 曾被写成「比 numpy 慢一个量级」。
+复核发现 numpy 的 `astype` 缺省 `order='K'`（转置输入返回 F 连续结果 = 一次线性流），
+同口径要写 `order='C'`（1.05 ms）；而「差距在访存次序」也不成立 —— 手写实验脚本
+当时的「列主序 0 ms」写错了内层步长。详见 `HISTORY.md` §H.3.11 的更正与 §H.3.12。
+
+**已知且不修**：SBCL 的 `replace` 没有 16 字节元素的 basher，`(complex double-float)`
+的同型块拷贝只能逐元素（5~10 ms/1M，而 `double-float` 是 1 ms）。`sb-kernel` 的
+`system-area-ub8-copy` 能到 1.5 ms 级，但属内部符号且需 pinning，与「可移植优先」
+冲突，已写进 `CONVENTIONS.md` §16.4.1 作为已知固定成本。
+
+验证：`test-copy-into` 35 → 41 断言（新增复数×非连续的 typed-walk 覆盖 + 倍率护栏），
+55 套件全绿，编译体检 `caught WARNING` 0。
+
+---
+
 ## 2026-10-23（十七）— 第十七轮：`vt-astype` 的复数转换提速 5~20 倍
 
 **行为变化**：无。所有 dtype 组合的取值 / dtype / 形状 / 副本语义一律不变，

@@ -374,12 +374,19 @@
   "把非连续视图按 strides 收集成**同 dtype 的内存连续**新张量（行主序落点）。
    与 `vt-copy-into` 的通用 walker 语义相同，差别只在**元素类型是静态的**：
    泛型 `aref` 对 `(complex double-float)` 每个元素都要装箱/解包，
-   实测 1000×1000 转置视图 16MB 拷贝 17ms，特化后 2ms。
+   实测 1000×1000 转置视图 16MB 拷贝 17ms，特化后 1~2ms。
 
    用途：`vt-astype` 的非连续回退。同 dtype 时它的返回**就是**结果
    （一次特化遍历，无第二趟）；跨 dtype 时作为中间副本，交给连续 cast 特化。
-   `%inner-run-suffix` 分解出的 run 只有 1 个元素时（转置/步进视图），
-   逐 run `replace` 的调用开销远大于收益，故这里不做 run 归并。
+
+   遍历形态：**末轴用 DOTIMES 展开，其余轴用 odometer**。
+   落点行主序 ⇒ 末轴在目标上连续，内层循环只需源指针按 `s[末轴]` 步进；
+   odometer 的迭代次数从 `size` 降到 `size / d[末轴]`，每元素开销被摊薄。
+   实测 1000×1000 转置视图：全 odometer 6ms → 末轴展开 1ms（同数据的
+   手写 2 层循环也是 1ms，说明这是该访存次序的下限）。
+
+   不按 `%inner-run-suffix` 合并 run：转置/步进视图的 run 只有 1 个元素，
+   逐 run `replace` 的调用开销远大于收益。
 
    铁律 1：只改变搬运方式，落点（行主序连续布局）与逐元素 walker 逐位一致。"
   (let* ((shape (vt-shape tensor))
@@ -396,20 +403,37 @@
                         :offset 0
                         :dtype dtype)))
     (declare (type fixnum rank size in-offset))
-    (let ((dims (coerce shape 'simple-vector))
-          (i-strs (coerce in-strides 'simple-vector))
-          (indices (make-array rank :element-type 'fixnum :initial-element 0)))
+    (let* ((dims (coerce shape 'simple-vector))
+           (i-strs (coerce in-strides 'simple-vector))
+           (inner-dim (if (plusp rank) (the fixnum (svref dims (1- rank))) 1))
+           (outer-rank (max 0 (1- rank)))
+           ;; 末轴为 0 长度时 size 也是 0，无需再除
+           (outer-size (if (zerop outer-rank) 1
+                           (if (zerop inner-dim) 0 (/ size inner-dim))))
+           (indices (make-array (max outer-rank 1)
+                                :element-type 'fixnum :initial-element 0)))
       (declare (type simple-vector dims i-strs)
+               (type fixnum inner-dim outer-rank outer-size)
                (type (simple-array fixnum (*)) indices))
       (macrolet ((walk (elt)
                    `(let ((src (the (simple-array ,elt (*)) in-data))
                           (dst (the (simple-array ,elt (*)) out-data))
-                          (i-ptr in-offset))
+                          (s-in (if (plusp rank)
+                                    (the fixnum (svref i-strs (1- rank))) 1))
+                          (i-ptr in-offset)
+                          (d-ptr 0))
                       (declare (type (simple-array ,elt (*)) src dst)
-                               (type fixnum i-ptr))
-                      (dotimes (k size)
-                        (setf (aref dst k) (aref src i-ptr))
-                        (let ((d (the fixnum (1- rank))))
+                               (type fixnum s-in i-ptr d-ptr))
+                      (dotimes (k outer-size)
+                        ;; ---- 末轴：dst 连续、src 按 S-IN 步进 ----
+                        (let ((sp i-ptr))
+                          (declare (type fixnum sp))
+                          (dotimes (j inner-dim)
+                            (setf (aref dst (the fixnum (+ d-ptr j))) (aref src sp))
+                            (incf sp s-in)))
+                        (incf d-ptr inner-dim)
+                        ;; ---- 其余轴：行主序 odometer（只走 outer-rank 个轴）----
+                        (let ((d (the fixnum (1- outer-rank))))
                           (declare (type fixnum d))
                           (loop
                             (when (< d 0) (return))
@@ -903,6 +927,12 @@
                 ((equal et '(signed-byte 8))   (typed-walk (signed-byte 8)))
                 ((equal et '(unsigned-byte 16)) (typed-walk (unsigned-byte 16)))
                 ((equal et '(unsigned-byte 8))  (typed-walk (unsigned-byte 8)))
+                ;; 复数同型：interleaved 布局下与实数同构（§16.1 铁律 3），
+                ;; 缺这两格时会掉到 %COPY-GENERIC-SLOW 的泛型 aref —— 每元素
+                ;; 装箱/解包，实测 1000×1000 转置视图 17ms（补格后 6ms，
+                ;; 同形 f64T 是 3ms，2 倍字节数对应 2 倍耗时）。
+                ((equal et '(complex double-float)) (typed-walk (complex double-float)))
+                ((equal et '(complex single-float)) (typed-walk (complex single-float)))
                 (t (return-from %copy-generic
                      (%copy-generic-slow dest-data dest-dtype dest-strides dest-off
                                          src-data src-strides src-off

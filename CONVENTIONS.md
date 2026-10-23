@@ -1267,9 +1267,27 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 2. 非连续视图先做**同 dtype 的特化收集**（`%gather-contiguous`），再走上面的
    连续特化 cast；同 dtype 时收集结果**就是**答案（一趟）；
 3. 同 dtype 且物理布局相同（含复数 interleaved）一律 `replace` 块拷贝，
-   不得逐元素重建 `complex` 对象。
+   不得逐元素重建 `complex` 对象；
 4. 判据：`(vt-astype 复数数组 :complex64)` 的耗时不得超过同规模
    `(vt-astype 实数数组 :float32)` 的 10 倍（`test/astype-cast-test.lisp` 有护栏）。
+
+**同一条规则约束「拷贝」而不只是「转换」**（`vt-copy` / `vt-contiguous` /
+`vt-copy-into` 共用 `%copy-generic`，它也是按元素类型展开的）：
+
+5. `%copy-generic` 的 typed-walk 分派表必须覆盖 `(complex double-float)` 与
+   `(complex single-float)`。缺这两格时复数会掉进 `%copy-generic-slow` 的泛型
+   `aref`：1000×1000 转置视图 17 ms vs 6 ms（`test/test-copy-into.lisp` 有护栏）；
+6. `%gather-contiguous` 与任何手写多维 walker：**末轴必须 `DOTIMES` 展开，
+   其余轴才走 odometer**。全 odometer 每元素约 5 ns（索引数组 + 循环体），
+   1M 元素就是 5 ms —— 与元素类型无关的固定开销；
+7. 元素类型分派表的新增判据：`grep` 出所有 `(equal et 'double-float)` /
+   `(equal in-et 'double-float)` 形式的表，逐张确认复数两格是否也需要。
+
+**尚未消除的固定成本（已知、可接受）**：SBCL 的 `replace` 只有 1/2/4/8 字节元素的
+basher，**没有 16 字节的**，因此 `(complex double-float)` 的同型块拷贝是逐元素
+（1M 元素约 5~10 ms，而 `double-float` 只要 1 ms）。走 `sb-kernel:` 的
+`system-area-ub8-copy` 可到 1.5 ms 级，但那是内部符号（跨 SBCL 版本无保证），
+且需要 `with-pinned-objects`；本库**不使用**，宁可慢也不换可移植性。
 
 > 差异 D-C1 的两条后果在这里同样成立：复数→实数**静默**丢弃虚部（无警告），
 > 且该语义在快慢两条路径上必须逐位一致（含 `-0.0` 符号位与 NaN/Inf 传播）。
