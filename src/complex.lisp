@@ -1430,8 +1430,10 @@
 
 (defun %cx-matmul (a b)
   "复数 matmul 分派（语义同 numpy.matmul）。"
-  (let* ((a (ensure-vt a)) (b (ensure-vt b))
-         (ra (length (vt-shape a))) (rb (length (vt-shape b)))
+  (let* ((a (ensure-vt a))
+	 (b (ensure-vt b))
+         (ra (length (vt-shape a)))
+	 (rb (length (vt-shape b)))
          (dt (vt-promote-type (vt-dtype a) (vt-dtype b)))
          (ca (vt-contiguous a)) (cb (vt-contiguous b))
          (res

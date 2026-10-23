@@ -66,8 +66,10 @@
   (let ((ax (abs x)) (ay (abs y)))
     (cond ((zerop ax) ay)
           ((zerop ay) ax)
-          ((> ax ay) (let ((r (/ ay ax))) (* ax (sqrt (+ 1.0s0 (* r r))))))
-          (t (let ((r (/ ax ay))) (* ay (sqrt (+ 1.0s0 (* r r)))))))))
+          ((> ax ay) (let ((r (/ ay ax)))
+		       (* ax (sqrt (+ 1.0s0 (* r r))))))
+          (t (let ((r (/ ax ay)))
+	       (* ay (sqrt (+ 1.0s0 (* r r)))))))))
 
 (defun %cop-sqrt (z)
   "复数平方根（主值，C99 csqrt 分支切割）。
@@ -77,13 +79,16 @@
    **350ns/元素**（1M = 350ms）；而 C99 的标准公式只用 hypot + 1 次
    实数 sqrt + 2 次除法，约 20ns。二者在本库被测的全部点上逐位一致
    （complex-test 的 8 个分支切割用例 + numpy 差分）。"
-  (let ((x (%creal z)) (y (%cimag z)))
+  (let ((x (%creal z))
+	(y (%cimag z)))
     (cond ((%cx-nan-p z) (%cx-nan-complex z))
           ;; 实轴：虚部保持原符号（含 -0.0），必须走特例，否则 ±0 会被抹平
           ((and (zerop y) (>= x 0)) (complex (sqrt x) y))
           ((and (zerop y) (minusp x))
            (complex (* 0 x)
-                    (if (minusp (float-sign y)) (- (sqrt (- x))) (sqrt (- x)))))
+                    (if (minusp (float-sign y))
+			(- (sqrt (- x)))
+			(sqrt (- x)))))
           (t
            (let* ((r (%cx-hypot x y))
                   (s (sqrt (* 0.5s0 (+ r (abs x))))))
@@ -285,7 +290,9 @@
          (n (vt-size flat))
          (fi (vt-dtype-itemsize from))
          (ti (vt-dtype-itemsize dtype))
-         (m (if (> fi ti) (* n (floor fi ti)) (floor n (floor ti fi))))
+         (m (if (> fi ti)
+		(* n (floor fi ti))
+		(floor n (floor ti fi))))
          (out-shape (or shape (%cx-view-dtype-shape (vt-shape v) from dtype)))
          (out-size (reduce #'* out-shape :initial-value 1)))
     (unless (= out-size m)
