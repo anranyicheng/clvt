@@ -80,6 +80,7 @@ SUITES[complex-nan-inf-test]="77 复数 NaN/Inf 与 median 契约（第十轮 §
 SUITES[complex-scan-axis-test]="26 复数沿轴扫描回归（第九轮 §16.29: cumsum/cumprod/nancumsum/nancumprod 在 axis<rank-1 时只算第一条 fiber 的静默错值 · 2D 两轴 + 3D 三轴 + 负轴 + 转置视图 + c64 + 退化/空轴 + :out 连续与非连续 · 期望值取自 numpy 2.3.5 逐位相等 · 实数路径回归）"
 SUITES[complex-gap-test]="50 复数缺口回归（第八轮 §16.28: from-array/from-sequence/full 的 dtype 推断保住虚部 · float_power 复数主值分支与 NaN 边界 · cbrt 对齐 numpy 的确定性拒绝 · layer-norm 复数分支（复数均值+实数方差）· 已支持函数抽查）"
 SUITES[scan-first-element-test]="38 累积扫描首元素语义（第十四轮 §16.30.3: numpy 的 accumulate 首个输出是输入本身而非 OP(单位元,输入) —— cumsum([-0.0]) 的符号位、cumprod 的 inf*0、nan 族掩码后的首元素；覆盖实数线三条路径(快路径/axis/展平) + 复数回归 + dtype 提升 + :out 非连续落点。测试进程故意不屏蔽浮点陷阱）"
+SUITES[cumulative-axis-test]="70 累积沿轴 + nanmedian 多轴（第十五轮 §16.35: 沿轴累积从 196ms 降到 4ms 的**逐位回归** —— 用独立朴素参照(list+坐标换算，不碰 strides)对照 2D/3D/负轴/步长切片/转置/负步长/4 dtype/int8 提升/空轴/轴长1/:out 列视图与完全别名 + 性能护栏(沿轴 ≤40× 展平) · nanmedian axis 列表(含 keepdims/负轴/顺序无关/NaN/复数字典序/连续与非连续 :out/重复轴与越界报错)，期望值 numpy 2.4.6 实测）"
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
 SUITES[test-all]="641 绝大多数函数的测试"
@@ -145,6 +146,7 @@ DEFAULT_ORDER=(
     complex-nan-inf-test
     complex-scan-axis-test
     scan-first-element-test
+    cumulative-axis-test
     complex-gap-test
     complex-matmul-perf-test
     complex-test
@@ -189,6 +191,7 @@ clvt 自动化测试运行器
   --quick         跳过性能基准和慢速测试 (等同无参数)
   --all           运行所有测试包括性能基准 (benchmark-copy / performance-bench)
   --verbose       显示完整 SBCL 输出
+  --skip-build    跳过「全系统零 WARNING」编译体检 (默认执行，约 1.5~2 分钟)
   --help          显示此帮助信息
 
 环境变量:
@@ -198,6 +201,8 @@ clvt 自动化测试运行器
                   默认值可能 "Heap exhausted" 崩溃并报出无法追查的 ?/?
   TIMEOUT         每个测试超时秒数 (默认: 300)
   CLVT_TEST_OUT   流水线套件的产物目录 (默认: 临时目录，跑完自动清理)
+  CLVT_SKIP_BUILD_CHECK
+                  置 1 等价于 --skip-build
 
 本脚本是 clvt 全部测试的唯一入口：test/ 下每个测试套件（含「Lisp 生成 +
 NumPy 校验」两阶段流水线套件）都在此注册，启动时会自检运行列表是否覆盖
@@ -226,6 +231,65 @@ check_asdf() {
         --eval '(require :asdf)' \
         --eval '(format t "ASDF ~a~%" (asdf:asdf-version))' 2>/dev/null \
         || { fail "ASDF 加载失败"; exit 1; }
+}
+
+# ============================================================
+# 编译体检门禁：整个系统必须「零 caught WARNING」地编译通过
+#
+# 为什么必须做：第十四轮发现一个裸 `"` 把 docstring 提前闭合，5 个英文单词
+# 变成函数体里的 form（undefined variable ×5），编译器报了 20 条 WARNING，
+# 而**运行期完全不报错**（SBCL 把未定义变量当 special 变量读，函数照样返回 T）。
+# 也就是说：只要没人看编译输出，这类缺陷可以永久潜伏。括号检查查不出它
+# （括号是平衡的），numpy 对拍也查不出（数值对）。唯一信号就是这些 WARNING。
+#
+# WARNING 与 STYLE-WARNING 分开统计：本仓现有 96 条 STYLE-WARNING 属
+# 「unused variable / 未使用函数」这类噪音，不作为门禁（噪声化的门禁等于没门禁）；
+# 但 WARNING（undefined variable / undefined function / 类型声明矛盾）一律拦。
+#
+# 代价：这一步会 `:force t` 重编译整个系统（约 1.5~2 分钟），随后各套件直接
+# 复用刚生成的 fasl，所以总耗时基本不额外增加（原本第一个套件就要冷编译）。
+# 需要跳过时用 --skip-build 或 CLVT_SKIP_BUILD_CHECK=1。
+# ============================================================
+check_build_warnings() {
+    if [[ "${CLVT_SKIP_BUILD_CHECK:-0}" == "1" || "$skip_build" == true ]]; then
+        warn "已跳过编译体检（CLVT_SKIP_BUILD_CHECK=1 / --skip-build）"
+        return 0
+    fi
+    header "编译体检 — 全系统零 WARNING"
+    local log_file
+    log_file="$(mktemp -t clvt-build-warn.XXXXXX)"
+    # 注意：**不能**包 (handler-bind ((warning #'muffle-warning)) ...) ——
+    # 那会把编译期告警一并吞掉，门禁就恒过 0 条（实测：包了之后本应 96 条
+    # STYLE-WARNING 输出 0 条）。这里要的就是原始编译输出。
+    if ! "$SBCL" --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform \
+            --non-interactive \
+            --eval '(require :asdf)' \
+            --eval "(push #p\"$PROJECT_DIR/\" asdf:*central-registry*)" \
+            --eval '(asdf:compile-system :clvt :force t)' \
+            > "$log_file" 2>&1; then
+        fail "编译失败（非 WARNING 级错误），尾部输出："
+        tail -30 "$log_file" | sed 's/^/    /'
+        rm -f "$log_file"
+        exit 1
+    fi
+    # 只数 WARNING（STYLE-WARNING 不算）：用行首锚定避免把
+    # "caught STYLE-WARNING" 也算进去。
+    local n_warn n_style
+    n_warn=$(grep -c '^; caught WARNING:' "$log_file" 2>/dev/null || true)
+    n_style=$(grep -c '^; caught STYLE-WARNING:' "$log_file" 2>/dev/null || true)
+    n_warn=${n_warn:-0}
+    n_style=${n_style:-0}
+    if [[ "$n_warn" -gt 0 ]]; then
+        fail "编译产生 $n_warn 条 WARNING（STYLE-WARNING $n_style 条，不计）"
+        echo "    最近的告警上下文："
+        grep -n -B2 -A6 '^; caught WARNING:' "$log_file" | head -40 | sed 's/^/    /'
+        echo "    → 完整日志: $log_file"
+        echo "    → 典型根因: docstring 里有未转义的 \" ，把后续正文读成了代码。"
+        return 1
+    fi
+    ok "编译干净（WARNING 0，STYLE-WARNING $n_style）"
+    rm -f "$log_file"
+    return 0
 }
 
 check_python() {
@@ -504,6 +568,7 @@ main() {
     local suites_to_run=()
     local run_benchmarks=false
     local specific_suite=""
+    local skip_build=false
 
     # 解析参数
     while [[ $# -gt 0 ]]; do
@@ -538,6 +603,10 @@ main() {
                 VERBOSE=1
                 shift
                 ;;
+            --skip-build)
+                skip_build=true
+                shift
+                ;;
             --help|-h)
                 usage
                 exit 0
@@ -563,6 +632,12 @@ main() {
             fail "测试工具链 key 同步检查未通过（先修复漂移再运行套件，详见上方输出）"
             exit 1
         fi
+    fi
+
+    # 编译体检：整个系统必须零 WARNING 编译通过（细节见 check_build_warnings）
+    if ! check_build_warnings; then
+        fail "编译体检未通过（先消除 WARNING 再跑套件；临时跳过用 --skip-build）"
+        exit 1
     fi
 
     # 运行列表自检：每个已注册套件都必须被接线（防「写了却没人跑」的漏接线）

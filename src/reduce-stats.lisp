@@ -1084,6 +1084,9 @@
          ;; (vt-cumsum 2x2) 必崩）。按 CONVENTIONS §0「与 NumPy 冲突以
          ;; NumPy 为准」改为展平形状，并去掉该递归。
          (res-shape (if axis shape (list (vt-size tensor))))
+         ;; 归一化后的轴（nil 表示展平）。提前算：快路径与通用路径共用，
+         ;; 也保证「轴越界/重复」在每个路径上都是同一个错误时机。
+         (ax (when axis (vt-normalize-axis axis rank)))
          ;; out 给出时统一入口校验（形状/dtype 严格相等/可写性）
          (result (if out
                      (vt-check-out out res-shape final-dtype :op-name "vt-cumulative")
@@ -1092,17 +1095,23 @@
          (in-strides (vt-strides tensor)) (in-offset (vt-offset tensor))
          (out-strides (vt-strides result)) (out-offset (vt-offset result)))
     ;; ================================================================
-    ;; 快路径（类型声明驱动）：输入连续 + 结果连续 + op 是内建 +/* +
-    ;; 元素类型在四种存储类型之内。
+    ;; 快路径（类型声明驱动）：op 是内建 +/* 且输入/结果的**元素类型相同**
+    ;; 且该类型属于四种物理存储类型。
     ;;
-    ;; 通用路径是「逐元素 funcall op + 逐元素 vt-cast」，实测 1M 元素需
-    ;; 227ms（约 227ns/元素，比 numpy 慢 70 倍），瓶颈全部来自没有类型信息：
-    ;;   · aref 走泛型二维分派（慢 ~20x）
+    ;; 通用路径是「逐元素 funcall op + 逐元素 vt-cast」，实测 1M 元素沿轴
+    ;; 需 196ms（约 196ns/元素，比 numpy 慢 59 倍），瓶颈全部来自没有类型
+    ;; 信息：
+    ;;   · aref 对未声明元素类型的数组走泛型分派（慢 ~20x）
     ;;   · (funcall op ...) 每次调用都要装箱
     ;;   · (vt-cast cum final-dtype) 走 ecase + 泛型算术
-    ;; 这里把「数组元素类型」与「累加器类型」同时声明，并把 op 提到
-    ;; 循环外做一次 eq 分派，让 +/* 直接编译成机器指令。
-    ;; 结果与通用路径逐位相同（同为行主序顺序累加，铁律 1/2）。
+    ;; 这里把「数组元素类型」与「累加器类型」同时声明，并把 op 提到循环外
+    ;; 做一次 eq 分派，让 +/* 直接编译成机器指令。
+    ;;
+    ;; 关键：**平面与沿轴共用同一个 RUN**（区别只在步长 1 与 stride）。
+    ;; 第十四轮只给 axis=nil 做了特化，沿轴仍走通用路径 —— 于是同一个函数
+    ;; 在 `(vt-cumsum a)` 与 `(vt-cumsum a :axis 0)` 上差 196 倍。第十五轮
+    ;; 把 RUN 抽出来，两条路径都吃到特化。
+    ;; 结果与通用路径逐位相同（同为顺序累加，铁律 1/2）。
     ;; ================================================================
     (macrolet ((cum-typed (lt)
                  ;; 存储表达式按元素类型在**编译期**选定：整数用 dtype.lisp 中
@@ -1110,61 +1119,89 @@
                  (let ((store (cond ((equal lt '(signed-byte 64)) `(%coerce-int64 acc))
                                     ((equal lt '(signed-byte 32)) `(%coerce-int32 acc))
                                     (t 'acc))))
-                   `(let ((src (the (simple-array ,lt (*)) in-data))
-                          (dst (the (simple-array ,lt (*)) out-data))
-                          (n (the fixnum (vt-size result)))
-                          (ip (the fixnum in-offset))
-                          (opos (the fixnum out-offset)))
-                      (declare (type (simple-array ,lt (*)) src dst)
-                               (type fixnum n ip opos))
-                      ;; 首元素**直接拷贝**，从第二个元素起才做 OP。
-                      ;; numpy 的 accumulate 就是这个语义（CONVENTIONS §16.30.3）：
-                      ;;   np.cumsum([-0.0])  => [-0.]   而 0.0 + (-0.0) = +0.0
-                      ;; 也就是说「从单位元起算」会静默洗掉 -0.0 的符号位；
-                      ;; 对 cumprod 还会在 inf/nan 首元素上凭空造出 0*inf。
-                      ;; 与 %CX-SCAN-RUN 的复数线保持同一口径。
-                      (if (eq op #'+)
-                          (let ((acc (the ,lt (coerce init-val ',lt))))
-                            (declare (type ,lt acc))
-                            (when (plusp n)
-                              (setf acc (aref src ip))
-                              (setf (aref dst opos) acc)
-                              (loop for i of-type fixnum from 1 below n
-                                    do (setf acc (+ acc (aref src (+ ip i))))
-                                       (setf (aref dst (+ opos i)) ,store))))
-                          (let ((acc (the ,lt (coerce init-val ',lt))))
-                            (declare (type ,lt acc))
-                            (when (plusp n)
-                              (setf acc (aref src ip))
-                              (setf (aref dst opos) acc)
-                              (loop for i of-type fixnum from 1 below n
-                                    do (setf acc (* acc (aref src (+ ip i))))
-                                       (setf (aref dst (+ opos i)) ,store)))))))))
+                   `(labels ((run (sp dp cnt istep ostep)
+                             ;; 从 SP 起沿 ISTEP 走 CNT 个，写到 DP 起沿 OSTEP。
+                             ;; 首元素**直接拷贝**，从第二个起才做 OP：
+                             ;; numpy 的 accumulate 就是这个语义（§16.30.3）——
+                             ;;   np.cumsum([-0.0]) => [-0.]  而 0.0 + (-0.0) = +0.0
+                             ;; 「从单位元起算」会静默洗掉 -0.0 的符号位，
+                             ;; cumprod 还会在 inf 首元素上凭空造出 0*inf。
+                             (declare (type fixnum sp dp cnt istep ostep)
+                                      (optimize (speed 3) (safety 1)))
+                             (let ((src (the (simple-array ,lt (*)) in-data))
+                                   (dst (the (simple-array ,lt (*)) out-data)))
+                               (declare (type (simple-array ,lt (*)) src dst))
+                               (when (plusp cnt)
+                                 (let ((acc (the ,lt (aref src sp))))
+                                   (declare (type ,lt acc))
+                                   (setf (aref dst dp) acc)
+                                   (if (eq op #'+)
+                                       (loop for si of-type fixnum = (+ sp istep) then (+ si istep)
+                                             for di of-type fixnum = (+ dp ostep) then (+ di ostep)
+                                             for i of-type fixnum from 1 below cnt
+                                             do (setf acc (+ acc (aref src si)))
+                                                (setf (aref dst di) ,store))
+                                       (loop for si of-type fixnum = (+ sp istep) then (+ si istep)
+                                             for di of-type fixnum = (+ dp ostep) then (+ di ostep)
+                                             for i of-type fixnum from 1 below cnt
+                                             do (setf acc (* acc (aref src si)))
+                                                (setf (aref dst di) ,store)))))))
+                           (run-flat ()
+                             ;; 展平：整块一次顺序扫描（已保证输入/结果连续）
+                             (run in-offset out-offset (vt-size result) 1 1))
+                           (run-axis ()
+                             ;; 沿轴：除 AX 外各维做里程计，每条 fiber 只算一次
+                             ;; 起点；内层整段交给 RUN（步长 = 该轴 stride，可为负）。
+                             (let ((dim (the fixnum (nth ax shape)))
+                                   (istep (the fixnum (nth ax in-strides)))
+                                   (ostep (the fixnum (nth ax out-strides)))
+                                   (idx (make-array (max 1 rank)
+                                                    :element-type 'fixnum
+                                                    :initial-element 0)))
+                               (declare (type (simple-array fixnum (*)) idx))
+                               (loop
+                                 (let ((sp in-offset) (dp out-offset))
+                                   (dotimes (d rank)
+                                     (unless (= d ax)
+                                       (incf sp (* (aref idx d) (nth d in-strides)))
+                                       (incf dp (* (aref idx d) (nth d out-strides)))))
+                                   (run sp dp dim istep ostep))
+                                 ;; 里程计：跳过 AX 维，逐位向左进位
+                                 (let ((carry t))
+                                   (loop for d of-type fixnum from (1- rank) downto 0
+                                         while carry
+                                         do (unless (= d ax)
+                                              (incf (aref idx d))
+                                              (if (< (aref idx d) (nth d shape))
+                                                  (setf carry nil)
+                                                  (setf (aref idx d) 0))))
+                                   (when carry (return)))))))
+                     (if ax (run-axis) (run-flat))))))
       (when (and (member op (list #'+ #'*))
-                 ;; 仅在「全局累积（axis=nil）」时可用线性快路径：
-                 ;; 此时累加正是按行主序对整块做一次顺序累加，
-                 ;; 与 numpy 的 flat 语义完全一致。axis 非空时累加沿
-                 ;; 指定轴进行，必须走通用路径。
-                 (null axis)
-                 (vt-contiguous-p tensor)
-                 (vt-contiguous-p result)
                  (equal (array-element-type in-data)
-                        (array-element-type out-data)))
+                        (array-element-type out-data))
+                 (member (array-element-type in-data)
+                         (list 'double-float 'single-float
+                               '(signed-byte 64) '(signed-byte 32))
+                         :test #'equal)
+                 ;; axis=nil 时要求全连续（展平后才是行主序）；沿轴时
+                 ;; 走 strides，任意布局都成立，无需连续。
+                 (or ax
+                     (and (vt-contiguous-p tensor)
+                          (vt-contiguous-p result))))
         (let ((et (array-element-type in-data)))
           (cond ((equal et 'double-float)     (cum-typed double-float))
                 ((equal et 'single-float)     (cum-typed single-float))
                 ((equal et '(signed-byte 64)) (cum-typed (signed-byte 64)))
                 ((equal et '(signed-byte 32)) (cum-typed (signed-byte 32)))
                 (t nil)))
-        (when (member (array-element-type in-data)
-                      (list 'double-float 'single-float
-                            '(signed-byte 64) '(signed-byte 32))
-                      :test #'equal)
-          (return-from %vt-cumulative result))))
-    (if axis
+        (return-from %vt-cumulative result)))
+    (if ax
         ;; ---------------- 沿指定轴累积（形状不变）----------------
-        (let* ((ax (vt-normalize-axis axis rank))
-               (ax-dim (nth ax shape))
+        ;; 通用回退路径：dtype 不在四种存储类型内、或输入/结果元素类型不同
+        ;; （如 int8→int64 提升、显式 :dtype 改变宽度）。语义正确但慢
+        ;; （逐元素 funcall + vt-cast），正常情况都被上面的特化路径接走。
+        (let* ((ax-dim (nth ax shape))
                (indices (make-array rank :element-type '(signed-byte 64)
                                          :initial-element 0)))
           (labels ((advance ()
@@ -2275,9 +2312,52 @@
                (vt-copy-into out var)
                out)))))
 
+(defun %nanmedian-fold-axes (tensor axes keepdims)
+  "把**多个**归约轴 AXES 折成末尾一维，返回 (values 2D视图 目标形状)。
+
+  思路：置换 (保留轴…, 归约轴…) → 重塑成 (H, D) —— H = 保留轴元素数，
+  D = 归约区元素数 —— 于是「沿 (0,1) 归约」变成「沿单轴 1 归约」，
+  可以直接复用测透了的单轴内核，不必再写一套多维 fiber 遍历。
+
+  正确性前提：中位数对归约区内元素的**顺序不敏感**（内部要排序），
+  所以把归约轴搬到末尾、再把它们压成一维，不改变结果。
+  `vt-reshape` 对非连续视图会自动落地（先 vt-contiguous 再重塑），
+  因此任意 strides / 负步长 / 偏移的输入都成立。"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (axes (sort (copy-list axes) #'<))
+         (kept (loop for i below rank unless (member i axes) collect i))
+         (kept-shape (mapcar (lambda (i) (nth i shape)) kept))
+         (red-size (reduce #'* (mapcar (lambda (i) (nth i shape)) axes)
+                           :initial-value 1))
+         (h (reduce #'* kept-shape :initial-value 1))
+         (two (vt-reshape (vt-transpose tensor (append kept axes))
+                          (list h red-size)))
+         (target (if keepdims
+                     (loop for d in shape for i from 0
+                           collect (if (member i axes) 1 d))
+                     kept-shape)))
+    (values two target)))
+
+(defun %nanmedian-multi (tensor axis keepdims out)
+  "实数：多轴 nanmedian。折叠成 2-D 后复用单轴内核，再重塑回目标形状。"
+  (let* ((in (ensure-vt tensor))
+         (axes (vt-normalize-axes axis (length (vt-shape in)))))
+    (multiple-value-bind (two target) (%nanmedian-fold-axes in axes keepdims)
+      (let ((res (vt-reshape (vt-nanmedian two :axis 1) target)))
+        (cond ((null out) res)
+              ((eq res out) out)
+              (t (vt-check-out out target :float64 :op-name "vt-nanmedian")
+                 (vt-copy-into out res)
+                 out))))))
+
 (defun vt-nanmedian (tensor &key axis keepdims out dtype)
   "忽略 NaN 的中位数（对标 numpy.nanmedian）。全为 NaN 的归约区结果为 NaN。
   结果 dtype 恒为 :float64（复数入参时保持复数 dtype）；out 必须形状/dtype 精确匹配。
+
+   axis 接受 nil / 整数 / 整数列表。**多轴**（如 '(0 1)）在第十五轮接通：
+   折叠成 (H, D) 后复用单轴内核（见 %NANMEDIAN-FOLD-AXES），此前直接报
+   「暂不支持多轴归约」而 numpy 是支持的。
 
    复数（§16.16）：按 (实部, 虚部) 字典序排序取中位，偶数个取中间两值均值；
    任一分量为 NaN 的元素视为缺失。第十三轮之前这段逻辑在 complex-ops.lisp
@@ -2286,6 +2366,8 @@
     (return-from vt-nanmedian
       (%cx-op-nanmedian (ensure-vt tensor)
                         :axis axis :keepdims keepdims :out out :dtype dtype)))
+  (when (and axis (listp axis) (cdr axis))
+    (return-from vt-nanmedian (%nanmedian-multi (ensure-vt tensor) axis keepdims out)))
   (with-float-safe
     (let* ((nan (vt-get-nan :float64))
            (in-data (vt-data tensor))

@@ -642,12 +642,29 @@
                  (b (aref tmp (floor cnt 2))))
              (* 0.5s0 (+ a b))))))))
 
+(defun %cx-nanmedian-multi (in axes keepdims out dtype)
+  "复数：多轴 nanmedian —— 折叠成 (H, D) 后复用单轴内核，再重塑回目标形状。"
+  (with-float-safe
+    (multiple-value-bind (two target) (%nanmedian-fold-axes in axes keepdims)
+      (let* ((dt (or dtype (vt-dtype in)))
+             (res (vt-reshape (%cx-op-nanmedian two :axis 1 :dtype dt) target)))
+        (cond ((null out) res)
+              ((eq res out) out)
+              (t (vt-check-out out target dt :op-name "VT-NANMEDIAN")
+                 (vt-copy-into out res)
+                 out))))))
+
 (defun %cx-op-nanmedian (tensor &key axis keepdims out dtype)
   "忽略 NaN 的中位数（复数）：按字典序；偶数个取中间两值均值。
    全 NaN 切片 → NaN+0j（numpy 语义）。
    第十三轮：原先是同名 DEFUN 覆盖 reduce-stats.lisp 的实现并 (%cx-orig) 转发，
-   现在只做复数分支，公开入口在 reduce-stats.lisp 的单一 DEFUN 里分派。"
+   现在只做复数分支，公开入口在 reduce-stats.lisp 的单一 DEFUN 里分派。
+   第十五轮：多轴（如 '(0 1)）接通 —— 折叠成 2-D 后复用本函数的单轴分支。"
   (let ((in (ensure-vt tensor)))
+    (when (and axis (listp axis) (cdr axis))
+      (return-from %cx-op-nanmedian
+        (%cx-nanmedian-multi in (vt-normalize-axes axis (length (vt-shape in)))
+                             keepdims out dtype)))
     (with-float-safe
       (let* ((shape (vt-shape in))
              (rank (length shape))
@@ -684,7 +701,8 @@
                      (incf k))))
                (%cx-write-flat res vals dt)
                res)))
-          (t (error "vt-nanmedian: 暂不支持多轴归约（numpy 支持；此处用 axis=nil 或单轴）")))))))
+          ;; 多轴已在函数入口分流（见上），这里只剩单轴/展平两种
+          (t (error "vt-nanmedian: 内部错误 —— 多轴未在入口分流")))))))
 
 ;;; ==================================================================
 ;;; 8. 卷积 / 互相关（复数）

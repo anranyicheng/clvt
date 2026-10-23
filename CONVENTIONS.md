@@ -3079,6 +3079,168 @@ SIMD 内核用 1e-14 做过性能/收敛平衡，复数 Jacobi 的压测按 1e-1
 | `vt-nanmedian` **多轴** | 复数与实数两侧都只支持单轴（numpy `nanmedian(axis=(0,1))` 合法）；调用报「暂不支持多轴归约」 | 需先给实数侧补多轴，再让复数侧复用（复数侧已有 `%cx-fiber-geom`，多轴可用「置换到末尾 + 展平成 2-D」复用现有 fiber 循环） |
 | 编译期 WARNING 无人管 | 96 条 STYLE-WARNING + 本轮修掉的 20 条 WARNING | 建议给 `run-tests.sh` 加一条「编译输出里不得有 `caught WARNING`（STYLE-WARNING 除外）」的门禁；否则 16.34.2 那一类会再回来 |
 
+> ✅ **第十五轮全部收口**（§16.35）：三条依次对应 §16.35.2（沿轴累积特化，
+> 196 → 4 ms）、§16.35.4（nanmedian 多轴，折叠法）、§16.35.5（编译体检门禁）。
+
+---
+
+### 16.35 第十五轮：把第十四轮的三条遗留全部收口
+
+第十四轮最后留了一张「已定位、未修」的表（§16.34.7）：沿轴累积慢 39×、
+`nanmedian` 不支持多轴、编译 WARNING 无人管。本轮把三条做完，并顺带修掉
+一条同源的隐性开销（`nancumsum` 的逐元素写回）。
+
+#### 16.35.1 出发点：同一个函数的两条路径差 196 倍
+
+```
+(vt-cumsum a)            ; 1M 元素，展平  → 1 ms
+(vt-cumsum a :axis 0)    ; 1000×1000      → 196 ms     ← 同一份语义
+```
+
+第十四轮给 `axis=nil` 做了「按元素类型特化 + 首元素直拷」的循环，但沿轴那条
+仍在跑通用回退：`(funcall op ...)` 每元素一次装箱、`(vt-cast cum final-dtype)`
+每元素一次 ecase、`aref` 打在**未声明元素类型**的数组上走泛型分派。
+三个 200ns/元素 叠起来，正好是 196 ms。
+
+#### 16.35.2 修法：平面与沿轴共用同一个 `RUN`
+
+关键观察：两条路径的**内层**完全一样 —— 都是「从某起点，按固定步长走 N 个」。
+差别只在「有多少条这样的段、每段起点怎么算」：
+
+| 路径 | 段数 | 起点 | 步长 |
+|---|---|---|---|
+| `axis=nil`（展平） | 1 | `tensor.offset` | 1（要求全连续） |
+| `axis=k` | `∏_{d≠k} shape[d]` | 除 k 维之外各维索引折算 | `strides[k]`（可为负） |
+
+于是只写一份内核：
+
+```lisp
+(labels ((run (sp dp cnt istep ostep)   ; 从 SP 走 CNT 个到 DP，步长 ISTEP/OSTEP
+           ...（首元素直拷 + 特化累加）...)
+         (run-flat () (run in-offset out-offset (vt-size result) 1 1))
+         (run-axis ()                       ; 除 AX 外各维做里程计
+           (loop ... (run sp dp dim istep ostep) ...)))
+  (if ax (run-axis) (run-flat)))
+```
+
+两个实现细节值得记：
+
+1. **`labels` 而不是 `flet`**。`run-flat`/`run-axis` 要调 `run`，`flet` 里
+   兄弟函数**互不可见**（会编译成对外部 `CLVT::RUN` 的调用，运行期
+   `The function CLVT::RUN is undefined`）。这个坑当场踩了一次。
+2. **`ax` 必须提前到 `let*` 里算**。宏在展开期求值，若在宏体内写
+   `(if ax ...)`，`ax` 是词法变量、编译期不可见 → `The variable AX is unbound`。
+   现在宏展开出的是**运行期** `(if ax (run-axis) (run-flat))`。
+
+#### 16.35.3 实测（1000×1000 / 1M 元素，SBCL 2.6.8，同进程取 5 次最优）
+
+| 调用 | 修前 | 修后 | numpy 2.4.6 | 修前/后 |
+|---|---:|---:|---:|---:|
+| `cumsum axis=0` | 196 ms | **4 ms** | 3.3 ms | 49× |
+| `cumsum axis=1` | 196 ms | **4 ms** | 3.3 ms | 49× |
+| `cumprod axis=0` | 197 ms | **3 ms** | 3.8 ms | 66× |
+| `cumsum axis=1`（float32） | 196 ms | **1 ms** | — | — |
+| `cumsum axis=1`（int64） | 191 ms | **1 ms** | — | — |
+| `cumsum axis=0`（转置视图，stride 非 1） | 196 ms | **2 ms** | — | — |
+| `nancumsum axis=0` | 260 ms | **14 ms** | 6.2 ms | 18× |
+| `cumsum`（展平，回归项） | 1–4 ms | **1–3 ms** | — | — |
+
+`nancumsum` 那条另有三处改动（`%E3-CUMULATIVE-SKIP-NAN` 的 axis 分支）：
+把 `(setf (apply #'vt-ref result coords) ...)` 换成 strides 驱动的指针（省掉
+每元素一次坐标列表 cons + 一次通用坐标折算）、把 `(funcall op-fn ...)` 内联成
+`(if sum-p (+ cum x) (* cum x))`、结果 dtype 是 float64 时直接存（省掉
+`vt-cast`）。顺带删掉了变成死代码的 `cumstep` flet。
+
+#### 16.35.4 `nanmedian` 多轴：折叠成 2-D，复用单轴内核
+
+numpy 的 `nanmedian(a, axis=(0,1))` 合法，而 clvt 两侧（实数 `vt-nanmedian`、
+复数 `%cx-op-nanmedian`）都只支持单轴，多轴直接报「暂不支持」。
+
+**正确性前提（本轮的裁决依据）**：中位数对归约区内元素的**顺序不敏感**
+（内部本来就要排序）。所以
+
+> 置换 (保留轴…, 归约轴…) → 重塑成 `(H, D)` → 沿单轴 1 归约 → 重塑回目标形状
+
+与「直接沿多轴取中位」等价。这条前提让改动量从「再写一套多维 fiber 遍历」
+降到「一个 20 行的折叠函数」，并且复数侧可以**完整复用**同一份折叠逻辑
+（折叠只做置换与重塑，与 dtype 无关）：
+
+```lisp
+(defun %nanmedian-fold-axes (tensor axes keepdims) ...)  ; 共用
+(defun %nanmedian-multi     (tensor axis keepdims out) ...)      ; 实数
+(defun %cx-nanmedian-multi  (in axes keepdims out dtype) ...)    ; 复数
+```
+
+`vt-reshape` 对非连续视图会自动落地，所以任意 strides / 负步长 / 偏移的输入
+都成立（实测转置输入与连续副本结果一致）。
+
+**验证**（numpy 2.4.6 实测值，数据用 `a[i,j,k]=100i+10j+k` 保证可精确表示）：
+
+| 用例 | numpy | clvt |
+|---|---|---|
+| `axis=(0,1)` | `[60 61 62 63]` | 一致 |
+| `axis=(1,2)` | `[11.5 111.5]` | 一致 |
+| `axis=(0,2)` | `[51.5 61.5 71.5]` | 一致 |
+| `axis=(0,1,2)` | `61.5`（0 维） | 一致 |
+| `axis=(0,1) keepdims` | `(1,1,4)` | 一致 |
+| `b[0,0,0]=NaN, axis=(0,1)` | `[100 61 62 63]` | 一致 |
+| 复数 `z=a+i(i+2j+3k), axis=(0,2)` | `[51.5+5j 61.5+7j 71.5+9j]` | 一致（字典序） |
+| 负数轴 `(-2,-1)` / 乱序 `(2,1)` | 与 `(1,2)` 相同 | 一致 |
+| 非连续 `:out` | — | 落点正确、未越界 |
+
+#### 16.35.5 编译体检门禁：WARNING 归零才算过
+
+第十四轮那个「裸引号」事故的本质是：**编译器报了 20 条 WARNING，运行期完全
+正常**（SBCL 把未定义变量当 special 变量读，函数照样返回 T）。只要没人看编译
+输出，这类缺陷可以永久潜伏 —— 而 `check-parens` 查不出（括号是平衡的），
+numpy 对拍也查不出（数值是对的）。
+
+`run-tests.sh` 现在在跑套件前先做一次全系统编译体检：
+
+| 项 | 规定 |
+|---|---|
+| 触发 | 每次运行都做（`--skip-build` / `CLVT_SKIP_BUILD_CHECK=1` 可跳过） |
+| 口径 | `asdf:compile-system :clvt :force t`，**必须真的重编译** |
+| 拦截 | `^; caught WARNING:` 计数 > 0 → FAIL 并打印上下文 |
+| 放行 | `STYLE-WARNING`（unused variable 类，现有 96 条）不计 —— 噪声化的门禁等于没门禁 |
+| 顺带收益 | 这一次重编译产出的 fasl 被后续套件直接复用，总耗时基本不额外增加 |
+
+**踩到的坑（值得记）**：第一版把编译包在
+`(handler-bind ((warning #'muffle-warning)) ...)` 里（照抄套件里的写法）——
+结果 96 条 STYLE-WARNING 全部消失、门禁恒报「0 条」。**muffle 把编译期告警
+一起吞了**。门禁必须吃原始输出。这一条已写进脚注里，防止后人"顺手加个 muffle
+让输出干净点"。
+
+反向验证（故意引入 `(progn undefined-scratch-variable 1)`）：
+
+```
+[FAIL] 编译产生 1 条 WARNING（STYLE-WARNING 96 条，不计）
+    17526-;   undefined variable: CLVT::UNDEFINED-SCRATCH-VARIABLE
+[FAIL] 编译体检未通过（先消除 WARNING 再跑套件；临时跳过用 --skip-build）
+```
+
+#### 16.35.6 测试
+
+新增 `test/cumulative-axis-test.lisp`（**70 断言**，注册后共 **54 套件**）：
+
+| 组 | 覆盖 |
+|---|---|
+| A 沿轴累积（32） | 用**独立朴素参照**（纯 list + 坐标换算，完全不碰 strides/aref）对照：2D 五向、3D 四向、cumprod、步长切片、转置、负步长、float32/int32/int64、int8→int64 通用回退、空轴、轴长 1、`:out` 列视图落点、`:out` 完全别名 |
+| A2 性能护栏（1） | 沿轴 ≤ **40×** 展平（修前是 196×，修后实测 1.7×）。不用绝对毫秒：CI 机器波动大；比值只抓「掉回通用路径」这一个回归 |
+| B nanmedian 多轴（37） | 上表全部用例 + `:out` 连续/非连续/形状不符报错 + 重复轴与越界报错 + 单轴与全归约不回归 |
+
+> 为什么 A 组不硬编码 numpy 期望：沿轴累积的期望值有 1M 个数字。**保的是
+> 「快路径 == 朴素定义」**（铁律 1/2），numpy 一致性由
+> `scan-first-element-test` 与 `differential-probes` 两个套件继续覆盖。
+
+#### 16.35.7 本轮剩余（仍未做）
+
+| 项 | 现状 | 备注 |
+|---|---|---|
+| 复数 `matmul` 无 SIMD | 相对实数 SIMD 2.0–4.2×（§16.27.6） | 需要 SoA 视图 + 划入 4 条实 GEMM，工作量大 |
+| `real/imag` 仍是副本（D-C3） | numpy 返回共享视图 | 要动物理层（分量视图），风险高于收益 |
+| `%cx-op-nanmedian` 的展平分支仍按 fiber 收 values 向量 | 已够快（复数中位数本就慢），未实测 | 低优先 |
+
 ---
 
 ### 16.20 累计变更文件清单（第一～十二轮）
@@ -3160,6 +3322,11 @@ SIMD 内核用 1e-14 做过性能/收敛平衡，复数 Jacobi 的压测按 1e-1
 | `src/extensions3.lisp` | **第十四轮**：`%e3-cumulative-skip-nan` 的 axis 与展平两处循环改为「掩码后首元素直拷」，`nancumsum([-0.0])` 保住符号位（§16.34.4） |
 | `src/linalg.lisp` | **第十四轮**：`vt-svd` 的 `max-sweeps`/`tol` 改 `supplied-p`，实数 50/1e-14 与复数 60/1e-15 各用自己验证过的缺省（§16.34.5） |
 | `test/scan-first-element-test.lisp` | **第十四轮新增** 38 断言（实数 cumsum/cumprod 三条路径的符号零 + nan 族 + dtype 提升 + `:out` 非连续落点 + 复数回归），注册后共 53 套件 |
+| `src/reduce-stats.lisp` | **第十五轮**：`%vt-cumulative` 的平面/沿轴两条路径合并到同一个按元素类型特化的 `RUN`（沿轴 196 → 4 ms）；新增 `%nanmedian-fold-axes` / `%nanmedian-multi`，`vt-nanmedian` 接通 axis 列表（§16.35.2、§16.35.4） |
+| `src/extensions3.lisp` | **第十五轮**：`%e3-cumulative-skip-nan` 的 axis 分支改 strides 指针写回、op 内联、float64 直存（260 → 14 ms）；删除已成死代码的 `cumstep` flet（§16.35.3） |
+| `src/complex-ops.lisp` | **第十五轮**：新增 `%cx-nanmedian-multi`，`%cx-op-nanmedian` 入口分流 axis 列表（复数多轴，复用实数侧折叠） |
+| `test/run-tests.sh` | **第十五轮**：新增「全系统零 WARNING」编译体检门禁（`--skip-build` 可跳过）+ `cumulative-axis-test` 注册，共 54 套件 |
+| `test/cumulative-axis-test.lisp` | **第十五轮新增** 70 断言（沿轴累积的朴素参照对照 + 性能护栏 + nanmedian 多轴/复数/`:out` 契约） |
 
 ---
 

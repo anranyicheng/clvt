@@ -1078,81 +1078,95 @@
    AXIS 为 nil 时展平。init-val 为累积初值（0 / 1）。"
   (with-float-safe
    (let* ((input (ensure-vt tensor))
-         (shape (vt-shape input))
-         (final-dtype (or dtype (vt-dtype input)))
-         (result (if out
+          (shape (vt-shape input))
+          (final-dtype (or dtype (vt-dtype input)))
+          (result (if out
                      (vt-check-out out shape final-dtype :op-name op-name)
                      (vt-zeros shape :dtype final-dtype)))
-         (work (vt-astype input :float64))
-         (op-fn (if (eq op :sum) #'+ #'*))
-         (op-init (or init-val (if (eq op :sum) 0.0d0 1.0d0))))
-    (flet ((cumstep (acc x)
-             (if (%nan-p x) acc (funcall op-fn acc x))))
-      (if axis
-          (let* ((rank (length shape))
-                 (ax (vt-normalize-axis axis rank))
-                 (indices (make-array rank :element-type '(signed-byte 64)
-                                           :initial-element 0))
-                 (in-data (vt-data work)) (in-strs (vt-strides work))
-                 (in-off (vt-offset work)))
-            ;; 类型声明（性能）：WORK 恒为连续 float64，声明后内层 aref
-            ;; 走元素类型特化，省掉每元素一次 widetag 分派。
-            (declare (type (simple-array double-float (*)) in-data))
-            (labels ((advance ()
-                       (loop for d from (1- rank) downto 0
-                             when (/= d ax)
-                               do (incf (aref indices d))
-                                  (if (< (aref indices d) (nth d shape))
-                                      (return-from advance t)
-                                      (setf (aref indices d) 0)))))
-              (loop
-                (let ((ptr in-off))
-                  (loop for d from 0 below rank
-                        do (incf ptr (* (aref indices d) (nth d in-strs))))
-                  (let ((cum (coerce (if (eq op :sum) 0 op-init) 'double-float))
-                        (ax-stride (nth ax in-strs))
-                        (ax-dim (nth ax shape)))
-                    (dotimes (i ax-dim)
-                      ;; 首元素取「掩码后的输入本身」而不是 OP(单位元, 输入)：
-                      ;; numpy.nancumsum([-0.0]) => [-0.]，而 0.0 + (-0.0) = +0.0
-                      ;; 会洗掉符号位（CONVENTIONS §16.30.3 的实数线遗留项）。
-                      (let ((x (aref in-data (+ ptr (* i ax-stride)))))
-                        (if (zerop i)
-                            (setf cum (if (%nan-p x)
-                                          (coerce (if (eq op :sum) 0.0d0 1.0d0)
-                                                  'double-float)
-                                          x))
-                            (setf cum (cumstep cum x))))
-                      ;; 目标坐标：indices 中 AXIS 位置替换为 i，其余维保持
-                      (let ((coords (coerce indices 'list)))
-                        (setf (nth ax coords) i)
-                        (setf (apply #'vt-ref result coords)
-                              (vt-cast cum final-dtype))))))
-                (unless (advance) (return))))
-            result)
-          ;; 展平路径：原实现每元素 VT-REF 读 + VT-REF 写（各一次泛型
-          ;; aref 与坐标折算）+ VT-CAST，1M 元素实测 474ms。
-          ;; 改为「一次特化扫描算进 double vector，再一次性写回」。
-          (let* ((flat (if (vt-contiguous-p work) work (vt-contiguous work)))
-                 (d (the (simple-array double-float (*)) (vt-data flat)))
-                 (off (vt-offset flat))
-                 (n (vt-size work))
-                 (tmp (make-array n :element-type 'double-float))
-                 (cum (coerce (if (eq op :sum) 0 op-init) 'double-float))
-                 (sum-p (eq op :sum)))
-            (declare (type fixnum off n) (type double-float cum))
-            (dotimes (i n)
-              (declare (type fixnum i))
-              (let ((x (aref d (the fixnum (+ off i)))))
-                (if (zerop i)
-                    ;; 首元素：掩码后直拷（numpy.nancumsum([-0.0]) => [-0.]）
-                    (setf cum (if (/= x x)
-                                  (coerce (if sum-p 0.0d0 1.0d0) 'double-float)
-                                  x))
-                    (unless (/= x x)                ; NaN 跳过（保持累积值）
-                      (setf cum (if sum-p (+ cum x) (* cum x))))))
-              (setf (aref tmp i) cum))
-            (%e3-store-double-vector result tmp)))))))
+          (work (vt-astype input :float64))
+          (op-init (or init-val (if (eq op :sum) 0.0d0 1.0d0))))
+    ;; 注：原有一个 `(flet ((cumstep (acc x) ...))` 包住两条路径，内部用
+    ;; `(funcall op-fn acc x)`。第十五轮把 op 内联进两个内层循环后它已无调用点，
+    ;; 一并删除（每元素一次 FUNCALL 的装箱开销是这条路径的主要成本之一）。
+    (if axis
+        (let* ((rank (length shape))
+               (ax (vt-normalize-axis axis rank))
+               (indices (make-array rank :element-type '(signed-byte 64)
+                                         :initial-element 0))
+               (in-data (vt-data work)) (in-strs (vt-strides work))
+               (in-off (vt-offset work))
+               (out-data (vt-data result)) (out-strs (vt-strides result))
+               (out-off (vt-offset result)))
+          ;; 类型声明（性能）：WORK 恒为连续 float64，声明后内层 aref
+          ;; 走元素类型特化，省掉每元素一次 widetag 分派。
+          (declare (type (simple-array double-float (*)) in-data))
+          (labels ((advance ()
+                     (loop for d from (1- rank) downto 0
+                           when (/= d ax)
+                             do (incf (aref indices d))
+                                (if (< (aref indices d) (nth d shape))
+                                    (return-from advance t)
+                                    (setf (aref indices d) 0)))))
+            (loop
+              ;; 每条 fiber 只算一次起点（输入与目标各一份），内层按
+              ;; `起点 + i*stride` 递推 —— 第十五轮把逐元素
+              ;; `(setf (apply #'vt-ref result coords) …)` 换掉：那里
+              ;; 每个元素都要 cons 一次坐标列表 + 一次通用坐标折算，
+              ;; 1M 元素沿轴实测 260ms（numpy 6ms）。机制 B（offset +
+              ;; strides 驱动）在这里只差一个指针。
+              (let ((ptr in-off) (dptr out-off))
+                (loop for d from 0 below rank
+                      do (incf ptr (* (aref indices d) (nth d in-strs)))
+                         (incf dptr (* (aref indices d) (nth d out-strs))))
+                (let ((cum (coerce (if (eq op :sum) 0 op-init) 'double-float))
+                      (ax-stride (nth ax in-strs))
+                      (ax-dstride (nth ax out-strs))
+                      (ax-dim (nth ax shape))
+                      (sum-p (eq op :sum))
+                      ;; 结果 dtype 就是 float64 时省掉逐元素 VT-CAST
+                      ;; （ecase + 泛型算术，是这条路径剩下的主要开销）。
+                      (raw-store-p (eq final-dtype :float64)))
+                  (declare (type double-float cum))
+                  (dotimes (i ax-dim)
+                    ;; 首元素取「掩码后的输入本身」而不是 OP(单位元, 输入)：
+                    ;; numpy.nancumsum([-0.0]) => [-0.]，而 0.0 + (-0.0) = +0.0
+                    ;; 会洗掉符号位（CONVENTIONS §16.30.3 的实数线遗留项）。
+                    (let ((x (aref in-data (+ ptr (* i ax-stride)))))
+                      (if (zerop i)
+                          (setf cum (if (%nan-p x)
+                                        (if sum-p 0.0d0 1.0d0)
+                                        x))
+                          ;; op 内联进循环：原来每元素一次 FUNCALL，
+                          ;; 装箱开销比算术本身还大。
+                          (unless (%nan-p x)
+                            (setf cum (if sum-p (+ cum x) (* cum x))))))
+                    (setf (aref out-data (+ dptr (* i ax-dstride)))
+                          (if raw-store-p cum (vt-cast cum final-dtype))))))
+              (unless (advance) (return))))
+          result)
+        ;; 展平路径：原实现每元素 VT-REF 读 + VT-REF 写（各一次泛型
+        ;; aref 与坐标折算）+ VT-CAST，1M 元素实测 474ms。
+        ;; 改为「一次特化扫描算进 double vector，再一次性写回」。
+        (let* ((flat (if (vt-contiguous-p work) work (vt-contiguous work)))
+               (d (the (simple-array double-float (*)) (vt-data flat)))
+               (off (vt-offset flat))
+               (n (vt-size work))
+               (tmp (make-array n :element-type 'double-float))
+               (cum (coerce (if (eq op :sum) 0 op-init) 'double-float))
+               (sum-p (eq op :sum)))
+          (declare (type fixnum off n) (type double-float cum))
+          (dotimes (i n)
+            (declare (type fixnum i))
+            (let ((x (aref d (the fixnum (+ off i)))))
+              (if (zerop i)
+                  ;; 首元素：掩码后直拷（numpy.nancumsum([-0.0]) => [-0.]）
+                  (setf cum (if (/= x x)
+                                (coerce (if sum-p 0.0d0 1.0d0) 'double-float)
+                                x))
+                  (unless (/= x x)                ; NaN 跳过（保持累积值）
+                    (setf cum (if sum-p (+ cum x) (* cum x))))))
+            (setf (aref tmp i) cum))
+          (%e3-store-double-vector result tmp))))))
 
 (defun vt-nancumsum (tensor &key axis dtype out)
   "沿 AXIS 累积和，NaN 视为 0（跳过，不改变累积值）（对标 numpy.nancumsum）。
