@@ -27,16 +27,19 @@
 ;;; 本库不存在「同名 DEFUN 再写一遍 + 转发」或 `(setf (symbol-function …))`
 ;;; 这类覆盖式机制 —— 它们会让「重载单个源文件」静默丢失复数语义。
 ;;; 想确认现状：`grep -c "setf (symbol-function" src/*.lisp` 应为 0。
+;;;
+;;; 因此本文件**只放复数算法与工具**，没有公开函数的同名定义。想找某个公开
+;;; 函数的复数分派，去它的归属文件（`grep -n "defun vt-<name>" src/`）；
+;;; 归属关系见 CONVENTIONS §16.32 与 §16.33.6 的裁决表。
 
-;;; %CX-DEEP-P / %CX-TENSOR-P 已迁至 src/dispatch.lisp：
-;;; 它们必须在 elementwise / reduce-stats / linalg 之前就可用，否则那些
-;;; 归属文件无法在自己体内分派，只能靠事后覆盖 —— 见 CONVENTIONS §16.32。
+;;; %cx-deep-p / %cx-tensor-p 住在 src/dispatch.lisp —— 它们必须在
+;;; elementwise / reduce-stats / linalg **之前**可用，否则那些归属文件无法在
+;;; 自己体内分派，只能靠事后覆盖（§16.32）。
 
 ;;; ------------------------------------------------------------------
 ;;; 通用小工具：C 连续落地 / 步长 / fiber 起点
 ;;; ------------------------------------------------------------------
 
-;;; %CX-FLAT 已迁至 src/complex-kernels.lisp
 (defun %cx-strides-vec (shape)
   "C 连续布局的步长向量。"
   (coerce (vt-compute-strides shape) 'simple-vector))
@@ -84,20 +87,9 @@
 ;;; 故 sqrt/log/三角/双曲/反函数直接复用 CL，只需补齐极点与非有限值
 ;;; 的返回约定（CL 在这些点抛条件，numpy 返回 Inf/NaN）。
 
-;;; %CX-NAN-OF / %CX-INF-OF / %CX-NAN-COMPLEX / %CX-HYPOT 已迁至 src/complex-kernels.lisp
-;;; %COP-SQRT / LOG / LOG2 / LOG10 / SQUARE / RECIP / SIGNUM / ABS 已迁至 src/complex-kernels.lisp
-
-;;; %COP-NEG 已迁至 src/complex-kernels.lisp
 
 ;;; ==================================================================
-;;; 3. 一元函数分派包装
-;;; ==================================================================
-
-;;; %COP-LOG-BASE 已迁至 src/complex-kernels.lisp
-
-;;; vt-log 的 M1 匿名包装已拆除：分派移入 elementwise.lisp 的单一 DEFUN
-;;; ==================================================================
-;;; 4. 实部 / 虚部 / 共轭 / 幅角 / 模（§16.6）
+;;; 3. 实部 / 虚部 / 共轭 / 幅角 / 模（§16.6）
 ;;; ==================================================================
 
 ;;; ------------------------------------------------------------------
@@ -116,7 +108,6 @@
 ;;;   循环上界逐元素推进，编译器可完全证明）。
 ;;; ------------------------------------------------------------------
 
-;;; %DEF-CX-TO-REAL-RUN / %CX-*-RUN / %CX-RUN-TO-REAL 已迁至 src/complex-kernels.lisp
 
 (defun %cx-op-abs (vt &key out dtype)
   "逐元素绝对值 / 复数模。
@@ -134,17 +125,10 @@
     "VT-ABS")))
 
 
-;;; VT-REAL 已迁出：搬到 extensions3.lisp（归属文件）
-
-;;; VT-IMAG 已迁出：搬到 extensions3.lisp（归属文件）
-
-;;; VT-CONJ 已迁出：搬到 extensions3.lisp（归属文件）
-
 (defun vt-conjugate (tensor &key out dtype)
   "vt-conj 的 numpy 全名别名。"
   (vt-conj tensor :out out :dtype dtype))
 
-;;; VT-ANGLE 已迁出：搬到 extensions3.lisp（归属文件）
 
 (defun vt-iscomplexobj (x)
   "判定 X 是否含复数（对标 numpy.iscomplexobj）。"
@@ -174,10 +158,9 @@
       (vt-map #'complex re im :dtype dt))))
 
 ;;; ==================================================================
-;;; 5. 幂（§16.10）
+;;; 4. 幂（§16.10）
 ;;; ==================================================================
 
-;;; %CX-POW-2 已迁至 src/complex-kernels.lisp
 
 (defun %cx-op-pow (vt power &key out dtype)
   "逐元素幂 VT**POWER（对标 numpy.power）。
@@ -197,10 +180,8 @@
     (vt-map (function %cx-pow-2) in pw :out out :dtype dt))))
 
 
-;;; VT-EXPT 已迁出：与归属文件同义，删冗余
-;;; vt-float-power 的 M1 匿名包装已拆除：分派移入 extensions3.lisp 的单一 DEFUN
 ;;; ==================================================================
-;;; 6. 比较与极值（字典序，§16.8）
+;;; 5. 比较与极值（字典序，§16.8）
 ;;; ==================================================================
 
 ;; 性能：这一组在比较/谓词内核里每元素调用一次，必须内联。
@@ -244,7 +225,7 @@
   (cond ((%cisnan a) b) ((%cisnan b) a) ((%cgt a b) b) (t a)))
 
 ;;; ==================================================================
-;;; 7. 判定族 isnan / isinf / isfinite（§16.7）
+;;; 6. 判定族 isnan / isinf / isfinite（§16.7）
 ;;; ==================================================================
 
 (declaim (inline %cx-nan-flag %cx-inf-flag %cx-finite-flag))
@@ -255,7 +236,7 @@
 (defun %cx-finite-flag (x) (if (%cx-finite-p x) 1 0))
 
 ;;; ==================================================================
-;;; 8. 归约内核（sum / prod / max / min）
+;;; 7. 归约内核（sum / prod / max / min）
 ;;;
 ;;; 为什么不复用 def-vt-reduce 的内核：那套内核按「存储级 dtype」做编译期
 ;;; 特化（+kernel-lts+ 只有 4 种实数类型），复数落不进去；硬塞会把
@@ -581,7 +562,7 @@
         (%cx-write-flat res vals :int64)))))
 
 ;;; ==================================================================
-;;; 9. 统计量（mean / var / std / average）
+;;; 8. 统计量（mean / var / std / average）
 ;;; ==================================================================
 
 (defun %cx-op-mean (tensor &key axis keepdims dtype out)
@@ -651,9 +632,6 @@
            (v (vt-var in :axis axis :keepdims keepdims :ddof ddof :dtype dt)))
       (vt-sqrt v :out out :dtype dt))))
 
-;;; vt-average 已归位 reduce-stats.lisp：原先是「同名 defun +
-;;; (%cx-orig 'vt-average) 转发」，重载 reduce-stats.lisp 就会静默丢掉复数分支。
-
 (defun %cx-op-round (tensor &key (divisor 1) out dtype)
   "逐元素四舍五入（对标 numpy.round）。
 
@@ -676,7 +654,7 @@
 
 
 ;;; ==================================================================
-;;; 10. 扫描（cumsum / cumprod）
+;;; 9. 扫描（cumsum / cumprod）
 ;;; ==================================================================
 
 (defun %cx-scan (tensor axis op out dtype op-name)
@@ -813,7 +791,7 @@
 
 
 ;;; ==================================================================
-;;; 11. 排序 / argsort / 中位数（字典序 + NaN 末尾，§16.8）
+;;; 10. 排序 / argsort / 中位数（字典序 + NaN 末尾，§16.8）
 ;;; ==================================================================
 
 (declaim (inline %cx-sort-less))
@@ -1450,8 +1428,6 @@
   (if out (progn (vt-copy-into out r) out) r)))
 
 
-;;; VT-@ 已迁出：与归属文件同义，删冗余
-
 (defun %cx-op-dot (a b &key dtype out)
   "点积 / 内积（对标 numpy.dot）。复数：同 vt-matmul 语义，不取共轭。"
 (let ((r (%cx-matmul a b)))
@@ -1498,7 +1474,7 @@
 
 
 ;;; ==================================================================
-;;; 12. 范数（必然实数，§16.7）
+;;; 11. 范数（必然实数，§16.7）
 ;;; ==================================================================
 
 (defun %cx-op-norm (vt &key axis keepdims dtype out)
@@ -1519,7 +1495,7 @@
         (vt-sqrt ss :out out :dtype dt)))))
 
 ;;; ==================================================================
-;;; 13. 未覆盖函数的确定性报错（§16.11）
+;;; 12. 未覆盖函数的确定性报错（§16.11）
 ;;; ==================================================================
 
 ;; 复数线代（det/inv/solve/lu/cholesky/qr/svd/eig/pinv/lstsq/
@@ -1535,7 +1511,7 @@
 ;; 先编译，不能直接引用复数层）。钩子为 NIL 时自动回落到通用累加状态机。
 
 ;;; ==================================================================
-;;; 14. 加载期自检（§10.1 L1/L2）
+;;; 13. 加载期自检（§10.1 L1/L2）
 ;;; ==================================================================
 
 (defun %cx-self-check ()

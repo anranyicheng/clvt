@@ -13,6 +13,8 @@
 
   C1  代码注释里不得出现「第 N 轮」        → 编年史只允许在 HISTORY.md / CHANGELOG.md
   C1b CONVENTIONS 正文不得出现「本轮」     → 契约不谈时序，读者不知道「本轮」是哪一轮
+  C1c 代码注释不得出现「搬迁墓碑」          → 「X 已迁至 Y」对读者无信息（grep 即可知），
+                                              且下次搬迁又过时；带「因为…」的说明除外
   C2  `§x.y` 引用必须能解析到真实小节       → 防锚点漂移（改编号后忘了改引用）
       （扫描范围含 HISTORY.md / CHANGELOG.md —— 编年史里引用契约小节同样会漂移）
   C3  CONVENTIONS 的 §16.x 三级编号必须递增 → 防再次插入错位
@@ -32,6 +34,9 @@ CODE_GLOBS = ["src/*.lisp", "test/*.lisp"]
 
 ROUND_RE = re.compile(r"第[一二三四五六七八九十]+轮")
 NOW_RE = re.compile(r"本轮|这一轮|上一轮|前几轮")
+# 搬迁墓碑：「X 已迁至/已迁出/已归位 Y」。同行带理由的（因为/否则/会）放行。
+TOMB_RE = re.compile(r"(已迁至|已迁出|已归位|已拆除|已移除)")
+REASON_RE = re.compile(r"(因为|否则|会|理由)")
 HEAD_RE = re.compile(r"^#{2,4}\s+(\d+(?:\.\d+)*)\b", re.M)
 REF_RE = re.compile(r"§\s*(\d+\.\d+(?:\.\d+)?)")
 REF_H = re.compile(r"§\s*(H\.\d+(?:\.\d+)*)")
@@ -57,6 +62,24 @@ def main():
             "代码注释里出现「第 N 轮」（编年史应只写在 HISTORY.md / CHANGELOG.md，"
             "代码注释请改写成无时序的现状陈述）：\n    " + "\n    ".join(hits[:10])
             + (f"\n    …共 {len(hits)} 处" if len(hits) > 10 else ""))
+
+    # ---------- C1c: 代码注释不得是搬迁墓碑 ----------
+    tomb = []
+    for pat in CODE_GLOBS:
+        for f in sorted(ROOT.glob(pat)):
+            for i, line in enumerate(read(f).splitlines(), 1):
+                st = line.lstrip()
+                if not st.startswith(";") or "已迁" not in line and "已归位" not in line \
+                        and "已拆除" not in line and "已移除" not in line:
+                    continue
+                if TOMB_RE.search(line) and not REASON_RE.search(line):
+                    tomb.append(f"{f.relative_to(ROOT)}:{i}: {line.strip()[:70]}")
+    if tomb:
+        errors.append(
+            "代码注释里出现「搬迁墓碑」（X 已迁至 Y）—— 读者 grep 就知道符号在哪，"
+            "墓碑只会在下次搬迁时又过时；若确有约束要留，请改写成现状陈述：\n    "
+            + "\n    ".join(tomb[:8])
+            + (f"\n    …共 {len(tomb)} 处" if len(tomb) > 8 else ""))
 
     # ---------- C1b: CONVENTIONS 正文不得有「本轮」 ----------
     # 跳过门禁自身的说明行（§0 的规则表里必须写出这些词才能描述规则）
@@ -116,7 +139,7 @@ def main():
 
     n_sections = len(anchors)
     print(f"[docs] OK: 代码注释无轮次编号；{n_sections} 个 §锚点全部可解析；"
-          f"§16.x 递增；无时序用语；HISTORY.md 已接入")
+          f"§16.x 递增；无时序用语/墓碑；HISTORY.md 已接入")
     for w in warns:
         print("[docs] " + w)
     sys.exit(0)

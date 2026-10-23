@@ -25,9 +25,6 @@
 
 (in-package :clvt)
 
-;;; （原「0. 原实现预捕获」段已删除：覆盖式架构拆除后不再需要，
-;;;   理由与判据见 complex.lisp 的「0.」小节点评。）
-
 ;;; ==================================================================
 ;;; 1. 值级小工具
 ;;; ==================================================================
@@ -122,10 +119,7 @@
 ;;; 这一偏差登记在 CONVENTIONS §16.18「已知差异 D-C7」，并写进 docstring，
 ;;; 避免使用者以为改视图能改原数组。
 
-;;; %CX-VIEW-PAIR-P / %CX-VIEW-DTYPE-SHAPE / %CX-REINTERPRET 已迁至 src/complex-kernels.lisp
 
-;;; vt-view 已归位 manip.lisp：原先是「同名 defun 再写一遍 +
-;;; (%cx-orig 'vt-view) 转发」，重载 manip.lisp 就会静默丢掉 :dtype 重解释。
 ;;; ==================================================================
 ;;; 4. 转换：repeat（复数）
 ;;; ==================================================================
@@ -449,7 +443,6 @@
 ;;; 一次拿到所有 axis/keepdims 组合，且**复用已优化的内核**
 ;;; （vt-sum / vt-amax 的复数快路径），不再写第二套 fiber 循环。
 
-;;; %CX-TO-OUT 已迁至 src/complex-kernels.lisp
 
 (defun %cx-nan-sentinel (dt sign)
   "全 ±Inf 的复数哨兵：SIGN 为 +1 → (+inf,+inf)，-1 → (-inf,-inf)。
@@ -1113,14 +1106,6 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
         (vt-where zero-d ident r0 :dtype :complex128)))))
 
 
-;;; ---- 12.5 fromiter：默认 dtype 推断含复数 -------------------------
-;;; 原实现默认 :float64，且显式传 :float64 时复数会被静默取实部。
-;;; numpy 的 fromiter 必须显式给 dtype，给实数 dtype 遇复数直接 TypeError。
-
-;;; vt-fromiter 已归位 extensions3.lisp：原先是同名 DEFUN +
-;;; (%cx-orig 'vt-fromiter) 转发，重载 extensions3.lisp 就会把复数序列
-;;; 静默按 :float64 构建（丢虚部）。
-
 (defun %cx-op-positive (tensor &key out dtype)
   "逐元素取正（一元 +，对标 numpy.positive）。复数恒等映射，保复数 dtype。"
   (let ((v (ensure-vt tensor)))
@@ -1137,7 +1122,7 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 ;;;
 ;;; 判据：只要**任一参数**含复数就拒绝 —— 与 %CX-DEF-UNSUPPORTED 一致。
 
-;;; ---- 12.6 any / all：复数按「非零」判定真值 ----------------------
+;;; ---- 12.5 any / all：复数按「非零」判定真值 ----------------------
 ;;; numpy 对复数的布尔语义就是「任一分量非零即为真」（`bool(0+0j)` 为 False，
 ;;; `bool(nan+0j)` 为 True）。clvt 的 vt-any / vt-all 是 8 路实数元素类型
 ;;; 特化的归约，遇到复数直接抛 "unsupported input dtype"。

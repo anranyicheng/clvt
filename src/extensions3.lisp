@@ -784,8 +784,8 @@
    结果 dtype 缺省 float64。:out 契约同 vt-abs（支持广播）。
 
   复数（§16.10）：两个分量各自按复数幂算，与 vt-pow 共用 %CX-POW-2。
-  原先是 complex.lisp 的匿名包装，重载本文件后复数会被静默取实部
-  （实测 (vt-float-power #C(2 1) #C(2 0)) 得 4.0，numpy 是 3+4j）。"
+  漏掉这里的复数分派会静默取实部：(vt-float-power #C(2 1) #C(2 0))
+  会得 4.0，而 numpy 是 3+4j。"
   (when (or (%cx-deep-p x) (%cx-deep-p y))
     (return-from vt-float-power
       (let* ((xe (ensure-vt x))

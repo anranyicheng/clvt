@@ -133,11 +133,8 @@
   `%float-map-pair` 的编译期内联循环（原实现对每种情形都用 lambda，
   一律回退 vt-map 的 funcall 路径，1M 元素实测 log 57ms / log2 103ms）；
   任意其它 base 仍是 lambda 路径（base 是运行期变量，无法内联）。"
-  ;; 复数分派：原先是 complex.lisp 里 `(setf (symbol-function
-  ;; 'vt-log) (lambda (&rest ...)))` 装的匿名包装 —— 重载本文件就会静默
-  ;; 变回实数路径（log(-1+0i) 从 πi 变成 NaN）。
   ;; 判据用 %CX-ANY-P 而非 %CX-TENSOR-P：后者对 list 返回 NIL，
-  ;; (vt-log (list #C(0 1))) 会掉进实数路径。
+  ;; (vt-log (list #C(0 1))) 会掉进实数路径（log(-1+0i) 从 πi 变成 NaN）。
   (when (%cx-any-p vt)
     (return-from vt-log
       (let* ((in (ensure-vt vt))
