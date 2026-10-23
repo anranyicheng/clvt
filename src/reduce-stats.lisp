@@ -1070,7 +1070,7 @@
   ;; 当 out 与输入在物理区间上重叠（如 out = base[1:7]、in = base[0:6]）时，
   ;; 先写的输出会污染后面还没读到的输入，实测 `(vt-cumsum in :out out)`
   ;; 得到 1,2,4,8,16,32 这种「越滚越大」的错值。这里统一走 vt-out-snapshot，
-  ;; 与 vt-map / SIMD matmul 的口径一致（§16.36.1）。
+  ;; 与 vt-map / SIMD matmul 的口径一致（§16.35.3）。
   (let* ((tensor (if out (first (vt-out-snapshot out (list tensor))) tensor))
          (shape (vt-shape tensor))
          (rank (length shape))

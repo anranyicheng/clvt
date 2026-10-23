@@ -93,7 +93,7 @@
 | `test/check_key_sync.py` | **第十四轮**：codegen 门禁改「语义比较 + `--strict` 逐字节」双口径；`:tol` 按 dtype 分级容差；生成器退出码非 0 直接 FAIL；清理生成器遗留的 `tmp/`（§16.34.3） |
 | `src/reduce-stats.lisp` | **第十四轮**：`vt-cumulative` 拆「外壳（with-float-safe）+ `%vt-cumulative` 内核」；快路径 / axis / 展平三处循环改为**首元素直拷**（§16.34.2、§16.34.4） |
 | `src/extensions3.lisp` | **第十四轮**：`%e3-cumulative-skip-nan` 的 axis 与展平两处循环改为「掩码后首元素直拷」，`nancumsum([-0.0])` 保住符号位（§16.34.4） |
-| `src/linalg.lisp` | **第十四轮**：`vt-svd` 的 `max-sweeps`/`tol` 改 `supplied-p`，实数 50/1e-14 与复数 60/1e-15 各用自己验证过的缺省（§16.34.5） |
+| `src/linalg.lisp` | **第十四轮**：`vt-svd` 的 `max-sweeps`/`tol` 改 `supplied-p`，实数 50/1e-14 与复数 60/1e-15 各用自己验证过的缺省（§16.33.6） |
 | `test/scan-first-element-test.lisp` | **第十四轮新增** 38 断言（实数 cumsum/cumprod 三条路径的符号零 + nan 族 + dtype 提升 + `:out` 非连续落点 + 复数回归），注册后共 53 套件 |
 | `src/reduce-stats.lisp` | **第十五轮**：`%vt-cumulative` 的平面/沿轴两条路径合并到同一个按元素类型特化的 `RUN`（沿轴 196 → 4 ms）；新增 `%nanmedian-fold-axes` / `%nanmedian-multi`，`vt-nanmedian` 接通 axis 列表（§16.35.2、§16.35.4） |
 | `src/extensions3.lisp` | **第十五轮**：`%e3-cumulative-skip-nan` 的 axis 分支改 strides 指针写回、op 内联、float64 直存（260 → 14 ms）；删除已成死代码的 `cumstep` flet（§16.35.3） |
@@ -132,3 +132,411 @@ LAMBDA，`declaim inline` 对调用点失效；哪些符号被覆盖无法静态
 
 判据（全部应为 0）：`grep -c "setf (symbol-function" src/*.lisp`、
 `grep -c "(%cx-orig" src/*.lisp`。
+
+---
+
+## H.3 第十四～十六轮：工程状态、性能与契约层的三轮（详细）
+
+> 为什么单独成节：这三轮的叙事原先住在 `CONVENTIONS.md` §16.34–§16.36，
+> 与 `CHANGELOG.md` 的对应条目是**同一件事的两个版本**，且其中的性能数字
+> 随机器/版本腐烂得最快。现在契约结论留在 `CONVENTIONS.md` §16.34–§16.36
+> （各带一句「来历见 HISTORY」），过程、踩坑与实测数据放这里。
+
+### H.3.1 第十四轮：拆分的收尾、两处静默错值与门禁的可用性
+
+前十三轮把「复数能不能算对」基本做完了（159/159 单一 DEFUN 分派、52 个套件全绿）。
+本轮换了个角度：**不复盘语义，复盘工程状态** —— 全量重跑测试入口，逐条追问
+「这条命令在一台干净的机器上真的能过吗」。
+
+结论是 4 个缺陷，其中 2 个属于「测试/构建本身坏了」，1 个是静默错值，1 个是
+会在用户进程里崩的陷阱问题。
+
+#### H.3.1.1 A：`elementwise1/2` 是 `elementwise` 的完整副本（拆了个寂寞）
+
+提交 `59ff055`（"拆分elementwise文件，避免编译需要过大内存"）**只加了两个文件，
+一行没从原文件删**：
+
+| 事实 | 数据 |
+|---|---|
+| `elementwise.lisp` 顶层定义 | 133 个（1530 行） |
+| `elementwise1.lisp` + `elementwise2.lisp` | 39 + 46 = 85 个 |
+| 这 85 个在 `elementwise.lisp` 里**是否还存在** | **100% 存在**（逐行归一化比对：422/422、361/361 行命中） |
+| 唯一差异 | ew1 多 `(in-package :clvt)`；ew2 多一行 `(sb-ext::gc :full t)` |
+
+后果有两条，都不是"只是占地方"：
+
+1. **拆分目标完全没达成**。`elementwise.lisp` 仍是 1530 行，4 GB 堆照样在
+   编译它时 `Heap exhausted, game over` —— 而 `run-tests.sh` 的默认值正是
+   4096 MB。也就是说这个提交的全部收益为零，成本是 942 行死代码。
+2. **重新引入了刚刚花两轮消灭的病根**。85 个 `DEFUN` 各存在两份，后加载者胜；
+   `elementwise.lisp` 里那份改动**永远不生效**。这与 §16.32/§16.33 描述的
+   「覆盖式分派」是同一个机制（`clvt.asd` 的顺序决定谁赢），只是从"符号函数被
+   setf 覆盖"变成了"符号函数被后一个文件重定义"。§16.33.7 花一整列记下的
+   「跨文件同名 defun：14 对 → **0**」在同一个提交里回到了 85 对。
+
+**修法**：把 `elementwise.lisp` 第 596 行之后（`%pow-odd-int-p` 起，即 ew1+ew2
+承载的整段）删掉，保留前 48 个定义，并在文件尾写清三段分工与这条铁律。
+
+验证（`sbcl --dynamic-space-size 4096`，清空 fasl 缓存冷编译）：
+
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| 冷编译 | **Heap exhausted（4 GB）** | **成功** |
+| `caught WARNING` | 20 | **0** |
+| `caught STYLE-WARNING` | 96 | 96（均为既有的 unused-variable 类） |
+| 跨文件同名 `defun` | 85 对 | **0** |
+
+#### H.3.1.2 B：docstring 里一个裸 `"` 让函数体混进了 5 个未定义变量
+
+`src/map-reduce.lisp` 的 `%weak-cast-needed-p` docstring 结尾写着：
+
+```lisp
+      构造函数收到 #C(1 0) 而报 "is not of type REAL"。"
+```
+
+中间那个 `"` 把字符串**提前闭合**了。于是 `is`、`not`、`of`、`type`、`REAL`
+五个 token 成了**函数体里的五个 form**，真正的 docstring 只剩末尾一个 `"。"`：
+
+```lisp
+(BLOCK %WEAK-CAST-NEEDED-P
+  CLVT::IS NOT CLVT::OF TYPE REAL "。" (AND (= (VT-SIZE X) 1) ...))
+```
+
+编译器报了 5 条 `undefined variable` + 「294 more uses」（SBCL 按组件累计），
+共 20 条 WARNING。**危险的地方在于它不报错**：SBCL 把未定义变量当 special 变量
+读，实测 `(%weak-cast-needed-p ...)` 仍返回 T —— 也就是说这个函数一直在依赖
+「读未绑定 special 变量」的未定义行为工作。
+
+**修法**：写成 `\"is not of type REAL\"`（转义）。修完 `caught WARNING` 归零。
+
+> 教训：`check-parens` 查不出这类问题 —— 括号是平衡的，坏的是**字符串边界**。
+> 唯一可靠的信号是编译期的 `undefined variable` 警告，所以「编译零 WARNING」
+> 应当作为门禁，而不是当成噪音 muffle 掉（`run-tests.sh` 现在正是
+> `(handler-bind ((warning #'muffle-warning)) ...)`）。
+
+#### H.3.1.3 C：key-sync 门禁在 numpy 2.4.6 上硬失败，整套测试起不来
+
+`run-tests.sh` 的第一步是 `check_key_sync.py`，它把「重新生成的探针文件」
+与「提交的探针文件」做**逐字节比对**。而 `gen_probes*.py` 用 `str(np.float64)`
+输出期望值 —— 这个格式化随 numpy 版本变：
+
+```
+numpy 2.5.0：0.529475129
+numpy 2.4.6：0.5294751290000002      （同一条用例，差 1 ulp）
+```
+
+本机 numpy 2.4.6（也就是 §16 复数章的基准版本）因此必然报「codegen 漂移」，
+门禁 `exit 1`，**52 个套件一个都跑不了**。§10.4.1 其实已经记录了这个现象
+（"不要盲目重新生成再提交"），但门禁本身没有相应放宽。
+
+**修法**：门禁默认改成**语义比较**，`--strict` 保留逐字节口径：
+
+| 项 | 规则 |
+|---|---|
+| key 集合 / dtype / shape / 比较方式（`:exact`/`:tol`） | 必须完全一致，否则 FAIL |
+| `:tol` 条目的数值 | 按 dtype 分级容差：float64 `1e-12`、float32 `1e-6`（实测跨版本最大漂移 float64 2.1e-16、float32 1.0e-7，均 <1 ulp） |
+| `:exact` 条目的数值 | **逐字符相同**（该模式断言的就是逐位相等，文本一变必然运行期失败） |
+| 生成器退出码非 0 | FAIL（否则文件不重写 → 「文本相同」的假通过，见 §10.4.1 的"静默失效"） |
+| 生成的 `tmp/` 目录 | 跑完删掉（提交 60336c9 已把它从仓库移除，不该每次跑测试又冒出来） |
+
+修后本机输出：`[key-sync] OK: ref_compute 651 key，5 套件查询 651，缺失 0`
++ 两条「格式化漂移」WARN（7 条与 8 条），套件得以正常启动。
+
+#### H.3.1.4 D：实数线 `vt-cumulative` 没包 `with-float-safe`（用户进程会崩）
+
+写 §16.34.2 的回归测试时顺手试了 `(vt-cumprod #(inf 0))`：
+
+```
+Unhandled FLOATING-POINT-INVALID-OPERATION ...
+Operation was (* #.SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY 0.0d0).
+```
+
+numpy 的行为是 `np.cumprod([inf, 0]) → [inf, nan]`（附 RuntimeWarning）。
+按 §5.2「算术传播」与 §7 的平台陷阱约定，本库必须返回 nan 而不是抛条件。
+同类问题在 §16.30.2 已经踩过一次（复数 `vt-median` 漏包），这次是实数累积。
+
+**修法**：拆成「外壳 + 内核」两个函数 ——
+
+```lisp
+(defun vt-cumulative (tensor op init-val &key axis dtype out)
+  "…（契约不变）…"
+  (with-float-safe
+   (%vt-cumulative tensor op init-val :axis axis :dtype dtype :out out)))
+```
+
+不用「把 150 行循环体整体缩进一级」的写法，是因为那样每次语义改动都会淹没在
+重排 diff 里。内核改名后必须同步 `(return-from %vt-cumulative result)` ——
+漏改会得到 `return for unknown block: VT-CUMULATIVE`（本轮实测踩到）。
+
+#### H.3.1.5 顺带：`vt-svd` 的死缺省（§16.33.6 待办的收尾）
+
+第十三轮合并两处 `defun` 时，公开签名取的是实数线的 `50 / 1e-14`，而分派处写的是
+`(%cx-op-svd matrix :max-sweeps max-sweeps :tol tol)` —— 于是 `%cx-op-svd`
+自己的 `60 / 1e-15` 缺省**永远是死代码**，复数 SVD 实际一直跑在 50/1e-14 上，
+与它被压测验证的参数不一致。
+
+**修法**：改 `supplied-p`，两条路径各回各家：
+
+```lisp
+(defun vt-svd (matrix &key (full-matrices nil)
+                          (max-sweeps nil max-sweeps-p) (tol nil tol-p))
+  (when (%cx-any-p matrix)
+    (return-from vt-svd (%cx-op-svd matrix :full-matrices full-matrices
+                                          :max-sweeps (if max-sweeps-p max-sweeps 60)
+                                          :tol (if tol-p tol 1e-15))))
+  (let ((max-sweeps (if max-sweeps-p max-sweeps 50))
+        (tol (if tol-p tol 1e-14)))
+    ...))
+```
+
+不把两条路径统一到同一组数值，是因为两侧的缺省都是**各自验证过**的：实数线的
+SIMD 内核用 1e-14 做过性能/收敛平衡，复数 Jacobi 的压测按 1e-15 通过。统一到
+任一侧都是拿一侧的验证结论去覆盖另一侧。
+
+#### H.3.1.6 测试
+
+新增 `test/scan-first-element-test.lisp`（**38 断言**，已接入 `run-tests.sh`，
+当前共 **53 个套件**）。它锁的是 A/B/C 之外的**语义**改动（首元素直拷 + 陷阱），
+结构修复由既有的 `complex-dispatch-test`（跨文件同名 defun）与「编译零 WARNING」覆盖：
+
+| 组 | 覆盖 |
+|---|---|
+| 1 实数 cumsum（19） | `[-0.0]` 的符号位、`[-0.0,0.0]`、2-D 三向（axis=0/1/nil）的**符号表 + 数值**、float32、轴长 1、负步长视图、空输入 |
+| 2 实数 cumprod（5） | `[-0.0]`、`[inf,0] → [inf,nan]`、2-D axis=0 符号表 |
+| 3 nan 族（6） | `nancumsum([-0.0])` 保号、`[nan,-0.0] → [+0,+0]`、`nancumprod([nan]) → 1`、2-D axis=0 |
+| 4 dtype 契约（6） | int8 → int64 且不溢出、显式 `:dtype` 生效且不破坏保号、复数路径回归 |
+| 5 `:out` 非连续（3） | 列视图落点逐位置核对、首元素符号、**其余位置不动** |
+
+两条测试写法硬约束（NaN 用 `sb-ext:float-nan-p`、符号零显式判）已提炼为
+`CONVENTIONS.md` §16.34.3。
+
+### H.3.2 第十五轮：把第十四轮的三条遗留全部收口
+
+第十四轮最后留了一张「已定位、未修」的表（§16.34.4）：沿轴累积慢 39×、
+`nanmedian` 不支持多轴、编译 WARNING 无人管。本轮把三条做完，并顺带修掉
+一条同源的隐性开销（`nancumsum` 的逐元素写回）。
+
+#### H.3.2.1 出发点：同一个函数的两条路径差 196 倍
+
+```
+(vt-cumsum a)            ; 1M 元素，展平  → 1 ms
+(vt-cumsum a :axis 0)    ; 1000×1000      → 196 ms     ← 同一份语义
+```
+
+第十四轮给 `axis=nil` 做了「按元素类型特化 + 首元素直拷」的循环，但沿轴那条
+仍在跑通用回退：`(funcall op ...)` 每元素一次装箱、`(vt-cast cum final-dtype)`
+每元素一次 ecase、`aref` 打在**未声明元素类型**的数组上走泛型分派。
+三个 200ns/元素 叠起来，正好是 196 ms。
+
+#### H.3.2.2 修法：平面与沿轴共用同一个 `RUN`
+
+关键观察：两条路径的**内层**完全一样 —— 都是「从某起点，按固定步长走 N 个」。
+差别只在「有多少条这样的段、每段起点怎么算」：
+
+| 路径 | 段数 | 起点 | 步长 |
+|---|---|---|---|
+| `axis=nil`（展平） | 1 | `tensor.offset` | 1（要求全连续） |
+| `axis=k` | `∏_{d≠k} shape[d]` | 除 k 维之外各维索引折算 | `strides[k]`（可为负） |
+
+于是只写一份内核：
+
+```lisp
+(labels ((run (sp dp cnt istep ostep)   ; 从 SP 走 CNT 个到 DP，步长 ISTEP/OSTEP
+           ...（首元素直拷 + 特化累加）...)
+         (run-flat () (run in-offset out-offset (vt-size result) 1 1))
+         (run-axis ()                       ; 除 AX 外各维做里程计
+           (loop ... (run sp dp dim istep ostep) ...)))
+  (if ax (run-axis) (run-flat)))
+```
+
+两个实现细节值得记：
+
+1. **`labels` 而不是 `flet`**。`run-flat`/`run-axis` 要调 `run`，`flet` 里
+   兄弟函数**互不可见**（会编译成对外部 `CLVT::RUN` 的调用，运行期
+   `The function CLVT::RUN is undefined`）。这个坑当场踩了一次。
+2. **`ax` 必须提前到 `let*` 里算**。宏在展开期求值，若在宏体内写
+   `(if ax ...)`，`ax` 是词法变量、编译期不可见 → `The variable AX is unbound`。
+   现在宏展开出的是**运行期** `(if ax (run-axis) (run-flat))`。
+
+#### H.3.2.3 实测（1000×1000 / 1M 元素，SBCL 2.6.8，同进程取 5 次最优）
+
+| 调用 | 修前 | 修后 | numpy 2.4.6 | 修前/后 |
+|---|---:|---:|---:|---:|
+| `cumsum axis=0` | 196 ms | **4 ms** | 3.3 ms | 49× |
+| `cumsum axis=1` | 196 ms | **4 ms** | 3.3 ms | 49× |
+| `cumprod axis=0` | 197 ms | **3 ms** | 3.8 ms | 66× |
+| `cumsum axis=1`（float32） | 196 ms | **1 ms** | — | — |
+| `cumsum axis=1`（int64） | 191 ms | **1 ms** | — | — |
+| `cumsum axis=0`（转置视图，stride 非 1） | 196 ms | **2 ms** | — | — |
+| `nancumsum axis=0` | 260 ms | **14 ms** | 6.2 ms | 18× |
+| `cumsum`（展平，回归项） | 1–4 ms | **1–3 ms** | — | — |
+
+`nancumsum` 那条另有三处改动（`%E3-CUMULATIVE-SKIP-NAN` 的 axis 分支）：
+把 `(setf (apply #'vt-ref result coords) ...)` 换成 strides 驱动的指针（省掉
+每元素一次坐标列表 cons + 一次通用坐标折算）、把 `(funcall op-fn ...)` 内联成
+`(if sum-p (+ cum x) (* cum x))`、结果 dtype 是 float64 时直接存（省掉
+`vt-cast`）。顺带删掉了变成死代码的 `cumstep` flet。
+
+#### H.3.2.4 `nanmedian` 多轴：折叠成 2-D，复用单轴内核
+
+numpy 的 `nanmedian(a, axis=(0,1))` 合法，而 clvt 两侧（实数 `vt-nanmedian`、
+复数 `%cx-op-nanmedian`）都只支持单轴，多轴直接报「暂不支持」。
+
+**正确性前提（本轮的裁决依据）**：中位数对归约区内元素的**顺序不敏感**
+（内部本来就要排序）。所以
+
+> 置换 (保留轴…, 归约轴…) → 重塑成 `(H, D)` → 沿单轴 1 归约 → 重塑回目标形状
+
+与「直接沿多轴取中位」等价。这条前提让改动量从「再写一套多维 fiber 遍历」
+降到「一个 20 行的折叠函数」，并且复数侧可以**完整复用**同一份折叠逻辑
+（折叠只做置换与重塑，与 dtype 无关）：
+
+```lisp
+(defun %nanmedian-fold-axes (tensor axes keepdims) ...)  ; 共用
+(defun %nanmedian-multi     (tensor axis keepdims out) ...)      ; 实数
+(defun %cx-nanmedian-multi  (in axes keepdims out dtype) ...)    ; 复数
+```
+
+`vt-reshape` 对非连续视图会自动落地，所以任意 strides / 负步长 / 偏移的输入
+都成立（实测转置输入与连续副本结果一致）。
+
+**验证**（numpy 2.4.6 实测值，数据用 `a[i,j,k]=100i+10j+k` 保证可精确表示）：
+
+| 用例 | numpy | clvt |
+|---|---|---|
+| `axis=(0,1)` | `[60 61 62 63]` | 一致 |
+| `axis=(1,2)` | `[11.5 111.5]` | 一致 |
+| `axis=(0,2)` | `[51.5 61.5 71.5]` | 一致 |
+| `axis=(0,1,2)` | `61.5`（0 维） | 一致 |
+| `axis=(0,1) keepdims` | `(1,1,4)` | 一致 |
+| `b[0,0,0]=NaN, axis=(0,1)` | `[100 61 62 63]` | 一致 |
+| 复数 `z=a+i(i+2j+3k), axis=(0,2)` | `[51.5+5j 61.5+7j 71.5+9j]` | 一致（字典序） |
+| 负数轴 `(-2,-1)` / 乱序 `(2,1)` | 与 `(1,2)` 相同 | 一致 |
+| 非连续 `:out` | — | 落点正确、未越界 |
+
+#### H.3.2.5 编译体检门禁：WARNING 归零才算过
+
+第十四轮那个「裸引号」事故的本质是：**编译器报了 20 条 WARNING，运行期完全
+正常**（SBCL 把未定义变量当 special 变量读，函数照样返回 T）。只要没人看编译
+输出，这类缺陷可以永久潜伏 —— 而 `check-parens` 查不出（括号是平衡的），
+numpy 对拍也查不出（数值是对的）。
+
+`run-tests.sh` 现在在跑套件前先做一次全系统编译体检：
+
+| 项 | 规定 |
+|---|---|
+| 触发 | 每次运行都做（`--skip-build` / `CLVT_SKIP_BUILD_CHECK=1` 可跳过） |
+| 口径 | `asdf:compile-system :clvt :force t`，**必须真的重编译** |
+| 拦截 | `^; caught WARNING:` 计数 > 0 → FAIL 并打印上下文 |
+| 放行 | `STYLE-WARNING`（unused variable 类，现有 96 条）不计 —— 噪声化的门禁等于没门禁 |
+| 顺带收益 | 这一次重编译产出的 fasl 被后续套件直接复用，总耗时基本不额外增加 |
+
+**踩到的坑（值得记）**：第一版把编译包在
+`(handler-bind ((warning #'muffle-warning)) ...)` 里（照抄套件里的写法）——
+结果 96 条 STYLE-WARNING 全部消失、门禁恒报「0 条」。**muffle 把编译期告警
+一起吞了**。门禁必须吃原始输出。这一条已写进脚注里，防止后人"顺手加个 muffle
+让输出干净点"。
+
+反向验证（故意引入 `(progn undefined-scratch-variable 1)`）：
+
+```
+[FAIL] 编译产生 1 条 WARNING（STYLE-WARNING 96 条，不计）
+    17526-;   undefined variable: CLVT::UNDEFINED-SCRATCH-VARIABLE
+[FAIL] 编译体检未通过（先消除 WARNING 再跑套件；临时跳过用 --skip-build）
+```
+
+### H.3.3 第十六轮：`:out` 重叠保护的缺口、两处 dtype 静默降级，以及一次负结果
+
+第十五轮把「能算对」和「跑得快」两条线都推到了头，剩下的三条（复数 matmul
+SIMD、`real/imag` 视图、复数逐元素 SIMD）都是内核级工作。本轮换到**契约层**
+扫了一遍 —— 抓到了两个真缺陷，都在「不报错、但结果是错的」这一类。
+
+#### H.3.3.1 A：流式累积没有 `:out` 重叠保护（数据被自己写坏）
+
+§4.3 的硬约定是「输出与任一输入在物理区间上重叠 → 先做 `vt-copy` 快照」，
+理由是 `np.add(z, z, out=z[::-1])` 这类调用必须等价于「先读全量、再写」。
+`vt-map` 与 SIMD matmul 都走 `vt-out-snapshot`，但 `reduce-stats` 的
+`vt-cumulative` 是**流式**的（读到第 i 个就写第 i 个位置），一旦 out 与输入
+错位重叠，先写的结果就会污染还没读到的输入：
+
+```lisp
+;; base = (1 2 3 4 5 0 0 0)；in = base[0:6]，out = base[1:7]
+(vt-cumsum in :out out)
+;; 修前 → (1 1 2 4 8 16 32 0)      ← 输入被自己覆盖，越滚越大
+;; 修后 → (1 1 3 6 10 15 15 0)     ← 先快照，等于 cumsum((1 2 3 4 5 0))
+```
+
+为什么只有实数 `cumsum`/`cumprod` 中招 —— 这一栏值得记住，它解释了「为什么
+同样的契约在别的函数上没出问题」：
+
+| 函数 | 结构 | 重叠安全 |
+|---|---|---|
+| `vt-cumsum` / `vt-cumprod`（实数） | 单趟流式读改写 | ❌ → 本轮修 |
+| `vt-nancumsum` / `vt-nancumprod` | 先算进临时 double 向量，最后一次写回 | ✅ 天然安全 |
+| 复数 `%cx-op-cum*` | 同样两趟 | ✅ |
+| `vt-map` / SIMD matmul / einsum | 显式 `vt-out-snapshot` | ✅ |
+
+**修法**：`%vt-cumulative` 开头把输入过一遍 `vt-out-snapshot`：
+
+```lisp
+(let* ((tensor (if out (first (vt-out-snapshot out (list tensor))) tensor))
+       ...)
+```
+
+`vt-out-snapshot` 内部用物理区间判重叠（`%vt-views-overlap-p`），无重叠时
+零开销、不复制。
+
+#### H.3.3.2 B：`nanmedian` 的两处 dtype 静默降级
+
+| 调用 | 修前 | 问题 |
+|---|---|---|
+| `(vt-nanmedian 实数数组 :dtype :int32)` | 静默返回 float64 | 显式 `:dtype` 被**完全忽略** |
+| `(vt-nanmedian 复数数组 :dtype :float64)` | 静默返回 float64（**取实部**） | 虚部消失，正中 §16.13 红线 |
+
+第二条是最危险的一类：用户拿到的是「数值看起来合理」的实数结果，而虚部已经
+无声无息地丢了。§16.4 早已为 ufunc 定了同一句话——「复数输入的结果 dtype
+必须是复数类型」——`nanmedian` 当时没接上。
+
+**修法**：公开入口做两个前置判定（消息里写清原因与替代做法）：
+
+```lisp
+(实数输入 + :dtype ≠ :float64)  → 报错「实数输入的结果 dtype 恒为 :float64…」
+(复数输入 + :dtype 非复数)      → 报错「用实数 dtype 会把虚部静默丢掉」
+```
+
+缺省行为不变（实数 → float64，复数 → 保持复数 dtype），所以不影响既有调用。
+
+> 顺带记录一个**未动**的 numpy 差异：`np.nanmedian(float32 数组)` 返回
+> float32，而本库实数路径恒为 float64。这是既有契约（§16.10 明写），
+> 改它属于行为变更，需要单独裁决；本轮只堵住「显式 `:dtype` 被忽略」。
+
+#### H.3.3.3 C：复数 matmul 的一次负结果（省下一轮重复投入）
+
+`%cx-matmul-*-rows` 的内层是 `(incf (aref c …) (* av (aref b …)))` —— 每个
+`(p,j)` 都对 C 做一次读-改-写，k=256 时同一组元素被访问 256 次。直觉上换成
+「4 个局部累加器、只在最后写回」应该大幅减少访存，而且累加次序仍是 p 递增、
+结果**逐位相同**（§16.27.5 的 bit-exact 断言能直接验证）。
+
+实测（禁用并行 GEMM，单线程，SBCL 2.6.8）：
+
+| n | 旧内核（逐元素 incf） | 新内核（4 局部累加器） | 结论 |
+|---:|---:|---:|---|
+| 192 | 8.60 ms | **6.40 ms** | 好 1.34× |
+| 256 | **15.67 ms** | 17.33 ms | 反而差 10% |
+| 384 | 66.00 ms | 68.00 ms | 持平 |
+
+三档没有一致方向、差异在测量噪声内 —— **无稳定收益，已回退**（不留代码）。
+并行路径（默认开启）下两者都是 3 ms 级，差异被完全掩盖。
+
+结论：这条路的瓶颈在复数乘法的**标量算术**（每元素 4 乘 2 加，且 SBCL 的
+`(complex double-float)` 读写要经 16 字节装载/解包），不在 C 的访存。
+要再快只有两条路：
+
+1. **SIMD**：按 j 维向量化（f64.4 处理 2 个复数，需 shuffle 组 re/im），
+   累加次序不变 → 仍满足铁律 1/2；
+2. **SoA + 4 条实 GEMM**：算术量不变但把复数乘法拆成纯实数 FMA，能吃到
+   实数线的 SIMD/并行内核；代价是**累加顺序改变**，与「与朴素循环逐位相等」
+   冲突，需要先裁决这条不变量。
+
+§16.25 已实测 SoA/打包比标量更慢（22.9 ms vs 13.5 ms），本轮又排除了
+「局部累加器」这一条 —— 剩下能动的只有第 1 条。

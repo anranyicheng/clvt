@@ -657,7 +657,7 @@
   "忽略 NaN 的中位数（复数）：按字典序；偶数个取中间两值均值。
    全 NaN 切片 → NaN+0j（numpy 语义）。
    本函数只做复数分支；公开入口在 reduce-stats.lisp 的单一 DEFUN 里分流（§16.32）。
-   多轴（如 '(0 1)）由入口折叠成 2-D 后复用本函数的单轴分支（§16.35.4）。"
+   多轴（如 '(0 1)）由入口折叠成 2-D 后复用本函数的单轴分支（§16.35.2）。"
   (let ((in (ensure-vt tensor)))
     (when (and axis (listp axis) (cdr axis))
       (return-from %cx-op-nanmedian

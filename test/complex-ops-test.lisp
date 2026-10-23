@@ -230,7 +230,7 @@
                 (lambda () (vt-view cx-a nil :dtype :int64)))
   (expect-error "view 形状不匹配"
                 (lambda () (vt-view cx-a (list 3) :dtype :float64)))
-  ;; 多轴 nanmedian 已接通（§16.35.4）；此前这里断言的是「必须报错」。
+  ;; 多轴 nanmedian 已接通（§16.35.2）；此前这里断言的是「必须报错」。
   ;; numpy 2.4.6: nanmedian([[1+2j, 3-4j, 5+0j]], axis=(0,1)) => 3-4j
   (expect-true "nanmedian 多轴 (0 1) 已支持"
                (let ((r (vt-ref (vt-nanmedian (vt-reshape cx-c (list 1 3))
