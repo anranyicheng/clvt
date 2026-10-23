@@ -1507,9 +1507,9 @@ python3 test/gen_complex_expected.py               # 重新生成期望值（num
 
 ---
 
-### 16.18 数据搬运层（第二轮进化）：转换 / 拼接 / 剪切 / 集合 / 缺失值 / 缩并
+### 16.18 数据搬运层：转换 / 拼接 / 剪切 / 集合 / 缺失值 / 缩并
 
-第一轮（16.1–16.14）解决的是**逐元素算术与归约**；这一轮补的是**结构层**。
+本节是**结构层**（逐元素算术与归约见 §16.5–§16.14）。
 落地文件 `src/complex-ops.lisp`（在 `src/complex.lisp` 之后加载），
 同样遵守「实数路径零改动 + 只对含复数的调用分派」。
 
@@ -1674,10 +1674,10 @@ Unhandled TYPE-ERROR ... The value #C(0.0 0.0) is not of type (COMPLEX SINGLE-FL
 （`clvt.asd` 本身变了，正常 `asdf:load-system` 也会重编；但若你的 ASDF 版本
 对 `:around-compile` 变化不敏感，用 `:force t` 最稳。）
 
-### 16.19 线性代数与算子补齐（第三轮进化）
+### 16.19 线性代数与算子补齐
 
-前两轮把「逐元素」和「结构层」做完了，但**复数线代整块仍是硬报错**，
-另有一批算子在复数输入下**静默只算实部**。本轮收尾。
+本节覆盖复数线代（LU / Cholesky / QR / SVD / 厄米特特征值 …）与一批原本在
+复数输入下**静默只算实部**的算子。
 
 落地：
 - `src/complex-linalg.lisp`（新增）：LU / det / solve / inv / Cholesky /
@@ -1875,7 +1875,7 @@ where/broadcast/copy-to!/write/save-load/array-equal/isclose… 全部直接可�
 > 「每轮改了哪些文件」属于**编年史**，已迁到 `HISTORY.md`（§H.1）。
 > 本文件只保留现行契约，不再逐步列举改动文件。
 
-### 16.21 第五轮：复数 einsum 的 GEMM 快路径
+### 16.21 复数 einsum 的 GEMM 快路径
 
 #### 16.21.1 问题与实测
 
@@ -2062,24 +2062,15 @@ np.unique(np.array([nan, nan, 1.]))     # [1., nan]  ← 展平则折叠
 clvt 与自家 `vt-diagonal` 保持一致，缺省取**最后两轴**。2 维输入两者等价；
 batch 输入要复现 numpy 缺省需显式 `:axis1 0 :axis2 1`（已写入 docstring）。
 
----
+套件 `setops-axis-trace-test`。逐条断言见该文件头注释；套件说明见
+`bash test/run-tests.sh --list`。
 
-### 16.25 第五轮测试
-
-- `test/setops-axis-trace-test.lisp`：**56 条断言**
-  = 37 项 numpy 2.4.6 差分（unique :axis 的 7 种轴/19 例含 index/inverse/counts、
-  NaN 行、非连续视图、退化形状、复数 2 例 + trace 的 14 例含 offset 正负/越界/
-  复数/3D axis1+axis2）
-  + 契约断言（dtype/shape 保持、NaN 折叠差异、inverse 重建、
-  axis 越界与秩不足报错、`:out` 非连续 0 维视图）
-  + 实数回归网（默认路径逐位不变）
-- 期望值由 `test/gen_setops_axis_expected.py` 从本机 numpy 实测生成
-  （`test/setops-axis-expected.sexp`），禁手写（§10.4）。
-- 已接入 `test/run-tests.sh`（`SUITES` + `DEFAULT_ORDER`），当前共 **44 个套件**。
+> 注：本处原有「第五轮测试」的逐条断言枚举（编号 16.25），与套件头注释、`run-tests.sh`
+> 的 `SUITES` 三处重复，已删除（编号不复用，以保持既有 `§16.2x` 引用不断）。
 
 ---
 
-### 16.26 einsum 的实数 GEMM 快通道接入 SIMD（第六轮）
+### 16.26 einsum 的实数 GEMM 快通道接入 SIMD
 
 **症状**：同一台机器上，`(vt-einsum "ij,jk->ik" a b)` 比 `(vt-matmul a b)`
 慢 **5.7~6.4×**（float64，1024²，单线程）；多线程下内存带宽掩盖掉一部分，
@@ -2198,7 +2189,7 @@ maxabs = 0）。与 numpy `@` 的相对差 ≤ 7.7e-15。
 
 ---
 
-### 16.27 第七轮：复数 matmul 内核对齐实数线（标量形态）
+### 16.27 复数 matmul 内核对齐实数线（标量形态）
 
 #### 16.27.1 症状
 
@@ -2323,7 +2314,7 @@ n=256、单线程、预分配缓冲区、只计内核本身（不含 `make-vt`/`
 
 套件 `complex-matmul-perf-test`。逐条断言见该文件头注释；套件说明见 `bash test/run-tests.sh --list`。
 
-### 16.28 第八轮：复数缺口扫描与补齐（入口 / 幂 / 归一化）
+### 16.28 复数缺口扫描与补齐（入口 / 幂 / 归一化）
 
 #### 16.28.1 怎么扫（这套方法请沿用）
 
@@ -2419,7 +2410,7 @@ softplus/gelu/mish/hard-tanh/hard-sigmoid`）。依据都是「numpy 同样拒�
 厄米特矩阵的特征值本来就是实数。要一般复矩阵的复特征值，那需要另一套
 （Hessenberg + QR 迭代）实现，属未来工作。
 
-### 16.29 第九轮：沿轴扫描的静默错值（cumsum/cumprod 只算第一条 fiber）
+### 16.29 沿轴扫描内核必须遍历 `ax-stride` 层
 
 #### 16.29.1 症状
 
@@ -2499,7 +2490,7 @@ det/inv/solve/pinv/cholesky/matrix_power/cond/svd-qr 的数值、复数比较与
 
 套件 `complex-scan-axis-test`。逐条断言见该文件头注释；套件说明见 `bash test/run-tests.sh --list`。
 
-### 16.30 第十轮：NaN/Inf 语义、median 契约与 `:out` 非连续
+### 16.30 NaN/Inf 语义、median 契约与 `:out` 非连续
 
 #### 16.30.1 方法：从「dtype 保真」走到「数值对拍」
 
@@ -2584,7 +2575,7 @@ np.cumsum([-0.0+0j])         # [-0.+0.j]    ← 首元素直拷，符号位保�
 
 套件 `complex-nan-inf-test`。逐条断言见该文件头注释；套件说明见 `bash test/run-tests.sh --list`。
 
-### 16.31 第十一轮：弱标量提升（numpy NEP 50）
+### 16.31 弱标量提升（numpy NEP 50）
 
 #### 16.31.1 方法：换个角度扫 —— 只比 dtype
 
@@ -2709,7 +2700,7 @@ dtype（`%WEAK-CAST1`）。代价 O(1)，类型检查能过、内联快路径回
 
 套件 `dtype-weak-scalar-test`。逐条断言见该文件头注释；套件说明见 `bash test/run-tests.sh --list`。
 
-### 16.32 第十二轮：拆掉覆盖式复数层（单一 DEFUN 分派）
+### 16.32 单一 DEFUN 分派（禁止覆盖式复数层）
 
 #### 16.32.1 为什么必须拆
 
@@ -2843,68 +2834,56 @@ grep -n "cx-orig" src/*.lisp | grep eval-when # 预捕获清单删除
 
 ---
 
-### 16.33 第十三轮：覆盖式复数层的收尾（159 / 159，S6 + S7）
+### 16.33 复数层的结构约束与签名裁决
 
-第十二轮把 143 / 159 改成单一 `DEFUN` 分派，留下 16 个「形状不规整」的。
-本轮把剩下的 16 个做完，并删掉整套覆盖机制（S6），补上验收断言（S7）。
+> 完整过程（16 个符号怎么分类、`vt-log` 的 `:base` 除零事故、重载验收的做法、
+> 最终统计）见 `HISTORY.md` §H.3.4。本节只留**现行的结构约束与签名裁决**。
 
-#### 16.33.1 16 个符号按「该怎么改」分四类
+#### 16.33.1 覆盖不仅掩盖重复，还会掩盖错误实现
 
-| 类 | 数量 | 符号 | 处理方式 |
-|---|---:|---|---|
-| A 纯冗余 | 2 | `vt-@` `vt-expt` | 两处 `defun` 语义完全相同（都只是委托 `vt-matmul` / `vt-pow`），删 `complex.lisp` 那份 |
-| B 错误死桩搬迁 | 4 | `vt-real` `vt-imag` `vt-conj` `vt-angle` | `extensions3.lisp` 那份写着「本库无复数 dtype，恒返回输入本身」——**是错的**；把 `complex.lisp` 的权威实现搬到归属文件，删桩 |
-| C M1 匿名包装合并 | 2 | `vt-log` `vt-float-power` | 包装体（含 `:base` / 复数幂）并进归属文件的 `defun`，`return-from` 分派 |
-| D M2 同名覆盖 + `%cx-orig` 转发 | 8 | `vt-view` `vt-average` `vt-clip` `vt-clamp` `vt-fromiter` `vt-unique` `vt-nanmedian` `vt-matrix-rank` | 复数侧实现改名 `%cx-op-*`，归属文件插守卫；**同时把两处 lambda-list 合并成一份** |
+`vt-real` / `vt-imag` / `vt-conj` / `vt-angle` 在 `extensions3.lisp` 里的那份
+曾经写着「本库无复数 dtype，恒返回输入本身」——**是错的**，其正确性完全靠
+`clvt.asd` 的文件顺序（后加载者胜）维持。调一下顺序，`(vt-conj #C(1 2))`
+就会静默返回 `#C(1 2)`。
 
-B 类是这一轮最值得记的一笔：那 4 个桩的正确性完全靠「后加载者胜」维持。
-有人调整 `clvt.asd` 的文件顺序，`(vt-conj #C(1 2))` 就会静默返回 `#C(1 2)`。
-**覆盖不仅掩盖重复，还会掩盖错误实现** —— 这是它比死代码更危险的地方。
+**这是禁止覆盖式分派的第二条理由**（第一条见 §16.32）：同名定义不只是「哪份
+生效」不确定，它会让**错误实现**看起来和正确实现一样正常。
 
-#### 16.33.2 结构变更：内核前移，新文件 `src/complex-kernels.lisp`
+#### 16.33.2 标量内核必须前移，依赖方向单向
 
-D 类之所以拖到最后一轮，是因为复数分支依赖的内核住在 `complex*.lisp`（最后加载），
-而归属文件在前 —— 编译期只能前向引用。本轮把它们拆成两层：
+复数分支依赖的标量内核住在 `complex-kernels.lisp`，加载位置在
+`dispatch` 之后、**所有归属文件之前**：
 
 | 层 | 文件 | 加载位置 | 内容 |
 |---|---|---|---|
-| 标量内核 | `src/complex-kernels.lisp`（**新增**） | `dispatch` 之后、所有归属文件之前 | `%cop-*`（sqrt/log/pow/square/recip/signum/abs）、`%cx-nan-of`/`%cx-inf-of`/`%cx-nan-complex`、`%def-cx-to-real-run` + 4 个 `%cx-*-run`、`%cx-run-to-real`、`%cx-pow-2`、`%cx-to-out`、`%cx-flat`、view 的 3 个重解释内核 |
+| 标量内核 | `src/complex-kernels.lisp` | `dispatch` 之后、归属文件之前 | `%cop-*`（sqrt/log/pow/square/recip/signum/abs）、`%cx-nan-of`/`%cx-inf-of`/`%cx-nan-complex`、`%def-cx-to-real-run` + 4 个 `%cx-*-run`、`%cx-run-to-real`、`%cx-pow-2`、`%cx-to-out`、`%cx-flat`、view 的 3 个重解释内核 |
 | 张量逻辑 | `complex.lisp` / `complex-ops.lisp` / `complex-linalg.lisp` | 末尾（不变） | 需要 shape/axis/dtype 的算法 |
 
-依赖方向变成单向：**归属文件 → 标量内核**，不再有「归属文件要等复数层」的倒挂。
-`dispatch.lisp` 末尾补了一份 `declaim ftype` 清单（`%cx-op-unique` / `%cx-op-nanmedian` /
-`%cx-op-clip` / `%cx-op-matrix-rank`），把「这些名字由后面的文件提供」写成可对账的契约，
-编译期不再有 `UNDEFINED-FUNCTION` style-warning。
+依赖方向**只能是**「归属文件 → 标量内核」。反过来（归属文件等复数层）就是
+第十三轮之前的状态：编译期只能前向引用，`declaim ftype` 无处可写。
 
-#### 16.33.3 迁移中发现的新缺陷：`vt-log` 的 `:base` 一直在除零
+`dispatch.lisp` 末尾维护一份 `declaim ftype` 清单（`%cx-op-unique` /
+`%cx-op-nanmedian` / `%cx-op-clip` / `%cx-op-matrix-rank`），把「这些名字由
+后面的文件提供」写成**可对账的契约** —— 新增复数分支时若忘了同步，编译期
+立刻出 `UNDEFINED-FUNCTION` style-warning。
 
+#### 16.33.3 `vt-log` 的 `:base`：不要写 `(log x base)`
+
+CL 的 `(log x base)` 是**两参数对数** `log_x(base)`，不是「以 base 为底」。
+
+```lisp
+;; 错：算成 ln(base)/ln(1) = 0.693/0，with-float-safe 下得 Inf，再乘进结果变 0+0i
+(complex (/ (realpart l) (log base 1.0d0)) …)
+;; 对：
+(complex (/ (realpart l) (log base)) …)
 ```
-原实现: (complex (/ (realpart l) (log base 1.0d0)) …)
-```
 
-CL 的 `(log x base)` 是**两参数对数** `log_x(base)`，于是这里算成了
-`ln(base) / ln(1) = 0.693 / 0`。浮点陷阱被 `with-float-safe` 屏蔽，除法得到 `Inf`，
-再乘进结果变成 `0+0i`：
+这个 bug 在覆盖式架构下活了五轮 —— 没有任何测试覆盖「复数 + 非缺省 base」这一格。
+现已在 `complex-reload-test` 的探针里锁死。
 
-| 表达式 | 整改前 | 整改后 | numpy |
-|---|---|---|---|
-| `(vt-log #C(8 0) :base 2)` | `#C(0.0d0 0.0d0)` | `#C(3.0d0 0.0d0)` | `3+0j` |
+#### 16.33.4 覆盖机制已全部删除（判据）
 
-正确写法是 `(log base)`（自然对数）。**这个 bug 在覆盖式架构下活了整整五轮**，
-原因是没有任何测试覆盖「复数 + 非缺省 base」这一格 —— 而它属于最常用的换底调用。
-本轮把它补进 `complex-reload-test` 的探针，并修正实现。
-
-#### 16.33.4 S6 收尾：整套覆盖机制删除
-
-删除顺序（顺序颠倒会掩盖漏改的调用点）：
-
-1. 清掉 `(%cx-orig 'vt-sum)` 两处调用（`vt-var` / `vt-norm` 里对实数 `sq` 求和，
-   现在直接 `(vt-sum sq …)` —— 分派判据看到实数即走原路）；
-2. 删三个文件里的 `eval-when` 预捕获清单（`complex.lisp` 63 条、`complex-ops.lisp` 49 条、
-   `complex-linalg.lisp` 12 条）—— 这份清单以前**必须**手工与 `defun` 保持同步，漏写即无限递归；
-3. 删 `*cx-originals*` 哈希表与 `%cx-orig` 函数。
-
-判据（全部应输出 0，已写进 `complex-reload-test` 的最后一条断言）：
+下面三条必须全部输出 **0**（`complex-reload-test` 里有对应断言）：
 
 ```sh
 grep -c "setf (symbol-function" src/*.lisp    # 0（注释除外）
@@ -2912,60 +2891,42 @@ grep -c "(%cx-orig"            src/*.lisp    # 0（注释除外）
 grep -c "eval-when.*cx-orig"   src/*.lisp    # 0
 ```
 
-#### 16.33.5 S7 验收：重载单文件不丢复数（新套件）
+删除顺序（顺序颠倒会掩盖漏改的调用点，反过来的代价是运行期
+`symbol-function` 返回 NIL 而不是编译期报错）：清 `(%cx-orig …)` 调用点 →
+删 `eval-when` 预捕获清单 → 删 `*cx-originals*` 表与 `%cx-orig` 函数。
 
-`test/complex-reload-test.lisp`（14 断言）—— 这是本轮**唯一真正的验收**。
-同一 image 里逐个 `load` 12 个源文件（`dispatch` / `complex-kernels` / `manip` /
-`elementwise` / `reduce-stats` / `setops` / `linalg` / `extensions` / `extensions3` /
-`complex` / `complex-ops` / `complex-linalg`），每轮跑 19 个探针：
+#### 16.33.5 重载验收：重载任何单个源文件都不许丢复数
 
-| 探针组 | 覆盖 |
-|---|---|
-| 第十二轮代表（3） | `sqrt(-1+0i)`、`sum`、`maximum` 字典序 |
-| 第十三轮 16 个符号 | `@` `expt` `real` `imag` `conj` `angle` `log`（含 `:base`）`float-power` `view` `average` `clip` `clamp` `fromiter` `unique` `nanmedian` `matrix-rank` |
-| 结构 | 全库无 `(setf (symbol-function …))` 代码行 |
-
-在整改前，这一条在「重载 `elementwise.lisp`」那一轮**必然失败**（`sqrt` 变 NaN float64）。
-现在 14/14 全过。
+套件 `complex-reload-test`。它在同一 image 里逐个 `load` 12 个源文件，
+每轮跑 19 个探针（3 个 §16.32 代表 + 本节 16 个符号 + 全库无
+`(setf (symbol-function …))`）。覆盖式架构下它必然失败 —— 这是那套机制
+唯一真正的验收手段，也是回归网里最该保留的一个。
 
 #### 16.33.6 lambda-list 漂移的最终裁决
 
-第十二轮记录 9 处漂移，本轮的 8 个 D 类里含 5 处，逐一裁决：
+合并同名 `defun` 时两处参数表不一致，等于「谁生效」由加载顺序决定。
+下列 7 处已裁决，**新写复数分支时必须与这里的签名一致**：
 
-| 符号 | 整改前（两处） | 裁决 | 理由 |
-|---|---|---|---|
-| `vt-view` | `(vt new-shape)` / `(vt &rest args)` | 取 `&rest` + 手工分流 | 后者兼容前者调用形态，且能表达 `(vt-view a :dtype dt)` |
-| `vt-average` | 两处都是 `&rest args` | 保留 `&rest`，复数 + 带参 → 报错 | 复数 weights 路径未验收，显式报错优于猜（§16.11） |
-| `vt-clip` | 两处同签名 | 统一，`min-p`/`max-p` 显式传入内核 | `supplied-p` 语义必须原样保留 |
-| `vt-clamp` | `(tensor vmin vmax &key)` / `(vt &optional …)` | 取 `&optional`（更宽） | `(vt-clamp a)` 原先在必填签名下报错；pytorch 语义允许只给一侧 |
-| `vt-fromiter` | `(dtype :float64)` / `(dtype nil dtype-p)` | 取推断式：含复数 → `:complex128`，否则 `:float64` | 既保住旧默认，又不静默丢虚部 |
-| `vt-nanmedian` | 无 `dtype` / 有 `dtype` | 加 `dtype` | 向后兼容（可选关键字） |
-| `vt-matrix-rank` | `(tol 1e-10)` / `(tol nil)` | 统一 `(tol nil)`，实数分支内部回落 `1e-10` | 保持两条路径各自的缺省口径不变 |
+| 符号 | 裁决 | 理由 |
+|---|---|---|
+| `vt-view` | `&rest` + 手工分流 | 兼容 `(vt-view a shape)`，且能表达 `(vt-view a :dtype dt)` |
+| `vt-average` | `&rest`；复数 + 带参 → 报错 | 复数 weights 路径未验收，显式报错优于猜（§16.13） |
+| `vt-clip` | 统一签名，`min-p`/`max-p` 显式传入内核 | `supplied-p` 语义必须原样保留 |
+| `vt-clamp` | `&optional`（更宽） | `(vt-clamp a)` 原先在必填签名下报错；pytorch 语义允许只给一侧 |
+| `vt-fromiter` | 推断式：含复数 → `:complex128`，否则 `:float64` | 既保住旧默认，又不静默丢虚部 |
+| `vt-nanmedian` | 增加可选 `dtype` | 向后兼容 |
+| `vt-matrix-rank` | `(tol nil)`，实数分支内部回落 `1e-10` | 两条路径各自的缺省口径不变 |
 
-> `vt-svd` 的 `max-sweeps 50/tol 1e-14` vs `60/1e-15` 未在本轮处理：
-> 它已经在第十二轮随 S5-C 迁移成单一 `defun`，但**当时保留的是复数版参数**
-> （后加载者胜），需要单独确认期望值。记为待办，不在本轮扩大改动面。
->
-> ✅ **第十四轮已裁决**（§16.33.6）：签名改为 `supplied-p`，两条路径各用自己
-> 验证过的缺省（实数 50/1e-14、复数 60/1e-15），显式传参时以调用方为准。
-> 顺带修掉一个隐藏问题：合并后 `%cx-op-svd` 自己的 `60/1e-15` 缺省是**死代码**
-> （分派时总把公开缺省显式传下去），复数 SVD 实际上一直跑在 50/1e-14 上。
+`vt-svd` 的 `max-sweeps`/`tol` 用 `supplied-p` 分开：实数 50/1e-14、
+复数 60/1e-15，各自用验证过的缺省，显式传参时以调用方为准。
 
 #### 16.33.7 结果
 
-| 项 | 第十二轮后 | 本轮后 |
-|---|---|---|
-| 单一 `DEFUN` 分派的公开符号 | 143 / 159 | **159 / 159** |
-| `(setf (symbol-function …))` 代码处 | 2 | **0** |
-| `%cx-orig` 调用点 | 16 | **0** |
-| `eval-when` 预捕获清单 | 3 个文件、124 条 | **0** |
-| 跨文件同名 `defun` | 14 对 | **0** |
-| `%cx-def-*` 宏 | 0 | 0 |
-| 测试套件 | 51 | **52**（新增 `complex-reload-test`） |
-| 源码行数 | 24,624 | 24,878 |
+单一 `DEFUN` 分派 **159/159**；`setf (symbol-function)` 2 → **0**；
+`%cx-orig` 调用点 16 → **0**；`eval-when` 清单 124 条 → **0**；
+跨文件同名 `defun` 14 对 → **0**。明细与行数统计见 `HISTORY.md` §H.3.4.4。
 
-导出符号数不变（367），`src/` 净增 254 行 —— 增量全部是注释与 docstring：
-删掉 659 行覆盖代码与死桩，新增 373 行分派守卫、内核文件与新测试。
+---
 
 ### 16.34 构建、门禁与测试写法（契约）
 
@@ -3122,7 +3083,7 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 
 | # | 项 | 现状与数据 | 为什么难 / 下一步 |
 |---|---|---|---|
-| U1 | 复数 `matmul` 的 SIMD | 标量内核已对齐实数标量线（§16.27.5：同规模 5.32 ms vs 实数 2.46 ms）；相对**实数 SIMD** 仍差 2.0–4.2× | 唯一可行路线是「交错布局上按 j 向量化 + shuffle 组 re/im」（保持 p 递增 → 仍满足铁律 1/2）。SoA+4 路实 GEMM 已实测更慢（§16.25）且改变累加顺序，本地累加器也已实测无收益（§16.36.2） |
+| U1 | 复数 `matmul` 的 SIMD | 标量内核已对齐实数标量线（§16.27.5：同规模 5.32 ms vs 实数 2.46 ms）；相对**实数 SIMD** 仍差 2.0–4.2× | 唯一可行路线是「交错布局上按 j 向量化 + shuffle 组 re/im」（保持 p 递增 → 仍满足铁律 1/2）。SoA+4 路实 GEMM 已实测更慢（§16.36.2）且改变累加顺序，本地累加器也已实测无收益（§16.36.2） |
 | U2 | `real/imag` 返回共享视图（D-C3） | 现在返回副本；numpy 的 `z.real` 是同一缓冲的零拷贝视图 | 需给 strided view 引入「分量视图」（`data` + 分量偏移 + 元素宽度/2），会动物理层，影响 `vt-write`/`vt-copy-into`/别名判定；风险高于收益 |
 | U3 | 复数逐元素算子的 SIMD 特化（D-C5） | §16.14.3 实测：`add` 1.8×、`mul` 2.3×、`sqrt` 4.0×、`abs` 6.5×（相对 float64） | 与 U1 同源；还需要先解决 `sb-simd` 的 shuffle 组装形式 |
 | U4 | 编译期 `STYLE-WARNING` 尚不拦截 | 现有 96 条（unused-variable 类）；`WARNING` 已由 §16.34.2 的门禁拦死 | 先逐条清到 0，再把门禁从 `WARNING` 收紧到 `STYLE-WARNING`；否则一次性收紧会让门禁长期红 |

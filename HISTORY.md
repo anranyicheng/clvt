@@ -538,5 +538,75 @@ SIMD、`real/imag` 视图、复数逐元素 SIMD）都是内核级工作。本�
    实数线的 SIMD/并行内核；代价是**累加顺序改变**，与「与朴素循环逐位相等」
    冲突，需要先裁决这条不变量。
 
-§16.25 已实测 SoA/打包比标量更慢（22.9 ms vs 13.5 ms），本轮又排除了
+§16.36.2 已实测 SoA/打包比标量更慢（22.9 ms vs 13.5 ms），本轮又排除了
 「局部累加器」这一条 —— 剩下能动的只有第 1 条。
+
+---
+
+### H.3.4 第十三轮：覆盖式复数层的收尾（159 / 159）
+
+> 本轮的**契约结论**（结构约束、签名裁决、删除判据）留在
+> `CONVENTIONS.md` §16.33；这里是完整过程与统计。
+
+#### H.3.4.1 16 个符号按「该怎么改」分四类
+
+| 类 | 数量 | 符号 | 处理方式 |
+|---|---:|---|---|
+| A 纯冗余 | 2 | `vt-@` `vt-expt` | 两处 `defun` 语义完全相同（都只是委托 `vt-matmul` / `vt-pow`），删 `complex.lisp` 那份 |
+| B 错误死桩搬迁 | 4 | `vt-real` `vt-imag` `vt-conj` `vt-angle` | `extensions3.lisp` 那份写着「本库无复数 dtype，恒返回输入本身」——**是错的**；把 `complex.lisp` 的权威实现搬到归属文件，删桩 |
+| C M1 匿名包装合并 | 2 | `vt-log` `vt-float-power` | 包装体（含 `:base` / 复数幂）并进归属文件的 `defun`，`return-from` 分派 |
+| D M2 同名覆盖 + `%cx-orig` 转发 | 8 | `vt-view` `vt-average` `vt-clip` `vt-clamp` `vt-fromiter` `vt-unique` `vt-nanmedian` `vt-matrix-rank` | 复数侧实现改名 `%cx-op-*`，归属文件插守卫；**同时把两处 lambda-list 合并成一份** |
+
+B 类是这一轮最值得记的一笔：那 4 个桩的正确性完全靠「后加载者胜」维持。
+有人调整 `clvt.asd` 的文件顺序，`(vt-conj #C(1 2))` 就会静默返回 `#C(1 2)`。
+**覆盖不仅掩盖重复，还会掩盖错误实现** —— 这是它比死代码更危险的地方。
+
+#### H.3.4.2 迁移中发现的新缺陷：`vt-log` 的 `:base` 一直在除零
+
+```
+原实现: (complex (/ (realpart l) (log base 1.0d0)) …)
+```
+
+CL 的 `(log x base)` 是**两参数对数** `log_x(base)`，于是这里算成了
+`ln(base) / ln(1) = 0.693 / 0`。浮点陷阱被 `with-float-safe` 屏蔽，除法得到 `Inf`，
+再乘进结果变成 `0+0i`：
+
+| 表达式 | 整改前 | 整改后 | numpy |
+|---|---|---|---|
+| `(vt-log #C(8 0) :base 2)` | `#C(0.0d0 0.0d0)` | `#C(3.0d0 0.0d0)` | `3+0j` |
+
+正确写法是 `(log base)`（自然对数）。**这个 bug 在覆盖式架构下活了整整五轮**，
+原因是没有任何测试覆盖「复数 + 非缺省 base」这一格 —— 而它属于最常用的换底调用。
+本轮把它补进 `complex-reload-test` 的探针，并修正实现。
+
+#### H.3.4.3 S7 验收：重载单文件不丢复数（新套件）
+
+`test/complex-reload-test.lisp`（14 断言）—— 这是本轮**唯一真正的验收**。
+同一 image 里逐个 `load` 12 个源文件（`dispatch` / `complex-kernels` / `manip` /
+`elementwise` / `reduce-stats` / `setops` / `linalg` / `extensions` / `extensions3` /
+`complex` / `complex-ops` / `complex-linalg`），每轮跑 19 个探针：
+
+| 探针组 | 覆盖 |
+|---|---|
+| 第十二轮代表（3） | `sqrt(-1+0i)`、`sum`、`maximum` 字典序 |
+| 第十三轮 16 个符号 | `@` `expt` `real` `imag` `conj` `angle` `log`（含 `:base`）`float-power` `view` `average` `clip` `clamp` `fromiter` `unique` `nanmedian` `matrix-rank` |
+| 结构 | 全库无 `(setf (symbol-function …))` 代码行 |
+
+在整改前，这一条在「重载 `elementwise.lisp`」那一轮**必然失败**（`sqrt` 变 NaN float64）。
+现在 14/14 全过。
+
+#### H.3.4.4 结果
+
+| 项 | 第十二轮后 | 本轮后 |
+|---|---|---|
+| 单一 `DEFUN` 分派的公开符号 | 143 / 159 | **159 / 159** |
+| `(setf (symbol-function …))` 代码处 | 2 | **0** |
+| `%cx-orig` 调用点 | 16 | **0** |
+| `eval-when` 预捕获清单 | 3 个文件、124 条 | **0** |
+| 跨文件同名 `defun` | 14 对 | **0** |
+| `%cx-def-*` 宏 | 0 | 0 |
+| 测试套件 | 51 | **52**（新增 `complex-reload-test`） |
+| 源码行数 | 24,624 | 24,878 |
+
+导出符号数不变（367），`src/` 净增 254 行 —— 增量全部是注释与 docstring：
+删掉 659 行覆盖代码与死桩，新增 373 行分派守卫、内核文件与新测试。
