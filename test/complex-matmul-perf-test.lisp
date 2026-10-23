@@ -1,6 +1,6 @@
 ;;;; complex-matmul-perf-test.lisp — 复数 matmul 内核（§16.27）回归网
 ;;;;
-;;;; 目的：锁住第七轮对 %CX-MATMUL-RUN 的重写（对齐实数线的 %MATMUL-DF-ROWS
+;;;; 目的：锁住对 %CX-MATMUL-RUN 的重写（对齐实数线的 %MATMUL-DF-ROWS，§16.27
 ;;;; 形态：safety 0 + 指针递推 + j 4 路展开 + 复用 CALL-PARALLEL-GEMM）。
 ;;;;
 ;;;; 两部分断言：

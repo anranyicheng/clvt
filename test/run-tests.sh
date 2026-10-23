@@ -634,6 +634,13 @@ main() {
         fi
     fi
 
+    # 文档/注释一致性门禁（静态，秒级）：代码注释不得带轮次编号、
+    # §引用必须可解析、§16.x 编号必须递增、HISTORY.md 必须接入。
+    if ! python3 "$SCRIPT_DIR/check_docs.py"; then
+        fail "文档/注释一致性检查未通过（详见上方输出）"
+        exit 1
+    fi
+
     # 编译体检：整个系统必须零 WARNING 编译通过（细节见 check_build_warnings）
     if ! check_build_warnings; then
         fail "编译体检未通过（先消除 WARNING 再跑套件；临时跳过用 --skip-build）"

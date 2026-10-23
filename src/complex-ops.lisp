@@ -1,13 +1,13 @@
-;;;; complex-ops.lisp — 复数「数据搬运层」（第二轮进化）
+;;;; complex-ops.lisp — 复数「数据搬运层」：转换 / 拼接 / 剪切 / 集合 / 缺失值 / 缩并
 ;;;;
-;;;; 第一轮（src/complex.lisp）解决的是**逐元素算术与归约**；
-;;;; 这一轮补的是**结构层**：转换 / 拼接 / 剪切 / 集合 / 缺失值 / 缩并。
+;;;; 定位：只放**复数分支的实现**。每个公开入口的实数实现仍在它的归属文件里，
+;;;; 由该文件的单一 DEFUN 在入口处 `(when (%cx-any-p …) …)` 分流到这里的
+;;;; `%cx-op-*`（CONVENTIONS §16.32/§16.33）。因此本文件不做任何运行期重定义。
 ;;;;
-;;;; 设计约束（延续第一轮，CONVENTIONS §16）：
+;;;; 设计约束（CONVENTIONS §16）：
 ;;;;
-;;;;  1) **实数路径零改动**：每个被覆盖的函数在加载时先用 %CX-ORIG 捕获
-;;;;     原实现，只有「含复数」的调用进新内核，其余原样转发（性能与语义
-;;;;     与第一轮之前完全一致）。
+;;;;  1) **实数路径零影响**：不含复数的调用根本不进本文件，语义与性能
+;;;;     由归属文件的原有实现保证。
 ;;;;
 ;;;;  2) **顺序即语义**：复数的全序是**字典序**（实部优先，再比虚部），
 ;;;;     NaN 恒排末尾（§16.8）。sort / argsort / unique / searchsorted /
@@ -122,9 +122,9 @@
 ;;; 这一偏差登记在 CONVENTIONS §16.18「已知差异 D-C7」，并写进 docstring，
 ;;; 避免使用者以为改视图能改原数组。
 
-;;; %CX-VIEW-PAIR-P / %CX-VIEW-DTYPE-SHAPE / %CX-REINTERPRET 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %CX-VIEW-PAIR-P / %CX-VIEW-DTYPE-SHAPE / %CX-REINTERPRET 已迁至 src/complex-kernels.lisp
 
-;;; vt-view 已归位 manip.lisp（第十三轮）：原先是「同名 defun 再写一遍 +
+;;; vt-view 已归位 manip.lisp：原先是「同名 defun 再写一遍 +
 ;;; (%cx-orig 'vt-view) 转发」，重载 manip.lisp 就会静默丢掉 :dtype 重解释。
 ;;; ==================================================================
 ;;; 4. 转换：repeat（复数）
@@ -293,9 +293,8 @@
    %AXIS-ELEM-EQ）本身与元素类型无关，复数按 (实部, 虚部) 字典序参与比较，
    因此直接复用实数层的 %UNIQUE-AXIS，无需第二份实现。
 
-   第十三轮：原先是同名 DEFUN 覆盖 setops.lisp 的实现并 (%cx-orig) 转发，
-   重载 setops.lisp 就会把复数静默送进实数内核。现在只保留复数分支，
-   公开入口在 setops.lisp 的单一 DEFUN 里分派。"
+   本函数只做复数分支；公开入口在 setops.lisp 的单一 DEFUN 里分流（§16.32）。
+   若改成「事后重定义公开函数」，重载 setops.lisp 就会把复数静默送进实数内核。"
   (let ((rank (length (vt-shape in))))
     (if (and axis (> rank 1))
         (%unique-axis in (vt-normalize-axis axis rank)
@@ -447,10 +446,10 @@
 ;;;     全 NaN → NaN+0j。
 ;;;
 ;;; 实现策略：用「掩码 + 单位元替换 + 既有复数归约内核」的向量化写法，
-;;; 一次拿到所有 axis/keepdims 组合，且**复用第一轮已优化的内核**
+;;; 一次拿到所有 axis/keepdims 组合，且**复用已优化的内核**
 ;;; （vt-sum / vt-amax 的复数快路径），不再写第二套 fiber 循环。
 
-;;; %CX-TO-OUT 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %CX-TO-OUT 已迁至 src/complex-kernels.lisp
 
 (defun %cx-nan-sentinel (dt sign)
   "全 ±Inf 的复数哨兵：SIGN 为 +1 → (+inf,+inf)，-1 → (-inf,-inf)。
@@ -657,9 +656,8 @@
 (defun %cx-op-nanmedian (tensor &key axis keepdims out dtype)
   "忽略 NaN 的中位数（复数）：按字典序；偶数个取中间两值均值。
    全 NaN 切片 → NaN+0j（numpy 语义）。
-   第十三轮：原先是同名 DEFUN 覆盖 reduce-stats.lisp 的实现并 (%cx-orig) 转发，
-   现在只做复数分支，公开入口在 reduce-stats.lisp 的单一 DEFUN 里分派。
-   第十五轮：多轴（如 '(0 1)）接通 —— 折叠成 2-D 后复用本函数的单轴分支。"
+   本函数只做复数分支；公开入口在 reduce-stats.lisp 的单一 DEFUN 里分流（§16.32）。
+   多轴（如 '(0 1)）由入口折叠成 2-D 后复用本函数的单轴分支（§16.35.4）。"
   (let ((in (ensure-vt tensor)))
     (when (and axis (listp axis) (cdr axis))
       (return-from %cx-op-nanmedian
@@ -786,10 +784,10 @@
 ;;; 9. 张量缩并（tensordot / inner）
 ;;; ==================================================================
 ;;; 实数路径靠 vt-einsum 实现，而 einsum 的 dtype 白名单只含 4 种实数
-;;; 类型（§16.11 的「第一轮不支持」清单）。复数这里绕开 einsum：
+;;; 类型（§16.11 的算子清单）。复数这里绕开 einsum：
 ;;;   transpose（把收缩轴挪到 a 末尾 / b 开头）→ reshape 成 2D →
 ;;;   **复数专用 matmul 内核** → reshape 回自由轴形状。
-;;; 数学上与 einsum 等价，且完全复用第一轮已优化的矩阵乘。
+;;; 数学上与 einsum 等价，且完全复用已优化的矩阵乘。
 
 (defun %cx-tensordot-axes (axes ar br)
   "把 AXES 规范化成 (values a-axes b-axes)（负轴按各自秩归一化）。"
@@ -862,7 +860,7 @@
 
 
 ;;; ==================================================================
-;;; 10. 缺失值累积 与 共轭点积（补第一轮的漏网）
+;;; 10. 缺失值累积 与 共轭点积
 ;;; ==================================================================
 
 (defun %cx-nan-fill (in fill)
@@ -876,7 +874,7 @@
 
    复数：原实现走 `(vt-astype input :float64)`（取实部），会**静默丢掉虚部**。
    这里改为「NaN→0+0i 后调用复数 cumsum」，语义与 numpy 完全相同，
-   且复用第一轮已优化的扫描内核。"
+   且复用已优化的扫描内核。"
 (vt-cumsum (%cx-nan-fill tensor 0) :axis axis :dtype dtype :out out))
 
 
@@ -895,7 +893,7 @@
 ;;; 11. 明确拒绝（与 numpy 一致，但给出可读错误）
 ;;; ------------------------------------------------------------------
 
-;;; 第十二轮：vt-digitize 的复数拒绝已并入归属 DEFUN 的守卫（CONVENTIONS §16.32）。
+;;; vt-digitize 的复数拒绝在归属 DEFUN 的守卫里（§16.32），本文件不再有对应符号。
 
 
 ;;; ==================================================================
@@ -997,8 +995,8 @@
   "复数 vt-clip 的实现（V 已 ENSURE-VT）。按**字典序**整元素夹取，不按分量。
 
    `(vt-clip a min)` 只给下限 → 报错（numpy 语义：clip() missing a_max）。
-   第十三轮：原先是同名 DEFUN 覆盖 elementwise.lisp 的实现并用 (%cx-orig)
-   回调，重载 elementwise.lisp 后复数会被逐分量裁剪 —— 静默错答案。"
+   本函数只做复数分支；公开入口在 elementwise.lisp 的单一 DEFUN 里分流（§16.32）。
+   若改成事后重定义，重载 elementwise.lisp 后复数会被**逐分量**裁剪 —— 静默错答案。"
   (when (and min-p (not max-p))
     (error "vt-clip: 只提供 MIN-VAL 而未提供 MAX-VAL（numpy 语义：\
 clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
@@ -1119,7 +1117,7 @@ clip() missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 ;;; 原实现默认 :float64，且显式传 :float64 时复数会被静默取实部。
 ;;; numpy 的 fromiter 必须显式给 dtype，给实数 dtype 遇复数直接 TypeError。
 
-;;; vt-fromiter 已归位 extensions3.lisp（第十三轮）：原先是同名 DEFUN +
+;;; vt-fromiter 已归位 extensions3.lisp：原先是同名 DEFUN +
 ;;; (%cx-orig 'vt-fromiter) 转发，重载 extensions3.lisp 就会把复数序列
 ;;; 静默按 :float64 构建（丢虚部）。
 

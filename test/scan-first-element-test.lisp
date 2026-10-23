@@ -1,4 +1,4 @@
-;;;; scan-first-element-test.lisp — 累积扫描的「首元素」语义回归（第十四轮）
+;;;; scan-first-element-test.lisp — 累积扫描的「首元素」语义回归（§16.30.3）
 ;;;;
 ;;;; 背景（CONVENTIONS §16.30.3）：
 ;;;;   numpy 的 **accumulate**（cumsum/cumprod）与 **reduce**（sum/prod）在首元素上
@@ -8,7 +8,7 @@
 ;;;;       np.cumsum([-0.0])       => [-0.]        (accumulate 直拷，符号位保留)
 ;;;;       np.cumsum([-0.0, 0.0])  => [-0.  0.]    (0 + -0.0 = +0.0)
 ;;;;
-;;;;   复数线（%CX-SCAN-RUN）在第十轮已改为「首元素直拷」；**实数线一直是
+;;;;   复数线（%CX-SCAN-RUN）已改为「首元素直拷」；**实数线一直是
 ;;;;   从单位元起算**，于是 `(vt-cumsum -0.0)` 静默返回 +0.0 —— 同一份代码
 ;;;;   在实数与复数上给了不同的位模式。本套件把实数线也钉住。
 ;;;;
@@ -220,7 +220,7 @@
     (report "cumsum 显式 :dtype :float32 生效" (eq (vt-dtype r) :float32))
     (report "cumsum 显式 :dtype 后首元素符号仍保留"
             (eq (first (signs r)) :-0+)))
-  ;; 复数路径回归（第十轮已修，不能被本轮改动带坏）
+  ;; 复数路径回归（已修，不能被这次改动带坏）
   (let ((z (vt-from-sequence (list (complex -0.0d0 0.0d0) 1.0d0) :dtype :complex128)))
     (let ((r (vt-cumsum z)))
       (report "cumsum(complex) -0.0 实部符号保留"
@@ -253,7 +253,7 @@
 ;;; ------------------------------------------------------------------
 
 (format t "~&=====================================")
-(format t "~&累积扫描首元素语义（第十四轮）")
+(format t "~&累积扫描首元素语义（§16.30.3）")
 (format t "~&=====================================~%")
 (run-real-cumsum)
 (run-real-cumprod)

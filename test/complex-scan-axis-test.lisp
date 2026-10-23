@@ -1,4 +1,4 @@
-;;;; complex-scan-axis-test.lisp — 复数「沿轴扫描」回归网（第九轮 §16.29）
+;;;; complex-scan-axis-test.lisp — 复数「沿轴扫描」回归网（§16.29）
 ;;;;
 ;;;; 背景：vt-cumsum / vt-cumprod / vt-nancumsum / vt-nancumprod 的连续内核
 ;;;; %CX-SCAN-RUN 的 axis 分支漏了一层 fiber 遍历（没有遍历 AX 轴之后的
@@ -208,7 +208,7 @@
 ;;; ------------------------------------------------------------------
 
 (format t "~&=====================================")
-(format t "~&复数沿轴扫描回归（第九轮，§16.29）")
+(format t "~&复数沿轴扫描回归（§16.29）")
 (format t "~&=====================================~%")
 (run-scan-cases)
 (run-real-regression)

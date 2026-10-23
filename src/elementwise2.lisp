@@ -290,8 +290,8 @@
   实测 v=[1+2j, 3-4j, 5+0j], clip(0, 2) → [1+2j, 2+0j, 2+0j]：第一项虚部 2
   超出 2 却没被裁，因为比较的是 (1,2) 整体而不是分量 2。
 
-  第十三轮之前这段逻辑在 complex-ops.lisp 用同名 DEFUN 覆盖本函数并用
-  (%cx-orig) 回调，重载本文件后复数会被逐分量裁剪（静默错答案）。"
+  复数分支在 complex-ops.lisp 的 %CX-OP-CLIP；本函数只做分流（§16.32）。
+  若改成事后重定义，重载本文件后复数会被逐分量裁剪（静默错答案）。"
   (when (%cx-any-p vt)
     (return-from vt-clip
       (%cx-op-clip (ensure-vt vt) min-val max-val min-p max-p out dtype)))

@@ -114,7 +114,7 @@
         (:float64 (fill-float double-float))
         (:float32 (fill-float single-float))
         ((:int64 :int32)
-         ;; 与 int16/int8/uint 路径一致：溢出按 NumPy 语义回绕（§8.5），
+         ;; 与 int16/int8/uint 路径一致：溢出按 NumPy 语义回绕（§9.2），
          ;; 避免大参数下 (setf aref) 触发数组元素类型错误
          (if (eq dtype :int64)
              (fill-int (signed-byte 64) %wrap-int64)

@@ -1,9 +1,5 @@
-;;;; complex-linalg.lisp — 复数线性代数（第三轮进化）
-;;;;
-;;;; 第一轮（src/complex.lisp）把复数线代整块标成「第二轮实现」；
-;;;; 第二轮（src/complex-ops.lisp）绕开 einsum 做了 matmul/dot/inner/
-;;;; tensordot/correlate，但 LU/Cholesky/QR/SVD/特征值仍然是硬报错。
-;;;; 本文件补齐这一块。
+;;;; complex-linalg.lisp — 复数线性代数：LU / Cholesky / QR / SVD /
+;;;;                       厄米特特征值 / det / inv / solve / pinv / lstsq / rank
 ;;;;
 ;;;; 设计约束：
 ;;;;
@@ -997,8 +993,7 @@
   "复数矩阵秩（V 已 ENSURE-VT）：基于奇异值。
    阈值 TOL 显式给出时用之，否则 s_max·max(m,n)·eps（numpy 的缺省口径）。
 
-   第十三轮：原先是同名 DEFUN 覆盖 linalg.lisp 的实现并用 (%cx-orig) 转发，
-   重载 linalg.lisp 后复数会掉进实数路径（vt-astype :float64 = 静默取实部）。"
+   本函数只做复数分支；公开入口在 linalg.lisp 的单一 DEFUN 里分流（§16.32）。"
   (with-float-safe
     (let ((shape (vt-shape v)))
       (unless (= 2 (length shape))

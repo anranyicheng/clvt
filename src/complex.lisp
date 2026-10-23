@@ -1,4 +1,4 @@
-;;;; complex.lisp — 复数语义层（第一轮进化）
+;;;; complex.lisp — 复数语义层（本文件的公共算法与工具）
 ;;;;
 ;;;; 设计原则（CONVENTIONS §16）：
 ;;;;
@@ -7,12 +7,13 @@
 ;;;;     strides/offset 仍以「元素」为单位，实部/虚部 interleaved 存储。
 ;;;;     于是切片、转置、广播、非连续写入、别名快照全部自动正确。
 ;;;;
-;;;;  2) **实数路径零改动**：本文件对每个受影响的公开函数在加载时捕获
-;;;;     原实现（%cx-orig），只把「输入含复数」的调用接进复数内核；
-;;;;     其余调用原样转发。实数语义与性能不受影响（§16.12）。
+;;;;  2) **分派不在本文件**：公开入口（elementwise / reduce-stats / linalg /
+;;;;     extensions3 …）各自用单一 DEFUN 体内的 `(when (%cx-any-p …) …)`
+;;;;     分流到复数分支，本文件只提供这些分支共用的算法与工具。
+;;;;     为什么不是「本文件事后重定义公开函数」见 CONVENTIONS §16.32。
 ;;;;
-;;;;  3) **未覆盖即显式报错**：第一轮不支持的函数（LU/SVD/百分位/位运算等）
-;;;;     在入口处给出确定性错误，绝不静默丢虚部（§16.11）。
+;;;;  3) **未实现即显式报错**：没有复数实现的函数在入口给出确定性错误，
+;;;;     绝不静默丢虚部（§16.13）。
 ;;;;
 ;;;;  4) **单一语义出口**：所有判定/比较/取模经由 dtype.lisp 的
 ;;;;     %creal/%cimag/%cabs/%carg/%cisnan/%clt/… 实现，不在各处散写。
@@ -20,25 +21,14 @@
 (in-package :clvt)
 
 ;;; ==================================================================
-;;; 0. （空）原实现登记表已删除 —— 见下
+;;; 0. 分派口径
 ;;; ==================================================================
-;;; 第十二轮之前这里是 *CX-ORIGINALS* 哈希表 + %CX-ORIG 函数 + 一份 63 个名字的
-;;; EVAL-WHEN 预捕获清单。三者的作用是「先存下实数实现，再用同名 DEFUN 覆盖它，
-;;; 复数分支里回调存下来的那份」。
-;;;
-;;; 第十三轮把最后 16 个公开符号也改成单一 DEFUN 体内分派后，覆盖式架构不存在
-;;; 了，这三者一并删除。删除顺序有讲究：
-;;;   1. 先清掉所有 (%CX-ORIG 'vtx) 调用点（2 处 vt-sum）；
-;;;   2. 再删三个文件的 EVAL-WHEN 预捕获清单；
-;;;   3. 最后删表与函数 —— 顺序颠倒会让「忘记删的调用点」在运行期变成
-;;;      「symbol-function 返回 NIL」而不是编译期就报错。
-;;;
-;;; 判据（可脚本校验，全部应为 0）：
-;;;   grep -c "setf (symbol-function" src/*.lisp
-;;;   grep -c "(%cx-orig"              src/*.lisp
-;;;   grep -c "eval-when.*cx-orig"     src/*.lisp
+;;; 公开函数的复数分支在**归属文件**的单一 DEFUN 体内分流（§16.32），
+;;; 本库不存在「同名 DEFUN 再写一遍 + 转发」或 `(setf (symbol-function …))`
+;;; 这类覆盖式机制 —— 它们会让「重载单个源文件」静默丢失复数语义。
+;;; 想确认现状：`grep -c "setf (symbol-function" src/*.lisp` 应为 0。
 
-;;; %CX-DEEP-P / %CX-TENSOR-P 已迁至 src/dispatch.lisp（第十二轮）：
+;;; %CX-DEEP-P / %CX-TENSOR-P 已迁至 src/dispatch.lisp：
 ;;; 它们必须在 elementwise / reduce-stats / linalg 之前就可用，否则那些
 ;;; 归属文件无法在自己体内分派，只能靠事后覆盖 —— 见 CONVENTIONS §16.32。
 
@@ -46,7 +36,7 @@
 ;;; 通用小工具：C 连续落地 / 步长 / fiber 起点
 ;;; ------------------------------------------------------------------
 
-;;; %CX-FLAT 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %CX-FLAT 已迁至 src/complex-kernels.lisp
 (defun %cx-strides-vec (shape)
   "C 连续布局的步长向量。"
   (coerce (vt-compute-strides shape) 'simple-vector))
@@ -94,18 +84,18 @@
 ;;; 故 sqrt/log/三角/双曲/反函数直接复用 CL，只需补齐极点与非有限值
 ;;; 的返回约定（CL 在这些点抛条件，numpy 返回 Inf/NaN）。
 
-;;; %CX-NAN-OF / %CX-INF-OF / %CX-NAN-COMPLEX / %CX-HYPOT 已迁至 src/complex-kernels.lisp（第十三轮）
-;;; %COP-SQRT / LOG / LOG2 / LOG10 / SQUARE / RECIP / SIGNUM / ABS 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %CX-NAN-OF / %CX-INF-OF / %CX-NAN-COMPLEX / %CX-HYPOT 已迁至 src/complex-kernels.lisp
+;;; %COP-SQRT / LOG / LOG2 / LOG10 / SQUARE / RECIP / SIGNUM / ABS 已迁至 src/complex-kernels.lisp
 
-;;; %COP-NEG 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %COP-NEG 已迁至 src/complex-kernels.lisp
 
 ;;; ==================================================================
 ;;; 3. 一元函数分派包装
 ;;; ==================================================================
 
-;;; %COP-LOG-BASE 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %COP-LOG-BASE 已迁至 src/complex-kernels.lisp
 
-;;; vt-log 的 M1 匿名包装已拆除：分派移入 elementwise.lisp 的单一 DEFUN（第十三轮）
+;;; vt-log 的 M1 匿名包装已拆除：分派移入 elementwise.lisp 的单一 DEFUN
 ;;; ==================================================================
 ;;; 4. 实部 / 虚部 / 共轭 / 幅角 / 模（§16.6）
 ;;; ==================================================================
@@ -126,7 +116,7 @@
 ;;;   循环上界逐元素推进，编译器可完全证明）。
 ;;; ------------------------------------------------------------------
 
-;;; %DEF-CX-TO-REAL-RUN / %CX-*-RUN / %CX-RUN-TO-REAL 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %DEF-CX-TO-REAL-RUN / %CX-*-RUN / %CX-RUN-TO-REAL 已迁至 src/complex-kernels.lisp
 
 (defun %cx-op-abs (vt &key out dtype)
   "逐元素绝对值 / 复数模。
@@ -144,17 +134,17 @@
     "VT-ABS")))
 
 
-;;; VT-REAL 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
+;;; VT-REAL 已迁出：搬到 extensions3.lisp（归属文件）
 
-;;; VT-IMAG 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
+;;; VT-IMAG 已迁出：搬到 extensions3.lisp（归属文件）
 
-;;; VT-CONJ 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
+;;; VT-CONJ 已迁出：搬到 extensions3.lisp（归属文件）
 
 (defun vt-conjugate (tensor &key out dtype)
   "vt-conj 的 numpy 全名别名。"
   (vt-conj tensor :out out :dtype dtype))
 
-;;; VT-ANGLE 已迁出（第十三轮）：搬到 extensions3.lisp（归属文件）
+;;; VT-ANGLE 已迁出：搬到 extensions3.lisp（归属文件）
 
 (defun vt-iscomplexobj (x)
   "判定 X 是否含复数（对标 numpy.iscomplexobj）。"
@@ -187,7 +177,7 @@
 ;;; 5. 幂（§16.10）
 ;;; ==================================================================
 
-;;; %CX-POW-2 已迁至 src/complex-kernels.lisp（第十三轮）
+;;; %CX-POW-2 已迁至 src/complex-kernels.lisp
 
 (defun %cx-op-pow (vt power &key out dtype)
   "逐元素幂 VT**POWER（对标 numpy.power）。
@@ -207,8 +197,8 @@
     (vt-map (function %cx-pow-2) in pw :out out :dtype dt))))
 
 
-;;; VT-EXPT 已迁出（第十三轮）：与归属文件同义，删冗余
-;;; vt-float-power 的 M1 匿名包装已拆除：分派移入 extensions3.lisp 的单一 DEFUN（第十三轮）
+;;; VT-EXPT 已迁出：与归属文件同义，删冗余
+;;; vt-float-power 的 M1 匿名包装已拆除：分派移入 extensions3.lisp 的单一 DEFUN
 ;;; ==================================================================
 ;;; 6. 比较与极值（字典序，§16.8）
 ;;; ==================================================================
@@ -661,7 +651,7 @@
            (v (vt-var in :axis axis :keepdims keepdims :ddof ddof :dtype dt)))
       (vt-sqrt v :out out :dtype dt))))
 
-;;; vt-average 已归位 reduce-stats.lisp（第十三轮）：原先是「同名 defun +
+;;; vt-average 已归位 reduce-stats.lisp：原先是「同名 defun +
 ;;; (%cx-orig 'vt-average) 转发」，重载 reduce-stats.lisp 就会静默丢掉复数分支。
 
 (defun %cx-op-round (tensor &key (divisor 1) out dtype)
@@ -1118,7 +1108,7 @@
 ;;;
 ;;; 为什么不走 vt-einsum：einsum 的 supported-types 只有 4 种实数类型，
 ;;; 其结果缓冲区按这 4 种分配 —— 复数输入会得到 double-float 缓冲并
-;;; 在写回时报 "is not of type DOUBLE-FLOAT"。第一轮为 matmul 家族
+;;; 在写回时报 "is not of type DOUBLE-FLOAT"。为 matmul 家族
 ;;; 写一个独立的通用内核（先 contiguous 落地，再三重/二重循环），
 ;;; 语义与 einsum 的 `...ij,...jk->...ik` 完全一致（§16.13）。
 ;;; ==================================================================
@@ -1129,7 +1119,7 @@
    类型特化三重循环（i-k-j 次序，内层连续访存）。实测 256x256：
    泛型版 1748ms → 特化版见 test/complex-bench.lisp。
 
-   ⚠ A/B 的 **offset 必须透传**（第五轮 §16.22 修复）：
+   ⚠ A/B 的 **offset 必须透传**（§16.22）：
    VT-CONTIGUOUS 对「本身已连续」的切片视图是零拷贝，offset 保留原值
    （如 (vt-slice (vt-ravel a) i j) 得到的 1D 片段）。原实现按扁平下标
    从 0 起算，批量 matmul 的每个 batch 切片都会读到基数组开头 → 结果
@@ -1150,7 +1140,7 @@
 ;;; ------------------------------------------------------------------
 ;;; 11.5.1 复数 GEMM 的「行内核」（对照 linalg.lisp 的 %MATMUL-DF-ROWS）
 ;;;
-;;; 旧内核（第一轮）是 i-p-j 三重循环，但每个元素都由 (i,j,p) **重算**
+;;; 旧内核是 i-p-j 三重循环，但每个元素都由 (i,j,p) **重算**
 ;;; 扁平下标，并且整段落在 %CX-DISPATCH 的 (safety 1) 里。实测（n=256，
 ;;; 单线程，只计内核本身、不含 make-vt/contiguous，见 §16.27 消融表）：
 ;;;
@@ -1460,7 +1450,7 @@
   (if out (progn (vt-copy-into out r) out) r)))
 
 
-;;; VT-@ 已迁出（第十三轮）：与归属文件同义，删冗余
+;;; VT-@ 已迁出：与归属文件同义，删冗余
 
 (defun %cx-op-dot (a b &key dtype out)
   "点积 / 内积（对标 numpy.dot）。复数：同 vt-matmul 语义，不取共轭。"
@@ -1486,7 +1476,7 @@
   ;; ⚠ 原实现写成 (vt-reshape ... :dtype dt)：vt-reshape 只接受
   ;; (vt shape) 两个参数，多出的 :dtype 会变成第三个实参 →
   ;; "invalid number of arguments: 3"。复数外积**从来没跑通过**，
-  ;; 而实数路径走原实现所以一直正常（§16.19 第四轮修复）。
+  ;; 而实数路径不走这里所以一直正常（§16.19）。
   (if out
       (progn (vt-copy-into (vt-check-out out (vt-shape r) dt
                                          :op-name "vt-outer")
@@ -1533,12 +1523,11 @@
 ;;; ==================================================================
 
 ;; 复数线代（det/inv/solve/lu/cholesky/qr/svd/eig/pinv/lstsq/
-;; matrix-rank/matrix-power）已由 src/complex-linalg.lisp 实现（第三轮）。
+;; matrix-rank/matrix-power）已由 src/complex-linalg.lisp 实现。
 ;; vt-cond 复用 vt-svd + vt-inv，随之自动可用，故也不再列入拒绝清单。
 ;; 详见 CONVENTIONS §16.19。
 
-;; vt-einsum 已支持复数（第三轮白名单放开 complex64/complex128）。
-;; 第五轮（§16.21）把三类快路径也接上复数：
+;; vt-einsum 支持复数（complex64/complex128）；三类快路径同样走复数内核（§16.21）：
 ;;   · 逐元素 "ij,ij->ij"    → vt-map（元素类型无关）
 ;;   · 全收缩 "i,i->"        → %CX-EINSUM-DOT
 ;;   · GEMM/BMM "...ij,...jk->...ik" → %CX-GEMM-STRIDED

@@ -89,7 +89,7 @@
                                       :dtype :complex128))
 (defparameter cx-dup (vt-from-sequence (list (z #C(3 1)) (z #C(1 5)) (z #C(1 2)) (z #C(3 1)))
                                        :dtype :complex128))
-;; 第四轮新增用例的输入（与生成器一一对应）
+;; 结构算子用例的输入（与生成器一一对应，§16.19.8）
 (defparameter cx-nanc (vt-from-sequence (list (complex +nan+ 0.0d0)) :dtype :complex128))
 (defparameter cx-emptyc (vt-zeros (list 0) :dtype :complex128))
 (defparameter cx-idxcol (vt-from-sequence (list (list 1) (list 0)) :dtype :int64))
@@ -230,7 +230,7 @@
                 (lambda () (vt-view cx-a nil :dtype :int64)))
   (expect-error "view 形状不匹配"
                 (lambda () (vt-view cx-a (list 3) :dtype :float64)))
-  ;; 第十五轮：多轴 nanmedian 已接通（此前这里断言的是「必须报错」）。
+  ;; 多轴 nanmedian 已接通（§16.35.4）；此前这里断言的是「必须报错」。
   ;; numpy 2.4.6: nanmedian([[1+2j, 3-4j, 5+0j]], axis=(0,1)) => 3-4j
   (expect-true "nanmedian 多轴 (0 1) 已支持"
                (let ((r (vt-ref (vt-nanmedian (vt-reshape cx-c (list 1 3))

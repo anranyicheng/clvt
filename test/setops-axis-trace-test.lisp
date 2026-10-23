@@ -1,4 +1,4 @@
-;;;; setops-axis-trace-test.lisp — 按轴去重 / 迹（第五轮通用特性补齐）
+;;;; setops-axis-trace-test.lisp — 按轴去重 / 迹（§16.23 / §16.24）
 ;;;;
 ;;;; 覆盖两个「numpy 有、clvt 之前缺」的通用特性（不是复数专属）：
 ;;;;   1) vt-unique :axis —— numpy 2.x 的按轴去重

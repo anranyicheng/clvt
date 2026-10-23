@@ -446,7 +446,7 @@
               ((equal et '(signed-byte 8))  (walk (signed-byte 8)))
               ((equal et '(unsigned-byte 16)) (walk (unsigned-byte 16)))
               ((equal et '(unsigned-byte 8))  (walk (unsigned-byte 8)))
-              ;; 复数（CONVENTIONS §16.19 / 第四轮补齐）：本函数只做「按索引搬
+              ;; 复数（CONVENTIONS §16.19）：本函数只做「按索引搬
               ;; 元素」，与元素类型无关 —— 8 路分派纯粹是性能特化，
               ;; 漏掉复数就会掉进报错分支。注意 SEL 是**下标**（fixnum），
               ;; 元素值是复数，不受 fixnum 声明影响。
@@ -983,9 +983,10 @@
                       (t xf))))
             v :out out :dtype (%e3-float-prefer-dtype dt :float64))))
 
-;;; 第十三轮：这 4 个函数原先是「本库无复数 dtype，恒返回输入本身」的
-;;; 错误桩（complex.lisp 里另有一份完整实现靠加载顺序覆盖它）。现在只保留
-;;; complex.lisp 那一份权威实现，搬到归属文件，复数 / 实数都在本体内判定。
+;;; 下面这组（real / imag / conj / angle 等）只保留**一份**实现：复数与实数
+;;; 都在函数体内判定（`(when (%cx-any-p …) …)`），不存在第二份同名定义。
+;;; 历史上有过「本库无复数 dtype，恒返回输入本身」的错误桩，靠加载顺序覆盖，
+;;; 一旦调整 `clvt.asd` 的顺序就会静默返回错误结果（§16.32）。
 
 (defun vt-real (tensor &key out dtype)
   "取实部（对标 numpy.real）。复数 → 分量浮点 dtype 的实数张量；
@@ -1086,7 +1087,7 @@
           (work (vt-astype input :float64))
           (op-init (or init-val (if (eq op :sum) 0.0d0 1.0d0))))
     ;; 注：原有一个 `(flet ((cumstep (acc x) ...))` 包住两条路径，内部用
-    ;; `(funcall op-fn acc x)`。第十五轮把 op 内联进两个内层循环后它已无调用点，
+    ;; `(funcall op-fn acc x)`。op 内联进两个内层循环后它已无调用点，
     ;; 一并删除（每元素一次 FUNCALL 的装箱开销是这条路径的主要成本之一）。
     (if axis
         (let* ((rank (length shape))
@@ -1109,7 +1110,7 @@
                                     (setf (aref indices d) 0)))))
             (loop
               ;; 每条 fiber 只算一次起点（输入与目标各一份），内层按
-              ;; `起点 + i*stride` 递推 —— 第十五轮把逐元素
+              ;; `起点 + i*stride` 递推 —— 把逐元素
               ;; `(setf (apply #'vt-ref result coords) …)` 换掉：那里
               ;; 每个元素都要 cons 一次坐标列表 + 一次通用坐标折算，
               ;; 1M 元素沿轴实测 260ms（numpy 6ms）。机制 B（offset +

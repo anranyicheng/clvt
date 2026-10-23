@@ -4,6 +4,62 @@
 
 ---
 
+## 2026-10-23（十三）— 第十三轮：覆盖式复数层收尾（159/159 单一 DEFUN）
+
+第十二轮把 143/159 改成单一 `DEFUN` 分派，剩 16 个"形状不规整"的；本轮做完并
+删掉整套覆盖机制。
+
+16 个符号按"该怎么改"分四类：**纯冗余**（`vt-@`/`vt-expt`，删重复 defun）、
+**错误死桩搬迁**（`vt-real`/`vt-imag`/`vt-conj`/`vt-angle` —— `extensions3.lisp`
+那份写着"本库无复数 dtype，恒返回输入本身"，是错的，可靠"后加载者胜"维持）、
+**匿名包装合并**（`vt-log`/`vt-float-power`）、**同名覆盖 + `%cx-orig` 转发**
+（8 个，复件改名 `%cx-op-*`，归属文件插守卫，两份 lambda-list 合成一份）。
+
+结构上把标量内核前移到新文件 `src/complex-kernels.lisp`（`dispatch` 之后、所有
+归属文件之前），依赖方向变成单向「归属文件 → 标量内核」，消除倒挂。
+
+迁移中发现 `vt-log` 的 `:base` 一直在除零：`(log base 1.0d0)` 是**两参数对数**
+`log_1(base)`，导致 `(vt-log #C(8 0) :base 2)` 返回 `0+0i`（应 `3+0i`）。这个 bug
+在覆盖式架构下活了五轮 —— 因为没有任何用例覆盖"复数 + 非缺省 base"这一格。
+
+新增 `test/complex-reload-test.lisp`（14 断言）：同进程逐个重载 12 个源文件，
+每轮跑 19 个探针。这是本轮**唯一真正的验收**：覆盖式架构下它必然失败。
+
+结果：单一 `DEFUN` 分派 **159/159**；`(setf (symbol-function …))` 2 → **0**；
+`%cx-orig` 调用点 16 → **0**；`eval-when` 预捕获清单 124 条 → **0**；
+跨文件同名 `defun` 14 对 → **0**；套件 51 → **52**。
+
+---
+
+## 2026-10-23（十二）— 第十二轮：拆掉覆盖式复数层（第一阶段 92/159）
+
+**背景**：复数支持早期靠"运行期重定义公开函数"实现（`(setf (symbol-function …))`
+装匿名包装，或"同名 defun 再写一遍 + `%cx-orig` 转发"）。后果是：只重载
+`src/elementwise.lisp`，`(vt-sqrt #C(-1 0))` 会从 `#C(-0.0d0 1.0d0)` 静默变成
+`float64` 的 `NaN`；函数对象是匿名 LAMBDA，`declaim inline` 失效；哪些符号被覆盖
+无法静态枚举。
+
+**做法**：把复数分支下沉到归属文件的**单一 `DEFUN` 体内**：
+
+```lisp
+(defun vt-abs (vt &key out dtype)
+  (when (%cx-any-p vt)                    ; 复数分流
+    (return-from vt-abs (%cx-abs …)))
+  …原实数实现不变…)
+```
+
+新增 `src/dispatch.lisp` 作为唯一判定入口（`%cx-arg-complex-p` / `%cx-any-p` /
+`%cx-deep-p` / `%cx-result-complex-dtype` / `%cx-reduce-dispatch`），在 `clvt.asd`
+里紧随 `core` 加载。本轮完成 92/159（elementwise 20 拒绝型 + 10 比较/极值 +
+18 一元、nn 9 个激活、extensions3 10 个、reduce-stats 14 个门面……）。
+
+顺带发现 9 处 lambda-list 漂移（两处同名 defun 的参数表不一致，靠加载顺序决定
+谁生效），记入待办。
+
+新增 `test/complex-dispatch-test.lisp`（结构契约：必须是具名 `DEFUN`、list 入参
+走复数路径、实数不回归）。套件 50 → 51。
+
+
 ## 2026-10-23（十六）— 第十六轮：`:out` 重叠保护的缺口、两处 dtype 静默降级
 
 第十五轮把「能算对」和「跑得快」两条线推到头之后，本轮换到**契约层**扫了一遍，

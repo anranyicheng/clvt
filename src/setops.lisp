@@ -369,8 +369,8 @@
 
    复数（§16.8）：展平路径按 (实部, 虚部) 字典序，NaN 折叠为一个；
    AXIS 路径无需第二份实现 —— %AXIS-ELEM-LESSP / %AXIS-ELEM-EQ 本身
-   与元素类型无关。第十三轮之前复数分支在 complex-ops.lisp 用同名 defun
-   覆盖本函数，重载本文件就会把复数静默送进实数内核。"
+   与元素类型无关，故 AXIS 路径无需复数分支。展平路径的复数比较器在
+   complex-ops.lisp；本函数只做分流（§16.32）。"
   (let* ((in (ensure-vt tensor))
          (rank (length (vt-shape in))))
     (if (and axis (> rank 1))

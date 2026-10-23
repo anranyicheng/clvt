@@ -63,8 +63,8 @@
   shape=:DTYPE 然后报 odd number of &KEY arguments。这里手工分流：
   首参是关键字 → 视为只有关键字；否则首参是形状。
 
-  第十三轮：这段逻辑原先在 complex-ops.lisp，靠加载顺序覆盖本函数，
-  且内部用 (%cx-orig 'vt-view) 回调本文件的实数实现。现在只有这一份。"
+  本函数是唯一入口：复数分支（重解释 dtype 等）在 complex-ops.lisp 的
+  %CX-OP-VIEW，由这里的 `(when (%cx-any-p …))` 分流（§16.32）。"
   (let ((v (ensure-vt vt))
         (shape nil)
         (dtype nil))

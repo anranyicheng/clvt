@@ -2222,11 +2222,11 @@ w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=
 (defun vt-matrix-rank (matrix &optional (tol nil))
   "计算矩阵的秩 (线性代数定义：线性无关的行/列数)。
    实数路径：带部分选主元的高斯消元法，统计非零主元的数量，TOL 缺省 1e-10。
-   复数路径（§16.20）：基于奇异值，阈值 TOL 缺省 s_max·max(m,n)·eps
+   复数路径（§16.19）：基于奇异值，阈值 TOL 缺省 s_max·max(m,n)·eps
    （numpy 口径）—— 原实数实现里的 `(vt-astype matrix :float64)` 对复数是
    **静默取实部**，会给错答案。
 
-   第十三轮之前复数分支在 complex-linalg.lisp 用同名 DEFUN 覆盖本函数并用
+   复数分支在 complex-linalg.lisp；本函数在入口分流（§16.32），原先
    (%cx-orig) 回调，重载本文件后复数会掉进实数路径。"
   (when (%cx-any-p matrix)
     (return-from vt-matrix-rank (%cx-op-matrix-rank (ensure-vt matrix) tol)))
@@ -2706,7 +2706,7 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
   tol : 收敛容差（缺省：实数 1e-14 / 复数 1e-15）
 
   缺省值按路径分开（§16.33.6 的 lambda-list 漂移收尾）：
-  实数线与复数线各自用自己验证过的参数。第十三轮把两处 DEFUN 合成一个时，
+  实数线与复数线各自用自己验证过的参数。两处 DEFUN 合并成一个时，
   公开签名取的是实数线的 50/1e-14，于是复数的 60/1e-15 **变成了死缺省**
   （分派时总把公开缺省显式传下去）—— 复数 SVD 的那些压测是按 60/1e-15
   验证的，不能靠「反正测试还过」来维持。这里用 supplied-p 让两条路径各回各家：

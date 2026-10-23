@@ -1,4 +1,4 @@
-;;;; complex-dispatch-test.lisp — 第十二轮：分派结构回归（16 断言）
+;;;; complex-dispatch-test.lisp — 分派结构回归（§16.32，16 断言）
 ;;;;
 ;;;; 这个套件断言的不是数值，而是**结构契约**：
 ;;;;
@@ -70,7 +70,7 @@
     ;; S5-C 线代（11）
     vt-cholesky vt-det vt-eig vt-inv vt-lstsq vt-lu vt-matrix-power
     vt-pinv vt-qr vt-svd vt-solve
-    ;; S6 收尾（16）：第十三轮
+    ;; S6 收尾（16，§16.33）
     ;;   · 纯冗余删重（2）：与归属文件语义相同，删 complex 侧那份
     vt-@ vt-expt
     ;;   · 错误死桩搬迁（4）：extensions3 里写着「本库无复数 dtype」的桩，

@@ -1,4 +1,4 @@
-;;;; complex-nan-inf-test.lisp — 第十轮：NaN/Inf 语义 / median 契约 / :out 非连续
+;;;; complex-nan-inf-test.lisp — NaN/Inf 语义 / median 契约 / :out 非连续（§16.30）
 ;;;;
 ;;;; 本轮靠「数值对拍」（262 条复数表达式 vs numpy 2.3.5）找到两类真问题：
 ;;;;   1. vt-median 的复数实现与**本库自己的实数实现**在 AXIS=NIL 时分叉：
@@ -449,7 +449,7 @@
 ;;; ==================================================================
 
 (format t "~&=====================================")
-(format t "~&复数 NaN/Inf 与 median 契约回归（第十轮）")
+(format t "~&复数 NaN/Inf 与 median 契约回归（§16.30）")
 (format t "~&=====================================~%")
 (run-median-cases)
 (run-scan-first-cases)

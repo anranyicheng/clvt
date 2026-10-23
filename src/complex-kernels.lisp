@@ -1,9 +1,9 @@
-;;;; complex-kernels.lisp — 复数**标量内核**（第十三轮抽出）
+;;;; complex-kernels.lisp — 复数**标量内核**（纯函数：只吃数、吐数）
 ;;;;
 ;;;; 为什么单独成文件
 ;;;; ----
-;;;; 第十三轮之前这些内核住在 complex.lisp（:serial t 的最后几个文件之一），
-;;;; 而调用它们的归属文件（elementwise / extensions3 / reduce-stats …）在
+;;;; 调用这些内核的归属文件（elementwise / extensions3 / reduce-stats …）在
+;;;; 加载顺序上**早于**复数语义层，所以内核必须先于它们可用；否则那些文件在
 ;;;; 前面加载。于是「复数支持」只能靠事后 `(setf (symbol-function ...))`
 ;;;; 覆盖，或者靠 `%cx-orig` 存一份原实现再转发 —— 两种都是覆盖式，
 ;;;; 重载单个源文件就会静默丢失复数语义（§16.32）。
@@ -165,8 +165,8 @@
 (defun %cop-log-base (z base)
   "复数换底对数 log_base(z)。base 必须为正实数（numpy：非法 base → NaN）。
 
-   ⚠ 第十三轮修复：原实现写 `(log base 1.0d0)` —— CL 的
-   `(log x base)` 是两参数对数 `log_x(base)`，于是这里算成了
+   ⚠ 陷阱：**不要写成 `(log base 1.0d0)`** —— CL 的
+   `(log x base)` 是两参数对数 `log_x(base)`，那样算成了
    `log_1(base) = ln(base)/ln(1) = 0.693/0` = 除零（陷阱被 with-float-safe
    屏蔽时得到 Inf，再乘进结果 → 0+0i）。实测 `(vt-log #C(8 0) :base 2)`
    整改前返回 0+0i，numpy 是 3+0i。正确写法是 `(log base)`（自然对数）。"

@@ -282,7 +282,7 @@
             (vt-to-list (vt-linspace 0.0d0 1.0d0 4 :endpoint nil))
             '(0.0d0 0.25d0 0.5d0 0.75d0))
   (check-dtype "vt-linspace :dtype :float32" (vt-linspace 0 1 3 :dtype :float32) :float32)
-  (check "vt-linspace float32 以 double 计算后舍入存储（§9.3）"
+  (check "vt-linspace float32 以 double 计算后舍入存储（§9.2）"
          (let ((f (vt-linspace 0.0d0 1.0d0 3 :dtype :float32)))
            (allclose-lists (vt-to-list f) '(0.0 0.5 1.0))))
   (check-eq "vt-logspace(0,2,3) = 1,10,100"
@@ -417,7 +417,7 @@
     (check-eq "vt-transpose 元素正确" (vt-to-list (vt-transpose a))
               '((1.0d0 4.0d0) (2.0d0 5.0d0) (3.0d0 6.0d0)))
     (check-shape "vt-transpose 显式 perm (1 0)" (vt-transpose a '(1 0)) '(3 2)))
-  (check "vt-squeeze 默认移除全部长度 1 轴（§9.3: (1 3 1)→(3)）"
+  (check "vt-squeeze 默认移除全部长度 1 轴（§9.2: (1 3 1)→(3)）"
          (equal (vt-shape (vt-squeeze (vt-ones '(1 3 1)))) '(3)))
   (check "vt-squeeze :axis 0 只移除指定轴"
          (equal (vt-shape (vt-squeeze (vt-ones '(1 3 1)) :axis 0)) '(3 1)))
@@ -848,7 +848,7 @@
               (vt-float-nan :float64))))
 
 (deftest test-arith-trig
-    "elementwise: 三角/反三角（asin 命名，§9.3）/ 双曲 / atan2 / hypot(inf,nan)=inf / sinc / deg2rad"
+    "elementwise: 三角/反三角（asin 命名，§9.2）/ 双曲 / atan2 / hypot(inf,nan)=inf / sinc / deg2rad"
   (check-eq "vt-sin(pi/2)=1" (vt-to-list (vt-sin (vt-from-sequence (list (/ pi 2.0d0)))))
             '(1.0d0))
   (check-eq "vt-cos(0)=1" (vt-to-list (vt-cos (vt-zeros '(1)))) '(1.0d0))
@@ -914,7 +914,7 @@
     (check-eq "vt-nonzero-p" (vt-to-list (vt-nonzero-p a)) '(1 1 0))
     (check-eq "vt-even-p" (vt-to-list (vt-even-p a)) '(0 1 1))
     (check-eq "vt-odd-p" (vt-to-list (vt-odd-p a)) '(1 0 0))
-    (check-dtype "谓词默认 :int8 承载布尔（§9.3）" (vt-positive-p a) :int8))
+    (check-dtype "谓词默认 :int8 承载布尔（§9.2）" (vt-positive-p a) :int8))
   (let ((x (vt-from-sequence '(1 0 2) :dtype :int64))
         (y (vt-from-sequence '(0 3 2) :dtype :int64)))
     (check-eq "vt-logical-and" (vt-to-list (vt-logical-and x y)) '(0.0d0 0.0d0 1.0d0))
@@ -966,7 +966,7 @@
             '(2.0d0 3.0d0)))
 
 (deftest test-arith-comparisons
-    "elementwise: vt-= /= < <= > >= 全部返回 :int8 0/1（§9.3）"
+    "elementwise: vt-= /= < <= > >= 全部返回 :int8 0/1（§9.2）"
   (let ((a (vt-from-sequence '(1.0d0 2.0d0 3.0d0)))
         (b (vt-from-sequence '(1.0d0 0.0d0 3.0d0))))
     (check-dtype "vt-= 默认 :int8" (vt-= a b) :int8)
@@ -1156,7 +1156,7 @@
             (vt-to-list (vt-correlate (vt-from-sequence '(1 2 3) :dtype :int64)
                                       (vt-from-sequence '(0 1) :dtype :int64) :mode :valid))
             '(2 3))
-  (check "vt-interp 中点与端点（left/right 缺省用端点值，§9.3）"
+  (check "vt-interp 中点与端点（left/right 缺省用端点值，§9.2）"
          (allclose-lists
           (vt-to-list (vt-interp (vt-from-sequence '(0.5d0 1.0d0 2.5d0 -1.0d0))
                                  (vt-from-sequence '(0.0d0 1.0d0 2.0d0))
@@ -1483,7 +1483,7 @@
     (check "vt-random-uniform 落在 [low, high)"
            (and (>= (reduce #'min (vt-to-list u)) 2.0d0)
                 (< (reduce #'max (vt-to-list u)) 5.0d0))))
-  (check "vt-random-normal std=0 → 常量 mean 填充（§9.3 约定）"
+  (check "vt-random-normal std=0 → 常量 mean 填充（§9.2 约定）"
          (allclose-lists (vt-to-list (vt-random-normal '(4) :mean 3.0d0 :std 0.0d0))
                          '(3.0d0 3.0d0 3.0d0 3.0d0)))
   (let ((n (with-seed (9) (vt-random-normal '(1000) :mean 5.0d0 :std 2.0d0))))

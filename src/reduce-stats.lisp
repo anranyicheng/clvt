@@ -463,7 +463,7 @@
    小整型逻辑 dtype（4 种）→ %kernel-small-general 通用内核（路径 3 结构）。
    路径 1/2/3 的输出对同一语义必须一致；连续性只影响性能。"
   (let ((fn-name (intern (format nil "VT-~a" name)))
-        ;; 第十二轮：生成的函数体改名为内部实现，公开名由 DEF-VT-REDUCE-FACADE
+        ;; 宏生成的函数体改名为内部实现，公开名由 DEF-VT-REDUCE-FACADE
         ;; 生成（唯一的一个 DEFUN），复数分派就在那个门面里。这样
         ;;   · 公开符号只有一个定义，重载任何单个文件都不会丢复数支持；
         ;;   · 复数分支需要「把变换后的实参再喂给实数实现」（all/any 走
@@ -881,14 +881,14 @@
   (let ((weights nil))
     (when (and args (not (keywordp (first args))))
       (setf weights (pop args)))
-    ;; 复数分派（第十三轮）：原先 complex.lisp 用同名 defun 覆盖本函数并转发
+    ;; 复数分派：原先 complex.lisp 用同名 defun 覆盖本函数并转发
     ;; 回来（%cx-orig），重载本文件就会把复数静默送进实数内核。
     ;;
     ;; 语义保持既有契约（CONVENTIONS §16.11）：无参数的复数 average 就是
     ;; vt-mean（vt-mean 本身支持复数，走 %average-impl 的「等权」分支）；
-    ;; 带 weights/axis 的复数路径第一轮尚未验收，显式报错而不是猜。
+    ;; 带 weights/axis 的复数路径尚未验收，显式报错而不是猜。
     (when (and (%cx-any-p tensor) args)
-      (error "vt-average: 复数路径第一轮不支持参数 ~a（CONVENTIONS §16.11）" args))
+      (error "vt-average: 复数路径不支持参数 ~a（CONVENTIONS §16.11）" args))
     (apply #'%average-impl tensor weights args)))
 
 (defun %average-impl (tensor weights &key axis keepdims dtype out)
@@ -1070,7 +1070,7 @@
   ;; 当 out 与输入在物理区间上重叠（如 out = base[1:7]、in = base[0:6]）时，
   ;; 先写的输出会污染后面还没读到的输入，实测 `(vt-cumsum in :out out)`
   ;; 得到 1,2,4,8,16,32 这种「越滚越大」的错值。这里统一走 vt-out-snapshot，
-  ;; 与 vt-map / SIMD matmul 的口径一致（第十六轮 §16.36）。
+  ;; 与 vt-map / SIMD matmul 的口径一致（§16.36.1）。
   (let* ((tensor (if out (first (vt-out-snapshot out (list tensor))) tensor))
          (shape (vt-shape tensor))
          (rank (length shape))
@@ -1114,9 +1114,8 @@
     ;; 做一次 eq 分派，让 +/* 直接编译成机器指令。
     ;;
     ;; 关键：**平面与沿轴共用同一个 RUN**（区别只在步长 1 与 stride）。
-    ;; 第十四轮只给 axis=nil 做了特化，沿轴仍走通用路径 —— 于是同一个函数
-    ;; 在 `(vt-cumsum a)` 与 `(vt-cumsum a :axis 0)` 上差 196 倍。第十五轮
-    ;; 把 RUN 抽出来，两条路径都吃到特化。
+    ;; 只给 axis=nil 特化、不管沿轴，会让同一个函数在
+    ;; `(vt-cumsum a)` 与 `(vt-cumsum a :axis 0)` 上差两个数量级（实测 196×）。
     ;; 结果与通用路径逐位相同（同为顺序累加，铁律 1/2）。
     ;; ================================================================
     (macrolet ((cum-typed (lt)
@@ -1271,7 +1270,7 @@
     axis=NIL → **先展平再累积**，返回一维（np.cumsum([[1,2],[3,4]]) -> (4,)）；
     axis 给定 → 形状与输入相同，仅该轴被累积。
 
-  首元素直拷（§16.30.3，第十四轮）：numpy 的 accumulate 不是「从单位元起算」，
+  首元素直拷（§16.30.3）：numpy 的 accumulate 不是「从单位元起算」，
   首个输出等于输入本身 —— `np.cumsum([-0.0])` 给 `-0.0`，而 `0.0 + (-0.0)` 给
   `+0.0`。符号零是语义信息（`1/x` → ∓Inf、`log` 的分支切割），不能静默洗掉。
 
@@ -2361,11 +2360,11 @@
   "忽略 NaN 的中位数（对标 numpy.nanmedian）。全为 NaN 的归约区结果为 NaN。
   结果 dtype 恒为 :float64（复数入参时保持复数 dtype）；out 必须形状/dtype 精确匹配。
 
-   axis 接受 nil / 整数 / 整数列表。**多轴**（如 '(0 1)）在第十五轮接通：
+   axis 接受 nil / 整数 / 整数列表。**多轴**（如 '(0 1)）已支持：
    折叠成 (H, D) 后复用单轴内核（见 %NANMEDIAN-FOLD-AXES），此前直接报
    「暂不支持多轴归约」而 numpy 是支持的。
 
-   :dtype 契约（第十六轮收紧，§16.13「禁止静默降级」）：
+   :dtype 契约（§16.13「禁止静默降级」）：
      实数输入 → 结果恒为 :float64（对标 numpy.nanmedian 的缺省口径），
                  显式给别的 dtype 一律报错，**不再静默忽略**；
      复数输入 → 必须是复数 dtype（:complex64/:complex128），给实数 dtype 报错。
@@ -2373,7 +2372,7 @@
    float64 —— 虚部被静默丢弃，正是 §16.13 列为「最危险」的那类失败。
 
    复数（§16.16）：按 (实部, 虚部) 字典序排序取中位，偶数个取中间两值均值；
-   任一分量为 NaN 的元素视为缺失。第十三轮之前这段逻辑在 complex-ops.lisp
+   任一分量为 NaN 的元素视为缺失。复数分支在 complex-ops.lisp
    用同名 defun 覆盖本函数，重载本文件后复数会掉进实数内核（静默取实部）。"
   (when (and dtype (null (%cx-any-p tensor)) (not (eq dtype :float64)))
     (error "vt-nanmedian: 实数输入的结果 dtype 恒为 :float64（对标 numpy.nanmedian），~

@@ -38,8 +38,8 @@
 
    签名用 &OPTIONAL 而不是 (tensor vmin vmax &key …)：后者把 vmin/vmax
    定为必填，`(vt-clamp a)` 会报 invalid number of arguments。
-   第十三轮之前 complex-ops.lisp 里还有一份同名的 &OPTIONAL 版本靠加载
-   顺序覆盖本函数，现在只有这一份。
+   复数侧没有第二份同名实现：复数分支走 complex-ops.lisp 的 %CX-OP-CLAMP，
+   本函数是唯一入口（§16.32 的单一 DEFUN 约束）。
 
    `:out` / `:dtype` 契约同 vt-clip（复数走字典序整元素夹取）。"
   (declare (ignore vmin-p vmax-p))

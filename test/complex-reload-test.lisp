@@ -12,7 +12,7 @@
 ;;;; 又会悄悄退回去。
 ;;;;
 ;;;; 做法：同一 image 里逐个 `load` 归属文件（源码，重新编译），每轮跑一遍
-;;;; 16 个探针。探针覆盖第十三轮迁移的全部 16 个符号 + 第十二轮的三个代表。
+;;;; 16 个探针。探针覆盖 §16.33 迁移的全部 16 个符号 + §16.32 的三个代表。
 ;;;;
 ;;;; 注意：本套件会重定义全局函数，**必须排在最后**（run-tests.sh 的
 ;;;; DEFAULT_ORDER 已如此安排）。
@@ -56,7 +56,7 @@
 ;;; ------------------------------------------------------------------
 (defparameter *probes*
   (list
-   ;; —— 第十二轮代表（回归保护）——
+   ;; —— §16.32 代表（回归保护）——
    (cons "sqrt(-1+0i) → complex128 的 i"
          (lambda ()
            (let ((r (vt-sqrt (vt-complex -1.0d0 0.0d0))))
@@ -75,7 +75,7 @@
                                    (vt-from-sequence (list #C(0d0 9d0)))))
                  #C(1d0 2d0))))
 
-   ;; —— 第十三轮 16 个符号 ——
+   ;; —— §16.33 的 16 个符号 ——
    (cons "vt-@ 复数"
          (lambda ()
            (near (cval (vt-@ (vt-from-sequence '((#C(1d0 2d0))) :dtype :complex128)
@@ -103,7 +103,7 @@
            (let ((z (cval (vt-log (vt-complex -1.0d0 0.0d0)))))
              (and (eq (vt-dtype (vt-log (vt-complex -1.0d0 0.0d0))) :complex128)
                   (near (realpart z) 0d0) (near (imagpart z) pi)))))
-   (cons "vt-log 复数 :base（第十三轮修掉的除零）"
+   (cons "vt-log 复数 :base（§16.33.3 修掉的除零）"
          (lambda () (near (realpart (cval (vt-log (vt-complex 8.0d0 0.0d0)
                                                   :base 2.0d0)))
                           3d0)))
