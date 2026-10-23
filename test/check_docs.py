@@ -14,6 +14,7 @@
   C1  代码注释里不得出现「第 N 轮」        → 编年史只允许在 HISTORY.md / CHANGELOG.md
   C1b CONVENTIONS 正文不得出现「本轮」     → 契约不谈时序，读者不知道「本轮」是哪一轮
   C2  `§x.y` 引用必须能解析到真实小节       → 防锚点漂移（改编号后忘了改引用）
+      （扫描范围含 HISTORY.md / CHANGELOG.md —— 编年史里引用契约小节同样会漂移）
   C3  CONVENTIONS 的 §16.x 三级编号必须递增 → 防再次插入错位
   C4  HISTORY.md 必须存在且被 CONVENTIONS 引用 → 防契约与编年史再次合流
 
@@ -33,6 +34,7 @@ ROUND_RE = re.compile(r"第[一二三四五六七八九十]+轮")
 NOW_RE = re.compile(r"本轮|这一轮|上一轮|前几轮")
 HEAD_RE = re.compile(r"^#{2,4}\s+(\d+(?:\.\d+)*)\b", re.M)
 REF_RE = re.compile(r"§\s*(\d+\.\d+(?:\.\d+)?)")
+REF_H = re.compile(r"§\s*(H\.\d+(?:\.\d+)*)")
 
 
 def read(p):
@@ -75,7 +77,7 @@ def main():
     anchors |= set(re.findall(r"^#{2,4}\s+(H\.\d+)\b", hist, re.M))
 
     bad_refs = {}
-    for pat in ["CONVENTIONS.md", "README.md"] + CODE_GLOBS:
+    for pat in ["CONVENTIONS.md", "README.md", "HISTORY.md", "CHANGELOG.md"] + CODE_GLOBS:
         for f in sorted(ROOT.glob(pat)):
             for i, line in enumerate(read(f).splitlines(), 1):
                 for ref in REF_RE.findall(line):

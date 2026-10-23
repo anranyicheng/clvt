@@ -258,7 +258,7 @@ Operation was (* #.SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY 0.0d0).
 
 numpy 的行为是 `np.cumprod([inf, 0]) → [inf, nan]`（附 RuntimeWarning）。
 按 §5.2「算术传播」与 §7 的平台陷阱约定，本库必须返回 nan 而不是抛条件。
-同类问题在 §16.30.2 已经踩过一次（复数 `vt-median` 漏包），这次是实数累积。
+同类问题在复数 `vt-median` 上踩过一次（漏包 `WITH-FLOAT-SAFE`，见 §16.30.1），这次是实数累积。
 
 **修法**：拆成「外壳 + 内核」两个函数 ——
 
