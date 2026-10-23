@@ -1066,7 +1066,13 @@
 
 (defun %vt-cumulative (tensor op init-val &key axis dtype out)
   "VT-CUMULATIVE 的内核（不含浮点陷阱屏蔽）；语义与契约见下方的公开入口。"
-  (let* ((shape (vt-shape tensor))
+  ;; 别名保护（§4.3 H6）：累积是**流式**读写 —— 读到第 i 个就写第 i 个位置。
+  ;; 当 out 与输入在物理区间上重叠（如 out = base[1:7]、in = base[0:6]）时，
+  ;; 先写的输出会污染后面还没读到的输入，实测 `(vt-cumsum in :out out)`
+  ;; 得到 1,2,4,8,16,32 这种「越滚越大」的错值。这里统一走 vt-out-snapshot，
+  ;; 与 vt-map / SIMD matmul 的口径一致（第十六轮 §16.36）。
+  (let* ((tensor (if out (first (vt-out-snapshot out (list tensor))) tensor))
+         (shape (vt-shape tensor))
          (rank (length shape))
          ;; 结果 dtype 由「输入 dtype + 显式 :dtype」决定，不由 out 决定。
          ;; v0.4.x 修复：numpy cumsum/cumprod 对精度低于平台整型的整型
@@ -2359,9 +2365,22 @@
    折叠成 (H, D) 后复用单轴内核（见 %NANMEDIAN-FOLD-AXES），此前直接报
    「暂不支持多轴归约」而 numpy 是支持的。
 
+   :dtype 契约（第十六轮收紧，§16.13「禁止静默降级」）：
+     实数输入 → 结果恒为 :float64（对标 numpy.nanmedian 的缺省口径），
+                 显式给别的 dtype 一律报错，**不再静默忽略**；
+     复数输入 → 必须是复数 dtype（:complex64/:complex128），给实数 dtype 报错。
+   之所以要拦：修复前 `(vt-nanmedian z :dtype :float64)` 会**取实部**返回
+   float64 —— 虚部被静默丢弃，正是 §16.13 列为「最危险」的那类失败。
+
    复数（§16.16）：按 (实部, 虚部) 字典序排序取中位，偶数个取中间两值均值；
    任一分量为 NaN 的元素视为缺失。第十三轮之前这段逻辑在 complex-ops.lisp
    用同名 defun 覆盖本函数，重载本文件后复数会掉进实数内核（静默取实部）。"
+  (when (and dtype (null (%cx-any-p tensor)) (not (eq dtype :float64)))
+    (error "vt-nanmedian: 实数输入的结果 dtype 恒为 :float64（对标 numpy.nanmedian），~
+            收到 :dtype ~a。需要别的精度请对结果再 vt-astype。" dtype))
+  (when (and dtype (%cx-any-p tensor) (not (member dtype '(:complex64 :complex128))))
+    (error "vt-nanmedian: 复数输入的结果 dtype 必须是复数类型（:complex64 / :complex128），~
+            收到 :dtype ~a —— 用实数 dtype 会把虚部静默丢掉。" dtype))
   (when (%cx-any-p tensor)
     (return-from vt-nanmedian
       (%cx-op-nanmedian (ensure-vt tensor)

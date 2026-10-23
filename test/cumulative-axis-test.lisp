@@ -310,6 +310,74 @@
             (handler-case (progn (vt-nanmedian a :axis '(0 9)) nil) (error () t)))))
 
 ;;; ------------------------------------------------------------------
+;;; C. 契约：:out 重叠保护 + nanmedian 的 dtype 降级拦截
+;;;
+;;; 两组都是第十六轮补的洞：
+;;;   C1 累积是**流式**读写（读到第 i 个就写第 i 个），当 out 与输入在物理
+;;;      区间上部分重叠（out = base[1:7]、in = base[0:6]）时，先写的结果会
+;;;      污染还没读到的输入 —— 修前 `(vt-cumsum in :out out)` 给出
+;;;      1,2,4,8,16,32 这种「越滚越大」的错值。§4.3 要求先快照。
+;;;   C2 `(vt-nanmedian z :dtype :float64)` 曾**取实部**返回 float64，
+;;;      虚部被静默丢弃（§16.13 列为最危险的失败模式）。
+;;; ------------------------------------------------------------------
+
+(defun run-contract ()
+  (format t "~&--- C. 契约（重叠保护 / dtype 降级）---~%")
+
+  ;; C1: 偏移 1 的重叠。base 初始 (1 2 3 4 5 0 0 0)，
+  ;; a = base[0:6] = (1 2 3 4 5 0)，out = base[1:7]。
+  ;; 正确（先快照）：cumsum(a) = (1 3 6 10 15 15) → base = (1 1 3 6 10 15 15 0)
+  (flet ((shifted (fn)
+           (let ((base (vt-zeros '(8) :dtype :float64)))
+             (dotimes (i 5) (setf (vt-ref base i) (coerce (1+ i) 'double-float)))
+             (funcall fn (vt-slice base '(0 6)) :out (vt-slice base '(1 7)))
+             (mapcar (lambda (x) (coerce x 'double-float))
+                     (vt-to-list (vt-ravel base))))))
+    (report "cumsum :out 偏移重叠（先快照）"
+            (equal (shifted #'vt-cumsum)
+                   (list 1d0 1d0 3d0 6d0 10d0 15d0 15d0 0d0))
+            (format nil "~a" (shifted #'vt-cumsum)))
+    (report "cumprod :out 偏移重叠（先快照）"
+            ;; cumprod((1 2 3 4 5 0)) = (1 2 6 24 120 0) → base[1:7] 落位
+            (equal (shifted #'vt-cumprod)
+                   (list 1d0 1d0 2d0 6d0 24d0 120d0 0d0 0d0))
+            (format nil "~a" (shifted #'vt-cumprod)))
+    ;; 完全别名（cumsum 天然安全，但必须保证快照逻辑不把它改坏）
+    (let ((a (vt-from-sequence '(1 2 3 4 5) :dtype :float64)))
+      (vt-cumsum a :out a)
+      (report "cumsum :out 完全别名"
+              (equal (mapcar (lambda (x) (coerce x 'double-float))
+                             (vt-to-list (vt-ravel a)))
+                     (list 1d0 3d0 6d0 10d0 15d0)))))
+
+  ;; C2: dtype 降级必须报错（而不是静默取实部/静默忽略）
+  (let ((z (vt-from-sequence (list (list #C(1 2) #C(3 -4) #C(5 0)))
+                             :dtype :complex128))
+        (r (vt-from-sequence '((1.0d0 2.0d0 3.0d0)) :dtype :float64)))
+    (report "复数 nanmedian + :dtype :float64 报错"
+            (handler-case
+                (progn (sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow)
+                         (vt-nanmedian z :axis 1 :dtype :float64))
+                       nil)
+              (error () t)))
+    (report "实数 nanmedian + :dtype :float32 报错"
+            (handler-case (progn (vt-nanmedian r :axis 1 :dtype :float32) nil)
+              (error () t)))
+    (report "复数 nanmedian + :dtype :complex64 正常"
+            (sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow)
+              (eq (vt-dtype (vt-nanmedian z :axis 1 :dtype :complex64)) :complex64)))
+    (report "实数 nanmedian 缺省仍为 :float64"
+            (eq (vt-dtype (vt-nanmedian r :axis 1)) :float64)))
+
+  ;; C3: 退化（归约区长度 0）多轴 → NaN，与 numpy 一致
+  (let ((d (vt-nanmedian (vt-zeros '(2 0 3)) :axis '(1 2))))
+    (report "多轴归约区为空 → (2) 全 NaN"
+            (and (equal (vt-shape d) '(2))
+                 (every (lambda (x) (sb-ext:float-nan-p x))
+                        (mapcar (lambda (x) (coerce x 'double-float))
+                                (vt-to-list (vt-ravel d))))))))
+
+;;; ------------------------------------------------------------------
 ;;; 入口
 ;;; ------------------------------------------------------------------
 
@@ -319,6 +387,7 @@
 (run-accumulate-axis)
 (run-perf-guard)
 (run-nanmedian-multi)
+(run-contract)
 
 (format t "~&=====================================~%")
 (format t "Total: ~d / Pass: ~d / Fail: ~d~%" (+ *pass* *fail*) *pass* *fail*)
