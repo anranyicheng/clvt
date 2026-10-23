@@ -686,6 +686,8 @@ C1 形状/秩 · C2 dtype · C3 广播 · C4 归约轴 · C5 NaN/Inf · C6 空�
 | **生成必须可复现** | 连续两次生成必须逐字节相同；随机类用例统一 `rng(seed)`，禁止裸用全局 RNG |
 | **浮点格式随 numpy 版本变** | `gen_probes*.py` 用 `str(np.float64)` 输出期望值：numpy 2.4 给 `0.27279899999999996`、2.5 给 `0.272799`。**同一份代码在不同 numpy 下 codegen 必然漂移**，但数值只差 1 ulp（比较用 `:tol`）。遇到跨版本漂移时不要盲目「重新生成再提交」——先确认是格式化差异还是真语义变化（本轮就遇到过：本机 numpy 2.4.6 报漂移，上游 2.5.0 正常） |
 | **重新生成后先 `git add`** | 门禁结束时 `git checkout -- <生成物>` 还原工作区，否则改动会被门禁自己抹掉 |
+| **门禁默认按语义比较，不按字节** | `check_key_sync.py` 默认只要求 key/dtype/shape/比较方式一致 + 数值在 dtype 级容差内（float64 1e-12、float32 1e-6），跨版本的格式化漂移只报 WARN；要钉死文本用 `--strict`。否则「换一台机器就整套测试起不来」（§16.34.3 实测） |
+| **生成器退出码必须检查** | 生成器崩溃时文件不重写，`committed == regenerated` 会**假通过** —— 这条路径必须单独拦，比没有门禁更危险 |
 
 > 新增导出函数的完整操作：改 `package.lisp`（不重复）→ 跑 `python3 test/gen_probes2.py`
 > → `git add` → `bash test/run-tests.sh --suite differential-probes-test2`。
@@ -2577,6 +2579,11 @@ np.cumsum([-0.0+0j])         # [-0.+0.j]    ← 首元素直拷，符号位保�
 > `VT-CUMULATIVE`（`acc` 从 0/1 起算），因此实数 `cumsum([-0.0])` 仍给 `+0.0`。
 > 修它要动快路径 + 通用路径 + 轴分支共四处循环，风险与本轮主题（复数）无关，
 > 故列为下一轮候选，不在本轮夹带。
+>
+> ✅ **第十四轮已修**（§16.34.2）：三处循环全部改为「首元素直拷」，
+> 并顺带发现实数 `vt-cumulative` **没有包 `with-float-safe`**——
+> `(vt-cumprod #(inf 0))` 在默认陷阱下直接抛 INVALID-OPERATION，
+> 而 numpy 返回 `[inf, nan]`。
 
 #### 16.30.4 已核实「不是 bug」的三类差异
 
@@ -2892,6 +2899,188 @@ grep -n "cx-orig" src/*.lisp | grep eval-when # 预捕获清单删除
 
 ---
 
+### 16.34 第十四轮：拆分的收尾、两处静默错值与门禁的可用性
+
+前十三轮把「复数能不能算对」基本做完了（159/159 单一 DEFUN 分派、52 个套件全绿）。
+本轮换了个角度：**不复盘语义，复盘工程状态** —— 全量重跑测试入口，逐条追问
+「这条命令在一台干净的机器上真的能过吗」。
+
+结论是 4 个缺陷，其中 2 个属于「测试/构建本身坏了」，1 个是静默错值，1 个是
+会在用户进程里崩的陷阱问题。
+
+#### 16.34.1 A：`elementwise1/2` 是 `elementwise` 的完整副本（拆了个寂寞）
+
+提交 `59ff055`（"拆分elementwise文件，避免编译需要过大内存"）**只加了两个文件，
+一行没从原文件删**：
+
+| 事实 | 数据 |
+|---|---|
+| `elementwise.lisp` 顶层定义 | 133 个（1530 行） |
+| `elementwise1.lisp` + `elementwise2.lisp` | 39 + 46 = 85 个 |
+| 这 85 个在 `elementwise.lisp` 里**是否还存在** | **100% 存在**（逐行归一化比对：422/422、361/361 行命中） |
+| 唯一差异 | ew1 多 `(in-package :clvt)`；ew2 多一行 `(sb-ext::gc :full t)` |
+
+后果有两条，都不是"只是占地方"：
+
+1. **拆分目标完全没达成**。`elementwise.lisp` 仍是 1530 行，4 GB 堆照样在
+   编译它时 `Heap exhausted, game over` —— 而 `run-tests.sh` 的默认值正是
+   4096 MB。也就是说这个提交的全部收益为零，成本是 942 行死代码。
+2. **重新引入了刚刚花两轮消灭的病根**。85 个 `DEFUN` 各存在两份，后加载者胜；
+   `elementwise.lisp` 里那份改动**永远不生效**。这与 §16.32/§16.33 描述的
+   「覆盖式分派」是同一个机制（`clvt.asd` 的顺序决定谁赢），只是从"符号函数被
+   setf 覆盖"变成了"符号函数被后一个文件重定义"。§16.33.7 花一整列记下的
+   「跨文件同名 defun：14 对 → **0**」在同一个提交里回到了 85 对。
+
+**修法**：把 `elementwise.lisp` 第 596 行之后（`%pow-odd-int-p` 起，即 ew1+ew2
+承载的整段）删掉，保留前 48 个定义，并在文件尾写清三段分工与这条铁律。
+
+验证（`sbcl --dynamic-space-size 4096`，清空 fasl 缓存冷编译）：
+
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| 冷编译 | **Heap exhausted（4 GB）** | **成功** |
+| `caught WARNING` | 20 | **0** |
+| `caught STYLE-WARNING` | 96 | 96（均为既有的 unused-variable 类） |
+| 跨文件同名 `defun` | 85 对 | **0** |
+
+#### 16.34.2 B：docstring 里一个裸 `"` 让函数体混进了 5 个未定义变量
+
+`src/map-reduce.lisp` 的 `%weak-cast-needed-p` docstring 结尾写着：
+
+```lisp
+      构造函数收到 #C(1 0) 而报 "is not of type REAL"。"
+```
+
+中间那个 `"` 把字符串**提前闭合**了。于是 `is`、`not`、`of`、`type`、`REAL`
+五个 token 成了**函数体里的五个 form**，真正的 docstring 只剩末尾一个 `"。"`：
+
+```lisp
+(BLOCK %WEAK-CAST-NEEDED-P
+  CLVT::IS NOT CLVT::OF TYPE REAL "。" (AND (= (VT-SIZE X) 1) ...))
+```
+
+编译器报了 5 条 `undefined variable` + 「294 more uses」（SBCL 按组件累计），
+共 20 条 WARNING。**危险的地方在于它不报错**：SBCL 把未定义变量当 special 变量
+读，实测 `(%weak-cast-needed-p ...)` 仍返回 T —— 也就是说这个函数一直在依赖
+「读未绑定 special 变量」的未定义行为工作。
+
+**修法**：写成 `\"is not of type REAL\"`（转义）。修完 `caught WARNING` 归零。
+
+> 教训：`check-parens` 查不出这类问题 —— 括号是平衡的，坏的是**字符串边界**。
+> 唯一可靠的信号是编译期的 `undefined variable` 警告，所以「编译零 WARNING」
+> 应当作为门禁，而不是当成噪音 muffle 掉（`run-tests.sh` 现在正是
+> `(handler-bind ((warning #'muffle-warning)) ...)`）。
+
+#### 16.34.3 C：key-sync 门禁在 numpy 2.4.6 上硬失败，整套测试起不来
+
+`run-tests.sh` 的第一步是 `check_key_sync.py`，它把「重新生成的探针文件」
+与「提交的探针文件」做**逐字节比对**。而 `gen_probes*.py` 用 `str(np.float64)`
+输出期望值 —— 这个格式化随 numpy 版本变：
+
+```
+numpy 2.5.0：0.529475129
+numpy 2.4.6：0.5294751290000002      （同一条用例，差 1 ulp）
+```
+
+本机 numpy 2.4.6（也就是 §16 复数章的基准版本）因此必然报「codegen 漂移」，
+门禁 `exit 1`，**52 个套件一个都跑不了**。§10.4.1 其实已经记录了这个现象
+（"不要盲目重新生成再提交"），但门禁本身没有相应放宽。
+
+**修法**：门禁默认改成**语义比较**，`--strict` 保留逐字节口径：
+
+| 项 | 规则 |
+|---|---|
+| key 集合 / dtype / shape / 比较方式（`:exact`/`:tol`） | 必须完全一致，否则 FAIL |
+| `:tol` 条目的数值 | 按 dtype 分级容差：float64 `1e-12`、float32 `1e-6`（实测跨版本最大漂移 float64 2.1e-16、float32 1.0e-7，均 <1 ulp） |
+| `:exact` 条目的数值 | **逐字符相同**（该模式断言的就是逐位相等，文本一变必然运行期失败） |
+| 生成器退出码非 0 | FAIL（否则文件不重写 → 「文本相同」的假通过，见 §10.4.1 的"静默失效"） |
+| 生成的 `tmp/` 目录 | 跑完删掉（提交 60336c9 已把它从仓库移除，不该每次跑测试又冒出来） |
+
+修后本机输出：`[key-sync] OK: ref_compute 651 key，5 套件查询 651，缺失 0`
++ 两条「格式化漂移」WARN（7 条与 8 条），套件得以正常启动。
+
+#### 16.34.4 D：实数线 `vt-cumulative` 没包 `with-float-safe`（用户进程会崩）
+
+写 §16.34.2 的回归测试时顺手试了 `(vt-cumprod #(inf 0))`：
+
+```
+Unhandled FLOATING-POINT-INVALID-OPERATION ...
+Operation was (* #.SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY 0.0d0).
+```
+
+numpy 的行为是 `np.cumprod([inf, 0]) → [inf, nan]`（附 RuntimeWarning）。
+按 §5.2「算术传播」与 §7 的平台陷阱约定，本库必须返回 nan 而不是抛条件。
+同类问题在 §16.30.2 已经踩过一次（复数 `vt-median` 漏包），这次是实数累积。
+
+**修法**：拆成「外壳 + 内核」两个函数 ——
+
+```lisp
+(defun vt-cumulative (tensor op init-val &key axis dtype out)
+  "…（契约不变）…"
+  (with-float-safe
+   (%vt-cumulative tensor op init-val :axis axis :dtype dtype :out out)))
+```
+
+不用「把 150 行循环体整体缩进一级」的写法，是因为那样每次语义改动都会淹没在
+重排 diff 里。内核改名后必须同步 `(return-from %vt-cumulative result)` ——
+漏改会得到 `return for unknown block: VT-CUMULATIVE`（本轮实测踩到）。
+
+#### 16.34.5 顺带：`vt-svd` 的死缺省（§16.33.6 待办的收尾）
+
+第十三轮合并两处 `defun` 时，公开签名取的是实数线的 `50 / 1e-14`，而分派处写的是
+`(%cx-op-svd matrix :max-sweeps max-sweeps :tol tol)` —— 于是 `%cx-op-svd`
+自己的 `60 / 1e-15` 缺省**永远是死代码**，复数 SVD 实际一直跑在 50/1e-14 上，
+与它被压测验证的参数不一致。
+
+**修法**：改 `supplied-p`，两条路径各回各家：
+
+```lisp
+(defun vt-svd (matrix &key (full-matrices nil)
+                          (max-sweeps nil max-sweeps-p) (tol nil tol-p))
+  (when (%cx-any-p matrix)
+    (return-from vt-svd (%cx-op-svd matrix :full-matrices full-matrices
+                                          :max-sweeps (if max-sweeps-p max-sweeps 60)
+                                          :tol (if tol-p tol 1e-15))))
+  (let ((max-sweeps (if max-sweeps-p max-sweeps 50))
+        (tol (if tol-p tol 1e-14)))
+    ...))
+```
+
+不把两条路径统一到同一组数值，是因为两侧的缺省都是**各自验证过**的：实数线的
+SIMD 内核用 1e-14 做过性能/收敛平衡，复数 Jacobi 的压测按 1e-15 通过。统一到
+任一侧都是拿一侧的验证结论去覆盖另一侧。
+
+#### 16.34.6 测试
+
+新增 `test/scan-first-element-test.lisp`（**38 断言**，已接入 `run-tests.sh`，
+当前共 **53 个套件**）。它锁的是 A/B/C 之外的**语义**改动（首元素直拷 + 陷阱），
+结构修复由既有的 `complex-dispatch-test`（跨文件同名 defun）与「编译零 WARNING」覆盖：
+
+| 组 | 覆盖 |
+|---|---|
+| 1 实数 cumsum（19） | `[-0.0]` 的符号位、`[-0.0,0.0]`、2-D 三向（axis=0/1/nil）的**符号表 + 数值**、float32、轴长 1、负步长视图、空输入 |
+| 2 实数 cumprod（5） | `[-0.0]`、`[inf,0] → [inf,nan]`、2-D axis=0 符号表 |
+| 3 nan 族（6） | `nancumsum([-0.0])` 保号、`[nan,-0.0] → [+0,+0]`、`nancumprod([nan]) → 1`、2-D axis=0 |
+| 4 dtype 契约（6） | int8 → int64 且不溢出、显式 `:dtype` 生效且不破坏保号、复数路径回归 |
+| 5 `:out` 非连续（3） | 列视图落点逐位置核对、首元素符号、**其余位置不动** |
+
+两个测试写法上的硬约束（都踩过）：
+
+- **NaN 一律用 `sb-ext:float-nan-p`**。测试进程故意不屏蔽陷阱（SBCL 默认全开），
+  `(= x x)` / `(/= x x)` 判 NaN 会直接抛 INVALID-OPERATION（§16.28.5 的老坑）。
+- **符号零必须显式判**（`(zerop x)` 且 `(minusp (float-sign x))`）。`=` / `eql`
+  下 `-0.0` 与 `+0.0` 相等，任何只写数值相等的断言都抓不到这个 bug。
+
+#### 16.34.7 本轮遗留（已定位、未修）
+
+| 项 | 数据 | 下一步 |
+|---|---|---|
+| 实数 `cumsum/cumprod` 的 **axis 路径慢** | 1000×1000 `axis=0` 实测 196 ms（numpy ~5 ms，约 39×）；同规模 `axis=nil` 快路径只有 4 ms | 通用路径的内层 `aref` 是泛型（`in-data` 无元素类型声明）+ 每元素 `(nth ax strides)`。修法与 §16.27 的 matmul 同源：按 4 种存储类型特化 + 行起点递推。属性能项，不夹带在语义修复里 |
+| `vt-nanmedian` **多轴** | 复数与实数两侧都只支持单轴（numpy `nanmedian(axis=(0,1))` 合法）；调用报「暂不支持多轴归约」 | 需先给实数侧补多轴，再让复数侧复用（复数侧已有 `%cx-fiber-geom`，多轴可用「置换到末尾 + 展平成 2-D」复用现有 fiber 循环） |
+| 编译期 WARNING 无人管 | 96 条 STYLE-WARNING + 本轮修掉的 20 条 WARNING | 建议给 `run-tests.sh` 加一条「编译输出里不得有 `caught WARNING`（STYLE-WARNING 除外）」的门禁；否则 16.34.2 那一类会再回来 |
+
+---
+
 ### 16.20 累计变更文件清单（第一～十二轮）
 
 | 文件 | 改动 |
@@ -2964,6 +3153,13 @@ grep -n "cx-orig" src/*.lisp | grep eval-when # 预捕获清单删除
 | `src/manip.lisp` | **第十二轮**：`vt-repeat` 加体内分派 |
 | `src/complex-linalg.lisp` | **第十二轮**：10 个公开 `defun` 抽成 `%cx-op-*` 内部实现（仅 `vt-matrix-rank` 因 `&optional` 未迁） |
 | `test/complex-dispatch-test.lisp` | **第十二轮新增** 15 断言（结构契约：143 个符号必须是具名 DEFUN / list 入参 / 实数不回归 / 复数抽样 / `:out`），注册后共 51 套件 |
+| `src/elementwise.lisp` | **第十四轮**：删掉与 `elementwise1/2` 重复的 85 个定义（原 1530 行 → 614 行），文件尾补三段分工与「跨文件同名 defun 必须为 0」的铁律说明（§16.34.1） |
+| `src/map-reduce.lisp` | **第十四轮**：`%weak-cast-needed-p` 的 docstring 里裸 `"` 转义为 `\"`，消除 5 个未定义变量混入函数体（20 条编译 WARNING → 0，§16.34.2） |
+| `test/check_key_sync.py` | **第十四轮**：codegen 门禁改「语义比较 + `--strict` 逐字节」双口径；`:tol` 按 dtype 分级容差；生成器退出码非 0 直接 FAIL；清理生成器遗留的 `tmp/`（§16.34.3） |
+| `src/reduce-stats.lisp` | **第十四轮**：`vt-cumulative` 拆「外壳（with-float-safe）+ `%vt-cumulative` 内核」；快路径 / axis / 展平三处循环改为**首元素直拷**（§16.34.2、§16.34.4） |
+| `src/extensions3.lisp` | **第十四轮**：`%e3-cumulative-skip-nan` 的 axis 与展平两处循环改为「掩码后首元素直拷」，`nancumsum([-0.0])` 保住符号位（§16.34.4） |
+| `src/linalg.lisp` | **第十四轮**：`vt-svd` 的 `max-sweeps`/`tol` 改 `supplied-p`，实数 50/1e-14 与复数 60/1e-15 各用自己验证过的缺省（§16.34.5） |
+| `test/scan-first-element-test.lisp` | **第十四轮新增** 38 断言（实数 cumsum/cumprod 三条路径的符号零 + nan 族 + dtype 提升 + `:out` 非连续落点 + 复数回归），注册后共 53 套件 |
 
 ---
 
@@ -3145,6 +3341,11 @@ grep -c "eval-when.*cx-orig"   src/*.lisp    # 0
 > `vt-svd` 的 `max-sweeps 50/tol 1e-14` vs `60/1e-15` 未在本轮处理：
 > 它已经在第十二轮随 S5-C 迁移成单一 `defun`，但**当时保留的是复数版参数**
 > （后加载者胜），需要单独确认期望值。记为待办，不在本轮扩大改动面。
+>
+> ✅ **第十四轮已裁决**（§16.34.5）：签名改为 `supplied-p`，两条路径各用自己
+> 验证过的缺省（实数 50/1e-14、复数 60/1e-15），显式传参时以调用方为准。
+> 顺带修掉一个隐藏问题：合并后 `%cx-op-svd` 自己的 `60/1e-15` 缺省是**死代码**
+> （分派时总把公开缺省显式传下去），复数 SVD 实际上一直跑在 50/1e-14 上。
 
 #### 16.33.7 结果
 

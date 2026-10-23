@@ -1113,7 +1113,16 @@
                         (ax-stride (nth ax in-strs))
                         (ax-dim (nth ax shape)))
                     (dotimes (i ax-dim)
-                      (setf cum (cumstep cum (aref in-data (+ ptr (* i ax-stride)))))
+                      ;; 首元素取「掩码后的输入本身」而不是 OP(单位元, 输入)：
+                      ;; numpy.nancumsum([-0.0]) => [-0.]，而 0.0 + (-0.0) = +0.0
+                      ;; 会洗掉符号位（CONVENTIONS §16.30.3 的实数线遗留项）。
+                      (let ((x (aref in-data (+ ptr (* i ax-stride)))))
+                        (if (zerop i)
+                            (setf cum (if (%nan-p x)
+                                          (coerce (if (eq op :sum) 0.0d0 1.0d0)
+                                                  'double-float)
+                                          x))
+                            (setf cum (cumstep cum x))))
                       ;; 目标坐标：indices 中 AXIS 位置替换为 i，其余维保持
                       (let ((coords (coerce indices 'list)))
                         (setf (nth ax coords) i)
@@ -1135,8 +1144,13 @@
             (dotimes (i n)
               (declare (type fixnum i))
               (let ((x (aref d (the fixnum (+ off i)))))
-                (unless (/= x x)                    ; NaN 跳过（保持累积值）
-                  (setf cum (if sum-p (+ cum x) (* cum x)))))
+                (if (zerop i)
+                    ;; 首元素：掩码后直拷（numpy.nancumsum([-0.0]) => [-0.]）
+                    (setf cum (if (/= x x)
+                                  (coerce (if sum-p 0.0d0 1.0d0) 'double-float)
+                                  x))
+                    (unless (/= x x)                ; NaN 跳过（保持累积值）
+                      (setf cum (if sum-p (+ cum x) (* cum x))))))
               (setf (aref tmp i) cum))
             (%e3-store-double-vector result tmp)))))))
 

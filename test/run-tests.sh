@@ -79,6 +79,7 @@ SUITES[dtype-weak-scalar-test]="14 弱标量提升回归（第十一轮 §16.31:
 SUITES[complex-nan-inf-test]="77 复数 NaN/Inf 与 median 契约（第十轮 §16.30: median 在 axis=nil/空 fiber/NaN 传播三处与实数路径分叉 · 前缀扫描首元素直拷（-0.0 符号位、Inf 元素）· nan* 家族含 ±Inf 与全 NaN 切片 · isnan/isinf/isfinite/nan_to_num/含 NaN 排序 · axis 元组归约 · :out 非连续/转置/原地 · einsum 九种模式）"
 SUITES[complex-scan-axis-test]="26 复数沿轴扫描回归（第九轮 §16.29: cumsum/cumprod/nancumsum/nancumprod 在 axis<rank-1 时只算第一条 fiber 的静默错值 · 2D 两轴 + 3D 三轴 + 负轴 + 转置视图 + c64 + 退化/空轴 + :out 连续与非连续 · 期望值取自 numpy 2.3.5 逐位相等 · 实数路径回归）"
 SUITES[complex-gap-test]="50 复数缺口回归（第八轮 §16.28: from-array/from-sequence/full 的 dtype 推断保住虚部 · float_power 复数主值分支与 NaN 边界 · cbrt 对齐 numpy 的确定性拒绝 · layer-norm 复数分支（复数均值+实数方差）· 已支持函数抽查）"
+SUITES[scan-first-element-test]="38 累积扫描首元素语义（第十四轮 §16.30.3: numpy 的 accumulate 首个输出是输入本身而非 OP(单位元,输入) —— cumsum([-0.0]) 的符号位、cumprod 的 inf*0、nan 族掩码后的首元素；覆盖实数线三条路径(快路径/axis/展平) + 复数回归 + dtype 提升 + :out 非连续落点。测试进程故意不屏蔽浮点陷阱）"
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
 SUITES[test-all]="641 绝大多数函数的测试"
@@ -143,6 +144,7 @@ DEFAULT_ORDER=(
     dtype-weak-scalar-test
     complex-nan-inf-test
     complex-scan-axis-test
+    scan-first-element-test
     complex-gap-test
     complex-matmul-perf-test
     complex-test

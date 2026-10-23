@@ -1064,13 +1064,8 @@
 ;;; 累积
 ;;; ------------------------------------------------------------------
 
-(defun vt-cumulative (tensor op init-val &key axis dtype out)
-  "累积归约核心原语：沿 AXIS 依次累积 OP（#\+ / #\*），以 INIT-VAL 起始。
-  dtype 语义（§4.2 H3）：结果 dtype = 显式 :dtype，否则为输入 dtype；out 必须精确匹配。
-
-  结果形状（v0.4.1 逻辑修复，对标 numpy）：
-    axis=NIL → **先展平再累积**，返回一维（np.cumsum([[1,2],[3,4]]) -> (4,)）；
-    axis 给定 → 形状与输入相同，仅该轴被累积。"
+(defun %vt-cumulative (tensor op init-val &key axis dtype out)
+  "VT-CUMULATIVE 的内核（不含浮点陷阱屏蔽）；语义与契约见下方的公开入口。"
   (let* ((shape (vt-shape tensor))
          (rank (length shape))
          ;; 结果 dtype 由「输入 dtype + 显式 :dtype」决定，不由 out 决定。
@@ -1122,19 +1117,29 @@
                           (opos (the fixnum out-offset)))
                       (declare (type (simple-array ,lt (*)) src dst)
                                (type fixnum n ip opos))
+                      ;; 首元素**直接拷贝**，从第二个元素起才做 OP。
+                      ;; numpy 的 accumulate 就是这个语义（CONVENTIONS §16.30.3）：
+                      ;;   np.cumsum([-0.0])  => [-0.]   而 0.0 + (-0.0) = +0.0
+                      ;; 也就是说「从单位元起算」会静默洗掉 -0.0 的符号位；
+                      ;; 对 cumprod 还会在 inf/nan 首元素上凭空造出 0*inf。
+                      ;; 与 %CX-SCAN-RUN 的复数线保持同一口径。
                       (if (eq op #'+)
                           (let ((acc (the ,lt (coerce init-val ',lt))))
                             (declare (type ,lt acc))
-                            (dotimes (i n)
-                              (declare (type fixnum i))
-                              (setf acc (+ acc (aref src (+ ip i))))
-                              (setf (aref dst (+ opos i)) ,store)))
+                            (when (plusp n)
+                              (setf acc (aref src ip))
+                              (setf (aref dst opos) acc)
+                              (loop for i of-type fixnum from 1 below n
+                                    do (setf acc (+ acc (aref src (+ ip i))))
+                                       (setf (aref dst (+ opos i)) ,store))))
                           (let ((acc (the ,lt (coerce init-val ',lt))))
                             (declare (type ,lt acc))
-                            (dotimes (i n)
-                              (declare (type fixnum i))
-                              (setf acc (* acc (aref src (+ ip i))))
-                              (setf (aref dst (+ opos i)) ,store))))))))
+                            (when (plusp n)
+                              (setf acc (aref src ip))
+                              (setf (aref dst opos) acc)
+                              (loop for i of-type fixnum from 1 below n
+                                    do (setf acc (* acc (aref src (+ ip i))))
+                                       (setf (aref dst (+ opos i)) ,store)))))))))
       (when (and (member op (list #'+ #'*))
                  ;; 仅在「全局累积（axis=nil）」时可用线性快路径：
                  ;; 此时累加正是按行主序对整块做一次顺序累加，
@@ -1155,7 +1160,7 @@
                       (list 'double-float 'single-float
                             '(signed-byte 64) '(signed-byte 32))
                       :test #'equal)
-          (return-from vt-cumulative result))))
+          (return-from %vt-cumulative result))))
     (if axis
         ;; ---------------- 沿指定轴累积（形状不变）----------------
         (let* ((ax (vt-normalize-axis axis rank))
@@ -1179,7 +1184,13 @@
                 (let ((in-stride (nth ax in-strides))
                       (out-stride (nth ax out-strides))
                       (cum (coerce init-val lisp-type)))
-                  (loop for i from 0 below ax-dim do
+                  ;; 首元素直拷（numpy accumulate 语义，§16.30.3）：
+                  ;; 每条 fiber 的第一个输出 = 输入本身，不是 OP(单位元, 输入)。
+                  (when (plusp ax-dim)
+                    (let ((v (aref in-data in-ptr)))
+                      (setf cum v)
+                      (setf (aref out-data out-ptr) (vt-cast v final-dtype))))
+                  (loop for i from 1 below ax-dim do
                     (setf cum (funcall op cum (aref in-data (+ in-ptr (* i in-stride)))))
                     (setf (aref out-data (+ out-ptr (* i out-stride)))
                           (vt-cast cum final-dtype)))))
@@ -1198,11 +1209,35 @@
                (conv (vt-cast-fun final-dtype))
                (cum (coerce init-val lisp-type)))
           (declare (type fixnum soff n doff))
-          (dotimes (i n)
-            (declare (type fixnum i))
-            (setf cum (funcall op cum (aref src (+ soff i))))
-            (setf (aref dst (+ doff i)) (funcall conv cum)))))
+          ;; 首元素直拷：cumsum([-0.0]) 必须是 -0.0（numpy 实测），
+          ;; 而 0.0 + (-0.0) = +0.0 会把符号位洗掉。§16.30.3
+          (when (plusp n)
+            (let ((v (aref src soff)))
+              (setf cum v)
+              (setf (aref dst doff) (funcall conv v))))
+          (loop for i of-type fixnum from 1 below n
+                do (setf cum (funcall op cum (aref src (+ soff i))))
+                   (setf (aref dst (+ doff i)) (funcall conv cum)))))
     result))
+
+(defun vt-cumulative (tensor op init-val &key axis dtype out)
+  "累积归约核心原语：沿 AXIS 依次累积 OP（#\+ / #\*），以 INIT-VAL 起始。
+  dtype 语义（§4.2 H3）：结果 dtype = 显式 :dtype，否则为输入 dtype；out 必须精确匹配。
+
+  结果形状（v0.4.1 逻辑修复，对标 numpy）：
+    axis=NIL → **先展平再累积**，返回一维（np.cumsum([[1,2],[3,4]]) -> (4,)）；
+    axis 给定 → 形状与输入相同，仅该轴被累积。
+
+  首元素直拷（§16.30.3，第十四轮）：numpy 的 accumulate 不是「从单位元起算」，
+  首个输出等于输入本身 —— `np.cumsum([-0.0])` 给 `-0.0`，而 `0.0 + (-0.0)` 给
+  `+0.0`。符号零是语义信息（`1/x` → ∓Inf、`log` 的分支切割），不能静默洗掉。
+
+  NaN/Inf（§5.5 / §7）：外壳把内核包在 WITH-FLOAT-SAFE 里。SBCL 默认四类浮点
+  陷阱全开，`inf + (-inf)`、`inf * 0` 会直接抛 FLOATING-POINT-INVALID-OPERATION，
+  而 numpy 只是给出 nan 并继续（`np.cumprod([inf, 0])` → `[inf, nan]`）。
+  用「外壳 + 内核」两层而不是把 150 行循环体整体缩进，是为了让 diff 只反映语义变更。"
+  (with-float-safe
+   (%vt-cumulative tensor op init-val :axis axis :dtype dtype :out out)))
 
 (defun vt-cumsum (tensor &key axis dtype out)
   "沿 AXIS 的累积和（axis 缺省全展平）。等价 (vt-cumulative tensor #\+ 0 :axis axis)。"

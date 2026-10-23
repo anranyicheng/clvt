@@ -192,7 +192,7 @@
    5. 这一组输入里**至少有一个真张量**（SIZE>1）。全标量时没有「要对齐的
       大数组」，预转纯属添乱 —— `(vt-complex 1.0d0 2.0d0)` 内部就是
       `(vt-map #'complex 1.0 2.0 :dtype :complex128)`，把实参转成复数会让
-      构造函数收到 #C(1 0) 而报 "is not of type REAL"。"
+      构造函数收到 #C(1 0) 而报 \"is not of type REAL\"。"
   (and (= (vt-size x) 1)
        (not (eq (vt-dtype x) final-dtype))
        (<= (%dtype-kind-rank (vt-dtype x)) (%dtype-kind-rank final-dtype))

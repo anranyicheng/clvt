@@ -2697,12 +2697,20 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
                   ((> m n) (values (extend-orthogonal-basis u-k) s-vt vt-out))
                   ((< m n) (values u-k s-vt vt-out))))))))
 
-(defun vt-svd (matrix &key (full-matrices nil) (max-sweeps 50) (tol 1e-14))
+(defun vt-svd (matrix &key (full-matrices nil)
+                          (max-sweeps nil max-sweeps-p) (tol nil tol-p))
   "奇异值分解 a = u s v^t。
   full-matrices : t 则返回完整尺寸 u(m×m), s(k), vt(n×n) (k = min(m,n))
                   : nil 返回经济尺寸 u(m×k), s(k), vt(k×n)
-  max-sweeps : jacobi 最大扫描次数
-  tol : 收敛容差
+  max-sweeps : jacobi 最大扫描次数（缺省：实数 50 / 复数 60）
+  tol : 收敛容差（缺省：实数 1e-14 / 复数 1e-15）
+
+  缺省值按路径分开（§16.33.6 的 lambda-list 漂移收尾）：
+  实数线与复数线各自用自己验证过的参数。第十三轮把两处 DEFUN 合成一个时，
+  公开签名取的是实数线的 50/1e-14，于是复数的 60/1e-15 **变成了死缺省**
+  （分派时总把公开缺省显式传下去）—— 复数 SVD 的那些压测是按 60/1e-15
+  验证的，不能靠「反正测试还过」来维持。这里用 supplied-p 让两条路径各回各家：
+  调用方显式给参时以调用方为准，不给时各自用本路径的缺省。
 
   实现：单边 Jacobi 双路径路由（同 vt-matmul 的快速路径 + 通用回退模式）：
   1. 快速路径（SBCL 且 *vt-linalg-simd-enabled* = t）：转置布局 W = A^T +
@@ -2712,10 +2720,15 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
      全部语义，修复其按列跨行访问的性能缺陷），无 SIMD 依赖。
   两条路径共享迭代次序、收敛判据、零奇异值补全与重建逻辑。"
   (when (%cx-any-p matrix)
-    (return-from vt-svd (%cx-op-svd matrix :full-matrices full-matrices :max-sweeps max-sweeps :tol tol)))
-  (assert (= 2 (vt-order matrix)))
-  (with-float-safe
-    (let* ((mat (vt-astype matrix :float64))
+    (return-from vt-svd
+      (%cx-op-svd matrix :full-matrices full-matrices
+                         :max-sweeps (if max-sweeps-p max-sweeps 60)
+                         :tol (if tol-p tol 1e-15))))
+  (let ((max-sweeps (if max-sweeps-p max-sweeps 50))
+        (tol (if tol-p tol 1e-14)))
+    (assert (= 2 (vt-order matrix)))
+    (with-float-safe
+      (let* ((mat (vt-astype matrix :float64))
            (m (first  (vt-shape mat)))
            (n (second (vt-shape mat)))
            (k (min m n)))
@@ -2759,7 +2772,7 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
                                 (coerce tol 'double-float))
 
         ;; ---- 共享重建：排序 / 填 U / 零 σ 补全 / 构造 vt / 形状分派 ----
-        (%vt-svd-rebuild w-data vt-data col-norms m n k full-matrices)))))
+        (%vt-svd-rebuild w-data vt-data col-norms m n k full-matrices))))))
 
 ;;;; linalg-extensions.lisp — 扩展线性代数功能
 ;;; ============================================================
