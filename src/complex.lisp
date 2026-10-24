@@ -306,8 +306,73 @@
 
 (%def-cx-reducer %cx-reduce-sum (+ acc v))
 (%def-cx-reducer %cx-reduce-prod (* acc v) :init-form (+ zero 1))
-(%def-cx-reducer %cx-reduce-max (if (null acc) v (%cop-max acc v)) :init-form nil)
-(%def-cx-reducer %cx-reduce-min (if (null acc) v (%cop-min acc v)) :init-form nil)
+;;; ---- 极值归约：按精度各生成一份，累加器**必须带类型声明** ----
+;;;
+;;; 为什么不能复用 %DEF-CX-REDUCER：那条路把累加器写成
+;;; `(let ((acc (aref d 0))) … (vector acc))`，而 `(vector acc)` 接受任意类型，
+;;; 加上 %COP-MAX 的**派生返回类型是 T**（形参无声明 → 返回 a 或 b → T），
+;;; SBCL 会把 ACC 放宽成 T —— 于是每次 %COP-MAX 都在装箱/解包复数：
+;;; 1M 元素实测 41ms，补上 `(type (complex double-float) acc)` 后 3ms。
+;;; 内联逐元素算子（%inline2-loop）没有这个问题：实参是已知类型的 aref，
+;;; 展开后按上下文重新推导类型，不会被函数的派生类型拖累。
+;;; 逐元素 vs 归约的这条差异，是「同一内核在两处快慢差 13 倍」的全部原因。
+(defmacro %def-cx-extremum-kernel (name ctype cmp)
+  "生成单一精度的极值归约内核 NAME(DATA SHAPE AX)（CMP 为 %COP-MAX/%COP-MIN）。
+   空归约区返回 (vector nil)，与调用方的契约一致。"
+  `(defun ,name (data shape ax)
+     (let ((d (the (simple-array ,ctype (*)) data)))
+       (declare (type (simple-array ,ctype (*)) d)
+                (optimize (speed 3) (safety 1)))
+       (if (null ax)
+           (let ((n (the fixnum (length d))))
+             (declare (type fixnum n))
+             (if (zerop n)
+                 (vector nil)
+                 (let ((acc (aref d 0)))
+                   (declare (type ,ctype acc))
+                   (dotimes (i (the fixnum (1- n)))
+                     (declare (type fixnum i))
+                     (setf acc (,cmp acc (aref d (1+ i)))))
+                   (vector acc))))
+           (multiple-value-bind (head dim ax-stride) (%cx-fiber-geom shape ax)
+             (declare (type fixnum head dim ax-stride))
+             (let ((res (make-array (the fixnum (* head ax-stride)))))
+               (dotimes (h head)
+                 (declare (type fixnum h))
+                 (let* ((hb (the fixnum (* h dim ax-stride)))
+                        (row (the fixnum (* h ax-stride))))
+                   (declare (type fixnum hb row))
+                   (dotimes (ti ax-stride)
+                     (declare (type fixnum ti))
+                     (let ((p (the fixnum (+ hb ti))))
+                       (declare (type fixnum p))
+                       (if (zerop dim)
+                           (setf (aref res (the fixnum (+ row ti))) nil)
+                           (let ((acc (aref d p)))
+                             (declare (type ,ctype acc))
+                             (dotimes (j (the fixnum (1- dim)))
+                               (declare (type fixnum j))
+                               (incf p ax-stride)
+                               (setf acc (,cmp acc (aref d p))))
+                             (setf (aref res (the fixnum (+ row ti))) acc)))))))
+               res))))))
+
+(%def-cx-extremum-kernel %cx-reduce-max-d (complex double-float) %cop-max)
+(%def-cx-extremum-kernel %cx-reduce-max-s (complex single-float) %cop-max)
+(%def-cx-extremum-kernel %cx-reduce-min-d (complex double-float) %cop-min)
+(%def-cx-extremum-kernel %cx-reduce-min-s (complex single-float) %cop-min)
+
+(defun %cx-reduce-max (data shape ax)
+  (let ((et (array-element-type data)))
+    (cond ((equal et '(complex double-float)) (%cx-reduce-max-d data shape ax))
+          ((equal et '(complex single-float)) (%cx-reduce-max-s data shape ax))
+          (t (error "%cx-reduce-max: 非复数缓冲区 ~a" et)))))
+
+(defun %cx-reduce-min (data shape ax)
+  (let ((et (array-element-type data)))
+    (cond ((equal et '(complex double-float)) (%cx-reduce-min-d data shape ax))
+          ((equal et '(complex single-float)) (%cx-reduce-min-s data shape ax))
+          (t (error "%cx-reduce-min: 非复数缓冲区 ~a" et)))))
 
 (defun %cx-arg-reduce-run (data shape ax op)
   "argmax/argmin 的连续内核。返回 fixnum 向量。
@@ -781,9 +846,18 @@
                      (decf j))
             (setf (aref v (+ base (1+ j))) x))))
        (t
-        ;; 自底向上稳定归并（无递归、顺序访存）
-        (let ((w 1))
-          (declare (type fixnum w))
+        ;; 自底向上稳定归并（无递归、顺序访存）。
+        ;;
+        ;; 双缓冲**乒乓**：每一趟把 SRC 归并进 DST 后交换两者，不再把每段
+        ;; 归并结果 REPLACE 回 V。旧写法每段一次 `replace` —— n=1M 时第一趟
+        ;; 就有 50 万次两元素拷贝，调用开销完全盖过数据量（实测 1M c128
+        ;; 排序 200ms，其中约 100ms 是这 50 万次 `replace`）。
+        ;; 乒乓后每趟只多一次「结果落在 AUX 时拷回」，且是整段一次 memcpy。
+        (let ((src v)
+              (dst aux)
+              (w 1))
+          (declare (type (simple-array ,lt (*)) src dst)
+                   (type fixnum w))
           (loop while (< w n) do
             (let ((lo 0))
               (declare (type fixnum lo))
@@ -795,18 +869,21 @@
                        (k lo))
                   (declare (type fixnum mid hi i j k))
                   (loop while (and (< i mid) (< j hi)) do
-                    (if (%cx-sort-less (aref v (+ base j)) (aref v (+ base i)))
-                        (progn (setf (aref aux k) (aref v (+ base j))) (incf j))
-                        (progn (setf (aref aux k) (aref v (+ base i))) (incf i)))
+                    (if (%cx-sort-less (aref src (+ base j)) (aref src (+ base i)))
+                        (progn (setf (aref dst k) (aref src (+ base j))) (incf j))
+                        (progn (setf (aref dst k) (aref src (+ base i))) (incf i)))
                     (incf k))
                   (loop while (< i mid) do
-                    (setf (aref aux k) (aref v (+ base i))) (incf i) (incf k))
+                    (setf (aref dst k) (aref src (+ base i))) (incf i) (incf k))
                   (loop while (< j hi) do
-                    (setf (aref aux k) (aref v (+ base j))) (incf j) (incf k))
-                  (replace v aux :start1 (+ base lo) :end1 (+ base hi)
-                             :start2 lo :end2 hi))
+                    (setf (aref dst k) (aref src (+ base j))) (incf j) (incf k)))
                 (incf lo (* 2 w))))
-            (setf w (* 2 w))))))))
+            (rotatef src dst)
+            (setf w (* 2 w)))
+          ;; 结果落在 AUX 时整段拷回（一次，不是每段一次）
+          (when (eq src aux)
+            (replace v aux :start1 base :end1 (+ base n)
+                       :start2 0 :end2 n)))))))
 
 (%def-cx-fiber-sorter %cx-sort-fiber-f64 (complex double-float))
 (%def-cx-fiber-sorter %cx-sort-fiber-f32 (complex single-float))

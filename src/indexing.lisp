@@ -277,12 +277,24 @@
               (promoted (vt-promote-type (vt-dtype x) (vt-dtype y)))
               (final-dtype (or dtype promoted))
               ;; 统一硬契约（H1–H4）：形状/dtype 严格相等/可写
+              ;; 分配用不填充版：下面两条路都会写满每个元素
               (result (if out
                           (vt-check-out out target-shape final-dtype
                                         :op-name "vt-where")
-                          (vt-zeros target-shape :dtype final-dtype))))
-         (vt-map (lambda (c a b) (if (/= c 0) a b))
-                 condition x y :out result :dtype final-dtype))))))
+                          (%alloc-vt target-shape final-dtype)))
+              ;; 快路径前置：结果连续 + 每个输入「要么长度 1（广播），
+              ;; 要么连续且形状与结果相同」，且 x/y/结果同元素类型、掩码为 :int8。
+              ;; 不满足就退回 vt-map 的闭包路径（语义完全一致）。
+              (fast-p (and (vt-contiguous-p result)
+                           (flet ((ok (tv)
+                                    (or (= (vt-size tv) 1)
+                                        (and (vt-contiguous-p tv)
+                                             (equal (vt-shape tv) target-shape)))))
+                             (and (ok condition) (ok x) (ok y))))))
+         (unless (and fast-p (%select-fast condition x y result))
+           (vt-map (lambda (c a b) (if (/= c 0) a b))
+                   condition x y :out result :dtype final-dtype))
+         result)))))
 
 (defun vt-argwhere (condition &key (dtype :int64))
   "返回非零元素坐标，形状 (n, rank)。"

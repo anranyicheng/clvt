@@ -75,6 +75,7 @@ SUITES[einsum-gemm-layout-test]="36 einsum GEMM 布局归一化 (§16.26: NN/NT/
 SUITES[astype-cast-test]="663 vt-astype 转换矩阵与复数快路径测试 (100 格 10dtype×10dtype numpy 2.4.6 差分对照 + 契约断言(取实部/虚部补0/NaN·Inf→整数=0/符号零/rank-0/空张量/广播视图) + 转置·翻转·切片·广播视图与连续副本等价 + 性能护栏(复数转换 ≤8~10× 实数线, 优化前 17~41ms→1~4ms); 期望由 test/gen_astype_cast_expected.py 生成)"
 SUITES[order-stat-test]="266 顺序统计量正确性与退化护栏 (median/percentile/nanmedian 与「排序+位置公式」独立参照逐点一致(6 种分布×7 种规模×5 个分位点) + 重复值密集/已排序/逆序相对随机输入的倍率护栏；修复前后：全零 200k 10.7s→1ms、降序 400k 142ms→21ms)"
 SUITES[cx-extreme-argsort-test]="74 复数极值族与 argsort/topk 的正确性 + 倍率护栏 (maximum/minimum/fmax/fmin 与字典序独立参照逐点一致(16x16 值对 x 2 dtype), clip=min(max), 4 种布局(连续/广播/转置/步进)同语义, argsort 双射+非降序+稳定性+多轴, topk 与排序切片一致且下标回指; 修复前 1M: maximum 804ms→7ms, clip 1600→9ms, argsort 2115→283ms, topk 490→303ms);"
+SUITES[cx-reduce-where-test]="119 极值归约与掩码三元选择的正确性 + 倍率护栏 (vt-where 与逐元素参考一致(8 实数 dtype + 2 复数 dtype x 4 种掩码) + 广播/转置视图/:out 复用/参数配对; amax/amin 的 NaN 传播、单轴、c64/c128、空归约报错; 排序双缓冲乒乓的 1..1000 规模边界; 倍率护栏 where<=4x / amax<=8x; 修复前 1M: amax 41ms->3ms, where 32->5ms, nansum 35->5ms, nanvar 65->28ms)"
 SUITES[complex-ops-test]="128 复数数据搬运层测试 (97 项 numpy 2.4.6 差分对照: 转换/拼接/剪切/集合/nan 族/缩并/卷积 + dtype&shape 契约 + :out 硬契约 + 未支持组合报错 + 实数回归网; 期望由 test/gen_complex_ops_expected.py 生成)"
 SUITES[complex-dispatch-test]="17 复数分派结构回归（第十二/十三轮 §16.32: 159 个已迁移符号必须是具名 DEFUN 而非 setf 装的匿名包装（重载安全的充分必要条件）· list 入参走复数路径 · 拒绝型守卫 · 实数路径不回归 · 复数语义抽样 · :out 契约）"
 SUITES[complex-reload-test]="14 重载单文件不丢复数（第十三轮 S7 验收核心: 逐一重载 dispatch/complex-kernels/manip/elementwise/reduce-stats/setops/linalg/extensions/extensions3/complex/complex-ops/complex-linalg 共 12 个源文件，每轮 19 个探针覆盖全部 159 个迁移符号的代表语义必须不变 —— 覆盖式架构下这一条必然失败）"
@@ -157,6 +158,7 @@ DEFAULT_ORDER=(
     astype-cast-test
     order-stat-test
     cx-extreme-argsort-test
+    cx-reduce-where-test
     complex-linalg-test
     setops-axis-trace-test
     einsum-gemm-layout-test

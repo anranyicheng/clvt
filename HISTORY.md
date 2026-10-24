@@ -14,7 +14,7 @@
 
 ---
 
-## H.1 累计变更文件清单（第一～二十轮）
+## H.1 累计变更文件清单（第一～二十一轮）
 
 ### 16.20 累计变更文件清单（第一～十二轮）
 
@@ -125,6 +125,13 @@
 | `CONVENTIONS.md` | **第二十轮**：新增 §16.8.1（极值/排序内核的四条执行层硬约束 + 「previously compiled」探测器）；§16.37 关闭 U5/U6/U8 |
 | `test/cx-extreme-argsort-test.lisp` | **第二十轮新增** 74 断言（极值语义/布局/`clip`/`argsort`/`topk` + 四条倍率护栏），注册后共 57 套件 |
 | `test/run-tests.sh` | **第二十轮**：注册 `cx-extreme-argsort-test` |
+| `src/complex.lisp` | **第二十一轮**：新增 `%def-cx-extremum-kernel`（按精度生成的极值归约内核，累加器带类型声明 + 首元素播种），`%cx-reduce-max/-min` 改为元素类型分派（`vt-amax` 41 → 3 ms，§16.8.2 第 1 条）；归并排序改双缓冲乒乓（§16.8.1 第 2 条） |
+| `src/map-reduce.lisp` | **第二十一轮**：新增 `%select-loop` / `%select-fast`（int8 掩码 + 同类型数据的三元选择，10 格分派） |
+| `src/indexing.lisp` | **第二十一轮**：`vt-where` 接入 `%select-fast` 快路径，分配由 `vt-zeros` 改为 `%alloc-vt`（32 → 5 ms） |
+| `CONVENTIONS.md` | **第二十一轮**：新增 §16.8.2（归约累加器 / 混合类型逐元素算子的两处类型放宽陷阱）；§16.8.1 第 2 条补「归并必须双缓冲乒乓」；§16.37 更新 U7、新增 U9（基数排序） |
+| `test/cx-reduce-where-test.lisp` | **第二十一轮新增** 119 断言（`vt-where` 10 dtype × 4 掩码、布局、极值归约、排序乒乓边界、四条护栏），注册后共 58 套件 |
+| `test/run-tests.sh` | **第二十一轮**：注册 `cx-reduce-where-test` |
+
 
 | `test/test-copy-into.lisp` | **第十八轮**：+6 断言（复数×非连续 typed-walk：转置/翻转/3-D 置换/非连续 dest + `c128T vt-copy ≤ 8× f64T` 护栏），35 → 41 |
 
@@ -160,7 +167,7 @@ LAMBDA，`declaim inline` 对调用点失效；哪些符号被覆盖无法静态
 
 ---
 
-## H.3 §16 后半章的详细叙事（第五～二十轮）
+## H.3 §16 后半章的详细叙事（第五～二十一轮）
 
 > 为什么单独成节：这些内容原先住在 `CONVENTIONS.md` §16.21–§16.36，按
 > 「症状 → 根因 → 修法 → 实测」写，与 `CHANGELOG.md` 的对应条目是**同一件事
@@ -1374,3 +1381,106 @@ Proclaiming CLVT::%CX-EQ-FLAG to be INLINE, but 12 calls to it were previously c
 > `get-internal-real-time` 的有效分辨率（约 1 ms）里，倍率会算成 1000×+。
 > **性能护栏的规模必须让「基准项」也远超计时噪声**，这是第三次记同类教训
 > （前两次：§H.3.11 的落点口径、§H.3.13 的构造计入计时）。
+
+---
+
+### H.3.15 第二十一轮：巡检第二遍 —— 三处「类型被推断放宽」
+
+上一轮把 U5/U6/U8 关掉后，重跑一遍巡检（8 个族、约 30 个算子，按 c128/f64 比值
+排序）。这次的异常项集中在**归约**与**掩码选择**上，根因全是同一件事：
+**变量类型在某一处被推断放宽**，热路径静默退回泛型。
+
+| 场景（1M 元素） | 修前 | 修后 | 同形实数线 |
+|---|---:|---:|---:|
+| `vt-amax` c128 | 41 ms | **3 ms** | <1 ms |
+| `vt-amin` c128 | 41 ms | **2 ms** | <1 ms |
+| `vt-where(mask,a,b)` c128 | 32 ms | **5 ms** | 2 ms |
+| `vt-nansum` | 35 ms | **5 ms** | 1 ms |
+| `vt-nanmean` | 46 ms | **13 ms** | <1 ms |
+| `vt-nanvar` | 65 ms | **28 ms** | 1 ms |
+| `vt-nanstd` | 62 ms | **30 ms** | 1 ms |
+| `vt-nanmax` | 88 ms | **22 ms** | 1 ms |
+| `vt-nancumsum` | 36 ms | **5 ms** | 13 ms |
+
+#### 一、归约累加器被放宽成 `T`
+
+先按上一轮的套路拆（`%cx-reduce-max` 40 ms、`%cx-reduce-values :max` 43 ms、
+`vt-amax` 端到端 53 ms），确定瓶颈在内核本身；同一条宏生成的 `%cx-reduce-sum`
+却是 <1 ms。同一个 `%cx-dispatch`、同一条循环骨架，差别只有步进表达式。
+
+抽出最小复现，两个函数只差一行 `(declare (type (complex double-float) acc))`：
+
+| 写法 | 1M c128 |
+|---|---:|
+| `(let ((acc (aref d 0))) … (setf acc (%cop-max acc v)) … (vector acc))` | 40 ms |
+| 同上 + `(declare (type (complex double-float) acc))` | **3 ms** |
+
+原因：`(vector acc)` 接受任意类型，而 `%cop-max` 的**派生返回类型是 `T`**
+（它的形参没有声明 → `(cond ((%cx-nan-p a) a) …)` 返回 `a` 或 `b` → `T`）。
+SBCL 于是把 `acc` 的变量类型放宽到 `T`，每次调用都要装箱/解包复数。
+
+> 为什么**逐元素**路径没这个问题：`%inline2-loop` 里的实参是已知类型的
+> `aref`，内联展开后按**上下文**重新推导类型，不受函数派生类型的拖累。
+> 于是出现了「同一内核、逐元素 5 ms、归约 41 ms」的怪象 —— 这条差异上一轮
+> 完全没看出来。
+
+修法：新增 `%def-cx-extremum-kernel`，按精度各生成一份，累加器带
+`(type (complex double-float) acc)` / `(type (complex single-float) acc)`，
+`%cx-reduce-max` / `-min` 只做元素类型分派。顺带把 `(if (null acc) v …)` 换成
+「首元素播种」，空归约区仍返回 `(vector nil)`，与调用方契约一致。
+
+（中间踩了一个坑：把 `%def-cx-reducer` 的 `flet` 改成三个互相调用的局部函数时
+必须用 `labels` —— `flet` 是并列绑定，兄弟函数互相不可见，直接报
+「The function STEP-AT is undefined」。）
+
+#### 二、`vt-where` 永远进不去内联快路径
+
+`vt-where` 是三元选择，走 `(vt-map (lambda (c a b) (if (/= c 0) a b)) …)` ——
+闭包 + 每元素 `vt-cast`。数值上一看就知道：`vt-isnan` 2 ms、`vt-sum` <1 ms，
+而 `vt-where(mask, 0, z)` 32 ms。
+
+根因不是「没特化」，而是**永远进不去**：`%vt-inline3-fast` 的前置条件是
+「三个输入与结果的元素类型全同」，而掩码恒为 `:int8`、数据是 `:complex128` ——
+dtype 永远不相等。这类「混合类型逐元素算子」必须单独列一张按元素类型展开的
+表（和 `%mask*-loop` 同一个理由）。
+
+新增 `%select-loop`（掩码 int8 + 两个同类型数据 + 长度 1 广播）与
+`%select-fast`（10 格分派），`vt-where` 在「结果连续 + 每输入要么长度 1 要么
+连续同形状」时走它，否则退回原路。1M c128 **32 → 5 ms**。
+
+nan 族全部建在 `vt-where` 上，收益直接传导：`nansum` 35→5、`nanmean` 46→13、
+`nanvar` 65→28、`nanstd` 62→30、`nanmax` 88→22、`nancumsum` 36→5。
+顺带把 `vt-where` 的分配从 `vt-zeros` 换成 `%alloc-vt`（两条路都会写满每个
+元素，零填充是纯浪费）。
+
+#### 三、排序的双缓冲乒乓（只有 10%，但先把话说准）
+
+`vt-sort` 的归并每合并一段就 `replace` 回原缓冲区 —— n=1M 时第一趟有 50 万次
+两元素拷贝。改成「每趟把 src 归并进 dst 后交换」，理论上该省掉这些调用。
+
+实测只从 200 → 181 ms（c128）、132 → 130 ms（f64）。**说明 `replace` 的调用
+开销不是主因**（SBCL 对小 `replace` 的展开比预期便宜）。真正的成本结构是：
+c64（8 字节）176 ms 与 c128（16 字节）181 ms 几乎一样 → **不是内存带宽受限**，
+而是每次比较的**分支不可预测**（随机数据上归并的 if 是抛硬币，约 15 周期/次，
+20M 次 ≈ 100 ms）。
+
+要再往下只能换算法（LSD 基数排序，numpy 对 f64 用的就是它：5.9 ms vs 我们的
+130 ms）。复数要按「先虚部后实部两次稳定基数」实现，且 NaN 必须映到最大键值；
+这是一次算法替换而不是缺陷修复，收益大但风险也大 —— 登记进 §16.37，本轮不做。
+乒乓本身仍然保留：它是标准形态，且省掉了每段的 `replace` 调用。
+
+#### 四、测试
+
+新增 `test/cx-reduce-where-test.lisp`（119 断言）：
+
+| 组 | 内容 |
+|---|---|
+| `vt-where` | 8 个实数 dtype + 2 个复数 dtype × 4 种掩码（全 0/全 1/交替/负值），与逐元素参考逐点一致 |
+| 布局 | 标量广播、转置视图与物化副本同结果、`:out` 复用写满、单参数形式 = `nonzero`、参数不配对/`dtype` 冲突报错 |
+| 极值归约 | NaN 传播（max 与 min 都要）、无 NaN 时的字典序取值、单轴 `axis=0/1`、c64 保 dtype、空归约报错 |
+| 排序乒乓 | n ∈ {1,2,3,16,17,18,33,64,65,1000}（跨过插入排序阈值与奇偶趟数）：非降序、`argsort` 是排列、按下标取值 == `vt-sort` |
+| 护栏 | `where` c128/f64 ≤ 4×、`amax` c128/f64 ≤ 8×、`amax` 绝对 < 40 ms |
+
+> 写这套测试时又踩了「字典序」：先按直觉把 `amin{(1+2i),(0+9i),(2+0i)}` 写成
+> `1+2i`，实际最小是 `0+9i`（实部优先）。§16.8 那句「字典序不是任意一致的全序」
+> 值得每个写测试的人读一遍。
