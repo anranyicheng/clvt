@@ -1281,13 +1281,23 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
    其余轴才走 odometer**。全 odometer 每元素约 5 ns（索引数组 + 循环体），
    1M 元素就是 5 ms —— 与元素类型无关的固定开销；
 7. 元素类型分派表的新增判据：`grep` 出所有 `(equal et 'double-float)` /
-   `(equal in-et 'double-float)` 形式的表，逐张确认复数两格是否也需要。
+   `(equal in-et 'double-float)` 形式的表，逐张确认复数两格是否也需要；
+8. 同 dtype 的**整段块拷贝**一律走 `%memcpy`（core 里那**一份**按元素类型展开
+   并带两端 `(the …)` 声明的实现）。`join.lisp` 的 `%block-copy` 只是它的
+   实参顺序包装。原因：`replace` 只有两端都被编译器确认为同类 specialized
+   `SIMPLE-ARRAY` 时才走字节级 memmove，缺声明就退化成逐元素泛型序列操作 ——
+   1M complex128 实测 **8 ms vs 0.2 ms**（f64 也白付一次 SAETP 分派）。
+   判据：`grep -n "(replace " src/*.lisp | grep -v "the (simple-array"`
+   应当只剩 `%memcpy` 自己的兜底分支。
 
-**尚未消除的固定成本（已知、可接受）**：SBCL 的 `replace` 只有 1/2/4/8 字节元素的
-basher，**没有 16 字节的**，因此 `(complex double-float)` 的同型块拷贝是逐元素
-（1M 元素约 5~10 ms，而 `double-float` 只要 1 ms）。走 `sb-kernel:` 的
-`system-area-ub8-copy` 可到 1.5 ms 级，但那是内部符号（跨 SBCL 版本无保证），
-且需要 `with-pinned-objects`；本库**不使用**，宁可慢也不换可移植性。
+**已知的固定成本**：分配一个 16 MB 缓冲区（`make-array` 的页清零）约 1~3 ms，
+这是 `vt-copy` / `vt-astype` 的**下限**，与算法无关。分配本身不要用
+`make-vt … 0`（多一趟全量填充，1M complex128 = 3 ms）—— 见 `%alloc-vt`。
+
+> 早先本节写过「SBCL 没有 16 字节元素的 basher」，**那是错的**：当时看到
+> 5~10 ms 是因为 `replace` 两端缺类型声明（第 8 条）。补上声明后
+> 1M complex128 只要 0.2 ms，与 `double-float` 同量级。教训与 §H.3.11 一样：
+> 测量结论必须能追到具体的代码形态，否则很容易把「少写一个声明」记成「平台缺陷」。
 
 > 差异 D-C1 的两条后果在这里同样成立：复数→实数**静默**丢弃虚部（无警告），
 > 且该语义在快慢两条路径上必须逐位一致（含 `-0.0` 符号位与 NaN/Inf 传播）。
@@ -2924,6 +2934,31 @@ grep -c "eval-when.*cx-orig"   src/*.lisp    # 0
 
 → 见 §16.37（唯一清单）。
 
+#### 16.35.5 顺序统计的选取内核必须有两条退化护栏
+
+`median` / `percentile` / `quantile` / `nanmedian` / `nanpercentile` / `nanquantile`
+共用 `%select-double`（quickselect）。它必须在**两类真实输入**上都不退化：
+
+| 退化源 | 症状（实测） | 必需的对策 |
+|---|---|---|
+| **大量重复值** | Lomuto 两分区每趟只剥掉 pivot 一个元素：200k 全零 **10.7 s**、两值 3.0 s | **三分区**（`<` / `=` / `>`）：等于 pivot 的整段一趟剥掉，全等输入 O(n) → 1 ms |
+| **三数取中的坏排列** | 400k 整体降序且 `k = n/2-1`：451 趟、30.2M 次访问、**142 ms**（同数组 `k = n/2` 只要 1 趟 2 ms） | **访问量上限 4n**：超限改用 `%sort-fibers` 排完整段再取第 k 个，最坏情况钉在 O(n log n) → 21 ms |
+
+三条约束：
+
+1. 两条护栏缺一不可 —— 它们各自对应一类输入，互不覆盖（三分区治重复值，
+   上限治坏排列；只做前者时降序仍慢 7 倍，只做后者时全零仍要十几秒）；
+2. 护栏只能**改变执行路径**，不得改变结果：排序兜底用的是同一个缓冲区
+   （quickselect 丢弃的区间只含「一定小于/大于第 k 个」的元素，全量排序后
+   第 k 个仍然是答案，§1 铁律 1）；
+3. 判据（`test/order-stat-test.lisp`）：
+   - 与「先排序再按位置公式取」的独立参照**逐点一致**（6 种分布 × 7 种规模 × 5 个分位点）；
+   - 重复值密集 / 已排序 / 逆序输入相对**随机输入**的倍率 ≤ 8×（倍率而非绝对
+     毫秒：既避开机器速度，也能抓住 5000× 与 18× 这两类回归）。
+
+> 同样的「护栏思维」适用于任何**期望线性、最坏可能平方**的选取/分块内核。
+> 写新的 quickselect / 快速幂 / 哈希探测循环时，先问「最坏输入长什么样」。
+
 ---
 
 ### 16.36 dtype 契约与一条「此路不通」的结论
@@ -2971,6 +3006,10 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U1 | 复数 `matmul` 的 SIMD | 标量内核已对齐实数标量线（§16.27.4：同规模约 2.2×，而 flop 比是 4×）；相对**实数 SIMD** 仍差 2.0–4.2× | 唯一可行路线是「交错布局上按 j 向量化 + shuffle 组 re/im」（保持 p 递增 → 仍满足铁律 1/2）。SoA+4 路实 GEMM 已实测更慢（§16.36.2）且改变累加顺序，本地累加器也已实测无收益（§16.36.2） |
 | U2 | `real/imag` 返回共享视图（D-C3） | 现在返回副本；numpy 的 `z.real` 是同一缓冲的零拷贝视图 | 需给 strided view 引入「分量视图」（`data` + 分量偏移 + 元素宽度/2），会动物理层，影响 `vt-write`/`vt-copy-into`/别名判定；风险高于收益 |
 | U3 | 复数逐元素算子的 SIMD 特化（D-C5） | §16.14.3 实测：`add` 1.8×、`mul` 2.3×、`sqrt` 4.0×、`abs` 6.5×（相对 float64） | 与 U1 同源；还需要先解决 `sb-simd` 的 shuffle 组装形式 |
+| U5 | 复数极值族（`maximum`/`minimum`/`fmax`/`fmin`）与 `vt-clip` | `vt-map` 通用路径 834 ms/1M（实数 3 ms）；`clip` = max+min → 1.6 s。根因：`vt-map` 每元素 `funcall` + `vt-cast`（后者每次都 `with-float-safe`） | 试过 `vt-fast-map` 内联，实测**更慢**（1469~1592 ms，返回值类型未知导致写回前多一次运行期转换）。下一步：给 c64/c128 各写带 `ftype` 返回类型的内核，或按 `%cx-dispatch` 写专用二元内核宏（§H.3.13） |
+| U6 | 复数 `argsort` / `topk` | 1062 / 1083 ms/1M（实数 50 / 83 ms）。`stable-sort` + lambda 比较器：每比较一次 `funcall` + 两次 `aref`，1M 元素约 20M 次比较 | 照 `%def-cx-fiber-sorter` 的形态写**下标**归并内核（比较内联、零 cons、零 funcall），预期 ~60 ms |
+| U7 | 复数 nan 族（`nansum`/`nanmean`/`nanvar`/`nanmedian`/`nancumsum`/`nan-to-num`） | 86~117 ms/1M（实数 0~5 ms） | 都是「掩码 + 替身 + 复用归约」的组合式实现，中间要过 `vt-astype`/`vt-where`；需先解决 U5 那类逐元素路径，收益才会传导过来 |
+| U8 | 复数比较（`vt-<` 等） | 65 ms/1M（实数 2 ms）；§16.14.3 记录的是 3 ms | 需复核：文档数字与当前实现不符（可能是后续改动引入的回归），下次动这类算子时先重测再修 |
 | U4 | 编译期 `STYLE-WARNING` 尚不拦截 | 现有 96 条（unused-variable 类）；`WARNING` 已由 §16.34.2 的门禁拦死 | 先逐条清到 0，再把门禁从 `WARNING` 收紧到 `STYLE-WARNING`；否则一次性收紧会让门禁长期红 |
 
 > **已关闭**（保留在此仅为说明它们不再是待办）：einsum 复数、复数归约多轴

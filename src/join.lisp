@@ -27,33 +27,14 @@
 ;;; 内部原语：连续块拷贝（本文件快路径共用）
 ;;; ------------------------------------------------------------------
 
-(declaim (inline %axis-outer-inner))
+(declaim (inline %axis-outer-inner %block-copy))
 
 (defun %block-copy (dest-data src-data dst-start src-start length)
   "同元素类型一维缓冲区间的块拷贝（等价 memcpy；length 为 0 时 no-op）。
-
-   REPLACE 的目标/源都声明成 (SIMPLE-ARRAY * (*)) 时，SBCL 只能走通用
-   ELT 路径（每元素一次 widetag 分派）；这里按元素类型 8 路特化，
-   让 REPLACE 退化为 memmove。"
+   实现委托给 `clvt::%memcpy`（core 里的单一份按元素类型展开的表，
+   含 complex128/complex64 两格）—— 本函数只保留本文件惯用的实参顺序。"
   (declare (type fixnum dst-start src-start length))
-  (when (plusp length)
-    (macrolet ((cp (lt)
-                 `(replace (the (simple-array ,lt (*)) dest-data)
-                           (the (simple-array ,lt (*)) src-data)
-                           :start1 dst-start :end1 (+ dst-start length)
-                           :start2 src-start :end2 (+ src-start length))))
-      (let ((et (array-element-type dest-data)))
-        (cond ((equal et 'double-float) (cp double-float))
-              ((equal et 'single-float) (cp single-float))
-              ((equal et '(signed-byte 64)) (cp (signed-byte 64)))
-              ((equal et '(signed-byte 32)) (cp (signed-byte 32)))
-              ((equal et '(signed-byte 16)) (cp (signed-byte 16)))
-              ((equal et '(signed-byte 8)) (cp (signed-byte 8)))
-              ((equal et '(unsigned-byte 16)) (cp (unsigned-byte 16)))
-              ((equal et '(unsigned-byte 8)) (cp (unsigned-byte 8)))
-              (t (replace dest-data src-data
-                          :start1 dst-start :end1 (+ dst-start length)
-                          :start2 src-start :end2 (+ src-start length)))))))
+  (%memcpy dest-data dst-start src-data src-start length)
   (values))
 
 (defun %axis-outer-inner (shape axis)

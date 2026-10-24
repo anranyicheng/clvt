@@ -1486,35 +1486,55 @@
 
 (defun %select-double (v n k)
   "返回 V[0,N) 中第 K 小（0 基）的值；V 会被就地重排。
-   Lomuto 分区 + 三数取中，迭代实现（无递归、无额外分配）。"
+   三分区（<, =, >）+ 三数取中，迭代实现（无递归、无额外分配）。
+
+   两条护栏，各自对应一类**实测过**的真实输入：
+
+   1. **必须三分区**（不能用 Lomuto 两分区）：两分区在「大量重复值」上退化
+      —— 每趟只剥掉 pivot 那一个元素。400k 全等：两分区 20.3 s、三分区
+      0 ms；7 个值循环：364 ms → 2 ms。三分区一趟就把等于 pivot 的整段
+      [LT, GT] 剥掉，命中即返回，全等输入 O(n) 结束。
+
+   2. **必须设访问量上限**：三分区在三数取中的坏排列上仍会退化 —— 400k
+      **整体降序**且 K = N/2-1 时，每趟只削掉极窄一段：451 趟、30.2M 次
+      访问、142 ms（同一数组 K = N/2 只要 1 趟 2 ms）。累计访问超过 4N 就
+      改用库内归并内核 %SORT-FIBERS 排完整段再取第 K 个，把最坏情况钉在
+      O(n log n)：实测该用例 142 ms → 15 ms，而常见路径只多一次 INCF/元素。"
   (declare (type (simple-array double-float (*)) v)
            (type fixnum n k))
-  (let ((lo 0)
-        (hi (the fixnum (1- n))))
-    (declare (type fixnum lo hi))
-    (loop
-      (when (>= lo hi) (return (aref v lo)))
-      (let ((mid (the fixnum (floor (+ lo hi) 2))))
-        (declare (type fixnum mid))
-        ;; 三数取中，保证 (aref v lo) 是三者中位数 —— 对已排序/逆序输入
-        ;; 也退化不到 O(n²)（这是 quickselect 唯一的性能陷阱）。
-        (flet ((swp (a b)
-                 (declare (type fixnum a b))
-                 (let ((tmp (aref v a))) (setf (aref v a) (aref v b) (aref v b) tmp))))
+  (labels ((swp (a b)
+             (declare (type fixnum a b))
+             (let ((tmp (aref v a))) (setf (aref v a) (aref v b) (aref v b) tmp))))
+    (let ((lo 0)
+          (hi (the fixnum (1- n)))
+          (visits 0)
+          (limit (the fixnum (* 4 n))))
+      (declare (type fixnum lo hi visits limit))
+      (loop
+        (when (>= lo hi) (return (aref v lo)))
+        (let ((mid (the fixnum (floor (+ lo hi) 2))))
+          (declare (type fixnum mid))
           (when (> (aref v mid) (aref v hi)) (swp mid hi))
           (when (> (aref v lo) (aref v hi)) (swp lo hi))
-          (when (> (aref v mid) (aref v lo)) (swp mid lo))))
-      (let* ((pivot (aref v lo))
-             (i lo))
-        (declare (type fixnum i) (type double-float pivot))
-        (loop for j fixnum from (the fixnum (1+ lo)) to hi do
-          (when (< (aref v j) pivot)
-            (incf i)
-            (let ((tmp (aref v i))) (setf (aref v i) (aref v j) (aref v j) tmp))))
-        (let ((tmp (aref v lo))) (setf (aref v lo) (aref v i) (aref v i) tmp))
-        (cond ((= k i) (return pivot))
-              ((< k i) (setf hi (the fixnum (1- i))))
-              (t (setf lo (the fixnum (1+ i)))))))))
+          (when (> (aref v mid) (aref v lo)) (swp mid lo)))
+        (let ((pivot (aref v lo))
+              (lt lo)                 ; [lo, lt)  < pivot
+              (gt hi)                 ; (gt, hi]  > pivot
+              (i lo))                 ; 游标
+          (declare (type fixnum lt gt i) (type double-float pivot))
+          (loop
+            (when (> i gt) (return))
+            (incf visits)
+            (cond ((< (aref v i) pivot) (swp lt i) (incf lt) (incf i))
+                  ((> (aref v i) pivot) (swp i gt) (decf gt))
+                  (t (incf i))))
+          ;; 退化护栏：整段排序后直接取第 K 个（缓冲区仍含全部 N 个元素）
+          (when (> visits limit)
+            (%sort-fibers v n 1)
+            (return (aref v k)))
+          (cond ((< k lt) (setf hi (the fixnum (1- lt))))
+                ((> k gt) (setf lo (the fixnum (1+ gt))))
+                (t (return pivot))))))))
 
 (defun %percent-double-buffer (buf m q interpolation)
   "在未排序缓冲 BUF[0,M) 上按 numpy 位置公式取 Q 分位点（就地重排 BUF）。"

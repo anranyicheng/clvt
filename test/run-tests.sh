@@ -73,6 +73,7 @@ SUITES[complex-linalg-test]="216 复数线性代数测试 (46 项 numpy 2.4.6 �
 SUITES[setops-axis-trace-test]="56 按轴去重/迹 测试 (37 项 numpy 2.4.6 差分对照: vt-unique :axis 含 return-index/inverse/counts、NaN 行不折叠、非连续视图、退化形状 + vt-trace :offset/:axis1/:axis2 含高维收缩 + 契约断言 + 实数回归网; 期望由 test/gen_setops_axis_expected.py 生成)"
 SUITES[einsum-gemm-layout-test]="36 einsum GEMM 布局归一化 (§16.26: NN/NT/C-转置/兜底 四条路径各档尺寸 + 批量含广播与批量NT + f32/i32/i64/c128/c64 + 转置输入/切片/非连续 :out/小矩阵 + SIMD关与单线程不变; 主断言 = 与 vt-matmul 逐位相等)"
 SUITES[astype-cast-test]="663 vt-astype 转换矩阵与复数快路径测试 (100 格 10dtype×10dtype numpy 2.4.6 差分对照 + 契约断言(取实部/虚部补0/NaN·Inf→整数=0/符号零/rank-0/空张量/广播视图) + 转置·翻转·切片·广播视图与连续副本等价 + 性能护栏(复数转换 ≤8~10× 实数线, 优化前 17~41ms→1~4ms); 期望由 test/gen_astype_cast_expected.py 生成)"
+SUITES[order-stat-test]="266 顺序统计量正确性与退化护栏 (median/percentile/nanmedian 与「排序+位置公式」独立参照逐点一致(6 种分布×7 种规模×5 个分位点) + 重复值密集/已排序/逆序相对随机输入的倍率护栏；修复前后：全零 200k 10.7s→1ms、降序 400k 142ms→21ms)"
 SUITES[complex-ops-test]="128 复数数据搬运层测试 (97 项 numpy 2.4.6 差分对照: 转换/拼接/剪切/集合/nan 族/缩并/卷积 + dtype&shape 契约 + :out 硬契约 + 未支持组合报错 + 实数回归网; 期望由 test/gen_complex_ops_expected.py 生成)"
 SUITES[complex-dispatch-test]="17 复数分派结构回归（第十二/十三轮 §16.32: 159 个已迁移符号必须是具名 DEFUN 而非 setf 装的匿名包装（重载安全的充分必要条件）· list 入参走复数路径 · 拒绝型守卫 · 实数路径不回归 · 复数语义抽样 · :out 契约）"
 SUITES[complex-reload-test]="14 重载单文件不丢复数（第十三轮 S7 验收核心: 逐一重载 dispatch/complex-kernels/manip/elementwise/reduce-stats/setops/linalg/extensions/extensions3/complex/complex-ops/complex-linalg 共 12 个源文件，每轮 19 个探针覆盖全部 159 个迁移符号的代表语义必须不变 —— 覆盖式架构下这一条必然失败）"
@@ -153,6 +154,7 @@ DEFAULT_ORDER=(
     complex-test
     complex-ops-test
     astype-cast-test
+    order-stat-test
     complex-linalg-test
     setops-axis-trace-test
     einsum-gemm-layout-test

@@ -108,6 +108,61 @@
         (:uint16  (mk (unsigned-byte 16) :uint16))
         (:uint8   (mk (unsigned-byte 8) :uint8))))))
 
+(defun %alloc-vt (shape dtype)
+  "分配内存连续、元素内容**未定义**的张量。调用方必须随后写满每个元素。
+
+   与 `make-vt` 的唯一差别是省掉 `:initial-element 0` 那一趟全量填充：
+   1M complex128 实测 3 ms（f64 1 ms）。`vt-copy` / `vt-contiguous` /
+   `%gather-contiguous` 这类「先分配、再把每个元素覆写一遍」的路径用不到零值，
+   白填一趟等于白白多一次全量写（还让目标页变脏，随后的真实写入要付 RFO）。
+   元素类型仍按字面展开，保持与 `make-vt` 相同的代码生成质量。"
+  (let ((size (vt-shape-to-size shape)))
+    (macrolet ((mk (lt) `(make-array size :element-type ',lt)))
+      (%make-vt :data (ecase dtype
+                        (:complex128 (mk (complex double-float)))
+                        (:complex64  (mk (complex single-float)))
+                        (:float64 (mk double-float))
+                        (:float32 (mk single-float))
+                        (:int64   (mk (signed-byte 64)))
+                        (:int32   (mk (signed-byte 32)))
+                        (:int16   (mk (signed-byte 16)))
+                        (:int8    (mk (signed-byte 8)))
+                        (:uint16  (mk (unsigned-byte 16)))
+                        (:uint8   (mk (unsigned-byte 8))))
+                :shape shape
+                :strides (vt-compute-strides shape)
+                :offset 0
+                :dtype dtype))))
+
+(defun %memcpy (dst dst-off src src-off count)
+  "把 SRC[SRC-OFF, SRC-OFF+COUNT) 块拷贝到 DST[DST-OFF, …)（同 dtype、同底层数组类型）。
+
+   为什么需要它：`replace` 只有**两端都被编译器确认为同类 specialized
+   SIMPLE-ARRAY** 时才走字节级 memmove；少了类型声明就退化成逐元素泛型序列
+   操作。1M 元素实测：`(replace dst src)` 8 ms vs 带声明 0.2 ms（16 字节元素
+   最明显，f64 也白付一次 SAETP 分派）。本函数把「按元素类型展开 + 带 THE
+   声明」这两件事收在一处，调用方不必各自复制 10 个分支。"
+  (macrolet ((cp (lt)
+               `(replace (the (simple-array ,lt (*)) dst)
+                         (the (simple-array ,lt (*)) src)
+                         :start1 dst-off :end1 (+ dst-off count)
+                         :start2 src-off :end2 (+ src-off count))))
+    (let ((et (array-element-type dst)))
+      (cond ((equal et 'double-float)            (cp double-float))
+            ((equal et 'single-float)            (cp single-float))
+            ((equal et '(signed-byte 64))        (cp (signed-byte 64)))
+            ((equal et '(signed-byte 32))        (cp (signed-byte 32)))
+            ((equal et '(signed-byte 16))        (cp (signed-byte 16)))
+            ((equal et '(signed-byte 8))         (cp (signed-byte 8)))
+            ((equal et '(unsigned-byte 16))      (cp (unsigned-byte 16)))
+            ((equal et '(unsigned-byte 8))       (cp (unsigned-byte 8)))
+            ((equal et '(complex double-float))  (cp (complex double-float)))
+            ((equal et '(complex single-float))  (cp (complex single-float)))
+            ;; 未知元素类型：通用序列 replace（语义一致，只是慢）
+            (t (replace dst src :start1 dst-off :end1 (+ dst-off count)
+                             :start2 src-off :end2 (+ src-off count)))))
+    count))
+
 (defun %all-integer-sequence-p (seq)
   "递归判断嵌套序列的所有叶子是否都是整数。
    空序列返回 NIL（numpy 对空列表 np.array([]).dtype 实际上是 float64，
@@ -276,7 +331,8 @@
   "返回内存连续的副本（若已连续则返回自身）。"
   (if (vt-contiguous-p vt)
       vt
-      (let* ((new (make-vt (vt-shape vt) 0 :dtype (vt-dtype vt))))
+      ;; 全量覆写在下面，零值填充是纯浪费（1M c128 = 3ms）
+      (let ((new (%alloc-vt (vt-shape vt) (vt-dtype vt))))
         (vt-copy-into new vt)
         new)))
 
@@ -396,12 +452,8 @@
          (in-data (vt-data tensor))
          (in-strides (vt-strides tensor))
          (in-offset (vt-offset tensor))
-         (out-data (make-array size :element-type (vt-dtype->lisp-type dtype)))
-         (out (%make-vt :data out-data
-                        :shape shape
-                        :strides (vt-compute-strides shape)
-                        :offset 0
-                        :dtype dtype)))
+         (out (%alloc-vt shape dtype))
+         (out-data (vt-data out)))
     (declare (type fixnum rank size in-offset))
     (let* ((dims (coerce shape 'simple-vector))
            (i-strs (coerce in-strides 'simple-vector))
@@ -779,10 +831,10 @@
     (if (eq target-dtype (vt-dtype vt))
         (let* ((shape (vt-shape vt))
                (size (vt-shape-to-size shape))
-               (new (make-vt shape 0 :dtype target-dtype)))
+               ;; 同上：两种落点都会写满全部元素
+               (new (%alloc-vt shape target-dtype)))
           (if (vt-contiguous-p vt)
-              (replace (vt-data new) (vt-data vt)
-                       :start2 (vt-offset vt) :end2 (+ (vt-offset vt) size))
+              (%memcpy (vt-data new) 0 (vt-data vt) (vt-offset vt) size)
               (vt-copy-into new vt))
           new)
         (vt-astype vt target-dtype))))
@@ -1096,9 +1148,7 @@
         (cond
           ;; 快路径 1：连续 + 同形 + 同 dtype → replace (memcpy)
           ((and dest-contig src-contig same-shape same-dtype)
-           (replace dest-data src-data
-                    :start1 dest-off :end1 (+ dest-off size)
-                    :start2 src-off  :end2 (+ src-off size)))
+           (%memcpy dest-data dest-off src-data src-off size))
 
           ;; 快路径 1.5：dest 连续 + 同形 + 同 dtype + src 可分解为
           ;; 「内层连续 run」（rank>2 且 run≥64；rank≤2 的行主序 walker
@@ -1114,9 +1164,7 @@
                (%map-inner-runs src-shape src-strides src-off run-cut run-len
                  (lambda (p)
                    (declare (type fixnum p))
-                   (replace dest-data src-data
-                            :start1 q :end1 (+ q run-len)
-                            :start2 p :end2 (+ p run-len))
+                   (%memcpy dest-data q src-data p run-len)
                    (incf q run-len))))))
 
           ;; 快路径 2：连续 + 同形 + 需要类型转换

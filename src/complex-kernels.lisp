@@ -336,3 +336,29 @@
         (vt-copy-into checked r)
         checked)
       r))
+
+;;; ---- 极值内核（maximum / minimum / fmax / fmin）----
+;;; 语义：字典序（实部→虚部），maximum/minimum 传播 NaN，fmax/fmin 忽略 NaN。
+;;; 位置：按 §16.33.2「标量内核前移」放在这里（dispatch 之后、所有归属文件之前），
+;;; 这样归属文件编译时至少知道这些符号存在。
+;;; 注意：把调用点改成 `vt-fast-map` 内联**并没有**变快（实测 834 → 1469 ms），
+;;; 原因是返回类型取决于分量宽度（c64/c128 两种），内联循环拿不到确定类型，
+;;; 写回前仍要多一次运行期转换。调用点因此保持 `vt-map`，数据与后续方案见
+;;; HISTORY §H.3.13 与 CONVENTIONS §16.37 的 U5。
+(declaim (inline %cop-max %cop-min %cop-fmax %cop-fmin))
+
+(defun %cop-max (a b)
+  "maximum 的复数语义：字典序取大，NaN 传播。"
+  (cond ((%cisnan a) a) ((%cisnan b) b) ((%clt a b) b) (t a)))
+
+(defun %cop-min (a b)
+  "minimum 的复数语义：字典序取小，NaN 传播。"
+  (cond ((%cisnan a) a) ((%cisnan b) b) ((%cgt a b) b) (t a)))
+
+(defun %cop-fmax (a b)
+  "fmax 的复数语义：字典序取大，忽略 NaN。"
+  (cond ((%cisnan a) b) ((%cisnan b) a) ((%clt a b) b) (t a)))
+
+(defun %cop-fmin (a b)
+  "fmin 的复数语义：字典序取小，忽略 NaN。"
+  (cond ((%cisnan a) b) ((%cisnan b) a) ((%cgt a b) b) (t a)))

@@ -208,22 +208,6 @@
 
 (defun %cx-ne-flag (a b) (- 1 (%cx-eq-flag a b)))
 
-(defun %cop-max (a b)
-  "maximum 的复数语义：字典序取大，NaN 传播。"
-  (cond ((%cisnan a) a) ((%cisnan b) b) ((%clt a b) b) (t a)))
-
-(defun %cop-min (a b)
-  "minimum 的复数语义：字典序取小，NaN 传播。"
-  (cond ((%cisnan a) a) ((%cisnan b) b) ((%cgt a b) b) (t a)))
-
-(defun %cop-fmax (a b)
-  "fmax 的复数语义：字典序取大，忽略 NaN。"
-  (cond ((%cisnan a) b) ((%cisnan b) a) ((%clt a b) b) (t a)))
-
-(defun %cop-fmin (a b)
-  "fmin 的复数语义：字典序取小，忽略 NaN。"
-  (cond ((%cisnan a) b) ((%cisnan b) a) ((%cgt a b) b) (t a)))
-
 ;;; ==================================================================
 ;;; 6. 判定族 isnan / isinf / isfinite（§16.7）
 ;;; ==================================================================

@@ -14,7 +14,7 @@
 
 ---
 
-## H.1 累计变更文件清单（第一～十八轮）
+## H.1 累计变更文件清单（第一～十九轮）
 
 ### 16.20 累计变更文件清单（第一～十二轮）
 
@@ -110,6 +110,13 @@
 | `test/run-tests.sh` | **第十七轮**：注册 `astype-cast-test`（SUITES + DEFAULT_ORDER） |
 | `src/core.lisp` | **第十八轮**：`%gather-contiguous` 的遍历改为「末轴 `DOTIMES` + 其余轴 odometer」（1M 转置收集 6 → 1 ms）；`%copy-generic` 的 typed-walk 补 `(complex double-float)` / `(complex single-float)` 两格（`vt-copy` 转置 17 → 6 ms，§16.4.1 第 5–7 条） |
 | `CONVENTIONS.md` | **第十八轮**：§16.4.1 补 5/6/7 三条（拷贝同受约束、末轴必须展开、新增分派表的检查方法）+ 「16 字节 basher 缺失」的已知成本声明 |
+| `src/reduce-stats.lisp` | **第十九轮**：`%select-double` 改三分区 + 访问量上限 4n（全零 200k 10.7 s → 1 ms，降序 400k 142 → 21 ms，§16.35.5） |
+| `src/core.lisp` | **第十九轮**：新增 `%alloc-vt`（不填充分配）与 `%memcpy`（带 `(the …)` 声明的按元素类型块拷贝）；`vt-copy` / `vt-contiguous` / `vt-copy-into` 快路径改走它们（连续 c128 拷贝 12 → 4 ms，`flatten`/`roll`/`tile`/`pad` 同步受益，§16.4.1 第 8 条） |
+| `src/join.lisp` | **第十九轮**：`%block-copy` 改为委托 `%memcpy`（保留原实参顺序），顺带获得复数两格 |
+| `src/complex-kernels.lisp` | **第十九轮**：`%cop-max` / `%cop-min` / `%cop-fmax` / `%cop-fmin` 由 `complex.lisp` 前移至此（§16.33.2 的「标量内核前移」），带 `declaim inline` |
+| `CONVENTIONS.md` | **第十九轮**：新增 §16.35.5（顺序统计的两条退化护栏）；§16.4.1 补第 8 条（块拷贝必须带类型声明）并更正「没有 16 字节 basher」的错误结论；§16.37 增补 U5–U8 |
+| `test/order-stat-test.lisp` | **第十九轮新增** 266 断言（独立参照对拍 + 退化倍率护栏），注册后共 56 套件 |
+| `test/run-tests.sh` | **第十九轮**：注册 `order-stat-test` |
 | `test/test-copy-into.lisp` | **第十八轮**：+6 断言（复数×非连续 typed-walk：转置/翻转/3-D 置换/非连续 dest + `c128T vt-copy ≤ 8× f64T` 护栏），35 → 41 |
 
 ---
@@ -144,7 +151,7 @@ LAMBDA，`declaim inline` 对调用点失效；哪些符号被覆盖无法静态
 
 ---
 
-## H.3 §16 后半章的详细叙事（第五～十八轮）
+## H.3 §16 后半章的详细叙事（第五～十九轮）
 
 > 为什么单独成节：这些内容原先住在 `CONVENTIONS.md` §16.21–§16.36，按
 > 「症状 → 根因 → 修法 → 实测」写，与 `CHANGELOG.md` 的对应条目是**同一件事
@@ -1129,3 +1136,119 @@ memmove（0~1 ms），唯独 `(complex double-float)` 退化成逐元素循环 �
   非连续 dest 写入，外加一条 `c128T vt-copy ≤ 8× f64T` 的倍率护栏（实测 2.3×）；
 - `test/astype-cast-test.lisp`：663 断言不变（遍历形态改了，落点必须逐位一致，
   已有的「非连续等价」组正好覆盖）。
+
+---
+
+### H.3.13 第十九轮：性能巡检 —— 找出「毫秒级 vs 秒级」的那几处
+
+前两轮都是「用户指哪儿打哪儿」。本轮换方法：**不看代码，先测**。写一个覆盖
+8 个函数族、50 个算子的巡检脚本，对同一算子分别跑 float64 与 complex128
+（同元素数），把「复数耗时 / 实数耗时」全部打出来。比值 ≥ 4 的逐个查根因。
+
+这个方法立刻露出四个前两轮完全没看到的问题（都在**实数线**或**非转换路径**上）：
+
+| 算子（1M 元素 / 200k 取样） | 修前 | 修后 | 根因 |
+|---|---:|---:|---|
+| `median`（全零数组）200k | 10 700 ms | **1 ms** | quickselect 两分区 → O(n²) |
+| `median`（整体降序）400k | 142 ms | **21 ms** | 三分区的坏排列，每趟只削极窄一段 |
+| `vt-copy`（连续 c128） | 12 ms | **4 ms** | `replace` 缺类型声明 + 零填充 |
+| `vt-copy` / `vt-flatten` / `roll` / `tile` / `pad` | 3~12× | **1.5~2×** | 同上 |
+
+#### 缺陷一：顺序统计的 quickselect 有两类退化（最严重，秒级）
+
+`median` / `percentile` / `quantile` / `nanmedian` 共用 `%select-double`。
+实测曲线（200k，先构造好数据再计时）：
+
+| 输入 | 修前 | 修后 |
+|---|---:|---:|
+| 全等（全零） | **10 700 ms** | 1 ms |
+| 只有两个值 | 2 980 ms | 2 ms |
+| 7 个值循环 | 364 ms（400k） | 2 ms（400k） |
+| 均匀随机 | 3 ms | 6 ms |
+| 已升序 | 0 ms | 2 ms |
+| 整体降序（`k = n/2-1`） | 142 ms（400k） | 21 ms（400k） |
+
+两处根因、两套对策（详见 §16.35.5 的契约）：
+
+1. **Lomuto 两分区 + 重复值** = O(n²)：每趟只剥掉 pivot 一个元素。改三分区
+   （`<` / `=` / `>`），等于 pivot 的整段一趟剥掉；
+2. **三分区 + 三数取中的坏排列**（该用例是「整体降序且 k 取中线左侧一格」）：
+   451 趟、30.2M 次访问。加**访问量上限 4n**，超限改用 `%sort-fibers`
+   排完整段再取第 k 个（缓冲区仍含全部元素，所以全量排序后第 k 个就是答案）。
+
+代价：随机输入 3 → 6 ms（多一次 `incf` 计数与三分区的一次额外比较），
+换来两类秒级退化消失。
+
+#### 缺陷二：`replace` 缺类型声明 = 逐元素泛型序列操作
+
+拆 `vt-copy` 的连续路径（1M complex128，16 MB）：
+
+| 段 | 修前 | 修后 |
+|---|---:|---:|
+| `make-vt … 0`（零填充） | 3 ms | 0（改用 `%alloc-vt` 不填充） |
+| `replace` 无类型声明 | 8 ms | — |
+| `replace` 带 `(the (simple-array …))` | — | **0.2 ms** |
+
+`replace` 只有在**两端都被编译器确认为同类 specialized `SIMPLE-ARRAY`** 时才
+展开成字节级 memmove；少一个声明就退回 `sb-sequence` 的逐元素路径（每元素一次
+SAETP 分派 + 类型检查）。这解释了前两轮一直以为的「SBCL 没有 16 字节 basher」
+—— 其实有，只是要类型信息。新增 `%memcpy`（core 内唯一一份按元素类型展开 +
+带声明的块拷贝），`vt-copy` / `vt-contiguous` / `vt-copy-into` 快路径与
+`join.lisp` 的 `%block-copy` 全部接到它上面（顺带给 `%block-copy` 补上复数两格，
+它原来只有 8 种实数）。
+
+顺带把 `make-vt … 0` 换成新的 `%alloc-vt`（不填充）：`vt-copy` / `vt-contiguous`
+/ `%gather-contiguous` 都是「先分配、再写满每个元素」，零值填充是纯浪费 ——
+它不但多一趟写，还把目标页弄脏，让随后的真实写入付 RFO。1M complex128 = 3 ms。
+
+#### 一条**负结果**：复数极值族（maximum/minimum/fmax/fmin/clip）
+
+巡检把 `vt-clip` 的复数版打成 **1637 ms / 1M**（实数 3 ms）。根因链：
+
+- `vt-clip` 复数分支 = `vt-maximum` + `vt-minimum`，两者都走
+  `(vt-map (function %cop-max) …)` —— `vt-map` 的通用路径每元素
+  `funcall` + `vt-cast` 写回，而 `vt-cast` 内部**每次调用都 `with-float-safe`**
+  （屏蔽/恢复浮点陷阱约 200 ns ×2）→ 800 ns/元素。
+
+按 §16.14.2 的正解应该是走 `vt-fast-map` 内联（`+`/`*` 就是这么降到 5 ms 的）。
+试了两版，**都更慢**：
+
+| 方案 | 1M complex128 |
+|---|---:|
+| `vt-map %cop-max`（原状） | 834 ms |
+| `vt-fast-map %cop-max`（内核仍在 complex.lisp） | 1592 ms |
+| 内核前移到 complex-kernels + `declaim inline` 后再 `vt-fast-map` | 1469 ms |
+
+内联路径反而更慢，说明生成的循环里每元素仍发生一次「返回值类型未知 →
+写回复数槽位前的运行期转换」—— `+`/`*` 没有这个问题是因为 SBCL 对 CL 内置
+函数有类型推导，而 `%cop-max` 的返回类型取决于分量宽度（c64/c128 两种）。
+
+**已回滚**到 `vt-map`（不留更慢的代码）。下一步的正确形态是给 c64/c128 各写
+一个**带 ftype 返回类型**的内核（`%cop-max-f64` / `%cop-max-f32`），让内联循环
+拿到确定的类型；或者按 `%cx-dispatch` 的形态写一个专用的二元内核宏。
+在做到之前，`clip` 的复数版维持在 ~1.6 s/1M，属**已知未修**。
+
+#### 巡检顺带量到的其他已知项（本轮不动，数字留档）
+
+| 算子（1M 复数） | 耗时 | 相对实数 | 性质 |
+|---|---:|---:|---|
+| `argsort` / `topk` | 1062 / 1083 ms | 21× / 13× | `stable-sort` + lambda 比较器，每比较一次 `funcall` + 两次 `aref`（~50 ns × 20M 次） |
+| `einsum`（GEMM） | 845 ms | 13.6× | 复数 GEMM 无 SIMD（§16.36.2 已裁决） |
+| `matmul` / `inner` | 278 ms | 4.3× | 同上 |
+| `nanvar` / `nanmean` / `nansum` | 117 / 101 / 86 ms | ~100× | 掩码 + `vt-cast` + 复算，组合算子偏多 |
+| `abs` | 17 ms | 8.5× | hypot，numpy 亦慢 |
+
+这些都已写进 §16.37 的未完成项，按「绝对耗时 × 修复代价」排序。
+
+#### 测试
+
+新增 `test/order-stat-test.lisp`（266 断言）：
+
+| 组 | 内容 |
+|---|---|
+| 正确性 | `median` / `percentile(0,25,50,75,100)` / `nanmedian` 与「先 `vt-sort` 再按 numpy 位置公式取」的**独立参照**逐点一致（6 种分布 × 7 种规模：1/2/3/7/8/100/1001） |
+| 护栏 | 全等 / 两值 / 7 值 / 升序 / 降序 相对**随机输入**的倍率 ≤ 8×（倍率而非绝对毫秒，避开机器速度；同时抓 5000× 与 18× 两类回归），另加全等数组的 200 ms 绝对上限 |
+
+> 写这套测试时踩了一个坑：第一版把 `make-data` 放进了计时区间，随机数生成
+> （200k ≈ 40 ms）盖过了被测算子，所有倍率都打成 1.0×。性能用例的
+> **基准与被测项必须同口径**，这条在 §H.3.11 已经记过一次，这是第二例。
