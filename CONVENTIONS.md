@@ -1382,11 +1382,46 @@ numpy 2.x 对复数定义了**字典序**（先实部，实部相等再比虚部
 | `maximum/minimum` | 字典序；NaN 传播 | `vt-maximum/minimum` | `%cop-max/min` |
 | `fmax/fmin` | 字典序；忽略 NaN | `vt-fmax/fmin` | `%cop-fmax/min` |
 | `sort` | 字典序，NaN 排末尾 | `vt-sort` | `%cx-sort-axis` + `%cx-sort-less` |
-| `argsort` | 同上，返回下标 | `vt-argsort` | 稳定性：`stable-sort` |
+| `argsort` | 同上，返回下标 | `vt-argsort` | 稳定性：稳定**下标归并**内核（`%cx-argsort-fiber`） |
 | `median` | 排序后取中位（偶数取两中位均值） | `vt-median` | 复数均值不是实数 |
 
 **为什么必须专列**：字典序不是「任意一致的全序」——`1+9j < 2+0j` 为真（实部优先），
 而按模长比较则为假。任何用 `abs` 或分量加权做比较的实现都会与 numpy 分歧。
+
+#### 16.8.1 执行层：极值与排序内核的三条硬约束
+
+上表定的是**语义**，本节定**执行形态**。三条都是踩过的坑，违反时结果正确但慢一到
+两个数量级（或慢且错）：
+
+1. **内核里的 NaN 判定只能用免屏蔽的 `%cx-nan-p`**，不能用边界版 `%cisnan` /
+   `%cisinf` / `%cisfinite`。后三者每次调用都套一层 `with-float-traps-masked`
+   （单次约 200 ns），极值内核每元素判两次 —— 1M 元素光「屏蔽/恢复陷阱」就是
+   800 ms（`vt-maximum` 实测 804 ms → 3 ms，**280×**）。前置条件（调用方已在
+   `with-float-safe` 内）由 `vt-map` / `vt-fast-map` / `%cx-reduce-*` /
+   `%cx-arg-reduce-run` 共同保证，分工见 §16.14。
+2. **`argsort` 必须走下标归并内核**（`%cx-argsort-fiber`），不得用
+   `(stable-sort idx (lambda (a b) ...))`：后者每次比较是一次 `funcall` +
+   两次跨步 `aref`（约 50 ns/比较），1M 元素约 20M 次比较 → 2.1 s。
+   稳定性由「插入排序（n ≤ 16）+ 自底向上归并」共同保证，与 `stable-sort` 等价。
+3. **`topk` 只允许算一次序**。它只需要 k 个元素，`vt-sort` + `vt-argsort` 两趟
+   O(n log n) 是纯浪费；正解是 `vt-argsort` 一趟 + 沿轴按下标取回值
+   （`%gather-axis-k`）。判据：`topk ≤ 1.4 × argsort`。
+4. **被 `vt-fast-map` 内联调用的标量内核必须定义在 `src/complex-kernels.lisp`**
+   （即早于 `map-reduce` / `elementwise*` / `extensions*` / `reduce-stats`）。
+   放晚了的后果不是报错而是**静默退化成函数调用**：定义在 `complex.lisp` 时
+   `vt-=` / `vt-<` / `vt-isnan` 对 1M complex128 分别是 60 / 45 / 25 ms，
+   前移后 4 / 5 / 1 ms。
+   **探测器**：编译日志里的
+   `Proclaiming X to be INLINE, but N calls to it were previously compiled`
+   —— 出现一行就说明某个内核放晚了 N 个调用点，逐条消除。本库当前为 0 条
+   `%cx-*` 命中（另有 3 条与复数无关：`vt-p` / `%copy-default-rng` /
+   `parse-subscript-tokens`）。
+
+> **`%gather-*` 的偏移契约**：`vt-contiguous` 对「已经连续」的输入**原样返回**，
+> 而 `narrow` / `flip` 出来的视图可能 offset 非零却仍满足连续判定
+> （单元素轴翻转后只剩 `offset=7`）。任何「取 `(vt-data t)` 后按扁平下标读写」的
+> 代码都**必须**把 `(vt-offset t)` 加成基址，否则读到别的元素 —— 这是静默错值。
+> 边界情形（k=1 的 `topk`）曾经因此返回全数组最小值而非最大值。
 
 ---
 
@@ -3006,15 +3041,18 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U1 | 复数 `matmul` 的 SIMD | 标量内核已对齐实数标量线（§16.27.4：同规模约 2.2×，而 flop 比是 4×）；相对**实数 SIMD** 仍差 2.0–4.2× | 唯一可行路线是「交错布局上按 j 向量化 + shuffle 组 re/im」（保持 p 递增 → 仍满足铁律 1/2）。SoA+4 路实 GEMM 已实测更慢（§16.36.2）且改变累加顺序，本地累加器也已实测无收益（§16.36.2） |
 | U2 | `real/imag` 返回共享视图（D-C3） | 现在返回副本；numpy 的 `z.real` 是同一缓冲的零拷贝视图 | 需给 strided view 引入「分量视图」（`data` + 分量偏移 + 元素宽度/2），会动物理层，影响 `vt-write`/`vt-copy-into`/别名判定；风险高于收益 |
 | U3 | 复数逐元素算子的 SIMD 特化（D-C5） | §16.14.3 实测：`add` 1.8×、`mul` 2.3×、`sqrt` 4.0×、`abs` 6.5×（相对 float64） | 与 U1 同源；还需要先解决 `sb-simd` 的 shuffle 组装形式 |
-| U5 | 复数极值族（`maximum`/`minimum`/`fmax`/`fmin`）与 `vt-clip` | `vt-map` 通用路径 834 ms/1M（实数 3 ms）；`clip` = max+min → 1.6 s。根因：`vt-map` 每元素 `funcall` + `vt-cast`（后者每次都 `with-float-safe`） | 试过 `vt-fast-map` 内联，实测**更慢**（1469~1592 ms，返回值类型未知导致写回前多一次运行期转换）。下一步：给 c64/c128 各写带 `ftype` 返回类型的内核，或按 `%cx-dispatch` 写专用二元内核宏（§H.3.13） |
-| U6 | 复数 `argsort` / `topk` | 1062 / 1083 ms/1M（实数 50 / 83 ms）。`stable-sort` + lambda 比较器：每比较一次 `funcall` + 两次 `aref`，1M 元素约 20M 次比较 | 照 `%def-cx-fiber-sorter` 的形态写**下标**归并内核（比较内联、零 cons、零 funcall），预期 ~60 ms |
-| U7 | 复数 nan 族（`nansum`/`nanmean`/`nanvar`/`nanmedian`/`nancumsum`/`nan-to-num`） | 86~117 ms/1M（实数 0~5 ms） | 都是「掩码 + 替身 + 复用归约」的组合式实现，中间要过 `vt-astype`/`vt-where`；需先解决 U5 那类逐元素路径，收益才会传导过来 |
-| U8 | 复数比较（`vt-<` 等） | 65 ms/1M（实数 2 ms）；§16.14.3 记录的是 3 ms | 需复核：文档数字与当前实现不符（可能是后续改动引入的回归），下次动这类算子时先重测再修 |
+| U7 | 复数 nan 族（`nansum`/`nanmean`/`nanvar`/`nanmedian`/`nancumsum`/`nan-to-num`） | 86~117 ms/1M（实数 0~5 ms） | 都是「掩码 + 替身 + 复用归约」的组合式实现，中间要过 `vt-astype`/`vt-where`；每多一层组合算子就多一趟全量遍历。要动的话先给「掩码 + 归约」写专用内联内核，别指望复用现有的逐元素路径（§16.8.1 第 1 条那种陷阱屏蔽开销会翻倍） |
 | U4 | 编译期 `STYLE-WARNING` 尚不拦截 | 现有 96 条（unused-variable 类）；`WARNING` 已由 §16.34.2 的门禁拦死 | 先逐条清到 0，再把门禁从 `WARNING` 收紧到 `STYLE-WARNING`；否则一次性收紧会让门禁长期红 |
 
 > **已关闭**（保留在此仅为说明它们不再是待办）：einsum 复数、复数归约多轴
 > `axis` 元组、LU/SVD/特征值/百分位、`.npy` 复数互操作、`ComplexWarning`
-> 等价物（有意不做）、`vt-nanmedian` 多轴、沿轴累积性能、编译 WARNING 门禁。
+> 等价物（有意不做）、`vt-nanmedian` 多轴、沿轴累积性能、编译 WARNING 门禁、
+> **复数极值族与 `clip`**（804→7 ms / 1600→9 ms，根因是内核误用边界版
+> `%cisnan`，见 §16.8.1）、**复数 `argsort` / `topk`**（2115→283 ms /
+> 490→303 ms，下标归并 + 只算一次序）、**复数比较与谓词**
+> （`vt-=` 60→4 ms、`vt-<` 45→5 ms、`vt-isnan` 25→1 ms，根因是标志内核
+> 定义在 `complex.lisp`、编译早于它的 `elementwise2` 只能用函数调用 ——
+> 即 §16.8.1 第 4 条）。
 > 编年史见 `HISTORY.md`，各轮摘要见 `CHANGELOG.md`。
 
 ---

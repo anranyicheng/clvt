@@ -181,45 +181,6 @@
 
 
 ;;; ==================================================================
-;;; 5. 比较与极值（字典序，§16.8）
-;;; ==================================================================
-
-;; 性能：这一组在比较/谓词内核里每元素调用一次，必须内联。
-;; 注意 declaim 必须出现在 **defun 之前**：SBCL 只在定义时可见
-;; inline 声明才记录可内联展开，事后补 declaim 不生效（实测 78ns/次）。
-(declaim (inline %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
-                 %cx-eq-flag %cx-ne-flag))
-
-;;; 比较的布尔承载：clvt 约定比较运算返回 :int8 的 1/0（§3.1），
-;;; 而 %clt/%cle/%cgt/%cge 返回 T/NIL（排序/极值内核需要布尔），
-;;; 故此处做一层 1/0 适配，避免把 T 写进整型缓冲。
-(defun %cx-lt-flag (a b) (if (%clt a b) 1 0))
-(defun %cx-le-flag (a b) (if (%cle a b) 1 0))
-(defun %cx-gt-flag (a b) (if (%cgt a b) 1 0))
-(defun %cx-ge-flag (a b) (if (%cge a b) 1 0))
-
-(defun %cx-eq-flag (a b)
-  "复数相等：任一分量 NaN → 0（对标 numpy：nan+0j == nan+0j 为 False）。
-   不能直接用 CL 的 `=`：浮点陷阱被屏蔽后 (= nan nan) 在复数上实测返回 T。"
-  (cond ((%cx-nan-p a) 0)
-        ((%cx-nan-p b) 0)
-        ((= a b) 1)
-        (t 0)))
-
-(defun %cx-ne-flag (a b) (- 1 (%cx-eq-flag a b)))
-
-;;; ==================================================================
-;;; 6. 判定族 isnan / isinf / isfinite（§16.7）
-;;; ==================================================================
-
-(declaim (inline %cx-nan-flag %cx-inf-flag %cx-finite-flag))
-; 谓词在三处被调用：vt-fast-map 内联循环（已屏蔽陷阱）、%cx-sort-less、
-;; %cx-arg-reduce-run。全部处于 with-float-safe 之下，故用免屏蔽快判。
-(defun %cx-nan-flag (x) (if (%cx-nan-p x) 1 0))
-(defun %cx-inf-flag (x) (if (%cx-inf-p x) 1 0))
-(defun %cx-finite-flag (x) (if (%cx-finite-p x) 1 0))
-
-;;; ==================================================================
 ;;; 7. 归约内核（sum / prod / max / min）
 ;;;
 ;;; 为什么不复用 def-vt-reduce 的内核：那套内核按「存储级 dtype」做编译期
@@ -850,6 +811,74 @@
 (%def-cx-fiber-sorter %cx-sort-fiber-f64 (complex double-float))
 (%def-cx-fiber-sorter %cx-sort-fiber-f32 (complex single-float))
 
+(defmacro %def-cx-argsort-kernel (name lt)
+  "生成**下标**排序内核 NAME(SRC BASE STRIDE IDX AUX N)：
+   把 IDX[0,N) 按 SRC[BASE + IDX[i]*STRIDE] 的字典序（NaN 末尾）稳定升序重排。
+
+   为什么不再用 `(stable-sort idx (lambda (a b) ...))`：那条路每次比较都是
+   一次 `funcall` + 两次跨步 `aref`（~50ns/比较），1M 元素约 20M 次比较
+   → 实测 1062ms；内核把比较器内联进归并循环，零 cons、零 funcall。
+   稳定性由插入排序 / 自底向上归并共同保证（两者都是稳定排序）。"
+  `(defun ,name (src base stride idx aux n)
+     (declare (type (simple-array ,lt (*)) src)
+              (type (simple-array fixnum (*)) idx aux)
+              (type fixnum base stride n)
+              (optimize (speed 3) (safety 1)))
+     (flet ((less (ia ib)
+              ;; 比较两个**下标**：取对应元素后走字典序比较（NaN 排末尾）
+              (%cx-sort-less (aref src (+ base (the fixnum (* ia stride))))
+                             (aref src (+ base (the fixnum (* ib stride)))))))
+       (declare (inline less))
+       (cond
+         ((<= n 1) nil)
+         ((<= n 16)
+          (loop for ii fixnum from 1 below n do
+            (let ((x (aref idx ii))
+                  (j (1- ii)))
+              (declare (type fixnum j))
+              (loop while (and (>= j 0) (less x (aref idx j)))
+                    do (setf (aref idx (1+ j)) (aref idx j))
+                       (decf j))
+              (setf (aref idx (1+ j)) x))))
+         (t
+          (let ((w 1))
+            (declare (type fixnum w))
+            (loop while (< w n) do
+              (let ((lo 0))
+                (declare (type fixnum lo))
+                (loop while (< lo n) do
+                  (let* ((mid (min (+ lo w) n))
+                         (hi (min (+ lo w w) n))
+                         (i lo)
+                         (j mid)
+                         (k lo))
+                    (declare (type fixnum mid hi i j k))
+                    (loop while (and (< i mid) (< j hi)) do
+                      (if (less (aref idx j) (aref idx i))
+                          (progn (setf (aref aux k) (aref idx j)) (incf j))
+                          (progn (setf (aref aux k) (aref idx i)) (incf i)))
+                      (incf k))
+                    (loop while (< i mid) do
+                      (setf (aref aux k) (aref idx i)) (incf i) (incf k))
+                    (loop while (< j hi) do
+                      (setf (aref aux k) (aref idx j)) (incf j) (incf k))
+                    (replace idx aux :start1 lo :end1 hi :start2 lo :end2 hi))
+                  (incf lo (* 2 w))))
+              (setf w (* 2 w)))))))))
+
+(%def-cx-argsort-kernel %cx-argsort-f64 (complex double-float))
+(%def-cx-argsort-kernel %cx-argsort-f32 (complex single-float))
+
+(defun %cx-argsort-fiber (src base stride idx aux n)
+  "按 SRC 的元素类型分派到下标排序内核（非复数缓冲区不会到这里）。
+   IDX/AUX 由调用方按 N 分配，返回时 IDX[0,N) 是排好的下标序列。"
+  (let ((et (array-element-type src)))
+    (cond ((equal et '(complex double-float))
+           (%cx-argsort-f64 src base stride idx aux n))
+          ((equal et '(complex single-float))
+           (%cx-argsort-f32 src base stride idx aux n))
+          (t (error "%cx-argsort-fiber: 非复数缓冲区 ~a" et)))))
+
 (defun %cx-sort-fiber (data base n)
   "按元素类型分派到原地排序内核（非复数缓冲区不会到这里）。"
   (let ((et (array-element-type data)))
@@ -885,8 +914,8 @@
 
    选路（两条都是「先落成连续副本，再按 fiber 处理」）：
      · sort（无 INDEX）：fiber 直接用归并内核原地排（零 cons / 零 funcall）；
-     · argsort（INDEX=T）：fiber 建 fixnum 下标向量后 STABLE-SORT，
-       比较器直读数据（不再是每元素一个 (值 . 下标) cons 对）。"
+     · argsort（INDEX=T）：fiber 用 %CX-ARGSORT-FIBER 对 fixnum 下标向量做
+       稳定排序，比较器内联进归并循环（不再是每比较一次 funcall）。"
   (let* ((in (ensure-vt tensor))
          (flat (%cx-flat in))
          (shape (vt-shape flat))
@@ -900,12 +929,11 @@
           (if index
               (let* ((res (make-vt (list n) 0 :dtype :int64))
                      (rd (vt-data res))
-                     (idx (make-array n :element-type 'fixnum)))
-                (declare (type (simple-array fixnum (*)) idx))
+                     (idx (make-array n :element-type 'fixnum))
+                     (aux (make-array n :element-type 'fixnum)))
+                (declare (type (simple-array fixnum (*)) idx aux))
                 (dotimes (i n) (setf (aref idx i) i))
-                (stable-sort idx
-                             (lambda (a b)
-                               (%cx-sort-less (aref src a) (aref src b))))
+                (%cx-argsort-fiber src 0 1 idx aux n)
                 (dotimes (i n) (setf (aref rd i) (aref idx i)))
                 res)
               (let* ((res (%cx-flat (vt-copy flat)))
@@ -922,8 +950,9 @@
               (let* ((res (make-vt shape 0 :dtype :int64))
                      (rd (vt-data res))          ; res 是新建连续张量，offset=0
                      (src (vt-data flat))
-                     (idx (make-array (max dim 1) :element-type 'fixnum)))
-                (declare (type (simple-array fixnum (*)) idx))
+                     (idx (make-array (max dim 1) :element-type 'fixnum))
+                     (aux (make-array (max dim 1) :element-type 'fixnum)))
+                (declare (type (simple-array fixnum (*)) idx aux))
                 (dotimes (h head)
                   (declare (type fixnum h))
                   (let ((row (the fixnum (* h dim ax-stride))))
@@ -931,11 +960,8 @@
                     (dotimes (t2 ax-stride)
                       (declare (type fixnum t2))
                       (dotimes (j dim) (setf (aref idx j) j))
-                      (stable-sort idx
-                                   (lambda (a b)
-                                     (%cx-sort-less
-                                      (aref src (+ row t2 (the fixnum (* a ax-stride))))
-                                      (aref src (+ row t2 (the fixnum (* b ax-stride)))))))
+                      (%cx-argsort-fiber src (the fixnum (+ row t2)) ax-stride
+                                         idx aux dim)
                       (dotimes (j dim)
                         (setf (aref rd (+ row t2 (the fixnum (* j ax-stride))))
                               (aref idx j))))))

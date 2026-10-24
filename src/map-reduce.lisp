@@ -57,6 +57,8 @@
       %cop-signum %cop-abs %cconj %cop-neg
       ;; v1.3：补齐算子（复数的 expm1 / log1p / sinc / sign）
       %cop-expm1 %cop-log1p %cop-sinc %cop-sign
+      ;; 极值族：vt-maximum / vt-minimum / vt-fmax / vt-fmin 的复数分支
+      %cop-max %cop-min %cop-fmax %cop-fmin
       %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
       %cx-nan-flag %cx-inf-flag %cx-finite-flag)
     "允许生成复数内联分支的算子白名单。
@@ -87,6 +89,8 @@
       %cop-sqrt %cop-log %cop-log2 %cop-log10 %cop-square %cop-recip
       %cop-signum %cop-abs %cop-neg
       %cop-expm1 %cop-log1p %cop-sinc %cop-sign
+      ;; 极值族：调用点全部在 `(when (%cx-any-p …) …)` 守卫之内，实数进不来
+      %cop-max %cop-min %cop-fmax %cop-fmin
       ;; 复数比较 / 谓词内核：调用点全部在 `(when (%cx-any-p …) …)` 守卫之内，
       ;; 实数输入根本进不来
       %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
@@ -509,9 +513,13 @@
           ;; 分量式写法语义完全相同（实数入参虚部补 +0.0，与 coerce 一致），
           ;; 且省掉一次泛型 coerce 的类型分派。
           ((consp lt)
-           (let ((part (second lt)))
-             `(complex (coerce (realpart ,form) ',part)
-                       (coerce (imagpart ,form) ',part))))
+           (let ((part (second lt))
+                 (z (gensym "Z")))
+             `(let ((,z ,form))
+                (if (typep ,z '(complex ,part))
+                    ,z
+                    (complex (coerce (realpart ,z) ',part)
+                             (coerce (imagpart ,z) ',part))))))
           (t                              `(coerce ,form ',lt)))))
 
 (defmacro %inline1-loop (lt op a res)

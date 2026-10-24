@@ -226,23 +226,67 @@
          (idx-c (vt-contiguous indices))
          (src-data (vt-data src-c))
          (idx-data (vt-data idx-c))
+         ;; 同 %GATHER-AXIS-K：VT-CONTIGUOUS 可能原样返回带 offset 的视图
+         (src-off (vt-offset src-c))
+         (idx-off (vt-offset idx-c))
          (result-data (make-array (vt-size source)
                                   :element-type (array-element-type src-data))))
     (let* ((outer (reduce #'* (subseq shape 0 ax) :initial-value 1))
            (inner (reduce #'* (subseq shape (1+ ax)) :initial-value 1))
            (k     (nth ax shape))
            (total (* outer k inner)))
-      (declare (fixnum outer inner k total))
+      (declare (fixnum outer inner k total src-off idx-off))
       (dotimes (flat total)
         (let* ((i  (mod flat inner))
                (oj (floor flat inner))
                (o  (floor oj k))
-               (gidx (truncate (aref idx-data flat)))
-               (src-flat (+ (* o k inner) (* gidx inner) i)))
+               (gidx (truncate (aref idx-data (+ idx-off flat))))
+               (src-flat (+ src-off (* o k inner) (* gidx inner) i)))
           (setf (aref result-data flat) (aref src-data src-flat))))
       (%make-vt :data result-data
                 :shape shape
                 :strides (vt-compute-strides shape)
+                :offset 0
+                :dtype (vt-dtype source)))))
+
+(defun %gather-axis-k (source indices axis)
+  "沿 AXIS 用 INDICES 的整数下标从 SOURCE 取值，**允许两侧沿 AXIS 长度不同**
+   （`%gather-along-axis` 要求形状完全相同，topk 只要 k 个位置，用不了）。
+   其余维度必须一一对应；结果形状 = INDICES 的形状、dtype = SOURCE 的 dtype。
+
+   语义：(i0…, j, i…) 位置取 SOURCE 的 (i0…, INDICES[i0…,j,i…], i…)。
+   内部先把两侧都落成连续布局（INDICES 常是 NARROW/FLIP 出来的视图）。"
+  (let* ((shape (vt-shape source))
+         (ishape (vt-shape indices))
+         (rank (length shape))
+         (ax (vt-normalize-axis axis rank))
+         (src-c (vt-contiguous source))
+         (idx-c (vt-contiguous indices))
+         (src-data (vt-data src-c))
+         (idx-data (vt-data idx-c))
+         ;; `vt-contiguous` 对「已经连续」的输入原样返回 —— 而 NARROW/FLIP 出来的
+         ;; 视图可能是 offset 非零、strides 也满足连续判定的（例如单元素轴翻转后
+         ;; 只剩 offset=7）。因此**必须**把两边的 offset 加成基址，不能假设为 0。
+         (src-off (vt-offset src-c))
+         (idx-off (vt-offset idx-c))
+         (result-data (make-array (vt-size indices)
+                                  :element-type (array-element-type src-data))))
+    (let* ((outer (reduce #'* (subseq shape 0 ax) :initial-value 1))
+           (inner (reduce #'* (subseq shape (1+ ax)) :initial-value 1))
+           (k (nth ax shape))
+           (nk (nth ax ishape))
+           (total (* outer nk inner)))
+      (declare (fixnum outer inner k nk total src-off idx-off))
+      (dotimes (flat total)
+        (let* ((i (mod flat inner))
+               (oj (floor flat inner))
+               (o (floor oj nk))
+               (gidx (truncate (aref idx-data (+ idx-off flat))))
+               (src-flat (+ src-off (* o k inner) (* gidx inner) i)))
+          (setf (aref result-data flat) (aref src-data src-flat))))
+      (%make-vt :data result-data
+                :shape ishape
+                :strides (vt-compute-strides ishape)
                 :offset 0
                 :dtype (vt-dtype source)))))
 
@@ -272,14 +316,13 @@
       (error "vt-topk: k (~a) 必须非负" k))
     (when (> k ax-dim)
       (error "vt-topk: k (~a) 不能大于轴大小 (~a)" k ax-dim))
-    (let* ((sorted-tensor  (vt-sort    tensor :axis ax))
-           (sorted-indices (vt-argsort tensor :axis ax))
-           (vals (if largest
-                     (vt-flip (vt-narrow sorted-tensor  ax (- ax-dim k) ax-dim) :axis ax)
-                     (vt-narrow sorted-tensor  ax 0 k)))
+    (let* ((sorted-indices (vt-argsort tensor :axis ax))
+           ;; 只算**一次**序：不要同时 vt-sort 与 vt-argsort（两趟 O(n log n)）
+           ;; —— topk 只要 k 个元素，值可以直接按下标 gather（%GATHER-AXIS-K）。
            (idxs (if largest
                      (vt-flip (vt-narrow sorted-indices ax (- ax-dim k) ax-dim) :axis ax)
-                     (vt-narrow sorted-indices ax 0 k))))
+                     (vt-narrow sorted-indices ax 0 k)))
+           (vals (%gather-axis-k tensor idxs ax)))
       (if sorted
           (values vals idxs)
           (let* ((perm (vt-argsort idxs :axis ax)))

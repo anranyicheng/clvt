@@ -341,24 +341,70 @@
 ;;; 语义：字典序（实部→虚部），maximum/minimum 传播 NaN，fmax/fmin 忽略 NaN。
 ;;; 位置：按 §16.33.2「标量内核前移」放在这里（dispatch 之后、所有归属文件之前），
 ;;; 这样归属文件编译时至少知道这些符号存在。
-;;; 注意：把调用点改成 `vt-fast-map` 内联**并没有**变快（实测 834 → 1469 ms），
-;;; 原因是返回类型取决于分量宽度（c64/c128 两种），内联循环拿不到确定类型，
-;;; 写回前仍要多一次运行期转换。调用点因此保持 `vt-map`，数据与后续方案见
-;;; HISTORY §H.3.13 与 CONVENTIONS §16.37 的 U5。
+;;;
+;;; NaN 判定必须用免屏蔽的 `%CX-NAN-P`，不能用边界的 `%CISNAN`：
+;;; 后者内部套一层 `with-float-traps-masked`（单次约 200ns），每元素判两次
+;;; → 1M 元素光屏蔽/恢复陷阱就是 800ms。本组内核的全部调用点
+;;; （vt-map / vt-fast-map / %cx-reduce-* / %cx-arg-reduce-run）都在
+;;; with-float-safe 之下，前置条件满足（§16.14 的分工）。
+;;; 实测 1M complex128：%cisnan 839ms → %cx-nan-p 3ms。
 (declaim (inline %cop-max %cop-min %cop-fmax %cop-fmin))
 
 (defun %cop-max (a b)
   "maximum 的复数语义：字典序取大，NaN 传播。"
-  (cond ((%cisnan a) a) ((%cisnan b) b) ((%clt a b) b) (t a)))
+  (cond ((%cx-nan-p a) a) ((%cx-nan-p b) b) ((%clt a b) b) (t a)))
 
 (defun %cop-min (a b)
   "minimum 的复数语义：字典序取小，NaN 传播。"
-  (cond ((%cisnan a) a) ((%cisnan b) b) ((%cgt a b) b) (t a)))
+  (cond ((%cx-nan-p a) a) ((%cx-nan-p b) b) ((%cgt a b) b) (t a)))
 
 (defun %cop-fmax (a b)
   "fmax 的复数语义：字典序取大，忽略 NaN。"
-  (cond ((%cisnan a) b) ((%cisnan b) a) ((%clt a b) b) (t a)))
+  (cond ((%cx-nan-p a) b) ((%cx-nan-p b) a) ((%clt a b) b) (t a)))
 
 (defun %cop-fmin (a b)
   "fmin 的复数语义：字典序取小，忽略 NaN。"
-  (cond ((%cisnan a) b) ((%cisnan b) a) ((%cgt a b) b) (t a)))
+  (cond ((%cx-nan-p a) b) ((%cx-nan-p b) a) ((%cgt a b) b) (t a)))
+
+;;; ==================================================================
+;;; 比较 / 谓词的「1/0 标志」内核（§16.8 / §16.9）
+;;;
+;;; 为什么住在这里（而不是 complex.lisp）：`vt-=` / `vt-<` / `vt-isnan` 等在
+;;; elementwise2.lisp 里通过 `vt-fast-map` **内联**调用它们，而 elementwise2
+;;; 早于 complex.lisp 编译。若定义在 complex.lisp，编译 elementwise2 时这些
+;;; 符号还是「未知函数」：
+;;;   · 每个元素退化成一次真实函数调用（实测 vt-= 1M complex128 60ms，
+;;;     实数线 1ms）；
+;;;   · 事后补 `declaim inline` 也无效，SBCL 只报
+;;;     「Proclaiming %CX-EQ-FLAG to be INLINE, but 12 calls were previously
+;;;      compiled」—— 这句话本身就是缺陷信号，出现即说明内核放晚了。
+;;; 这是 §16.33.2「标量内核前移」的又一例。
+;;; ==================================================================
+
+;;; 比较的布尔承载：clvt 约定比较运算返回 :int8 的 1/0（§3.1），
+;;; 而 %clt/%cle/%cgt/%cge 返回 T/NIL（排序/极值内核需要布尔），
+;;; 故此处做一层 1/0 适配，避免把 T 写进整型缓冲。
+(declaim (inline %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
+                 %cx-eq-flag %cx-ne-flag %cx-nan-flag %cx-inf-flag %cx-finite-flag))
+
+(defun %cx-lt-flag (a b) (if (%clt a b) 1 0))
+(defun %cx-le-flag (a b) (if (%cle a b) 1 0))
+(defun %cx-gt-flag (a b) (if (%cgt a b) 1 0))
+(defun %cx-ge-flag (a b) (if (%cge a b) 1 0))
+
+(defun %cx-eq-flag (a b)
+  "复数相等：任一分量 NaN → 0（对标 numpy：nan+0j == nan+0j 为 False）。
+   不能直接用 CL 的 `=`：浮点陷阱被屏蔽后 (= nan nan) 在复数上实测返回 T。"
+  (cond ((%cx-nan-p a) 0)
+        ((%cx-nan-p b) 0)
+        ((= a b) 1)
+        (t 0)))
+
+(defun %cx-ne-flag (a b) (- 1 (%cx-eq-flag a b)))
+
+;;; 判定族（§16.7）。谓词在多处被调用：vt-fast-map 内联循环、%cx-sort-less、
+;;; %cx-arg-reduce-run —— 全部处于 with-float-safe 之下，故用免屏蔽快判。
+(defun %cx-nan-flag (x) (if (%cx-nan-p x) 1 0))
+(defun %cx-inf-flag (x) (if (%cx-inf-p x) 1 0))
+(defun %cx-finite-flag (x) (if (%cx-finite-p x) 1 0))
+

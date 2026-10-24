@@ -155,7 +155,7 @@
         (unless (%cx-complex-dtype-p* dt)
           (error "vt-maximum: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
                  dt))
-        (vt-map (function %cop-max) a b :out out :dtype dt))))
+        (vt-fast-map (function %cop-max) a b :out out :dtype dt))))
   (vt-fast-map #'%op-maximum t1 t2 :out out :dtype dtype))
 
 (defun vt-minimum (t1 t2 &key out dtype)
@@ -170,7 +170,7 @@
         (unless (%cx-complex-dtype-p* dt)
           (error "vt-minimum: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
                  dt))
-        (vt-map (function %cop-min) a b :out out :dtype dt))))
+        (vt-fast-map (function %cop-min) a b :out out :dtype dt))))
   (vt-fast-map #'%op-minimum t1 t2 :out out :dtype dtype))
 
 (defun vt-fmax (t1 t2 &key out dtype)
@@ -185,7 +185,7 @@
         (unless (%cx-complex-dtype-p* dt)
           (error "vt-fmax: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
                  dt))
-        (vt-map (function %cop-fmax) a b :out out :dtype dt))))
+        (vt-fast-map (function %cop-fmax) a b :out out :dtype dt))))
   (vt-fast-map #'%op-fmax t1 t2 :out out :dtype dtype))
 
 (defun vt-fmin (t1 t2 &key out dtype)
@@ -200,7 +200,7 @@
         (unless (%cx-complex-dtype-p* dt)
           (error "vt-fmin: 复数输入的结果 dtype 必须是复数类型，收到 ~a"
                  dt))
-        (vt-map (function %cop-fmin) a b :out out :dtype dt))))
+        (vt-fast-map (function %cop-fmin) a b :out out :dtype dt))))
   (vt-fast-map #'%op-fmin t1 t2 :out out :dtype dtype))
 
 (defun vt-logical-and (t1 t2 &key out (dtype :int8))

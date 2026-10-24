@@ -4,6 +4,57 @@
 
 ---
 
+## 2026-10-23（二十）— 第二十轮：极值族 / argsort / topk / 比较族，10~300 倍
+
+**行为变化**：无（`topk` 的 `k=1` 顺带修掉一个静默错值，见下）。
+
+**性能**（1M 元素）：
+
+| 场景 | 修前 | 修后 | 同形实数线 |
+|---|---:|---:|---:|
+| `vt-maximum` c128 | 804 ms | **7 ms** | 2 ms |
+| `vt-clip` c128 | 1600 ms | **9 ms** | 3 ms |
+| `vt-argsort` c128 | 2115 ms | **273 ms** | 166 ms |
+| `vt-topk k=10` c128 | 490 ms | **303 ms** | 168 ms |
+| `vt-=` c128 | 60 ms | **4 ms** | 1 ms |
+| `vt-<` c128 | 45 ms | **5 ms** | 5 ms |
+| `vt-isnan` c128 | 25 ms | **1 ms** | 1 ms |
+
+四处根因，**没有一处是算法错**，全是「用错变体」或「放错文件」：
+
+1. 极值内核用边界版 `%cisnan` 判 NaN —— 它每次调用都套一层
+   `with-float-traps-masked`（约 200 ns），每元素两次 = 400 ns。换免屏蔽的
+   `%cx-nan-p` 即 839 → 3 ms。上一轮把这个归因成「返回值类型未知」，是错的。
+2. `%cast-to` 的复数分支在「结果类型未知」时要 2 次 `realpart` + 2 次 `coerce`。
+   加 `typep` 同宽快通道（命中直接返回，**不用 `the` 撒谎**），1M 7 → 3 ms，
+   与手写循环同速。这是**通用**修复，所有「复数目标、类型未知」的内联算子受益。
+3. `argsort` 用 `stable-sort` + lambda 比较器（每次比较一次 `funcall`）。
+   换成下标归并内核（插入排序 + 自底向上归并，比较器内联）：2115 → 273 ms，
+   排列逐位相同、稳定性单独验过。
+4. `topk` 同时 `vt-sort` + `vt-argsort`（两趟 O(n log n)），但它只要 k 个元素。
+   改为「一次 argsort + 沿轴 gather」：490 → 303 ms。
+
+**第五处（顺带发现）**：`vt-=` / `vt-<` / `vt-isnan` 慢是因为九个标志内核定义在
+**`complex.lisp`**，而它最后加载 —— 编译 `elementwise2` 时符号还不存在，12 个
+调用点全编成真实函数调用。编译日志里 9 条
+`Proclaiming %CX-EQ-FLAG to be INLINE, but 12 calls were previously compiled`
+一直在说这件事，被当成噪音忽略了。前移到 `complex-kernels.lisp` 后
+`STYLE-WARNING` 97 → 88，三个算子分别 60→4 / 45→5 / 25→1 ms。
+
+**一处静默错值修复**：新增的 `%gather-axis-k` 最初假设视图 `offset` 为 0，
+但 `vt-contiguous` 对「已连续」的输入原样返回，`narrow`+`flip` 的单元素视图
+`offset=7` 仍被判连续 → `topk(k=1)` 返回全数组最小值（下标对、值错）。
+既有 `%gather-along-axis` 同隐患，一并补 `(vt-offset …)` 基址。
+
+**测试**：新增 `cx-extreme-argsort-test`（74 断言 = 极值语义独立参照 16×16×2 +
+四种布局同语义 + `clip` + `argsort` 双射/非降序/稳定性/多轴 + `topk` 边界 k +
+四条倍率护栏）。新契约见 `CONVENTIONS.md` §16.8.1（四条执行层硬约束 +
+「previously compiled」探测器）。
+
+过程与消融见 `HISTORY.md` §H.3.14；§16.37 的 U5 / U6 / U8 全部关闭。
+
+---
+
 ## 2026-10-23（十九）— 第十九轮：性能巡检 —— `median` 秒级退化与 `replace` 缺声明
 
 **方法**：不再「指哪儿打哪儿」，先写一个覆盖 8 个族、50 个算子的巡检脚本，

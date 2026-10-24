@@ -14,7 +14,7 @@
 
 ---
 
-## H.1 累计变更文件清单（第一～十九轮）
+## H.1 累计变更文件清单（第一～二十轮）
 
 ### 16.20 累计变更文件清单（第一～十二轮）
 
@@ -117,6 +117,15 @@
 | `CONVENTIONS.md` | **第十九轮**：新增 §16.35.5（顺序统计的两条退化护栏）；§16.4.1 补第 8 条（块拷贝必须带类型声明）并更正「没有 16 字节 basher」的错误结论；§16.37 增补 U5–U8 |
 | `test/order-stat-test.lisp` | **第十九轮新增** 266 断言（独立参照对拍 + 退化倍率护栏），注册后共 56 套件 |
 | `test/run-tests.sh` | **第十九轮**：注册 `order-stat-test` |
+| `src/complex-kernels.lisp` | **第二十轮**：极值内核的 NaN 判定由边界版 `%cisnan` 改为免屏蔽 `%cx-nan-p`（`vt-maximum` 804 → 7 ms）；九个比较/谓词标志内核（`%cx-eq-flag` 等）由 `complex.lisp` 前移至此（`vt-=` 60 → 4 ms，§16.8.1 第 1/4 条） |
+| `src/map-reduce.lisp` | **第二十轮**：`%cast-to` 的复数分支加 `typep` 同宽快通道（「结果类型未知」时不再 2×realpart + 2×coerce，1M 7 → 3 ms）；`+cx-inline-ops+` / `+cx-only-ops+` 登记极值族 |
+| `src/elementwise2.lisp` | **第二十轮**：`vt-maximum`/`vt-minimum`/`vt-fmax`/`vt-fmin` 的复数分支由 `vt-map` 改为 `vt-fast-map`（内联） |
+| `src/complex.lisp` | **第二十轮**：新增 `%def-cx-argsort-kernel` / `%cx-argsort-fiber`（下标归并内核，`vt-argsort` 2115 → 273 ms），两处 `stable-sort` 调用点改走它；九个标志内核移出 |
+| `src/extensions.lisp` | **第二十轮**：新增 `%gather-axis-k`（允许两侧轴长不同的沿轴 gather）；`vt-topk` 改为「只算一次序 + gather」（490 → 303 ms）；`%gather-along-axis` / `%gather-axis-k` 补 `(vt-offset …)` 基址（修 `k=1` 的静默错值） |
+| `CONVENTIONS.md` | **第二十轮**：新增 §16.8.1（极值/排序内核的四条执行层硬约束 + 「previously compiled」探测器）；§16.37 关闭 U5/U6/U8 |
+| `test/cx-extreme-argsort-test.lisp` | **第二十轮新增** 74 断言（极值语义/布局/`clip`/`argsort`/`topk` + 四条倍率护栏），注册后共 57 套件 |
+| `test/run-tests.sh` | **第二十轮**：注册 `cx-extreme-argsort-test` |
+
 | `test/test-copy-into.lisp` | **第十八轮**：+6 断言（复数×非连续 typed-walk：转置/翻转/3-D 置换/非连续 dest + `c128T vt-copy ≤ 8× f64T` 护栏），35 → 41 |
 
 ---
@@ -151,7 +160,7 @@ LAMBDA，`declaim inline` 对调用点失效；哪些符号被覆盖无法静态
 
 ---
 
-## H.3 §16 后半章的详细叙事（第五～十九轮）
+## H.3 §16 后半章的详细叙事（第五～二十轮）
 
 > 为什么单独成节：这些内容原先住在 `CONVENTIONS.md` §16.21–§16.36，按
 > 「症状 → 根因 → 修法 → 实测」写，与 `CHANGELOG.md` 的对应条目是**同一件事
@@ -1252,3 +1261,116 @@ SAETP 分派 + 类型检查）。这解释了前两轮一直以为的「SBCL 没
 > 写这套测试时踩了一个坑：第一版把 `make-data` 放进了计时区间，随机数生成
 > （200k ≈ 40 ms）盖过了被测算子，所有倍率都打成 1.0×。性能用例的
 > **基准与被测项必须同口径**，这条在 §H.3.11 已经记过一次，这是第二例。
+
+---
+
+### H.3.14 第二十轮：把巡检留下的三项待办全部关掉 —— 三处都是「放错地方」
+
+§16.37 的待办表里，U5（复数极值族）、U6（复数 argsort/topk）、U8（复数比较）
+挂着三行数字。本轮把它们全部关掉。共同点：**都不是算法错，而是「用错了变体」
+或「放错了文件」**，代价 10~300 倍。
+
+| 场景（1M 元素） | 修前 | 修后 | 同形实数线 |
+|---|---:|---:|---:|
+| `vt-maximum` c128 | 804 ms | **7 ms** | 2 ms |
+| `vt-clip` c128 | 1600 ms | **9 ms** | 3 ms |
+| `vt-argsort` c128 | 2115 ms | **273 ms** | 166 ms |
+| `vt-topk k=10` c128 | 490 ms | **303 ms** | 168 ms |
+| `vt-=` c128 | 60 ms | **4 ms** | 1 ms |
+| `vt-<` c128 | 45 ms | **5 ms** | 5 ms |
+| `vt-isnan` c128 | 25 ms | **1 ms** | 1 ms |
+
+#### 一、极值族：`%cisnan` 每元素两次「屏蔽/恢复浮点陷阱」
+
+上一轮把这条归因成「返回值类型未知导致写回前多一次运行期转换」，**错了**。
+先用三段式拆开（同一内核只改写回点）：
+
+| 写法 | 1M c128 |
+|---|---:|
+| 裸内核 + 裸写回 | 843 ms |
+| 裸内核 + `%cast-to` 复数构造 | 1661 ms |
+| 裸内核 + `(the (complex double-float) …)` | 852 ms |
+
+裸写回就要 843 ms —— 说明瓶颈在内核本身。把 `%cisnan` 换成免屏蔽的
+`%cx-nan-p`（其余不动）：**839 ms → 3 ms**。根因是 `%cisnan` 每次都套一层
+`with-float-traps-masked`（约 200 ns），极值内核每元素判两次 = 400 ns/元素。
+dtype.lisp 里那组快判原语的注释早就写了「内核热路径请用 %CX-NAN-P」，
+这条内核没遵守 —— 而 `%cx-arg-reduce-run`、`%cx-sort-less` 都遵守了。
+
+修完内核，`%cast-to` 的问题才浮出来（上一轮看到的就是这一层）：
+复数的 `coerce` 分支在「实参类型未知」时要 2 次 `realpart` + 2 次 `coerce`，
+约 800 ns/元素。改成**先 `typep` 判同宽、命中直接返回**：
+
+```lisp
+(let ((z <form>))
+  (if (typep z '(complex double-float))
+      z
+      (complex (coerce (realpart z) 'double-float)
+               (coerce (imagpart z) 'double-float))))
+```
+
+这一改是**通用**的（任何「复数目标、结果类型未知」的内联算子都受益），
+且**不撒谎**（`typep` 保证安全，不是 `the` 断言），1M 上 7 ms → 3 ms，
+已与手写循环同速。顺带解释清楚上一轮 `vt-fast-map` 反而更慢的原因：
+内核慢 800 ms + 写回慢 800 ms，两笔叠加。
+
+#### 二、`argsort`：`stable-sort` + lambda 比较器
+
+旧实现给 fixnum 下标向量做 `(stable-sort idx (lambda (a b) (%cx-sort-less …)))`，
+每次比较 = 一次 `funcall` + 两次跨步 `aref`（约 50 ns），1M 元素约 20M 次比较。
+新增 `%def-cx-argsort-kernel`（照 `%def-cx-fiber-sorter` 的形态）：插入排序
+（n ≤ 16）+ 自底向上稳定归并，比较器**内联**进归并循环，零 cons、零 funcall。
+同一份数据上 A/B：c128 **2115 → 273 ms**、c64 1598 → 229 ms，两边给出的排列
+逐位相同（`equalp` 校验），重复值数组的稳定性单独验过。
+
+#### 三、`topk`：既排值又排下标（两趟 O(n log n)）
+
+`vt-topk` 只要 k 个元素，却同时调 `vt-sort` 与 `vt-argsort`。改成「只算一次序 +
+按下标取回值」，新增 `%gather-axis-k`（沿轴 gather，允许两侧轴长不同 ——
+既有的 `%gather-along-axis` 要求形状完全相同，用不了）。490 → 303 ms。
+
+**顺带挖出一个静默错值**：`%gather-axis-k` 最初假设两边视图的 `offset` 为 0。
+但 `vt-contiguous` 对「已经连续」的输入**原样返回**，而 `narrow` + `flip` 出来的
+单元素视图 offset=7 却仍满足连续判定 —— 于是 `k=1` 的 `topk` 返回了全数组的
+**最小值**（下标对、值错）。既有 `%gather-along-axis` 有同一处隐患，一并补上
+`(vt-offset …)` 基址。这类「视图 offset」错误不报错、只在边界尺寸上现形，
+测试里专门加了 `k = 0 / 1 / n` 三档。
+
+#### 四、比较与谓词：内核放晚了一个文件
+
+`vt-=` 60 ms、`vt-<` 45 ms、`vt-isnan` 25 ms（实数线 1~5 ms）—— 而 §16.14.3
+记录的曾经是 3 ms。它们在 `elementwise2.lisp` 里通过 `vt-fast-map` 内联调用，
+但 `%cx-eq-flag` 等九个标志内核定义在 **`complex.lisp`**，而 `complex.lisp` 是
+**最后**加载的（它要捕获各函数的实数原实现）。于是编译 `elementwise2` 时这些
+符号还不存在，12 个调用点全部编成真实函数调用；事后 `declaim inline` 也无效。
+
+编译日志里一直有 9 条告警在说这件事：
+
+```
+Proclaiming CLVT::%CX-EQ-FLAG to be INLINE, but 12 calls to it were previously compiled.
+```
+
+把这九条当成噪音忽略了很久。它们其实是**缺陷信号**：出现一行就说明某个内核
+放晚了 N 个调用点。把九个内核移到 `src/complex-kernels.lisp`（`§16.33.2`
+「标量内核前移」的同一招，上一轮对极值族用过）→ `STYLE-WARNING` 97 → 88，
+`vt-=` 60 → 4 ms、`vt-<` 45 → 5 ms、`vt-isnan` 25 → 1 ms。
+剩下 3 条 `previously compiled` 与复数无关（`vt-p` / `%copy-default-rng` /
+`parse-subscript-tokens`），留给 U4 一起清。
+
+#### 五、测试
+
+新增 `test/cx-extreme-argsort-test.lisp`（74 断言）：
+
+| 组 | 内容 |
+|---|---|
+| 极值语义 | `maximum`/`minimum`/`fmax`/`fmin` × 2 dtype × 16×16 值对，与「按字典序逐对折叠」的独立参照（只用 `realpart`/`imagpart`/`float-nan-p`）逐点一致 |
+| 布局 | 连续 / 广播标量 / 转置视图 / 步进视图 四种落点同语义（快路径与 `vt-map` 兜底的选择随连续性而变，语义不能跟着变） |
+| `clip` | `= min(max(x, lo), hi)`；只给上限；全省略 = 副本；返回新缓冲 |
+| `argsort` | 双射、施加上标 == `vt-sort`、非降序、**稳定性**（等值下标递增）、`axis=0/1/nil`、转置视图与物化副本同结果、NaN 排末尾 |
+| `topk` | `k ∈ {0,1,3,n}` × `largest` × `sorted` 与「排序切片」一致、下标回指、二维沿轴 |
+| 护栏 | 极值 c128/f64 ≤ 8×、argsort c128/f64 ≤ 3×、`topk ≤ 1.4×argsort`、`argsort ≤ 2.5×sort` |
+
+> 护栏的规模从 200k 抬到 1M：200k 时实数线只要 0.2~0.6 ms，落到
+> `get-internal-real-time` 的有效分辨率（约 1 ms）里，倍率会算成 1000×+。
+> **性能护栏的规模必须让「基准项」也远超计时噪声**，这是第三次记同类教训
+> （前两次：§H.3.11 的落点口径、§H.3.13 的构造计入计时）。
