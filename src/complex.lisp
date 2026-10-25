@@ -230,6 +230,7 @@
                          `(let ((,arr2 (the (simple-array ,',ctype (*)) ,data2))
                                 (,zero2 ,',zero-form))
                             (declare (type (simple-array ,',ctype (*)) ,arr2)
+                                     (ignorable ,zero2)
                                      (optimize (speed 3) (safety 1)))
                             ,@body2)))
               ,@body)))
@@ -238,12 +239,20 @@
               (let ((,arr (the (simple-array (complex double-float) (*)) ,data))
                     (,zero (complex 0.0d0 0.0d0)))
                 (declare (type (simple-array (complex double-float) (*)) ,arr)
+                         ;; ZERO 只在部分内核里用到；标 IGNORABLE 而不是要求
+                         ;; 调用点写 (declare (ignore zero)) —— 后者在内层
+                         ;; MACROLET 里是「外层变量」的 ignore，SBCL 既报
+                         ;; 「IGNORE declaration for a variable from outer
+                         ;; scope」又拦不住「defined but never used」，
+                         ;; 实测这两类合起来占全库 STYLE-WARNING 的一半。
+                         (ignorable ,zero)
                          (optimize (speed 3) (safety 1)))
                 ,(bind '(complex double-float) '(complex 0.0d0 0.0d0))))
              ((equal et '(complex single-float))
               (let ((,arr (the (simple-array (complex single-float) (*)) ,data))
                     (,zero (complex 0.0s0 0.0s0)))
                 (declare (type (simple-array (complex single-float) (*)) ,arr)
+                         (ignorable ,zero)
                          (optimize (speed 3) (safety 1)))
                 ,(bind '(complex single-float) '(complex 0.0s0 0.0s0))))
              (t (error "%cx-dispatch: 非复数缓冲区 ~a" et))))))
@@ -378,7 +387,6 @@
   "argmax/argmin 的连续内核。返回 fixnum 向量。
    OP ∈ :argmax :argmin。AX=NIL 表示展平（结果为单元素向量）。"
   (%cx-dispatch data d zero
-    (declare (ignore zero))
     (flet ((better (acc v)
              (cond ((null acc) t)
                    ((%cx-nan-p acc) nil)
@@ -719,7 +727,6 @@
                                (declare (type fixnum p))
                                (setf (aref rdata p) (vt-cast acc dt))
                                (dotimes (j (the fixnum (1- dim-ax)))
-                                 (declare (ignore j))
                                  (incf p ax-stride)
                                  (setf acc (if (eq op :sum)
                                                (+ acc (aref data p))
@@ -742,8 +749,6 @@
    （np.prod([inf+0j]) = inf+nanj），那条路径在 %CX-REDUCE 里，不要一起改。"
   (%cx-dispatch src s zero
     (%cx-dispatch dst d zero2
-      (declare (ignore zero2)
-               (ignorable zero))
       (if (null ax)
           (let ((n (the fixnum (length s))))
             (declare (type fixnum n))
@@ -782,7 +787,6 @@
                         (setf (aref d p) acc)
                         (incf p ax-stride)
                         (dotimes (j (the fixnum (1- dim)))
-                          (declare (ignore j))
                           (setf acc (if (eq op :sum)
                                         (+ acc (aref s p))
                                         (* acc (aref s p))))
@@ -997,7 +1001,6 @@
          (flat (%cx-flat in))
          (shape (vt-shape flat))
          (rank (length shape))
-         (dt (vt-dtype in))
          (ax (if axis (vt-normalize-axis axis rank) nil)))
     (if (null ax)
         ;; ---------- 展平 ----------
@@ -1287,7 +1290,6 @@
   (%cx-dispatch ad a zero
     (%cx-dispatch bd b zero2
       (%cx-dispatch rd c zero3
-        (declare (ignorable zero2 zero3))
         ;; ① 清零（整块一趟，连续访存）
         (dotimes (i m)
           (declare (type fixnum i))
@@ -1350,7 +1352,6 @@
   (%cx-dispatch ad a zero
     (%cx-dispatch bd b zero2
       (%cx-dispatch rd c zero3
-        (declare (ignorable zero2 zero3))
         (cond
           ;; (a) 连续 NN：与 vt-matmul 共用行内核（最快）
           ((and (= sa-j 1) (= sb-k 1) (= sc-k 1)
@@ -1401,7 +1402,6 @@
          (bo (the fixnum (vt-offset b))))
     (%cx-dispatch ad aa zero
       (%cx-dispatch bd bb zero2
-        (declare (ignore zero2))
         (let ((acc zero)
               (pa ao)
               (pb bo))
@@ -1496,7 +1496,7 @@
              ((and (= ra 1) (= rb 1)) (%cx-dot-1d ca cb))
              ((and (= ra 2) (= rb 2)) (%cx-matmul-2d ca cb))
              ((and (= ra 2) (= rb 1))
-              (let ((m (first (vt-shape ca))) (k (second (vt-shape ca))))
+              (let ((k (second (vt-shape ca))))
                 (%cx-matmul-2d ca (vt-reshape cb (list k 1)))))
              ((and (= ra 1) (= rb 2))
               (let ((k (vt-size ca)) (n (second (vt-shape cb))))

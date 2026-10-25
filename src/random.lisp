@@ -171,7 +171,6 @@
     (setf *vt-default-random-state* (vt-make-random-state seed)))
   seed)
 
-(declaim (inline %copy-default-rng))
 (defun %copy-default-rng ()
   "解析 rng=nil 时的活动随机状态。
    with-generator 作用域内 → 直接返回生成器状态对象（抽样推进其流，

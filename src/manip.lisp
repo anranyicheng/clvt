@@ -802,7 +802,6 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
                          do (let ((v (aref sd (the fixnum (+ soff i))))
                                   (rr (max r 0)))
                               (dotimes (k rr)
-                                (declare (ignore k))
                                 (setf (aref rd pos) v)
                                 (incf pos))))))))
           res))

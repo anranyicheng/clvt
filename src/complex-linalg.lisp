@@ -898,9 +898,10 @@
 ;;; 数值上「看起来像」，但 A·A⁺ 不再是厄米特投影算子。
 
 (defun %csvd-of (matrix what)
-  "取 SVD 的三件套（复数），用于 pinv/lstsq/rank。"
+  "取 SVD 的三件套（复数），用于 pinv/lstsq/rank。
+   WHAT 只用于调用点自述（错误信息里由调用方自己拼），此处不用。"
+  (declare (ignore what))
   (multiple-value-bind (u s vh) (vt-svd matrix)
-    (declare (ignore what))
     (values u s vh)))
 
 (defun %cx-op-pinv (matrix &key (rcond 1e-15))

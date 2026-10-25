@@ -3026,7 +3026,7 @@ grep -c "eval-when.*cx-orig"   src/*.lisp    # 0
 **为什么默认不是逐字节**：`str(np.float64)` 的格式化随 numpy 版本变，
 跨版本必然漂移，字节比对会让门禁在干净机器上必红（§10.4.1）。
 
-#### 16.34.2 编译体检门禁：`caught WARNING` 必须为 0
+#### 16.34.2 编译体检门禁：`WARNING` 为 0，`STYLE-WARNING` 走白名单
 
 跑套件前先 `asdf:compile-system :clvt :force t`。**必须真的重编译** ——
 命中缓存时不产生任何告警输出，门禁会静默失效。
@@ -3034,9 +3034,23 @@ grep -c "eval-when.*cx-orig"   src/*.lisp    # 0
 | 项 | 规定 |
 |---|---|
 | 拦截 | `^; caught WARNING:` 计数 > 0 → FAIL 并打印上下文 |
-| 放行 | `STYLE-WARNING`（unused-variable 类）不计 —— 噪声化的门禁等于没门禁 |
+| 拦截 | `STYLE-WARNING` 未命中白名单 → FAIL（判据见下） |
+| 白名单 | 只有 4 条：3 × `&OPTIONAL and &KEY found in the same lambda list`（`vt-where` / `vt-clip` / `vt-clamp` 的位置参数形态）+ 1 × `Previously compiled call to CLVT:VT-P could not be inlined`（访问器在 layout 已知前被调用） |
+| 判据 | **不是"总数 ≤ 4"**（会被「一条消失 + 一条新增」绕过），而是「两类各自条数钉死，且总数 == 两类之和」——任何第 5 条都会 FAIL |
 | 跳过 | `--skip-build` / `CLVT_SKIP_BUILD_CHECK=1` |
 | 顺带收益 | 这次重编译的 fasl 被后续套件复用，总耗时基本不增加 |
+
+**为什么这 4 条留着**：前 3 条是公开 API 的位置参数形态（改成 `&key` 会同时改
+调用方与错误信息），第 4 条是 SBCL 对「结构体 layout 尚未可见」的自述提示。
+两者都不是本库的缺陷，且**改不掉而不改语义**。白名单只允许缩，不允许加 ——
+真需要加时（例如新 API 又用了 `&OPTIONAL`+`&KEY`）必须同步改门禁脚本并在
+`CHANGELOG` 里写明。
+
+**清零的过程值**：79 → 4。主体是 `%cx-dispatch` 的 `ZERO`
+参数（18 条 unused + 14 条 `IGNORE declaration for outer scope` + 6 条
+`reading an ignored variable`）—— 把调用点的 `(declare (ignore zero))`
+改成宏内 `(ignorable ,zero)`，一次消掉 38 条。其余是散落的 unused 绑定
+与 4 条**无效的** `declaim inline`（声明晚于调用点，只产生告警不产生内联）。
 
 **实现陷阱**：不要像套件那样包 `(handler-bind ((warning #'muffle-warning)) ...)` ——
 `muffle` 会把编译期告警一起吞掉，门禁恒报「0 条」。门禁必须吃原始输出。
@@ -3189,8 +3203,7 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U2 | `real/imag` 返回共享视图（D-C3） | 现在返回副本；numpy 的 `z.real` 是同一缓冲的零拷贝视图 | 需给 strided view 引入「分量视图」（`data` + 分量偏移 + 元素宽度/2），会动物理层，影响 `vt-write`/`vt-copy-into`/别名判定；风险高于收益 |
 | U3 | 复数逐元素算子的 SIMD 特化（D-C5） | §16.14.3 实测：`add` 1.8×、`mul` 2.3×、`sqrt` 4.0×、`abs` 6.5×（相对 float64） | 与 U1 同源；还需要先解决 `sb-simd` 的 shuffle 组装形式 |
 | U7 | 复数 nan 族剩余的「多趟」成本 | `nansum` 5 / `nanmean` 13 / `nanvar` 28 / `nanstd` 30 / `nanmax` 22 ms（原 35~88 ms，`vt-where` 特化后）；`nan-to-num` 54 ms 仍偏慢 | 剩下的成本是「掩码 + 计数 + 归约」各自一趟：`nanmean` = isnan + where + sum + logical-not + astype + sum + div + where，约 7 趟全量遍历。要再压需要把「掩码计数 + 求和」合成单趟内核（`%nan-sum-count`），收益约 2×，但会让 nan 族脱离通用算子组合、失去「语义只有一处」的性质 —— 先登记不取 |
-| U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | 1M：`sort` f64 130 / c128 181；`argsort` 158 / 284；`median` 25 / 208；numpy 同机 5.9 / 83 / 19 / 100 / — / —。c64 与 c128 耗时几乎相同 ⇒ **不是带宽受限**，而是归并每次比较的分支不可预测（随机数据上约 15 周期 × 20M 次 ≈ 100 ms） | 要再压须换 LSD 基数排序（numpy 对 f64 即是）。复数 = 「先按虚部一次稳定基数、再按实部一次稳定基数」；NaN 必须映到最大键值（负数 NaN 翻转后会跑到最前）。属算法替换而非缺陷修复，需单独一轮 + 与现实现逐位对拍 |
-| U4 | 编译期 `STYLE-WARNING` 尚不拦截 | 现有 96 条（unused-variable 类）；`WARNING` 已由 §16.34.2 的门禁拦死 | 先逐条清到 0，再把门禁从 `WARNING` 收紧到 `STYLE-WARNING`；否则一次性收紧会让门禁长期红 |
+| U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | 1M：`sort` f64 130 / c128 181；`argsort` 158 / 284；`median` 25 / 208；numpy 同机 5.9 / 83 / 19 / 100 / — / —。c64 与 c128 耗时几乎相同 ⇒ **不是带宽受限**，而是归并每次比较的分支不可预测（随机数据上约 15 周期 × 20M 次 ≈ 100 ms） | 要再压须换 LSD 基数排序（numpy 对 f64 即是）。复数 = 「先按虚部一次稳定基数、再按实部一次稳定基数」；NaN 必须映到最大键值（负数 NaN 翻转后会跑到最前）。属算法替换而非缺陷修复，需单独一轮 + 与现实现逐位对拍。**已实测否决**：LSD 基数排序（IEEE754 单调键 + 两半 u32 + 8 趟 8 bit）在 1M double 上实测 **107 ms/4 趟**（8 趟约 200 ms），比现有自底向上归并的 130 ms **更慢** —— 原因是 64 位键在 SBCL 上是 bignum（必须拆两半）、且每趟都要把「键 + 值」两条流按 256 个桶散写。真要再压只能换 introsort（numpy 的 float 路径），但那**破坏稳定性**（`argsort` 的稳定契约要改）。保留现状 |
 
 
 > **已关闭**（保留在此仅为说明它们不再是待办）：einsum 复数、复数归约多轴

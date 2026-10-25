@@ -462,7 +462,7 @@
    执行层选路：存储级 dtype（4 种）→ in-et × res-lt 类型特化内核；
    小整型逻辑 dtype（4 种）→ %kernel-small-general 通用内核（路径 3 结构）。
    路径 1/2/3 的输出对同一语义必须一致；连续性只影响性能。"
-  (let ((fn-name (intern (format nil "VT-~a" name)))
+  (let (;; 公开名由 DEF-VT-REDUCE-FACADE 生成，这里不需要 FN-NAME
         ;; 宏生成的函数体改名为内部实现，公开名由 DEF-VT-REDUCE-FACADE
         ;; 生成（唯一的一个 DEFUN），复数分派就在那个门面里。这样
         ;;   · 公开符号只有一个定义，重载任何单个文件都不会丢复数支持；
@@ -2226,6 +2226,9 @@
       acc)))
 
 (defun %nan-fast-p (axis keepdims final-dtype)
+  "快路径判据：axis 全归约 + 目标 float32/64。KEEPDIMS 不影响选路（全归约
+   时形状恒为 (1,…) 或空，两条路都对），故忽略。"
+  (declare (ignore keepdims))
   (and (null axis)
        (or (eq final-dtype :float64) (eq final-dtype :float32))))
 

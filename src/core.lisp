@@ -23,8 +23,10 @@
   (offset 0 :type fixnum)
   (dtype :float64 :type symbol))
 
-(declaim (inline vt-shape vt-strides vt-offset vt-data vt-dtype vt-p
+(declaim (inline vt-shape vt-strides vt-offset vt-data vt-dtype
                  vt-order vt-size))
+;; VT-P 不列入：结构体访问器由 SBCL 在 layout 已知时自动内联，显式
+;; DECLAIM 只会得到「Proclaiming VT-P to be INLINE, but 1 call …」告警。
 
 ;;; ------------------------------------------------------------------
 ;;; 访问器与尺寸
@@ -402,7 +404,11 @@
    vt-contiguous-p / 写入侧契约中排除）。
    RUN 应与 (%inner-run-suffix shape strides) 的返回值一致。"
   (declare (type list shape strides)
-           (type fixnum offset cut run))
+           (type fixnum offset cut)
+           ;; RUN 是「调用方与本函数必须对同一个内层 run 长度达成一致」的
+           ;; 契约参数：本函数只在 [0,cut) 的外层 odometer 上工作，不需要它。
+           ;; 保留形参是为了让调用点显式写出 run（错配时人能看见）。
+           (ignore run))
   (let* ((outer-dims (coerce (subseq shape 0 cut) 'simple-vector))
          (outer-strides (coerce (subseq strides 0 cut) 'simple-vector))
          (k (length outer-dims)))

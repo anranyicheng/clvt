@@ -265,7 +265,7 @@ check_build_warnings() {
         warn "已跳过编译体检（CLVT_SKIP_BUILD_CHECK=1 / --skip-build）"
         return 0
     fi
-    header "编译体检 — 全系统零 WARNING"
+    header "编译体检 — 零 WARNING + STYLE-WARNING 白名单"
     local log_file
     log_file="$(mktemp -t clvt-build-warn.XXXXXX)"
     # 注意：**不能**包 (handler-bind ((warning #'muffle-warning)) ...) ——
@@ -282,22 +282,39 @@ check_build_warnings() {
         rm -f "$log_file"
         exit 1
     fi
-    # 只数 WARNING（STYLE-WARNING 不算）：用行首锚定避免把
-    # "caught STYLE-WARNING" 也算进去。
-    local n_warn n_style
+    # WARNING 一律拦；STYLE-WARNING 走**白名单计数**（不是"不计"）。
+    # 白名单只有两类、共 4 条，都是 SBCL 语义/本库 API 形态决定的，
+    # 不是缺陷（见 CONVENTIONS §16.34.2）：
+    #   · 3 条 `&OPTIONAL and &KEY found in the same lambda list`
+    #     —— vt-where / vt-clip / vt-clamp 的位置参数形态；
+    #   · 1 条 `Previously compiled call to CLVT:VT-P could not be inlined`
+    #     —— 结构体访问器在 layout 已知前被调用（SBCL 自身给出的提示）。
+    # 判据不是"总数 ≤ 4"（那会被一条消失+一条新增绕过），而是
+    # **所有 STYLE-WARNING 都必须命中白名单**，且两类各自的条数钉死。
+    local n_warn n_style n_api n_vtp
     n_warn=$(grep -c '^; caught WARNING:' "$log_file" 2>/dev/null || true)
     n_style=$(grep -c '^; caught STYLE-WARNING:' "$log_file" 2>/dev/null || true)
-    n_warn=${n_warn:-0}
-    n_style=${n_style:-0}
+    n_api=$(grep -c '&OPTIONAL and &KEY found in the same lambda list' "$log_file" 2>/dev/null || true)
+    n_vtp=$(grep -c 'Previously compiled call to CLVT:VT-P' "$log_file" 2>/dev/null || true)
+    n_warn=${n_warn:-0}; n_style=${n_style:-0}; n_api=${n_api:-0}; n_vtp=${n_vtp:-0}
     if [[ "$n_warn" -gt 0 ]]; then
-        fail "编译产生 $n_warn 条 WARNING（STYLE-WARNING $n_style 条，不计）"
+        fail "编译产生 $n_warn 条 WARNING（STYLE-WARNING $n_style 条）"
         echo "    最近的告警上下文："
         grep -n -B2 -A6 '^; caught WARNING:' "$log_file" | head -40 | sed 's/^/    /'
         echo "    → 完整日志: $log_file"
         echo "    → 典型根因: docstring 里有未转义的 \" ，把后续正文读成了代码。"
         return 1
     fi
-    ok "编译干净（WARNING 0，STYLE-WARNING $n_style）"
+    if [[ "$n_api" -ne 3 || "$n_vtp" -ne 1 || "$n_style" -ne $((n_api + n_vtp)) ]]; then
+        fail "STYLE-WARNING 不在白名单内（总 $n_style；&OPTIONAL+&KEY $n_api/3，VT-P $n_vtp/1）"
+        echo "    全部 STYLE-WARNING 上下文："
+        grep -n -A3 '^; caught STYLE-WARNING:' "$log_file" | head -60 | sed 's/^/    /'
+        echo "    → 完整日志: $log_file"
+        echo "    → 白名单只有 §16.34.2 那 4 条；新出现的必须先修掉，"
+        echo "      确实无法修的（如新增 API 用了 &OPTIONAL+&KEY）再同步改本脚本。"
+        return 1
+    fi
+    ok "编译干净（WARNING 0；STYLE-WARNING $n_style 条 = 白名单 4 条）"
     rm -f "$log_file"
     return 0
 }

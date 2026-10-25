@@ -84,7 +84,6 @@
                   (list inputs output explicit-p))
             (values inputs output explicit-p))))))
 
-(declaim (inline parse-subscript-tokens))
 (defun parse-subscript-tokens (str)
   (declare (optimize (speed 3)) (simple-string str))
   (let ((len (length str))
@@ -1833,7 +1832,9 @@ lu/b/ob: 连续行主序句柄（通用: simple-array；AVX: SAP），s1=1。"
      (declare (type ,handle-type lu-h b-h ob-h)
               (type (simple-array fixnum (*)) piv)
               (type fixnum lu-off lu-s0 lu-s1 n
-                    b-off b-s0 b-s1 ob-off ob-s0 ob-s1 nrhs)
+                    b-off b-s0 b-s1 ob-off ob-s0 nrhs)
+              ;; OB-S1 只为与其它句柄保持签名对称而传入，核心按行主序取址
+              (ignore ob-s1)
               (type double-float singular-threshold)
               (optimize (speed 3) (safety 0) (debug 0) (space 0)))
      ;; 1. 应用行置换 pb（逐元素拷贝，与原实现一致）
@@ -2838,11 +2839,10 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
            (a-s0 (first (vt-strides a)))
            (a-s1 (second (vt-strides a)))
            (a-off (vt-offset a))
-           (l-s0 (first (vt-strides l)))
            (l-s1 (second (vt-strides l)))
            (l-off (vt-offset l)))
       (declare (type (simple-array double-float (*)) a-data l-data)
-               (type fixnum n a-s0 a-s1 a-off l-s0 l-s1 l-off))
+               (type fixnum n a-s0 a-s1 a-off l-s1 l-off))
       ;; 引擎分派（ensure-contiguous/vt-zeros 保证 s1=1）
       (cond
         #+sbcl
@@ -2926,7 +2926,9 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
 (defun %vt-eig-core-avx (a-h a-data v-h v-data n max-iter tol)
   "Jacobi 旋转（AVX 路径：行对称访问 + rot2/dot 内核 + V^T 累积）。"
   (declare (type sb-sys:system-area-pointer a-h v-h)
-           (type (simple-array double-float (*)) a-data v-data)
+           (type (simple-array double-float (*)) a-data)
+           ;; V-DATA 只在通用引擎里用；AVX 走指针，签名保留以对齐两条引擎
+           (ignore v-data)
            (type fixnum n max-iter)
            (type double-float tol)
            (optimize (speed 3) (safety 0) (debug 0) (space 0)))

@@ -145,8 +145,7 @@
                (total (reduce #'+ reps :initial-value 0))
                (res (make-vt (list total) 0 :dtype dt)))
           (%cx-dispatch (vt-data flat) src zero
-            (declare (ignore zero))
-            (let ((dst (vt-data res))
+                    (let ((dst (vt-data res))
                   (off (vt-offset flat))
                   (pos 0))
               (declare (type fixnum off pos))
@@ -214,14 +213,15 @@
 
 (defun %cx-unique-sorted (flat dt)
   "展平、排序（字典序 + NaN 末尾）后做 run-length。
-   返回 (values 唯一值数组 计数 fixnum 向量 唯一数)。"
+   返回 (values 唯一值数组 计数 fixnum 向量 唯一数)。
+   DT 由调用方的 %CX-DISPATCH 决定，这里不用（保留形参以对齐签名）。"
+  (declare (ignore dt))
   (let* ((copy (vt-copy flat))
          (data (vt-data copy))
          (n (vt-size flat)))
     (%cx-sort-fiber data 0 n)
     (%cx-dispatch data arr zero
-      (declare (ignore zero))
-      (let ((uniq (make-array (max n 1) :element-type (array-element-type data)))
+        (let ((uniq (make-array (max n 1) :element-type (array-element-type data)))
             (cnts (make-array (max n 1) :element-type '(signed-byte 64)))
             (u 0) (pos 0))
         (declare (type fixnum u pos))
@@ -301,8 +301,7 @@
         (flat (%cx-flat test)))
     (with-float-safe
       (%cx-dispatch (vt-data flat) arr zero
-        (declare (ignore zero))
-        (let ((off (vt-offset flat))
+            (let ((off (vt-offset flat))
               (n (vt-size flat)))
           (dotimes (i n)
             (setf (gethash (%cx-key (aref arr (+ off i))) h) t)))))
@@ -334,8 +333,7 @@
          (k 0))
     (with-float-safe
       (%cx-dispatch (vt-data (vt-copy u)) src zero
-        (declare (ignore zero))
-        (let ((dst (vt-data res)))
+            (let ((dst (vt-data res)))
           (dotimes (i n)
             (let ((v (aref src i)))
               (when (if invert
@@ -380,9 +378,7 @@
 (defun %cx-searchsorted-run (tbl tvals right out)
   "在已升序的复数表 TBL 中对每个 TVALS 二分。RIGHT 为 T 时找第一个 > 的位置。"
   (%cx-dispatch tbl arr zero
-    (declare (ignore zero))
     (%cx-dispatch tvals varr zero2
-      (declare (ignore zero2))
       (let ((n (length arr))
             (nv (length varr)))
         (declare (type fixnum n nv))
@@ -551,7 +547,6 @@
   "跳过 NaN 的 argmax/argmin 内核。返回 fixnum 向量。
    全 NaN 切片 → 报错（对标 numpy 的 ValueError: All-NaN slice encountered）。"
   (%cx-dispatch data d zero
-    (declare (ignore zero))
     (flet ((better (acc v)
              (or (null acc)
                  (if (eq op :nanargmax) (%clt acc v) (%cgt acc v)))))
@@ -719,8 +714,7 @@
     (with-float-safe
       (%cx-dispatch ad s zero
         (%cx-dispatch vd w zero2
-          (declare (ignore zero2))
-          (let ((offset (the fixnum (1- m))))
+            (let ((offset (the fixnum (1- m))))
             (loop for k fixnum from (- offset) below n
                   for i fixnum from 0
                   do (let ((sum zero))

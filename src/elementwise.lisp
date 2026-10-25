@@ -91,7 +91,6 @@
                (lambda (x)
                  (or (vt-int-dtype-p (vt-dtype x))
                      (member (vt-dtype x) '(:uint8 :uint16)))))
-             (dts (mapcar #'vt-dtype all))
              ;; 弱标量（NEP 50）：Lisp 标量只贡献「种类」，不参与宽度判定。
              ;; 于是 (vt-/ f32-数组 2) 保持 float32（numpy 同），而
              ;; (vt-/ int-数组 2) 仍是 float64（数组本身是整型）。

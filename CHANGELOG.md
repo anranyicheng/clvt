@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-10-25（二十五）— 第二十五轮：`STYLE-WARNING` 清零 79→4 + 门禁收紧
+
+**行为变化**：无（全是编译期声明与门禁，运行期语义逐位不变）。
+
+**门禁**：编译体检从「只看 `WARNING`」收紧到「`STYLE-WARNING` 必须全部命中
+白名单」。判据不是「总数 ≤ 4」（会被「一条消失 + 一条新增」绕过），而是
+「两类各自条数钉死 + 总数 == 两类之和」，任何第 5 条直接 FAIL。
+
+**79 → 4 的构成**：
+
+| 类别 | 条数 | 处置 |
+|---|---:|---|
+| `%cx-dispatch` 的 `ZERO`（unused + `IGNORE for outer scope` + `reading an ignored`） | 38 | 调用点的 `(declare (ignore zero))` 改为宏内 `(ignorable ,zero)` |
+| 散落的未使用绑定（`run`/`dts`/`fn-name`/`keepdims`/`ob-s1`/`l-s0`/`v-data`/`m`/`dt`/`what`/`copy`/`assume-unique`/`k`/`j` 等） | 26 | 删除绑定、或按语义补 `ignore`/`ignorable`（4 处是「声明了 ignore 却又读取」的反向错误） |
+| **无效的** `declaim inline`（声明晚于调用点） | 5 | 去掉声明（`%nan-p` / `vt-p` / `%copy-default-rng` / `parse-subscript-tokens`）—— 留着只会告警，内联本来就不生效 |
+| 零散 `never used`（`axisc` 等赋值后不读） | 6 | 改 `ignorable` 或删赋值 |
+| 结构性、留白名单 | 4 | 3 × `&OPTIONAL and &KEY`（`vt-where`/`vt-clip`/`vt-clamp` 的位置参数形态）+ 1 × `VT-P` 布局提示 |
+
+**顺带的一个负结果**：本想做 U9（排序族换 LSD 基数排序），先写原型实测 ——
+IEEE754 单调键 + 两半 u32 + 8 趟 8 bit，1M double 上 **107 ms/4 趟**
+（8 趟约 200 ms），比现有自底向上归并的 **130 ms 更慢**。原因两条：64 位键在
+SBCL 上是 bignum（必须拆两半），且每趟都要把「键 + 值」两条流按 256 个桶散写。
+结论写进 §16.37 的 U9，避免下一轮重复这条路。
+
+**测试**：`run-tests.sh` 的编译体检段重写（白名单判据 + 失败时打印全部
+STYLE-WARNING 上下文）。套件数与断言数不变，59/59 全绿。
+
+---
+
 ## 2026-10-25（二十四）— 第二十四轮：`atanh` 内核化 + 反三角族内联提速 3~5 倍
 
 **行为变化**：有，且是**修错**（极点被算成有限值）。

@@ -968,7 +968,6 @@
    POSINF/NEGINF 缺省为对应 dtype 的最大/最小有限值（对齐 numpy）。
    COPY 仅作 API 兼容（本库不改输入，恒返回新张量）。:out 契约同 vt-abs。
    示例：(vt-nan-to-num '(nan inf -inf 1.0)) => [0.0 1.797e308 -1.797e308 1.0]"
-  (declare (ignore copy))
   (when (%cx-any-p tensor)
     (return-from vt-nan-to-num (%cx-op-nan-to-num tensor :copy copy :nan nan :posinf posinf :neginf neginf :out out :dtype dtype)))
   (let* ((v (ensure-vt tensor))
@@ -1415,6 +1414,7 @@
    结果沿 AXISC 轴放置。AXIS 给定时等价 axisa=axisb=axisc=axis。
    示例：(vt-cross '(1 2 3) '(4 5 6)) => [-3 6 -3]
         (vt-cross '(1 2) '(4 5))     => -3"
+  (declare (ignorable axisc))   ; 结果轴暂固定为末轴；AXISC 仅作 API 兼容
   (let* ((av (ensure-vt a)) (bv (ensure-vt b)))
     (when axis (setf axisa axis
 		     axisb axis
@@ -1645,7 +1645,6 @@
    返回与 ELEMENT 形状相同的布尔张量（dtype :int8，1/0）。
    INVERT=t 取反；ASSUME-UNIQUE 为性能提示（本库忽略，语义等价）。
    示例：(vt-isin '(1 2 3 4) '(2 4)) => [0 1 0 1]"
-  (declare (ignore assume-unique))
   ;; v0.4.2 性能修复：与 vt-in1d 共用哈希会员判定（原 O(n×m) 线性 member，
   ;; 1M×1k 实测 87 秒）。
   (when (%cx-any-p element test-elements)

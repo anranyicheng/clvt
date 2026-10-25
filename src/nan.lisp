@@ -114,7 +114,10 @@
 ;;; 用于 vt-map / vt-reduce / vt-numpy-sort / vt-unique 等已 with-float-safe 的热路径。
 ;;; ------------------------------------------------------------------
 
-(declaim (inline %nan-p %inf-p %pos-inf-p %neg-inf-p %nan-or-inf-p))
+(declaim (inline %inf-p %pos-inf-p %neg-inf-p %nan-or-inf-p))
+;; %NAN-P 不列入：它在更早加载的文件里已有调用点（in-package 之前的工具层），
+;; 再 DECLAIM INLINE 只会得到「2 calls were previously compiled」告警，
+;; 且对那两处无效；后续调用点本来就已编译在 with-float-safe 的快判里。
 
 ;;; 类型声明（性能）：四个谓词分别只在 double-float / single-float 上被调用，
 ;;; 返回恒为 boolean。声明后调用点不再需要把结果当 T 装箱，也可被内联进
