@@ -220,14 +220,22 @@
 ;;; D. 护栏
 ;;; ==================================================================
 
+(defun us-now ()
+  "微秒分辨率时钟。**不要**用 GET-INTERNAL-REAL-TIME：它在 SBCL 上只有
+   1ms 的 tick（INTERNAL-TIME-UNITS-PER-SECOND = 1000），比 tick 短的操作
+   一律量成 0 —— `vt-amax` float64 1M 约 0.8ms，会被量成 0，于是
+   「c128 / f64 倍率」的分母落到下限 0.05，护栏偶发报 60x 假失败。"
+  (multiple-value-bind (s u) (sb-ext:get-time-of-day)
+    (+ (* s 1000000) u)))
+
 (defun ms-of (thunk &key (runs 2))
   (let ((best most-positive-fixnum))
     (dotimes (_ (1+ runs))
       (sb-ext:gc :full t)
-      (let ((t0 (get-internal-real-time)))
+      (let ((t0 (us-now)))
         (funcall thunk)
-        (setf best (min best (- (get-internal-real-time) t0)))))
-    (/ (* 1000.0d0 best) internal-time-units-per-second)))
+        (setf best (min best (- (us-now) t0)))))
+    (/ best 1000.0d0)))
 
 (defun test-guardrails ()
   (let* ((n 1000000)

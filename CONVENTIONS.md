@@ -1418,6 +1418,14 @@ numpy 2.x 对复数定义了**字典序**（先实部，实部相等再比虚部
    —— 出现一行就说明某个内核放晚了 N 个调用点，逐条消除。本库当前为 0 条
    `%cx-*` 命中（另有 3 条与复数无关：`vt-p` / `%copy-default-rng` /
    `parse-subscript-tokens`）。
+   **探测器有盲区**：它只抓「符号**已存在**、inline 声明迟到」的情形。
+   若内核**根本没定义**就被 `(function %cop-xxx)` 引用（`%cop-sign` /
+   `%cop-sinc` / `%cop-expm1` / `%cop-log1p` 原住在 `complex-ops.lisp`，
+   而调用点在更早的 `extensions3` / `elementwise2`），编译期只当普通函数调用，
+   **一条告警都不会有**。这类只能靠静态扫描：
+   `(文件加载顺序, (function KERNEL) 引用位置, KERNEL 的 defun 位置)` 三元组，
+   定义晚于引用即是缺陷（实测 1M complex128：`vt-sign` 104 → 26 ms）。
+   `test/complex-elementary-test.lisp` 的 D 段是它的回归网。
 
 > **`%gather-*` 的偏移契约**：`vt-contiguous` 对「已经连续」的输入**原样返回**，
 > 而 `narrow` / `flip` 出来的视图可能 offset 非零却仍满足连续判定
@@ -1598,6 +1606,50 @@ matmul 仍保留**独立专用内核**（`%cx-matmul`，`vt-contiguous` 落地�
 - `sqrt`/`abs` 含 `hypot` 与除法 → 4~6× 属正常（numpy 亦然）；
 - `matmul` 实数有 SIMD/并行内核，复数目前是标量三重循环 → 39× 是**下一步**（见 16.17）；
 - `exp` 走 CL 的复数 exp（内部含 sin/cos），5× 属正常。
+
+#### 16.14.4 复数初等函数：**不要**把 CL 的复数超越函数当内核
+
+CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语义也基本正确，
+但它们走 SBCL 的通用复数算术路径，单价 200 ns~1.1 µs/元素 —— 比同形实数慢
+10~50 倍。判据只有一条：**复数超越函数的内核必须用分量式重写，不得直接回调 CL**。
+
+实测（1M complex128，SBCL 2.6.8；同形 float64 作对照）：
+
+| 算子 | CL 回退 | 分量内核 | 相对 float64（修前 → 修后） |
+|---|---:|---:|---:|
+| `log` | 352 ms | **55 ms** | 43× → 6.7× |
+| `log2` | 354 ms | **96 ms** | 44× → 12× |
+| `log10` | 357 ms | **97 ms** | 40× → 12× |
+| `log1p` | 383 ms | **65 ms** | — |
+| `sign` | 104 ms | **26 ms** | 40× → 10× |
+| `sinc` | 218 ms | **81 ms** | — |
+| `expm1` | 116 ms | **58 ms** | — |
+
+**分量式的代价点**（每条都是踩过的坑）：
+
+1. **模必须走 `%cop-abs`，不能写 `(sqrt (+ (* x x) (* y y)))`**。后者在
+   |x| > 1e154 时上溢成 Inf —— 与 `%cop-sqrt` 里同一处教训。`%cop-abs` 已带
+   量级守卫（`< 1d150` 走快路，否则 `%cx-hypot`）。
+2. **NaN 判定的优先级高于 Inf**。`log(Inf+NaNj)` 在 numpy 是 `Inf+NaNj`
+   （模为 Inf 时相位无意义），若先判 `%cx-nan-p` 就退化成 `NaN+NaNj` ——
+   实测 441 点网格里正是这两格不一致。
+3. **相位必须用 `(atan y x)`（atan2），不能用 `(phase z)`**：`phase` 对
+   `x = -0.0` 的符号零处理与 numpy 不同，`log(-0+0i)` 会丢掉 π。
+4. **内核要 `declaim inline`，且声明必须早于 `defun`**（§16.14.2 第 2 条）。
+   `%cop-log` 内联前后是 199 ms / 55 ms —— 差的那 144 ms 全是「每元素一次
+   真实函数调用 + 内核在独立编译单元里按泛型 NUMBER 编」。
+
+**验收方式**：`test/complex-elementary-test.lisp` 的 441 点网格（21 实部 ×
+21 虚部，含 ±0 / ±1e-8 / ±1 / ±1d300 / ±Inf / NaN）× 5 个算子与 numpy 2.4.6
+逐点对拍。用容差 1e-9 比数值、按**类别**比特殊值（NaN 只与 NaN 相等、Inf 比
+符号），期望值由 `test/gen_complex_elementary_expected.py` 生成。
+
+> **尚未内核化的 6 个**（`tan` / `tanh` / `asin` / `acos` / `asinh` / `acosh`）
+> 仍走 CL 回退。它们在同一网格上与 numpy 有 67~92 处不一致（合 481/4410），
+> 全部落在**分支切割的符号零**与**NaN 输入**上 —— 实测 `vt-asin` 遇到含 NaN
+> 虚部的输入会直接抛 `(DOUBLE-FLOAT 0.0)` 类型错误。属**已有的静默错值**，
+> 不是这次改动引入的；重写它们需要逐函数复刻 numpy 的 Kahan 分支，已登记为
+> §16.37 的 U10。**改这六个之前必须先跑通这张网格**，否则只是把错值换个位置。
 
 ---
 ### 16.15 与 numpy 的已知差异清单（全部为**有意**保留）
@@ -3074,6 +3126,7 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U7 | 复数 nan 族剩余的「多趟」成本 | `nansum` 5 / `nanmean` 13 / `nanvar` 28 / `nanstd` 30 / `nanmax` 22 ms（原 35~88 ms，`vt-where` 特化后）；`nan-to-num` 54 ms 仍偏慢 | 剩下的成本是「掩码 + 计数 + 归约」各自一趟：`nanmean` = isnan + where + sum + logical-not + astype + sum + div + where，约 7 趟全量遍历。要再压需要把「掩码计数 + 求和」合成单趟内核（`%nan-sum-count`），收益约 2×，但会让 nan 族脱离通用算子组合、失去「语义只有一处」的性质 —— 先登记不取 |
 | U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | 1M：`sort` f64 130 / c128 181；`argsort` 158 / 284；`median` 25 / 208；numpy 同机 5.9 / 83 / 19 / 100 / — / —。c64 与 c128 耗时几乎相同 ⇒ **不是带宽受限**，而是归并每次比较的分支不可预测（随机数据上约 15 周期 × 20M 次 ≈ 100 ms） | 要再压须换 LSD 基数排序（numpy 对 f64 即是）。复数 = 「先按虚部一次稳定基数、再按实部一次稳定基数」；NaN 必须映到最大键值（负数 NaN 翻转后会跑到最前）。属算法替换而非缺陷修复，需单独一轮 + 与现实现逐位对拍 |
 | U4 | 编译期 `STYLE-WARNING` 尚不拦截 | 现有 96 条（unused-variable 类）；`WARNING` 已由 §16.34.2 的门禁拦死 | 先逐条清到 0，再把门禁从 `WARNING` 收紧到 `STYLE-WARNING`；否则一次性收紧会让门禁长期红 |
+| U10 | **6 个复数超越函数仍走 CL 回退**：`tan` / `tanh` / `asin` / `acos` / `asinh` / `acosh` | 1M complex128：`tan` 203 / `tanh` 192 / `asin` 915 / `acos` 876 / `asinh` 949 / `acosh` 866 ms（同形 float64 13~22 ms）；与 numpy 2.4.6 的 441 点网格（含 ±0/±Inf/NaN/±1d300）比对，不一致 **481/4410**：`tan` 92、`tanh` 92、`asin` 70、`acos` 72、`asinh` 70、`acosh` 67 | **两件事，别混**：①性能靠分量式（§16.14.4 的四条代价点），②正确性靠复刻 numpy 的 Kahan 分支。已试并**回滚**的方向：`asin = -i·log(iz+sqrt(1-z²))` 与 `asin = -i·log(iz+sqrt(1+z)·sqrt(1-z))` 两版在 441 点上分别有 386/386 处不一致（大 |z| 处主值支选取不同）；`tanh = (tanh x + i tan y)/(1+i·tanh x·tan y)` 有 232 处（`|y|` 巨大时 numpy 走 `copysign(0,y)` 的极限分支）。下一步：逐函数对照 numpy 的 `npy_ctanh` / `npy_casin` 源码分支，并把「y=±0 的符号零」作为独立用例。**注意 `vt-asin` 目前对含 NaN 虚部的输入会抛类型错误**（`(DOUBLE-FLOAT 0.0)`），这是应当优先修的硬缺陷 |
 
 > **已关闭**（保留在此仅为说明它们不再是待办）：einsum 复数、复数归约多轴
 > `axis` 元组、LU/SVD/特征值/百分位、`.npy` 复数互操作、`ComplexWarning`
@@ -3083,7 +3136,12 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 > 490→303 ms，下标归并 + 只算一次序）、**复数比较与谓词**
 > （`vt-=` 60→4 ms、`vt-<` 45→5 ms、`vt-isnan` 25→1 ms，根因是标志内核
 > 定义在 `complex.lisp`、编译早于它的 `elementwise2` 只能用函数调用 ——
-> 即 §16.8.1 第 4 条）。
+> 即 §16.8.1 第 4 条）、**复数 `log` 族的分量内核**（352→55 ms，同时修掉
+> `log(-0±0i)` 丢失 π 相位的静默错值，见 §16.14.4）、**四个「被晚加载文件
+> 调用」的逐元素内核前移**（`%cop-sign` / `%cop-sinc` / `%cop-expm1` /
+> `%cop-log1p`：`vt-sign` 104→26 ms、`vt-sinc` 218→81 ms、
+> `vt-expm1` 116→58 ms、`vt-log1p` 383→65 ms —— 与上一条同源但**不触发**
+> 编译期探测器，见 §16.8.1 第 4 条的「盲区」）。
 > 编年史见 `HISTORY.md`，各轮摘要见 `CHANGELOG.md`。
 
 ---

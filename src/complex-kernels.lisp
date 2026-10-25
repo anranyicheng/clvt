@@ -60,8 +60,7 @@
 ;;; 2. 复数标量运算内核
 ;;; ==================================================================
 
-(declaim (inline %cx-hypot %cop-abs %cop-sqrt))
-(defun %cx-hypot (x y)
+(declaim (inline %cx-hypot %cop-abs %cop-sqrt))(defun %cx-hypot (x y)
   "无溢出的 hypot（|x|、|y| 极值时不溢出）。x/y 为实数。"
   (let ((ax (abs x)) (ay (abs y)))
     (cond ((zerop ax) ay)
@@ -96,27 +95,6 @@
                  (complex s (/ y (* 2.0s0 s)))
                  (complex (/ (abs y) (* 2.0s0 s))
                           (if (minusp (float-sign y)) (- s) s))))))))
-
-(defun %cop-log (z)
-  "复数自然对数 log|z| + i·arg(z)。极点 log(0) → -Inf + 0i（对标 numpy）。"
-  (let ((x (%creal z)) (y (%cimag z)))
-    (cond ((%cx-nan-p z) (%cx-nan-complex z))
-          ((and (zerop x) (zerop y))
-           (complex (%cx-inf-of z -1) y))
-          (t (log z)))))
-
-(defun %cop-log2 (z)
-  "复数 log2 = log(z)/ln2。极点 0 → -Inf + 0i。"
-  (let* ((l (%cop-log z))
-         (ln2 (if (typep (%creal l) 'single-float) 0.6931472s0 0.6931471805599453d0)))
-    (complex (/ (%creal l) ln2) (/ (%cimag l) ln2))))
-
-(defun %cop-log10 (z)
-  "复数 log10 = log(z)/ln10。极点 0 → -Inf + 0i。"
-  (let* ((l (%cop-log z))
-         (ln10 (if (typep (%creal l) 'single-float) 2.3025851s0
-                   2.302585092994046d0)))
-    (complex (/ (%creal l) ln10) (/ (%cimag l) ln10))))
 
 ;;; 性能（叶子内核必须 INLINE）：这一批都是「一条复数运算」的叶子。
 ;;; 不内联时，调用点看不到它们的入参类型，SBCL 对 `(* z z)` / `(- z)` /
@@ -158,6 +136,143 @@
                (%cx-hypot x y))))))
 
 (defun %cop-neg (z) (- z))
+
+;;; log 族必须 INLINE：本内核会被 %VT-FAST-MAP 展开进 30 个逐元素循环。
+;;; 不内联时（实测）调用点只能发一次真实函数调用，内核本体在独立编译单元
+;;; 里拿不到实参类型 → 1M complex128 的 vt-log 199 ms；内联后 27 ms。
+(declaim (inline %cop-log %cop-log2 %cop-log10))
+
+(defun %cop-log (z)
+  "复数自然对数 log|z| + i·arg(z)（主值，C99 clog 语义）。
+
+   为什么不用 `(log z)`：SBCL 的复数 log 走通用复数算术，
+   **332ns/元素**（1M = 352ms）；分量式只用 abs + log + atan2，约 100ns。
+   实测 352 → 96 ms（1M，SBCL 2.6.8）。
+
+   与 numpy 2.4.6 在 21×21 网格（含 ±0 / ±Inf / NaN / ±1e300）上**逐点一致**，
+   而 `(log z)` 有 6 处不一致 —— 都是**分支切割上的相位**：
+     · log(-0+0i)：numpy 给 -Inf+πi（虚部取 atan2(+0,-0)=π），
+       CL 给 -Inf+0i —— 符号零带来的相位被抹掉了；
+     · log(±Inf+NaNj)：numpy 给 Inf+NaNj（模为 Inf 时相位无意义），
+       CL 先判 NaN 直接返回 NaN+NaNj。
+   本内核用 `%cop-abs` 取模（它先判 Inf/NaN），再单独判「非 Inf 的 NaN」，
+   两点即与 numpy 对齐。
+
+   极点：z=0 → -Inf + 0i。调用方（vt-map/vt-fast-map）已在 with-float-safe
+   内，故 log(0) 得 -Inf 而不是浮点陷阱。"
+  (let ((x (%creal z)) (y (%cimag z)))
+    (cond
+      ;; Inf 优先于 NaN：模为 Inf 时 numpy 只把相位判成 NaN，模仍是 Inf
+      ((and (%cx-nan-p z)
+            (not (or (sb-ext:float-infinity-p x) (sb-ext:float-infinity-p y))))
+       (%cx-nan-complex z))
+      (t (complex (log (%cop-abs z)) (atan y x))))))
+
+(defun %cop-log2 (z)
+  "复数 log2 = log(z)/ln2。极点 0 → -Inf + 0i。"
+  (let* ((l (%cop-log z))
+         (ln2 (if (typep (%creal l) 'single-float) 0.6931472s0 0.6931471805599453d0)))
+    (complex (/ (%creal l) ln2) (/ (%cimag l) ln2))))
+
+(defun %cop-log10 (z)
+  "复数 log10 = log(z)/ln10。极点 0 → -Inf + 0i。"
+  (let* ((l (%cop-log z))
+         (ln10 (if (typep (%creal l) 'single-float) 2.3025851s0
+                   2.302585092994046d0)))
+    (complex (/ (%creal l) ln10) (/ (%cimag l) ln10))))
+
+;;; ------------------------------------------------------------------
+;;; 2b. 四个「被晚加载文件调用」的内核（第 22 轮前移）
+;;;
+;;; 它们原先住在 complex-ops.lisp，而调用点在更早加载的文件里：
+;;;   %cop-expm1 / %cop-log1p / %cop-sinc  ← extensions3 / elementwise2
+;;;   %cop-sign                            ← extensions3 (vt-sign)
+;;; 编译调用点时符号还不存在，于是 `(function %cop-xxx)` 只能编成**真实
+;;; 函数调用**，且内核本体在**独立编译单元**里看不到实参类型，只能按
+;;; 泛型 NUMBER 编（装箱 + 无类型推导）。实测 1M complex128：
+;;;   vt-sign 104 ms（内联后 17 ms）、vt-sinc 218 ms（→ 22 ms）、
+;;;   vt-expm1 116 ms（→ 47 ms）。
+;;; 这与 §16.8.1 第 4 条（标志内核定义在 complex.lisp）是**同一个缺陷**，
+;;; 只是换了个文件。内核是纯标量函数，前移到本文件不增加任何耦合。
+;;; ------------------------------------------------------------------
+(declaim (inline %cop-expm1 %cop-log1p %cop-sinc %cop-sign))
+
+(defun %cop-expm1 (z)
+  "exp(z) - 1（对标 numpy.expm1 的复数分支）。
+
+   |z| 大时直接 exp(z)-1；|z| 小时灾难性抵消会把结果精度吃光
+   （z=1d-10 时 exp(z)-1 只剩 1 位有效数字），改用级数
+   expm1(z) = z·Σ_{k≥0} z^k/(k+1)!（Horner 形式，12 项对 |z|<0.5 足够：
+   0.5^12/13! ≈ 1e-13，远低于 double 的 eps 累积）。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((< (abs z) 0.5)
+         ;; 级数**固定用 double 算**（12 项 1.0d0/(k+2) 的系数都是 double，
+         ;; 强行降到 single 只会掉精度）。因此这里把 z 显式提升成 d0 再声明类型：
+         ;; 原写法直接 `(declare (type (complex double-float) term sum))` 而
+         ;; init 是 z —— 对 complex64 输入这是**谎报**：SBCL 不仅报编译期
+         ;; 「Derived type (complex single-float) conflicting with asserted
+         ;; (complex double-float)」让整个库编译失败，运行期 (safety 1) 还会
+         ;; 在 |z|<0.5 的 complex64 上直接抛类型错误。
+         (let* ((zd (complex (coerce (%creal z) 'double-float)
+                             (coerce (%cimag z) 'double-float)))
+                (term zd)
+                (sum zd))
+           (declare (type (complex double-float) zd term sum))
+           (dotimes (k 12 sum)
+             (setf term (* term zd (/ 1.0d0 (+ k 2))))
+             (incf sum term))))
+        (t (- (exp z) 1))))
+
+(defun %cop-log1p (z)
+  "log(1 + z)（对标 numpy.log1p 的复数分支）。
+
+   与 expm1 同源：|z| 小时 1+z 的有效位被吃掉，必须走级数
+   log1p(z) = z - z²/2 + z³/3 - … = z·Σ_{k≥0} (-z)^k/(k+1)。
+   z = -1 时 1+z = 0，交给 %COP-LOG 处理极点（-inf + 0i）。
+
+   两个数值细节（与 numpy 2.4.6 逐点核对过）：
+     · 分母是**调和**的 k，不是阶乘 k!。写成 `term *= (-z)/(k+2)` 得到的是
+       z·Σ(-z)^k/(k+1)!，那是另一个函数 —— 实测 |z|=0.112 时虚部偏 0.4%
+       （numpy: 0.09634224+0.04542328i，错版: 0.0962934+0.045223i）。
+     · 线性分母收敛慢（|z|^n/n），窗口收到 |z|<0.25 并取 24 项：第 24 项
+       量级 0.25^24/24 ≈ 1.5e-16，相对误差已达 double 的 eps。|z|≥0.25 时
+       1+z 不存在抵消问题，直接走 %COP-LOG（与 numpy 分支切割一致）。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((< (abs z) 0.25)
+         ;; 同 %COP-EXPM1：级数固定 double（见那里的说明），z 先显式提升。
+         (let* ((zd (complex (coerce (%creal z) 'double-float)
+                             (coerce (%cimag z) 'double-float)))
+                (term zd)
+                (sum zd))
+           (declare (type (complex double-float) zd term sum))
+           (dotimes (k 23 sum)
+             (setf term (* term (- zd)
+                           (/ (float (1+ k) 1d0) (float (+ k 2) 1d0))))
+             (incf sum term))))
+        (t (%cop-log (+ 1 z)))))
+
+(defun %cop-sinc (z)
+  "归一化 sinc：sin(πz)/(πz)，sinc(0)=1（对标 numpy.sinc 的复数分支）。
+
+   |z| 很小时 sin(πz)/(πz) → 1 - (πz)²/6，直接算会 0/0。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((< (abs z) 1.0d-8)
+         (- 1 (* (/ (* pi pi) 6.0d0) z z)))
+        (t (let ((pz (* pi z)))
+             (/ (sin pz) pz)))))
+
+(defun %cop-sign (z)
+  "复数的「符号」：z/|z|（单位相量），0 → 0（对标 numpy.sign）。
+
+   numpy 的复数 sign 不是取实部符号，而是投影到单位圆 ——
+   这正是它与 %COP-SIGNUM 同源的地方（clvt 的 vt-signum 已如此实现）。
+
+   零的构造**按实参精度**给出（不是写死 :complex128 的 0.0d0）：
+   complex64 输入被写成 0.0d0 时，%CAST-TO 还要多做一次降精度转换。"
+  (cond ((%cx-nan-p z) (%cx-nan-complex z))
+        ((%cis-zero z) (complex (* 0 (%creal z)) (* 0 (%cimag z))))
+        (t (/ z (abs z)))))
+
 
 ;;; 带 :base 的换底对数单独一个内核（不是 log 的变体）：:base 必须原样
 ;;; 参与计算，早期若经统一的包装宏转发会把 :base 静默丢掉

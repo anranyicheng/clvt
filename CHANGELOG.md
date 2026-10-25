@@ -4,6 +4,68 @@
 
 ---
 
+## 2026-10-25（二十二）— 第二十二轮：复数 `log` 族内核化 + 四个「晚加载」内核前移
+
+**行为变化**：有，且是**修错**（`log` 在分支切割上的相位）。其余为执行路径。
+
+| 场景 | 修前 | 修后 |
+|---|---|---|
+| `log(-0+0i)` | `-Inf + 0i` | **`-Inf + πi`**（= numpy） |
+| `log(-0-0i)` | `-Inf - 0i` | **`-Inf - πi`** |
+| `log(Inf+NaNj)` | `NaN + NaNj` | **`Inf + NaNj`** |
+
+**性能**（1M complex128，SBCL 2.6.8，同进程 3 次取最优）：
+
+| 场景 | 修前 | 修后 | 同形 float64 |
+|---|---:|---:|---:|
+| `vt-log` | 352 ms | **55 ms** | 8 ms |
+| `vt-log2` | 354 ms | **96 ms** | 8 ms |
+| `vt-log10` | 357 ms | **97 ms** | 9 ms |
+| `vt-log1p` | 383 ms | **65 ms** | — |
+| `vt-sign` | 104 ms | **26 ms** | 2.6 ms |
+| `vt-sinc` | 218 ms | **81 ms** | — |
+| `vt-expm1` | 116 ms | **58 ms** | — |
+
+**两处根因**（都不是算法问题）：
+
+1. **`%cop-log` 直接回调 CL 的 `(log z)`**。SBCL 的复数 log 走通用复数算术，
+   332 ns/元素；分量式 `log|z| + i·atan2(y,x)` 只需 abs + log + atan2。
+   顺带修掉三处相位错值 —— 根因是 CL 的 `log` 先判 NaN 再用自己的 `phase`，
+   把「模为 Inf」与「符号零决定的相位」两种情况都抹平了。改法要点：模走
+   `%cop-abs`（带量级守卫，避免 `x²` 上溢）、Inf 判定优先于 NaN、
+   相位用 `atan` 两参版（`phase` 对 `-0.0` 的处理与 numpy 不同）。
+   **`%cop-log` 还必须 `declaim inline`**：内联前后是 199 / 55 ms。
+2. **四个逐元素内核被晚加载的文件定义**。`%cop-expm1` / `%cop-log1p` /
+   `%cop-sinc` / `%cop-sign` 原住在 `complex-ops.lisp`，而调用点
+   （`extensions3` 的 `vt-sign`/`vt-expm1`/`vt-log1p`、`elementwise2` 的
+   `vt-sinc`）**先于它**编译。符号在编译调用点时还不存在 → `(function …)`
+   编成真实函数调用，内核本体被独立编译成「泛型 NUMBER」版本。
+   前移到 `complex-kernels.lisp` 即回到内联快路径。
+   **注意这类缺陷 `Proclaiming … to be INLINE, but N calls …` 探测器抓不到**
+   （它只抓「符号已存在、声明迟到」），只能静态扫描加载顺序 —— 已写进
+   `CONVENTIONS.md` §16.8.1 第 4 条的「盲区」。
+
+**同时量清了另一件事**：剩下 6 个复数超越函数（`tan`/`tanh`/`asin`/`acos`/
+`asinh`/`acosh`）仍走 CL 回退，在同一张 441 点网格上与 numpy 有 **481/4410**
+处不一致（其中 `vt-asin` 对含 NaN 虚部的输入会**直接抛类型错误**）。
+其中 67~92 处/函数落在「分支切割的符号零」与 NaN 输入上 —— 属已有静默错值，
+不是本轮引入。试过两版 `asin` 与一版 `tanh` 分量式，均**更差**（386/386/232
+处不一致），已回滚并把数据写进 §16.37 的 U10，避免下一轮重复踩。
+
+**测试**：新增 `complex-elementary-test`（68 断言 = 441 点网格 × 5 算子与
+numpy 2.4.6 逐点对拍 + 分支切割/极点/NaN 组合的显式断言 + dtype/shape/`:out`/
+`:base`/空数组契约 + 4 个前移内核的标量参考回归 + 四条倍率护栏）。
+期望值由 `test/gen_complex_elementary_expected.py` 生成。
+
+**顺带修掉测试侧的一个既有缺陷**：`cx-reduce-where-test` 的 `ms-of` 用
+`get-internal-real-time` 计时，而它在 SBCL 上只有 **1ms tick** ——
+比 tick 短的操作（`vt-amax` float64 1M 约 0.8ms）一律量成 0，护栏的分母
+落到下限 0.05，于是「c128/f64 ≤ 8x」偶发报 **60x 假失败**（实测 3 次里 2 次）。
+两套件统一换成 `sb-ext:get-time-of-day`（µs 分辨率）。
+新契约见 `CONVENTIONS.md` §16.14.4、§16.8.1（盲区）。
+
+---
+
 ## 2026-10-24（二十一）— 第二十一轮：归约 / 掩码选择，三处「类型被推断放宽」
 
 **行为变化**：无（唯一可见差异是 `vt-where` 的分配不再先清零，结果值不变）。

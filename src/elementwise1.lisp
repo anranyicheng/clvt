@@ -141,7 +141,9 @@
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-LOG")))
         (if base
             (vt-map (lambda (z) (%cop-log-base z base)) in :out out :dtype dt)
-            (vt-map #'%cop-log in :out out :dtype dt)))))
+            ;; 无 base 是常见情形：走 vt-fast-map 的内联循环（原先误用 vt-map，
+            ;; 每元素一次 funcall + 泛型 aref —— %cop-log 在白名单里也白搭）。
+            (vt-fast-map (function %cop-log) in :out out :dtype dt)))))
   (let ((dt (%infer-float-dtype vt dtype)))
     (cond
       ((null base)

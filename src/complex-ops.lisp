@@ -902,80 +902,16 @@
 ;;; 因此内部只用免屏蔽快判 %CX-NAN-P。白名单登记在
 ;;; map-reduce.lisp 的 +cx-inline-ops+（未登记则走 vt-map 兜底，语义相同）。
 
-(declaim (inline %cop-expm1 %cop-log1p %cop-sinc %cop-sign))
-
-(defun %cop-expm1 (z)
-  "exp(z) - 1（对标 numpy.expm1 的复数分支）。
-
-   |z| 大时直接 exp(z)-1；|z| 小时灾难性抵消会把结果精度吃光
-   （z=1d-10 时 exp(z)-1 只剩 1 位有效数字），改用级数
-   expm1(z) = z·Σ_{k≥0} z^k/(k+1)!（Horner 形式，12 项对 |z|<0.5 足够：
-   0.5^12/13! ≈ 1e-13，远低于 double 的 eps 累积）。"
-  (cond ((%cx-nan-p z) (%cx-nan-complex z))
-        ((< (abs z) 0.5)
-         ;; 级数**固定用 double 算**（12 项 1.0d0/(k+2) 的系数都是 double，
-         ;; 强行降到 single 只会掉精度）。因此这里把 z 显式提升成 d0 再声明类型：
-         ;; 原写法直接 `(declare (type (complex double-float) term sum))` 而
-         ;; init 是 z —— 对 complex64 输入这是**谎报**：SBCL 不仅报编译期
-         ;; 「Derived type (complex single-float) conflicting with asserted
-         ;; (complex double-float)」让整个库编译失败，运行期 (safety 1) 还会
-         ;; 在 |z|<0.5 的 complex64 上直接抛类型错误。
-         (let* ((zd (complex (coerce (realpart z) 'double-float)
-                             (coerce (imagpart z) 'double-float)))
-                (term zd)
-                (sum zd))
-           (declare (type (complex double-float) zd term sum))
-           (dotimes (k 12 sum)
-             (setf term (* term zd (/ 1.0d0 (+ k 2))))
-             (incf sum term))))
-        (t (- (exp z) 1))))
-
-(defun %cop-log1p (z)
-  "log(1 + z)（对标 numpy.log1p 的复数分支）。
-
-   与 expm1 同源：|z| 小时 1+z 的有效位被吃掉，必须走级数
-   log1p(z) = z - z²/2 + z³/3 - … = z·Σ_{k≥0} (-z)^k/(k+1)。
-   z = -1 时 1+z = 0，交给 %COP-LOG 处理极点（-inf + 0i）。
-
-   两个数值细节（与 numpy 2.4.6 逐点核对过）：
-     · 分母是**调和**的 k，不是阶乘 k!。写成 `term *= (-z)/(k+2)` 得到的是
-       z·Σ(-z)^k/(k+1)!，那是另一个函数 —— 实测 |z|=0.112 时虚部偏 0.4%
-       （numpy: 0.09634224+0.04542328i，错版: 0.0962934+0.045223i）。
-     · 线性分母收敛慢（|z|^n/n），窗口收到 |z|<0.25 并取 24 项：第 24 项
-       量级 0.25^24/24 ≈ 1.5e-16，相对误差已达 double 的 eps。|z|≥0.25 时
-       1+z 不存在抵消问题，直接走 %COP-LOG（与 numpy 分支切割一致）。"
-  (cond ((%cx-nan-p z) (%cx-nan-complex z))
-        ((< (abs z) 0.25)
-         ;; 同 %COP-EXPM1：级数固定 double（见那里的说明），z 先显式提升。
-         (let* ((zd (complex (coerce (realpart z) 'double-float)
-                             (coerce (imagpart z) 'double-float)))
-                (term zd)
-                (sum zd))
-           (declare (type (complex double-float) zd term sum))
-           (dotimes (k 23 sum)
-             (setf term (* term (- zd)
-                           (/ (float (1+ k) 1d0) (float (+ k 2) 1d0))))
-             (incf sum term))))
-        (t (%cop-log (+ 1 z)))))
-
-(defun %cop-sinc (z)
-  "归一化 sinc：sin(πz)/(πz)，sinc(0)=1（对标 numpy.sinc 的复数分支）。
-
-   |z| 很小时 sin(πz)/(πz) → 1 - (πz)²/6，直接算会 0/0。"
-  (cond ((%cx-nan-p z) (%cx-nan-complex z))
-        ((< (abs z) 1.0d-8)
-         (- 1 (* (/ (* pi pi) 6.0d0) z z)))
-        (t (let ((pz (* pi z)))
-             (/ (sin pz) pz)))))
-
-(defun %cop-sign (z)
-  "复数的「符号」：z/|z|（单位相量），0 → 0（对标 numpy.sign）。
-
-   numpy 的复数 sign 不是取实部符号，而是投影到单位圆 ——
-   这正是它与 %COP-SIGNUM 同源的地方（clvt 的 vt-signum 已如此实现）。"
-  (cond ((%cx-nan-p z) (%cx-nan-complex z))
-        ((zerop z) (%cx-complex-zero-of :complex128))
-        (t (/ z (abs z)))))
+;;; ---- 12.1 值级内核（**已前移**）------------------------------------
+;;; %COP-EXPM1 / %COP-LOG1P / %COP-SINC / %COP-SIGN 四个内核原先定义在这里，
+;;; 但调用点（extensions3 的 vt-expm1/vt-log1p/vt-sign、elementwise2 的
+;;; vt-sinc）在加载顺序上**早于**本文件 —— 编译调用点时符号还不存在，
+;;; `(function %cop-xxx)` 只能编成真实函数调用，内核本体也被独立编译成
+;;; 「泛型 NUMBER」版本（1M complex128：vt-sign 104 ms，内联后 17 ms）。
+;;; 第 22 轮按 §16.14.2 第 2 条把它们移到 src/complex-kernels.lisp（纯标量
+;;; 内核，无状态、无张量依赖），本文件不再保留任何定义。
+;;; 为什么不是"在本文件里 declaim inline"：inline 声明只在**编译调用点之前**
+;;; 可见才生效，而调用点已经编译过了 —— 声明永远迟到。
 
 ;;; ---- 12.2 clip / clamp：字典序夹取（numpy 语义）-------------------
 ;;; numpy 的 clip 实现是 `np.minimum(np.maximum(a, lo), hi)`，

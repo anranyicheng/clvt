@@ -1484,3 +1484,131 @@ c64（8 字节）176 ms 与 c128（16 字节）181 ms 几乎一样 → **不是�
 > 写这套测试时又踩了「字典序」：先按直觉把 `amin{(1+2i),(0+9i),(2+0i)}` 写成
 > `1+2i`，实际最小是 `0+9i`（实部优先）。§16.8 那句「字典序不是任意一致的全序」
 > 值得每个写测试的人读一遍。
+
+---
+
+### H.3.16 第二十二轮：复数 `log` 族为什么慢 43 倍 —— 以及一次「差点写错」的教训
+
+#### 一、起点不是「猜」，是巡检比值
+
+沿用第十九/二十轮的方法：对同一算子跑 float64 与 complex128（同元素数 1M），
+把比值打出来。这一遍扩到 45 个算子，26 个比值 ≥ 4，最高两个是
+`log` **42.4×**、`sign` **40.3×**。这两个数都不在 §16.14.3 的已知表里
+（那张表只覆盖 `add/mul/div/sqrt/exp/abs/sum/cumsum/sort/matmul`），
+说明它们从未被量过。
+
+第一个动作是**先量 CL 基线**，而不是先改代码：
+
+| 写法（1M，手写循环） | 耗时 |
+|---|---:|
+| `(log z)` CL 复数 | 329 ms |
+| `(complex (log (sqrt (+ x² y²))) (atan y x))` | 88 ms |
+| `(complex (log (hypot x y)) (atan y x))` | 54 ms |
+| 库内 `vt-log`（走 CL） | 352 ms |
+
+结论明确：**352 ms 里 329 ms 是 CL 自己的复数 log**，不是我们的调度或装箱。
+于是问题变成「分量式能不能既快又和 numpy 一致」。
+
+#### 二、一张 441 点网格，把「快」和「对」同时钉住
+
+只比速度很容易写出更快的错代码。这里先建网格：21 个实部 × 21 个虚部，
+取值刻意包含 `±0.0`（符号零）、`±1e-8`、`±0.5`、`±1`、`±1.5`、`±2`、`±4`、
+`±1e300`、`±Inf`、`NaN`，从 numpy 2.4.6 导出期望值
+（`test/gen_complex_elementary_expected.py`），然后在 Lisp 侧逐点比。
+
+**网格立刻给出一个意外**：现有实现（CL 回退）在 `log` 上就有 6 处与
+numpy 不一致，`tan`/`tanh` 各 92 处，`asin`/`acos`/`asinh`/`acosh` 各 67~72 处，
+合计 **481/4410**。也就是说本轮之前，这些函数在分支切割与 NaN 输入上
+就已经和 numpy 有系统偏差 —— 只是没有测试盯着。其中：
+
+```
+log(-0+0i)：CL 给 -Inf+0i，numpy 给 -Inf+πi
+asin(-4-0i)：CL 给 -1.5708+2.0634i，numpy 给 -1.5708-2.0634i（切割上的虚部符号反了）
+```
+
+第二条是硬缺陷：`vt-asin` 遇到「虚部是 NaN」的输入直接
+`The value NaN is not of type (DOUBLE-FLOAT 0.0)` —— 一个既能被用户触发、
+又不是 Lisp 语义所要求的崩溃（`with-float-safe` 只屏蔽浮点陷阱，屏蔽不了
+SBCL 的 `DECODE-FLOAT` 类型断言）。
+
+#### 三、`%cop-log` 的三个必须
+
+改完分量式后网格从 6 处降到 0，靠的不是公式本身，而是三条细节：
+
+1. **模走 `%cop-abs`**。第一版写 `(sqrt (+ (* x x) (* y y)))`，
+   `z = 1e300+1e300i` 直接 `FLOATING-POINT-OVERFLOW` —— 和 `%cop-sqrt` 里
+   踩过的是同一个坑（`x²` 上溢）。`%cop-abs` 已带 `< 1d150` 的量级守卫。
+2. **Inf 判定必须早于 NaN**。`log(Inf+NaNj)` 在 numpy 是 `Inf+NaNj`
+   （模为 Inf 时相位无意义，但模本身仍是 Inf）；先判 `%cx-nan-p` 就退化成
+   `NaN+NaNj`。网格里正好这两格（#398/#419）报错，改过来即 0。
+3. **相位用 `(atan y x)`**。`(phase z)` 看起来等价，但它在 `x = -0.0` 上
+   丢掉符号零带来的 π —— `log(-0+0i)` 就错成 `-Inf+0i`。
+
+#### 四、`declaim inline` 的 144 ms，以及探测器的盲区
+
+把内核写对之后 `vt-log` 仍有 199 ms。用 `vt-map` / `vt-fast-map` / 手写循环
+三路对比：
+
+| 调用方式 | 耗时 |
+|---|---:|
+| `vt-map #'%cop-log`（闭包） | 210 ms |
+| `vt-fast-map #'%cop-log`（无内联声明） | 202 ms |
+| `vt-fast-map #'%cop-log`（加 `declaim inline`） | 55 ms |
+| 手写循环 + 分量公式 | 23 ms |
+
+`vt-fast-map` 与 `vt-map` 差不多，说明**快路径根本没进去**：不是白名单问题
+（`%cop-log` 一直在 `+cx-inline-ops+` 里），而是缺 `declaim inline` ——
+和 §16.14.2 第 2 条同一件事，只是这次漏在了 log 上。
+
+顺手把同族四个内核（`%cop-expm1` / `%cop-log1p` / `%cop-sinc` / `%cop-sign`）
+搬到 `complex-kernels.lisp`。它们原本住在 `complex-ops.lisp`，而调用点在
+更早加载的 `extensions3` / `elementwise2` 里 —— **编译调用点时符号还不存在**，
+`(function %cop-sign)` 只能编成真实函数调用，内核本体被独立编译成
+「泛型 NUMBER」版本。实测 `vt-sign` 104 ms，`vt-signum` 17 ms（同一个公式、
+只是内联与否），差距一目了然。
+
+> **一个探测器抓不到的盲区**：§16.8.1 第 4 条让我们盯
+> `Proclaiming X to be INLINE, but N calls …`，但那条告警只在「符号已存在、
+> inline 声明迟到」时出现。这里的四个内核**压根还没定义**，编译期只当普通
+> 函数调用，一条告警都不会有。补了一个静态扫描（文件加载顺序 ×
+> `(function KERNEL)` 引用点 × `defun` 位置），全库只剩 4 处命中，就是这四个。
+
+#### 五、回滚：`asin`/`tanh` 的两版更差的尝试
+
+既然 `asin` 是 915 ms（最慢的一个），顺手试了分量式：
+
+| 方案 | 441 点不一致数 |
+|---|---:|
+| 现状（CL 回退） | 70 |
+| `asin = -i·log(iz + sqrt(1-z²))` | 386 |
+| `asin = -i·log(iz + sqrt(1+z)·sqrt(1-z))` | 386 |
+| `tanh = (tanh x + i·tan y)/(1 + i·tanh x·tan y)` | 232 |
+
+都比现状差 —— 大 `|z|` 处（1e300）主值支选取与 numpy 不同，`|y|` 巨大时
+numpy 走 `copysign(0,y)` 的极限分支而不是公式。**两版都已回滚**，数据写进
+§16.37 的 U10，避免下一轮从零再试一遍。教训：这六个函数要复刻 numpy 的
+Kahan 分支（`npy_casin` / `npy_ctanh` 的源码分支），不是套恒等式。
+
+#### 六、测试
+
+新增 `test/complex-elementary-test.lisp`（68 断言）：
+
+| 组 | 内容 |
+|---|---|
+| A 网格 | 441 点 × 5 算子（log/log2/log10/sign/sinc）与 numpy 2.4.6 逐点对拍；sign/sinc 在 `\|分量\| ≥ 1e300` 处跳过并说明原因 |
+| B 语义 | `log(±0±0i)` 的极点与分支切割（按**位模式**比较，不吃容差）、负实轴主值、模为 Inf、NaN 组合传播、`sign`/`sinc` 极点 |
+| C 契约 | complex64 保持、2-D 形状、`:out` 复用、`log(:base 2) = log2`、空数组、整数输入走实数通路 |
+| D 前移内核 | `expm1`/`log1p`/`sinc`/`sign` 与标量参考一致 + complex64 结果 dtype 不被 `0.0d0` 常量拉回 complex128 |
+| E 护栏 | log c128/f64 ≤ 12×、sign ≤ 15×、log 绝对 < 150 ms、sign 绝对 < 60 ms |
+
+> **测试自身的一个既有缺陷也在这里暴露**：`cx-reduce-where-test` 的 `ms-of`
+> 用 `get-internal-real-time`，而 SBCL 的该时钟只有 1ms tick —— `vt-amax`
+> float64 1M 约 0.8ms，被量成 0，倍率护栏的分母落到 0.05 下限，于是
+> 「c128/f64 ≤ 8x」偶发报 60x。两次全绿、第三次红的间歇性失败**不是被测代码
+> 的问题**，是量尺的问题。两套件统一改用 `sb-ext:get-time-of-day`（µs）。
+
+> 写网格测试时踩了两个「自己写的坑」：`comp=` 里 `((floatp want) … nil)`
+> 少写了一个 `and`，把「want 是浮点」直接当成「不相等」，于是**每个点都失败**
+> 而打印出来的 got/want 一模一样；另一次是把 `1e300` 写成单精度字面量
+> （本库锁定 `*read-default-float-format*` 为 single-float）导致 reader 直接
+> 上溢。两处都由「测试全红但差异不可见」暴露，值得记一笔。
