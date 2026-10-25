@@ -990,6 +990,158 @@
          (dotimes (i n) (setf (aref data (+ base (* i stride))) (aref tmp i)))))
       (t (error "%cx-sort-fiber-strided: 非复数缓冲区 ~a" et)))))
 
+;;; ------------------------------------------------------------------
+;;; 10.5 顺序统计：quickselect（median / nanmedian 共用）
+;;;
+;;; 为什么需要它：取一个中位数只要 O(N)，而排序是 O(N log N)。此前的实现是
+;;; `(vt-sort flat)` 再按 `(floor n 2)` 取下标 —— 1M complex128 实测 **225 ms**，
+;;; 而同形 float64 走已有的 %SELECT-DOUBLE 只要 **28 ms**（8 倍差价全部来自
+;;; 「为了取一个元素排了整份数据」）。numpy 的复数 median 同样走 introselect。
+;;;
+;;; 三条设计与 %SELECT-DOUBLE 对齐，每条都对应一类**实测过**的真实输入：
+;;;
+;;;  1. **三分区**（<, =, >），不是 Lomuto 两分区。两分区在「大量重复值」上
+;;;     退化成一趟只剥掉 pivot 那一个元素。复数尤其危险：网格数据
+;;;     （实部、虚部都取自少数几个值）重复率极高。
+;;;  2. **三数取中 + 访问量上限 4N**。三分区在坏排列上仍会退化，累计访问
+;;;     超过 4N 就直接整段排序再取第 K 个，把最坏情况钉在 O(N log N)。
+;;;  3. **比较器不做 NaN 判定**。调用方在「收数那一趟」已经统计过 NaN 个数
+;;;     （%CX-FILL-FIBER 的返回值），有 NaN 就走 NaN 语义、根本到不了这里。
+;;;     若改用 %C-LEX-COMPARE，每次比较要判 4 个分量的 NaN，实测贵 1.9 倍。
+;;; ------------------------------------------------------------------
+
+(defmacro %def-cx-select-kernel (cmp-name sel-name ctype rtype)
+  "生成 CMP-NAME（字典序 -1/0/1，不判 NaN）与 SEL-NAME（就地 quickselect）。"
+  `(progn
+     (declaim (inline ,cmp-name))
+     (defun ,cmp-name (a b)
+       "字典序比较，返回 -1 / 0 / 1。**不做 NaN 判定**：调用方保证缓冲区无 NaN
+       （见 %CX-SELECT-IN 的前置条件）。"
+       (declare (type ,ctype a b) (optimize (speed 3) (safety 1)))
+       (let ((ar (%creal a)) (ai (%cimag a))
+             (br (%creal b)) (bi (%cimag b)))
+         (declare (type ,rtype ar ai br bi))
+         (cond ((< ar br) -1)
+               ((> ar br) 1)
+               ((< ai bi) -1)
+               ((> ai bi) 1)
+               (t 0))))
+
+     (defun ,sel-name (v n k)
+       "返回 V[0,N) 中第 K 小（0 基）的值；V 被就地重排（元素集合不变）。
+       前置条件：V 中**无 NaN**（见文件头注释第 3 条）。"
+       (declare (type (simple-array ,ctype (*)) v)
+                (type fixnum n k)
+                (optimize (speed 3) (safety 1)))
+       (labels ((swp (a b)
+                  (declare (type fixnum a b))
+                  (let ((tmp (aref v a))) (setf (aref v a) (aref v b) (aref v b) tmp))))
+         (let ((lo 0)
+               (hi (the fixnum (1- n)))
+               (visits 0)
+               (limit (the fixnum (* 4 n))))
+           (declare (type fixnum lo hi visits limit))
+           (loop
+             (when (>= lo hi) (return (aref v lo)))
+             ;; 三数取中：把中位数换到 LO 位当 pivot
+             (let ((mid (the fixnum (floor (+ lo hi) 2))))
+               (declare (type fixnum mid))
+               (when (plusp (,cmp-name (aref v mid) (aref v hi))) (swp mid hi))
+               (when (plusp (,cmp-name (aref v lo) (aref v hi))) (swp lo hi))
+               (when (plusp (,cmp-name (aref v mid) (aref v lo))) (swp mid lo)))
+             (let ((pivot (aref v lo))
+                   (lt lo)              ; [lo, lt)  < pivot
+                   (gt hi)              ; (gt, hi]  > pivot
+                   (i lo))
+               (declare (type fixnum lt gt i) (type ,ctype pivot))
+               (loop
+                 (when (> i gt) (return))
+                 (incf visits)
+                 (let ((c (,cmp-name (aref v i) pivot)))
+                   (cond ((minusp c) (swp lt i) (incf lt) (incf i))
+                         ((plusp c) (swp i gt) (decf gt))
+                         (t (incf i)))))
+               ;; 退化护栏：整段排序后直接取第 K 个（缓冲区仍含全部 N 个元素）
+               (when (> visits limit)
+                 (%cx-sort-fiber v 0 n)
+                 (return (aref v k)))
+               (cond ((< k lt) (setf hi (the fixnum (1- lt))))
+                     ((> k gt) (setf lo (the fixnum (1+ gt))))
+                     (t (return pivot))))))))))
+
+(%def-cx-select-kernel %cx-select-cmp-d %cx-select-f64
+    (complex double-float) double-float)
+(%def-cx-select-kernel %cx-select-cmp-s %cx-select-f32
+    (complex single-float) single-float)
+
+(defun %cx-select-in (buf n k)
+  "按 BUF 的元素类型分派到 quickselect，返回第 K 小（0 基）。
+   前置条件：BUF[0,N) 中无 NaN；N ≥ 1；0 ≤ K < N。"
+  (let ((et (array-element-type buf)))
+    (cond ((equal et '(complex double-float)) (%cx-select-f64 buf n k))
+          ((equal et '(complex single-float)) (%cx-select-f32 buf n k))
+          (t (error "%cx-select-in: 非复数缓冲区 ~a" et)))))
+
+(defun %cx-fill-fiber (dst src base stride n)
+  "把 SRC 中「起点 BASE、步长 STRIDE、长度 N」的 fiber 收到 DST[0,N)。
+   返回 **NaN 个数** —— 收数这一趟顺便数掉，省掉一次独立的 ISNAN 全扫描
+   （median 的调用点本来就要先判「整份数据有没有 NaN」）。"
+  (macrolet ((pull (ctype)
+               `(let ((d (the (simple-array ,ctype (*)) src))
+                      (o (the (simple-array ,ctype (*)) dst)))
+                  (declare (type fixnum base stride n)
+                           (optimize (speed 3) (safety 1)))
+                  (let ((nans 0))
+                    (declare (type fixnum nans))
+                    (if (= stride 1)
+                        (dotimes (i n)
+                          (let ((z (aref d (the fixnum (+ base i)))))
+                            (setf (aref o i) z)
+                            (when (%cx-nan-p z) (incf nans))))
+                        (dotimes (i n)
+                          (let ((z (aref d (the fixnum (+ base (* i stride))))))
+                            (setf (aref o i) z)
+                            (when (%cx-nan-p z) (incf nans)))))
+                    nans))))
+    (let ((et (array-element-type src)))
+      (with-float-safe
+        (cond ((equal et '(complex double-float)) (pull (complex double-float)))
+              ((equal et '(complex single-float)) (pull (complex single-float)))
+              (t (error "%cx-fill-fiber: 非复数缓冲区 ~a" et)))))))
+
+(defun %cx-compact-fiber (dst src base stride n)
+  "把 SRC 中「起点 BASE、步长 STRIDE、长度 N」的 fiber 的**非 NaN** 元素
+   紧收到 DST[0,M)，返回 M。
+
+   与 %CX-FILL-FIBER 的区别：这里丢弃 NaN（nanmedian 语义），那边计数后
+   原样保留。两者都做**类型特化**的写入 —— 用 `(array-element-type ...)`
+   在运行期决定的通用 AREF 会让 SBCL 走泛型路径（1M complex128 实测
+   多付约 28 ms，见 §16.14.6）。"
+  (macrolet ((pull (ctype)
+               `(let ((d (the (simple-array ,ctype (*)) src))
+                      (o (the (simple-array ,ctype (*)) dst)))
+                  (declare (type fixnum base stride n)
+                           (optimize (speed 3) (safety 1)))
+                  (let ((m 0))
+                    (declare (type fixnum m))
+                    (if (= stride 1)
+                        (dotimes (i n)
+                          (let ((z (aref d (the fixnum (+ base i)))))
+                            (unless (%cx-nan-p z)
+                              (setf (aref o m) z)
+                              (incf m))))
+                        (dotimes (i n)
+                          (let ((z (aref d (the fixnum (+ base (* i stride))))))
+                            (unless (%cx-nan-p z)
+                              (setf (aref o m) z)
+                              (incf m)))))
+                    m))))
+    (let ((et (array-element-type src)))
+      (with-float-safe
+        (cond ((equal et '(complex double-float)) (pull (complex double-float)))
+              ((equal et '(complex single-float)) (pull (complex single-float)))
+              (t (error "%cx-compact-fiber: 非复数缓冲区 ~a" et)))))))
+
 (defun %cx-sort-axis-inner (tensor axis &key index)
   "排序实现体（陷阱已由 %CX-SORT-AXIS 屏蔽）。
 
@@ -1076,15 +1228,9 @@
    只要有一个分量是 NaN，整个元素按「NaN」对待（median 要传播、nanmedian 要跳过）。"
   (or (%cx-nan-p (%creal z)) (%cx-nan-p (%cimag z))))
 
-(defun %cx-has-nan-p (data off stride count)
-  "沿 DATA 从 OFF 起、步长 STRIDE 取 COUNT 个元素，判断是否有 NaN。
-   ⚠ 内部用 `(= x x)` 判 NaN（%CX-NAN-P），调用方**必须**在
-   WITH-FLOAT-SAFE 里调用，否则开着 FP 陷阱时会抛 FLOAT-INVALID。"
-  (declare (type fixnum off stride count))
-  (with-float-safe
-    (loop for i of-type fixnum below count
-          for p of-type fixnum = (+ off (* i stride))
-          thereis (%cx-elem-nan-p (aref data p)))))
+;; 注：旧有的 `%CX-HAS-NAN-P`（单趟扫描判是否有 NaN）已删除 —— median 的
+;; 两条路径都需要「先收进缓冲」再 quickselect，而收数本来就要逐元素看一遍，
+;; 于是 NaN 计数并进了 %CX-FILL-FIBER / %CX-COMPACT-FIBER 的返回值，省掉一整趟。
 
 (defun %cx-op-median (tensor &key axis keepdims)
   "中位数（对标 numpy.median）。复数按字典序排序后取中位；
@@ -1109,40 +1255,52 @@
                                 (vt-dtype->lisp-type
                                  (vt-complex-real-dtype dt)))))
                 (complex nv nv))))
+     ;; 第 26 轮：两条路径都从「全排序」改成 **quickselect**。取中位数只需
+     ;; O(N)，排序是 O(N log N) —— 1M complex128 实测 225 ms → 38 ms。
+     ;; 注意三件事：
+     ;;   · 缓冲区必须**独立分配**：VT-RAVEL / VT-CONTIGUOUS 对连续输入是
+     ;;     零拷贝视图，就地重排会改到调用方的数据；
+     ;;   · NaN 判定与收数合成一趟（%CX-FILL-FIBER 的返回值），不再单独
+     ;;     调 %CX-HAS-NAN-P 扫一遍；
+     ;;   · 偶数长度要取两个顺序统计量，`%CX-SELECT-IN` 只重排不改元素集合，
+     ;;     所以同一缓冲区连调两次是安全的（第 K 小的**值**与排列无关）。
      (if (null axis)
          ;; ---------------- 全局归约（axis=nil ≡ 先 ravel）----------------
-         (let* ((flat (vt-ravel in))
-                (n (the fixnum (vt-size flat)))
+         (let* ((flat (%cx-flat in))
+                (rv (vt-ravel flat))
+                (n (the fixnum (vt-size rv)))
                 (out-shape (when keepdims (make-list rank :initial-element 1)))
-                (res (make-vt out-shape 0 :dtype dt)))
-           (let ((sd (vt-data flat))
-                 (so (the fixnum (vt-offset flat))))
-             (if (or (zerop n) (%cx-has-nan-p sd so 1 n))
-                 ;; numpy：整表含 NaN → 结果 NaN（不忽略）；本库实数路径同样返回 NaN
-                 (setf (aref (vt-data res) (vt-offset res)) (nan-elem))
-                 (let* ((sorted (vt-sort flat))
-                        (data (vt-data sorted))
-                        (o (the fixnum (vt-offset sorted)))
-                        (lo (the fixnum (floor (1- n) 2)))
-                        (hi (the fixnum (floor n 2))))
-                   ;; 平均值在 double 下算完再 cast：c64 的 res 元素类型是
-                 ;; (complex single-float)，直接 setf 会撞类型断言。
-                 (setf (aref (vt-data res) (vt-offset res))
-                         (if (= lo hi)
-                             (aref data (+ o lo))
-                             (vt-cast (* 0.5d0 (+ (aref data (+ o lo))
-                                                  (aref data (+ o hi))))
-                                      dt))))))
+                (res (make-vt out-shape 0 :dtype dt))
+                (rd (vt-data res))
+                (ro (the fixnum (vt-offset res))))
+           (if (zerop n)
+               (setf (aref rd ro) (nan-elem))
+               (let* ((buf (make-array n :element-type (array-element-type (vt-data rv))))
+                      (lo (the fixnum (floor (1- n) 2)))
+                      (hi (the fixnum (floor n 2))))
+                 (if (plusp (%cx-fill-fiber buf (vt-data rv) (vt-offset rv)
+                                            (first (vt-strides rv)) n))
+                     ;; numpy：整表含 NaN → 结果 NaN（不忽略）；实数路径同
+                     (setf (aref rd ro) (nan-elem))
+                     ;; 平均值在 double 下算完再 cast：c64 的 res 元素类型是
+                     ;; (complex single-float)，直接 setf 会撞类型断言。
+                     (setf (aref rd ro)
+                           (if (= lo hi)
+                               (%cx-select-in buf n lo)
+                               (vt-cast (* 0.5d0 (+ (%cx-select-in buf n lo)
+                                                    (%cx-select-in buf n hi)))
+                                        dt))))))
            res)
          ;; ---------------- 轴归约 ----------------
          (let* ((ax (vt-normalize-axis axis rank))
-                (sorted (vt-sort in :axis ax))
-                (n (nth ax (vt-shape sorted)))
+                ;; 只读视图（不再需要 vt-sort：排序结果本身已无用）
+                (flat (%cx-flat in))
+                (shape (vt-shape flat))
+                (n (nth ax shape))
                 (out-shape (%cx-keepdims-shape (vt-shape in) (list ax) keepdims))
                 (res (make-vt out-shape 0 :dtype dt))
-                (flat (%cx-flat sorted))
                 (data (vt-data flat))
-                (shape (vt-shape flat)))
+                (off (the fixnum (vt-offset flat))))
            (if (zerop n)
                ;; 空 fiber：numpy 给 NaN+NaN i，不是 0
                (let ((rd (vt-data res))
@@ -1155,19 +1313,24 @@
                    (%cx-fiber-starts shape ax)
                  (declare (ignore dim-ax))
                  (let ((vals (make-array (length starts)))
+                       (buf (make-array n :element-type (array-element-type data)))
                        (lo (the fixnum (floor (1- n) 2)))
-                       (hi (the fixnum (floor n 2))))
-                   (let ((nanv (nan-elem)))
-                     (loop for s across starts
-                           for i from 0
-                           do (setf (aref vals i)
-                                    (if (%cx-has-nan-p data s ax-stride n)
-                                        nanv   ; numpy：该 fiber 含 NaN → 该处 NaN
-                                        (if (= lo hi)
-                                            (aref data (+ s (* lo ax-stride)))
-                                            (* 0.5d0
-                                               (+ (aref data (+ s (* lo ax-stride)))
-                                                  (aref data (+ s (* hi ax-stride))))))))))
+                       (hi (the fixnum (floor n 2)))
+                       (nanv (nan-elem)))
+                   (declare (type fixnum lo hi))
+                   (loop for s across starts
+                         for i from 0
+                         do (setf (aref vals i)
+                                  ;; %CX-FIBER-STARTS 给的是 offset=0 布局下的
+                                  ;; 线性偏移，这里要补回视图自身的 OFFSET
+                                  (if (plusp (%cx-fill-fiber buf data (+ off s)
+                                                             ax-stride n))
+                                      nanv  ; numpy：该 fiber 含 NaN → 该处 NaN
+                                      (if (= lo hi)
+                                          (%cx-select-in buf n lo)
+                                          (* 0.5d0
+                                             (+ (%cx-select-in buf n lo)
+                                                (%cx-select-in buf n hi)))))))
                    (%cx-write-flat res vals dt))))))))))
 
 

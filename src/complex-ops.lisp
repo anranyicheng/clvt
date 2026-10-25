@@ -429,11 +429,11 @@
 ;;; ==================================================================
 ;;; numpy 语义（2.4.6 实测，见 §16.18 表）：
 ;;;   · nansum/nanprod 跳过 NaN，空归约区取单位元（0 / 1）；
-;;;   · nanmax/nanmin 跳过 NaN，**全 NaN 切片 → NaN+0j**（不报错）；
+;;;   · nanmax/nanmin 跳过 NaN，**全 NaN 切片 → NaN+NaNj**（不报错）；
 ;;;   · nanargmax/nanargmin 跳过 NaN，全 NaN 切片 → 报错；
 ;;;   · nanmean 保复数、nanvar/nanstd **恒实数**（|x-mean|² 的均值）；
 ;;;   · nanmedian 取字典序中位数（偶数个取中间两个的算术平均），
-;;;     全 NaN → NaN+0j。
+;;;     全 NaN → NaN+NaNj。
 ;;;
 ;;; 实现策略：用「掩码 + 单位元替换 + 既有复数归约内核」的向量化写法，
 ;;; 一次拿到所有 axis/keepdims 组合，且**复用已优化的内核**
@@ -478,12 +478,12 @@
         ;; sum / prod：单位元语义天然正确（全 NaN → 0 / 1），无需修补
         ((member op '(:sum :prod))
          (%cx-to-out raw out name))
-        ;; max / min：全 NaN 切片用 count==0 检测 → NaN+0j
+        ;; max / min：全 NaN 切片用 count==0 检测 → **NaN+NaNj**（numpy 同）
         ((member op '(:max :min))
          (let* ((cnt (vt-sum (vt-astype (vt-logical-not mask) rdt)
                              :axis axis :keepdims keepdims :dtype rdt))
                 (empty (vt-= cnt (vt-cast 0 rdt)))
-                (nanv (complex (%cx-nan-of raw) 0)))
+                (nanv (%cx-complex-nan-of dt)))
            (%cx-to-out (vt-where empty nanv raw :dtype dt) out name)))
         ;; mean：求和 / 计数；count==0 → NaN+NaNj
         (t
@@ -609,24 +609,32 @@
         (%cx-write-flat res vals :int64)))))
 
 ;;; ---- nanmedian ----------------------------------------------------
-(defun %cx-nan-median-fiber (data base stride n dt)
-  "一条 fiber 的中位数（跳过 NaN，字典序）。全 NaN → NaN+0j（numpy 语义）。"
-  (let ((tmp (make-array (max n 1) :element-type (array-element-type data)))
+(defun %cx-nan-median-fiber (data base stride n dt &optional tmp)
+  "一条 fiber 的中位数（跳过 NaN，字典序）。全 NaN / 空 fiber → NaN+NaNj
+   （numpy 的 nanmedian 在全 NaN 上也给 nan+nanj）。
+
+   TMP 是可选的复用缓冲区（长度 ≥ N）；不给就新分配。调用方在逐 fiber 循环里
+   应当传入同一个 TMP —— 否则每条 fiber 都要分配/清零一次。
+
+   v0.4.18：收数改走 %CX-COMPACT-FIBER（类型特化），取中位改走 %CX-SELECT-IN
+   （O(N) 而非 O(N log N)）。1M complex128 实测 216 → 34 ms。"
+  (let ((tmp (or tmp (make-array (max n 1) :element-type (array-element-type data))))
         (cnt 0))
     (declare (type fixnum cnt))
-    (dotimes (i n)
-      (let ((v (aref data (+ base (* i stride)))))
-        (unless (%cx-nan-p v)
-          (setf (aref tmp cnt) v)
-          (incf cnt))))
+    (setf cnt (%cx-compact-fiber tmp data base stride n))
     (cond
-      ((zerop cnt) (complex (%cx-nan-of (vt-cast 0 dt)) 0))
+      ;; 全 NaN / 空 fiber → NaN+NaNj（第 26 轮修正）。此前返回 **NaN+0j**，
+      ;; 而 numpy 2.4.6 的 nanmedian / nanmax / nanmin 在全 NaN 上都是
+      ;; `nan+nanj` —— 虚部那个 0 是「先取 nan，再补 0」的副产品，不是语义。
+      ((zerop cnt) (%cx-complex-nan-of dt))
       (t
-       (%cx-sort-fiber tmp 0 cnt)
+       ;; 第 26 轮：从「整段排序再取中位」改成 quickselect（O(cnt) vs O(cnt log cnt)）。
+       ;; 同一缓冲区连调两次是安全的：%CX-SELECT-IN 只重排，元素集合不变，
+       ;; 第 K 小的**值**与排列无关。1M complex128 216 ms → 见 §16.14.6。
        (if (oddp cnt)
-           (aref tmp (floor cnt 2))
-           (let ((a (aref tmp (1- (floor cnt 2))))
-                 (b (aref tmp (floor cnt 2))))
+           (%cx-select-in tmp cnt (floor cnt 2))
+           (let ((a (%cx-select-in tmp cnt (1- (floor cnt 2))))
+                 (b (%cx-select-in tmp cnt (floor cnt 2))))
              (* 0.5s0 (+ a b))))))))
 
 (defun %cx-nanmedian-multi (in axes keepdims out dtype)
@@ -643,7 +651,7 @@
 
 (defun %cx-op-nanmedian (tensor &key axis keepdims out dtype)
   "忽略 NaN 的中位数（复数）：按字典序；偶数个取中间两值均值。
-   全 NaN 切片 → NaN+0j（numpy 语义）。
+   全 NaN / 空 fiber → NaN+NaNj（numpy 的 nanmedian 同样给 nan+nanj）。
    本函数只做复数分支；公开入口在 reduce-stats.lisp 的单一 DEFUN 里分流（§16.32）。
    多轴（如 '(0 1)）由入口折叠成 2-D 后复用本函数的单轴分支（§16.35.2）。"
   (let ((in (ensure-vt tensor)))
@@ -673,6 +681,9 @@
            (multiple-value-bind (head dim ax-stride) (%cx-fiber-geom shape (car axes))
              (declare (type fixnum head dim ax-stride))
              (let ((vals (make-array (the fixnum (* head ax-stride))))
+                   ;; 逐 fiber 复用一个缓冲区：每条 fiber 都新分配/清零一次
+                   ;; 会让「多条短 fiber」的用例被分配器主导（§16.14.6）。
+                   (tmp (make-array (max dim 1) :element-type (array-element-type data)))
                    (k 0))
                (declare (type fixnum k))
                (dotimes (h head)
@@ -683,7 +694,7 @@
                      (declare (type fixnum ti))
                      (setf (aref vals k)
                            (%cx-nan-median-fiber data (+ src-off row ti)
-                                                 ax-stride dim dt))
+                                                 ax-stride dim dt tmp))
                      (incf k))))
                (%cx-write-flat res vals dt)
                res)))

@@ -176,9 +176,13 @@ case("nansum-all", "(vt-nansum CX-NA)", np.nansum(NA))
 case("nanprod-ax1", "(vt-nanprod CX-NA :axis 1)", np.nanprod(NA, axis=1))
 case("nanmax-ax1", "(vt-nanmax CX-NA :axis 1)", np.nanmax(NA, axis=1))
 case("nanmin-ax1", "(vt-nanmin CX-NA :axis 1)", np.nanmin(NA, axis=1))
+# 全 NaN 时 numpy 的 nanmax/nanmin 返回**输入里的某个 NaN 元素**（所有比较恒假，
+# 于是 np.max 落到第一个元素），所以结果里那个「非 NaN 分量」是输入带来的、
+# 不是语义。这里用本库自己的规范复数 NaN（NaN+NaNj，见 %CX-COMPLEX-NAN-OF）
+# 作输入，期望值才有意义：clvt 统一返回 NaN+NaNj（§16.15 的 D-S2）。
 case("nanmax-allnan",
-     "(vt-nanmax (vt-from-sequence (list (complex +vt-dfloat-nan+ 0.0d0) (complex +vt-dfloat-nan+ 0.0d0)) :dtype :complex128))",
-     np.nanmax(np.array([complex(NAN, 0), complex(NAN, 0)])))
+     "(vt-nanmax (vt-from-sequence (list (complex +vt-dfloat-nan+ +vt-dfloat-nan+) (complex +vt-dfloat-nan+ +vt-dfloat-nan+)) :dtype :complex128))",
+     np.nanmax(np.array([complex(NAN, NAN), complex(NAN, NAN)])))
 case("nanargmax-ax1", "(vt-nanargmax CX-NA :axis 1)", np.nanargmax(NA, axis=1))
 case("nanargmin-ax1", "(vt-nanargmin CX-NA :axis 1)", np.nanargmin(NA, axis=1))
 case("nanmean-ax1", "(vt-nanmean CX-NA :axis 1)", np.nanmean(NA, axis=1))

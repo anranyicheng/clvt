@@ -75,6 +75,7 @@ SUITES[einsum-gemm-layout-test]="36 einsum GEMM 布局归一化 (§16.26: NN/NT/
 SUITES[astype-cast-test]="663 vt-astype 转换矩阵与复数快路径测试 (100 格 10dtype×10dtype numpy 2.4.6 差分对照 + 契约断言(取实部/虚部补0/NaN·Inf→整数=0/符号零/rank-0/空张量/广播视图) + 转置·翻转·切片·广播视图与连续副本等价 + 性能护栏(复数转换 ≤8~10× 实数线, 优化前 17~41ms→1~4ms); 期望由 test/gen_astype_cast_expected.py 生成)"
 SUITES[order-stat-test]="266 顺序统计量正确性与退化护栏 (median/percentile/nanmedian 与「排序+位置公式」独立参照逐点一致(6 种分布×7 种规模×5 个分位点) + 重复值密集/已排序/逆序相对随机输入的倍率护栏；修复前后：全零 200k 10.7s→1ms、降序 400k 142ms→21ms)"
 SUITES[cx-extreme-argsort-test]="74 复数极值族与 argsort/topk 的正确性 + 倍率护栏 (maximum/minimum/fmax/fmin 与字典序独立参照逐点一致(16x16 值对 x 2 dtype), clip=min(max), 4 种布局(连续/广播/转置/步进)同语义, argsort 双射+非降序+稳定性+多轴, topk 与排序切片一致且下标回指; 修复前 1M: maximum 804ms→7ms, clip 1600→9ms, argsort 2115→283ms, topk 490→303ms);"
+SUITES[selection-test]="2170 顺序统计量的算法 (median/nanmedian 与 numpy 2.4.6 逐例对拍(1/2/3 维 x axis/keepdims，输入由整数取模公式生成、两边逐位相同) + topk 与 argsort 路径**逐位一致**(6 dtype x 并列/NaN x 1/2/3 维 x sorted=nil x 非连续) + 全 NaN/单分量 NaN 语义 + 倍率护栏; 1M: median c128 225->30ms, median c64 205->26, median c128 axis0 152->37, nanmedian c128 216->30, topk f64 k=10 174->2.2, topk c128 k=10 297->3.0)"
 SUITES[complex-elementary-test]="181 复数初等/三角/反三角/反双曲函数 (441 点网格(21 实部x21 虚部, 含 ±0/±Inf/NaN/±1d300) x log/log2/log10/sign/sinc/tan/tanh/asin/acos/asinh/acosh/atanh 与 numpy 2.4.6 逐点对拍 + 分支切割/极点/NaN 组合的显式断言(log(-0±0i)=-Inf±πi、atanh(±1±0i)=±Inf±0i、asin 对 NaN 虚部不再抛类型错误) + dtype/shape/:out/:base/空数组契约 + 4 个前移内核(sign/sinc/expm1/log1p)的标量参考回归 + 7 条倍率/绝对护栏; 1M complex128 累计: log 352->55ms, sign 104->26, tan 203->83, tanh 192->51, asin 915->112, acos 876->60, asinh 949->92, acosh 866->62, atanh 75->59; 441 点不一致 499->0)"
 SUITES[cx-reduce-where-test]="119 极值归约与掩码三元选择的正确性 + 倍率护栏 (vt-where 与逐元素参考一致(8 实数 dtype + 2 复数 dtype x 4 种掩码) + 广播/转置视图/:out 复用/参数配对; amax/amin 的 NaN 传播、单轴、c64/c128、空归约报错; 排序双缓冲乒乓的 1..1000 规模边界; 倍率护栏 where<=4x / amax<=8x; 修复前 1M: amax 41ms->3ms, where 32->5ms, nansum 35->5ms, nanvar 65->28ms)"
 SUITES[complex-ops-test]="128 复数数据搬运层测试 (97 项 numpy 2.4.6 差分对照: 转换/拼接/剪切/集合/nan 族/缩并/卷积 + dtype&shape 契约 + :out 硬契约 + 未支持组合报错 + 实数回归网; 期望由 test/gen_complex_ops_expected.py 生成)"
@@ -161,6 +162,7 @@ DEFAULT_ORDER=(
     cx-extreme-argsort-test
     cx-reduce-where-test
     complex-elementary-test
+    selection-test
     complex-linalg-test
     setops-axis-trace-test
     einsum-gemm-layout-test

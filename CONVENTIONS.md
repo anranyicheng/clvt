@@ -1717,6 +1717,76 @@ CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语�
 > `Re(1/z)`（`|x| = 1e300` 时 `atanh ≈ 1/x = 1e-300`，用
 > `0.5·(log|1+z| - log|1-z|)` 会因两个 1e300 相减得 0）。
 
+#### 16.14.6 顺序统计量：取中位用 quickselect，取 top-k 用有界堆
+
+`median` / `nanmedian` / `topk` 三个算子此前都是「先整份排序，再取需要的那几个」。
+两个都属**算法选错**，不是常数因子问题：
+
+- 取中位数只要 O(N)，排序是 O(N log N)；
+- 取前 k 个只要 O(N log k)，排序是 O(N log N)。
+
+**`median` / `nanmedian`（complex）**：早先复数分支直接 `(vt-sort flat)` 再取下标，
+而同形 float64 走的早就是 `%SELECT-DOUBLE`（quickselect）。1M complex128 实测
+**225 ms vs 28 ms（8 倍差价全部来自排序）**。新增 `%CX-SELECT-F64/F32`
+（`src/complex.lisp`），与 `%SELECT-DOUBLE` 三条设计逐条对齐：
+
+| 设计 | 理由 |
+|---|---|
+| **三分区**（<, =, >）而非 Lomuto 两分区 | 两分区在「大量重复值」上一趟只剥掉 pivot 一个元素。复数尤其危险：网格数据（实部虚部都取自少数几个值）重复率极高 |
+| **三数取中 + 访问量上限 4N** | 三分区在坏排列上仍会退化（整体降序且 k 居中时能跑 451 趟）；超限就整段排序，把最坏情况钉在 O(N log N) |
+| **比较器不判 NaN** | 调用方在收数那一趟已经数过 NaN（`%CX-FILL-FIBER` 的返回值），有 NaN 就走 NaN 语义、根本到不了 select。改用 `%C-LEX-COMPARE` 每次比较要判 4 个分量，实测贵 1.9 倍 |
+
+配套还有两个「少一趟」：
+
+1. **收数与 NaN 判定合成一趟**（`%CX-FILL-FIBER` 返回 NaN 个数），不再单独
+   调 `%CX-HAS-NAN-P` 全扫。
+2. **缓冲区必须独立分配**。`VT-RAVEL` / `VT-CONTIGUOUS` 对连续输入是零拷贝
+   视图，就地重排会改到**调用方的数据** —— 这个坑比慢更严重。
+3. `nanmedian` 的收数走 `%CX-COMPACT-FIBER`（丢弃 NaN 并紧收）。这里曾用
+   `(array-element-type data)` 在运行期决定的通用 `AREF`，SBCL 只能走泛型
+   路径，1M 元素多付约 **28 ms**；同一条语句类型特化后 216 → 30 ms 里有一半
+   是它。
+
+**`topk`**：原实现 `vt-argsort` 整份排序后切 k 个。改成**有界堆**
+（`%TOPK-HEAP-*`，`src/extensions.lisp`），要点：
+
+1. **必须与 argsort 路径逐位一致**（值 + 下标，含并列与 NaN）。所以比较器
+   不重新定义语义，而是复刻 `vt-sort` 的全序：非 NaN 按数值升序、**NaN
+   名次最高**（`%sort-fibers-*` 把 NaN 抽出来压末尾）、并列时按原下标升序。
+   于是 largest 的次序 = `flip(narrow(argsort, N-k, N))`，smallest =
+   `narrow(argsort, 0, k)`。回归测试用「同一份输入分别走堆与 argsort 比
+   值和下标序列」，而不是与 numpy 比 —— 后者测不出并列序的漂移。
+2. **堆根是「最差」的那个**，弹出顺序是「劣→优」，所以要**倒着填**输出
+   数组（`slot = k-1-j`）。第一版正着填，k=1 全过、k≥3 全错。
+3. **`flet` 换成 `labels`**：`SIFT` 要调同层的 `WORSE`/`BEATS-ROOT`，`flet`
+   里兄弟函数互不可见（表现为 `undefined function CLVT::WORSE` 的
+   STYLE-WARNING，而且编译仍"成功"）。
+4. **阈值 k ≤ 轴长/8** 才走堆。实测 1M double：k=10 174→2.2 ms、k=1000
+   183→2.9、k=100000（轴长 1/10）194→54、k=125000（1/8）65 ms；再往大
+   优势收窄，所以留着 argsort 兜底。k=0 与不支持的 dtype 也走 argsort。
+
+| 算子（1M c128 或 f64） | 修前 | 修后 |
+|---|---:|---:|
+| `median` complex128 | 225 ms | **30 ms** |
+| `median` complex64 | 205 ms | **26 ms** |
+| `median` c128 `:axis 0`（1000×1000） | 152 ms | **37 ms** |
+| `nanmedian` complex128 | 216 ms | **30 ms** |
+| `topk` f64 k=10 | 174 ms | **2.2 ms** |
+| `topk` f64 k=1000 | 183 ms | **2.9 ms** |
+| `topk` complex128 k=10 | 297 ms | **3.0 ms** |
+
+**顺带修掉的一处静默错值**：全 NaN / 空 fiber 的复数 `nanmedian` / `nanmax` /
+`nanmin` 此前返回 **NaN+0j**，numpy 是 **NaN+NaNj**（那个虚部 0 是「先取
+NaN 再补 0」的副产品，不是语义）。现在统一 NaN+NaNj。
+
+> **两处与 numpy 的已知差异**（都记在 §16.15）：
+> 1. `median` 遇到**单分量 NaN**（如 `nan+1j`）时，numpy 直接返回那个 NaN
+>    元素本身（它的 partition 在 NaN 上比较恒假，NaN 会停在 kth 位），本库
+>    统一返回 NaN+NaNj。两者都是「结果含 NaN」。
+> 2. **全 NaN fiber 沿轴归约**时 numpy 自己不一致：1-D / 展平给 `nan+nanj`，
+>    2-D 沿轴给 `nan+0j`。本库统一 `nan+nanj`（只有两个分量都是 NaN 才是
+>    「两边都不是数」）。
+
 ### 16.15 与 numpy 的已知差异清单（全部为**有意**保留）
 
 | 编号 | 差异 | 影响面 | 处置 |
@@ -1727,6 +1797,8 @@ CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语�
 | D-C4 | 打印保留 `1.0+2.0j`（numpy 为 `1.+2.j`） | 显示 | 沿用本库浮点风格 |
 | D-C5 | 复数逐元素算子无 SIMD/内联特化 | 性能 | 第二轮 |
 | D-C6 | ~~`einsum` / LU 家族~~ 已支持复数；**百分位/`sort` 的复数语义仅字典序** | 功能面 | 见 §16.10 与 §16.18 |
+| D-S1 | `median` 遇**单分量 NaN**（如 `nan+1j`）返回 `NaN+NaNj`；numpy 直接把那个 NaN 元素返回（它的 partition 在 NaN 上比较恒假，NaN 会停在 kth 位） | 值 | 文档声明；两者都是「结果含 NaN」。测试里钉死本库取值（`selection-test` 的 D 节） |
+| D-S2 | `nanmedian`/`nanmax`/`nanmin` 对**沿轴全 NaN 的 fiber** 返回 `NaN+NaNj`；numpy 这里返回 `nan+0j`，而 1-D/展平却返回 `nan+nanj` —— **numpy 自己不一致** | 值 | 本库统一 `nan+nanj`（只有两个分量都是 NaN 才是「两边都不是数」） |
 
 ---
 
@@ -1817,11 +1889,11 @@ python3 test/gen_complex_expected.py               # 重新生成期望值（num
 | 函数 | 全 NaN 切片 | dtype |
 |---|---|---|
 | `nansum` / `nanprod` | `0` / `1`（单位元） | 复数 |
-| `nanmax` / `nanmin` | `NaN+0j`（**不报错**） | 复数 |
+| `nanmax` / `nanmin` | `NaN+NaNj`（**不报错**） | 复数 |
 | `nanargmax` / `nanargmin` | **报错** `All-NaN slice encountered` | int64 |
 | `nanmean` | `NaN+NaNj` | 复数 |
 | `nanvar` / `nanstd` | `NaN` | **实数** |
-| `nanmedian` | `NaN+0j` | 复数 |
+| `nanmedian` | `NaN+NaNj` | 复数 |
 
 实现采用「掩码 + 单位元替换 + 既有复数归约内核」的向量化写法：
 `sum/prod/mean` 把 NaN 换成 0/1 后直接调 `vt-sum/vt-prod`；
@@ -3203,7 +3275,7 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U2 | `real/imag` 返回共享视图（D-C3） | 现在返回副本；numpy 的 `z.real` 是同一缓冲的零拷贝视图 | 需给 strided view 引入「分量视图」（`data` + 分量偏移 + 元素宽度/2），会动物理层，影响 `vt-write`/`vt-copy-into`/别名判定；风险高于收益 |
 | U3 | 复数逐元素算子的 SIMD 特化（D-C5） | §16.14.3 实测：`add` 1.8×、`mul` 2.3×、`sqrt` 4.0×、`abs` 6.5×（相对 float64） | 与 U1 同源；还需要先解决 `sb-simd` 的 shuffle 组装形式 |
 | U7 | 复数 nan 族剩余的「多趟」成本 | `nansum` 5 / `nanmean` 13 / `nanvar` 28 / `nanstd` 30 / `nanmax` 22 ms（原 35~88 ms，`vt-where` 特化后）；`nan-to-num` 54 ms 仍偏慢 | 剩下的成本是「掩码 + 计数 + 归约」各自一趟：`nanmean` = isnan + where + sum + logical-not + astype + sum + div + where，约 7 趟全量遍历。要再压需要把「掩码计数 + 求和」合成单趟内核（`%nan-sum-count`），收益约 2×，但会让 nan 族脱离通用算子组合、失去「语义只有一处」的性质 —— 先登记不取 |
-| U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | 1M：`sort` f64 130 / c128 181；`argsort` 158 / 284；`median` 25 / 208；numpy 同机 5.9 / 83 / 19 / 100 / — / —。c64 与 c128 耗时几乎相同 ⇒ **不是带宽受限**，而是归并每次比较的分支不可预测（随机数据上约 15 周期 × 20M 次 ≈ 100 ms） | 要再压须换 LSD 基数排序（numpy 对 f64 即是）。复数 = 「先按虚部一次稳定基数、再按实部一次稳定基数」；NaN 必须映到最大键值（负数 NaN 翻转后会跑到最前）。属算法替换而非缺陷修复，需单独一轮 + 与现实现逐位对拍。**已实测否决**：LSD 基数排序（IEEE754 单调键 + 两半 u32 + 8 趟 8 bit）在 1M double 上实测 **107 ms/4 趟**（8 趟约 200 ms），比现有自底向上归并的 130 ms **更慢** —— 原因是 64 位键在 SBCL 上是 bignum（必须拆两半）、且每趟都要把「键 + 值」两条流按 256 个桶散写。真要再压只能换 introsort（numpy 的 float 路径），但那**破坏稳定性**（`argsort` 的稳定契约要改）。保留现状 |
+| U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | `median`/`nanmedian` 已改 quickselect、`topk` 已改有界堆（见 §16.14.6）；**剩下的只有 `sort`/`argsort` 本身**：1M `sort` f64 140 / c128 199、`argsort` 158 / 284，numpy 同机 5.9 / 83 / 19 / 100。c64 与 c128 耗时几乎相同 ⇒ 不是带宽受限，而是归并每次比较的分支不可预测（随机数据约 15 周期 × 20M 次） | 要再压只能换算法，但 **LSD 基数排序已实测否决**（IEEE754 单调键 + 两半 u32 + 8 趟 8 bit，1M double 107 ms/4 趟、8 趟约 200 ms，比归并 130 ms 更慢：64 位键在 SBCL 上是 bignum 必须拆两半，且每趟要把「键+值」两条流按 256 个桶散写）。剩下的路只有 introsort（numpy 的 float 路径），但那**破坏 `argsort` 的稳定契约**。保留现状 |
 
 
 > **已关闭**（保留在此仅为说明它们不再是待办）：einsum 复数、复数归约多轴

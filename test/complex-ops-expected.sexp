@@ -61,7 +61,7 @@
   (:NAME "nanprod-ax1" :FORM "(vt-nanprod CX-NA :axis 1)" :VALUE ((:CX 11d0 2d0) (:CX 30d0 5d0)) :DTYPE :COMPLEX128 :SHAPE (2))
   (:NAME "nanmax-ax1" :FORM "(vt-nanmax CX-NA :axis 1)" :VALUE ((:CX 3d0 -4d0) (:CX 6d0 1d0)) :DTYPE :COMPLEX128 :SHAPE (2))
   (:NAME "nanmin-ax1" :FORM "(vt-nanmin CX-NA :axis 1)" :VALUE ((:CX 1d0 2d0) (:CX 5d0 0d0)) :DTYPE :COMPLEX128 :SHAPE (2))
-  (:NAME "nanmax-allnan" :FORM "(vt-nanmax (vt-from-sequence (list (complex +vt-dfloat-nan+ 0.0d0) (complex +vt-dfloat-nan+ 0.0d0)) :dtype :complex128))" :VALUE ((:CX :NAN 0d0)) :DTYPE :COMPLEX128 :SHAPE ())
+  (:NAME "nanmax-allnan" :FORM "(vt-nanmax (vt-from-sequence (list (complex +vt-dfloat-nan+ +vt-dfloat-nan+) (complex +vt-dfloat-nan+ +vt-dfloat-nan+)) :dtype :complex128))" :VALUE ((:CX :NAN :NAN)) :DTYPE :COMPLEX128 :SHAPE ())
   (:NAME "nanargmax-ax1" :FORM "(vt-nanargmax CX-NA :axis 1)" :VALUE (2 1) :DTYPE :INT64 :SHAPE (2))
   (:NAME "nanargmin-ax1" :FORM "(vt-nanargmin CX-NA :axis 1)" :VALUE (0 0) :DTYPE :INT64 :SHAPE (2))
   (:NAME "nanmean-ax1" :FORM "(vt-nanmean CX-NA :axis 1)" :VALUE ((:CX 2d0 -1d0) (:CX 5.5d0 0.5d0)) :DTYPE :COMPLEX128 :SHAPE (2))
