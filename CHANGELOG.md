@@ -4,6 +4,55 @@
 
 ---
 
+## 2026-10-25（二十三）— 第二十三轮：三角 / 反三角六族内核化（481 处错值归零）
+
+**行为变化**：有，且是**修错**（分支切割的符号零 + 一处直接崩溃）。
+
+| 场景 | 修前 | 修后（= numpy 2.4.6） |
+|---|---|---|
+| `asin(-4-0i)` | `-1.5708+2.0634i`（虚部符号反） | **`-1.5708-2.0634i`** |
+| `asin(0+NaNj)` | 抛 `NaN is not of type (DOUBLE-FLOAT 0.0)` | **`0+NaNj`** |
+| `acos(-4+Infi)` | `-8.0-Inf i`（把 `2x` 当结果） | **`π/2-Inf i`** |
+| `tanh(-4+Infi)` | `0.0+0.0i` | **`NaN+NaNj`** |
+| `acosh(0+NaNj)` | `NaN+NaNj` | **`NaN+π/2·i`** |
+
+**性能**（1M complex128，SBCL 2.6.8，同进程 3 次取最优）：
+
+| 算子 | 修前 | 修后 | 同形 float64 |
+|---|---:|---:|---:|
+| `vt-tan` | 203 ms | **84 ms** | 14 ms |
+| `vt-tanh` | 192 ms | **51 ms** | 17 ms |
+| `vt-asin` | 915 ms | **340 ms** | 20 ms |
+| `vt-acos` | 876 ms | **300 ms** | 20 ms |
+| `vt-asinh` | 949 ms | **317 ms** | 22 ms |
+| `vt-acosh` | 866 ms | **315 ms** | 22 ms |
+
+**根因**：CL 对这六个函数都有复数定义，SBCL 的实现走通用复数算术（单价
+200 ns~1.1 µs/元素），而且**在分支切割与 NaN 输入上与 numpy 系统性不一致** ——
+441 点网格（21 实部 × 21 虚部，含 ±0/±Inf/NaN/±1d300）上合计 **481/4410**：
+`tan` 92、`tanh` 92、`asin` 70、`acos` 72、`asinh` 70、`acosh` 67。
+其中「NaN 虚部 → 抛 `DECODE-FLOAT` 类型断言」是**崩溃**，不是错值。
+
+**做法**：逐分支照抄 numpy `npy_math_complex.c.src` ——
+`ctanh` 用 Kahan(1987)；`casinh`/`cacos` 共用 `_do_hard_work`
+（Hull-Fairgrieve-Tang）+ `_clog_for_large_values`；`casin` 由 `casinh`
+变换；`cacosh` 由 `cacos` 旋转；`ctan` 完全委托 `ctanh`。
+**上一轮试过并回滚的恒等式全部弃用**（`asin = -i·log(iz+sqrt(1-z²))` 两版各有
+386 处错、`tanh` 的 tan 形式 232 处）。
+
+**四个坑**（都写进了 §16.14.5）：`(1- y)` 是「y 减 1」不是「1 减 y」；
+`(- y y)` 在内联循环里会被代数化简成 0（NaN 要用常量）；
+「含 NaN」分支的外层条件只能是 `isnan(x)||isnan(y)`，写成「非双有限」会吞掉
+「x 有限 + y=±Inf」并返回 `2x`；`%cx-hypot` 对 `(Inf,Inf)` 得 NaN，
+`_clog_for_large_values` 用之前必须先判 Inf。
+
+**测试**：`complex-elementary-test` 68 → **164 断言**（网格从 5 算子扩到 11 个，
+加 §D2「NaN 输入不抛条件」的 72 条回归 + 3 条极点语义 + 3 条新护栏）。
+期望值由 `test/gen_complex_elementary_expected.py` 重新生成（441 × 11 点）。
+新契约见 `CONVENTIONS.md` §16.14.5；`atanh` 的 18 处遗留登记为 §16.37 的 U11。
+
+---
+
 ## 2026-10-25（二十二）— 第二十二轮：复数 `log` 族内核化 + 四个「晚加载」内核前移
 
 **行为变化**：有，且是**修错**（`log` 在分支切割上的相位）。其余为执行路径。

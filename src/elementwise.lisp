@@ -478,7 +478,7 @@ lambda 算子请使用 %%float-map-fn"))
     (return-from vt-tan
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-TAN")))
-        (vt-fast-map (function tan) in :out out :dtype dt))))
+        (vt-fast-map (function %cop-tan) in :out out :dtype dt))))
   (%float-map #'tan vt out (%infer-float-dtype vt dtype)))
 
 
@@ -522,7 +522,7 @@ lambda 算子请使用 %%float-map-fn"))
     (return-from vt-tanh
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-TANH")))
-        (vt-fast-map (function tanh) in :out out :dtype dt))))
+        (vt-fast-map (function %cop-tanh) in :out out :dtype dt))))
   (%float-map #'tanh vt out (%infer-float-dtype vt dtype)))
 
 
@@ -533,7 +533,7 @@ lambda 算子请使用 %%float-map-fn"))
     (return-from vt-asin
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ASIN")))
-        (vt-fast-map (function asin) in :out out :dtype dt))))
+        (vt-fast-map (function %cop-asin) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-asin-df %op-asin-sf vt out dt)))
 
@@ -544,7 +544,7 @@ lambda 算子请使用 %%float-map-fn"))
     (return-from vt-acos
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ACOS")))
-        (vt-fast-map (function acos) in :out out :dtype dt))))
+        (vt-fast-map (function %cop-acos) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-acos-df %op-acos-sf vt out dt)))
 
@@ -555,7 +555,7 @@ lambda 算子请使用 %%float-map-fn"))
     (return-from vt-asinh
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ASINH")))
-        (vt-fast-map (function asinh) in :out out :dtype dt))))
+        (vt-fast-map (function %cop-asinh) in :out out :dtype dt))))
   (%float-map #'asinh vt out (%infer-float-dtype vt dtype)))
 
 
@@ -566,7 +566,7 @@ lambda 算子请使用 %%float-map-fn"))
     (return-from vt-acosh
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ACOSH")))
-        (vt-fast-map (function acosh) in :out out :dtype dt))))
+        (vt-fast-map (function %cop-acosh) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-acosh-df %op-acosh-sf vt out dt)))
 

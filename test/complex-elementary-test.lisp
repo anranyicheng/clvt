@@ -137,7 +137,17 @@
                       (cons "log2" (cons 'log2 #'vt-log2))
                       (cons "log10" (cons 'log10 #'vt-log10))
                       (cons "sign" (cons 'sign #'vt-sign))
-                      (cons "sinc" (cons 'sinc #'vt-sinc)))))
+                      (cons "sinc" (cons 'sinc #'vt-sinc))
+                      ;; 三角 / 反三角族：第 23 轮内核化后与 numpy 逐点一致
+                      ;; （此前 tan 92、tanh 92、asin 70、acos 72、
+                      ;;  asinh 70、acosh 67 处不一致，且 asin 对 NaN 虚部
+                      ;;  直接抛类型错误）
+                      (cons "tan" (cons 'tan #'vt-tan))
+                      (cons "tanh" (cons 'tanh #'vt-tanh))
+                      (cons "asin" (cons 'asin #'vt-asin))
+                      (cons "acos" (cons 'acos #'vt-acos))
+                      (cons "asinh" (cons 'asinh #'vt-asinh))
+                      (cons "acosh" (cons 'acosh #'vt-acosh)))))
     (expect-equal "网格点数 441" (vt-size input) 441)
     (dolist (case cases)
       (let* ((name (car case))
@@ -317,6 +327,36 @@
                       (vt-dtype (funcall fn c64)) :complex64)))))
 
 ;;; ==================================================================
+;;; D2. 三角/反三角族：NaN 输入不抛条件（本轮修掉的硬缺陷）
+;;; ==================================================================
+(defun test-trig-nan-safety ()
+  (let ((nan +vt-dfloat-nan+))
+    ;; 整改前：vt-asin / vt-acos / vt-asinh / vt-acosh 对「虚部是 NaN」的
+    ;; 输入直接抛 `The value NaN is not of type (DOUBLE-FLOAT 0.0)`
+    ;; （SBCL 的 DECODE-FLOAT 类型断言，with-float-safe 屏蔽不了）。
+    (dolist (fn (list (cons "vt-asin" #'vt-asin) (cons "vt-acos" #'vt-acos)
+                      (cons "vt-asinh" #'vt-asinh) (cons "vt-acosh" #'vt-acosh)
+                      (cons "vt-tan" #'vt-tan) (cons "vt-tanh" #'vt-tanh)))
+      (dolist (z (list (complex 0d0 nan) (complex 1d0 nan) (complex nan 0d0)
+                       (complex nan 1d0) (complex 4d0 +vt-dfloat-pos-inf+)
+                       (complex +vt-dfloat-pos-inf+ 4d0)))
+        (expect-true (format nil "~a(~a) 不抛条件" (car fn) z)
+                     (handler-case (progn (scalar (cdr fn) z) t)
+                       (error () nil)))
+        (expect-true (format nil "~a(~a) 返回复数" (car fn) z)
+                     (complexp (scalar (cdr fn) z))))))
+  ;; 极点的显式语义（numpy 2.4.6 实测）
+  (expect-true "tanh(0+Infi) = 0+NaNj（不是 NaN+NaNj）"
+               (let ((got (scalar #'vt-tanh (complex 0d0 +vt-dfloat-pos-inf+))))
+                 (and (zerop (realpart got)) (sb-ext:float-nan-p (imagpart got)))))
+  (expect-true "asin(0+NaNj) = 0+NaNj"
+               (let ((got (scalar #'vt-asin (complex 0d0 +vt-dfloat-nan+))))
+                 (and (zerop (realpart got)) (sb-ext:float-nan-p (imagpart got)))))
+  (expect-true "acos(-4+Infi) 实部 = π/2（走 clog-large，不是 2x）"
+               (comp= (realpart (scalar #'vt-acos (complex -4d0 +vt-dfloat-pos-inf+)))
+                      1.5707963267948966d0 1d-12)))
+
+;;; ==================================================================
 ;;; E. 倍率护栏
 ;;; ==================================================================
 (defun test-guardrails ()
@@ -337,7 +377,17 @@
     (expect-true (format nil "log c128 绝对 < 150ms（实测 ~,1f，修前 352）" t-log-c)
                  (< t-log-c 150.0d0))
     (expect-true (format nil "sign c128 绝对 < 60ms（实测 ~,1f，修前 104）" t-sign-c)
-                 (< t-sign-c 60.0d0))))
+                 (< t-sign-c 60.0d0))
+    ;; 三角/反三角族（第 23 轮）：修前 tan 203 / tanh 192 / asin 915 ms
+    (let ((t-tanh-c (ms-of (lambda () (vt-tanh zc))))
+          (t-asin-c (ms-of (lambda () (vt-asin zc)))))
+      (expect-true (format nil "tanh c128/f64 倍率 ~,1fx ≤ 8x（修前 11.5x）"
+                           (/ t-tanh-c (max (ms-of (lambda () (vt-tanh zr))) 0.05d0)))
+                   (<= (/ t-tanh-c (max (ms-of (lambda () (vt-tanh zr))) 0.05d0)) 8.0d0))
+      (expect-true (format nil "tanh c128 绝对 < 120ms（实测 ~,1f，修前 192）" t-tanh-c)
+                   (< t-tanh-c 120.0d0))
+      (expect-true (format nil "asin c128 绝对 < 500ms（实测 ~,1f，修前 915）" t-asin-c)
+                   (< t-asin-c 500.0d0)))))
 
 (defun main ()
   (format t "~&=== 复数初等函数 / 内核前置 测试 ===")
@@ -345,6 +395,7 @@
   (test-special-semantics)
   (test-vector-contract)
   (test-hoisted-kernels)
+  (test-trig-nan-safety)
   (test-guardrails)
   (format t "~&~%通过: ~a  失败: ~a~%" *pass* *fail*)
   (when *failures*

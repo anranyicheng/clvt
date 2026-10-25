@@ -33,6 +33,14 @@ FUNCS = [
     ("log10", np.log10),
     ("sign", np.sign),
     ("sinc", np.sinc),
+    # 三角 / 反三角族（第 23 轮内核化）：这六个函数此前走 SBCL 的通用复数
+    # 实现，在分支切割与 NaN 输入上与 numpy 有 481/4410 处不一致。
+    ("tan", np.tan),
+    ("tanh", np.tanh),
+    ("asin", np.arcsin),
+    ("acos", np.arccos),
+    ("asinh", np.arcsinh),
+    ("acosh", np.arccosh),
 ]
 
 

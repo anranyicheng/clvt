@@ -51,14 +51,23 @@
     "(complex128 / complex64) 的 CL 元素类型。")
 
   (defparameter +cx-inline-ops+
-    '(+ - * / abs sqrt exp log log2 log10 sin cos tan asin acos atan
-      sinh cosh tanh asinh acosh atanh square reciprocal signum
+    '(;; 三角/反三角：**只走 %cop-***（第 23 轮内核化）。
+      ;; 裸名 `tan tanh asin acos asinh acosh` 已从白名单移除 ——
+      ;; 它们会展开成 SBCL 的通用复数实现（1M c128 慢 3~15 倍，且
+      ;; 在分支切割/NaN 上与 numpy 不一致，见 §16.14.5）。
+      %cop-tan %cop-tanh %cop-asin %cop-acos %cop-asinh %cop-acosh
+      ;; 保留走 CL 的这几个：实测与 numpy 逐点一致且单价可接受
+      ;; （sin/cos/exp 约 50/50/39 ms，sinh/cosh 同量级）
+      exp sin cos atan sinh cosh atanh
+      + - * / abs sqrt log log2 log10 square reciprocal signum
       %cop-sqrt %cop-log %cop-log2 %cop-log10 %cop-square %cop-recip
       %cop-signum %cop-abs %cconj %cop-neg
       ;; v1.3：补齐算子（复数的 expm1 / log1p / sinc / sign）
       %cop-expm1 %cop-log1p %cop-sinc %cop-sign
       ;; 极值族：vt-maximum / vt-minimum / vt-fmax / vt-fmin 的复数分支
       %cop-max %cop-min %cop-fmax %cop-fmin
+      ;; 三角/反三角内核：调用点全部在 (when (%cx-any-p …) …) 守卫之内
+      %cop-tan %cop-tanh %cop-asin %cop-acos %cop-asinh %cop-acosh
       %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
       %cx-nan-flag %cx-inf-flag %cx-finite-flag)
     "允许生成复数内联分支的算子白名单。
@@ -91,6 +100,8 @@
       %cop-expm1 %cop-log1p %cop-sinc %cop-sign
       ;; 极值族：调用点全部在 `(when (%cx-any-p …) …)` 守卫之内，实数进不来
       %cop-max %cop-min %cop-fmax %cop-fmin
+      ;; 三角/反三角内核：调用点全部在 (when (%cx-any-p …) …) 守卫之内
+      %cop-tan %cop-tanh %cop-asin %cop-acos %cop-asinh %cop-acosh
       ;; 复数比较 / 谓词内核：调用点全部在 `(when (%cx-any-p …) …)` 守卫之内，
       ;; 实数输入根本进不来
       %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag

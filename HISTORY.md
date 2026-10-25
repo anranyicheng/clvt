@@ -1612,3 +1612,85 @@ Kahan 分支（`npy_casin` / `npy_ctanh` 的源码分支），不是套恒等式
 > 而打印出来的 got/want 一模一样；另一次是把 `1e300` 写成单精度字面量
 > （本库锁定 `*read-default-float-format*` 为 single-float）导致 reader 直接
 > 上溢。两处都由「测试全红但差异不可见」暴露，值得记一笔。
+
+---
+
+### H.3.17 第二十三轮：三角 / 反三角六族 —— 为什么"套恒等式"是错的
+
+#### 一、上一轮已经把坑踩过了
+
+第二十二轮收尾时试过两版 `asin` 与一版 `tanh` 的分量式，分别有 386/386/232 处
+不一致，回滚并登记为 U10。这一轮把那张表当成路标：**不要从恒等式出发，
+从 numpy 的源码分支出发**。
+
+拉 `numpy/_core/src/npymath/npy_math_complex.c.src`，六个函数的关系是：
+
+```
+ctan   = -i·ctanh(i·z)            完全委托
+casin  = i·conj(casinh(i·conj z)) 完全委托
+cacosh = ±i·cacos                 取实部 ≥ 0
+casinh ┐
+cacos  ┴─ 共用 _do_hard_work + _clog_for_large_values
+ctanh  ──  Kahan(1987) + |x| ≥ 22 的渐近分支
+```
+
+也就是说只要把 `casinh`/`cacos`/`ctanh` 三个写对，另外三个是五行变换。
+`_do_hard_work` 是 Hull-Fairgrieve-Tang 的区域划分（`A_crossover = 10`、
+`B_crossover = 0.6417`、`FOUR_SQRT_MIN`），加上 `_f(a,b,h) = (hypot-b)/2`
+的无抵消形式 —— 这些常数和分支一个都不能省。
+
+#### 二、四次"看起来对但错"的经历
+
+写的过程里每个坑都表现为「网格上几十处错值」，而不是编译错误：
+
+1. **`(1- y)` 是「y 减 1」**。`_do_hard_work` 里同时有 `1+y`、`1-y`、`y+1`、
+   `y-1` 四种组合，我第一遍把 `1-y` 写成 `(1- y)`，`Am1` 少了一个 hypot 项，
+   `asinh(4+4i)` 的实部从 2.426 变 1.805，asinh/acos 各 77 处错。
+2. **`(- y y)` 会被代数化简成 0**。numpy 的 `return (y-y, y-y)` 用来造 NaN，
+   但在 `(speed 3)(safety 0)` 的内联循环里 SBCL 直接把 `x-x` 折成 0 ——
+   `tanh(-4+Infi)` 于是返回 `0+0i`。改用 `(%cx-nan-of z)`。
+3. **「非双有限」不能代替「含 NaN」**。`cacos` 的非有限段是
+   `if (isnan(x) || isnan(y)) { … }`，我写成 `(not (and (finite x) (finite y)))`，
+   于是「x 有限 + y=±Inf」也进了那段，返回 `(2x, ∓Inf)`：`acos(-4+Infi)` 给出
+   `-8.0-Inf i`。75 处错值。
+4. **`%cx-hypot` 对 `(Inf, Inf)` 得 NaN**。它是给 `%cop-sqrt`/`%cop-abs` 用的，
+   那两处在调它之前已经判过 Inf；`_clog_for_large_values` 直接用就
+   `inf/inf = NaN`，`log|z|` 变 NaN，`asin(±Inf±Infi)` 全错（4 个函数共 12 处）。
+
+#### 三、符号零：这一族真正的难点
+
+`y = ±0` 的符号位决定分支切割两侧的虚部符号，而 CL 的实现里 `phase`/`decode-float`
+一类的路径会把它抹平。numpy 的做法是**每个出口都 `copysign`**：
+`copysign(rx, x)`、`copysign(ry, y)`。我第一版把 `copysign(wy, y)` 写成
+`(if (minusp (float-sign y)) (- wy) wy)` —— 这是 `-copysign`，符号恰好反了，
+`asin(-4-0i)` 于是给出 `-1.5708+2.0634i`（正确是 `-1.5708-2.0634i`）。
+改成 `(if (minusp (float-sign src)) (- (abs mag)) (abs mag))` 之后归零。
+
+#### 四、验收
+
+441 点网格（21 实部 × 21 虚部，取值刻意含 `±0.0`、`±1e-8`、`±1`、`±2`、`±4`、
+`±1e300`、`±Inf`、`NaN`）上：
+
+| 算子 | 修前 | 修后 |
+|---|---:|---:|
+| `tan` / `tanh` | 92 / 92 | **0 / 0** |
+| `asin` / `acos` | 70 / 72 | **0 / 0** |
+| `asinh` / `acosh` | 70 / 67 | **0 / 0** |
+| `atanh` | 18 | 18（仍走 CL，登记 U11） |
+
+性能同时改善 2.4~3.8 倍（`tan` 203→84、`tanh` 192→51、`asin` 915→340、
+`acos` 876→300、`asinh` 949→317、`acosh` 866→315 ms）。
+
+#### 五、留下的事
+
+- **`atanh` 18 处**：`atanh(-1±0i)` 应是 `-Inf+0i`，CL 给 `-177.099+0.785i`
+  —— CL 把极点算成了有限值。glibc 的 `catanh` 也没有 Kahan 分支可抄，
+  要按 C99 的角例表自己写。
+- **反三角族仍慢**：300~340 ms vs float64 的 20 ms。瓶颈是
+  `_do_hard_work` 的 5 个返回值（多值返回在内联循环里会落栈），以及
+  `_clog_for_large_values` 未内联。可行的下一步是拆成两个单值函数。
+  两件都写进 §16.37 的 U11。
+
+> 又一次印证了第二十轮那句话：**这类问题没有"聪明的写法"，只有"照对的写"**。
+> 恒等式看起来更短，但在 `|z| = 1e300` 与 `y = ±0` 这两个极端上，主值支和
+> 符号零的选取全在细节里 —— 而细节只存在于参考实现的分支里。

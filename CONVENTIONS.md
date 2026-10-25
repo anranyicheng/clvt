@@ -1644,14 +1644,69 @@ CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语�
 逐点对拍。用容差 1e-9 比数值、按**类别**比特殊值（NaN 只与 NaN 相等、Inf 比
 符号），期望值由 `test/gen_complex_elementary_expected.py` 生成。
 
-> **尚未内核化的 6 个**（`tan` / `tanh` / `asin` / `acos` / `asinh` / `acosh`）
-> 仍走 CL 回退。它们在同一网格上与 numpy 有 67~92 处不一致（合 481/4410），
-> 全部落在**分支切割的符号零**与**NaN 输入**上 —— 实测 `vt-asin` 遇到含 NaN
-> 虚部的输入会直接抛 `(DOUBLE-FLOAT 0.0)` 类型错误。属**已有的静默错值**，
-> 不是这次改动引入的；重写它们需要逐函数复刻 numpy 的 Kahan 分支，已登记为
-> §16.37 的 U10。**改这六个之前必须先跑通这张网格**，否则只是把错值换个位置。
+> **这六个函数**（`tan` / `tanh` / `asin` / `acos` / `asinh` / `acosh`）
+> 在同一张网格上与 numpy 曾有 481/4410 处不一致（全部落在**分支切割的符号零**
+> 与 **NaN 输入**上，其中 `vt-asin` 遇到含 NaN 虚部的输入会直接抛
+> `(DOUBLE-FLOAT 0.0)` 类型错误）。它们已按 §16.14.5 内核化，**现在全部为 0**；
+> **改动它们之前必须先跑通那张网格**，否则只是把错值换个位置。
+> 剩下的 `atanh` 见 §16.37 的 U11。
 
 ---
+#### 16.14.5 三角 / 反三角族：算法必须照抄 numpy 的分支，**不能套恒等式**
+
+`tan` / `tanh` / `asin` / `acos` / `asinh` / `acosh` 这六个函数的 CL 复数定义
+语义上是对的，但 SBCL 的实现走通用复数算术：单价 200 ns~1.1 µs/元素，且在
+**分支切割与 NaN 输入上与 numpy 不一致**。1M complex128 实测：
+
+| 算子 | CL 回退 | 内核 | 修前不一致（441 点） | 修后 |
+|---|---:|---:|---:|---:|
+| `tan` | 203 ms | **84 ms** | 92 | **0** |
+| `tanh` | 192 ms | **51 ms** | 92 | **0** |
+| `asin` | 915 ms | **340 ms** | 70 | **0** |
+| `acos` | 876 ms | **300 ms** | 72 | **0** |
+| `asinh` | 949 ms | **317 ms** | 70 | **0** |
+| `acosh` | 866 ms | **315 ms** | 67 | **0** |
+
+算法来源是 numpy `numpy/_core/src/npymath/npy_math_complex.c.src`：
+`ctanh` 用 Kahan(1987)，`casinh`/`cacos` 共用 `_do_hard_work`
+（Hull-Fairgrieve-Tang），`casin = i·conj(casinh(i·conj z))`，
+`cacosh = ±i·cacos`（取实部 ≥ 0），`ctan = -i·ctanh(i·z)`。
+
+**五条硬约束**（每条都对应一批实测错值）：
+
+1. **不要用恒等式代替分支**。`asin = -i·log(iz + sqrt(1-z²))` 及其
+   `sqrt(1+z)·sqrt(1-z)` 变体在 441 点上各有 **386** 处不一致（大 `|z|` 处
+   主值支选取就错）；`tanh = (tanh x + i tan y)/(1 + i tanh x tan y)` 有
+   **232** 处（`|x|` 与 `|y|` 都大时分子分母同时上溢）。Kahan 形式用
+   `beta = 1+tan²y`、`rho = sqrt(1+sinh²x)` 消掉上溢，且 `|x| ≥ 22` 直接
+   走渐近式。
+2. **`(1- y)` 是「y 减 1」**。`_do_hard_work` 里同时出现 `1+y`、`1-y`、
+   `y+1`、`y-1` 四种组合，把 `1-y` 写成 `(1- y)` 会让 `Am1` 差一个
+   `hypot` 项 —— 实测 `asinh(4+4i)` 的实部从 2.426 变成 1.805。
+   正确写法：`(- 1d0 y)`。
+3. **`(- y y)` 不能用来构造 NaN**。内联循环是 `(speed 3)(safety 0)`，SBCL
+   会把 `x-x` 代数化简成 `0` —— `tanh(-4+Infi)` 因此返回 `0+0i` 而不是
+   `NaN+NaNj`。用 `(%cx-nan-of z)`。
+4. **「含 NaN」分支的外层条件只能是 `(isnan x) || (isnan y)`**。写成
+   「非双有限」会把 `x` 有限、`y=±Inf` 的输入也吞进去：`cacos` 那段里
+   `return (x+x, -y)` 于是返回 `(2x, ∓Inf)`，441 点里 75 处错值。这类输入
+   必须落到 `_clog_for_large_values` 分支。
+5. **`%cx-hypot` 对 `(Inf, Inf)` 会算出 `inf/inf = NaN`** —— 它是给
+   `%cop-sqrt`/`%cop-abs` 用的（那两处在调它之前已判过 Inf）。任何直接用
+   它的代码（如 `_clog_for_large_values`）**必须先判 Inf**，否则
+   `log|z|` 变 NaN。
+
+**验收方式**：`test/complex-elementary-test.lisp` 的同一张 441 点网格
+（11 个算子 × 441 点 = 4851 次比较）与 numpy 2.4.6 逐点对拍，外加
+「NaN 输入不抛条件」的回归断言 —— 整改前 `vt-asin`/`vt-acos`/`vt-asinh`/
+`vt-acosh` 遇到虚部为 NaN 的输入会直接抛
+`The value NaN is not of type (DOUBLE-FLOAT 0.0)`（SBCL `DECODE-FLOAT` 的
+类型断言，`with-float-safe` 屏蔽不了）。
+
+> **未覆盖的一格**：`atanh` 仍走 CL 回退（18/441 处不一致：`atanh(-1±0i)`
+> 应是 `-Inf+0i` 而 CL 给 `-177.099+0.785i`；NaN 组合也错）。它的算法与
+> 上面六个不同源（glibc 的 `catanh` 没有 Kahan 分支），单列进 §16.37 的 U11。
+
 ### 16.15 与 numpy 的已知差异清单（全部为**有意**保留）
 
 | 编号 | 差异 | 影响面 | 处置 |
@@ -3126,7 +3181,8 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U7 | 复数 nan 族剩余的「多趟」成本 | `nansum` 5 / `nanmean` 13 / `nanvar` 28 / `nanstd` 30 / `nanmax` 22 ms（原 35~88 ms，`vt-where` 特化后）；`nan-to-num` 54 ms 仍偏慢 | 剩下的成本是「掩码 + 计数 + 归约」各自一趟：`nanmean` = isnan + where + sum + logical-not + astype + sum + div + where，约 7 趟全量遍历。要再压需要把「掩码计数 + 求和」合成单趟内核（`%nan-sum-count`），收益约 2×，但会让 nan 族脱离通用算子组合、失去「语义只有一处」的性质 —— 先登记不取 |
 | U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | 1M：`sort` f64 130 / c128 181；`argsort` 158 / 284；`median` 25 / 208；numpy 同机 5.9 / 83 / 19 / 100 / — / —。c64 与 c128 耗时几乎相同 ⇒ **不是带宽受限**，而是归并每次比较的分支不可预测（随机数据上约 15 周期 × 20M 次 ≈ 100 ms） | 要再压须换 LSD 基数排序（numpy 对 f64 即是）。复数 = 「先按虚部一次稳定基数、再按实部一次稳定基数」；NaN 必须映到最大键值（负数 NaN 翻转后会跑到最前）。属算法替换而非缺陷修复，需单独一轮 + 与现实现逐位对拍 |
 | U4 | 编译期 `STYLE-WARNING` 尚不拦截 | 现有 96 条（unused-variable 类）；`WARNING` 已由 §16.34.2 的门禁拦死 | 先逐条清到 0，再把门禁从 `WARNING` 收紧到 `STYLE-WARNING`；否则一次性收紧会让门禁长期红 |
-| U10 | **6 个复数超越函数仍走 CL 回退**：`tan` / `tanh` / `asin` / `acos` / `asinh` / `acosh` | 1M complex128：`tan` 203 / `tanh` 192 / `asin` 915 / `acos` 876 / `asinh` 949 / `acosh` 866 ms（同形 float64 13~22 ms）；与 numpy 2.4.6 的 441 点网格（含 ±0/±Inf/NaN/±1d300）比对，不一致 **481/4410**：`tan` 92、`tanh` 92、`asin` 70、`acos` 72、`asinh` 70、`acosh` 67 | **两件事，别混**：①性能靠分量式（§16.14.4 的四条代价点），②正确性靠复刻 numpy 的 Kahan 分支。已试并**回滚**的方向：`asin = -i·log(iz+sqrt(1-z²))` 与 `asin = -i·log(iz+sqrt(1+z)·sqrt(1-z))` 两版在 441 点上分别有 386/386 处不一致（大 |z| 处主值支选取不同）；`tanh = (tanh x + i tan y)/(1+i·tanh x·tan y)` 有 232 处（`|y|` 巨大时 numpy 走 `copysign(0,y)` 的极限分支）。下一步：逐函数对照 numpy 的 `npy_ctanh` / `npy_casin` 源码分支，并把「y=±0 的符号零」作为独立用例。**注意 `vt-asin` 目前对含 NaN 虚部的输入会抛类型错误**（`(DOUBLE-FLOAT 0.0)`），这是应当优先修的硬缺陷 |
+| U11 | `atanh` 仍走 CL 回退 + 反三角族剩余的性能差距 | `atanh` 1M c128 75 ms（float64 15 ms），441 点网格 **18 处**不一致：`atanh(-1±0i)` 应为 `-Inf+0i` 而 CL 给 `-177.099+0.785i`（CL 把极点算成有限值）；NaN 组合也差。`asin`/`acos`/`asinh`/`acosh` 已达 300~340 ms，仍是对应 float64 的 15~20 倍 | `atanh`：按 glibc `catanh` 的 C99 角例重写（`±1+0i → ±Inf+0i`、`x+i∞ → ±0+iπ/2`、`±0+iNaN → ±0+iNaN`），再套 441 点网格验收。反三角族性能：瓶颈是 `%cx-do-hard-work` 的 **5 个返回值**（多值返回在内联循环里会落栈）与未内联的 `_clog_for_large_values`；可行的下一步是改成「写进 fixnum/float 缓存数组」或拆成 `_do_hard_work-rx` / `_sqrt_a2my2` 两个单值函数，预期 1.5~2× |
+
 
 > **已关闭**（保留在此仅为说明它们不再是待办）：einsum 复数、复数归约多轴
 > `axis` 元组、LU/SVD/特征值/百分位、`.npy` 复数互操作、`ComplexWarning`

@@ -293,6 +293,279 @@
       (%cx-nan-complex z)))
 
 ;;; ==================================================================
+;;; 2c. 三角 / 反三角族（tan / tanh / asin / acos / asinh / acosh）
+;;;
+;;; 为什么必须自己写：CL 对这六个函数**都有**复数定义，但 SBCL 的实现走
+;;; 通用复数算术，单价 200 ns ~ 1.1 µs/元素（1M complex128：asin 915 ms、
+;;; acos 876、asinh 949、acosh 866、tan 203、tanh 192），而同形 float64
+;;; 只要 13~22 ms。更要紧的是它们**在分支切割与 NaN 输入上与 numpy 不一致**
+;;; （441 点网格上 6 个函数合计 481 处）：
+;;;   · CL 的 asin 在 y=±0 的切割上虚部符号反了；
+;;;   · CL 的 asin/acos/asinh/acosh 遇到「虚部是 NaN」的输入会直接抛
+;;;     `The value NaN is not of type (DOUBLE-FLOAT 0.0)`（DECODE-FLOAT
+;;;     的类型断言，with-float-safe 屏蔽不了）。
+;;;
+;;; 算法逐分支照抄 numpy `npy_math_complex.c.src`：ctanh 用 Kahan(1987)，
+;;; casinh/cacos 用 Hull-Fairgrieve-Tang 的 `_do_hard_work`，casin 由 casinh
+;;; 变换得到，cacosh 由 cacos 旋转得到。**不要**换成恒等式（如
+;;; `asin = -i·log(iz+sqrt(1-z²))`）—— 实测在 441 点上反而有 386 处不一致，
+;;; 大 |z| 处主值支选取就错了。
+;;;
+;;; 常数按 double 取（`+eps+` = DBL_EPSILON …）。complex64 输入会以 double
+;;; 中间精度计算后由 %CAST-TO 降精度，**比 numpy 的 float32 路径更准**，
+;;; 代价是一次降精度转换。
+;;; ==================================================================
+
+(defconstant +cx-eps+ 2.220446049250313d-16)
+(defconstant +cx-recip-eps+ 4.503599627370496d15)   ; 1/DBL_EPSILON
+(defconstant +cx-tmax+ 1.7976931348623157d308)
+(defconstant +cx-four-sqrt-min+ 5.9666725849601654d-154)
+(defconstant +cx-quarter-sqrt-max+ 3.3519519824856489d153)
+(defconstant +cx-sqrt-min+ 1.4916681462400413d-154)
+(defconstant +cx-loge2+ 0.6931471805599453d0)
+(defconstant +cx-sqrt-6-eps+ 3.65002414998885671d-8)
+(defconstant +cx-pio2-lo+ 6.1232339957367659d-17)
+(defconstant +cx-a-crossover+ 10d0)
+(defconstant +cx-b-crossover+ 0.6417d0)
+(defconstant +cx-tanh-huge+ 22d0)
+
+;; 有限性判定直接用 dtype.lisp 的 %CX-FINITE-P（它同时支持实数与复数，
+;; 且已在本文件之前定义）—— **不要**在这里重复定义，那会静默覆盖掉复数版，
+;; 让 %cx-finite-flag 这类调用点拿到「按实数断言」的实现（编译期 WARNING）。
+(declaim (inline %cx-copy-sign %cx-log1p-d))
+(defun %cx-copy-sign (mag src)
+  "copysign(mag, src)：|MAG| 带上 SRC 的符号位（含 -0.0）。"
+  (if (minusp (float-sign src)) (- (abs mag)) (abs mag)))
+
+(defun %cx-log1p-d (x)
+  "实数 log1p。SBCL 没有 log1p/expm1，`sb-kernel:%log1p` 是内部符号（§16.4.1
+   的「可移植优先」不允许依赖）。|x|<0.5 走 24 项级数（0.5^24/24 ≈ 2.5e-9 的
+   截断远低于 double 的 eps 累积），其余直接 `(log (1+x))` —— x≥0.5 时 1+x
+   不存在抵消。"
+  (if (< (abs x) 0.5d0)
+      (let ((sum 0d0) (term x))
+        (dotimes (k 24 sum)
+          (incf sum term)
+          (setf term (* term (- x) (/ (float (1+ k) 1d0) (float (+ k 2) 1d0))))))
+      (log (+ 1d0 x))))
+
+(defun %cx-f (a b h)
+  "numpy 的 `_f(a,b,hypot(a,b)) = (hypot(a,b) - b)/2` 的无抵消形式。"
+  (cond ((minusp b) (* 0.5d0 (- h b)))
+        ((zerop b) (* 0.5d0 a))
+        (t (/ (/ (* a a) (+ h b)) 2d0))))
+
+(defun %cx-do-hard-work (x y)
+  "numpy `_do_hard_work`：X、Y 均取绝对值。返回
+   (values rx b-is-usable b sqrt-a2my2 new-y)。
+   RX = Re(casinh(z)) = -Im(cacos(y + i·x))。"
+  (let* ((r (%cx-hypot x (1+ y)))          ; |z+i|
+         (s (%cx-hypot x (- 1d0 y)))       ; |z-i|
+         (a (max (/ (+ r s) 2d0) 1d0))      ; 舍入可能给 <1，钳到 1
+         (scale (/ 4d0 (* +cx-eps+ +cx-eps+)))
+         (rx (if (< a +cx-a-crossover+)
+                 (cond ((and (= y 1d0) (< x (/ (* +cx-eps+ +cx-eps+) 128d0)))
+                        (sqrt x))
+                       ((>= x (* +cx-eps+ (abs (- y 1d0))))
+                        (let ((am1 (+ (%cx-f x (1+ y) r)
+                                      (%cx-f x (- 1d0 y) s))))
+                          (%cx-log1p-d (+ am1 (sqrt (* am1 (1+ a)))))))
+                       ((< y 1d0)
+                        (/ x (sqrt (* (- 1d0 y) (1+ y)))))
+                       (t
+                        (%cx-log1p-d (+ (- y 1d0)
+                                        (sqrt (* (- y 1d0) (1+ y)))))))
+                 (log (+ a (sqrt (- (* a a) 1d0)))))))
+    (if (< y +cx-four-sqrt-min+)
+        ;; y/A 可能下溢：按 2/eps 整体放大，new-y 同步放大
+        (values rx nil 0d0 (* a (/ 2d0 +cx-eps+)) (* y (/ 2d0 +cx-eps+)))
+        (let ((b (/ y a)))                  ; b = (|z+i|-|z-i|)/2 = y/A
+          (if (<= b +cx-b-crossover+)
+              (values rx t b 0d0 y)
+              (cond
+                ((and (= y 1d0) (< x (/ +cx-eps+ 128d0)))
+                 (values rx nil b (* (sqrt x) (sqrt (/ (+ a y) 2d0))) y))
+                ((>= x (* +cx-eps+ (abs (- y 1d0))))
+                 (let ((amy (+ (%cx-f x (1+ y) r)
+                               (%cx-f x (- y 1d0) s))))
+                   (values rx nil b (sqrt (* amy (+ a y))) y)))
+                ((> y 1d0)
+                 (values rx nil b
+                         (/ (* x scale y) (sqrt (* (1+ y) (- y 1d0))))
+                         (* y scale)))
+                (t (values rx nil b (sqrt (* (- 1d0 y) (1+ y))) y))))))))
+
+(defun %cx-clog-large (x y)
+  "numpy `_clog_for_large_values`：|z| 很大（>~1/eps）时的 log，返回
+   (values rr ri)。三分支避免 hypot 上溢/下溢。"
+  (let* ((ax (abs x)) (ay (abs y)))
+    (when (< ax ay) (rotatef ax ay))
+    (values
+     (cond ;; 两个分量都可能是 Inf：此时 hypot 得上溢成 +Inf，直接给 +Inf。
+           ;; （%CX-HYPOT 对 (inf,inf) 会算出 inf/inf = NaN，不能直接用。）
+           ((or (sb-ext:float-infinity-p ax) (sb-ext:float-infinity-p ay))
+            +vt-dfloat-pos-inf+)
+           ((> ax (/ +cx-tmax+ 2d0))
+            (+ (log (%cx-hypot (/ x 2.718281828459045d0)
+                               (/ y 2.718281828459045d0)))
+               1d0))
+           ((or (> ax +cx-quarter-sqrt-max+) (< ay +cx-sqrt-min+))
+            (log (%cx-hypot x y)))
+           (t (/ (log (+ (* ax ax) (* ay ay))) 2d0)))
+     (atan y x))))
+
+(declaim (inline %cop-tanh %cop-tan %cop-asinh %cop-acos %cop-asin %cop-acosh))
+
+(defun %cop-tanh (z)
+  "复数双曲正切（Kahan 1987，同 numpy npy_ctanh）。
+
+   为什么不写成 `(tanh x + i tan y)/(1 + i tanh x tan y)`：那个恒等式在
+   `|x|` 大、`|y|` 也大时分子分母同时上溢，实测 441 点里有 232 处与 numpy
+   不一致。Kahan 形式用 `beta = 1+tan²y`、`rho = sqrt(1+sinh²x)` 消掉上溢，
+   且 `|x| ≥ 22` 时 `tanh x` 在 double 里已是 ±1，直接走渐近式。"
+  (let ((x (%creal z)) (y (%cimag z)))
+    (cond
+      ;; ctanh(±0 + i·非有限) = ±0 + iNaN（C99/glibc；numpy 回退代码给 NaN+NaNj，
+      ;; 但 numpy 在 glibc 上走的是系统 ctanh，实测以系统行为为准）
+      ((and (zerop x) (not (%cx-finite-p y))) (complex x +vt-dfloat-nan+))
+      ((not (%cx-finite-p x))
+       (if (sb-ext:float-nan-p x)
+           (complex x (if (zerop y) y (* x y)))
+           (complex (if (minusp x) -1d0 1d0)
+                    (if (sb-ext:float-infinity-p y)
+                        (if (minusp y) -0d0 0d0)
+                        (let ((sc (* (sin y) (cos y))))
+                          (if (minusp (float-sign sc)) -0d0 0d0))))))
+      ;; ⚠ 不能写 `(- y y)` 求 NaN：内联循环里是 (speed 3)(safety 0)，
+      ;; SBCL 会把 x-x 代数化简成 0（实测 tanh(-4+Infi) 返回 0+0i）
+      ((not (%cx-finite-p y)) (complex (%cx-nan-of z) (%cx-nan-of z)))
+      ((>= (abs x) +cx-tanh-huge+)
+       (let ((emx (exp (- (abs x)))))
+         (complex (if (minusp x) -1d0 1d0)
+                  (* 4d0 (sin y) (cos y) emx emx))))
+      (t
+       (let* ((tt (tan y))
+              (beta (+ 1d0 (* tt tt)))       ; 1/cos²y
+              (s (sinh x))
+              (rho (sqrt (+ 1d0 (* s s))))   ; cosh x
+              (denom (+ 1d0 (* beta s s))))
+         (complex (/ (* beta rho s) denom) (/ tt denom)))))))
+
+(defun %cop-tan (z)
+  "复数正切 = -i·ctanh(i·z)（同 numpy：ctan 完全委托 ctanh）。"
+  (let* ((x (%creal z)) (y (%cimag z)))
+    ;; tan(±Inf|NaN + i·0) = NaN + i·0（C99 角例，穿透 ctanh 变换会丢符号零）
+    (when (and (not (%cx-finite-p x)) (zerop y))
+      (return-from %cop-tan (complex +vt-dfloat-nan+ y)))
+    (let ((w (%cop-tanh (complex (- y) x))))
+      (complex (%cimag w) (- (%creal w))))))
+
+(defun %cop-asinh (z)
+  "复数反双曲正弦（numpy casinh：Hull-Fairgrieve-Tang + 大值渐近）。
+
+   分支切割在虚轴 |y|>1 段：asinh(x-0i) 的虚部是 -π，+0i 则是 +π —— 由
+   `copysign(rx, x)` / `copysign(ry, y)` 保留符号零决定。"
+  (let* ((x (%creal z)) (y (%cimag z))
+         (ax (abs x)) (ay (abs y))
+         (nan (%cx-nan-of z)))
+    (cond
+      ;; NaN 组（先于 Inf：numpy 的 casinh 在这几个角例上 Inf 与 NaN 混合）
+      ((or (sb-ext:float-nan-p x) (sb-ext:float-nan-p y))
+       (cond ((sb-ext:float-infinity-p x) (complex x (+ y y)))
+             ((sb-ext:float-infinity-p y) (complex (abs y) (+ x x)))
+             ((zerop y) (complex (+ x x) y))
+             (t (complex nan nan))))
+      ;; Inf 组：x=±Inf 且 y 有限 → (±Inf, ±0)；两者都 Inf → (±Inf, ±π/4)
+      ((or (sb-ext:float-infinity-p x) (sb-ext:float-infinity-p y))
+       (complex (%cx-copy-sign +vt-dfloat-pos-inf+ x)
+                (cond ((and (sb-ext:float-infinity-p x)
+                            (not (sb-ext:float-infinity-p y)))
+                       (%cx-copy-sign 0d0 y))
+                      ((and (sb-ext:float-infinity-p x)
+                            (sb-ext:float-infinity-p y))
+                       (%cx-copy-sign (/ pi 4d0) y))
+                      (t (if (zerop y) y (atan y x))))))
+      ((or (> ax +cx-recip-eps+) (> ay +cx-recip-eps+))
+       (multiple-value-bind (wx wy)
+           (if (minusp (float-sign x))
+               (%cx-clog-large (- x) (- y))
+               (%cx-clog-large x y))
+         (incf wx +cx-loge2+)
+         (complex (%cx-copy-sign wx x) (%cx-copy-sign wy y))))
+      ((and (zerop x) (zerop y)) z)
+      ((and (< ax (/ +cx-sqrt-6-eps+ 4d0)) (< ay (/ +cx-sqrt-6-eps+ 4d0))) z)
+      (t
+       (multiple-value-bind (rx usable b sq new-y) (%cx-do-hard-work ax ay)
+         (let ((ry (if usable (asin b) (atan new-y sq))))
+           (complex (%cx-copy-sign rx x) (%cx-copy-sign ry y))))))))
+
+(defun %cop-acos (z)
+  "复数反余弦（numpy cacos：同一套 `_do_hard_work`，参数互换）。"
+  (let* ((x (%creal z)) (y (%cimag z))
+         (sx (float-sign x)) (sy (float-sign y))
+         (ax (abs x)) (ay (abs y)))
+    (cond
+      ;; ⚠ 这一段的外层条件只能是**含 NaN**（numpy 的 cacos 就是
+      ;; `if (isnan(x) || isnan(y)) {…}`）。写成「非双有限」会把
+      ;; 「x 有限 + y=±Inf」也吞进来，返回 (2x, ∓Inf) —— 实测 441 点里
+      ;; 75 处错值；那种输入应落到下面的大值分支（走 _clog_for_large_values）。
+      ((or (sb-ext:float-nan-p x) (sb-ext:float-nan-p y))
+       (cond ((sb-ext:float-infinity-p x)
+              (complex (if (sb-ext:float-nan-p y) (%cx-nan-of z) (+ y y))
+                       +vt-dfloat-neg-inf+))
+             ((sb-ext:float-infinity-p y)
+              (complex (+ x x) (- y)))
+             ((and (zerop x) (sb-ext:float-nan-p y))
+              (complex (+ (/ pi 2d0) +cx-pio2-lo+) (+ y y)))
+             (t (complex +vt-dfloat-nan+ +vt-dfloat-nan+))))
+      ((or (> ax +cx-recip-eps+) (> ay +cx-recip-eps+))
+       (multiple-value-bind (wx wy) (%cx-clog-large x y)
+         (complex (abs wy)
+                  (let ((ryy (+ wx +cx-loge2+)))
+                    (if (minusp sy) ryy (- ryy))))))
+      ((and (= x 1d0) (zerop y)) (complex 0d0 (- y)))
+      ((and (< ax (/ +cx-sqrt-6-eps+ 4d0)) (< ay (/ +cx-sqrt-6-eps+ 4d0)))
+       (complex (- (/ pi 2d0) (- x +cx-pio2-lo+)) (- y)))
+      (t
+       (multiple-value-bind (ry usable b sq new-x) (%cx-do-hard-work ay ax)
+         (let ((rx (if usable
+                       (if (minusp sx) (acos (- b)) (acos b))
+                       (if (minusp sx) (atan sq (- new-x)) (atan sq new-x)))))
+           (complex rx (if (minusp sy) ry (- ry)))))))))
+
+(defun %cop-asin (z)
+  "复数反正弦 = i·conj(casinh(i·conj z))（同 numpy）。
+
+   NaN 组合**不能**经 asinh 中转：numpy/glibc 的 casin 在
+   `(±0, NaN) / (±Inf, NaN) / (NaN, ±Inf)` 上有自己的 C99 角例，
+   中转会把 `casin(NaN+0i)` 算成 `π/2 + NaNi`（实测 441 点里 4 处）。"
+  (let ((x (%creal z)) (y (%cimag z)))
+    (if (or (sb-ext:float-nan-p x) (sb-ext:float-nan-p y))
+        (cond ((and (zerop x) (sb-ext:float-nan-p y)) (complex x y))
+              ((and (sb-ext:float-infinity-p x) (sb-ext:float-nan-p y))
+               (complex +vt-dfloat-nan+ +vt-dfloat-pos-inf+))
+              ((and (sb-ext:float-nan-p x) (sb-ext:float-infinity-p y))
+               (complex +vt-dfloat-nan+ y))
+              (t (complex +vt-dfloat-nan+ +vt-dfloat-nan+)))
+        (let ((w (%cop-asinh (complex y x))))
+          (complex (%cimag w) (%creal w))))))
+
+(defun %cop-acosh (z)
+  "复数反双曲余弦 = ±i·cacos(z)，符号取「实部 ≥ 0」（同 numpy cacosh）。"
+  (let ((x (%creal z)) (y (%cimag z)))
+    ;; glibc 的 cacosh(±0 + NaN i) = NaN + i·π/2（经 cacos 中转会丢成 NaN+NaNj）
+    (when (and (sb-ext:float-nan-p y) (zerop x))
+      (return-from %cop-acosh (complex +vt-dfloat-nan+ (/ pi 2d0))))
+    (let* ((w (%cop-acos z))
+           (rx (%creal w)) (ry (%cimag w)))
+      (cond ((and (sb-ext:float-nan-p rx) (sb-ext:float-nan-p ry))
+             (complex ry rx))
+            ((sb-ext:float-nan-p rx) (complex (abs ry) rx))
+            ((sb-ext:float-nan-p ry) (complex ry ry))
+            (t (complex (abs ry) (%cx-copy-sign rx y)))))))
+
+
+;;; ==================================================================
 ;;; 3. 「复数 → 实数」特化循环
 ;;; ==================================================================
 
