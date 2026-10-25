@@ -332,7 +332,7 @@
 ;; 有限性判定直接用 dtype.lisp 的 %CX-FINITE-P（它同时支持实数与复数，
 ;; 且已在本文件之前定义）—— **不要**在这里重复定义，那会静默覆盖掉复数版，
 ;; 让 %cx-finite-flag 这类调用点拿到「按实数断言」的实现（编译期 WARNING）。
-(declaim (inline %cx-copy-sign %cx-log1p-d))
+(declaim (inline %cx-copy-sign %cx-log1p-d %cx-f %cx-do-hard-work %cx-clog-large))
 (defun %cx-copy-sign (mag src)
   "copysign(mag, src)：|MAG| 带上 SRC 的符号位（含 -0.0）。"
   (if (minusp (float-sign src)) (- (abs mag)) (abs mag)))
@@ -563,6 +563,78 @@
             ((sb-ext:float-nan-p rx) (complex (abs ry) rx))
             ((sb-ext:float-nan-p ry) (complex ry ry))
             (t (complex (abs ry) (%cx-copy-sign rx y)))))))
+
+;;; ------------------------------------------------------------------
+;;; 2d. atanh（numpy npy_catanh：分段 + _real_part_reciprocal）
+;;;
+;;; CL 的 atanh 在复数上把**极点算成有限值**：`atanh(-1+0i)` 给
+;;; `-177.099+0.785i`（应为 `-Inf+0i`），441 点网格上共 18 处不一致。
+;;; numpy 的实现分四段：实数退化 / 纯虚数 / 大值（|x| 或 |y| > 1/eps 时
+;;; 实部退化成 Re(1/z)）/ 一般式（log1p + atan2，按 |x|、|y| 分三种）。
+;;; 注意所有公式都用 **|x|、|y|**，最后统一 `copysign` 回去 —— 直接带符号
+;;; 代入会在 x<0 时把对数参数算成负数。
+;;; ------------------------------------------------------------------
+(defconstant +cx-sqrt-3-eps+ 2.5809568279517849d-8)
+
+(declaim (inline %cx-sum-squares %cx-recip-real-part %cx-real-atanh %cop-atanh))
+
+(defun %cx-sum-squares (x y)
+  "numpy `_sum_squares`：x²+y²，Y 极小时避免下溢（Y 假定非负）。"
+  (if (< y 1.4916681462400413d-154)
+      (* x x)
+      (+ (* x x) (* y y))))
+
+(defun %cx-recip-real-part (x y)
+  "Re(1/(x+iy)) = x/(x²+y²)，按 max(|x|,|y|) 缩放避免上溢/下溢。
+   不能写成 `(realpart (/ z))` —— 复除法会先算中间量，1e300 处直接上溢。"
+  (let* ((ax (abs x)) (ay (abs y)) (m (max ax ay)))
+    (cond ((sb-ext:float-infinity-p m)
+           (if (sb-ext:float-infinity-p x) (if (minusp x) -0d0 0d0) 0d0))
+          ((zerop m) 0d0)
+          (t (let ((xs (/ x m)) (ys (/ y m)))
+               (/ (/ xs (+ (* xs xs) (* ys ys))) m))))))
+
+(defun %cx-real-atanh (x)
+  "实数 atanh：±1 → ±Inf（钉死极点；CL 的 atanh 在 1 上行为依赖实现）。"
+  (cond ((= x 1d0) +vt-dfloat-pos-inf+)
+        ((= x -1d0) +vt-dfloat-neg-inf+)
+        (t (atanh x))))
+
+(defun %cop-atanh (z)
+  "复数反双曲正切（主值，分支切割在实轴 |x|>1 段）。"
+  (let* ((x (%creal z)) (y (%cimag z))
+         (ax (abs x)) (ay (abs y))
+         (pio2 (+ (/ pi 2d0) +cx-pio2-lo+))
+         (eps +cx-eps+))
+    (cond
+      ;; y=0 且 |x|≤1：退化成实数 atanh（±1 → ±Inf，这是 CL 算错的那格）
+      ((and (zerop y) (<= ax 1d0)) (complex (%cx-real-atanh x) y))
+      ;; 纯虚数：atanh(iy) = i·atan(y)，与实数 atan 同精度
+      ((zerop x) (complex x (atan y)))
+      ((or (sb-ext:float-nan-p x) (sb-ext:float-nan-p y))
+       (cond ((sb-ext:float-infinity-p x)
+              (complex (%cx-copy-sign 0d0 x) (+ y y)))
+             ((sb-ext:float-infinity-p y)
+              (complex (%cx-copy-sign 0d0 x) (%cx-copy-sign pio2 y)))
+             (t (complex (%cx-nan-of z) (%cx-nan-of z)))))
+      ;; 大值：实部退化成 Re(1/(x+iy))，虚部就是 ±π/2
+      ((or (> ax +cx-recip-eps+) (> ay +cx-recip-eps+))
+       (complex (%cx-recip-real-part x y) (%cx-copy-sign pio2 y)))
+      ;; 极小值：atanh(z) ≈ z
+      ((and (< ax (/ +cx-sqrt-3-eps+ 2d0)) (< ay (/ +cx-sqrt-3-eps+ 2d0))) z)
+      (t
+       (let* ((rx (if (and (= ax 1d0) (< ay eps))
+                      (/ (- +cx-loge2+ (log ay)) 2d0)
+                      (/ (%cx-log1p-d
+                          (/ (* 4d0 ax) (%cx-sum-squares (- ax 1d0) ay)))
+                         4d0)))
+              (ry (cond ((= ax 1d0) (/ (atan 2d0 (- ay)) 2d0))
+                        ((< ay eps)
+                         (/ (atan (* 2d0 ay) (* (- 1d0 ax) (+ 1d0 ax))) 2d0))
+                        (t (/ (atan (* 2d0 ay)
+                                    (- (* (- 1d0 ax) (+ 1d0 ax)) (* ay ay)))
+                              2d0)))))
+         (complex (%cx-copy-sign rx x) (%cx-copy-sign ry y)))))))
 
 
 ;;; ==================================================================

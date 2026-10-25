@@ -41,6 +41,7 @@ FUNCS = [
     ("acos", np.arccos),
     ("asinh", np.arcsinh),
     ("acosh", np.arccosh),
+    ("atanh", np.arctanh),
 ]
 
 

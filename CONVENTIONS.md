@@ -1649,7 +1649,7 @@ CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语�
 > 与 **NaN 输入**上，其中 `vt-asin` 遇到含 NaN 虚部的输入会直接抛
 > `(DOUBLE-FLOAT 0.0)` 类型错误）。它们已按 §16.14.5 内核化，**现在全部为 0**；
 > **改动它们之前必须先跑通那张网格**，否则只是把错值换个位置。
-> 剩下的 `atanh` 见 §16.37 的 U11。
+> `atanh` 与它们同源但算法不同（见 §16.14.5 末尾），现在也是 0。
 
 ---
 #### 16.14.5 三角 / 反三角族：算法必须照抄 numpy 的分支，**不能套恒等式**
@@ -1662,10 +1662,11 @@ CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语�
 |---|---:|---:|---:|---:|
 | `tan` | 203 ms | **84 ms** | 92 | **0** |
 | `tanh` | 192 ms | **51 ms** | 92 | **0** |
-| `asin` | 915 ms | **340 ms** | 70 | **0** |
-| `acos` | 876 ms | **300 ms** | 72 | **0** |
-| `asinh` | 949 ms | **317 ms** | 70 | **0** |
-| `acosh` | 866 ms | **315 ms** | 67 | **0** |
+| `asin` | 915 ms | **112 ms** | 70 | **0** |
+| `acos` | 876 ms | **60 ms** | 72 | **0** |
+| `asinh` | 949 ms | **92 ms** | 70 | **0** |
+| `acosh` | 866 ms | **62 ms** | 67 | **0** |
+| `atanh` | 75 ms | **59 ms** | 18 | **0** |
 
 算法来源是 numpy `numpy/_core/src/npymath/npy_math_complex.c.src`：
 `ctanh` 用 Kahan(1987)，`casinh`/`cacos` 共用 `_do_hard_work`
@@ -1691,7 +1692,12 @@ CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语�
    「非双有限」会把 `x` 有限、`y=±Inf` 的输入也吞进去：`cacos` 那段里
    `return (x+x, -y)` 于是返回 `(2x, ∓Inf)`，441 点里 75 处错值。这类输入
    必须落到 `_clog_for_large_values` 分支。
-5. **`%cx-hypot` 对 `(Inf, Inf)` 会算出 `inf/inf = NaN`** —— 它是给
+5. **`%cx-do-hard-work` / `%cx-clog-large` 必须 `declaim inline`**。它们每个
+   元素调一次，且 `%cx-do-hard-work` 有 **5 个返回值**、`%cx-clog-large` 有
+   2 个；不内联时多值返回落栈 + 参数装箱，`vt-acos` 300 ms、`vt-asinh` 317 ms。
+   两个都内联后 **60 ms / 92 ms**（3~5 倍）。这是本族性能的**唯一主开关** ——
+   比换公式、改分支顺序的收益大一个数量级。
+6. **`%cx-hypot` 对 `(Inf, Inf)` 会算出 `inf/inf = NaN`** —— 它是给
    `%cop-sqrt`/`%cop-abs` 用的（那两处在调它之前已判过 Inf）。任何直接用
    它的代码（如 `_clog_for_large_values`）**必须先判 Inf**，否则
    `log|z|` 变 NaN。
@@ -1703,9 +1709,13 @@ CL 的 `log` / `asin` / `acos` / `asinh` / `acosh` 对复数**有定义**，语�
 `The value NaN is not of type (DOUBLE-FLOAT 0.0)`（SBCL `DECODE-FLOAT` 的
 类型断言，`with-float-safe` 屏蔽不了）。
 
-> **未覆盖的一格**：`atanh` 仍走 CL 回退（18/441 处不一致：`atanh(-1±0i)`
-> 应是 `-Inf+0i` 而 CL 给 `-177.099+0.785i`；NaN 组合也错）。它的算法与
-> 上面六个不同源（glibc 的 `catanh` 没有 Kahan 分支），单列进 §16.37 的 U11。
+> **`atanh` 与上面六个不同源**：numpy 自己实现了 `npy_catanh`（分段 +
+> `_real_part_reciprocal`），不是 libm。它的坑是**所有公式都用 `|x|、|y|`、
+> 最后统一 `copysign` 回去** —— 直接带符号代入会在 `x<0` 处把 `log1p` 的
+> 参数算成负数（`0.25·log1p(4x/den)` 在 `x = -1+1e-8i` 处退化成
+> `log1p(-1) = -Inf`，而真值是 `-9.5569`）。另外大 `|x|` 时实部会退化成
+> `Re(1/z)`（`|x| = 1e300` 时 `atanh ≈ 1/x = 1e-300`，用
+> `0.5·(log|1+z| - log|1-z|)` 会因两个 1e300 相减得 0）。
 
 ### 16.15 与 numpy 的已知差异清单（全部为**有意**保留）
 
@@ -3181,7 +3191,6 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U7 | 复数 nan 族剩余的「多趟」成本 | `nansum` 5 / `nanmean` 13 / `nanvar` 28 / `nanstd` 30 / `nanmax` 22 ms（原 35~88 ms，`vt-where` 特化后）；`nan-to-num` 54 ms 仍偏慢 | 剩下的成本是「掩码 + 计数 + 归约」各自一趟：`nanmean` = isnan + where + sum + logical-not + astype + sum + div + where，约 7 趟全量遍历。要再压需要把「掩码计数 + 求和」合成单趟内核（`%nan-sum-count`），收益约 2×，但会让 nan 族脱离通用算子组合、失去「语义只有一处」的性质 —— 先登记不取 |
 | U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | 1M：`sort` f64 130 / c128 181；`argsort` 158 / 284；`median` 25 / 208；numpy 同机 5.9 / 83 / 19 / 100 / — / —。c64 与 c128 耗时几乎相同 ⇒ **不是带宽受限**，而是归并每次比较的分支不可预测（随机数据上约 15 周期 × 20M 次 ≈ 100 ms） | 要再压须换 LSD 基数排序（numpy 对 f64 即是）。复数 = 「先按虚部一次稳定基数、再按实部一次稳定基数」；NaN 必须映到最大键值（负数 NaN 翻转后会跑到最前）。属算法替换而非缺陷修复，需单独一轮 + 与现实现逐位对拍 |
 | U4 | 编译期 `STYLE-WARNING` 尚不拦截 | 现有 96 条（unused-variable 类）；`WARNING` 已由 §16.34.2 的门禁拦死 | 先逐条清到 0，再把门禁从 `WARNING` 收紧到 `STYLE-WARNING`；否则一次性收紧会让门禁长期红 |
-| U11 | `atanh` 仍走 CL 回退 + 反三角族剩余的性能差距 | `atanh` 1M c128 75 ms（float64 15 ms），441 点网格 **18 处**不一致：`atanh(-1±0i)` 应为 `-Inf+0i` 而 CL 给 `-177.099+0.785i`（CL 把极点算成有限值）；NaN 组合也差。`asin`/`acos`/`asinh`/`acosh` 已达 300~340 ms，仍是对应 float64 的 15~20 倍 | `atanh`：按 glibc `catanh` 的 C99 角例重写（`±1+0i → ±Inf+0i`、`x+i∞ → ±0+iπ/2`、`±0+iNaN → ±0+iNaN`），再套 441 点网格验收。反三角族性能：瓶颈是 `%cx-do-hard-work` 的 **5 个返回值**（多值返回在内联循环里会落栈）与未内联的 `_clog_for_large_values`；可行的下一步是改成「写进 fixnum/float 缓存数组」或拆成 `_do_hard_work-rx` / `_sqrt_a2my2` 两个单值函数，预期 1.5~2× |
 
 
 > **已关闭**（保留在此仅为说明它们不再是待办）：einsum 复数、复数归约多轴

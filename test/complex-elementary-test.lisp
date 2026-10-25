@@ -147,7 +147,11 @@
                       (cons "asin" (cons 'asin #'vt-asin))
                       (cons "acos" (cons 'acos #'vt-acos))
                       (cons "asinh" (cons 'asinh #'vt-asinh))
-                      (cons "acosh" (cons 'acosh #'vt-acosh)))))
+                      (cons "acosh" (cons 'acosh #'vt-acosh))
+                      ;; atanh：整改前 CL 把极点算成有限值
+                      ;; （atanh(-1±0i) → -177.099±0.785i，应为 -Inf±0i），
+                      ;; 441 点里 18 处不一致
+                      (cons "atanh" (cons 'atanh #'vt-atanh)))))
     (expect-equal "网格点数 441" (vt-size input) 441)
     (dolist (case cases)
       (let* ((name (car case))
@@ -336,7 +340,8 @@
     ;; （SBCL 的 DECODE-FLOAT 类型断言，with-float-safe 屏蔽不了）。
     (dolist (fn (list (cons "vt-asin" #'vt-asin) (cons "vt-acos" #'vt-acos)
                       (cons "vt-asinh" #'vt-asinh) (cons "vt-acosh" #'vt-acosh)
-                      (cons "vt-tan" #'vt-tan) (cons "vt-tanh" #'vt-tanh)))
+                      (cons "vt-tan" #'vt-tan) (cons "vt-tanh" #'vt-tanh)
+                      (cons "vt-atanh" #'vt-atanh)))
       (dolist (z (list (complex 0d0 nan) (complex 1d0 nan) (complex nan 0d0)
                        (complex nan 1d0) (complex 4d0 +vt-dfloat-pos-inf+)
                        (complex +vt-dfloat-pos-inf+ 4d0)))
@@ -386,8 +391,16 @@
                    (<= (/ t-tanh-c (max (ms-of (lambda () (vt-tanh zr))) 0.05d0)) 8.0d0))
       (expect-true (format nil "tanh c128 绝对 < 120ms（实测 ~,1f，修前 192）" t-tanh-c)
                    (< t-tanh-c 120.0d0))
-      (expect-true (format nil "asin c128 绝对 < 500ms（实测 ~,1f，修前 915）" t-asin-c)
-                   (< t-asin-c 500.0d0)))))
+      (expect-true (format nil "asin c128 绝对 < 250ms（实测 ~,1f，修前 915）" t-asin-c)
+                   (< t-asin-c 250.0d0))
+      ;; 反三角族另一半：内联 _do_hard_work 之后 acos/asinh/acosh 才降到
+      ;; 三位数（acos 876→60、asinh 949→92、acosh 866→62）
+      (let ((t-acos-c (ms-of (lambda () (vt-acos zc))))
+            (t-acosh-c (ms-of (lambda () (vt-acosh zc)))))
+        (expect-true (format nil "acos c128 绝对 < 200ms（实测 ~,1f，修前 876）" t-acos-c)
+                     (< t-acos-c 200.0d0))
+        (expect-true (format nil "acosh c128 绝对 < 200ms（实测 ~,1f，修前 866）" t-acosh-c)
+                     (< t-acosh-c 200.0d0))))))
 
 (defun main ()
   (format t "~&=== 复数初等函数 / 内核前置 测试 ===")

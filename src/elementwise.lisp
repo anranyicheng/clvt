@@ -578,7 +578,7 @@ lambda 算子请使用 %%float-map-fn"))
     (return-from vt-atanh
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-ATANH")))
-        (vt-fast-map (function atanh) in :out out :dtype dt))))
+        (vt-fast-map (function %cop-atanh) in :out out :dtype dt))))
 (let ((dt (%infer-float-dtype vt dtype)))
     (%float-map-pair %op-atanh-df %op-atanh-sf vt out dt)))
 

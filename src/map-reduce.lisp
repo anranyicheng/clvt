@@ -58,7 +58,7 @@
       %cop-tan %cop-tanh %cop-asin %cop-acos %cop-asinh %cop-acosh
       ;; 保留走 CL 的这几个：实测与 numpy 逐点一致且单价可接受
       ;; （sin/cos/exp 约 50/50/39 ms，sinh/cosh 同量级）
-      exp sin cos atan sinh cosh atanh
+      %cop-atanh exp sin cos atan sinh cosh
       + - * / abs sqrt log log2 log10 square reciprocal signum
       %cop-sqrt %cop-log %cop-log2 %cop-log10 %cop-square %cop-recip
       %cop-signum %cop-abs %cconj %cop-neg
@@ -101,7 +101,7 @@
       ;; 极值族：调用点全部在 `(when (%cx-any-p …) …)` 守卫之内，实数进不来
       %cop-max %cop-min %cop-fmax %cop-fmin
       ;; 三角/反三角内核：调用点全部在 (when (%cx-any-p …) …) 守卫之内
-      %cop-tan %cop-tanh %cop-asin %cop-acos %cop-asinh %cop-acosh
+      %cop-tan %cop-tanh %cop-asin %cop-acos %cop-asinh %cop-acosh %cop-atanh
       ;; 复数比较 / 谓词内核：调用点全部在 `(when (%cx-any-p …) …)` 守卫之内，
       ;; 实数输入根本进不来
       %cx-eq-flag %cx-ne-flag %cx-lt-flag %cx-le-flag %cx-gt-flag %cx-ge-flag
