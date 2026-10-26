@@ -362,45 +362,55 @@
                       1.5707963267948966d0 1d-12)))
 
 ;;; ==================================================================
-;;; E. 倍率护栏
+;;; E. 护栏：**一律用倍率，不用绝对毫秒**
+;;;
+;;; ⚠ 绝对毫秒阈值不可移植。这一节最初写的是「acos c128 < 200ms」，而开发机
+;;; 实测 98ms —— 只有 2 倍余量：慢一倍的机器（笔记本、共享 VM、内存带宽不同）
+;;; 直接红，报出来却是「性能回归」。实测踩过：同一份代码在 2.05× 慢的机器上
+;;; acos 就顶到 200，套件红一条。
+;;;
+;;; 这里改成两类**机器无关**的倍率：
+;;;
+;;;   A. 同一算子的 c128 / f64 —— 直接回答「复数是否被同族的实数路径落下」；
+;;;   B. 复数算子 / `VT-EXP`（同为复数超越内核，一次超越函数 + 少量算术）——
+;;;      回答「这个算子是否退回了 CL 回退」。选 exp 当锚点是因为它自己不在
+;;;      这些断言的保护范围内，且成本构成相近（比值跨机器只漂 ±30% 左右）。
+;;;
+;;; 两边都留 ≥3 倍余量（相对开发机实测），同时远低于「退回 CL 回退」的比值
+;;; （那一跳是 5~25 倍），所以它拦得住真回归，又不会被机器速度误伤。
 ;;; ==================================================================
+
 (defun test-guardrails ()
   (let* ((n 1000000)
          (zc (vt-astype (vt-random-uniform (list n) :low 0.5d0 :high 1.5d0)
                         :complex128))
          (zr (vt-random-uniform (list n) :low 0.5d0 :high 1.5d0))
-         (t-log-c (ms-of (lambda () (vt-log zc))))
-         (t-log-r (ms-of (lambda () (vt-log zr))))
-         (t-sign-c (ms-of (lambda () (vt-sign zc))))
-         (t-sign-r (ms-of (lambda () (vt-sign zr)))))
-    (let ((ratio (/ t-log-c (max t-log-r 0.05d0))))
-      (expect-true (format nil "log c128/f64 倍率 ~,1fx ≤ 12x（修前 43x）" ratio)
-                   (<= ratio 12.0d0)))
-    (let ((ratio (/ t-sign-c (max t-sign-r 0.05d0))))
-      (expect-true (format nil "sign c128/f64 倍率 ~,1fx ≤ 15x（修前 40x）" ratio)
-                   (<= ratio 15.0d0)))
-    (expect-true (format nil "log c128 绝对 < 150ms（实测 ~,1f，修前 352）" t-log-c)
-                 (< t-log-c 150.0d0))
-    (expect-true (format nil "sign c128 绝对 < 60ms（实测 ~,1f，修前 104）" t-sign-c)
-                 (< t-sign-c 60.0d0))
-    ;; 三角/反三角族（第 23 轮）：修前 tan 203 / tanh 192 / asin 915 ms
-    (let ((t-tanh-c (ms-of (lambda () (vt-tanh zc))))
-          (t-asin-c (ms-of (lambda () (vt-asin zc)))))
-      (expect-true (format nil "tanh c128/f64 倍率 ~,1fx ≤ 8x（修前 11.5x）"
-                           (/ t-tanh-c (max (ms-of (lambda () (vt-tanh zr))) 0.05d0)))
-                   (<= (/ t-tanh-c (max (ms-of (lambda () (vt-tanh zr))) 0.05d0)) 8.0d0))
-      (expect-true (format nil "tanh c128 绝对 < 120ms（实测 ~,1f，修前 192）" t-tanh-c)
-                   (< t-tanh-c 120.0d0))
-      (expect-true (format nil "asin c128 绝对 < 250ms（实测 ~,1f，修前 915）" t-asin-c)
-                   (< t-asin-c 250.0d0))
-      ;; 反三角族另一半：内联 _do_hard_work 之后 acos/asinh/acosh 才降到
-      ;; 三位数（acos 876→60、asinh 949→92、acosh 866→62）
-      (let ((t-acos-c (ms-of (lambda () (vt-acos zc))))
-            (t-acosh-c (ms-of (lambda () (vt-acosh zc)))))
-        (expect-true (format nil "acos c128 绝对 < 200ms（实测 ~,1f，修前 876）" t-acos-c)
-                     (< t-acos-c 200.0d0))
-        (expect-true (format nil "acosh c128 绝对 < 200ms（实测 ~,1f，修前 866）" t-acosh-c)
-                     (< t-acosh-c 200.0d0))))))
+         (anchor (max (ms-of (lambda () (vt-exp zc))) 0.05d0)))
+    (format t "~&  [护栏] 锚点 1M c128 vt-exp = ~,2f ms~%" anchor)
+    (flet ((rel (f) (/ (ms-of (lambda () (funcall f zc))) anchor)))
+      ;; ---- A. 同算子 c128 / f64 ----
+      (flet ((pair-ratio (label f limit prefix)
+                 (let* ((tc (ms-of (lambda () (funcall f zc))))
+                        (tr (max (ms-of (lambda () (funcall f zr))) 0.05d0))
+                        (r (/ tc tr)))
+                   (expect-true (format nil "~a c128/f64 倍率 ~,1fx ≤ ~,0fx（~a）"
+                                        label r limit prefix)
+                                (<= r limit)))))
+        (pair-ratio "log" #'vt-log 12.0d0 "修前 43x")
+        (pair-ratio "sign" #'vt-sign 15.0d0 "修前 40x")
+        (pair-ratio "tanh" #'vt-tanh 8.0d0 "修前 11.5x"))
+      ;; ---- B. 复数算子 / 锚点 exp ----
+      (flet ((anchor-ratio (label f limit prefix)
+               (let ((r (rel f)))
+                 (expect-true (format nil "~a c128 / exp 倍率 ~,2fx ≤ ~,0fx（~a）"
+                                      label r limit prefix)
+                              (<= r limit)))))
+        (anchor-ratio "log" #'vt-log 5.0d0 "修前 10.2x")
+        (anchor-ratio "tanh" #'vt-tanh 4.0d0 "修前 5.6x")
+        (anchor-ratio "asin" #'vt-asin 12.0d0 "修前 26.5x")
+        (anchor-ratio "acos" #'vt-acos 12.0d0 "修前 25.4x")
+        (anchor-ratio "asinh" #'vt-asinh 12.0d0 "修前 27.5x")
+        (anchor-ratio "acosh" #'vt-acosh 12.0d0 "修前 25.1x")))))
 
 (defun main ()
   (format t "~&=== 复数初等函数 / 内核前置 测试 ===")

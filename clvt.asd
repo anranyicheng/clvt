@@ -4,7 +4,7 @@
   :description "common lisp vector tensor library"
   :author "xizang123321@gmail.com"
   :license  "MIT"
-  :version "0.4.19"
+  :version "0.4.20"
   :serial t
   ;; ------------------------------------------------------------------
   ;; 读取格式锁定（**不要删**）
