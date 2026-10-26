@@ -613,6 +613,58 @@
                          (/ 1.0d0 (float cnt 1.0d0)))))
             (vt-map (lambda (s) (* s inv)) sums :out out :dtype dt))))))
 
+(defun %cx-sumsq-all (flat mr mi)
+  "Σ|z-mean|²（**不跳过 NaN**：var 里 NaN 必须传播，含 NaN 时调用方已提前返回）。
+   与 numpy 的 `_var` 复数分支一致：`x.real² + x.imag²`，而不是 `abs(z)²`
+   —— `abs` 走 hypot，比平方和少一次上溢/下溢风险但多一次开方，且与 numpy
+   不逐位一致。"
+  (macrolet ((pull (ctype rtype)
+               `(let ((d (the (simple-array ,ctype (*)) (vt-data flat)))
+                      (off (the fixnum (vt-offset flat)))
+                      (n (the fixnum (vt-size flat)))
+                      (m0 (coerce mr ',rtype))
+                      (m1 (coerce mi ',rtype)))
+                  (declare (type (simple-array ,ctype (*)) d)
+                           (type fixnum off n)
+                           (type ,rtype m0 m1)
+                           (optimize (speed 3) (safety 1)))
+                  (let ((a (coerce 0 ',rtype)))
+                    (declare (type ,rtype a))
+                    (dotimes (i n)
+                      (let* ((z (aref d (the fixnum (+ off i))))
+                             (dr (- (%creal z) m0))
+                             (dm (- (%cimag z) m1)))
+                        (declare (type ,rtype dr dm))
+                        (incf a (+ (* dr dr) (* dm dm)))))
+                    a))))
+    (let ((et (array-element-type (vt-data flat))))
+      (cond ((equal et '(complex double-float)) (pull (complex double-float) double-float))
+            ((equal et '(complex single-float)) (pull (complex single-float) single-float))
+            (t (error "%cx-sumsq-all: 非复数缓冲区 ~a" et))))))
+
+(defun %cx-var-global (in rdt ddof keepdims out)
+  "复数方差的全归约（axis=nil）两趟实现：mean → Σ|z-mean|² → 除以 (n-ddof)。
+   与原流水线（mean + sub + abs + square + sum + map 共 6 趟、3 个 16MB 临时）
+   语义一致，含 `(max (- n ddof) 1)` 的钳制。"
+  (let* ((flat (%cx-flat in))
+         (n (the fixnum (vt-size flat)))
+         (rt (vt-dtype->lisp-type rdt))
+         (shape (if keepdims (make-list (length (vt-shape in)) :initial-element 1) nil))
+         (nan (coerce +vt-dfloat-nan+ rt))
+         ;; VT-MEAN 在 axis=nil 时返回 0 维张量（不是裸数值），要取出标量
+         (mu-raw (vt-mean in))
+         (mu (if (vt-p mu-raw) (vt-item mu-raw) mu-raw)))
+    (with-float-safe
+      (%cx-to-out
+       (make-vt shape
+                (if (%cx-nan-p mu)
+                    nan
+                    (let ((ss (%cx-sumsq-all flat (%creal mu) (%cimag mu)))
+                          (den (max (- n ddof) 1)))
+                      (/ ss (coerce den rt))))
+                :dtype rdt)
+       out "VT-VAR"))))
+
 (defun %cx-op-var (tensor &key axis keepdims (ddof 0) dtype out)
   "沿 AXIS 求方差（对标 numpy.var）。
 
@@ -625,6 +677,9 @@
            (dt (or dtype rdt)))
       (when (vt-complex-dtype-p dt)
         (error "vt-var: 复数方差的结果 dtype 必须是实数类型，收到 ~a" dt))
+      ;; 全归约走两趟单趟扫描；沿轴版本保持原流水线。
+      (when (null axis)
+        (return-from %cx-op-var (%cx-var-global in rdt ddof keepdims out)))
       (let* ((rank (length (vt-shape in)))
              (axes (vt-normalize-axes axis rank))
              (n (if axes

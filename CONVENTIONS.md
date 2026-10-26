@@ -1787,6 +1787,74 @@ NaN 再补 0」的副产品，不是语义）。现在统一 NaN+NaNj。
 >    2-D 沿轴给 `nan+0j`。本库统一 `nan+nanj`（只有两个分量都是 NaN 才是
 >    「两边都不是数」）。
 
+#### 16.14.7 nan 族 / `var` / `nan_to_num`：把「多趟张量流水线」压成单趟或两趟
+
+nan 族的写法一直是「掩码 + 单位元替换 + 复用既有归约内核」：
+
+```
+nanmean = isnan + where + sum + logical-not + astype + sum + div + where   （≈7 趟）
+nanvar  = 上面两倍 + map + mul + sum + map + map                           （≥10 趟）
+```
+
+好处是「语义只有一处」（掩码 + 既有内核都对，组合就对），代价是每次都要
+分配 2~3 个 16 MB 临时张量并全量遍历。1M complex128 实测 `nanmean` 20 /
+`nanvar` 50 / `nanmax` 23 ms，而**同形 float64 早就有单趟快路径**
+（`%NAN-SUM-COUNT` / `%NAN-SUMSQ`，1.4 ms）—— 这个差价里没有一处是
+「复数本来就该慢」。同样的病还有三处：`nan_to_num` 走 `vt-map` + 闭包、
+`var`（复数）没有两趟版、`nansum`（实数）只有通用 `%OP-STEP` 循环。
+
+**做法**（只在 `axis=nil` 的全归约上启用，沿轴版本保持流水线）：
+
+| 新内核 | 用途 | 位置 |
+|---|---|---|
+| `%CX-NAN-SUM-COUNT` | 复数和 + 计数（单趟） | `complex-ops.lisp` |
+| `%CX-NAN-EXTREMUM-COUNT` | 字典序极值 + 计数（单趟） | 同上 |
+| `%CX-NAN-SUMSQ` | Σ\|z−mean\|²（跳过 NaN，单趟） | 同上 |
+| `%CX-SUMSQ-ALL` | Σ\|z−mean\|²（**不跳过**，var 用） | `complex.lisp` |
+| `%SUMSQ-ALL` | 实数版（var 用） | `reduce-stats.lisp` |
+| `%NAN-TO-NUM-BUFFER` / `%CX-NAN-TO-NUM-BUFFER` | 逐分量替换的直线循环 | `extensions3.lisp` / `complex-ops.lisp` |
+
+| 算子（1M） | 修前 | 修后 |
+|---|---:|---:|
+| `nanmean` c128 | 19.9 ms | **1.3 ms** |
+| `nanvar` / `nanstd` c128 | 49.8 / 49.3 ms | **3.0 / 3.1 ms** |
+| `nanmax` / `nanmin` c128 | 22.4 / 22.5 ms | **1.8 / 1.9 ms** |
+| `nansum` c128 | 7.0 ms | **1.3 ms** |
+| `nan-to-num` c128 | 78.9 ms | **5.5 ms**（对照 `vt-copy` 3.4 ms） |
+| `nan-to-num` f64 | 21.9 ms | **1.7 ms** |
+| `var` c128 | 27.2 ms | **1.2 ms** |
+| `var` f64 | 6.5 ms | **1.1 ms** |
+| `nansum` f64 | 8.9 ms | **0.8 ms** |
+
+**五条坑**（每条都对应一次实测错值/崩溃）：
+
+1. **极值扫描不能拿 `a[0]` 当种子**。NaN 参与比较时 `%CLT` 恒假，若 `a[0]` 是
+   NaN，`BEST` 会永远停在 NaN 上、后面所有有限值都比不过它 —— 用 `FIRST`
+   标志在「第一个非 NaN」处初始化。
+2. **`n=0` 时 `(aref d off)` 越界**。空数组的 nanmax 走的是「计数 0 → NaN+NaNj」
+   分支，但种子取得比它早，必须先判 `(plusp n)`。
+3. **`%NAN-P` 必须在 `with-float-safe` 里调**。`(/= nan nan)` 在 SBCL 上是
+   UCOMISD + invalid 陷阱，不是 C 的 quiet compare。
+4. **快路径必须显式要求「浮点 dtype」**。`%E3-FLOAT-PREFER-DTYPE` 对整数输入
+   原样返回 `:int64`，于是 `(eq (vt-dtype v) odt)` 对整数也成立，而
+   `%NAN-TO-NUM-BUFFER` 只认 f32/f64 → 返回 **NIL 张量**（不是报错）。
+5. **`nansum` 的门面是宏生成的**，不能覆盖公开符号（§16.32 禁止靠加载顺序
+   覆盖）。给 `DEF-VT-REDUCE-FACADE` 加了一个可选的 `:fast` 钩子
+   （5 参函数，返回 NIL 表示不接管），这样「全归约快路径」与「一个符号只有
+   一个 DEFUN」两条约束同时成立。
+
+**顺带修掉一处公开 API 崩溃**：`%CX-ABS-RUN` / `%CX-ANGLE-RUN` 的特化循环
+（`%DEF-CX-TO-REAL-RUN` 生成）**没有屏蔽浮点陷阱**。内核里 `%CX-INF-P` 是
+`(> v maxf)`、`%COP-ARG` 要看符号，UCOMISD 遇 NaN 会置 invalid 并触发陷阱 ——
+于是 `(vt-abs z)` 与 `(vt-angle z)` 在**含 NaN 的输入上直接抛
+FLOATING-POINT-INVALID-OPERATION**。这是公开 API 的崩溃（与 §16.14.5 里
+`vt-asin` 那处同类），加一层 `with-float-safe` 即修好；切换 FP 控制字只在
+进出各一次，不在逐元素路径上。
+
+> **仍未融合的**：`nanprod`（单位元是 1，不是热点）、以及**所有沿轴版本**
+> （`axis` 非 nil）仍是流水线。后者若要快，需要把「掩码计数 + 归约」做成
+> 逐 fiber 的融合内核，收益与复杂度都远高于全归约这一批。
+
 ### 16.15 与 numpy 的已知差异清单（全部为**有意**保留）
 
 | 编号 | 差异 | 影响面 | 处置 |
@@ -3274,7 +3342,6 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | U1 | 复数 `matmul` 的 SIMD | 标量内核已对齐实数标量线（§16.27.4：同规模约 2.2×，而 flop 比是 4×）；相对**实数 SIMD** 仍差 2.0–4.2× | 唯一可行路线是「交错布局上按 j 向量化 + shuffle 组 re/im」（保持 p 递增 → 仍满足铁律 1/2）。SoA+4 路实 GEMM 已实测更慢（§16.36.2）且改变累加顺序，本地累加器也已实测无收益（§16.36.2） |
 | U2 | `real/imag` 返回共享视图（D-C3） | 现在返回副本；numpy 的 `z.real` 是同一缓冲的零拷贝视图 | 需给 strided view 引入「分量视图」（`data` + 分量偏移 + 元素宽度/2），会动物理层，影响 `vt-write`/`vt-copy-into`/别名判定；风险高于收益 |
 | U3 | 复数逐元素算子的 SIMD 特化（D-C5） | §16.14.3 实测：`add` 1.8×、`mul` 2.3×、`sqrt` 4.0×、`abs` 6.5×（相对 float64） | 与 U1 同源；还需要先解决 `sb-simd` 的 shuffle 组装形式 |
-| U7 | 复数 nan 族剩余的「多趟」成本 | `nansum` 5 / `nanmean` 13 / `nanvar` 28 / `nanstd` 30 / `nanmax` 22 ms（原 35~88 ms，`vt-where` 特化后）；`nan-to-num` 54 ms 仍偏慢 | 剩下的成本是「掩码 + 计数 + 归约」各自一趟：`nanmean` = isnan + where + sum + logical-not + astype + sum + div + where，约 7 趟全量遍历。要再压需要把「掩码计数 + 求和」合成单趟内核（`%nan-sum-count`），收益约 2×，但会让 nan 族脱离通用算子组合、失去「语义只有一处」的性质 —— 先登记不取 |
 | U9 | 排序族的**算法**（`sort`/`argsort`/`topk`/`median` 共用归并） | `median`/`nanmedian` 已改 quickselect、`topk` 已改有界堆（见 §16.14.6）；**剩下的只有 `sort`/`argsort` 本身**：1M `sort` f64 140 / c128 199、`argsort` 158 / 284，numpy 同机 5.9 / 83 / 19 / 100。c64 与 c128 耗时几乎相同 ⇒ 不是带宽受限，而是归并每次比较的分支不可预测（随机数据约 15 周期 × 20M 次） | 要再压只能换算法，但 **LSD 基数排序已实测否决**（IEEE754 单调键 + 两半 u32 + 8 趟 8 bit，1M double 107 ms/4 趟、8 趟约 200 ms，比归并 130 ms 更慢：64 位键在 SBCL 上是 bignum 必须拆两半，且每趟要把「键+值」两条流按 256 个桶散写）。剩下的路只有 introsort（numpy 的 float 路径），但那**破坏 `argsort` 的稳定契约**。保留现状 |
 
 

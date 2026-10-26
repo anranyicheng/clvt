@@ -657,11 +657,19 @@
                        (type (simple-array ,olt (*)) dst)
                        (type fixnum n p q)
                        (optimize (speed 3) (safety 1)))
-              (dotimes (i n)
-                (declare (type fixnum i))
-                (setf (aref dst q) (,kernel (aref src p)))
-                (incf p)
-                (incf q)))))
+              ;; WITH-FLOAT-SAFE 必须包住整条循环：内核里含 NaN 比较
+              ;; （%COP-ABS 的 `%CX-INF-P` 是 `(> v maxf)`、%COP-ARG 的
+              ;; `(atan ...)` 也要看符号），而 SBCL 的 UCOMISD 遇 NaN 会置
+              ;; invalid 并**触发陷阱**。不屏蔽的话 `(vt-abs z)` / `(vt-angle z)`
+              ;; 在含 NaN 的输入上直接抛 FLOATING-POINT-INVALID-OPERATION ——
+              ;; 这是公开 API 的崩溃，不是「值不对」。切换 FP 控制字只在进出
+              ;; 各一次，不在逐元素路径上。
+              (with-float-safe
+                (dotimes (i n)
+                  (declare (type fixnum i))
+                  (setf (aref dst q) (,kernel (aref src p)))
+                  (incf p)
+                  (incf q))))))
     `(defun ,name (in res)
        (declare (type vt in res))
        (flet ((fallback ()
