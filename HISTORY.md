@@ -1990,3 +1990,242 @@ U7 那行写着「复数 nan 族剩余的多趟成本」。真正让人下决心
 > 这一轮和第三轮（`log` 族）有点像：都不是「算法错」，而是**同一个库里的两条
 > 路只优化了一条**。判断标准很朴素 —— 同形 dtype 之间的倍率超过 5 倍，
 > 基本就不是「复数固有代价」，而是「有一边没跟上」。
+
+## H.3.22 第二十九轮：把「搬运与归约」从内存带宽里捞出来
+
+> 第二十八轮只改测试（性能护栏改倍率），细节见 `CHANGELOG.md`，本节不重复。
+
+#### 一、起点：四条路里只有两条真的在算
+
+用户点名的六个对象（矩阵乘、连续性判断/连续化、dtype 转换、切片、拼接、求和）
+先按「1M 元素、1000×1000、float64」量了一遍。结论分成三类：
+
+| 操作 | 实测 | 判断 |
+|---|---:|---|
+| `vt-matmul` 1000³ f64 | 98 ms（默认线程） | 慢 3~4 倍，且在 31 线程下崩溃 |
+| `vt-sum :axis 0` | 3 ms | 与同数据 numpy 差 20 倍 |
+| `vt-amax :axis 0` | 20 ms | 同上，且更糟 |
+| `vt-sum` int16 | 7 ms | 掉进通用 odometer |
+| `vt-astype` int8→f64 | 8 ms | 每元素一次 `funcall` |
+| `vt-contiguous`（转置视图） | 3.4 ms | 通用 walker 每元素重算 stride |
+| `vt-concatenate :axis 0` | 0.2 ms | 已经是块拷贝，无空间 |
+| `vt-slice` 任意 spec | 0.1 µs | **纯视图构造，本来就不用优化** |
+
+「切片」这一项是虚惊：它是零拷贝的 stride 重写，1M 张量切一刀 0.1µs，
+比一次函数调用还便宜。真正贵的是「切片之后干了什么」（连续化/转换），
+所以力气全花在那两条路上。
+
+#### 二、矩阵乘：先分清是「算得慢」还是「搬得慢」
+
+旧的 `define-simd-matmul-rows` 是「1 行 × VW 列」的 gaxpy：每个 k 步读一遍
+C 的一整行、写一遍；B 的每一行被 m 次重读。1000³ 时 B 要从内存过 8 GB ——
+单线程 235 ms 与「纯内存带宽上限」对得上，与算力无关。
+
+换成标准三层分块后：
+
+- 寄存器微块 4×8（f64）/ 4×16（f32）：C 的一块在整段 k 里驻留寄存器，
+  C 只在 kc 边界读写一次；B 的每个向量被 4 行复用；
+- 缓存分块 MC/KC/NC = 64/256/256：A 128KB + B 512KB + C 128KB，一起进 L2；
+- 内层指针步进：每个 k 步只有 4 次 A 指针自增 + 1 次 B 指针自增。
+
+单线程 235 ms → 82 ms。**这就是这台机器 AVX2 的上限**：同一份数据
+f32 只要 39 ms（8 宽对 4 宽，正好差 2 倍），说明两条都贴住了峰值；
+而 numpy 单线程 1000³ 是 22 ms —— 它用的是 AVX-512（本机 numpy 的
+`show_config` 报 `AVX512_ICL`）。sb-simd 只有 AVX2，所以单线程没得再挖，
+剩下的只能靠线程。
+
+#### 三、线程数：31 线程比 8 线程慢 3 倍
+
+原默认是 `(- *processor-number* 1)` = 31。实测（1000³ f64）：
+
+| 线程 | 1 | 2 | 4 | 8 | 12 | 16 | 24 | 31 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ms | 93 | 46 | 26 | 16 | 13 | 12 | 11~16 | 11~87 |
+
+两件事同时成立：
+
+1. **只切行是错的**。每个线程都要把整个 B 过一遍，线程数翻倍、B 的
+   DRAM 流量也翻倍。改成 (i, j) 二维网格后，总流量 ≈
+   `(m/MC)·k·n + (n/NC)·m·k`，与线程数几乎无关。
+2. **线程数不是越多越好**。31 线程出现过 87 ms 的崩溃式退化（30 个线程
+   各自的工作集互相踢出 L2，而线程创建/汇合的开销摊不薄 8 ms 的活）。
+   默认上限因此取 `min(16, 核数-1)`。
+
+默认线程下 1000³ f64：98 ms → 12~16 ms（6~8 倍）。
+
+#### 四、归约：把「按列跨 stride」换成「整行推进」
+
+`%kernel-single-axis` 的内层是「固定列 i，沿归约轴走」，步长 = INNER。
+axis=0 时 INNER = n（8KB）：每个元素换一条 cache line，整列扫完再扫下一列
+时那些行早被挤出 L2。1M f64 求和 3 ms，numpy 0.15 ms。
+
+新的 `%kernel-row-acc` 把内层维整体当累加器（`acc[0..INNER)` 常驻 L1），
+按行推进，两个流都是顺序的。**关键是它没有改变任何求和顺序**：
+同一个输出元素看到的仍是 r = 0,1,2,…，只是把「不同输出元素之间」的循环
+翻到了外层，所以结果与旧路径**逐位相同**（当场用独立三重循环对拍验证）。
+
+1M f64 axis=0：sum 3→0.45 ms，amax 20→1.7 ms，prod/nansum/mean 同量级。
+
+顺带把 4 种窄整型（int8/int16/uint8/uint16）也接进这条路径：它们原先
+只能走路径 3 的 odometer（每元素重算多维下标），1M int16 求和 7 ms →
+0.5 ms。
+
+还多接了一类：**归约轴是连续区间**的多轴归约（`(0,1)`、`(1,2)` …）。
+只要归约轴在 shape 里连成一段 `[a,b)`，多层轴就等价于一层
+（`outer=∏[0,a)`、`red=∏[a,b)`、`inner=∏[b,rank)`），行累加内核直接可用；
+`inner` 太窄时退回列扫内核。`(50,100,200)` 求 `axis=(0,1)`：
+9 ms → 0.5 ms，与朴素三重循环参考逐位一致。
+
+**收尾：三块分派合成一块，并修掉两个自己埋的坑。**
+
+第一版把「单轴存储级」「单轴窄整型」「多轴」写成了三条独立 clause，其中
+多轴那条为了在四层嵌套的反引号模板里插 clause，用 `(list (list (list 'and …)))`
+手工拼了二十多行代码数据 —— 既读不懂，也确实出了两次括号事故。改法：
+
+- 几何条件抽成 `%CONTIG-AXIS-TEST`（4 条断言，`(consp axes)` + 双连续 +
+  「归约轴连成一段」的 loop）；
+- clause 的 body 抽成 `%CONTIG-AXIS-BODY`，用**一层反引号**写真代码；
+- `%CONTIG-AXIS-CLAUSE` 只做 `(cons test body)` 的装配，模板里剩一行
+  `,@(%contig-axis-clause op arg-p #'dispatch)`。
+
+三块合一之后顺带暴露并修掉两个 bug：
+
+1. **窄整型多轴直接抛错**。旧的多轴 clause 只检查几何条件、不检查 dtype，
+   于是 `(vt-sum int16-3d :axis '(0 1))` 落进存储级 dispatch，报
+   `unsupported input dtype (SIGNED-BYTE 16)` —— 这条路以前走路径 3，
+   是我把它拉进快路径时掐断的。现在窄整型有 `%SMALL-INT-AXIS-FORM`
+   统一分派（行累加 / 列扫）。
+2. **窄整型 `amax` 报 `unsupported output dtype`**。窄整型的 max/min
+   结果**保持**输入 dtype（int8 进 int8 出），而分派表只列了 4 种存储级
+   输出类型。改成遍历 `+ALL-LTS+`（存储级 + 窄整型）即可。
+
+对拍：8 种 dtype × 3 种 shape × 全部轴组合（单轴/多轴/不连续轴）×
+4 个算子 + argmax/argmin，共 592 组，与「按 C 序累加进输出桶」的朴素参考
+**逐位相同**（float32 的参考也用 single 累加，否则比的是精度不是实现）。
+
+#### 五、一条 `declaim inline` 值 10 倍
+
+`amax` 换成行累加后仍要 14.6 ms，而 sum 只要 0.45 ms —— 同样的循环、
+同样的访存，差别只在 `%op-step` 的极值分支里有两次 `%nan-p` 调用。
+
+`%nan-p` 的形参类型是 `T`（`(and (floatp x) (not (= x x)))`）。不内联时
+函数体只能按泛型数值编译，`=` 走 `TWO-ARG-=` 的运行时派发，一次调用
+20~30 个周期；每元素两次，正好是实测的 14 ns/元素。
+
+`(declaim (inline %nan-p %nan-or-inf-p))` 之后，调用点已知元素类型，
+`(floatp x)` 折成常量 T、`(= x x)` 折成一条 COMISD：14.6 ms → 1.2 ms。
+
+这条**必须**放在 `util.lisp` 而不是 `nan.lisp`：`util.lisp` 里的
+`vt-numpy-sort` 已经调用了它，声明晚于调用点会得到
+「could not be inlined because its source code was not saved」，
+内联**静默失效**（只有一个 STYLE-WARNING）。两个谓词的定义因此整体
+搬到了 `util.lisp`（它们不依赖 nan.lisp 的任何东西）。
+
+#### 六、astype 与连续化：把「逐元素 funcall」换成特化循环
+
+- 窄整型源（4 种）原先没有特化分支，落到通用 fallback：每元素一次
+  `(funcall (vt-cast-fun ...))`。补上 4×8 个 `spec` 实例后
+  int8→f64 8 ms → 0.7 ms。
+- `vt-contiguous` / `vt-copy` 的非连续分支原走 `vt-copy-into` 的通用
+  walker（每元素重算 shape/stride）。改走 `%gather-contiguous`
+  （末轴展开 + 其余轴 odometer、按元素类型特化）：转置 1M 3.4 → 1.2 ms。
+  注意 `%gather-contiguous` 的「未知元素类型」兜底原本 `return-from`
+  到 `vt-contiguous` —— 现在两者互相调用，那条兜底必须改成直接
+  `vt-copy-into`，否则就是死循环。
+
+#### 七、三个坑
+
+1. **`ql:quickload` 会骗人**。改完文件在同一秒内编译，ASDF 按秒级
+   时间戳判定 fasl 是新的，于是「LOADED」但跑的是旧代码；等测试套件
+   强制重编时才炸（`undefined variable N-NON`）。判断编译是否真的发生，
+   要看输出里有没有 `; wrote ...fasl`，不能只看「没报错」。
+2. **`(setf ,@pairs)` 的 pairs 必须是扁平序列**。第一版写成
+   `((place value) (place value))`，展开成 `(setf (p v) (p v))`，
+   SBCL 报的是「不是合法的函数名」—— 因为 `(setf (p v))` 只有一个参数时
+   会被当成 `(function (setf p))` 的查找。
+3. **`cond` 的 clause 不能「中途失败再落到下一条」**。窄整型的快路径
+   先写成了 `(clause (if 满足 (行累加) (通用内核)))`，而通用内核要的
+   `n-red/n-non/...` 只在路径 3 的 `let*` 里绑定 —— 报 undefined variable。
+   正确写法是把「满足条件」并进 clause 自己的条件里，不满足时这条 clause
+   干脆不匹配，自然落到路径 3。
+
+#### 八、这一轮改到的文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/simd-matmul.lisp` | 重写 GEMM 内核（分块宏 `DEFINE-BLOCKED-GEMM` + 标量/向量行尾块 + 二维网格调度）；线程数默认上限 16 |
+| `src/reduce-stats.lisp` | 新增 `%KERNEL-ROW-ACC`（路径 2b）与窄整型路径 2c；`+ROW-ACC-MIN-INNER+` 门槛 |
+| `src/util.lisp` | `%NAN-P` / `%NAN-OR-INF-P` 移入并 `declaim inline`（必须先于所有调用点） |
+| `src/nan.lisp` | 迁出上述两个谓词（其余不变） |
+| `src/core.lisp` | `vt-astype` 补窄整型 ×8 目标特化；`vt-contiguous` / `vt-copy` 非连续分支改走 `%GATHER-CONTIGUOUS` |
+| `CONVENTIONS.md` | §2.2 补连续化实现；§7.3 改线程数/网格契约；新增 §7.4 快路径清单 |
+
+## H.3.23 第三十轮：`vt-astype` 的「两趟」是怎么被找出来的
+
+> 上一轮把 astype / 连续化 / 归约的搬运层统一到 `%MEMCPY` + `%GATHER-CONTIGUOUS`，
+> 细节见 `CHANGELOG.md`（二十九），本节不重复。
+
+#### 一、表里的倍率对不上
+
+上一轮的验收表里，转置视图的 `vt-contiguous` 是「3.4 ms → 1.2 ms」，而
+`vt-copy` 的转置是「2.6 ms → 1.2 ms」—— 两条都落在 1.2 ms，看着很一致。
+但把同一份数据做成**切片视图**（`a[::2,:]`，500×1000，内层 run = 1000）再量：
+
+| 视图 | `vt-astype → f32` |
+|---|---:|
+| 连续 1000×1000 | 0.55 ms |
+| 切片 `a[::2,:]`（半张表） | **1.23 ms** |
+| 转置（半趟等效数据） | 1.92 ms |
+
+半张表的转换比整张表还慢 —— 只能是「趟数」不对。读代码确认：非连续分支
+`(%inner-run-suffix ...)` 只用来判「run 够不够长」，够长时**跨 dtype** 仍走
+`(vt-astype (vt-contiguous tensor) new-dtype)`，也就是「先收集成连续副本，
+再整数组转换」：一块 4 MB 临时分配 + 两趟全量流量。同一份数据上，
+转置视图（run = 1）走 `%gather-contiguous` 只要一趟，切片视图反而要两趟。
+
+#### 二、为什么不能只加一条分支
+
+给「跨 dtype + 长 run」加一条融合分支，要的是同一张 10×10 特化表的
+**另一套落点**。当时那张表是写在 `(macrolet ((spec ...)) (cond ...))` 里的
+62 条手写 clause，`spec` 展开成「`(dotimes (i size))` 写满整个 `new-data`」，
+没法按 run 复用 —— 直接复制一份就是 62 条 clause 的手抄，正式把
+「快路径与通用路径各写一套」这个坑再挖一遍（§7.4 的原话）。
+
+改法是把循环的**起止**和**落点**参数化：`spec` 展开成
+「`dp` 从 `p` 起、`dq` 从 `q` 起、共 `len` 个」，然后整张表提成局部函数
+`%cast-run (dst p q len)`：
+
+- 连续视图：`(%cast-run new-data in-offset 0 size)` —— 一次调用，参数全常量；
+- 切片视图：`%map-inner-runs` 每段 run 调一次 `(%cast-run new-data p q run-len)`。
+
+62 条 clause 一字未改（只把 `(aref dst i)` 换成 `(aref d dq)`，编译器对
+`dq` 与对 `i` 做的是同一件事：strength-reduce 成指针自增），所以连续路径
+的耗时实测不变（0.55 ms，改前 0.55 ms）。
+
+#### 三、两个当场踩到的坑
+
+1. **`return-from` 不是可选项**。融合分支写完后，`%gather-contiguous` 那条
+   分支被我顺手写成了 `(if ... tmp (vt-astype tmp new-dtype))` —— 看着等价，
+   但函数末尾还有一句 `new`（调用方预分配的那个数组）。于是所有非连续
+   **短 run** 路径都返回了未写满的 `new`：34 条「转置/翻转/切片/广播视图
+   与连续副本一致」全红，而 100 格连续矩阵全绿 —— 正好是「非连续分支唯一
+   出口」这条约定（§2.2）漏掉的表现。
+2. **`(declare (ignorable ,lt))` 不是「忽略宏参数」的写法**。`memcpy` 宏的
+   形参是类型说明符 `(signed-byte 64)`，展开成 `(declare (ignorable (signed-byte 64)))`
+   直接被编译器判为「不是合法的变量名」。宏参数不用就不会有 style-warning，
+   什么都不写才对。
+
+#### 四、验收
+
+| 场景 | 改前 | 改后 |
+|---|---:|---:|
+| `astype a[::2,:]` f64→f32 | 1.23 ms | 0.33 ms |
+| `astype a[::2,:]` f64→i32 | 1.36 ms | 0.87 ms |
+| `astype a[::2,:]` c128→c64 | 1.63 ms | 0.64 ms |
+| `vt-copy a[::2,:] :dtype :float32` | 0.82 ms | 0.33 ms |
+| `astype a[::2,:]` f64→f64（同型） | 0.23 ms | 0.24 ms |
+| `astype` 连续 1000×1000 f64→f32 | 0.55 ms | 0.55 ms |
+| `astype` 转置 f64→f32 | 1.92 ms | 1.92 ms |
+
+62 套件全绿；新增护栏 G8 把「切片视图不得退回双趟」钉成倍率断言
+（`≤ 1.8×`，双趟是 4×）。

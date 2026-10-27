@@ -48,6 +48,7 @@ SUITES[nan-random-test]="89 NaN 随机数测试"
 SUITES[property-test]="性质测试"
 SUITES[test-extensions]="19 扩展函数回归测试"
 SUITES[simd-test]="SIMD 路径测试"
+SUITES[perf-fastpath-test]="13 非复数快路径护栏 (GEMM 分块/归约行累加/窄整型/astype/连续化 的选路结构与机器无关倍率；纯正确性测试抓不到「选路退化」)"
 SUITES[test-overlap]="6 重叠拷贝回归测试"
 SUITES[svd-fast-path-test]="SVD 双路径测试 (差分参考/选路不变量/数学性质/numpy对比/退化形状)"
 SUITES[linalg-fast-path-test]="LINALG 双路径测试 (lu/qr/solve/chol/eig: 差分参考/选路不变量/数学性质/numpy对比/边界)"
@@ -127,6 +128,7 @@ DEFAULT_ORDER=(
     property-test
     test-extensions
     simd-test
+    perf-fastpath-test
     test-overlap
     test-copy-into
     test-simd-batch-matmul

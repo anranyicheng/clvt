@@ -122,15 +122,9 @@
 ;;; 类型声明（性能）：四个谓词分别只在 double-float / single-float 上被调用，
 ;;; 返回恒为 boolean。声明后调用点不再需要把结果当 T 装箱，也可被内联进
 ;;; 比较/裁剪/极值热循环的布尔分支中。
-(declaim (ftype (function (t) boolean) %nan-p)
-         (ftype (function (t) boolean) %inf-p)
+(declaim (ftype (function (t) boolean) %inf-p)
          (ftype (function (t) boolean) %pos-inf-p)
-         (ftype (function (t) boolean) %neg-inf-p)
-         (ftype (function (t) boolean) %nan-or-inf-p))
-
-(defun %nan-p (x)
-  "快速 NaN 判定：IEEE 754 中 NaN != NaN。调用方需屏蔽浮点陷阱。"
-  (and (floatp x) (not (= x x))))
+         (ftype (function (t) boolean) %neg-inf-p))
 
 (defun %inf-p (x)
   "快速 Inf 判定：|x| > most-positive-double-float（对 single/double 均成立）。"
@@ -141,12 +135,6 @@
 
 (defun %neg-inf-p (x)
   (and (floatp x) (< x most-negative-double-float)))
-
-(defun %nan-or-inf-p (x)
-  "浮点 NaN 或 ±Inf 判定。调用方需屏蔽浮点陷阱。"
-  (and (floatp x)
-       (or (not (= x x))
-	   (> (abs x) most-positive-double-float))))
 
 (declaim (inline %safe-truncate))
 ;;; 类型声明（性能）：输入恒为实数，输出恒为整数。这是所有窄化转换

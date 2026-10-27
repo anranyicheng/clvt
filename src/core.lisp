@@ -329,18 +329,20 @@
                          (t (setf contiguous nil))))
           contiguous))))
 
-(defun vt-contiguous (vt)
-  "返回内存连续的副本（若已连续则返回自身）。"
-  (if (vt-contiguous-p vt)
-      vt
-      ;; 全量覆写在下面，零值填充是纯浪费（1M c128 = 3ms）
-      (let ((new (%alloc-vt (vt-shape vt) (vt-dtype vt))))
-        (vt-copy-into new vt)
-        new)))
+
 
 ;;; ------------------------------------------------------------------
 ;;; 拷贝与类型转换
 ;;; ------------------------------------------------------------------
+(defparameter +astype-fuse-min-run+ 16
+  "`vt-astype` 对非连续视图启用「逐 run 单趟转换」的最小内层 run 长度。
+
+   为什么有门槛：run 太短时（转置/翻转视图 run=1）逐 run 的调用开销
+   远大于收益，此时改走 `%gather-contiguous` 的同 dtype 特化收集
+   （一次遍历、静态元素类型），再做整数组转换。
+   16 与 `vt-copy-into` 用 `%inner-run-suffix` 做块拷贝的门槛取同一个
+   数：两处若各取一个值，同形视图会在两条 API 上表现出不同的快慢。")
+
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun %astype-cast-form (out-lt src-expr &optional in-lt)
     "生成把 src-expr 转换到 out-lt 的代码。
@@ -514,9 +516,25 @@
                 ((equal lt '(unsigned-byte 8))       (walk (unsigned-byte 8)))
                 ((equal lt '(complex double-float))  (walk (complex double-float)))
                 ((equal lt '(complex single-float))  (walk (complex single-float)))
-                ;; 未知底层元素类型：回退到库的通用 strided 拷贝（语义一致）
-                (t (return-from %gather-contiguous (vt-contiguous tensor)))))))
+                ;; 未知底层元素类型：回退到库的通用 strided 拷贝（语义一致）。
+                ;; **不能**回写 VT-CONTIGUOUS —— 它现在反过来调用本函数，
+                ;; 那样就是一个自递归死循环。
+                (t (let ((new (%alloc-vt shape dtype)))
+                     (vt-copy-into new tensor)
+                     new))))))
     out))
+
+(defun vt-contiguous (vt)
+  "返回内存连续的副本（若已连续则返回自身，零拷贝）。
+
+   非连续时走 `%gather-contiguous`：它按**末轴展开 + 其余轴 odometer** 做
+   同 dtype 的特化收集，避开了 `vt-copy-into` 通用 walker 每元素的
+   shape/stride 重算。实测 1000×1000 转置视图（16MB 来回）：
+   3.4ms → 1.2ms；stride=2 视图 1.0ms → 0.4ms。
+   落点仍是行主序连续（铁律 1：连续性只影响选路，不影响结果）。"
+  (if (vt-contiguous-p vt)
+      vt
+      (%gather-contiguous vt)))
 
 (defun vt-astype (tensor new-dtype)
   "将张量转换为新类型（浮点转整数截断）。返回连续的新张量。
@@ -526,8 +544,14 @@
      · 目标为实数/整数且入参为复数 → **取实部**（静默丢弃虚部，
        对标 numpy astype 的 ComplexWarning，本库不产生警告）；
      · NaN/±Inf → 整数一律 0（§7.2）。
-   执行层（§16.4.1）：10×10 组合各自走按元素类型展开的特化循环，
-   非连续视图先经 `%gather-contiguous` 做同 dtype 特化收集。"
+
+   执行层（§16.4.1）—— 三条落点，**共用同一张 10×10 特化表**：
+     1. 连续视图：整数组一次 `%CAST-RUN`（同 dtype 走 `%memcpy`）；
+     2. 非连续、内层 run ≥ `+astype-fuse-min-run+`（切片/跨步视图）：
+        逐 run 直接写进目标数组 —— 单趟、无临时副本；
+     3. 非连续、run 更短（转置/翻转视图）：先 `%gather-contiguous` 做
+        同 dtype 特化收集（同 dtype 时它就是结果），跨 dtype 再走第 1 条。
+   分配用 `make-array`（不填充零值，与 `%alloc-vt` 等价）。"
   (with-float-safe
     (let* ((shape (vt-shape tensor))
            (rank (length shape))
@@ -543,291 +567,290 @@
                           :offset 0
                           :dtype new-dtype)))
       (declare (type fixnum rank size in-offset))
-      (cond
-        ;; ---- 标量 ----
-        ((zerop rank)
-         (setf (aref new-data 0)
-               (funcall (vt-cast-fun new-dtype) (aref in-data in-offset))))
+      ;; 10×10 特化表被两条落点共用（整数组 / 逐 run），所以提成一个局部
+      ;; 函数 %CAST-RUN：(DST P Q LEN) = 把 IN-DATA 的 [P, P+LEN) 按
+      ;; NEW-DTYPE 写到 DST 的 [Q, Q+LEN)。提成一处而不是各写一套，是为了
+      ;; 避免「快路径与通用路径各写一套」再分叉（CONVENTIONS §7.4）。
+      (macrolet
+          ((spec (in-lt out-lt)
+             (let ((expr (%astype-cast-form out-lt '(aref src dp) in-lt)))
+               `(let ((src (the (simple-array ,in-lt (*)) in-data))
+                      (d (the (simple-array ,out-lt (*)) dst))
+                      (dp p)
+                      (dq q))
+                  (declare (type (simple-array ,in-lt (*)) src)
+                           (type (simple-array ,out-lt (*)) d)
+                           (type fixnum dp dq))
+                  (dotimes (j len)
+                    (setf (aref d dq) ,expr)
+                    (incf dp)
+                    (incf dq)))))
+           (memcpy (lt)
+             ;; 同型块拷贝统一走 %MEMCPY（库内唯一块拷贝实现，§2.2 / §16.4.1）。
+             ;; LT 只让调用点自解释（写出「两端同型」这件事），实际类型由
+             ;; %MEMCPY 在运行时按目的地元素类型分派 —— 这也是它能一处顶掉
+             ;; 原先 10 份 `(replace (the (simple-array …)))` 的原因。
+             (declare (ignore lt))
+             `(%memcpy dst q in-data p len)))
+        (flet ((%cast-run (dst p q len)
+                 (declare (type fixnum p q len))
+                 (let ((in-et (array-element-type in-data)))
+                   (cond
+                     ;; ============================================================
+                     ;; 同型 memcpy
+                     ;; ============================================================
+                     ((and (equal in-et 'double-float)       (equal new-lisp-type 'double-float))
+                      (memcpy double-float))
+                     ((and (equal in-et 'single-float)       (equal new-lisp-type 'single-float))
+                      (memcpy single-float))
+                     ((and (equal in-et '(signed-byte 64))   (equal new-lisp-type '(signed-byte 64)))
+                      (memcpy (signed-byte 64)))
+                     ((and (equal in-et '(signed-byte 32))   (equal new-lisp-type '(signed-byte 32)))
+                      (memcpy (signed-byte 32)))
+                     ;; 以下 4 个为防御性：*vt-storage-dtypes* 目前不分配这些底层数组，
+                     ;; 但保留可让 vt-from-array 等异常路径也走快车道。
+                     ((and (equal in-et '(signed-byte 16))   (equal new-lisp-type '(signed-byte 16)))
+                      (memcpy (signed-byte 16)))
+                     ((and (equal in-et '(signed-byte 8))    (equal new-lisp-type '(signed-byte 8)))
+                      (memcpy (signed-byte 8)))
+                     ((and (equal in-et '(unsigned-byte 16)) (equal new-lisp-type '(unsigned-byte 16)))
+                      (memcpy (unsigned-byte 16)))
+                     ((and (equal in-et '(unsigned-byte 8))  (equal new-lisp-type '(unsigned-byte 8)))
+                      (memcpy (unsigned-byte 8)))
+                     ;; 复数同型：物理布局逐位相同（interleaved），一次 replace 即可，
+                     ;; 不需要经过任何逐元素解包/重组（§16.4：同 dtype 不改变数值）。
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(complex double-float)))
+                      (memcpy (complex double-float)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(complex single-float)))
+                      (memcpy (complex single-float)))
 
-        ;; ---- 连续视图 ----
-        ((vt-contiguous-p tensor)
-         (let ((in-et (array-element-type in-data)))
-           (macrolet
-               ((spec (in-lt out-lt)
-                  (let ((expr (%astype-cast-form out-lt '(aref src p) in-lt)))
-                    `(let ((src (the (simple-array ,in-lt (*)) in-data))
-                           (dst (the (simple-array ,out-lt (*)) new-data))
-                           (p in-offset))
-                       (declare (type (simple-array ,in-lt (*)) src)
-                                (type (simple-array ,out-lt (*)) dst)
-                                (type fixnum p))
-                       (dotimes (i size)
-                         (setf (aref dst i) ,expr)
-                         (incf p)))))
-                (memcpy (lt)
-                  `(replace (the (simple-array ,lt (*)) new-data)
-                            (the (simple-array ,lt (*)) in-data)
-                            :start1 0 :end1 size
-                            :start2 in-offset
-                            :end2 (the fixnum (+ in-offset size)))))
-             (cond
-               ;; ============================================================
-               ;; 同型 memcpy
-               ;; ============================================================
-               ((and (equal in-et 'double-float)       (equal new-lisp-type 'double-float))
-                (memcpy double-float))
-               ((and (equal in-et 'single-float)       (equal new-lisp-type 'single-float))
-                (memcpy single-float))
-               ((and (equal in-et '(signed-byte 64))   (equal new-lisp-type '(signed-byte 64)))
-                (memcpy (signed-byte 64)))
-               ((and (equal in-et '(signed-byte 32))   (equal new-lisp-type '(signed-byte 32)))
-                (memcpy (signed-byte 32)))
-               ;; 以下 4 个为防御性：*vt-storage-dtypes* 目前不分配这些底层数组，
-               ;; 但保留可让 vt-from-array 等异常路径也走快车道。
-               ((and (equal in-et '(signed-byte 16))   (equal new-lisp-type '(signed-byte 16)))
-                (memcpy (signed-byte 16)))
-               ((and (equal in-et '(signed-byte 8))    (equal new-lisp-type '(signed-byte 8)))
-                (memcpy (signed-byte 8)))
-               ((and (equal in-et '(unsigned-byte 16)) (equal new-lisp-type '(unsigned-byte 16)))
-                (memcpy (unsigned-byte 16)))
-               ((and (equal in-et '(unsigned-byte 8))  (equal new-lisp-type '(unsigned-byte 8)))
-                (memcpy (unsigned-byte 8)))
-               ;; 复数同型：物理布局逐位相同（interleaved），一次 replace 即可，
-               ;; 不需要经过任何逐元素解包/重组（§16.4：同 dtype 不改变数值）。
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(complex double-float)))
-                (memcpy (complex double-float)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(complex single-float)))
-                (memcpy (complex single-float)))
+                     ;; ============================================================
+                     ;; double-float 源
+                     ;; ============================================================
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 64)))
+                      (spec double-float (signed-byte 64)))
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 32)))
+                      (spec double-float (signed-byte 32)))
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 16)))
+                      (spec double-float (signed-byte 16)))
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 8)))
+                      (spec double-float (signed-byte 8)))
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(unsigned-byte 16)))
+                      (spec double-float (unsigned-byte 16)))
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(unsigned-byte 8)))
+                      (spec double-float (unsigned-byte 8)))
+                     ((and (equal in-et 'double-float) (equal new-lisp-type 'single-float))
+                      (spec double-float single-float))
 
-               ;; ============================================================
-               ;; double-float 源
-               ;; ============================================================
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 64)))
-                (spec double-float (signed-byte 64)))
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 32)))
-                (spec double-float (signed-byte 32)))
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 16)))  
-                (spec double-float (signed-byte 16)))
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(signed-byte 8)))   
-                (spec double-float (signed-byte 8)))
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(unsigned-byte 16))) 
-                (spec double-float (unsigned-byte 16)))
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(unsigned-byte 8)))  
-                (spec double-float (unsigned-byte 8)))
-               ((and (equal in-et 'double-float) (equal new-lisp-type 'single-float))
-                (spec double-float single-float))
+                     ;; ============================================================
+                     ;; single-float 源
+                     ;; ============================================================
+                     ((and (equal in-et 'single-float) (equal new-lisp-type 'double-float))
+                      (spec single-float double-float))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 64)))
+                      (spec single-float (signed-byte 64)))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 32)))
+                      (spec single-float (signed-byte 32)))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 16)))
+                      (spec single-float (signed-byte 16)))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 8)))
+                      (spec single-float (signed-byte 8)))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(unsigned-byte 16)))
+                      (spec single-float (unsigned-byte 16)))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(unsigned-byte 8)))
+                      (spec single-float (unsigned-byte 8)))
 
-               ;; ============================================================
-               ;; single-float 源
-               ;; ============================================================
-               ((and (equal in-et 'single-float) (equal new-lisp-type 'double-float))
-                (spec single-float double-float))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 64)))
-                (spec single-float (signed-byte 64)))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 32)))
-                (spec single-float (signed-byte 32)))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 16)))  
-                (spec single-float (signed-byte 16)))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(signed-byte 8)))   
-                (spec single-float (signed-byte 8)))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(unsigned-byte 16))) 
-                (spec single-float (unsigned-byte 16)))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(unsigned-byte 8)))  
-                (spec single-float (unsigned-byte 8)))
+                     ;; ============================================================
+                     ;; int64 源
+                     ;; ============================================================
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'double-float))
+                      (spec (signed-byte 64) double-float))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'single-float))
+                      (spec (signed-byte 64) single-float))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 32)))
+                      (spec (signed-byte 64) (signed-byte 32)))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 16)))
+                      (spec (signed-byte 64) (signed-byte 16)))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 8)))
+                      (spec (signed-byte 64) (signed-byte 8)))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(unsigned-byte 16)))
+                      (spec (signed-byte 64) (unsigned-byte 16)))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(unsigned-byte 8)))
+                      (spec (signed-byte 64) (unsigned-byte 8)))
 
-               ;; ============================================================
-               ;; int64 源
-               ;; ============================================================
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'double-float))
-                (spec (signed-byte 64) double-float))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type 'single-float))
-                (spec (signed-byte 64) single-float))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 32)))
-                (spec (signed-byte 64) (signed-byte 32)))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 16)))  
-                (spec (signed-byte 64) (signed-byte 16)))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(signed-byte 8)))   
-                (spec (signed-byte 64) (signed-byte 8)))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(unsigned-byte 16))) 
-                (spec (signed-byte 64) (unsigned-byte 16)))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(unsigned-byte 8)))  
-                (spec (signed-byte 64) (unsigned-byte 8)))
+                     ;; ============================================================
+                     ;; int32 源
+                     ;; ============================================================
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'double-float))
+                      (spec (signed-byte 32) double-float))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'single-float))
+                      (spec (signed-byte 32) single-float))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 64)))
+                      (spec (signed-byte 32) (signed-byte 64)))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 16)))
+                      (spec (signed-byte 32) (signed-byte 16)))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 8)))
+                      (spec (signed-byte 32) (signed-byte 8)))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(unsigned-byte 16)))
+                      (spec (signed-byte 32) (unsigned-byte 16)))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(unsigned-byte 8)))
+                      (spec (signed-byte 32) (unsigned-byte 8)))
 
-               ;; ============================================================
-               ;; int32 源
-               ;; ============================================================
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'double-float))
-                (spec (signed-byte 32) double-float))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type 'single-float))
-                (spec (signed-byte 32) single-float))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 64)))
-                (spec (signed-byte 32) (signed-byte 64)))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 16)))  
-                (spec (signed-byte 32) (signed-byte 16)))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(signed-byte 8)))   
-                (spec (signed-byte 32) (signed-byte 8)))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(unsigned-byte 16))) 
-                (spec (signed-byte 32) (unsigned-byte 16)))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(unsigned-byte 8)))  
-                (spec (signed-byte 32) (unsigned-byte 8)))
+                     ;; ============================================================
+                     ;; 复数源 → 复数目标（CONVENTIONS §16.4）
+                     ;; 分量各自 coerce 后重组；interleaved 存储的读写都是 16B/8B 整体，
+                     ;; 因此这里不存在「实部/虚部两趟」的余地，逐元素 spec 即最优形态。
+                     ;; ============================================================
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(complex single-float)))
+                      (spec (complex double-float) (complex single-float)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(complex double-float)))
+                      (spec (complex single-float) (complex double-float)))
 
-               ;; ============================================================
-               ;; 复数源 → 复数目标（CONVENTIONS §16.4）
-               ;; 分量各自 coerce 后重组；interleaved 存储的读写都是 16B/8B 整体，
-               ;; 因此这里不存在「实部/虚部两趟」的余地，逐元素 spec 即最优形态。
-               ;; ============================================================
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(complex single-float)))
-                (spec (complex double-float) (complex single-float)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(complex double-float)))
-                (spec (complex single-float) (complex double-float)))
+                     ;; ============================================================
+                     ;; 复数源 → 实/整目标：先取实部，再按实数规则 cast
+                     ;; （§16.4 astype 语义：静默丢弃虚部，对标 numpy 的 ComplexWarning，
+                     ;;  本库不产生 warning；整数目标仍是截断 + 回绕）。
+                     ;; ============================================================
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type 'double-float))
+                      (spec (complex double-float) double-float))
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type 'single-float))
+                      (spec (complex double-float) single-float))
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 64)))
+                      (spec (complex double-float) (signed-byte 64)))
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 32)))
+                      (spec (complex double-float) (signed-byte 32)))
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 16)))
+                      (spec (complex double-float) (signed-byte 16)))
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 8)))
+                      (spec (complex double-float) (signed-byte 8)))
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(unsigned-byte 16)))
+                      (spec (complex double-float) (unsigned-byte 16)))
+                     ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(unsigned-byte 8)))
+                      (spec (complex double-float) (unsigned-byte 8)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type 'double-float))
+                      (spec (complex single-float) double-float))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type 'single-float))
+                      (spec (complex single-float) single-float))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 64)))
+                      (spec (complex single-float) (signed-byte 64)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 32)))
+                      (spec (complex single-float) (signed-byte 32)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 16)))
+                      (spec (complex single-float) (signed-byte 16)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 8)))
+                      (spec (complex single-float) (signed-byte 8)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(unsigned-byte 16)))
+                      (spec (complex single-float) (unsigned-byte 16)))
+                     ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(unsigned-byte 8)))
+                      (spec (complex single-float) (unsigned-byte 8)))
 
-               ;; ============================================================
-               ;; 复数源 → 实/整目标：先取实部，再按实数规则 cast
-               ;; （§16.4 astype 语义：静默丢弃虚部，对标 numpy 的 ComplexWarning，
-               ;;  本库不产生 warning；整数目标仍是截断 + 回绕）。
-               ;; ============================================================
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type 'double-float))
-                (spec (complex double-float) double-float))
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type 'single-float))
-                (spec (complex double-float) single-float))
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 64)))
-                (spec (complex double-float) (signed-byte 64)))
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 32)))
-                (spec (complex double-float) (signed-byte 32)))
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 16)))
-                (spec (complex double-float) (signed-byte 16)))
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(signed-byte 8)))
-                (spec (complex double-float) (signed-byte 8)))
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(unsigned-byte 16)))
-                (spec (complex double-float) (unsigned-byte 16)))
-               ((and (equal in-et '(complex double-float)) (equal new-lisp-type '(unsigned-byte 8)))
-                (spec (complex double-float) (unsigned-byte 8)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type 'double-float))
-                (spec (complex single-float) double-float))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type 'single-float))
-                (spec (complex single-float) single-float))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 64)))
-                (spec (complex single-float) (signed-byte 64)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 32)))
-                (spec (complex single-float) (signed-byte 32)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 16)))
-                (spec (complex single-float) (signed-byte 16)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(signed-byte 8)))
-                (spec (complex single-float) (signed-byte 8)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(unsigned-byte 16)))
-                (spec (complex single-float) (unsigned-byte 16)))
-               ((and (equal in-et '(complex single-float)) (equal new-lisp-type '(unsigned-byte 8)))
-                (spec (complex single-float) (unsigned-byte 8)))
+                     ;; ============================================================
+                     ;; 实数/整数源 → 复数目标：虚部补 0（§16.4）
+                     ;; ============================================================
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(complex double-float)))
+                      (spec double-float (complex double-float)))
+                     ((and (equal in-et 'double-float) (equal new-lisp-type '(complex single-float)))
+                      (spec double-float (complex single-float)))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(complex double-float)))
+                      (spec single-float (complex double-float)))
+                     ((and (equal in-et 'single-float) (equal new-lisp-type '(complex single-float)))
+                      (spec single-float (complex single-float)))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(complex double-float)))
+                      (spec (signed-byte 64) (complex double-float)))
+                     ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(complex single-float)))
+                      (spec (signed-byte 64) (complex single-float)))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(complex double-float)))
+                      (spec (signed-byte 32) (complex double-float)))
+                     ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(complex single-float)))
+                      (spec (signed-byte 32) (complex single-float)))
+                     ((and (equal in-et '(signed-byte 16)) (equal new-lisp-type '(complex double-float)))
+                      (spec (signed-byte 16) (complex double-float)))
+                     ((and (equal in-et '(signed-byte 16)) (equal new-lisp-type '(complex single-float)))
+                      (spec (signed-byte 16) (complex single-float)))
+                     ((and (equal in-et '(signed-byte 8)) (equal new-lisp-type '(complex double-float)))
+                      (spec (signed-byte 8) (complex double-float)))
+                     ((and (equal in-et '(signed-byte 8)) (equal new-lisp-type '(complex single-float)))
+                      (spec (signed-byte 8) (complex single-float)))
+                     ((and (equal in-et '(unsigned-byte 16)) (equal new-lisp-type '(complex double-float)))
+                      (spec (unsigned-byte 16) (complex double-float)))
+                     ((and (equal in-et '(unsigned-byte 16)) (equal new-lisp-type '(complex single-float)))
+                      (spec (unsigned-byte 16) (complex single-float)))
+                     ((and (equal in-et '(unsigned-byte 8)) (equal new-lisp-type '(complex double-float)))
+                      (spec (unsigned-byte 8) (complex double-float)))
+                     ((and (equal in-et '(unsigned-byte 8)) (equal new-lisp-type '(complex single-float)))
+                      (spec (unsigned-byte 8) (complex single-float)))
 
-               ;; ============================================================
-               ;; 实数/整数源 → 复数目标：虚部补 0（§16.4）
-               ;; ============================================================
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(complex double-float)))
-                (spec double-float (complex double-float)))
-               ((and (equal in-et 'double-float) (equal new-lisp-type '(complex single-float)))
-                (spec double-float (complex single-float)))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(complex double-float)))
-                (spec single-float (complex double-float)))
-               ((and (equal in-et 'single-float) (equal new-lisp-type '(complex single-float)))
-                (spec single-float (complex single-float)))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(complex double-float)))
-                (spec (signed-byte 64) (complex double-float)))
-               ((and (equal in-et '(signed-byte 64)) (equal new-lisp-type '(complex single-float)))
-                (spec (signed-byte 64) (complex single-float)))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(complex double-float)))
-                (spec (signed-byte 32) (complex double-float)))
-               ((and (equal in-et '(signed-byte 32)) (equal new-lisp-type '(complex single-float)))
-                (spec (signed-byte 32) (complex single-float)))
-               ((and (equal in-et '(signed-byte 16)) (equal new-lisp-type '(complex double-float)))
-                (spec (signed-byte 16) (complex double-float)))
-               ((and (equal in-et '(signed-byte 16)) (equal new-lisp-type '(complex single-float)))
-                (spec (signed-byte 16) (complex single-float)))
-               ((and (equal in-et '(signed-byte 8)) (equal new-lisp-type '(complex double-float)))
-                (spec (signed-byte 8) (complex double-float)))
-               ((and (equal in-et '(signed-byte 8)) (equal new-lisp-type '(complex single-float)))
-                (spec (signed-byte 8) (complex single-float)))
-               ((and (equal in-et '(unsigned-byte 16)) (equal new-lisp-type '(complex double-float)))
-                (spec (unsigned-byte 16) (complex double-float)))
-               ((and (equal in-et '(unsigned-byte 16)) (equal new-lisp-type '(complex single-float)))
-                (spec (unsigned-byte 16) (complex single-float)))
-               ((and (equal in-et '(unsigned-byte 8)) (equal new-lisp-type '(complex double-float)))
-                (spec (unsigned-byte 8) (complex double-float)))
-               ((and (equal in-et '(unsigned-byte 8)) (equal new-lisp-type '(complex single-float)))
-                (spec (unsigned-byte 8) (complex single-float)))
+                     ;; ============================================================
+                     ;; 窄整型源（int16/int8/uint16/uint8）→ 实/整目标
+                     ;;
+                     ;; 这 4 种是**逻辑级** dtype，物理也是窄数组。原先它们掉进下面的
+                     ;; 通用 fallback：每元素一次 `(funcall (vt-cast-fun ...))` ——
+                     ;; 一次闭包调用 + 动态 dtype 派发，1M 元素实测 8ms（同规模
+                     ;; f64→f32 只要 1ms）。这里按 (源, 目标) 逐个展开特化循环，
+                     ;; 与上面 4 种存储级 dtype 走的是同一份 `spec` 模板。
+                     ;; ============================================================
+                     ((member in-et +small-int-ets+ :test #'equal)
+                      (macrolet ((narrow-cases ()
+                                   `(cond
+                                      ,@(loop for in-lt in '((signed-byte 16) (signed-byte 8)
+                                                             (unsigned-byte 16) (unsigned-byte 8))
+                                              append
+                                              (loop for out-lt in '(double-float single-float
+                                                                    (signed-byte 64) (signed-byte 32)
+                                                                    (signed-byte 16) (signed-byte 8)
+                                                                    (unsigned-byte 16) (unsigned-byte 8))
+                                                    collect
+                                                    `((and (equal in-et ',in-lt)
+                                                           (equal new-lisp-type ',out-lt))
+                                                      (spec ,in-lt ,out-lt)))))))
+                        (narrow-cases)))
+                   ;; ============================================================
+                   ;; 其他组合：通用 fallback（走 vt-cast-fun，语义已对齐）
+                   ;; ============================================================
+                   (t
+                    (let ((conv (vt-cast-fun new-dtype))
+                          (dp p)
+                          (dq q))
+                      (declare (type fixnum dp dq))
+                      (dotimes (j len)
+                        (setf (aref dst dq)
+                              (funcall conv (aref in-data dp)))
+                        (incf dp)
+                        (incf dq))))))))
+          (cond
+            ;; ---- 0 维 ----
+            ((zerop rank)
+             (setf (aref new-data 0)
+                   (funcall (vt-cast-fun new-dtype) (aref in-data in-offset))))
 
-               ;; ============================================================
-               ;; 其他组合：通用 fallback（走 vt-cast-fun，语义已对齐）
-               ;; ============================================================
-               (t
-                (let ((conv (vt-cast-fun new-dtype))
-                      (p in-offset))
-                  (declare (type fixnum p))
-                  (dotimes (i size)
-                    (setf (aref new-data i)
-                          (funcall conv (aref in-data p)))
-                    (incf p))))))))
+            ;; ---- 连续视图：整数组一趟 ----
+            ((vt-contiguous-p tensor)
+             (%cast-run new-data in-offset 0 size))
 
-        ;; ---- 非连续视图：内层连续 run 分解快路径 + 逐元素回退 ----
-        (t
-         (multiple-value-bind (run-cut run-len)
-             (%inner-run-suffix shape in-strides)
-           (declare (type fixnum run-cut run-len))
-           (cond
-             ;; ---- 同 dtype 且 run 足够长：逐 run memcpy（单遍，无中间副本）。
-             ;;      每段 run 拷贝与逐元素 walker 数据完全一致（铁律 1/2）。
-             ;;      门控 run≥16：更短时每 run 的调用开销吞掉块拷贝收益。
-             ((and (eq (vt-dtype tensor) new-dtype) (>= run-len 16))
-              (let ((in-et (array-element-type in-data))
-                    (q 0))
-                (declare (type fixnum q))
-                (macrolet
-                    ((runs-memcpy (lt)
-                       `(let ((src (the (simple-array ,lt (*)) in-data))
-                              (dst (the (simple-array ,lt (*)) new-data)))
-                          (declare (type (simple-array ,lt (*)) src dst))
-                          (%map-inner-runs shape in-strides in-offset run-cut run-len
-                            (lambda (p)
-                              (declare (type fixnum p))
-                              (replace dst src
-                                       :start1 q :end1 (the fixnum (+ q run-len))
-                                       :start2 p :end2 (the fixnum (+ p run-len)))
-                              (incf q run-len))))))
-                  (cond
-                    ((equal in-et 'double-float)       (runs-memcpy double-float))
-                    ((equal in-et 'single-float)       (runs-memcpy single-float))
-                    ((equal in-et '(signed-byte 64))   (runs-memcpy (signed-byte 64)))
-                    ((equal in-et '(signed-byte 32))   (runs-memcpy (signed-byte 32)))
-                    ((equal in-et '(signed-byte 16))   (runs-memcpy (signed-byte 16)))
-                    ((equal in-et '(signed-byte 8))    (runs-memcpy (signed-byte 8)))
-                    ((equal in-et '(unsigned-byte 16)) (runs-memcpy (unsigned-byte 16)))
-                    ((equal in-et '(unsigned-byte 8))  (runs-memcpy (unsigned-byte 8)))
-                    ((equal in-et '(complex double-float)) (runs-memcpy (complex double-float)))
-                    ((equal in-et '(complex single-float)) (runs-memcpy (complex single-float)))
-                    ;; 防御：未知底层元素类型 → 通用逐 run 拷贝
-                    (t
+            ;; ---- 非连续视图 ----
+            (t
+             (multiple-value-bind (run-cut run-len)
+                 (%inner-run-suffix shape in-strides)
+               (declare (type fixnum run-cut run-len))
+               (if (>= run-len +astype-fuse-min-run+)
+                   ;; 内层 run 够长：逐 run 直接写进目标数组。
+                   ;; 一趟读者 + 一趟写者，省掉「先收集成连续副本再转换」的
+                   ;; 中间 4~16MB 分配与两趟额外流量。
+                   (let ((q 0))
+                     (declare (type fixnum q))
                      (%map-inner-runs shape in-strides in-offset run-cut run-len
                        (lambda (p)
                          (declare (type fixnum p))
-                         (replace new-data in-data
-                                  :start1 q :end1 (+ q run-len)
-                                  :start2 p :end2 (+ p run-len))
-                         (incf q run-len))))))))
-             ;; ---- 跨 dtype 且 run 足够长：先物化连续中间副本（块拷贝），
-             ;;      再递归走连续特化 cast 路径。两段均为特化快路径，
-             ;;      实测优于逐元素 funcall 游走；代价是一个中间缓冲。
-             ((and (not (eq (vt-dtype tensor) new-dtype)) (>= run-len 16))
-	      (return-from vt-astype
-		(vt-astype (vt-contiguous tensor) new-dtype)))
-             ;; ---- 其余非连续视图：先按 strides 做**特化收集**，得到同 dtype 的
-             ;;      连续副本。同 dtype 时该副本就是结果（一趟特化遍历）；
-             ;;      跨 dtype 时再走上面的连续 cast 特化（两趟，但两趟都是
-             ;;      特化循环 —— 泛型 aref + funcall 的单趟游走实测慢 5~8 倍，
-             ;;      复数尤甚：每元素装箱/解包）。
-             (t
-              (let ((tmp (%gather-contiguous tensor)))
-                (if (eq (vt-dtype tensor) new-dtype)
-                    (return-from vt-astype tmp)
-                    (return-from vt-astype (vt-astype tmp new-dtype)))))))))
+                         (%cast-run new-data p q run-len)
+                         (incf q run-len)))
+                     new)
+                   ;; run 太短：同 dtype 特化收集（同 dtype 时它就是结果）。
+                   ;; 这两条必须 RETURN-FROM：收集结果与调用方预分配的 NEW
+                   ;; 是两个不同对象，落回函数末尾的 NEW 会返回未写满的数组。
+                   (let ((tmp (%gather-contiguous tensor)))
+                     (if (eq (vt-dtype tensor) new-dtype)
+                         (return-from vt-astype tmp)
+                         (return-from vt-astype (vt-astype tmp new-dtype))))))))))
       new)))
 
 
@@ -835,14 +858,16 @@
   "深度拷贝：返回独立、内存连续的新张量。可选类型转换。"
   (let ((target-dtype (or dtype (vt-dtype vt))))
     (if (eq target-dtype (vt-dtype vt))
-        (let* ((shape (vt-shape vt))
-               (size (vt-shape-to-size shape))
-               ;; 同上：两种落点都会写满全部元素
-               (new (%alloc-vt shape target-dtype)))
-          (if (vt-contiguous-p vt)
+        (if (vt-contiguous-p vt)
+            (let* ((shape (vt-shape vt))
+                   (size (vt-shape-to-size shape))
+                   (new (%alloc-vt shape target-dtype)))
               (%memcpy (vt-data new) 0 (vt-data vt) (vt-offset vt) size)
-              (vt-copy-into new vt))
-          new)
+              new)
+            ;; 非连续：走 %GATHER-CONTIGUOUS 的特化收集（同为行主序落点，
+            ;; 但它末轴展开 + 其余轴 odometer，实测快 2~2.5 倍）。
+            ;; 它自己分配新数组，故不需要上面那个 NEW。
+            (%gather-contiguous vt))
         (vt-astype vt target-dtype))))
 ;;; ------------------------------------------------------------------
 ;;; 别名检测辅助（放在 vt-copy-into 之前）

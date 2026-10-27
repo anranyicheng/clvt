@@ -113,6 +113,23 @@ vt = { data, shape, strides, offset, dtype }
 
 `vt-contiguous` 的零拷贝语义是性能关键，重构中**必须保留**。
 
+**实现（选路，不影响语义）**：非连续时的物理落地统一走 `%gather-contiguous`
+—— 按元素类型特化的「末轴 DOTIMES 展开 + 其余轴 odometer」遍历，
+落点固定为行主序连续。`vt-copy` 的非连续分支与 `vt-astype` 的非连续回退
+走同一条路（同一个落点，保证三者逐位可比）。
+
+`vt-astype` 在这条路之外**还有一条按 run 的融合**：非连续视图若内层
+连续 run ≥ `+astype-fuse-min-run+`（切片/跨步视图，如 `a[::2,:]`），
+就直接按 run 一趟写进目标数组，不落中间连续副本 —— 与 `vt-copy` 的
+「先收集再转换」相比省掉一块全尺寸临时分配和两趟全量流量。
+两条路的落点必须**逐位相同**（都是行主序连续、同 dtype），差别只在
+搬几趟；run 太短（转置/翻转，run=1）时逐 run 的调用开销大于收益，
+必须落回 `%gather-contiguous`。
+
+> **注意（自递归）**：`%gather-contiguous` 遇到未知底层元素类型时**不得**
+> 回写 `vt-contiguous`（两者互相调用会死循环），必须直接 `vt-copy-into`
+> 到新分配的连续数组。
+
 ---
 
 ## 3. dtype 系统
@@ -584,7 +601,39 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 ### 7.3 浮点确定性
 
 - 归约**累加顺序**在快路径与通用路径中必须一致（避免并行/分块改变结果）
-- `*matmul-thread-count*` 并行分块**不得**改变 GEMM 的累加顺序语义（当前按 k 维顺序累加，分块须保持）
+- `*simd-matmul-thread-count*` 并行分块**不得**改变 GEMM 的累加顺序语义（当前按 k 维顺序累加，分块须保持）
+
+**两条「合法的重排」**（只换遍历次序、不换任何单个输出元素的累加顺序，
+因此结果逐位相同）：
+
+| 重排 | 内容 | 为什么逐位相同 |
+|---|---|---|
+| GEMM 分块 | MC/KC/NC 三级分块 + 寄存器微块 | k 仍按 kc0 → kc-end 递增、块内 l 递增；kc 边界处寄存器写回 f64/f32/i32/i64 无损 |
+| 归约行累加 | 内层维整体当累加器，按行推进（`%kernel-row-acc`） | 每个输出元素看到的 r 仍是 0,1,2,…；翻到外层的只是「不同输出元素之间」的循环 |
+
+**GEMM 并行调度契约**：
+
+| 项 | 约定 |
+|---|---|
+| 划分方式 | C 的 **(i, j) 二维矩形网格**（`%gemm-grid`），不得只切行 —— 只切行时每个线程都要过一遍 B，线程数翻倍则 B 的 DRAM 流量翻倍 |
+| 线程数上限 | `min(16, 核数-1)`，可由 `*simd-matmul-thread-count*` 覆盖。**不是**越多越好：超过 16 后线程各自的分块工作集互相踢出 L2，实测出现过 3 倍退化 |
+| 小任务 | `m·k·n < *simd-matmul-thread-threshold*` 时串行，避免线程创建/汇合摊不薄 |
+| 回退 | 内核返回 NIL 表示不接管，由调用方回退（§8.3） |
+
+### 7.4 性能快路径清单（谁在什么时候接管）
+
+所有快路径的共同约束：**不满足条件时返回 NIL / 落到通用路径**，且结果与
+通用路径**逐位相同**（§1 铁律 1/2）。新增快路径必须同时给出「选路条件」
+与「逐位一致」的测试。
+
+| 层 | 快路径 | 选路条件 | 回退 |
+|---|---|---|---|
+| GEMM | `%simd-matmul-{f64,f32,i32,i64}`（`simd-matmul.lisp`） | 2 维、dtype 属 4 种存储级、`m·k·n ≥ *simd-matmul-threshold*`、out 连续且 dtype 精确匹配 | `vt-einsum` 通用路径 |
+| 归约（全归约） | `%kernel-global` | 输入连续、`axis=nil`、dtype 属 4 种存储级 | `%kernel-general`（stride 驱动 odometer） |
+| 归约（沿轴） | `%kernel-row-acc`（`inner ≥ +row-acc-min-inner+`）/ `%kernel-single-axis` | 输入与 out 都连续，且**归约轴在 shape 里连成一段** `[a,b)` —— 满足时多层轴等价于一层：`outer=∏[0,a)`、`red=∏[a,b)`、`inner=∏[b,rank)`；单轴天然满足，`(0,1)`/`(1,2)` 满足，`(0,2)` 不满足。窄整型同条件（内层用 `%small-int-axis-form` 分派）。行累加额外要求 out 不与输入同数组 | `%kernel-general` / `%kernel-small-general`（窄整型） |
+| 归约（arg 族） | `%kernel-single-axis` | 单轴 + 存储级 dtype（numpy 的 `argmax`/`argmin` 不接受轴元组；窄整型留在通用路径） | `%kernel-general` |
+| 类型转换 | `vt-astype` 的 `spec` 特化（10×10 + 4×8 窄整型），提成局部函数 `%cast-run` 后**两条落点共用同一张表** | 连续视图 → 整数组一次；非连续且内层 run ≥ `+astype-fuse-min-run+` → 逐 run 一趟直接写目标 | `%gather-contiguous` → 递归 astype（run 太短或未知元素类型） |
+| 连续化 | `%gather-contiguous` | 非连续视图 | 未知元素类型 → `vt-copy-into` |
 
 ---
 

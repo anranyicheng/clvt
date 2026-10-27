@@ -17,27 +17,9 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
-  (defparameter +kernel-lts+
-    '(double-float single-float (signed-byte 64) (signed-byte 32))
-    "类型特化内核支持的 Lisp 元素类型（即 4 种存储级物理 dtype，
-     与 *vt-storage-dtypes* 一一对应：执行层只对存储级类型生成特化内核。")
-
-  (defparameter +small-int-lts+
-    '((signed-byte 16) (signed-byte 8) (unsigned-byte 8) (unsigned-byte 16))
-    "小整型逻辑 dtype 对应的元素类型（非存储级）。
-
-     三层分离约定：逻辑层声明的 8 种 dtype 都必须可用（单一事实来源），
-     但执行层只为 4 种存储级类型生成 in-lt × res-lt 特化内核——
-     小整型输入统一路由到 %kernel-small-general 通用内核，
-     保证正确性（连续性/特化只影响性能）。")
-
   (defparameter +all-lts+ (append +kernel-lts+ +small-int-lts+)
     "全部 8 种元素类型（= 8 种逻辑 dtype）。用于空归约单位元等
      需要覆盖全部逻辑 dtype 的编译期展开。")
-
-  (defparameter +small-int-ets+
-    '((signed-byte 16) (signed-byte 8) (unsigned-byte 8) (unsigned-byte 16))
-    "小整型的运行时 array-element-type 形态（= +small-int-lts+，别名以示用途）。")
 
   (defun %op-arg-p (op)
     "是否为 arg 类归约（输出索引）。"
@@ -281,7 +263,7 @@
                ,(%cast-form res-lt (if arg-p 'best-i 'acc)))))))
 
 (defmacro %kernel-single-axis (op lt res-lt)
-  "路径 2：连续 + 单轴。"
+  "路径 2 的列扫内核：连续 + 归约区可塌成一层（单轴或多轴连续区间）。"
   (let* ((acc-lt (%op-acc-lt op lt res-lt))
          (init   (%op-init   op lt res-lt))
          (arg-p  (%op-arg-p  op))
@@ -307,6 +289,147 @@
                        (error "~a: All-NaN slice encountered" ',op))))
                (setf (aref od (the fixnum (+ res-off (* o inner) i)))
                      ,(%cast-form res-lt (if arg-p 'best-i 'acc))))))))))
+
+(defconstant +row-acc-min-inner+ 16
+  "行累加内核（%KERNEL-ROW-ACC）的启用门槛：内层维 ≥ 16 个元素。
+   内层维太窄时「累加器常驻 L1」没有意义（累加器本身只有几十字节，
+   而每行只有 1~2 条 cache line），反而多一次临时数组分配与写回，
+   此时列扫内核（%KERNEL-SINGLE-AXIS）本来就是顺序访问。")
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+
+  (defun %small-int-axis-form (op)
+    "窄整型（4 种逻辑级 dtype）的沿轴归约分派：in-lt × res-lt 全部实例化。
+
+     与存储级 dtype 用同一套内核模板，只是 in-lt 换成窄整型：
+     内层维够宽走行累加（%KERNEL-ROW-ACC），否则走列扫（%KERNEL-SINGLE-AXIS）。
+     这两个内核的输入侧都只有 `(the (simple-array ,lt (*)))` 与
+     `%op-step`，对窄整型成立（累加器提升到 int64 由 %OP-ACC-LT 决定）。
+
+     单独成函数、而不是写进 DEF-VT-REDUCE 的模板里：模板已经是三层嵌套的
+     反引号，再往里塞「按类型展开的 cond」既读不懂也容易括号错位。"
+    `(cond
+       ,@(loop for lt in '((signed-byte 16) (signed-byte 8)
+                           (unsigned-byte 16) (unsigned-byte 8))
+               collect
+               `((equal in-et ',lt)
+                 (cond
+                   ;; res-lt 用 +ALL-LTS+：窄整型输入的 max/min 结果**保持**
+                   ;; 输入 dtype（int8 进 int8 出），sum/prod 才提升到 int64。
+                   ;; 只列 +KERNEL-LTS+ 会让 `(vt-amax int16-array)` 报
+                   ;; "unsupported output dtype (SIGNED-BYTE 16)"。
+                   ,@(loop for rlt in +all-lts+
+                           collect
+                           `((equal res-lt ',rlt)
+                             (if (>= inner +row-acc-min-inner+)
+                                 (%kernel-row-acc ,op ,lt ,rlt)
+                                 (%kernel-single-axis ,op ,lt ,rlt))))
+                   (t (error "vt-~a: unsupported output dtype ~a" ',op res-lt)))))
+       (t (error "vt-~a: unsupported input dtype ~a" ',op in-et))))
+
+  (defun %contig-axis-test ()
+    "路径 2 的几何条件：输入/输出都连续，且归约轴在 shape 里连成一段。
+
+     连成一段是「多层轴塌成一层」的充要条件：单轴天然满足；
+     (0 1)、(1 2) 满足；(0 2) 不满足（中间夹着一层不归约的轴）。"
+    '((consp axes)                          ; 非全归约（全归约走路径 1）
+      (vt-contiguous-p tensor)
+      (vt-contiguous-p res)
+      (loop for x in axes
+            for y in (cdr axes)
+            always (= y (1+ x)))))
+
+  (defun %contig-axis-body (op arg-p kernel)
+    "路径 2 的 clause body（**forms 列表**，供 CONS 拼到测试条件后面）。
+
+     三种内容共用同一段几何量绑定（A/B/OUTER/RED/INNER），只在内层分叉：
+       · arg 族：只有列扫实例（argmax/argmin 只接受单轴，无需门槛判断）；
+       · 窄整型：行累加或列扫（由 %SMALL-INT-AXIS-FORM 决定）；
+       · 存储级：内层维够宽走行累加，否则列扫。
+     代码本体是一层反引号模板，读起来就是真代码；KERNEL 是
+     (lambda (macro-name) form)，把 DEF-VT-REDUCE 里的局部 DISPATCH 包一层。"
+    (let ((inner-form
+            (cond (arg-p (funcall kernel '%kernel-single-axis))
+                  (t `(if (member in-et +small-int-ets+ :test #'equal)
+                          ,(%small-int-axis-form op)
+                          (if (>= inner +row-acc-min-inner+)
+                              ,(funcall kernel '%kernel-row-acc)
+                              ,(funcall kernel '%kernel-single-axis)))))))
+      `((let* ((a (the fixnum (first axes)))
+               (b (the fixnum (1+ (the fixnum (car (last axes))))))
+               (outer (let ((r 1))
+                        (dotimes (i a r)
+                          (setf r (* r (the fixnum (nth i in-shape)))))))
+               (red (let ((r 1))
+                      (loop for i from a below b
+                            do (setf r (* r (the fixnum (nth i in-shape)))))
+                      r))
+               (inner (let ((r 1))
+                        (loop for i from b below (length in-shape)
+                              do (setf r (* r (the fixnum (nth i in-shape)))))
+                        r)))
+          (declare (fixnum a b outer red inner))
+          ,inner-form))))
+
+  (defun %contig-axis-clause (op arg-p dispatch)
+    "生成「归约轴连成一段」的那条 COND clause（恒为 1 条，包成列表便于 ,@）。
+
+     一条 clause 覆盖四种情形，几何条件只判一次：
+       单轴 / 多轴  ×  存储级 dtype / 窄整型
+     arg 族只服务单轴 + 存储级：numpy 的 argmax/argmin 不接受轴元组，
+     窄整型也没有 arg 实例（留在路径 3 的 %KERNEL-SMALL-GENERAL）。
+
+     结构与写法：测试条件由 %CONTIG-AXIS-TEST 拼、代码由 %CONTIG-AXIS-BODY
+     用反引号写，这里只做 `(cons 测试 body)` 的装配 —— 不再用 '(quote ...)
+     手搭整棵 clause（那样既读不懂，也最容易数错括号）。"
+    (let* ((kernel (lambda (macro-name) (funcall dispatch macro-name)))
+           (extra (if arg-p
+                      '((= (length axes) 1)
+                        (not (member in-et +small-int-ets+ :test #'equal)))
+                      '((not (eq (vt-data res) in-data)))))
+           (test (cons 'and (append (%contig-axis-test) extra))))
+      (list (cons test (%contig-axis-body op arg-p kernel))))))
+
+
+(defmacro %kernel-row-acc (op lt res-lt)
+  "行累加内核：连续 + 归约区可塌成一层 + 内层维够宽（INNER ≥ %ROW-ACC-MIN-INNER）。
+
+   列扫内核（%KERNEL-SINGLE-AXIS）的内层循环是「固定列 i，沿归约轴跨 stride 走」，
+   步长 = INNER。
+   axis=0 时 INNER = n（1000×1000 即 8KB）：每个 (r,i) 都要换一条 cache line，
+   整列扫完再扫下一列时那些行早已被挤出 L2 —— 实测 sum@axis0 1M 需要 3ms，
+   而同一份数据 numpy 只要 0.15ms。amax@axis0 更差（20ms）。
+
+   本路径把内层维整体当成累加器：acc[0..INNER) 常驻 L1，按**行**顺序推进，
+   一次读取正好是一条连续区间，两个流（d 与 acc）都是顺序的。
+
+   铁律 1（连续性只影响选路）：同一输出元素看到的累加次序仍是
+   r = 0,1,2,… 与列扫内核完全一致，故结果**逐位相同**；
+   只是把「不同输出元素之间」的循环翻到外层，不改变任何单个元素的求和顺序。
+
+   arg 族不进本路径（需要同步维护下标数组，收益/复杂度不划算）。"
+  (let* ((acc-lt (%op-acc-lt op lt res-lt))
+         (init   (%op-init   op lt res-lt)))
+    `(let ((d  (the (simple-array ,lt (*)) in-data))
+           (od (the (simple-array ,res-lt (*)) res-data))
+           (init-v (the ,acc-lt ,init)))
+       (declare (type fixnum outer red inner))
+       (let ((acc (make-array inner :element-type ',acc-lt)))
+         (declare (type (simple-array ,acc-lt (*)) acc))
+         (dotimes (o outer)
+           (let ((in-base (the fixnum (+ in-off (* o red inner))))
+                 (out-base (the fixnum (+ res-off (* o inner)))))
+             (declare (type fixnum in-base out-base))
+             (dotimes (i inner) (setf (aref acc i) init-v))
+             (dotimes (r red)
+               (let ((row (the fixnum (+ in-base (* r inner)))))
+                 (declare (type fixnum row))
+                 (dotimes (i inner)
+                   (%op-step ,op (aref acc i) (aref d (the fixnum (+ row i)))
+                             ,lt ,acc-lt))))
+             (dotimes (i inner)
+               (setf (aref od (the fixnum (+ out-base i)))
+                     ,(%cast-form res-lt '(aref acc i))))))))))
 
 (defmacro %kernel-general (op lt res-lt)
   "路径 3：通用回退（支持非连续 :out）。"
@@ -515,7 +638,6 @@
                   (rank (length in-shape))
                   (axes (vt-normalize-axes axis rank))
                   (global (null axes))
-                  (single-axis-p (and (= (length axes) 1) (not global)))
                   (out-shape
                     (cond ((and global (not keepdims)) nil)
                           (global (make-list rank :initial-element 1))
@@ -609,24 +731,21 @@
                                  (t 0)))
                       (return-from ,impl-name res)))))
                ;; ---- 主分派 ----
-               ;; 小整型（逻辑级 dtype）不进入类型特化内核：路径 1/2 以
-               ;; wide-et 守卫排除，统一由路径 3 的 %kernel-small-general 兜底。
+               ;; 路径 1：全归约（只服务存储级 dtype；窄整型由路径 3 兜底）。
+               ;; 路径 2：沿轴归约，条件是「归约轴在 shape 里连成一段」——
+               ;;         单轴与多轴、存储级与窄整型都收在这一条 clause 里，
+               ;;         具体内核由 %CONTIG-AXIS-CLAUSE 决定。
+               ;; 路径 3：通用回退（任意 strides / 不连续轴 / arg 族窄整型）。
                (cond
                  ;; 路径 1：连续 + 全局 + 存储级 dtype
                  ((and global (vt-contiguous-p tensor)
                        (not (member in-et +small-int-ets+ :test #'equal)))
                   ,(dispatch '%kernel-global))
-                 ;; 路径 2：连续 + 单轴 + 存储级 dtype
-                 ((and single-axis-p
-                       (vt-contiguous-p tensor)
-                       (vt-contiguous-p res)
-                       (not (member in-et +small-int-ets+ :test #'equal)))
-                  (let* ((ax (first axes))
-                         (outer (reduce #'* in-shape :end ax :initial-value 1))
-                         (red   (nth ax in-shape))
-                         (inner (reduce #'* in-shape :start (1+ ax) :initial-value 1)))
-                    (declare (fixnum ax outer red inner))
-                    ,(dispatch '%kernel-single-axis)))
+                 ;; 路径 2：连续 + 归约轴连成一段（单轴或多轴，含窄整型）。
+                 ;; 选路细节（几何条件、内核、门槛）全在 %CONTIG-AXIS-CLAUSE
+                 ;; 里，模板只留一行 —— 这里的嵌套反引号已经有四层，
+                 ;; 再往模板里塞代码生成内容只会制造括号事故。
+                 ,@(%contig-axis-clause op arg-p #'dispatch)
 
                  ;; 路径 3：通用回退（含小整型 %kernel-small-general）
                  (t

@@ -606,3 +606,28 @@
   (if (or (%cisnan a) (%cisnan b))
       t
       (not (= a b))))
+
+
+;;; ------------------------------------------------------------------
+;;; 元素类型分组（编译期常量）
+;;; ------------------------------------------------------------------
+;;; 放在 dtype.lisp 而不是 reduce-stats.lisp：core.lisp（vt-astype 的窄整型
+;;; 特化表）与 reduce-stats.lisp 都要用，而 core.lisp 先编译。
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defparameter +kernel-lts+
+    '(double-float single-float (signed-byte 64) (signed-byte 32))
+    "类型特化内核支持的 Lisp 元素类型（即 4 种存储级物理 dtype，
+     与 *vt-storage-dtypes* 一一对应：执行层只对存储级类型生成特化内核。")
+
+  (defparameter +small-int-lts+
+    '((signed-byte 16) (signed-byte 8) (unsigned-byte 8) (unsigned-byte 16))
+    "小整型逻辑 dtype 对应的元素类型（非存储级）。
+
+     三层分离约定：逻辑层声明的 8 种 dtype 都必须可用（单一事实来源），
+     但执行层只为 4 种存储级类型生成 in-lt × res-lt 特化内核——
+     小整型输入统一路由到 %kernel-small-general 通用内核，
+     保证正确性（连续性/特化只影响性能）。")
+
+  (defparameter +small-int-ets+
+    '((signed-byte 16) (signed-byte 8) (unsigned-byte 8) (unsigned-byte 16))
+    "小整型的运行时 array-element-type 形态（= +small-int-lts+，别名以示用途）。"))

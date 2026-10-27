@@ -8,155 +8,291 @@
 (defvar *simd-matmul-enabled* t)
 (defvar *simd-matmul-threshold* 50000)
 (defvar *simd-matmul-thread-threshold* 5000000)
-(defvar *simd-matmul-thread-count* (- *processor-number* 1))
+;; GEMM 的线程数**不是**越多越好：分块内核本身已把单线程推到算力上限，
+;; 再加线程只是抢同一个内存带宽。实测 1000³ float64 在 8~16 线程都是
+;; 11~16ms，而 31 线程（= 核数-1）出现过 87ms 的崩溃式退化 —— 30 个线程
+;; 各自的工作集互相踢出 L2，且线程创建/汇合的开销无法被 8ms 的活摊薄。
+;; 因此默认上限取 16：既能吃满多核，又不会把 L2 打穿。
+(defvar *simd-matmul-thread-count* (max 1 (min 16 (- *processor-number* 1)))
+  "GEMM 并行线程数上限（默认 min(16, 核数-1)）。")
 
 ;;; ============================================================
-;;; SIMD 内核宏
+;;; 分块 GEMM 内核
 ;;; ============================================================
-;;; 生成分块（64×256×256）+ SIMD 的行范围内核。
-;;; 参数：
-;;;   vwidth   : SIMD 宽度（4 或 8）
-;;;   elem-size: 元素字节大小
-;;;   elem-ref : 标量 SAP 读函数（带字节偏移）
-;;;   vec-ctor : SIMD 广播构造函数
-;;;   vec-ref  : SIMD SAP 读函数（带元素索引，非字节！）
-;;;   vec-add  : SIMD 向量加
-;;;   vec-mul  : SIMD 向量乘
-;;;   vec-fmadd: SIMD FMA（可选，nil 时走 mul+add）
+;;; 旧的「1 行 × VW 列」gaxpy 内核有两个致命访存问题：
+;;;   1. 每个 k 步都要把 C 的一整行读一遍再写一遍（C 流量 = 2·m·k·n·8 字节）；
+;;;   2. B 的每一行被 m 次重读（m=1000 时 B 要从内存过 8 GB）。
+;;; 实测 1000³ float64 单线程 235ms ≈ 纯内存带宽上限，与算力无关。
+;;;
+;;; 这里换成标准的三层分块：
+;;;   · 寄存器微块 MR×NR：C 的一个 MR×(NR·VW) 块在整段 k 里驻留寄存器，
+;;;     C 只在每个 kc 块边界读写一次；B 的每个向量被 MR 行复用；
+;;;   · 缓存分块 MC/KC/NC：A/B/C 三个瓦片一起塞进 L2（默认 64/256/256 →
+;;;     A 128KB + B 512KB + C 128KB），DRAM 流量降到 O(m·k·n/MC)；
+;;;   · 内层用指针步进（每个 k 步只有 MR 次 A 指针自增 + 1 次 B 指针自增），
+;;;     没有乘法、没有地址重算。
+;;;
+;;; 数值语义（铁律 1：连续性只影响选路，不影响结果）：k 方向的累加次序
+;;; 仍是 l = 0,1,2,…（kc 分块按序、块内递增），FMA 仍是单次舍入，
+;;; 因此与旧内核**逐位相同**。kc 边界处把寄存器写回 C 再读回是无损的
+;;; （f64/f32/i32/i64 的存储都是精确的）。
+;;;
+;;; 实测（本机 AVX2、单线程、1000³）：f64 235ms → 82ms，f32 → 39ms。
+;;; 两者都已在 AVX2 峰值附近（f64 4 宽、f32 8 宽，只差 2 倍），
+;;; 单线程已无余量，后续提速只能靠多线程。
 
-(defmacro define-simd-matmul-rows
-    (fn-name vwidth elem-size elem-ref vec-ctor vec-ref vec-add vec-mul
-     &optional vec-fmadd)
-  `(progn
-     (declaim (inline ,fn-name))
-     (defun ,fn-name (pa pb pc k n i-start i-end)
+(defvar *gemm-mc* 64
+  "GEMM 行分块高度（C/A 瓦片）。与 *GEMM-KC*/*GEMM-NC* 一起决定 L2 工作集。")
+(defvar *gemm-kc* 256 "GEMM 深度分块（k 方向）。")
+(defvar *gemm-nc* 256 "GEMM 列分块宽度（B/C 瓦片）。")
+
+;; 代码生成器必须在编译期可用：宏展开发生在编译期，而它们在本文件里
+;; 以 DEFUN 形式出现，故统一包进 EVAL-WHEN（与 core.lisp 的
+;; %ASTYPE-CAST-FORM 同一手法）。
+(eval-when (:compile-toplevel :load-toplevel :execute)
+
+(defun step-form (fmadd add mul a b c)
+  (if fmadd (list fmadd a b c) (list add c (list mul a b))))
+
+;;; ---------------------------------------------------------------
+;;; 标量尾块
+;;; ---------------------------------------------------------------
+(defun build-scalar (name elem-ref es)
+  `(defun ,name (pa pb pc k n i0 i1 j0 j1)
+     (declare (type sb-sys:system-area-pointer pa pb pc)
+              (type fixnum k n i0 i1 j0 j1)
+              (optimize (speed 3) (safety 0) (debug 0)))
+     (loop for i of-type fixnum from i0 below i1 do
+       (loop for j of-type fixnum from j0 below j1 do
+         (let ((acc (,elem-ref pc (the fixnum (* (the fixnum (+ (the fixnum (* i n)) j)) ,es)))))
+           (loop for l of-type fixnum from 0 below k do
+             (setf acc (+ acc
+                          (* (,elem-ref pa (the fixnum (* (the fixnum (+ (the fixnum (* i k)) l)) ,es)))
+                             (,elem-ref pb (the fixnum (* (the fixnum (+ (the fixnum (* l n)) j)) ,es)))))))
+           (setf (,elem-ref pc (the fixnum (* (the fixnum (+ (the fixnum (* i n)) j)) ,es))) acc))))))
+
+;;; ---------------------------------------------------------------
+;;; 向量行尾块（1 行 × VW 列）
+;;; ---------------------------------------------------------------
+(defun build-vecrow (name vw es elem-ref vec-ctor vec-ref add mul fmadd)
+  `(defun ,name (pa pb pc k n i0 i1 j0 j1)
+     (declare (type sb-sys:system-area-pointer pa pb pc)
+              (type fixnum k n i0 i1 j0 j1)
+              (optimize (speed 3) (safety 0) (debug 0)))
+     (loop for i of-type fixnum from i0 below i1 do
+       (let ((arow (the fixnum (* i k)))
+             (crow (the fixnum (* i n))))
+         (declare (type fixnum arow crow))
+         (loop for j of-type fixnum from j0 below j1 by ,vw do
+           (let ((acc (,vec-ref pc (the fixnum (+ crow j)))))
+             (loop for l of-type fixnum from 0 below k do
+               (setf acc ,(step-form fmadd add mul
+                                     `(,vec-ctor (,elem-ref pa (the fixnum
+                                                                   (* (the fixnum (+ arow l)) ,es))))
+                                     `(,vec-ref pb (the fixnum (+ (the fixnum (* l n)) j)))
+                                     'acc)))
+             (setf (,vec-ref pc (the fixnum (+ crow j))) acc)))))))
+
+;;; ---------------------------------------------------------------
+;;; 微块：MR 行 × (NR·VW) 列，C 驻留寄存器，指针步进
+;;; ---------------------------------------------------------------
+(defun build-micro (name vw es mr nr elem-ref vec-ctor vec-ref add mul fmadd)
+  (let* ((pa-r (loop for r below mr collect (gensym "PAR")))
+         (pc-r (loop for r below mr collect (gensym "PCR")))
+         (kes (gensym "KES"))
+         (pbp (gensym "PBP"))
+         (nb (gensym "NB"))
+         (accs (loop for r below mr append
+                     (loop for q below nr collect (gensym "ACC"))))
+         (bvs (loop for q below nr collect (gensym "BV")))
+         (avs (loop for r below mr collect (gensym "AV")))
+         ;; C 列地址：pc-r + q*VW（常数偏移）
+         (cix (lambda (r q) `(the fixnum (+ ,(nth r pc-r) ,(* q vw)))))
+         (bix (lambda (q) `(the fixnum (+ ,pbp ,(* q vw)))))
+         (acc (lambda (r q) (nth (+ (* r nr) q) accs)))
+         ;; 头部绑定
+         (binds
+          (append
+           (list (list kes `(the fixnum (* k ,es))))
+           (loop for r below mr collect
+                 (list (nth r pa-r)
+                       `(the fixnum (+ (the fixnum (* (the fixnum (+ (the fixnum (* i k)) kc0)) ,es))
+                                       ,@(when (plusp r) `((the fixnum (* ,r ,kes))))))))
+           (list (list pbp `(the fixnum (+ (the fixnum (* kc0 n)) j))))
+           (loop for r below mr collect
+                 (list (nth r pc-r)
+                       `(the fixnum (+ (the fixnum (* (the fixnum (+ i ,r)) n)) j))))
+           (list (list nb `(the fixnum (- kc-end kc0))))
+           (loop for r below mr append
+                 (loop for q below nr collect
+                       (list (funcall acc r q) (list vec-ref 'pc (funcall cix r q)))))))
+         ;; 每轮 k 的绑定：A 的 MR 次广播 + B 的 NR 个向量
+         (loop-binds
+          (append (loop for r below mr collect
+                        (list (nth r avs) (list vec-ctor (list elem-ref 'pa (nth r pa-r)))))
+                  (loop for q below nr collect
+                        (list (nth q bvs) (list vec-ref 'pb (funcall bix q))))))
+         ;; 累加
+         (updates
+          (loop for r below mr append
+                (loop for q below nr append
+                      (list (funcall acc r q)
+                            (step-form fmadd add mul (nth r avs) (nth q bvs) (funcall acc r q))))))
+         ;; 指针步进
+         (incfs
+          (append (loop for r below mr collect `(incf ,(nth r pa-r) ,es))
+                  (list `(incf ,pbp n))))
+         ;; 写回
+         (stores
+          (loop for r below mr append
+                (loop for q below nr append
+                      (list (list vec-ref 'pc (funcall cix r q)) (funcall acc r q))))))
+    `(defun ,name (pa pb pc k n i j kc0 kc-end)
        (declare (type sb-sys:system-area-pointer pa pb pc)
-                (type fixnum k n i-start i-end))
-       (let ((ii 64) (jj 256) (kk 256))
-         (declare (type fixnum ii jj kk))
-         (loop for ii0 of-type fixnum from i-start below i-end by ii do
-           (let ((ii-end (the fixnum (min i-end (the fixnum (+ ii0 ii))))))
-             (declare (type fixnum ii-end))
-             (loop for jj0 of-type fixnum from 0 below n by jj do
-               (let* ((jj-end (the fixnum (min n (the fixnum (+ jj0 jj)))))
-                      (len    (the fixnum (- jj-end jj0)))
-                      (len-main (the fixnum (logand len (- ,vwidth)))))
-                 (declare (type fixnum jj-end len len-main))
-                 (loop for kk0 of-type fixnum from 0 below k by kk do
-                   (let ((kk-end (the fixnum (min k (the fixnum (+ kk0 kk))))))
-                     (declare (type fixnum kk-end))
-                     (loop for i of-type fixnum from ii0 below ii-end do
-                       (let ((a-row (the fixnum (* i k)))
-                             (c-row (the fixnum (+ (the fixnum (* i n)) jj0))))
-                         (declare (type fixnum a-row c-row))
-                         (loop for l of-type fixnum from kk0 below kk-end do
-                           (let ((a-val (,elem-ref pa (* (+ a-row l) ,elem-size)))
-                                 (b-base (the fixnum (+ (the fixnum (* l n)) jj0))))
-                             (declare (type fixnum b-base))
-                             (let ((a-vec (,vec-ctor a-val))
-                                   (b-ptr b-base)
-                                   (c-ptr c-row))
-                               (declare (type fixnum b-ptr c-ptr))
-                               ;; 主循环：vwidth 宽 SIMD
-                               (loop for j of-type fixnum from 0 below len-main by ,vwidth do
-                                 (let ((c-vec (,vec-ref pc c-ptr))
-                                       (b-vec (,vec-ref pb b-ptr)))
-                                   (setf (,vec-ref pc c-ptr)
-                                         ,(if vec-fmadd
-                                              `(,vec-fmadd a-vec b-vec c-vec)
-                                              `(,vec-add c-vec
-                                                         (,vec-mul a-vec b-vec)))))
-                                 (incf c-ptr ,vwidth)
-                                 (incf b-ptr ,vwidth))
-                               ;; 尾部标量
-                               (loop for j of-type fixnum from len-main below len do
-                                 (setf (,elem-ref pc (* c-ptr ,elem-size))
-                                       (+ (,elem-ref pc (* c-ptr ,elem-size))
-                                          (* a-val
-                                             (,elem-ref pb (* b-ptr ,elem-size)))))
-                                 (incf c-ptr)
-                                 (incf b-ptr)))))))))))))))))
+                (type fixnum k n i j kc0 kc-end)
+                (optimize (speed 3) (safety 0) (debug 0)))
+       (let* ,binds
+         (declare (type fixnum ,kes ,@pa-r ,@pc-r ,pbp ,nb))
+         (loop repeat ,nb do
+           (let* ,loop-binds
+             (setf ,@updates))
+           ,@incfs)
+         (setf ,@stores)
+         nil))))
+
+;;; ---------------------------------------------------------------
+;;; 驱动
+;;; ---------------------------------------------------------------
+(defun build-driver (name micro vrow scal mr cols vw)
+  `(defun ,name (pa pb pc k n i0 i1 j0 j1)
+     (declare (type sb-sys:system-area-pointer pa pb pc)
+              (type fixnum k n i0 i1 j0 j1)
+              (optimize (speed 3) (safety 0) (debug 0)))
+     (let* ((mc (the fixnum *gemm-mc*))
+            (kc (the fixnum *gemm-kc*))
+            (nc (the fixnum *gemm-nc*))
+            (i-end (the fixnum (- i1 (the fixnum (mod (the fixnum (- i1 i0)) ,mr)))))
+            (j-end (the fixnum (- j1 (the fixnum (mod (the fixnum (- j1 j0)) ,cols)))))
+            (j-vw (the fixnum (- j1 (the fixnum (mod (the fixnum (- j1 j0)) ,vw))))))
+       (declare (type fixnum mc kc nc i-end j-end j-vw))
+       (loop for ic of-type fixnum from i0 below i-end by mc do
+         (loop for jc of-type fixnum from j0 below j-end by nc do
+           (loop for kc0 of-type fixnum from 0 below k by kc do
+             (let ((kc-end (the fixnum (min k (the fixnum (+ kc0 kc)))))
+                   (ic-end (the fixnum (min i-end (the fixnum (+ ic mc)))))
+                   (jc-end (the fixnum (min j-end (the fixnum (+ jc nc))))))
+               (declare (type fixnum kc-end ic-end jc-end))
+               (loop for i of-type fixnum from ic below ic-end by ,mr do
+                 (loop for j of-type fixnum from jc below jc-end by ,cols do
+                   (,micro pa pb pc k n i j kc0 kc-end)))))))
+       ;; 行尾（< MR 行）：整宽向量扫
+       (,vrow pa pb pc k n i-end i1 j0 j-vw)
+       ;; 列尾（COLS 的余数，按 VW 对齐部分）
+       (,vrow pa pb pc k n i0 i-end j-end j-vw)
+       ;; 残余列（< VW）：标量
+       (,scal pa pb pc k n i0 i1 j-vw j1)
+       nil)))
+
+) ; end eval-when
+
+(defmacro define-blocked-gemm (name vw es mr nr elem-ref vec-ctor vec-ref add mul fmadd)
+  (let* ((cols (* nr vw))
+         (micro (intern (format nil "~a-M" (string name))))
+         (vrow (intern (format nil "~a-V" (string name))))
+         (scal (intern (format nil "~a-S" (string name)))))
+    `(progn
+       ,(build-scalar scal elem-ref es)
+       ,(build-vecrow vrow vw es elem-ref vec-ctor vec-ref add mul fmadd)
+       ,(build-micro micro vw es mr nr elem-ref vec-ctor vec-ref add mul fmadd)
+       ,(build-driver name micro vrow scal mr cols vw))))
+
 
 ;;; ============================================================
-;;; 四个类型的内核
+;;; 四个类型的内核实例化
 ;;; ============================================================
+;; 微块尺寸取舍：f64 用 4×2（8 个 ymm 累加器 = 4 行 × 8 列，每 k 步
+;; 2 次 B 载入 + 4 次广播 + 8 次 FMA，正好喂满 2 个 FMA 端口）；
+;; f32 用 4×2（4 行 × 16 列）；整型 4×1（没有 FMA，寄存器压力小些）。
 
-;; float64: 4 宽 + FMA
-(define-simd-matmul-rows %simd-matmul-f64-rows
-  4 8
+(define-blocked-gemm %simd-matmul-f64 4 8 4 2
   sb-sys:sap-ref-double
-  sb-simd-avx:f64.4
-  sb-simd-avx:f64.4-sap-ref
-  sb-simd-avx:f64.4+
-  sb-simd-avx:f64.4*
-  sb-simd-fma:f64.4-fmadd)
+  sb-simd-avx:f64.4 sb-simd-avx:f64.4-sap-ref
+  sb-simd-avx:f64.4+ sb-simd-avx:f64.4* sb-simd-fma:f64.4-fmadd)
 
-;; float32: 8 宽 + FMA
-(define-simd-matmul-rows %simd-matmul-f32-rows
-  8 4
+(define-blocked-gemm %simd-matmul-f32 8 4 4 2
   sb-sys:sap-ref-single
-  sb-simd-avx:f32.8
-  sb-simd-avx:f32.8-sap-ref
-  sb-simd-avx:f32.8+
-  sb-simd-avx:f32.8*
-  sb-simd-fma:f32.8-fmadd)
+  sb-simd-avx:f32.8 sb-simd-avx:f32.8-sap-ref
+  sb-simd-avx:f32.8+ sb-simd-avx:f32.8* sb-simd-fma:f32.8-fmadd)
 
-;; int32: 8 宽，用 mullo（AVX2 的 vpmulld，低 32 位乘法）
-(define-simd-matmul-rows %simd-matmul-i32-rows
-  8 4
+(define-blocked-gemm %simd-matmul-i32 8 4 4 1
   sb-sys:signed-sap-ref-32
-  sb-simd-avx:s32.8
-  sb-simd-avx:s32.8-sap-ref
-  sb-simd-fma:s32.8+
-  sb-simd-fma:s32.8-mullo)
+  sb-simd-avx:s32.8 sb-simd-avx:s32.8-sap-ref
+  sb-simd-fma:s32.8+ sb-simd-fma:s32.8-mullo nil)
 
-;; int64: 4 宽，用 s64.4-mul（可能是模拟，需实测）
-(define-simd-matmul-rows %simd-matmul-i64-rows
-  4 8
+(define-blocked-gemm %simd-matmul-i64 4 8 4 1
   sb-sys:signed-sap-ref-64
-  sb-simd-avx:s64.4
-  sb-simd-avx:s64.4-sap-ref
-  sb-simd-fma:s64.4+
-  sb-simd-fma:s64.4-mul)
+  sb-simd-avx:s64.4 sb-simd-avx:s64.4-sap-ref
+  sb-simd-fma:s64.4+ sb-simd-fma:s64.4-mul nil)
 
 ;;; ============================================================
-;;; 并行调度
+;;; 并行调度（C 的二维矩形划分）
 ;;; ============================================================
+;;; 只按行切分时，每个线程都要把整个 B 过一遍：线程数翻倍，B 的 DRAM
+;;; 流量也翻倍。实测 31 线程只切行比 8 线程慢 3 倍。改成 (i, j) 二维
+;;; 网格后，总流量 ≈ (m/MC)·k·n + (n/NC)·m·k，与线程数基本无关。
 
-(defun %simd-matmul-parallel (rows-fn pa pb pc m k n)
-  (declare (type function rows-fn)
+(defun %gemm-grid (nthr m n)
+  "把 NTHR 个线程排成 MI×NJ 的网格（尽量让两边均衡，减少带宽放大）。"
+  (declare (type fixnum nthr m n))
+  (let* ((side (max 1 (isqrt (max 1 nthr))))
+         (mi (max 1 (min side m)))
+         (nj (max 1 (min (floor nthr mi) n))))
+    (values mi nj)))
+
+(defun %simd-matmul-parallel (kern pa pb pc m k n)
+  "在 M×N 上开线程跑 KERN；KERN 的签名是 (pa pb pc k n i0 i1 j0 j1)。"
+  (declare (type function kern)
            (type sb-sys:system-area-pointer pa pb pc)
            (type fixnum m k n))
-  (if (or (<= *simd-matmul-thread-count* 1)
-          (< (* m k n) *simd-matmul-thread-threshold*))
-      (funcall rows-fn pa pb pc k n 0 m)
-      (let* ((nthr (min *simd-matmul-thread-count* m))
-             (rows-per (ceiling m nthr))
-             (threads nil))
-        (declare (type fixnum nthr rows-per))
-        (loop for tid of-type fixnum from 0 below nthr
-              do (let* ((i0 (the fixnum (* tid rows-per)))
-                        (i1 (the fixnum (min m (+ i0 rows-per)))))
-                   (declare (type fixnum i0 i1))
-                   (when (< i0 i1)
-                     (push (sb-thread:make-thread
-                            (lambda () (funcall rows-fn pa pb pc k n i0 i1)))
-                           threads))))
-        (dolist (th threads) (sb-thread:join-thread th))))
+  (let ((nthr (if (or (<= *simd-matmul-thread-count* 1)
+                      (< (* m k n) *simd-matmul-thread-threshold*))
+                  1
+                  (min *simd-matmul-thread-count* (the fixnum (* m n))))))
+    (declare (type fixnum nthr))
+    (if (<= nthr 1)
+        (funcall kern pa pb pc k n 0 m 0 n)
+        (multiple-value-bind (mi nj) (%gemm-grid nthr m n)
+          (declare (type fixnum mi nj))
+          (let* ((ri (the fixnum (ceiling m mi)))
+                 (rj (the fixnum (ceiling n nj)))
+                 (threads nil))
+            (declare (type fixnum ri rj))
+            (dotimes (ii mi)
+              (dotimes (jj nj)
+                (let* ((i0 (the fixnum (* ii ri)))
+                       (j0 (the fixnum (* jj rj)))
+                       (i1 (the fixnum (min m (the fixnum (+ i0 ri)))))
+                       (j1 (the fixnum (min n (the fixnum (+ j0 rj))))))
+                  (declare (type fixnum i0 j0 i1 j1))
+                  (when (and (< i0 i1) (< j0 j1))
+                    (push (sb-thread:make-thread
+                           (lambda () (funcall kern pa pb pc k n i0 i1 j0 j1)))
+                          threads)))))
+            (dolist (th threads) (sb-thread:join-thread th))))))
   nil)
 
 ;;; ============================================================
 ;;; 通用 dispatch
 ;;; ============================================================
 
-(defun %simd-matmul-2d-generic (a b dtype out expected-dtype rows-fn elem-size)
+(defun %simd-matmul-2d-generic (a b dtype out expected-dtype kern elem-size)
   "各类型的公共 dispatch 逻辑。
    elem-size: 每个元素的字节数（f64/i64=8，f32/i32=4）。"
   (declare (type vt a b)
            (type (or null symbol) dtype)
            (type (or null vt) out)
            (type symbol expected-dtype)
-           (type function rows-fn)
+           (type function kern)
            (type fixnum elem-size))
   (unless *simd-matmul-enabled*
     (return-from %simd-matmul-2d-generic nil))
@@ -218,20 +354,20 @@
                   (pb (sb-sys:sap+ (sb-sys:vector-sap b-data) b-off))
                   (pc (sb-sys:sap+ (sb-sys:vector-sap out-data) out-off)))
               (declare (type sb-sys:system-area-pointer pa pb pc))
-              (%simd-matmul-parallel rows-fn pa pb pc m k n))))
+              (%simd-matmul-parallel kern pa pb pc m k n))))
         output))))
 
 (defun %simd-matmul-2d (a b dtype out)
   "按 dtype 分发。返回 VT 成功，NIL 让 vt-matmul 回退。"
   (with-float-safe
     (or (%simd-matmul-2d-generic a b dtype out :float64
-				 #'%simd-matmul-f64-rows 8)
+				 #'%simd-matmul-f64 8)
 	(%simd-matmul-2d-generic a b dtype out :float32
-				 #'%simd-matmul-f32-rows 4)
+				 #'%simd-matmul-f32 4)
 	(%simd-matmul-2d-generic a b dtype out :int32
-				 #'%simd-matmul-i32-rows 4)
+				 #'%simd-matmul-i32 4)
 	(%simd-matmul-2d-generic a b dtype out :int64
-				 #'%simd-matmul-i64-rows 8)
+				 #'%simd-matmul-i64 8)
 	nil)))
 
 ;; *simd-matmul-2d-fn* 在 linalg.lisp 文件中定义，这里注册
@@ -262,24 +398,24 @@
   (when (or (not *simd-matmul-enabled*)
             (< (* m k n) *simd-matmul-threshold*))
     (return-from %simd-gemm-raw nil))
-  (multiple-value-bind (rows-fn elem-size)
+  (multiple-value-bind (kern elem-size)
       (case elem-kind
-        (:float64 (values #'%simd-matmul-f64-rows 8))
-        (:float32 (values #'%simd-matmul-f32-rows 4))
-        (:int64   (values #'%simd-matmul-i64-rows 8))
-        (:int32   (values #'%simd-matmul-i32-rows 4))
+        (:float64 (values #'%simd-matmul-f64 8))
+        (:float32 (values #'%simd-matmul-f32 4))
+        (:int64   (values #'%simd-matmul-i64 8))
+        (:int32   (values #'%simd-matmul-i32 4))
         (t        (values nil 0)))
-    (unless rows-fn
+    (unless kern
       (return-from %simd-gemm-raw nil))
-    (let ((rows (the function rows-fn))
+    (let ((kern% (the function kern))
           (esize (the fixnum elem-size)))
-      (declare (type function rows) (type fixnum esize))
+      (declare (type function kern%) (type fixnum esize))
       (sb-sys:with-pinned-objects (a-data b-data c-data)
         (let ((pa (sb-sys:sap+ (sb-sys:vector-sap a-data) (the fixnum (* a-off esize))))
               (pb (sb-sys:sap+ (sb-sys:vector-sap b-data) (the fixnum (* b-off esize))))
               (pc (sb-sys:sap+ (sb-sys:vector-sap c-data) (the fixnum (* c-off esize)))))
           (declare (type sb-sys:system-area-pointer pa pb pc))
-          (%simd-matmul-parallel rows pa pb pc m k n))))
+          (%simd-matmul-parallel kern% pa pb pc m k n))))
     t))
 
 ;; *simd-gemm-raw-fn* 在 linalg.lisp 中定义（它先于本文件编译），这里注册。
@@ -298,7 +434,7 @@
 ;;; ============================================================
 
 (defun %simd-batched-matmul-core
-    (a b dtype out expected-dtype rows-fn elem-size)
+    (a b dtype out expected-dtype kern elem-size)
   "批量矩阵乘法核心。
    A: (..., M, K)，B: (..., K, N)。任一侧可缺批维度（numpy 广播）。
    OUT: (..., M, N)。ELEM-SIZE: f64/i64=8，f32/i32=4。"
@@ -306,7 +442,7 @@
            (type (or null symbol) dtype)
            (type (or null vt) out)
            (type symbol expected-dtype)
-           (type function rows-fn)
+           (type function kern)
            (type fixnum elem-size))
   (block core
     (unless *simd-matmul-enabled*
@@ -407,14 +543,14 @@
                     (declare (type sb-sys:system-area-pointer a-sap b-sap out-sap))
                     (flet ((run-one-batch (bi)
                              "跑一个 batch 的 M×N 输出。A/B 广播时 stride=0，指针不变。"
-                             (funcall rows-fn
+                             (funcall kern
                                       (sb-sys:sap+
                                        a-sap (* bi a-batch-stride elem-size))
                                       (sb-sys:sap+
                                        b-sap (* bi b-batch-stride elem-size))
                                       (sb-sys:sap+
                                        out-sap (* bi out-batch-stride elem-size))
-                                      k n 0 m)))
+                                      k n 0 m 0 n)))
                       (declare (inline run-one-batch))
                       (cond
                         ;; 总工作量小 → 串行
@@ -451,22 +587,22 @@
 (defun %simd-batched-matmul-f64 (a b dtype out)
   (with-float-safe
     (%simd-batched-matmul-core a b dtype out :float64
-                               #'%simd-matmul-f64-rows 8)))
+                               #'%simd-matmul-f64 8)))
 
 (defun %simd-batched-matmul-f32 (a b dtype out)
   (with-float-safe
     (%simd-batched-matmul-core a b dtype out :float32
-                               #'%simd-matmul-f32-rows 4)))
+                               #'%simd-matmul-f32 4)))
 
 (defun %simd-batched-matmul-i32 (a b dtype out)
   (with-float-safe
     (%simd-batched-matmul-core a b dtype out :int32
-                                #'%simd-matmul-i32-rows 4)))
+                                #'%simd-matmul-i32 4)))
 
 (defun %simd-batched-matmul-i64 (a b dtype out)
   (with-float-safe
     (%simd-batched-matmul-core a b dtype out :int64
-                                #'%simd-matmul-i64-rows 8)))
+                                #'%simd-matmul-i64 8)))
 
 (defun %simd-batched-matmul-dispatch (a b dtype out)
   "顶层分派。失败返回 NIL 让 vt-matmul 回退 einsum。"
