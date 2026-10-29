@@ -654,6 +654,46 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | 类型转换 | `vt-astype` 的 `spec` 特化（10×10 + 4×8 窄整型），提成局部函数 `%cast-run` 后**两条落点共用同一张表** | 连续视图 → 整数组一次；非连续且内层 run ≥ `+astype-fuse-min-run+` → 逐 run 一趟直接写目标 | `%gather-contiguous` → 递归 astype（run 太短或未知元素类型） |
 | 连续化 | `%gather-contiguous` | 非连续视图 | 未知元素类型 → `vt-copy-into` |
 
+### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
+
+SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有
+`sb-simd-avx512f` 包，f64 侧导出 `f64.8` / `f64.8-fmadd` / `f64.8-broadcast`
+等 1300 余个符号）。**它确实可以直接调用** —— `f64.8` 系列符合
+`define-blocked-gemm` 的元素算子协议，一行就能生成 512 位微块，不需要任何
+VOP 或机器码。但**不要**用它替换 `%simd-matmul-f64-512`：
+
+| 1000³ 单线程 | ms | GFLOPS | 相对自写内核 |
+|---|---:|---:|---:|
+| **自写机器码 8×16** | **27** | **74.1** | 1.00× |
+| sb-simd 512，微块 8×8 | 46 | 43.5 | 0.59× |
+| sb-simd 512，微块 8×16 | 53 | 37.7 | 0.51× |
+| sb-simd 512，微块 4×16 | 66 | 30.3 | 0.41× |
+| sb-simd AVX2，微块 4×8 | 80 | 25.0 | 0.34× |
+| numpy 单线程 | 21.7 | 92 | 1.24× |
+
+500³ 上同此趋势（自写 3.0 ms / 83 GF，sb-simd 512 最好 8.0 ms / 31 GF，
+2.7×）—— 小规模下 sb-simd 的固定开销与搬移更摊不薄。
+
+反汇编（`disassemble` 微块函数）给出的原因很具体：`sb-simd` 的
+`f64.8-fmadd` 是**纯函数 + 值语义**，结果只能回落到固定的 `ZMM0`，于是每条
+
+```
+VFMADD213PD ZMM0, ZMM1, ZMM26
+VMOVUPS    ZMM26, ZMM0        ; ← 40 条 FMA 后面跟了 34 条这个
+```
+
+都带一次搬移，前端吞吐被吃掉近一半；且 zmm 的分配范围窄，spill 频繁。
+自写内核用 `vfmadd231pd` **就地把累加器当目标**，一条 FMA 就是一条。
+
+**zmm 的 VOP 也仍然写不出来**（2.6.9 复核过）：核心映像无
+`sb-vm:double-avx512-reg` 这类 SC，`:scs` 写它会被当成函数调用；
+`sb-assem:define-instruction` 依旧为 NIL，只有 `inst`；EVEX 编码表不在
+`SB-X86-64-ASM` 里。`sb-vm::float-avx512-p` / `load-float-avx512` 这类
+辅助函数存在但接不进 VOP 的 `:generator`。
+
+结论：**自写机器码是当前唯一能拿满 512 位的路线**，sb-simd 的 512 只适合
+「不想自己发字节、又能接受 0.5×」的场景。数据与踩坑见 `HISTORY.md` §H.3.25。
+
 ---
 
 ## 8. 宏展开与源码结构约定
@@ -2933,6 +2973,40 @@ np.cumsum([-0.0+0j])         # [-0.+0.j]    ← 首元素直拷，符号位保�
 #### 16.30.5 测试
 
 套件 `complex-nan-inf-test`。逐条断言见该文件头注释；套件说明见 `bash test/run-tests.sh --list`。
+
+#### 16.30.6 可能返回 NaN 的内部浮点函数：返回类型必须显式 `ftype`
+
+**契约**：任何**允许返回 NaN** 的内部函数（`%cx-nan-*` 一族、融合的
+`nansum`/`nanvar` 扫描等），若返回单一浮点，就必须在 `defun` 前显式写
+
+```lisp
+(declaim (ftype (function (t t t) (values float)) %cx-nan-sumsq))
+```
+
+理由不是风格，是**正确性**：SBCL 从 2.6.9 起会把 `(* x x)`、`(+ a b)` 的
+返回类型推断成「非负浮点」`(FLOAT (0.0))`，而 **NaN 不属于该类型**（NaN 与 0
+的任何序比较都为假，落不进 `(float lo hi)`）。编译器随后把这个推断记成函数的
+类型，调用点就按它插一条返回值检查：
+
+```
+The value #<DOUBLE-FLOAT quiet NaN> is not of type
+  (OR (MEMBER 0.0d0 0.0) (FLOAT (0.0))) from the function type declaration.
+```
+
+`nanvar([inf, -inf, 1])` 就是踩这个：`mean` 为 NaN → `Σ|z-mean|²` 为 NaN →
+当场 TYPE-ERROR。这是**推断失真的编译器缺陷**（推导出的类型对那些「NaN 参与
+的乘法」不成立），不该靠改语义绕开 —— 该返回 NaN 的就得返回 NaN。
+
+| 做法 | 结果 |
+|---|---|
+| `(the double-float ...)` / `(sb-ext:truly-the ...)` 包住乘法或赋值 | **无效**，声明与推断取交集，NaN 仍被排除 |
+| `(declare (optimize (safety 0)))` | 无效，与安全检查无关，被拦的是返回值约定 |
+| 局部函数 + `(declare (notinline ...))` 藏起加法 | 有效，但每次累加多一次函数调用 |
+| **`declaim ftype` 把返回类型钉回 `float`** | **有效，且零运行时开销** —— fdefn 上记的是声明类型，检查点消失，循环内的数值推导不受影响 |
+
+判据：`(sb-introspect:function-type #'fn)` 的 `values` 分量里不得出现
+`(FLOAT (0.0))` / `(MEMBER 0.0d0 0.0)` 这类下界类型。`test/nan-fused-test.lisp`
+的 ±Inf 用例是这条的可执行版本（它就靠这个把回归抓下来）。
 
 ### 16.31 弱标量提升（numpy NEP 50）
 

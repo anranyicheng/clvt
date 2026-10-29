@@ -578,6 +578,14 @@
             ((equal et '(complex single-float)) (pull (complex single-float) single-float))
             (t (error "%cx-nan-extremum-count: 非复数缓冲区 ~a" et))))))
 
+;; SBCL 2.6.9 起把 `(* x x)` 的返回类型推断成「非负浮点」（`(FLOAT (0.0))`），
+;; 而 NaN 不属于该类型（NaN 与 0 的序关系全为假）。本函数恰恰**必须**能返回
+;; NaN：`mean` 为 NaN（输入 ±Inf 混合）或 `0 × +Inf` 时累加出 NaN。若放任推断，
+;; 调用点会按推断出的函数类型插一条返回值检查，NaN 当场 TYPE-ERROR。
+;; 显式 ftype 把记录在 fdefn 上的类型钉回 `float`（NaN 是 float），检查即消失，
+;; 且不影响循环内的数值推导（不产生运行时开销）。
+(declaim (ftype (function (t t t) (values float)) %cx-nan-sumsq))
+
 (defun %cx-nan-sumsq (flat mr mi)
   "Σ|z-mean|²，跳过 NaN（单趟）。NaN 位的贡献按原流水线的 `(* sq not-nan)`
    复刻为 `0 × |0-mean|²` —— MEAN 为 ±Inf 时该位给 NaN，与旧实现逐位相同。"

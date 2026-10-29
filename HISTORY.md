@@ -2335,3 +2335,136 @@ gas 对不上，而且差得没有规律。于是反过来做：用 gas 生成 3
   拷贝，不划算。
 - **f32 / 复数**：同样的发射器可以直接扩到 f32（`vfmadd231ps`，`{1to16}`），
   但 f32 GEMM 目前的占比不足以证明这笔投入。
+
+---
+
+## H.3.25 第三十二轮：SBCL 2.6.9 的两个面 —— sb-simd 的 512「能用但慢」，与一次推断失真导致的 NaN 崩溃
+
+> 对外结论见 `CHANGELOG.md`（三十二），契约见 `CONVENTIONS.md` §7.5 / §16.30.6。
+
+#### 一、先回答「能不能直接调」
+
+2.6.9 的 NEWS 第一条就是 `enhancement: addition of some AVX512 support to
+SB-SIMD`。装上之后 `(require :sb-simd)`，`sb-simd-avx512f` 包导出 1370 个
+符号，f64 一侧 `f64.8` / `f64.8-fmadd` / `f64.8-broadcast` / 比较与水平归约
+与 AVX2 的 `f64.4` 一族**完全同构**，`sb-ext:simd-pack-512` 也是内建类，
+`(sb-ext:simd-pack-512 double-float)` 是精确类型。
+
+也就是说：**不需要 VOP、不需要发机器码**，`define-blocked-gemm` 的算子参数
+传 `sb-simd-avx512f:f64.8*` 就能生成 512 位微块，改两行的事。于是先量：
+
+| 1000³ 单线程 | ms |
+|---|---:|
+| sb-simd 512，8×8 | 45 |
+| sb-simd 512，8×16 | 52 |
+| sb-simd 512，4×16 | 66 |
+| 自写机器码 8×16 | **27** |
+| sb-simd AVX2 4×8 | 82 |
+
+最快的 sb-simd 形态（45 ms）仍只有自写内核（27 ms）的 0.6×，而且**比 AVX2
+的 8×8 还慢** —— 如果只是「512 位更宽所以更快」的朴素预期，这里就该警觉。
+
+#### 二、反汇编把原因钉死在一行上
+
+反汇编 8×8 微块，内层每 5 条指令一组：
+
+```
+VFMADD213PD ZMM0, ZMM1, ZMM26
+VMOVUPS    ZMM26, ZMM0
+VFMADD213PD ZMM0, ZMM0, ZMM27
+VMOVUPS    ZMM27, ZMM0
+...
+```
+
+40 条 `VFMADD213PD` 后面跟了 34 条 `VMOVUPS`。根因是**语义模型**而不是实现
+质量：`f64.8-fmadd` 是纯函数（三参一返、`movable`+`flushable`），值语义要求
+结果落到约定的返回寄存器 `ZMM0`，而累加器住在另一个 zmm 里，于是每条 FMA
+都要搬一次。自写内核里 `vfmadd231pd zmm2, zmm1, [mem]{1to8}` 的第三个操作数
+**就是累加器本身**（读-改-写），一条指令顶两条。
+
+搬移还在前端：每条 FMA 多一个 uop，正好把 FMA 端口留出的余量吃回去。这解释了
+为什么 512 位反而打不过 256 位 —— 8×8 的 AVX2 微块每条 FMA 也是 2 uop，但
+寄存器压力小得多、没有 EVEX 前缀的取指代价。
+
+**顺便复核了 zmm 的 VOP**（第一轮的结论是否在 2.6.9 变了）：没有。
+`:scs (sb-vm::double-avx512-reg)` 能「编译通过」，是因为这个名字
+`fboundp` —— 编译器把它当成一次**函数调用**，而不是一个存储类；换成精确的
+`:arg-types` 后立刻报「不是合法的 SC」。`sb-assem:define-instruction` 依旧
+为 NIL，只有 `inst`；`SB-X86-64-ASM` 里没有 EVEX 编码表。
+
+结论：**自写机器码仍是唯一能拿满 512 位的路线**，与「2.6.9 是否支持 AVX-512」
+无关 —— 支持的是 sb-simd 的**函数式**通路，不是可发射的指令层。
+
+#### 三、第二个面：一个 NaN 让整套测试崩在 62/63
+
+装好 2.6.9 跑全量：63 套件、62 过、1 红（`nan-fused-test`），其余
+（包括 49 项 AVX-512 GEMM 测试）全绿 —— 自写机器码内核与编译器版本无关，
+这点先确认了，否则后面分不清是内核坏了还是环境变了。
+
+红灯现场：
+
+```
+Unhandled TYPE-ERROR in thread "main thread":
+  The value
+    #<DOUBLE-FLOAT quiet NaN>
+  is not of type
+    (OR (MEMBER 0.0d0 0.0) (FLOAT (0.0)))
+  from the function type declaration.
+0: (%CX-NAN-VAR-GLOBAL "VT-NANVAR" #<VT ... [+inf, -inf, 1.0-2.0j]> ...)
+```
+
+输入是 `[+inf+0i, -inf+0i, 1-2i]`：`mean` 的实部 `(+inf + -inf + 1)/3` 是
+NaN，`Σ|z-mean|²` 自然也是 NaN —— 这正是 `CONVENTIONS` §16.30 要求的传播。
+**错的是类型，不是值。**
+
+容易走错的一步：backtrace 顶层是 `%CX-NAN-VAR-GLOBAL`，看着像它的返回类型
+有问题。一看 `(sb-introspect:function-type #'%cx-nan-var-global)` 是
+`(FUNCTION (T T T T T T T) *)`，没事；有问题的是**被它调用的**
+`%cx-nan-sumsq`：
+
+```
+(FUNCTION (T T T) (VALUES (OR (MEMBER 0.0d0 0.0) (FLOAT (0.0))) &OPTIONAL))
+```
+
+检查是在**调用点**做的（内联进调用者帧，所以 backtrace 顶层落在调用者身上）。
+根因链：2.6.9 起 `(* x x)` 的返回类型被推断成「非负浮点」→ `(+ a (* dr dr))`
+仍是「非负」→ 整个 `let` 的 `a` 与函数返回值都被压成 `(FLOAT (0.0))`。
+而 **NaN 不属于任何 `(float lo hi)` 类型**（它与 0 的三种序比较全为假），
+于是这条推断在「参与乘法的量是 NaN」时不成立 —— 是**推断失真**，不是我们的
+语义错了。
+
+#### 四、四试一成才找到不花钱的修法
+
+`a` 明明声明了 `(type ,rtype a)` 也没用：声明与推断**取交集**，NaN 照样被
+排除。于是逐个试：
+
+| 写法 | 结果 |
+|---|---|
+| `(the double-float (* x x))` | 无效 |
+| `(sb-ext:truly-the double-float (incf a ...))` / 包住乘法 | 无效（`truly-the` 只在 NODE 层截断，回写变量时又并回推断） |
+| `(declare (optimize (safety 0)))` | 无效 —— 被拦的不是数组/类型安全，是「函数返回值约定」 |
+| 局部 `flet` + `(declare (notinline acc))` | **有效**，但每元素多一次函数调用 |
+| `(declaim (ftype (function (t t t) (values float)) %cx-nan-sumsq))` | **有效，且零运行时开销** |
+
+选最后一条：`ftype` 决定 fdefn 上记录的类型（调用点据此插检查），循环内的
+数值推导照旧，`(speed 3)` 的代码质量不受影响。`(values float)` 是**真话** ——
+NaN 是 float，两种精度都被覆盖；比 `(values t)` 保留的信息多，比
+`(values double-float)` 不撒谎（单精度输入也会走这里）。
+
+一句话记住：**凡是允许返回 NaN 的内部浮点函数，都要显式写 `ftype`；
+让编译器「推断」出来的返回类型去当契约，迟早会被一次 NaN 打穿。**
+这条已写进 `CONVENTIONS` §16.30.6。
+
+#### 五、验收
+
+| 项 | 2.6.9 |
+|---|---|
+| `nan-fused-test` | 302 项全过（修前崩在 `TEST-NANVAR`） |
+| `gemm-avx512-test` | 49/49、1000³ 27 ms（与 2.6.8 逐位、逐毫秒一致） |
+| 全量套件 | 63 套件全绿 |
+| 编译体检 | WARNING 0、STYLE-WARNING 4（白名单原样） |
+| 文档门禁 | `check_docs.py` 196 个锚点全解析 |
+
+环境侧：2.6.9 用 `./install.sh --prefix=/usr/local` 覆盖安装，2.6.8 保留为
+`/usr/local/bin/sbcl-2.6.8` + `/usr/local/lib/sbcl-2.6.8`（需
+`SBCL_HOME=/usr/local/lib/sbcl-2.6.8` 调用），回退只需换路径。
