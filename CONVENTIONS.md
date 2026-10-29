@@ -620,6 +620,24 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | 小任务 | `m·k·n < *simd-matmul-thread-threshold*` 时串行，避免线程创建/汇合摊不薄 |
 | 回退 | 内核返回 NIL 表示不接管，由调用方回退（§8.3） |
 
+**GEMM 累加器初值属于契约，不是优化项**：微内核必须**从 C 的现值开始**
+累加（先载入、末尾原样写回），不得「清零后末尾再 `vaddpd`」。后者少一次
+载入、实测快 3%，但舍入链变成 `((0 + a₀b₀) + …) + C`，在 C 远大于 Σab 时
+会丢掉 Σab 的低位 —— 对拍出现 `-4.99e-16` 而非 0。
+
+**f64 GEMM 的「逐位相同」边界**：`%simd-matmul-f64`（sb-simd 路径）把列分成
+三段 —— 8 列微块、按 4 列对齐的整宽向量、最后 `n mod 4` 列走**标量**
+`(incf c (* a b))`（两次舍入）。AVX-512 内核（§7.4 的 `%simd-matmul-f64-512`）
+对这些列用的是 FMA（一次舍入），因此：
+
+| 情形 | 要求 |
+|---|---|
+| `n mod 4 = 0` | **严格逐位相同**（含 1000³ 的全部 10⁶ 个元素） |
+| `n mod 4 ≠ 0` | 差异**只能**落在最后 `n mod 4` 列（`j ≥ n - (n mod 4)`），且相对误差 ≤ 1e-15；512 侧更精确 |
+
+差异一旦出现在别的列，就是内核 bug，不能归入「舍入差异」。
+`test/gemm-avx512-test.lisp` 的 `%tail-start` / `check-bits` 是这条的可执行版本。
+
 ### 7.4 性能快路径清单（谁在什么时候接管）
 
 所有快路径的共同约束：**不满足条件时返回 NIL / 落到通用路径**，且结果与
@@ -628,7 +646,8 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 
 | 层 | 快路径 | 选路条件 | 回退 |
 |---|---|---|---|
-| GEMM | `%simd-matmul-{f64,f32,i32,i64}`（`simd-matmul.lisp`） | 2 维、dtype 属 4 种存储级、`m·k·n ≥ *simd-matmul-threshold*`、out 连续且 dtype 精确匹配 | `vt-einsum` 通用路径 |
+| GEMM | `%simd-matmul-{f32,i32,i64}`（`simd-matmul.lisp`） | 2 维、dtype 属存储级、`m·k·n ≥ *simd-matmul-threshold*`、out 连续且 dtype 精确匹配 | `vt-einsum` 通用路径 |
+| GEMM（f64） | `%simd-matmul-f64-512`（`gemm-avx512.lisp`，运行时发射的 AVX-512 机器码；8 行 × 16 列微块，列尾走掩码内核） | 同上一行，**且** `avx512-gemm-kernels` 非 NIL —— 即 x86-64 + `/proc/cpuinfo` 有 `avx512f` + `*avx512-gemm-enabled*` 为真。`m mod 8` 的行尾仍交回 `%simd-matmul-f64` | `%simd-matmul-f64`（sb-simd AVX2） |
 | 归约（全归约） | `%kernel-global` | 输入连续、`axis=nil`、dtype 属 4 种存储级 | `%kernel-general`（stride 驱动 odometer） |
 | 归约（沿轴） | `%kernel-row-acc`（`inner ≥ +row-acc-min-inner+`）/ `%kernel-single-axis` | 输入与 out 都连续，且**归约轴在 shape 里连成一段** `[a,b)` —— 满足时多层轴等价于一层：`outer=∏[0,a)`、`red=∏[a,b)`、`inner=∏[b,rank)`；单轴天然满足，`(0,1)`/`(1,2)` 满足，`(0,2)` 不满足。窄整型同条件（内层用 `%small-int-axis-form` 分派）。行累加额外要求 out 不与输入同数组 | `%kernel-general` / `%kernel-small-general`（窄整型） |
 | 归约（arg 族） | `%kernel-single-axis` | 单轴 + 存储级 dtype（numpy 的 `argmax`/`argmin` 不接受轴元组；窄整型留在通用路径） | `%kernel-general` |

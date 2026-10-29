@@ -210,6 +210,53 @@
            (<= 8 clvt::+astype-fuse-min-run+ 64))))
 
 ;;; ------------------------------------------------------------------
+;;; G9 — AVX-512 机器码内核必须真的接管 f64 GEMM
+;;;      这条护栏防的是「内核加载失败/开关被关」的静默退化：结果依然正确，
+;;;      但 1000³ 从 ~27ms 掉回 ~80ms（numpy 的 75% → 25%）。
+;;;      用比值而非绝对毫秒，机器快慢在比值里抵消；本机没有 AVX-512 时跳过。
+;;; ------------------------------------------------------------------
+(defun g9-avx512-gemm-kernel ()
+  (multiple-value-bind (kern kernm) (clvt::avx512-gemm-kernels)
+    (declare (ignore kernm))
+    (if (null kern)
+        (progn (incf *pass*)
+               (format t "  [SKIP] G9 本机无 AVX-512F 内核（已回退 sb-simd，无需护栏）~%")
+               t)
+        (let* ((n 800)
+               (a (vt-random-uniform (list n n)))
+               (b (vt-random-uniform (list n n)))
+               (t512 (let ((clvt::*simd-matmul-thread-count* 1)
+                           (clvt::*avx512-gemm-enabled* t))
+                       (median-us (lambda () (vt-matmul a b)) :reps 3)))
+               (t2 (let ((clvt::*simd-matmul-thread-count* 1)
+                         (clvt::*avx512-gemm-enabled* nil))
+                     (median-us (lambda () (vt-matmul a b)) :reps 3))))
+          ;; 结构断言：分派函数必须指向 512 驱动
+          (check "G9a f64 GEMM 分派到 %SIMD-MATMUL-F64-512"
+                 (let ((clvt::*avx512-gemm-enabled* t))
+                   (eq (clvt::%f64-gemm-kernel) #'clvt::%simd-matmul-f64-512)))
+          ;; 倍率断言：512 内核至少要快 1.7×（实测本机 ~3×）
+          (check-ratio "G9b AVX-512 内核 / sb-simd 内核（800³）"
+                       (/ t512 (max t2 1e-9)) 0.6
+                       "t(512) ÷ t(sb-simd)")
+          ;; 结果不变性：关掉开关只换速度，不许换结果（尾部标量列除外，见
+          ;; test/gemm-avx512-test.lisp 的 %TAIL-START）
+          (let* ((m 120) (kk 90) (nn 128)
+                 (a2 (vt-random-uniform (list m kk)))
+                 (b2 (vt-random-uniform (list kk nn)))
+                 (d1 (let ((clvt::*simd-matmul-thread-count* 1)
+                           (clvt::*avx512-gemm-enabled* t))
+                       (vt-data (vt-matmul a2 b2))))
+                 (d2 (let ((clvt::*simd-matmul-thread-count* 1)
+                           (clvt::*avx512-gemm-enabled* nil))
+                       (vt-data (vt-matmul a2 b2)))))
+            (check "G9c 开关只改速度不改结果（128 列，n%4=0 ⇒ 逐位相同）"
+                   (dotimes (i (length d1) t)
+                     (unless (= (sb-kernel:double-float-bits (aref d1 i))
+                                (sb-kernel:double-float-bits (aref d2 i)))
+                       (return nil)))))))))
+
+;;; ------------------------------------------------------------------
 ;;; 主入口
 ;;; ------------------------------------------------------------------
 (defun run ()
@@ -222,6 +269,7 @@
   (g6-thread-count)
   (g7-same-result)
   (g8-astype-strided-fused)
+  (g9-avx512-gemm-kernel)
   (format t "~&===== 汇总: ~a 通过 / ~a 失败 =====~%" *pass* *fail*)
   (format t "Total: ~a | Pass: ~a | Fail: ~a~%" (+ *pass* *fail*) *pass* *fail*)
   (when *failures*

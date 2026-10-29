@@ -235,6 +235,68 @@
   sb-simd-fma:s64.4+ sb-simd-fma:s64.4-mul nil)
 
 ;;; ============================================================
+;;; f64 的 AVX-512 接管（gemm-avx512.lisp 提供机器码内核）
+;;; ============================================================
+;;; 与上面的 sb-simd 版本相比只换「寄存器微块」这一层：8 行 × 16 列（两个
+;;; 512 位向量）驻留寄存器，每个 k 步 16 条 vfmadd231pd 的广播直接取自
+;;; A 的内存操作数（{1to8}），不像 AVX2 那样额外占一条 vbroadcastsd。
+;;; 分块顺序、k 递增次序、累加器初值（从 C 读入）都与 sb-simd 版本一致，
+;;; 因此结果逐位相同（§7.3）。
+;;;
+;;; 尾块处理：
+;;;   · 列方向不足 16 列 → 掩码内核（k1/k2 分别管低/高 8 列），不越界写；
+;;;   · 行方向不足 8 行 → 交回 sb-simd 的 %SIMD-MATMUL-F64（≤7 行，
+;;;     占整块算力的 1% 以内，不值得再发射一份 MR=4 的内核）。
+(defun %simd-matmul-f64-512 (pa pb pc k n i0 i1 j0 j1)
+  (declare (type sb-sys:system-area-pointer pa pb pc)
+           (type fixnum k n i0 i1 j0 j1)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (multiple-value-bind (kern kernm) (avx512-gemm-kernels)
+    (unless (and kern kernm)
+      (return-from %simd-matmul-f64-512 (%simd-matmul-f64 pa pb pc k n i0 i1 j0 j1)))
+    (let* ((pa0 (sb-sys:sap-int pa))
+           (pb0 (sb-sys:sap-int pb))
+           (pc0 (sb-sys:sap-int pc))
+           (ast (the fixnum (* k 8)))
+           (bst (the fixnum (* n 8)))
+           (iend (the fixnum (- i1 (the fixnum (mod (the fixnum (- i1 i0)) 8))))))
+      (declare (type fixnum pa0 pb0 pc0 ast bst iend))
+      (loop for jc of-type fixnum from j0 below j1 by *gemm-nc* do
+        (let* ((nc (the fixnum (min *gemm-nc* (the fixnum (- j1 jc)))))
+               (nf (the fixnum (floor nc 16)))
+               (rm (the fixnum (mod nc 16)))
+               (mk (if (plusp rm) (the fixnum (1- (ash 1 rm))) 0)))
+          (declare (type fixnum nc nf rm mk))
+          (loop for kc0 of-type fixnum from 0 below k by *gemm-kc* do
+            (let ((kc (the fixnum (min *gemm-kc* (the fixnum (- k kc0))))))
+              (declare (type fixnum kc))
+              (loop for ic of-type fixnum from i0 below iend by *gemm-mc* do
+                (loop for i of-type fixnum from ic
+                        below (the fixnum (min iend (the fixnum (+ ic *gemm-mc*))))
+                        by 8 do
+                  (let ((pa-i (the fixnum (+ pa0 (the fixnum (* i ast)) (the fixnum (* kc0 8)))))
+                        (pb-j (the fixnum (+ pb0 (the fixnum (* kc0 bst)) (the fixnum (* jc 8)))))
+                        (pc-j (the fixnum (+ pc0 (the fixnum (* i bst)) (the fixnum (* jc 8))))))
+                    (declare (type fixnum pa-i pb-j pc-j))
+                    (when (plusp nf)
+                      (call-avx512-gemm kern pa-i pb-j pc-j kc ast bst nf 0))
+                    (when (plusp rm)
+                      (call-avx512-gemm kernm pa-i
+                                        (the fixnum (+ pb-j (the fixnum (* nf 128))))
+                                        (the fixnum (+ pc-j (the fixnum (* nf 128))))
+                                        kc ast bst 1 mk)))))))))
+      ;; 行尾（< 8 行）交回 sb-simd 微块
+      (when (< iend i1)
+        (%simd-matmul-f64 pa pb pc k n iend i1 j0 j1)))
+    nil))
+
+(defun %f64-gemm-kernel ()
+  "当前可用的 f64 GEMM 内核：有 AVX-512 机器码就用它，否则 sb-simd 版本。"
+  (multiple-value-bind (kern kernm) (avx512-gemm-kernels)
+    (declare (ignore kernm))
+    (if kern #'%simd-matmul-f64-512 #'%simd-matmul-f64)))
+
+;;; ============================================================
 ;;; 并行调度（C 的二维矩形划分）
 ;;; ============================================================
 ;;; 只按行切分时，每个线程都要把整个 B 过一遍：线程数翻倍，B 的 DRAM
@@ -361,7 +423,7 @@
   "按 dtype 分发。返回 VT 成功，NIL 让 vt-matmul 回退。"
   (with-float-safe
     (or (%simd-matmul-2d-generic a b dtype out :float64
-				 #'%simd-matmul-f64 8)
+				 (%f64-gemm-kernel) 8)
 	(%simd-matmul-2d-generic a b dtype out :float32
 				 #'%simd-matmul-f32 4)
 	(%simd-matmul-2d-generic a b dtype out :int32
@@ -400,7 +462,7 @@
     (return-from %simd-gemm-raw nil))
   (multiple-value-bind (kern elem-size)
       (case elem-kind
-        (:float64 (values #'%simd-matmul-f64 8))
+        (:float64 (values (%f64-gemm-kernel) 8))
         (:float32 (values #'%simd-matmul-f32 4))
         (:int64   (values #'%simd-matmul-i64 8))
         (:int32   (values #'%simd-matmul-i32 4))
@@ -587,7 +649,7 @@
 (defun %simd-batched-matmul-f64 (a b dtype out)
   (with-float-safe
     (%simd-batched-matmul-core a b dtype out :float64
-                               #'%simd-matmul-f64 8)))
+                               (%f64-gemm-kernel) 8)))
 
 (defun %simd-batched-matmul-f32 (a b dtype out)
   (with-float-safe

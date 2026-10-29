@@ -48,13 +48,14 @@ SUITES[nan-random-test]="89 NaN 随机数测试"
 SUITES[property-test]="性质测试"
 SUITES[test-extensions]="19 扩展函数回归测试"
 SUITES[simd-test]="SIMD 路径测试"
-SUITES[perf-fastpath-test]="13 非复数快路径护栏 (GEMM 分块/归约行累加/窄整型/astype/连续化 的选路结构与机器无关倍率；纯正确性测试抓不到「选路退化」)"
+SUITES[perf-fastpath-test]="16 非复数快路径护栏 (GEMM 分块/归约行累加/窄整型/astype/连续化/AVX-512 内核接管的选路结构与机器无关倍率；纯正确性测试抓不到「选路退化」)"
 SUITES[test-overlap]="6 重叠拷贝回归测试"
 SUITES[svd-fast-path-test]="SVD 双路径测试 (差分参考/选路不变量/数学性质/numpy对比/退化形状)"
 SUITES[linalg-fast-path-test]="LINALG 双路径测试 (lu/qr/solve/chol/eig: 差分参考/选路不变量/数学性质/numpy对比/边界)"
 SUITES[test-copy-into]="41 vt-copy-into 正确性测试 + 复数×非连续 typed-walk (转置/翻转/3-D 置换/非连续 dest 与独立参照逐位相等 + c128T 拷贝 ≤8× 实数线护栏)"
 SUITES[io-interop-test]="77 vt-load/vt-save 持久化与 numpy .npy 互操作测试（含 NaN payload 逐位/视图字节等价/不变性/覆盖语义）"
 SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
+SUITES[gemm-avx512-test]="49 AVX-512 f64 GEMM 机器码内核测试 (EVEX 发射器/掩码尾块/写边界哨兵/非对齐 SAP; 与 sb-simd 内核逐位对照, n%4 的尾部标量列按 §7.3 放宽为 ≤1e-15 且必须只落在这些列)"
 SUITES[test-bug0]="37 已知 bug 回归测试"
 SUITES[test-ai-edge-cases]="40 AI 主流函数语义回归测试 (matmul 1-D/广播 0-size/BCE NaN/vstack)"
 SUITES[memsafety-tests]="6 :out 快路径内存安全测试"
@@ -132,6 +133,7 @@ DEFAULT_ORDER=(
     test-overlap
     test-copy-into
     test-simd-batch-matmul
+    gemm-avx512-test
     test-bug0
     test-ai-edge-cases
     memsafety-tests

@@ -59,6 +59,7 @@
                (:file "src/setops")
                (:file "src/random")
                (:file "src/linalg")
+               #+sbcl (:file "src/gemm-avx512")
                #+sbcl (:file "src/simd-matmul")
                (:file "src/nn")
                (:file "src/rotate")
