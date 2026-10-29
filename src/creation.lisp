@@ -122,6 +122,10 @@
         (:int16  (fill-int (signed-byte 16) %wrap-int16))
         (:int8   (fill-int (signed-byte 8)  %wrap-int8))
         (:uint8  (fill-int (unsigned-byte 8)  %wrap-uint8))
+        ;; :bool 与 :uint8 共用物理存储，但写入前必须真值化（§17.1）：
+        ;; `(vt-arange 3 :dtype :bool)` 要给 [0 1 1]（= numpy 的
+        ;; [False True True]），而不是 [0 1 2] 这种「布尔数组里出现 2」。
+        (:bool   (fill-int (unsigned-byte 8) %bool-flag))
         (:uint16 (fill-int (unsigned-byte 16) %wrap-uint16))))
     (%make-vt :data data :shape shape :strides (vt-compute-strides shape)
               :offset 0 :dtype dtype)))
@@ -174,6 +178,7 @@
           (:int16  (fill-int (signed-byte 16)))
           (:int8   (fill-int (signed-byte 8)))
           (:uint8  (fill-int (unsigned-byte 8)))
+          (:bool   (fill-int (unsigned-byte 8)))
           (:uint16 (fill-int (unsigned-byte 16)))))
       (when endpoint
         (setf (aref data (1- num)) (vt-cast end dtype)))

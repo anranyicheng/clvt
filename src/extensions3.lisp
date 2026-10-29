@@ -3,7 +3,7 @@
 ;;;; 本文件严格遵循 CONVENTIONS.md：
 ;;;;   §1  三层架构：逻辑层（shape/dtype/广播/归约语义）/
 ;;;;        物理层（strides/offset/连续性/别名）/ 执行层（快路径 vs 通用路径）；
-;;;;   §3  dtype 系统：8 种逻辑 dtype；比较/逻辑/谓词函数返回 :int8 布尔语义；
+;;;;   §3/§17  dtype 系统：9 种逻辑 dtype（含 :bool）；比较/逻辑/谓词函数返回 :bool；
 ;;;;   §4  :out 硬契约：形状精确匹配、dtype 精确匹配、可写；
 ;;;;   §5  NaN/Inf 语义对齐 NumPy；
 ;;;;   §6  签名约定：一律 `&key dtype out`，缺省 nil 表示按输入提升；
@@ -826,15 +826,15 @@
           :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
 
 (defun vt-signbit (tensor &key out)
-  "逐元素符号位判定，返回 1/0，dtype 为 :int8（对标 numpy.signbit）。
-   x < 0 或为负零（-0.0）→ 1，否则 0。:out 契约同 vt-=（dtype :int8）。"
+  "逐元素符号位判定，返回 **:bool** 布尔张量（对标 numpy.signbit，§17）。
+   x < 0 或为负零（-0.0）→ True，否则 False。:out 契约同 vt-=（dtype :bool）。"
     (when (%cx-reject tensor)
     (error "vt-signbit: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (vt-map (lambda (x)
             ;; v0.4.1 修复（差分测试 R5）：按 IEEE 符号位判定；正 NaN 符号位
             ;; 为 0（numpy.signbit(+nan)=0），负 NaN/-0.0/负数为 1。
             (if (%e3-sign-bit-p (coerce x 'double-float)) 1 0))
-          (ensure-vt tensor :dtype :float64) :out out :dtype :int8))
+          (ensure-vt tensor :dtype :float64) :out out :dtype :bool))
 
 (declaim (inline %e3-nextafter))
 (defun %e3-nextafter (a b)
@@ -1680,16 +1680,16 @@
       (error () nil))))
 
 (defun vt-isposinf (tensor &key out)
-  "逐元素 +Inf 判定，返回 1/0，dtype 为 :int8（对标 numpy.isposinf）。
-   :out 契约同 vt-=（dtype :int8）。"
+  "逐元素 +Inf 判定，返回 **:bool** 布尔张量（对标 numpy.isposinf，§17）。
+   :out 契约同 vt-=（dtype :bool）。"
   (vt-map (lambda (x) (if (and (floatp x) (%pos-inf-p x)) 1 0))
-          (ensure-vt tensor :dtype :float64) :out out :dtype :int8))
+          (ensure-vt tensor :dtype :float64) :out out :dtype :bool))
 
 (defun vt-isneginf (tensor &key out)
-  "逐元素 -Inf 判定，返回 1/0，dtype 为 :int8（对标 numpy.isneginf）。
-   :out 契约同 vt-=（dtype :int8）。"
+  "逐元素 -Inf 判定，返回 **:bool** 布尔张量（对标 numpy.isneginf，§17）。
+   :out 契约同 vt-=（dtype :bool）。"
   (vt-map (lambda (x) (if (and (floatp x) (%neg-inf-p x)) 1 0))
-          (ensure-vt tensor :dtype :float64) :out out :dtype :int8))
+          (ensure-vt tensor :dtype :float64) :out out :dtype :bool))
 
 ;;; ==================================================================
 ;;; 8. 集合类（Set operations）
@@ -1697,9 +1697,9 @@
 
 (defun vt-isin (element test-elements &key (invert nil) (assume-unique nil))
   "逐元素判定是否存在于 TEST-ELEMENTS 中（对标 numpy.isin）。
-   返回与 ELEMENT 形状相同的布尔张量（dtype :int8，1/0）。
+   返回与 ELEMENT 形状相同的 **:bool** 布尔张量（§17）。
    INVERT=t 取反；ASSUME-UNIQUE 为性能提示（本库忽略，语义等价）。
-   示例：(vt-isin '(1 2 3 4) '(2 4)) => [0 1 0 1]"
+   示例：(vt-isin '(1 2 3 4) '(2 4)) => [False True False True]"
   ;; v0.4.2 性能修复：与 vt-in1d 共用哈希会员判定（原 O(n×m) 线性 member，
   ;; 1M×1k 实测 87 秒）。
   (when (%cx-any-p element test-elements)

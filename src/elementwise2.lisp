@@ -13,10 +13,11 @@
 
 (defun %op-ge (a b) (if (>= a b) 1.0d0 0.0d0))
 
-(defun vt-= (t1 t2 &key (dtype :int8) out)
-  "逐元素相等判定，返回值 1/0，dtype 默认 :int8（承载布尔语义，CONVENTIONS §3.1）。
-      NaN 与任何值比较恒假 → 0（含 NaN == NaN）。
-      :out dtype 必须精确等于结果 dtype（§4.2 H3，默认 :int8）。"
+(defun vt-= (t1 t2 &key (dtype :bool) out)
+  "逐元素相等判定，返回 **:bool** 布尔张量（CONVENTIONS §17）。
+      NaN 与任何值比较恒假 → False（含 NaN == NaN）。
+      :out dtype 必须精确等于结果 dtype（§4.2 H3，默认 :bool）；
+      显式传 :dtype :int8 仍可用，得到旧的 0/1 整型掩码。"
   (when (%cx-any-p t1 t2)
     (return-from vt-=
       (vt-fast-map (function %cx-eq-flag) (ensure-vt t1) (ensure-vt t2)
@@ -24,9 +25,9 @@
   (vt-fast-map #'%op-eq (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-/= (t1 t2 &key (dtype :int8) out)
-  "逐元素不等判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN 与任何值比较恒真 → 1（含 NaN != NaN）。:out 契约同 vt-=。"
+(defun vt-/= (t1 t2 &key (dtype :bool) out)
+  "逐元素不等判定，返回 **:bool** 布尔张量。
+      NaN 与任何值比较恒真 → True（含 NaN != NaN）。:out 契约同 vt-=。"
   (when (%cx-any-p t1 t2)
     (return-from vt-/=
       (vt-fast-map (function %cx-ne-flag) (ensure-vt t1) (ensure-vt t2)
@@ -34,9 +35,9 @@
   (vt-fast-map #'%op-ne (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-< (t1 t2 &key (dtype :int8) out)
-  "逐元素小于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+(defun vt-< (t1 t2 &key (dtype :bool) out)
+  "逐元素小于判定，返回 **:bool** 布尔张量。
+      NaN 参与的比较恒假 → False。:out 契约同 vt-=。"
   (when (%cx-any-p t1 t2)
     (return-from vt-<
       (vt-fast-map (function %cx-lt-flag) (ensure-vt t1) (ensure-vt t2)
@@ -44,9 +45,9 @@
   (vt-fast-map #'%op-lt (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-<= (t1 t2 &key (dtype :int8) out)
-  "逐元素小于等于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+(defun vt-<= (t1 t2 &key (dtype :bool) out)
+  "逐元素小于等于判定，返回 **:bool** 布尔张量。
+      NaN 参与的比较恒假 → False。:out 契约同 vt-=。"
   (when (%cx-any-p t1 t2)
     (return-from vt-<=
       (vt-fast-map (function %cx-le-flag) (ensure-vt t1) (ensure-vt t2)
@@ -54,9 +55,9 @@
   (vt-fast-map #'%op-le (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt-> (t1 t2 &key (dtype :int8) out)
-  "逐元素大于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+(defun vt-> (t1 t2 &key (dtype :bool) out)
+  "逐元素大于判定，返回 **:bool** 布尔张量。
+      NaN 参与的比较恒假 → False。:out 契约同 vt-=。"
   (when (%cx-any-p t1 t2)
     (return-from vt->
       (vt-fast-map (function %cx-gt-flag) (ensure-vt t1) (ensure-vt t2)
@@ -64,9 +65,9 @@
   (vt-fast-map #'%op-gt (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
-(defun vt->= (t1 t2 &key (dtype :int8) out)
-  "逐元素大于等于判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN 参与的比较恒假 → 0。:out 契约同 vt-=。"
+(defun vt->= (t1 t2 &key (dtype :bool) out)
+  "逐元素大于等于判定，返回 **:bool** 布尔张量。
+      NaN 参与的比较恒假 → False。:out 契约同 vt-=。"
   (when (%cx-any-p t1 t2)
     (return-from vt->=
       (vt-fast-map (function %cx-ge-flag) (ensure-vt t1) (ensure-vt t2)
@@ -203,22 +204,21 @@
         (vt-fast-map (function %cop-fmin) a b :out out :dtype dt))))
   (vt-fast-map #'%op-fmin t1 t2 :out out :dtype dtype))
 
-(defun vt-logical-and (t1 t2 &key out (dtype :int8))
-  "逐元素逻辑与（非零视为真），返回 1/0。
-   dtype 默认 :int8——与 §3.1「比较/逻辑运算返回 :int8」一致，
-   语义等价 numpy 的 bool（本库不引入独立 :bool dtype）。"
+(defun vt-logical-and (t1 t2 &key out (dtype :bool))
+  "逐元素逻辑与（非零视为真），返回 **:bool** 布尔张量（对标 numpy.logical_and）。
+   dtype 默认 :bool（CONVENTIONS §17）；显式 :dtype :int8 等仍可退化为 0/1 整数掩码。"
   (vt-fast-map #'%op-logical-and t1 t2 :dtype dtype :out out))
 
-(defun vt-logical-or (t1 t2 &key out (dtype :int8))
-  "逐元素逻辑或（非零视为真），返回 1/0。dtype 默认 :int8（同 §3.1）。"
+(defun vt-logical-or (t1 t2 &key out (dtype :bool))
+  "逐元素逻辑或（非零视为真），返回 **:bool** 布尔张量。dtype 默认 :bool（§17）。"
   (vt-fast-map #'%op-logical-or t1 t2 :dtype dtype :out out))
 
-(defun vt-logical-not (vt &key out (dtype :int8))
-  "逐元素逻辑非，返回 1/0。dtype 默认 :int8（同 §3.1）。"
+(defun vt-logical-not (vt &key out (dtype :bool))
+  "逐元素逻辑非，返回 **:bool** 布尔张量。dtype 默认 :bool（§17）。"
   (vt-fast-map #'%op-logical-not vt :dtype dtype :out out))
 
-(defun vt-logical-xor (t1 t2 &key out (dtype :int8))
-  "逐元素逻辑异或，返回 1/0。dtype 默认 :int8（同 §3.1）。"
+(defun vt-logical-xor (t1 t2 &key out (dtype :bool))
+  "逐元素逻辑异或，返回 **:bool** 布尔张量。dtype 默认 :bool（§17）。"
   (vt-fast-map #'%op-logical-xor t1 t2 :dtype dtype :out out))
 
 (defun vt-bit-and (t1 t2 &key out dtype)

@@ -224,7 +224,7 @@
 (check "copysign" '(-1d0 2d0 -3d0) (vt-copysign '(1 -2 3) '(-1 1 -1)))
 
 (check "signbit" '(1 0 0) (vt-signbit '(-1 0 1)))
-(check "signbit dtype" :int8 (vt-dtype (vt-signbit '(-1 0 1))))
+(check "signbit dtype" :bool (vt-dtype (vt-signbit '(-1 0 1))))
 (check "signbit -0.0" '(1) (vt-signbit (list -0.0d0)))
 
 (check "nextafter 1->2" '(1.0000000000000002d0) (vt-nextafter '(1.0d0) '(2.0d0)))
@@ -342,7 +342,7 @@
 (check-false "array-equiv 不等" (vt-array-equiv '(1 2) '(1 3)))
 
 (check "isposinf" '(1 0 0) (vt-isposinf (list *pinf* 1.0d0 *ninf*)))
-(check "isposinf dtype" :int8 (vt-dtype (vt-isposinf '(1d0))))
+(check "isposinf dtype" :bool (vt-dtype (vt-isposinf '(1d0))))
 (check "isneginf" '(0 0 1) (vt-isneginf (list *pinf* 1.0d0 *ninf*)))
 (check "isposinf NaN" '(0) (vt-isposinf (list *nan*)))
 
@@ -354,7 +354,7 @@
 (check "isin" '(0 1 0 1) (vt-isin (mki '(1 2 3 4)) (mki '(2 4))))
 (check "isin invert" '(1 0 1 0) (vt-isin (mki '(1 2 3 4)) (mki '(2 4)) :invert t))
 (check "isin 2d" '((0 1) (0 1)) (vt-isin (mki '((1 2) (3 4))) (mki '(2 4))))
-(check "isin dtype" :int8 (vt-dtype (vt-isin (mki '(1 2)) (mki '(2)))))
+(check "isin dtype" :bool (vt-dtype (vt-isin (mki '(1 2)) (mki '(2)))))
 (check "isin 空" '(0 0 0) (vt-isin (mki '(1 2 3)) (vt-fromiter '() :dtype :int64)))
 
 ;;; ============================================================
@@ -528,17 +528,17 @@
              (lambda () (vt-pow (vt-asarray '((1 2 3) (4 5 6)) :dtype :int64)
                                 (vt-asarray '((1 2 3) (4 5 6) (7 8 9)) :dtype :int64))))
 
-;; [P2#2] vt-logical-* 曾默认返回 :float64，违反 §3.1「比较/逻辑返回 :int8」。
-(check-true "P2-2 logical-and dtype int8"
-            (eq :int8 (vt-dtype (vt-logical-and (vt-asarray '(1 0) :dtype :int64)
+;; [P2#2] vt-logical-* 曾默认返回 :float64，违反「比较/逻辑返回布尔」（§17）。
+(check-true "P2-2 logical-and dtype bool"
+            (eq :bool (vt-dtype (vt-logical-and (vt-asarray '(1 0) :dtype :int64)
                                                 (vt-asarray '(1 1) :dtype :int64)))))
-(check-true "P2-2 logical-or dtype int8"
-            (eq :int8 (vt-dtype (vt-logical-or (vt-asarray '(1 0) :dtype :int64)
+(check-true "P2-2 logical-or dtype bool"
+            (eq :bool (vt-dtype (vt-logical-or (vt-asarray '(1 0) :dtype :int64)
                                                (vt-asarray '(0 0) :dtype :int64)))))
-(check-true "P2-2 logical-not dtype int8"
-            (eq :int8 (vt-dtype (vt-logical-not (vt-asarray '(1 0) :dtype :int64)))))
-(check-true "P2-2 logical-xor dtype int8"
-            (eq :int8 (vt-dtype (vt-logical-xor (vt-asarray '(1 0) :dtype :int64)
+(check-true "P2-2 logical-not dtype bool"
+            (eq :bool (vt-dtype (vt-logical-not (vt-asarray '(1 0) :dtype :int64)))))
+(check-true "P2-2 logical-xor dtype bool"
+            (eq :bool (vt-dtype (vt-logical-xor (vt-asarray '(1 0) :dtype :int64)
                                                 (vt-asarray '(1 1) :dtype :int64)))))
 (check "P2-2 logical-and 值" '(1 0)
        (vt-logical-and (vt-asarray '(1 0) :dtype :int64) (vt-asarray '(1 1) :dtype :int64)))

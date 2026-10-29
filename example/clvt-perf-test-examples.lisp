@@ -387,6 +387,34 @@
   (check-throws "percentile 空数组报错（numpy ValueError 语义）"
                 (lambda () (vt-percentile (vt-zeros '(0)) 50)))
 
+  ;; ---- 布尔 dtype（:bool）：掩码类函数的返回值与消费方 ------------
+  ;; 这一组守的是「比较/逻辑/谓词返回真布尔」这条契约，以及掩码到提取的
+  ;; 参数顺序 —— 下面的 bench 曾把 (vt-extract a mask) 写成条件在后，
+  ;; 结果不是 a[mask] 而是「拿 1M 个 float 当条件、0/1 掩码当数据源」。
+  (format t "~&[bool 掩码与提取]~%")
+  (let* ((a (f64 1.0d0 2.0d0 3.0d0 4.0d0))
+         (mask (vt-> a 2.0d0)))          ; [F F T T]
+    (check-true "比较结果 dtype 为 :bool（不再是 :int8 的 0/1）"
+                (eq (vt-dtype mask) :bool))
+    (check "bool 掩码取值只有 0/1" '(0 0 1 1) (as-list mask))
+    (check "compress(mask, a) = a[mask]" '(3.0d0 4.0d0)
+           (vt-compress mask a))
+    (check "extract 与 compress 同结果（参数顺序 = numpy.extract(cond, arr)）"
+           '(3.0d0 4.0d0) (vt-extract mask a))
+    (check-true "sum(bool) 升 int64（不在 int8 里溢出）"
+                (eq (vt-dtype (vt-sum mask)) :int64))
+    (check-true "any/all 返回 0 维 :bool"
+                (and (eq (vt-dtype (vt-any mask)) :bool)
+                     (eq (vt-dtype (vt-all mask)) :bool)
+                     (null (vt-shape (vt-any mask)))))
+    (check-true "where 接受 :bool 掩码"
+                (equal (as-list (vt-where mask a (vt-- a)))
+                       '(-1.0d0 -2.0d0 3.0d0 4.0d0)))
+    (check-true "bool + bool 走逻辑或（numpy 语义），不是整数 2"
+                (equal (as-list (vt-+ mask mask)) '(0 0 1 1)))
+    (check-throws "bool - bool 报错（numpy 的 bool_ 不支持减法）"
+                  (lambda () (vt-- mask mask))))
+
   (format t "~&~%=== 断言结果：通过 ~a，失败 ~a ===~%" *pass* *fail*)
   (zerop *fail*))
 
@@ -458,7 +486,10 @@
     (bench "roll" 5 (vt-roll a 10))
     (bench "repeat" 3 (vt-repeat small 10))
     (bench "compress" 3 (vt-compress mask a))
-    (bench "extract" 3 (vt-extract a mask))
+    ;; 注意参数顺序对标 numpy.extract(condition, arr)：条件在前、被取值的张量在后。
+    ;; 原写作 (vt-extract a mask) 是把 1M 个 float 当条件、拿 0/1 掩码当数据源，
+    ;; 结果不是 a[mask] 而是「掩码中真值位置的元素」，且走 float 条件的慢路径。
+    (bench "extract" 3 (vt-extract mask a))
     (bench "nonzero" 2 (vt-nonzero mask))
     (bench "pad :constant" 3 (vt-pad small '(10 10)))
     (bench "to-array" 3 (vt-to-array a))            ; 344333 → 7111

@@ -2468,3 +2468,186 @@ NaN 是 float，两种精度都被覆盖；比 `(values t)` 保留的信息多�
 环境侧：2.6.9 用 `./install.sh --prefix=/usr/local` 覆盖安装，2.6.8 保留为
 `/usr/local/bin/sbcl-2.6.8` + `/usr/local/lib/sbcl-2.6.8`（需
 `SBCL_HOME=/usr/local/lib/sbcl-2.6.8` 调用），回退只需换路径。
+
+---
+
+## H.3.26 第三十三轮：布尔不是一种整数 —— 把 `:int8` 的 0/1 换成真的 `:bool`
+
+> 对外结论见 `CHANGELOG.md`（三十三），契约见 `CONVENTIONS.md` §17。
+
+#### 一、问题不是「少一个 dtype」，而是「两件事被同一个表示占了」
+
+库里有九类函数按 NumPy 的语义**必须返回 `bool_`**：比较（6 个）、逻辑（4 个）、
+谓词（6 个）、`any`/`all`、`isnan`/`isinf`/`isfinite`/`isposinf`/`isneginf`/
+`signbit`、`isclose`、`isin`/`in1d`。但它们此前统一返回 `:int8` 的 0/1，
+靠文档里一句「语义上等价于布尔」维持。
+
+这句话挡不住两种事：
+
+1. **算术泄漏**。`:int8` 结果天然能继续参与算术：`(vt-+ mask mask)` 得 2，
+   `(vt-sum mask)` 得 `:int8` 且 128 个真就溢出；而 NumPy 的 `bool_` 在算术里
+   按逻辑运算走（`True+True=True`）、`sum` 升 `int64`。文档写得再清楚，
+   也拦不住调用方把掩码当整数用 —— 因为**类型系统没说不能**。
+2. **类型不可区分**。「布尔掩码」与「真 int8 数据」dtype 完全相同，
+   吃掩码的 `vt-where` / `vt-compress` / `vt-select` 无法表达、也无法校验
+   入参语义；打印出来两者也长得一模一样。
+
+#### 二、决策：新增第九种逻辑 dtype，物理 1 字节
+
+`*vt-dtypes*` 加 `:bool`，物理存储 `(unsigned-byte 8)`，`vt-dtype-itemsize` 给 1
+（与 `np.dtype(bool).itemsize == 1` 一致）。它**不进** `*vt-storage-dtypes*`：
+存储层没有新类型，只是与 `:uint8` 共用 `(unsigned-byte 8)`，靠 dtype 槽区分。
+
+`%dtype-kind-rank` 给 `bool = -1`（int=0 < float=1 < complex=2）。这一位的用途
+不是排序好看，而是单元素预转的放行条件：任何数值 dtype 都能无损承载 0/1，
+所以 `bool → 任意数值` 永远放行；反过来 `float → bool` 是**真值化**而不是截断，
+不能当普通预转处理。
+
+#### 三、一个必须在表之前拦下的转换：真值化 ≠ 截断
+
+`vt-astype` 原本只有一张按整数语义截断的 10×10 特化表。把 `:bool` 目标丢进去，
+`0.5` 会被 `truncate` 成 0 —— 而 `np.array(0.5).astype(bool)` 是 **True**；
+`nan` 会被截成 0 —— 而 `np.array(nan).astype(bool)` 也是 **True**。两处都错在
+「小于 1 的值」和 NaN，且**错得无声**。
+
+于是 `vt-astype` 在进表之前先分流：`:bool` 目标走 `%to-bool` → 逐元素
+`%bool-flag`。规则一共四条：Lisp 布尔按 T/NIL；整数/浮点按 `zerop`
+（`-0.0` → False，与 `np.bool_(-0.0)` 一致，`zerop` 天然正确）；NaN/±Inf →
+True（`nan ≠ 0`）；复数**任一分量非零**即为真。
+
+同一套规则也用在 `vt-arange` / `vt-linspace` 的 `:bool` 分支与 npy `|b1` 解码上
+（后者对任何非 0 字节一律真值化，不信任别人的文件守 0/1）。
+
+#### 四、新 dtype 自己带来的坑：`True + True = 2`
+
+`:bool` 落地后，`vt-+` 这类通用算术算子第一次可能**收到**布尔张量。当时的
+`vt-+` 是 dtype 无关的 —— `%op-final-dtype` 判 `bool ⊔ bool → :bool`（对，NumPy
+如此），然后内核用 `#'+` 相加，于是 `(1+1)=2` 被**原样写进 `:bool` 数组**。
+
+这条最危险的地方在于它是静默的：写回路径是 `(safety 0)` 的特化 aref，
+`(unsigned-byte 8)` 装 2 不报错；但「布尔数组只含 0/1」这条不变量一破，
+下游 `vt-where` 的掩码判定、npy 落盘的字节、打印的 True/False 就全都建立在
+一个假前提上。实测确认：
+
+```lisp
+(vt-to-list (vt-+ b c))   ; → (2 2 0)，dtype BOOL —— 修前
+```
+
+修法是按 NumPy 的 `bool_` 语义**分派**，而不是靠 clamp：
+
+| 算式 | NumPy 2.3.5 | 落点 |
+|---|---|---|
+| `b + b` | `bool`（`True+True=True`） | `%bool-fold` + `%bool-or-op` |
+| `b * b` | `bool`（逻辑与） | `%bool-fold` + `%bool-and-op` |
+| `b - b` / `-b` | **TypeError** | 报错并提示 `vt-logical-xor` / `-not` |
+| `b / b` | `float64`（`[1., nan]`） | `vt-/` 把 `:bool` 并入 true_divide 提升族 |
+| `b // b`、`b % b` | `int8` | `vt-div` / `vt-mod` 显式落 `:int8` |
+
+两个实现细节踩过坑：
+
+* `%bool-fold` 必须是**宏**。`vt-fast-map` 只在 `(function <symbol>)` 字面量形式
+  下走编译期内联，传函数值会退化成 `apply #'vt-map` —— 而那条回退路径把
+  函数值当成了「张量」，直接报 `参数解析错误`。
+* `vt-add` / `vt-sub` / `vt-mul` 是绕过 `vt-+` / `vt--` / `vt-*` 的二元专用入口，
+  守卫要单独加一遍；只修通用路径会留下后门。
+
+#### 五、执行层：掩码类型从 sb8 改 ub8，别掉进慢路径
+
+`+vt-mask-out-types+` 原来写的是 `(signed-byte 8)`（`:int8` 掩码），改为
+`(unsigned-byte 8)`。但 `%select-fast` 的 `macrolet` 只展开了有符号掩码，
+`vt-where` 拿 `:bool` 掩码会**退回 `vt-map`**（实测慢约 8×）——
+所以那里同时生成两种掩码类型的循环。
+
+归约侧另有一坑：`def-vt-reduce` 里 `all`/`any` 的小整型分支如果写成
+`(,kernel-macro ,op ,lt res-lt)`，`res-lt` 是**生成代码里的运行时变量名**，
+宏展开期就变成 `undefined type CLVT::RES-LT`（512 处 style-warning）；
+改成按 `+small-int-lts+` 逐项**字面量**展开才对。
+
+#### 六、测试策略：期望值必须与 clvt 的规范 NaN 逐位一致
+
+`test/gen_bool_expected.py` 生成 52 例 NumPy 期望（2.3.5 实测），输入刻意取
+`[-1, 0, 0.5, 1, nan, inf, -inf, -0.0, 3]` 这一组「每个分支都踩到」的值。
+
+第一版有 3 例不符（`stringbit-1d` / `logical-or` / `logical-xor`）。根因不是
+布尔语义，而是 **NaN 的符号位**：clvt 的规范 NaN 来自 x86 `0/0`，位模式是
+**负** QNaN `0xFFF8000000000000`；Python 的 `float("nan")` 是正 QNaN
+`0x7FF8000000000000`。两者 `isnan` 一致，但 `signbit` 与真值化会分叉。
+
+处理方式是**改期望、不改实现**：生成器显式构造同一个负 NaN
+（`np.array([0xFFF8000000000000], np.uint64).view(np.float64)`）。这条差异本身
+写进了 §17.3 的「已知偏差」表，因为它是表示层的差异，不是语义缺陷。
+
+差分探针（`differential-probes-test{,2}.lisp`）里 19 + 23 条期望 dtype 由
+`:int8` 就地改成 `:bool`。**没有整体重生成** —— 重生成会混入 numpy 版本差异的
+格式化漂移，把一次语义修复变成一次「文本全变」的不可审查提交。
+
+#### 七、把旧契约的测试也改掉（这一项最容易漏）
+
+改 dtype 之后 `test-all` / `core-test` / `uncovered-coverage-test` /
+`extensions3-test` / `complex-dispatch-test` / `complex-test` /
+`complex-ops-test` 七个套件全红 —— 它们断言的是**旧契约**（`(eq :int8 (vt-dtype
+(vt-= ...)))`）。这不是回归，是契约变了而断言没跟着改。
+
+处理原则：每处 `:int8` → `:bool`，并在同一位置**补一条 `:dtype :int8` 仍可用的
+断言**——否则「向后兼容」只写在文档里，没有任何机器守着。复数两套期望文件
+（`complex-expected.sexp` / `complex-ops-expected.sexp`）连同生成器
+（`gen_*.py`）一起改，避免下次重生成又漂回 `:int8`。
+
+#### 八、验收
+
+| 项 | 结果 |
+|---|---|
+| `bool-dtype-test` | 239 断言全过（A 52 例 numpy 对照 / B dtype 契约 / C 0-1 不变量 / D 互操作 / E 打印 / F npy `\|b1` / G 布尔算术） |
+| 差分探针 | `PASS=496/496`、`PASS=405/405` |
+| 全量套件 | 64 套件全绿 |
+| `check_docs.py` | 203 个锚点全解析 |
+| `check_key_sync.py` | `codegen 同步 ✓`，仅剩 numpy 1e-12 级格式化 WARN（pristine HEAD 同样如此） |
+
+一条离线教训：**给一个「语义上等价」的约定配上真类型，才会暴露那些此前
+只是「文档没写清」的洞**。`:int8` 冒充布尔的这些年里没人踩到 `True+True=2`，
+不是因为不存在，而是因为没人会去加两个掩码；换成 `:bool` 之后，第一次
+`(vt-+ b c)` 就把它照出来了。
+
+#### 九、把 `example/` 跑一遍：翻出的是示例自己的三个洞
+
+收尾时跑了 `example/` 下两个文件（`example.lisp` 6898 行 / 106 个 `test-*`
+函数、`clvt-perf-test-examples.lisp` 96 条断言 + 约 60 项基准）。这两个文件
+此前**从没进过任何自动化**，跑得通跑不通没人知道。
+
+第一次运行：两个都「通过」。但这个「通过」是假的：
+
+1. **9 处 `(assert (vt-all X))` 恒真**。`assert` 只判条件是否为 NIL，而
+   `vt-all` 返回的是 VT 对象 —— 任何 VT 对象都不为 NIL。也就是说从
+   `:int8` 时代起，这 9 条断言**一秒钟都没检查过任何东西**。换成 `:bool`
+   之后更隐蔽：返回值仍然不是 NIL，断言文本却写着「全为真」。
+   修法是加一个 `vt-all-true-p`（`(= 1 (vt-item (vt-all x)))`），把 0 维
+   布尔张量真正解包成 Lisp 布尔。
+2. **解开之后立刻有一条失败**：`(vt-all (vt-isinf mx))` 里 `mx` 是
+   `(vt-nanmax 全-NaN)`。作者当年拿不准，注释写的是
+   「+inf? 看实现，应该是 most-positive-double-float」。实测两边都不是：
+   NumPy 返回 **NaN**（`All-NaN slice encountered`），clvt 也返回 NaN。
+   是**示例的期望写错**，实现从一开始就是对的 —— 但恒真断言把它藏了这些年。
+3. **基准里 `extract` 测的是错的东西**。`(bench "extract" 3 (vt-extract a mask))`
+   把参数写反了：`numpy.extract(condition, arr)` 是条件在前，这里却是
+   1M 个 float 当条件、0/1 掩码当数据源。结果既不是 `a[mask]`（长度 999999
+   而不是 500000），耗时 216783 µs —— 而语义等价的 `compress` 只要 8479 µs。
+   改成 `(vt-extract mask a)` 后落到 21185 µs。**一个参数顺序错误伪装成了
+   「`vt-extract` 实现差 25 倍」**，如果直接去动内核，就是拿错误的尺子量。
+
+修完给两个示例补了门禁：`test/example-smoke-test.lisp` 登记进
+`run-tests.sh` 的 `DEFAULT_ORDER`，把两个示例当回归跑一遍，**只跑断言、
+不跑基准** —— 基准的绝对值随机器与 GC 漂移，做门禁只会变成间歇性红灯。
+`clvt-perf-test-examples.lisp` 的断言区另补了 9 条 `:bool` 契约
+（dtype / 0-1 取值 / compress≡extract / sum 升 int64 / any-all 形状 /
+where 吃 `:bool` 掩码 / `bool+bool` 是逻辑或 / `bool-bool` 必须报错），
+总数从 87 提到 96。
+
+顺带修掉一个由 `:bool` 打印引入的小瑕疵：`%format-number` 的布尔分支返回
+字面量 `"True"`/`"False"`，是**同一个常量对象**，SBCL 在 `*print-circle*`
+为真时会把它当共享结构，打印成 `#1=True, #2=False, #1#, #2#`。浮点分支走
+`format` 天然是新字符串，所以只有布尔撞上。加 `copy-seq` 即解。
+
+这一节的教训和第八节那条正好互为正反面：**把「看起来在测」的东西变成
+真的在测，比多写十条测试更有价值**。恒真断言不是「弱断言」，它是把
+「没测」伪装成「测过」—— 而且在语义变更（`:int8` → `:bool`）时，它的
+文字不需要改一个字就继续「通过」。

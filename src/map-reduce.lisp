@@ -18,10 +18,11 @@
     "全部 8 种 dtype 对应的 CL 数组元素类型（顺序：宽 → 窄，命中概率降序）。")
 
   (defparameter +vt-mask-out-types+
-    '((signed-byte 8))
-    "窄整型输出类型矩阵。按 CONVENTIONS §3.1「比较/逻辑运算返回 :int8，
-     取值 0/1」，布尔掩码的规范输出只有 :int8 一种；int16/uint8/uint16
-     输出仅在用户显式指定 :dtype 时出现，属罕见路径，仍由 vt-map 兜底。
+    '((unsigned-byte 8))
+    "窄整型输出类型矩阵。布尔（`:bool`）与 `:uint8` 的物理元素类型都是
+     `(unsigned-byte 8)`，而比较/逻辑/谓词运算的**默认**结果 dtype 是
+     `:bool`（CONVENTIONS §17），因此这里只需要 ub8 一格：
+     显式 `:dtype :int8` 的罕见用法仍由 vt-map 兜底（语义相同，仅性能差异）。
      矩阵保持单元素是有意的：每多一格就多一份完整内联循环，而
      vt-fast-map 在库内有 200+ 展开点，盲扩会让编译期代码量指数级放大
      （实测 8x8 全展开会直接 Heap exhausted）。")
@@ -785,11 +786,12 @@
 ;;; 收益直接传导。
 ;;; ==================================================================
 
-(defmacro %select-loop (lt a b c res)
-  "RES[i] = A[i] ≠ 0 ? B[i] : C[i]。A 为 (signed-byte 8) 掩码，
-   B/C/RES 同类型 LT（实数或复数）。支持长度 1 的广播输入（stride 取 0）。"
+(defmacro %select-loop (lt ml a b c res)
+  "RES[i] = A[i] ≠ 0 ? B[i] : C[i]。A 为 ML 掩码（(signed-byte 8) 或
+   (unsigned-byte 8)，后者即 :bool / :uint8），B/C/RES 同类型 LT
+   （实数或复数）。支持长度 1 的广播输入（stride 取 0）。"
   `(let ((od (the (simple-array ,lt (*)) (vt-data ,res)))
-         (m  (the (simple-array (signed-byte 8) (*)) (vt-data ,a)))
+         (m  (the (simple-array ,ml (*)) (vt-data ,a)))
          (d1 (the (simple-array ,lt (*)) (vt-data ,b)))
          (d2 (the (simple-array ,lt (*)) (vt-data ,c)))
          (p0 (vt-offset ,a)) (p1 (vt-offset ,b)) (p2 (vt-offset ,c))
@@ -799,7 +801,7 @@
          (op (vt-offset ,res))
          (n (the fixnum (vt-size ,res))))
      (declare (type (simple-array ,lt (*)) od d1 d2)
-              (type (simple-array (signed-byte 8) (*)) m)
+              (type (simple-array ,ml (*)) m)
               (type fixnum p0 p1 p2 s0 s1 s2 op n))
      (dotimes (i n)
        (declare (type fixnum i))
@@ -810,24 +812,31 @@
 (defun %select-fast (mask x y res)
   "掩码三元选择的内联内核（按 RES 的元素类型分派）。
    前置条件由调用方保证：三输入已可广播到 RES 的形状、且 x/y/RES 同 dtype。
-   返回 T 表示已写入 RES；NIL 表示不支持（调用方退回 vt-map）。"
-  (when (and (equal (array-element-type (vt-data mask)) '(signed-byte 8))
-             (equal (array-element-type (vt-data x))
-                    (array-element-type (vt-data res)))
-             (equal (array-element-type (vt-data y))
-                    (array-element-type (vt-data res))))
-    (let ((lt (array-element-type (vt-data res))))
-      (cond ((equal lt 'double-float)            (%select-loop double-float mask x y res) t)
-            ((equal lt 'single-float)            (%select-loop single-float mask x y res) t)
-            ((equal lt '(signed-byte 64))        (%select-loop (signed-byte 64) mask x y res) t)
-            ((equal lt '(signed-byte 32))        (%select-loop (signed-byte 32) mask x y res) t)
-            ((equal lt '(signed-byte 16))        (%select-loop (signed-byte 16) mask x y res) t)
-            ((equal lt '(signed-byte 8))         (%select-loop (signed-byte 8) mask x y res) t)
-            ((equal lt '(unsigned-byte 16))      (%select-loop (unsigned-byte 16) mask x y res) t)
-            ((equal lt '(unsigned-byte 8))       (%select-loop (unsigned-byte 8) mask x y res) t)
-            ((equal lt '(complex double-float))  (%select-loop (complex double-float) mask x y res) t)
-            ((equal lt '(complex single-float))  (%select-loop (complex single-float) mask x y res) t)
-            (t nil)))))
+   返回 T 表示已写入 RES；NIL 表示不支持（调用方退回 vt-map）。
+
+   掩码接受两种物理类型：`(signed-byte 8)`（历史 :int8 掩码）与
+   `(unsigned-byte 8)`（`:bool` / `:uint8`）。`vt-isnan` 之类返回 :bool 后，
+   若这里只认 sb8，`vt-where` 会静默掉进 vt-map 的闭包路径（正确但慢 ~8x）。"
+  (let ((mlt (array-element-type (vt-data mask))))
+    (when (and (member mlt '((signed-byte 8) (unsigned-byte 8)) :test #'equal)
+               (equal (array-element-type (vt-data x))
+                      (array-element-type (vt-data res)))
+               (equal (array-element-type (vt-data y))
+                      (array-element-type (vt-data res))))
+      (let ((lt (array-element-type (vt-data res))))
+        (macrolet ((gen (mlt)
+                     `(cond
+                        ,@(loop for l in '(double-float single-float
+                                           (signed-byte 64) (signed-byte 32)
+                                           (signed-byte 16) (signed-byte 8)
+                                           (unsigned-byte 16) (unsigned-byte 8)
+                                           (complex double-float) (complex single-float))
+                                collect `((equal lt ',l)
+                                          (%select-loop ,l ,mlt mask x y res) t))
+                        (t nil))))
+          (if (equal mlt '(signed-byte 8))
+              (gen (signed-byte 8))
+              (gen (unsigned-byte 8))))))))
 
 ;;; ==================================================================
 ;;; 混合类型快路径：窄整型输出（布尔掩码）
@@ -1054,7 +1063,7 @@
 								      (equal (vt-shape ,tv) out-shape))))))
 				   (maskable
                                      `(member (vt-dtype res)
-					      '(:int8 :int16 :uint8 :uint16))))
+					      '(:bool :int8 :int16 :uint8 :uint16))))
                               (cond
 				((= n 1)
 				 `(cond

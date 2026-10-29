@@ -4,6 +4,52 @@
 
 (in-package :clvt)
 
+;;; ------------------------------------------------------------------
+;;; 布尔算术改派（CONVENTIONS §17.3）
+;;;
+;;; numpy 的 `bool_` 参与算术时**不按整数算**：
+;;;   True + True  → True   （逻辑或，不是 2）
+;;;   True * True  → True   （逻辑与）
+;;;   True - True  → TypeError（布尔减法未定义）
+;;; 若按整数算，`(vt-+ mask mask)` 会把 2 写进 `:bool` 数组，而
+;;; `(safety 0)` 的写回路径不会拦下越界值 —— 「布尔数组只含 0/1」
+;;; 的不变量就此破掉（后续 `vt-where` 拿到的掩码、npy 落盘的字节都会失真）。
+;;;
+;;; 这两个内核与 elementwise2 的 `%op-logical-or` / `%op-logical-and` 语义
+;;; 相同，但必须定义在本文件：elementwise2 在本文件**之后**编译，
+;;; 这里调不到它（会触发 undefined-function 编译告警）。
+;;; ------------------------------------------------------------------
+(declaim (inline %bool-or-op %bool-and-op))
+(defun %bool-or-op (a b) (if (or (/= a 0) (/= b 0)) 1 0))
+(defun %bool-and-op (a b) (if (and (/= a 0) (/= b 0)) 1 0))
+
+(defmacro %bool-fold (fn tensors out)
+  "把一串 `:bool` 张量按 FN（逻辑与/或内核）折叠成一个布尔张量。
+   一元时返回自身的副本（`or(b,b) = b`）；OUT 只作用在最后一步，
+   避免中间结果多分配一次。
+
+   FN 必须是**字面量函数名**而不是函数值：`vt-fast-map` 只在
+   `(function <symbol>)` 形式下才走编译期内联，传函数值会退化成
+   `apply #'vt-map`（200+ 展开点的性能约定，见 map-reduce.lisp 的说明）。"
+  (let ((acc (gensym "ACC"))
+        (cells (gensym "CELLS")))
+    `(let ((,acc (first ,tensors))
+           (,cells (rest ,tensors)))
+       (if (null ,cells)
+           (vt-fast-map (function ,fn) ,acc ,acc :dtype :bool :out ,out)
+           (progn
+             (loop while ,cells
+                   do (setf ,acc (vt-fast-map (function ,fn) ,acc (pop ,cells)
+                                              :dtype :bool
+                                              :out (when (null ,cells) ,out))))
+             ,acc)))))
+
+(defun %bool-arith-p (dtype raws)
+  "是否该把 RAW 这批操作数按布尔语义处理：结果 dtype 落在 `:bool`
+   （未指定时，全布尔输入按提升规则必然得 `:bool`）且操作数全为布尔张量。"
+  (and (or (null dtype) (eq dtype :bool))
+       (%all-bool-tensors-p raws)))
+
 (defun vt-+ (&rest args)
   "逐元素加法（一元恒等 / 二元 / N 元，支持广播）。
 
@@ -11,9 +57,15 @@
      :dtype  结果 dtype；缺省按 numpy 类型提升规则由全部输入决定。
      :out    输出张量。**严格相等契约**：dtype 必须精确等于结果 dtype、
              形状必须精确等于广播结果形状、必须可写。
-   输入个数 ≤ 3 走编译期内联快路径，> 3 回退 vt-map（语义基准）。"
+   输入个数 ≤ 3 走编译期内联快路径，> 3 回退 vt-map（语义基准）。
+
+   布尔输入（CONVENTIONS §17.3）：全 `:bool` 操作数按 numpy 的 `bool_`
+   语义算**逻辑或**（`True + True = True`），不按整数相加 —— 后者会
+   把 2 写进布尔数组。显式 `:dtype :int8` 等数值目标仍走整数路径。"
   (with-float-safe
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
+      (when (%bool-arith-p dtype tensors)
+        (return-from vt-+ (%bool-fold %bool-or-op tensors out)))
       (case (length tensors)
         (1 (vt-fast-map #'+ (first tensors)
                             :dtype dtype :out out))
@@ -30,9 +82,15 @@
   "逐元素乘法（一元恒等 / 二元 / N 元，支持广播）。
 
    参数契约同 vt-+：:dtype 决定结果 dtype（缺省按提升规则），
-   :out 必须精确匹配结果形状与 dtype 且可写。"
+   :out 必须精确匹配结果形状与 dtype 且可写。
+
+   布尔输入（CONVENTIONS §17.3）：全 `:bool` 操作数按 numpy 的 `bool_`
+   语义算**逻辑与**（`True * True = True`），与整数相乘逐位巧合相同，
+   但显式走逻辑内核才能保证结果只取 0/1。"
   (with-float-safe
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
+      (when (%bool-arith-p dtype tensors)
+        (return-from vt-* (%bool-fold %bool-and-op tensors out)))
       (case (length tensors)
         (1 (vt-fast-map #'* (first tensors)
                             :dtype dtype :out out))
@@ -50,9 +108,17 @@
    一元：-vt；二元及以上：vt - arg1 - arg2 - ...
    VT 是第一个张量，其余从 ARGS 解析。
    参数契约同 vt-+：:dtype 决定结果 dtype（缺省按提升规则），
-   :out 必须精确匹配结果形状与 dtype 且可写。"
+   :out 必须精确匹配结果形状与 dtype 且可写。
+
+   布尔输入（CONVENTIONS §17.3）：**报错**，与 numpy 一致
+   （`np.array([True]) - np.array([True])` 抛 TypeError：布尔减法未定义，
+   否定请用 `vt-logical-not`，异或请用 `vt-logical-xor`）。
+   按整数相减会得到 0/-1，写进 `:bool` 数组即在 0/1 之外又造出 255。
+   显式 `:dtype :int8` 等数值目标仍走整数路径（向后兼容）。"
   (with-float-safe
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
+      (when (%bool-arith-p dtype (cons vt tensors))
+        (error "vt--: 布尔张量不支持减法/取负（numpy 同样拒绝：布尔减法未定义）。~%  否定请用 vt-logical-not，异或请用 vt-logical-xor；~%  若确实想要整数减法，请显式给出 :dtype :int8 等数值类型。见 CONVENTIONS §17.3"))
       (let ((all (cons (ensure-vt vt) tensors)))
         (case (length all)
           (1 (vt-fast-map #'- (first all)
@@ -90,15 +156,19 @@
              (int-family-p
                (lambda (x)
                  (or (vt-int-dtype-p (vt-dtype x))
-                     (member (vt-dtype x) '(:uint8 :uint16)))))
+                     (member (vt-dtype x) '(:uint8 :uint16 :bool)))))
              ;; 弱标量（NEP 50）：Lisp 标量只贡献「种类」，不参与宽度判定。
              ;; 于是 (vt-/ f32-数组 2) 保持 float32（numpy 同），而
              ;; (vt-/ int-数组 2) 仍是 float64（数组本身是整型）。
              (tensor-dts (loop for raw in (cons vt tensors) for x in all
                                unless (%scalar-kind raw) collect (vt-dtype x)))
              ;; dtype 版谓词（上面那个 INT-FAMILY-P 吃的是张量对象）
+             ;; :bool 也归入此族：numpy 的 true_divide 对布尔输入恒给 float64
+             ;; （`np.array([True,False])/np.array([True,False])` → [1., nan]），
+             ;; 若留整数语义则 `0/0` 直接撞 CL 的 division-by-zero。§17.3
              (dt-int-p (lambda (dt)
-                         (or (vt-int-dtype-p dt) (member dt '(:uint8 :uint16)))))
+                         (or (vt-int-dtype-p dt)
+                             (member dt '(:uint8 :uint16 :bool)))))
              (float-target
                (cond (dtype
                       ;; 显式整型目标：保持截断语义，零除确定性报错
@@ -155,17 +225,28 @@
 
 (defun vt-add (a b &key dtype out)
   "逐元素加法（二元特化入口），等价于 (vt-+ a b)。
-      :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。"
+      :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。
+      布尔操作数按逻辑或处理（CONVENTIONS §17.3，同 vt-+）。"
+  (when (%bool-arith-p dtype (list a b))
+    (return-from vt-add
+      (vt-fast-map #'%bool-or-op a b :dtype :bool :out out)))
   (vt-fast-map #'+ a b :dtype dtype :out out))
 
 (defun vt-sub (a b &key dtype out)
   "逐元素减法（二元特化入口），等价于 (vt-- a b)。
-      :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。"
+      :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。
+      布尔操作数报错（CONVENTIONS §17.3，同 vt--）。"
+  (when (%bool-arith-p dtype (list a b))
+    (error "vt-sub: 布尔张量不支持减法（numpy 同样拒绝）。否定请用 vt-logical-not，异或请用 vt-logical-xor；若确实想要整数减法，请显式给出 :dtype :int8 等数值类型。见 CONVENTIONS §17.3"))
   (vt-fast-map #'- a b :dtype dtype :out out))
 
 (defun vt-mul (a b &key dtype out)
   "逐元素乘法（二元特化入口），等价于 (vt-* a b)。
-      :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。"
+      :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。
+      布尔操作数按逻辑与处理（CONVENTIONS §17.3，同 vt-*）。"
+  (when (%bool-arith-p dtype (list a b))
+    (return-from vt-mul
+      (vt-fast-map #'%bool-and-op a b :dtype :bool :out out)))
   (vt-fast-map #'* a b :dtype dtype :out out))
 
 (defun %floor-div-op (x y)
@@ -193,10 +274,16 @@
       整数输入 floor 除，除数为 0 时返回 0（对标 numpy：静默返回 0）；
       浮点输入同样做 floor（v0.4.x 修复：原实现误用真除，未 floor），
       除数 ±0.0 按 IEEE 得 ±Inf/NaN。
-      需要 numpy true_divide 语义（恒浮点、不 floor）请用 vt-/。"
-    (when (%cx-reject a b)
+      需要 numpy true_divide 语义（恒浮点、不 floor）请用 vt-/。
+
+      布尔输入（CONVENTIONS §17.3）：结果 dtype 取 **:int8** 而不是 :bool ——
+      商不再是布尔量（numpy：`np.array([True,False]) // np.array([True,False])`
+      → int8 [1, 0]），留在 :bool 会让 1//1 这类结果冒充布尔真值。"
+  (when (%cx-reject a b)
     (error "vt-div: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-map #'%floor-div-op
+  (when (and (null dtype) (%all-bool-tensors-p (list a b)))
+    (setf dtype :int8))
+  (vt-map #'%floor-div-op
           (ensure-vt a) (ensure-vt b)
           :dtype dtype :out out))
 

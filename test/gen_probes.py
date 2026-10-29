@@ -16,8 +16,24 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TMP  = os.environ.get('FUZZ_TMP') or os.path.join(os.path.dirname(_SCRIPT_DIR), 'tmp')
 PROBE_OUT = os.path.join(_SCRIPT_DIR, 'differential-probes-test.lisp')
 
+# numeric dtype 名 → clvt dtype 关键字。**只放数值 dtype**：这个 dict 同时
+# 被 `for d1 in CLD: for d2 in CLD:` 当成「参与类型提升组合的 dtype 集合」，
+# 往里塞 'bool' 会给提升矩阵凭空加 17 行、并让后面所有 cid 整体位移
+# （实测：门禁报「少了 27 条 / 多了 61 条」且数值全错位）。
+# 布尔只是「结果标签」，走下面的 DTYPE_LABEL。
 CLD = {'float64':':float64','float32':':float32','int8':':int8','int16':':int16',
        'int32':':int32','int64':':int64','uint8':':uint8','uint16':':uint16'}
+
+
+def dtype_label(dt):
+    """numpy dtype → 期望表里的 clvt dtype 关键字。
+
+    `bool` 必须映射成 `:bool`（CONVENTIONS §17）：比较/逻辑/谓词/any-all
+    在 numpy 侧返回 `bool_`，clvt 自 §17 起也返回 `:bool`。此前为了迁就
+    「本库没有布尔 dtype」在生成器里把 bool 结果硬转成 int8，于是期望表
+    记的是错的 dtype（值对、标签错），布尔收紧后这批探针会集体误报。"""
+    name = str(np.dtype(dt))
+    return ':bool' if name == 'bool' else CLD[name]
 
 CASES = []  # (cid, desc, lisp_form, np_thunk, policy, expect)  expect: None|'err'
 def add(desc, lisp, npfn, policy='exact', expect=None):
@@ -806,11 +822,10 @@ def cmd_gen():
                     if r else np.array([], dtype=np.float64)
             else:
                 r = np.asarray(r)
-            if r.dtype == np.bool_: r = r.astype(np.int8)
             if r.ndim == 0:
-                exps[cid] = ('VT', CLD[str(r.dtype)], '()', [tok1(r[()])])
+                exps[cid] = ('VT', dtype_label(r.dtype), '()', [tok1(r[()])])
             else:
-                exps[cid] = ('VT', CLD[str(r.dtype)],
+                exps[cid] = ('VT', dtype_label(r.dtype),
                              '(' + ' '.join(map(str, r.shape)) + ')',
                              [tok1(x) for x in r.reshape(-1)])
         except Exception:

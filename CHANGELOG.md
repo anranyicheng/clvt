@@ -4,6 +4,64 @@
 
 ---
 
+## 2026-10-29（三十三）— feat(dtype): 引入 `:bool` 布尔 dtype，比较/逻辑/谓词类函数返回真布尔
+
+**行为变化（唯一一处）**：`vt-=` / `vt-/=` / `vt-<` / `vt-<=` / `vt->` / `vt->=`
+以及逻辑、谓词、`any`/`all`、`isnan` 族、`isclose`、`isin`/`in1d` 的**缺省结果
+dtype 由 `:int8` 变为 `:bool`**，值仍是 0/1。这是新增 dtype 带来的升级点：
+
+| 旧写法 | 现在 |
+|---|---|
+| `(vt-= a b)` | 返回 `:bool` 张量（打印为 `True`/`False`） |
+| `(vt-= a b :dtype :int8)` | 与升级前逐位相同（逃生门，全部布尔类函数都支持） |
+| `(vt-+ (vt-= a b) (vt-= c d))` | 现在是**逻辑或**（NumPy 语义），不再是 2 |
+| `(vt-- (vt-= a b) (vt-= c d))` | 现在**报错**（NumPy 的 `bool_` 不支持减法） |
+
+**背景**：库里有九类函数按 NumPy 语义必须返回 `bool_`，此前统一用 `:int8` 的 0/1
+承载，靠文档一句「语义上等价于布尔」维持。两个漏洞文档堵不住：① **算术泄漏** ——
+掩码能继续当整数算（`True+True=2`、`sum` 得 `int8` 且会溢出），而 NumPy 的
+`bool_` 在算术里走逻辑运算、`sum` 升 `int64`；② **类型不可区分** —— 布尔掩码与
+真的 `int8` 数据 dtype 相同，`vt-where` / `vt-compress` 无法校验入参语义。
+
+**做了什么**：
+
+- `:bool` 成为第九种非复数逻辑 dtype，物理存储 `(unsigned-byte 8)`、1 字节，
+  合法值只有 0/1（与 `np.dtype(bool).itemsize == 1` 一致）；
+- 「数值 → 布尔」走**真值化**而不是整数截断：`0.5 → True`、`nan → True`、
+  `-0.0 → False`、复数任一分量非零即真；`vt-astype` 在进截断表之前分流；
+- 类型提升对齐 NumPy：`bool ⊔ bool → bool`、`bool ⊔ int8 → int8`、
+  `bool ⊔ float32 → float32`；弱标量 `bool + 1 → int64`、`+ 1.0 → float64`；
+  `sum/prod/cumsum → int64`、`mean/std → float64`、`max/min → bool`；
+- 布尔参与算术时按 NumPy 分派：`+` 逻辑或、`*` 逻辑与、`-` 报错、
+  `/` 升 `float64`、`//` 与 `%` 落 `int8`（详见 `CONVENTIONS.md` §17.3）；
+- 打印 `True`/`False` 且表头 `dtype:BOOL`；npy 用 `|b1` 描述符，与
+  `np.load` / `np.save` 直接互通；
+- 契约写进 `CONVENTIONS.md` §17（真值语义 / 类型提升 / 算术语义 / 函数清单 /
+  掩码消费方 / 向后兼容），§3.1 的 dtype 表同步；`HISTORY.md` H.3.26 记过程。
+
+**example/ 的连带修复**：把 `example/` 下两个脚本跑进自动化后，翻出三处
+**示例自身**的缺陷（实现对、示例错，但此前一直静默）：
+
+- `example.lisp` 里 9 处 `(assert (vt-all X))` 恒真 —— `assert` 只判 NIL，
+  而 `vt-all` 返回 VT 对象，任何 VT 对象都不为 NIL。这 9 条断言从 `:int8`
+  时代起就没检查过任何东西。改用 `vt-all-true-p` 解包成 Lisp 布尔；
+- 解开后立刻暴露一条错期望：全 NaN 时 `nanmax`/`nanmin` 的期望被写成 `±Inf`，
+  而 numpy 与 clvt 都返回 **NaN**；
+- 基准里 `(vt-extract a mask)` 参数顺序反了（应为 `numpy.extract(condition, arr)`），
+  测出来的不是 `a[mask]`，还把 216783 µs 的错测量记成了 `extract` 的性能。
+  改为 `(vt-extract mask a)` 后是 21185 µs。
+
+新增门禁套件 `example-smoke-test`（`test/example-smoke-test.lisp`，已进
+`DEFAULT_ORDER`），只跑断言不跑基准；断言区另补 9 条 `:bool` 契约（87 → 96）。
+顺带修掉 `*print-circle*` 为真时布尔张量打印出 `#1=True, #2=False, #1#, #2#`
+的噪音（`%format-number` 返回字面量字符串所致，加 `copy-seq`）。
+
+**验收**：`bool-dtype-test` 239 断言（含 52 例 numpy 2.3.5 逐例对照）全过；
+差分探针 `496/496` + `405/405`；全量 **65 套件全绿**（新增 `example-smoke-test`
+98/98）；`check_docs.py` 204 锚点全解析。
+
+---
+
 ## 2026-10-29（三十二）— compat: SBCL 2.6.9 验证（sb-simd 的 512 实测否决 + 一处 NaN 类型回归）
 
 **行为变化**：对外 API / 数值一律不变。修的是**在 SBCL 2.6.9 上**的一个

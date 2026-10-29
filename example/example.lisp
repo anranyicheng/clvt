@@ -20,6 +20,15 @@
   (let ((s (vt-shape (first vts))))
     (every (lambda (v) (equal (vt-shape v) s)) (rest vts))))
 
+(defun vt-all-true-p (tensor)
+  "把 (vt-all TENSOR) 的 0 维布尔结果转成 Lisp 布尔，供 ASSERT 使用。
+
+  为什么需要这层：`(assert (vt-all x))` 在 Common Lisp 里**恒真** —— ASSERT
+  只判条件是否为 NIL，而 `vt-all` 返回的是一个 VT 对象，任何 VT 对象都不为
+  NIL。`:bool` dtype 落地后 `vt-all` 返回 `shape:NIL dtype:BOOL` 的张量，
+  于是这些断言原本想验证的「全为真」一点都没被检查到。"
+  (= 1 (vt-item (vt-all tensor))))
+
 ;; ============================================================
 ;; 浮点感知的测试比较器。
 ;;
@@ -4011,14 +4020,15 @@
 	  (assert (= s 0.0d0))
 	  ;; 检查一维张量: 全部元素都是 nan
 	  (let ((m0 (vt-nanmean all-nan :axis 0)))
-	    (assert (vt-all (vt-isnan m0)))
+	    (assert (vt-all-true-p (vt-isnan m0)))
 	    ;; 同时验证标量 m 也是 nan
-	    (assert (vt-all (vt-isnan (ensure-vt m)))))
-	  ;; max / min 边界
-	  (assert (vt-all (vt-isinf mx)))    ; -inf
-	  (assert (vt-all (vt-isinf mn)))    ; +inf? 看实现，应该是 most-positive-double-float
+	    (assert (vt-all-true-p (vt-isnan (ensure-vt m)))))
+	  ;; max / min 边界：全 NaN 时 numpy 返回 nan（RuntimeWarning: All-NaN
+	  ;; slice encountered），不是 ±Inf、也不是 most-positive-double-float。
+	  (assert (vt-all-true-p (vt-isnan mx)))
+	  (assert (vt-all-true-p (vt-isnan mn)))
 	  ;; 方差也应为 nan
-	  (assert (vt-all (vt-isnan (ensure-vt v))))))
+	  (assert (vt-all-true-p (vt-isnan (ensure-vt v))))))
 
       ;; ---- 边界情况：无 nan ----
       (let* ((clean (vt-arange 6 :step 1 :dtype :float64)))
@@ -4159,7 +4169,7 @@
          (k (vt-kron a b))
          (expected (vt-from-sequence '(3 4 5 6 8 10) :dtype :float64)))
     (assert (equal (vt-shape k) '(6)))
-    (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
+    (assert (vt-all-true-p (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([1,2],[3,4,5]) = ~a  pass~%" k))
   
   ;; 2. 两个矩阵
@@ -4173,7 +4183,7 @@
                       (18 21 24 28))
                     :dtype :float64)))
     (assert (equal (vt-shape k) '(4 4)))
-    (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
+    (assert (vt-all-true-p (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([[1,2],[3,4]], [[0,5],[6,7]]) pass~%"))
   
   ;; 3. 向量与矩阵（向量视为行向量）
@@ -4186,7 +4196,7 @@
                       (5 6 10 12))
                     :dtype :float64)))
     (assert (equal (vt-shape k) '(2 4)))
-    (assert (vt-all (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
+    (assert (vt-all-true-p (vt-isclose k expected :atol 1d-12 :rtol 1d-12)))
     (format t "  kron([1,2], [[3,4],[5,6]]) pass~%"))
   
   ;; 4. 高维情况 (3d)
@@ -4198,7 +4208,7 @@
     ;; 取一个子块验证
     (let* ((sub-k (vt-slice k '(0) '(:all) '(:all)))
            (expected-sub (vt-kron (vt-slice a '(0) '(:all) '(:all)) b)))
-      (assert (vt-all (vt-isclose sub-k expected-sub :atol 1d-12 :rtol 1d-12))))
+      (assert (vt-all-true-p (vt-isclose sub-k expected-sub :atol 1d-12 :rtol 1d-12))))
     (format t "  kron of 2x2x2 and 2x2 pass~%"))
   
   (format t "vt-kron tests passed.~%"))

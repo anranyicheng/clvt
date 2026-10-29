@@ -160,8 +160,8 @@ case("union1d", "(vt-union1d CX-A CX-B)", np.union1d(A, B))
 case("intersect1d", "(vt-intersect1d CX-A CX-DUP)", np.intersect1d(A, DUP))
 case("setdiff1d", "(vt-setdiff1d CX-A CX-DUP)", np.setdiff1d(A, DUP))
 case("setxor1d", "(vt-setxor1d CX-A CX-B)", np.setxor1d(A, B))
-case("in1d", "(vt-in1d CX-A CX-B)", np.isin(A, B).astype(np.int8), dtype=np.int8)
-case("isin", "(vt-isin CX-A CX-DUP)", np.isin(A, DUP).astype(np.int8), dtype=np.int8)
+case("in1d", "(vt-in1d CX-A CX-B)", np.isin(A, B), dtype=np.bool_)
+case("isin", "(vt-isin CX-A CX-DUP)", np.isin(A, DUP), dtype=np.bool_)
 case("searchsorted-left",
      "(vt-searchsorted (vt-sort CX-DUP) (vt-from-sequence (list #C(1.0d0 1.0d0) #C(2.0d0 0.0d0) #C(3.0d0 0.0d0) #C(5.0d0 0.0d0)) :dtype :complex128))",
      np.searchsorted(np.sort(DUP), [1 + 1j, 2 + 0j, 3 + 0j, 5 + 0j]))
@@ -248,11 +248,11 @@ case("outer-shape", "(vt-shape (vt-outer CX-A CX-B))", np.array([2, 2]), dtype="
 case_symbol("outer-dtype", "(vt-dtype (vt-outer CX-A CX-B))", ":COMPLEX128")
 
 # any / all：复数的真值 = 任一分量非零（NaN 为真）
-case("any-mixed", "(vt-any CX-C)", np.int8(np.any(C)), dtype=np.int8)
-case("all-mixed", "(vt-all CX-C)", np.int8(np.all(C)), dtype=np.int8)
-case("any-zero", "(vt-any CX-Z3)", np.int8(np.any(np.zeros(3, dtype=complex))),
+case("any-mixed", "(vt-any CX-C)", np.bool_(np.any(C)), dtype=np.bool_)
+case("all-mixed", "(vt-all CX-C)", np.bool_(np.all(C)), dtype=np.bool_)
+case("any-zero", "(vt-any CX-Z3)", np.bool_(np.any(np.zeros(3, dtype=complex))),
      dtype=np.int8)
-case("all-zero", "(vt-all CX-Z3)", np.int8(np.all(np.zeros(3, dtype=complex))),
+case("all-zero", "(vt-all CX-Z3)", np.bool_(np.all(np.zeros(3, dtype=complex))),
      dtype=np.int8)
 case("any-axis0", "(vt-any CX-M2 :axis 0)",
      np.any(M2, axis=0).astype(np.int8), dtype=np.int8)

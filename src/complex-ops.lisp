@@ -356,11 +356,12 @@
     h))
 
 (defun %cx-lookup-flags (element table invert)
-  "逐元素查表 → :int8 的 0/1（INVERT 取反）。形状与 ELEMENT 相同。"
+  "逐元素查表 → **:bool** 张量（INVERT 取反）。形状与 ELEMENT 相同。
+   复数与实数两条会员判定路径的返回值 dtype 必须一致（§17）。"
   (vt-map (lambda (z)
             (let ((hit (if (gethash (%cx-key z) table) 1 0)))
               (if invert (- 1 hit) hit)))
-          (ensure-vt element) :dtype :int8))
+          (ensure-vt element) :dtype :bool))
 
 (defun %cx-op-in1d (t1 t2)
   "逐元素判定是否属于 T2（对标 numpy.in1d）。复数按值相等（NaN 与 NaN 视为相等）。"

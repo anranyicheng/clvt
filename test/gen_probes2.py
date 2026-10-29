@@ -25,7 +25,7 @@ PROBE_OUT = os.path.join(_SCRIPT_DIR, 'differential-probes-test2.lisp')
 
 # 复用第 1 阶段的基础设施：数据生成 / 字面量 / OP / probe 前导码
 import gen_probes as gp
-from gen_probes import CLD, gen, fmtnum, lit, OP
+from gen_probes import CLD, dtype_label, gen, fmtnum, lit, OP
 
 import ast as _ast
 def _extract_prelude(path):
@@ -707,7 +707,7 @@ def g10():
     add('union1d', f"(vt-union1d {lA1} {lA2})", lambda: np.union1d(A1, A2))
     add('setdiff1d', f"(vt-setdiff1d {lA1} {lA2})", lambda: np.setdiff1d(A1, A2))
     add('setxor1d', f"(vt-setxor1d {lA1} {lA2})", lambda: np.setxor1d(A1, A2))
-    add('in1d', f"(vt-in1d {lA1} {lA2})", lambda: np.isin(A1, A2).astype(np.int8))
+    add('in1d', f"(vt-in1d {lA1} {lA2})", lambda: np.isin(A1, A2))
     F1 = np.array([1.5, 2.5, 3.5]); F2 = np.array([2.5, 5.0])
     lF1 = "(vt-from-sequence (list 1.5d0 2.5d0 3.5d0) :dtype :float64)"
     lF2 = "(vt-from-sequence (list 2.5d0 5.0d0) :dtype :float64)"
@@ -716,12 +716,12 @@ def g10():
     T = np.array([0, 2], dtype=np.int64)
     lE = f"(vt-from-sequence {lit(E, 'int64')} :dtype :int64)"
     lT = f"(vt-from-sequence {lit(T, 'int64')} :dtype :int64)"
-    add('isin 数组×数组', f"(vt-isin {lE} {lT})", lambda: np.isin(E, T).astype(np.int8))
-    add('isin invert', f"(vt-isin {lE} {lT} :invert t)", lambda: (~np.isin(E, T)).astype(np.int8))
-    add('isin 标量元素', f"(vt-isin 2 {lT})", lambda: np.isin(2, T).astype(np.int8))
+    add('isin 数组×数组', f"(vt-isin {lE} {lT})", lambda: np.isin(E, T))
+    add('isin invert', f"(vt-isin {lE} {lT} :invert t)", lambda: ~np.isin(E, T))
+    add('isin 标量元素', f"(vt-isin 2 {lT})", lambda: np.isin(2, T))
     E2 = np.array([[1, 2], [3, 4]], dtype=np.int64)
     lE2 = "(vt-from-sequence (list (list 1 2) (list 3 4)) :dtype :int64)"
-    add('isin 2d元素', f"(vt-isin {lE2} {lT})", lambda: np.isin(E2, T).astype(np.int8))
+    add('isin 2d元素', f"(vt-isin {lE2} {lT})", lambda: np.isin(E2, T))
     add('array-equal 相等', f"(vt-array-equal {lA1} (vt-from-sequence (list 1 2 3 4) :dtype :int64))",
         lambda: np.array_equal(A1, np.array([1, 2, 3, 4])))
     add('array-equal 不等', f"(vt-array-equal {lA1} {lA2})",
@@ -1193,7 +1193,7 @@ def g17():
     lCS2 = "(vt-from-sequence (list -0.0d0 1.0d0 -1.0d0 1.0d0) :dtype :float64)"
     add('copysign', f"(vt-copysign {lCS1} {lCS2})", lambda: np.copysign(CS1, CS2), 'tol')
     add('signbit', f"(vt-signbit (vt-from-sequence (list -0.0d0 1.0d0 -1.0d0 (sb-int:with-float-traps-masked (:invalid :divide-by-zero) (/ -0.0d0 0.0d0))) :dtype :float64))",
-        lambda: np.signbit(np.array([-0.0, 1.0, -1.0, -np.nan])).astype(np.int8))
+        lambda: np.signbit(np.array([-0.0, 1.0, -1.0, -np.nan])))
     NA = np.array([1.0, 0.0]); NB = np.array([2.0, -1.0])
     lNA = "(vt-from-sequence (list 1.0d0 0.0d0) :dtype :float64)"
     lNB = "(vt-from-sequence (list 2.0d0 -1.0d0) :dtype :float64)"
@@ -1285,10 +1285,10 @@ def g18():
 def g19():
     INF = np.array([np.inf, -np.inf, 0.0, np.nan, 1.0])
     lINF = "(vt-from-sequence (list +inf+ +ninf+ 0.0d0 +nan+ 1.0d0) :dtype :float64)"
-    add('isposinf', f"(vt-isposinf {lINF})", lambda: np.isposinf(INF).astype(np.int8))
-    add('isneginf', f"(vt-isneginf {lINF})", lambda: np.isneginf(INF).astype(np.int8))
+    add('isposinf', f"(vt-isposinf {lINF})", lambda: np.isposinf(INF))
+    add('isneginf', f"(vt-isneginf {lINF})", lambda: np.isneginf(INF))
     add('isposinf int输入', f"(vt-isposinf (vt-from-sequence (list 1 2) :dtype :int64))",
-        lambda: np.isposinf(np.array([1, 2], dtype=np.int64)).astype(np.int8))
+        lambda: np.isposinf(np.array([1, 2], dtype=np.int64)))
 
 # =====================================================================
 # 生成与比对（沿用第 1 阶段文件布局，产物加 2 后缀）
@@ -1315,9 +1315,7 @@ def cmd_gen():
                 r = np.concatenate([np.asarray(x).ravel() for x in r])
             else:
                 r = np.asarray(r)
-            if r.dtype == np.bool_:
-                r = r.astype(np.int8)
-            exps[cid] = ('VT', CLD[str(r.dtype)],
+            exps[cid] = ('VT', dtype_label(r.dtype),
                          '(' + ' '.join(map(str, r.shape)) + ')',
                          [tok1(x) for x in r.reshape(-1)])
         except Exception:

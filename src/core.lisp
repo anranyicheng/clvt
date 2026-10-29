@@ -108,6 +108,8 @@
         (:int16   (mk (signed-byte 16) :int16))
         (:int8    (mk (signed-byte 8) :int8))
         (:uint16  (mk (unsigned-byte 16) :uint16))
+        ;; :bool 与 :uint8 共用 (unsigned-byte 8) 物理存储（§17.1）。
+        (:bool    (mk (unsigned-byte 8) :bool))
         (:uint8   (mk (unsigned-byte 8) :uint8))))))
 
 (defun %alloc-vt (shape dtype)
@@ -130,6 +132,7 @@
                         (:int16   (mk (signed-byte 16)))
                         (:int8    (mk (signed-byte 8)))
                         (:uint16  (mk (unsigned-byte 16)))
+                        (:bool    (mk (unsigned-byte 8)))
                         (:uint8   (mk (unsigned-byte 8))))
                 :shape shape
                 :strides (vt-compute-strides shape)
@@ -536,6 +539,39 @@
       vt
       (%gather-contiguous vt)))
 
+(defun %to-bool (tensor)
+  "把任意张量**真值化**为连续的 `:bool` 张量（新分配）。
+
+   这是 `vt-astype ... :bool` 的落点，也是「数值 → 布尔」的唯一转换规则
+   （CONVENTIONS §17.1）：非零→1、零→0、NaN→1，复数按「任一分量非零」。
+   不能走整数截断表 —— `(truncate 0.5)` 是 0，而 `np.array(0.5).astype(bool)`
+   是 True，两者语义不同。"
+  (with-float-safe
+    (let* ((in (ensure-vt tensor))
+           (res (%alloc-vt (vt-shape in) :bool))
+           (od (vt-data res))
+           (i 0))
+      (declare (type (simple-array (unsigned-byte 8) (*)) od)
+               (type fixnum i))
+      (vt-do-each (ptr val in)
+        (declare (ignore ptr))
+        (setf (aref od i) (the (unsigned-byte 8) (%bool-flag val)))
+        (incf i))
+      res)))
+
+(defun %all-bool-tensors-p (xs)
+  "XS 全部是非标量的 `:bool` 张量时返回 T（弱标量一律不算）。
+
+   用途：算术算子（`vt-+` / `vt-*` / `vt--` …）在「全布尔操作数」时必须
+   改派逻辑语义或报错（CONVENTIONS §17.3）。按整数相加会把 `True + True`
+   算成 2 写进布尔数组 —— 直接破坏「布尔数组只含 0/1」的不变量，
+   而 `(safety 0)` 的写入路径不会拦下 2。"
+  (and (consp xs)
+       (every (lambda (x)
+                (and (null (%scalar-kind x))
+                     (eq (vt-dtype (ensure-vt x)) :bool)))
+              xs)))
+
 (defun vt-astype (tensor new-dtype)
   "将张量转换为新类型（浮点转整数截断）。返回连续的新张量。
 
@@ -551,7 +587,13 @@
         逐 run 直接写进目标数组 —— 单趟、无临时副本；
      3. 非连续、run 更短（转置/翻转视图）：先 `%gather-contiguous` 做
         同 dtype 特化收集（同 dtype 时它就是结果），跨 dtype 再走第 1 条。
-   分配用 `make-array`（不填充零值，与 `%alloc-vt` 等价）。"
+   分配用 `make-array`（不填充零值，与 `%alloc-vt` 等价）。
+
+   布尔目标（CONVENTIONS §17.1）：`:bool` 走 `%TO-BOOL` 的真值化路径，
+   **不进**下面这张按整数语义截断的特化表（0.5 → True，不是 0）。"
+  ;; :bool 目标在特化表之前分流：那张表的语义是「整数截断」，与真值化不同。
+  (when (eq new-dtype :bool)
+    (return-from vt-astype (%to-bool tensor)))
   (with-float-safe
     (let* ((shape (vt-shape tensor))
            (rank (length shape))

@@ -53,6 +53,7 @@ SUITES[test-overlap]="6 重叠拷贝回归测试"
 SUITES[svd-fast-path-test]="SVD 双路径测试 (差分参考/选路不变量/数学性质/numpy对比/退化形状)"
 SUITES[linalg-fast-path-test]="LINALG 双路径测试 (lu/qr/solve/chol/eig: 差分参考/选路不变量/数学性质/numpy对比/边界)"
 SUITES[test-copy-into]="41 vt-copy-into 正确性测试 + 复数×非连续 typed-walk (转置/翻转/3-D 置换/非连续 dest 与独立参照逐位相等 + c128T 拷贝 ≤8× 实数线护栏)"
+SUITES[bool-dtype-test]="239 布尔 dtype 测试 (52 例 numpy 逐例对照: 内容测试/比较/逻辑/any-all(轴·keepdims·空·NaN)/isclose·array_equal·allclose/isin·in1d/astype 真值化/sum 升 int64 + dtype 契约·0/1 不变量·打印·npy |b1 往返 + 布尔算术语义)"
 SUITES[io-interop-test]="77 vt-load/vt-save 持久化与 numpy .npy 互操作测试（含 NaN payload 逐位/视图字节等价/不变性/覆盖语义）"
 SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
 SUITES[gemm-avx512-test]="49 AVX-512 f64 GEMM 机器码内核测试 (EVEX 发射器/掩码尾块/写边界哨兵/非对齐 SAP; 与 sb-simd 内核逐位对照, n%4 的尾部标量列按 §7.3 放宽为 ≤1e-15 且必须只落在这些列)"
@@ -93,6 +94,7 @@ SUITES[cumulative-axis-test]="70 累积沿轴 + nanmedian 多轴（第十五轮 
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
 SUITES[test-all]="641 绝大多数函数的测试"
+SUITES[example-smoke-test]="98 example/ 两个示例脚本冒烟 (example.lisp 106 个 test-* 全部 ASSERT 通过 + clvt-perf-test-examples 96 条正确性断言；只跑断言不跑基准。第 33 轮引入 :bool 后靠它翻出示例自身的 3 处问题: 9 条恒真的 (assert (vt-all ...)) / 全 NaN 时 nanmax 期望写错 / vt-extract 参数顺序反了) "
 SUITES[core-test]="282 基础契约回归 (1 结构/199 函数语义/返回值形状/错误契约, 参照 CONVENTIONS)"
 SUITES[differential-probes-test]="496 差分探针 vs numpy (期望内嵌逐项判定, 覆盖算术/超越/归约/索引/操纵/随机/错误路径)"
 SUITES[differential-probes-test2]="405 第2阶段差分探针 vs numpy (导出符号 #200-#377: NaN统计/linalg分解/NN/随机/契约, 期望内嵌逐项判定)"
@@ -175,9 +177,11 @@ DEFAULT_ORDER=(
     legacy-coverage-test
     differential-probes-test
     differential-probes-test2
+    bool-dtype-test
     io-interop-test
     manip-interop-test
     test-all
+    example-smoke-test
 )
 
 BENCH_SUITES=(

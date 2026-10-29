@@ -123,8 +123,13 @@
                    6.0d0))
            1d-12))
 
-(report "实数比较仍返回 int8"
+(report "实数比较仍返回 :bool（§17）"
         (eq (vt-dtype (vt-< (vt-from-sequence (list 1.0d0)) (vt-from-sequence (list 2.0d0))))
+            :bool))
+
+(report "实数比较显式 :dtype :int8 仍可用（§17.6）"
+        (eq (vt-dtype (vt-< (vt-from-sequence (list 1.0d0)) (vt-from-sequence (list 2.0d0))
+                            :dtype :int8))
             :int8))
 
 (report "实数 maximum 仍走实数语义（非字典序）"

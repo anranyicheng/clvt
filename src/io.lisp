@@ -262,7 +262,8 @@
 (defvar *vt-indent-step* 1 "缩进步长")
 
 (defun %type-category (type)
-  (cond ((or (eq type 'fixnum)
+  (cond ((eq type :bool) :boolean)
+        ((or (eq type 'fixnum)
              (eq type 'integer)
              (eq type 'bit)
              (and (listp type)
@@ -297,6 +298,11 @@
 
 (defun %format-number (val type)
   (case (%type-category type)
+    ;; 注意 COPY-SEQ：字面量字符串是同一个常量对象，若直接返回，SBCL 在
+    ;; *PRINT-CIRCLE* 为真时会把它当成共享结构，打印出
+    ;; "#1=True, #2=False, #1#, #2#" 这种噪音。浮点分支走 FORMAT 天然是新
+    ;; 字符串，没有这个问题；布尔分支是唯一返回字面量的分支。
+    (:boolean (copy-seq (if (zerop val) "False" "True")))
     (:integer (format nil "~d" val))
     (:complex (%format-complex-number val))
     (:float (%format-real-part val))
@@ -356,7 +362,12 @@
 
 (defmethod print-object ((obj vt) stream)
   (print-unreadable-object (obj stream :type t :identity nil)
-    (let ((shape (vt-shape obj)) (element-type (vt-element-type obj)))
+    (let* ((shape (vt-shape obj))
+           (dtype (vt-dtype obj))
+           ;; 布尔张量的物理元素类型是 (unsigned-byte 8)，与 :uint8 相同；
+           ;; 直接印 VT-ELEMENT-TYPE 会让两种 dtype 在输出里无法区分，
+           ;; 所以 :bool 用逻辑 dtype 名，其余仍印物理元素类型。
+           (element-type (if (eq dtype :bool) :bool (vt-element-type obj))))
       (format stream "shape:~a dtype:~a " shape element-type)
       (cond
         ((and shape (zerop (reduce #'* shape :initial-value 1)))
@@ -568,7 +579,7 @@
     (:int32   (logand x #xFFFFFFFF))
     (:int16   (logand x #xFFFF))
     (:int8    (logand x #xFF))
-    ((:uint8 :uint16) x)))
+    ((:uint8 :uint16 :bool) x)))
 
 (defun %npy-decode-bits (dtype u)
   "npy 位模式 → 张量元素（类型与 dtype 的物理元素类型一致）。"
@@ -579,6 +590,9 @@
     (:int32   (if (logbitp 31 u) (- u (ash 1 32)) u))
     (:int16   (if (logbitp 15 u) (- u (ash 1 16)) u))
     (:int8    (if (logbitp 7 u) (- u 256) u))
+    ;; npy 的 |b1 只有 0/1 两种合法字节；其它字节（非 numpy 工具写的）
+    ;; 一律真值化，维持「布尔数组只含 0/1」的不变量（§17.1）。
+    (:bool    (if (zerop u) 0 1))
     ((:uint8 :uint16) u)))
 
 ;;; ------------------------------------------------------------------
@@ -597,12 +611,13 @@
     (:int16 "<i2")
     (:int8 "|i1")
     (:uint8 "|u1")
-    (:uint16 "<u2")))
+    (:uint16 "<u2")
+    (:bool "|b1")))
 
 (defun %npy-descr->dtype (descr)
   "npy descr 字符串 → clvt dtype；不支持/非法时确定性报错（L2 契约）。"
   (labels ((fail (why)
-             (error "vt-load: npy dtype '~a' 不受支持（~a）；支持 f8/f4/i8/i4/i2/i1/u2/u1/c16/c8"
+             (error "vt-load: npy dtype '~a' 不受支持（~a）；支持 f8/f4/i8/i4/i2/i1/u2/u1/b1/c16/c8"
                     descr why)))
     (when (or (not (stringp descr)) (zerop (length descr)))
       (fail "descr 为空"))
@@ -622,7 +637,8 @@
                     ((char= code #\c) (case size (16 :complex128) (8 :complex64)))
                     ((char= code #\i) (case size (8 :int64) (4 :int32)
                                         (2 :int16) (1 :int8)))
-                    ((char= code #\u) (case size (2 :uint16) (1 :uint8))))
+                    ((char= code #\u) (case size (2 :uint16) (1 :uint8)))
+                    ((char= code #\b) (case size (1 :bool))))
               (fail "类型码/宽度不在支持矩阵内")))))))
 
 ;;; ------------------------------------------------------------------

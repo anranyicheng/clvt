@@ -96,28 +96,32 @@
          (nlist (vt-sub (vt-from-sequence '(10 20 30)) (vt-from-sequence '(1 2 3)))))
   (check "vt-mul scalar" '(8.0d0 12.0d0)
          (nlist (vt-mul (vt-from-sequence '(2 3)) 4)))
-  ;; vt-<= / vt->= 返回 int8 布尔语义（CONVENTIONS §3.1）
+  ;; vt-<= / vt->= 返回 :bool 布尔语义（CONVENTIONS §17）
   (let ((r (vt-<= (vt-from-sequence '(1 2 3)) 2)))
-    (check-shape-dtype "vt-<=" r '(3) :int8)
+    (check-shape-dtype "vt-<=" r '(3) :bool)
     (check "vt-<= 值" '(1 1 0) (nlist r)))
   (let ((r (vt->= (vt-from-sequence '(1 2 3)) 2)))
-    (check-shape-dtype "vt->=" r '(3) :int8)
+    (check-shape-dtype "vt->=" r '(3) :bool)
     (check "vt->= 值" '(0 1 1) (nlist r)))
-  ;; 比较运算 dtype 契约（CONVENTIONS §3.1：统一 :int8 承载布尔）
-  (check "vt-= dtype" :int8 (vt-dtype (vt-= (vt-from-sequence '(1 2)) (vt-from-sequence '(1 3)))))
-  (check "vt-< dtype" :int8 (vt-dtype (vt-< (vt-from-sequence '(1 2)) 2)))
-  (check "vt-> dtype" :int8 (vt-dtype (vt-> (vt-from-sequence '(1 2)) 2)))
-  (check "vt-/= dtype" :int8 (vt-dtype (vt-/= (vt-from-sequence '(1 2)) 2)))
-  (check "vt-isnan dtype" :int8 (vt-dtype (vt-isnan (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+)))))
-  (check "vt-isfinite dtype" :int8 (vt-dtype (vt-isfinite (vt-from-sequence '(1.0 2.0)))))
+  ;; 比较运算 dtype 契约（CONVENTIONS §17：统一 :bool）
+  (check "vt-= dtype" :bool (vt-dtype (vt-= (vt-from-sequence '(1 2)) (vt-from-sequence '(1 3)))))
+  (check "vt-< dtype" :bool (vt-dtype (vt-< (vt-from-sequence '(1 2)) 2)))
+  (check "vt-> dtype" :bool (vt-dtype (vt-> (vt-from-sequence '(1 2)) 2)))
+  (check "vt-/= dtype" :bool (vt-dtype (vt-/= (vt-from-sequence '(1 2)) 2)))
+  (check "vt-isnan dtype" :bool (vt-dtype (vt-isnan (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+)))))
+  (check "vt-isfinite dtype" :bool (vt-dtype (vt-isfinite (vt-from-sequence '(1.0 2.0)))))
   ;; 逐元素乘 + out（out 必须与结果 dtype 一致）
   (let ((out (vt-zeros '(2))))
     (vt-mul (vt-from-sequence '(2 3)) 4 :out out)
     (check "vt-mul :out" '(8.0d0 12.0d0) (nlist out)))
-  ;; 比较的 out 必须为 int8（H3）
-  (let ((out (vt-zeros '(3) :dtype :int8)))
+  ;; 比较的 out 必须与结果 dtype 一致（H3）：缺省结果是 :bool
+  (let ((out (vt-zeros '(3) :dtype :bool)))
     (vt-<= (vt-from-sequence '(1 2 3)) 2 :out out)
-    (check "vt-<= :out int8" '(1 1 0) (nlist out))))
+    (check "vt-<= :out bool" '(1 1 0) (nlist out)))
+  ;; 显式 :dtype :int8 时 out 也必须是 int8（旧的 0/1 整型掩码路径，§17.6）
+  (let ((out (vt-zeros '(3) :dtype :int8)))
+    (vt-<= (vt-from-sequence '(1 2 3)) 2 :dtype :int8 :out out)
+    (check "vt-<= :out int8（显式 dtype）" '(1 1 0) (nlist out))))
 
 ;;; ============================================================
 ;;; 2. 三角函数 / 双曲（numpy 实测）
@@ -179,8 +183,8 @@
   (check "vt-positive-p NaN → 0" '(0)
          (nlist (vt-positive-p (vt-from-sequence (list +vt-dfloat-nan+)))))
   ;; 谓词 dtype 契约
-  (check "vt-even-p dtype" :int8 (vt-dtype (vt-even-p (vt-from-sequence '(2 3)))))
-  (check "vt-positive-p dtype" :int8 (vt-dtype (vt-positive-p (vt-from-sequence '(1 -1))))))
+  (check "vt-even-p dtype" :bool (vt-dtype (vt-even-p (vt-from-sequence '(2 3)))))
+  (check "vt-positive-p dtype" :bool (vt-dtype (vt-positive-p (vt-from-sequence '(1 -1))))))
 
 ;;; ============================================================
 ;;; 5. 逻辑 / 位运算（numpy 实测）

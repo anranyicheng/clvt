@@ -220,37 +220,36 @@
         (vt-fast-map (function %cop-signum) in :out out :dtype dt))))
   (vt-fast-map #'%sign1 vt :out out :dtype dtype))
 
-(defun vt-positive-p (vt &key out (dtype :int8))
-  "逐元素正数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      对标 numpy 的符号过滤语义（>0）。NaN 比较恒假 → 0。:out 契约同 vt-=。"
+(defun vt-positive-p (vt &key out (dtype :bool))
+  "逐元素正数判定，返回 **:bool** 布尔张量（CONVENTIONS §17）。
+      对标 numpy 的符号过滤语义（>0）。NaN 比较恒假 → False。:out 契约同 vt-=。"
   (vt-map (lambda (v)
             (if (> v 0.0d0) 1 0))
           vt :out out :dtype dtype))
 
-(defun vt-negative-p (vt &key out (dtype :int8))
-  "逐元素负数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN 比较恒假 → 0。:out 契约同 vt-=。"
+(defun vt-negative-p (vt &key out (dtype :bool))
+  "逐元素负数判定，返回 **:bool** 布尔张量。NaN 比较恒假 → False。:out 契约同 vt-=。"
   (vt-map (lambda (v)
             (if (< v 0.0d0) 1 0))
           vt :out out :dtype dtype))
 
-(defun vt-zero-p (vt &key out (dtype :int8))
-  "逐元素零判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      :out 契约同 vt-=。"
+(defun vt-zero-p (vt &key out (dtype :bool))
+  "逐元素零判定，返回 **:bool** 布尔张量。:out 契约同 vt-=。"
   (vt-map (lambda (v)
             (if (zerop v) 1 0))
           vt :out out :dtype dtype))
 
-(defun vt-nonzero-p (vt &key out (dtype :int8))
-  "逐元素非零判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      :out 契约同 vt-=。"
+(defun vt-nonzero-p (vt &key out (dtype :bool))
+  "逐元素非零判定，返回 **:bool** 布尔张量。:out 契约同 vt-=。
+      这是库内「真值化」的公共算子：任何需要布尔掩码的地方（复数 any/all、
+      索引选择）都经由它，因此它的结果 dtype 是 :bool 而非 :int8 很关键。"
   (vt-map (lambda (v)
             (if (zerop v) 0 1))
           vt :out out :dtype dtype))
 
-(defun vt-even-p (vt &key out (dtype :int8))
-  "逐元素偶数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN/±Inf 视为非偶数 → 0；非整数值视为非偶数 → 0
+(defun vt-even-p (vt &key out (dtype :bool))
+  "逐元素偶数判定，返回 **:bool** 布尔张量。
+      NaN/±Inf 视为非偶数 → False；非整数值视为非偶数 → False
       （对标模拟基准 v%2==0）。:out 契约同 vt-=。"
     (when (%cx-reject vt)
     (error "vt-even-p: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
@@ -260,9 +259,9 @@
                   (t (if (evenp (floor v)) 1 0))))
           vt :out out :dtype dtype))
 
-(defun vt-odd-p (vt &key out (dtype :int8))
-  "逐元素奇数判定，返回值 1/0，dtype 默认 :int8（承载布尔语义）。
-      NaN/±Inf 视为非奇数 → 0；非整数值视为非奇数 → 0
+(defun vt-odd-p (vt &key out (dtype :bool))
+  "逐元素奇数判定，返回 **:bool** 布尔张量。
+      NaN/±Inf 视为非奇数 → False；非整数值视为非奇数 → False
       （对标模拟基准 v%2==1）。:out 契约同 vt-=。"
     (when (%cx-reject vt)
     (error "vt-odd-p: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
@@ -333,9 +332,14 @@
    语义对标 numpy.remainder：结果与除数同号；
    除数为 0 时按 numpy dtype 语义（v0.3.6 起）：
    浮点语境（任一操作数为浮点）→ NaN；整型语境 → 0；
-   NaN 任一侧出现 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
-    (when (%cx-reject vt divisor)
+   NaN 任一侧出现 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。
+
+   布尔输入（CONVENTIONS §17.3）：结果 dtype 取 **:int8** —— 余数不是
+   布尔量（numpy：`np.mod(bool, bool)` → int8）。"
+  (when (%cx-reject vt divisor)
     (error "vt-mod: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+  (when (and (null dtype) (%all-bool-tensors-p (list vt divisor)))
+    (setf dtype :int8))
 (flet ((zero-div (x)
            ;; numpy 语义：浮点语境零除 → NaN，整型语境 → 0
            (if (floatp x) (%mod-float-nan x) 0)))

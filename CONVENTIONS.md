@@ -134,15 +134,30 @@ vt = { data, shape, strides, offset, dtype }
 
 ## 3. dtype 系统
 
-### 3.1 逻辑 dtype（8 种）与物理存储（4 种）
+### 3.1 逻辑 dtype（9 种）与物理存储
 
 | 类别 | dtype |
 |---|---|
-| 逻辑 dtype | `:float64 :float32 :int64 :int32 :int16 :int8 :uint8 :uint16` |
+| 逻辑 dtype | `:bool :float64 :float32 :int64 :int32 :int16 :int8 :uint8 :uint16` |
 | 物理存储 | `:float64 :float32 :int64 :int32`（其余逻辑 dtype 以窄类型物理存储） |
-| 布尔（内部） | 逻辑 `:int8` 承载，比较运算**逻辑上**返回布尔语义 |
+| 布尔 | 独立逻辑 dtype `:bool`，物理存储 `(unsigned-byte 8)`，1 字节，取值只允许 0/1 |
 
-> **约定**：本库不引入独立的 `:bool` dtype（NumPy 有 `bool_`）。比较/逻辑运算返回 `:int8`，取值 0/1，**语义上等价于 NumPy bool**。文档必须写明这一点，避免用户误当整数参与算术。
+> **约定**：`:bool` 是**第九种逻辑 dtype**（NumPy 的 `bool_` 对应物），完整契约见
+> [§17](#17-布尔-dtypebool)。比较、逻辑、谓词、`any/all`、`isclose`、`array_equal`、
+> `isin` 这些「NumPy 返回 `bool_`」的函数，缺省结果 dtype 一律是 `:bool`。
+>
+> 历史背景：`:bool` 引入之前，这些函数用 `:int8` 的 0/1 承载，靠「文档写一句
+> 语义等价于布尔」维持约定。该做法有两个无法用文档解决的漏洞：
+>
+> 1. **算术泄漏** —— `:int8` 结果能被当成整数继续算：`(vt-+ mask mask)` 得 2，
+>    `(vt-sum mask)` 得 int8 且会溢出，而 NumPy 的 `bool_` 参与算术按逻辑运算走、
+>    `sum` 升 int64；
+> 2. **类型不可区分** —— 「布尔掩码」与「真正的 int8 数据」在 dtype 上完全相同，
+>    吃掩码的函数（`vt-where` / `vt-compress` / `vt-select`）无法表达、也无法校验
+>    入参语义。
+>
+> 向后兼容：所有布尔类函数仍接受显式 `:dtype :int8`（或其它数值 dtype），此时
+> 得到旧的 0/1 整型掩码，行为与引入 `:bool` 之前逐位相同。
 
 ### 3.1.1 命名约定（**已确认的 API 现状**）
 
@@ -775,7 +790,7 @@ VMOVUPS    ZMM26, ZMM0        ; ← 40 条 FMA 后面跟了 34 条这个
 | `vt-slice` | spec 语法须与文档统一（**无 `:range`** → D1） | ✅ 实现正确，仅需补文档 |
 | `vt-where` | 单参数形式 `(vt-where cond)` 返回**按轴分组的索引列表**（长度 = rank，等价 `vt-nonzero` / `np.nonzero(cond)`）；三元形式同 `np.where(cond,x,y)` | ✅ 已对齐（见 D6） |
 | 空归约 | 三分类语义 | ✅ 正面样板（D11） |
-| 比较运算 | 返回 `:int8` 承载布尔（0/1） | ✅（文档需写明） |
+| 比较运算 | 返回 `:bool` 布尔张量（§17）；显式 `:dtype :int8` 得旧的 0/1 整型掩码 | ✅ 已对齐 |
 | 三角/反三角 | `asin/acos/atan` 命名（非 arc*），越界返回 NaN | ✅（命名见 §3.1.1） |
 | **docstring 覆盖** | 每个公开函数须有文档 | ⚠️ `vt-var` 等为 NIL，需全量审计（任务5） |
 | 激活函数族 | `vt-sigmoid`/`vt-relu`/`vt-leaky-relu`/`vt-swish`/`vt-softplus`/`vt-gelu`/`vt-mish`/`vt-hard-tanh`/`vt-hard-sigmoid`：输出**恒为浮点**，整数输入提升 `:float64`，float32 保持 float32（见 §3.4） | ✅ 已对齐（新增 softplus/gelu/leaky-relu） |
@@ -1135,7 +1150,7 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | SIMD 矩阵乘 | `simd-matmul.lisp` | 2d/batched 两条快路径：结果 dtype 不取 out + 别名改重叠判定 + 可写性检查 | ✅ |
 | 索引 | `indexing.lisp` | `vt-where` 结果 dtype = `(or :dtype promote)` + 统一 `vt-check-out` | ✅ |
 | 神经网络 | `nn.lisp` | `vt-sigmoid`/`vt-relu` 前置 `vt-check-out`（非连续 out 自动回落通用路径） | ✅ |
-| 扩展 | `extensions.lisp` / `extensions2.lisp` / `extensions3.lisp` | 全部透传下游原语，已自动获得统一契约（比较/逻辑类返回 `:int8`） | ✅ |
+| 扩展 | `extensions.lisp` / `extensions2.lisp` / `extensions3.lisp` | 全部透传下游原语，已自动获得统一契约（比较/逻辑类返回 `:bool`，见 §17） | ✅ |
 | creation / manip / join / setops / rotate / random | 同上 | 这些函数**本无 `:out` 参数**（与 numpy 一致，如 `concatenate`/`reshape` 无 `out=`） | N/A |
 
 **关键实现要点**（易错，已在测试中固化）：
@@ -1222,14 +1237,13 @@ NumPy：`np.reciprocal(np.array([2],dtype=np.int32))` → `[0]`（整型倒数�
 | F1 | `vt-identity` | **崩溃**（缺省值 NIL 下传） | `(vt-identity 3)` → `NIL fell through ECASE` | `&key (dtype :float64)` |
 | F2 | `vt-vander` | **崩溃**（`&key n` 无缺省） | `(vt-vander x)` → `odd number of &KEY arguments` | `&key (n nil)` → 缺省 `len(x)` |
 | F3 | `vt-atanh` | 边界值不符 numpy | `atanh(±1)` → NaN（应 ±Inf） | `±1→±Inf`，`\|x\|>1→NaN` |
-| F4 | `vt-= vt-/= vt-< vt-<= vt-> vt->=` | **dtype 契约违反**（§3.1） | 返回 `float64`，应 `:int8` | 缺省 dtype `:int8`，值 1/0 |
-| F5 | `vt-positive-p vt-negative-p vt-zero-p vt-nonzero-p vt-even-p vt-odd-p` | 同上 | 返回 `float64` | 缺省 dtype `:int8` |
-| F6 | `vt-isnan vt-isinf vt-isfinite` | 同上 | 返回 `float64` | dtype 固定 `:int8` |
+| F4 | `vt-= vt-/= vt-< vt-<= vt-> vt->=` | **dtype 契约违反**（§3.1） | 返回 `float64`，应布尔 | 缺省 dtype `:bool`（§17） |
+| F5 | `vt-positive-p vt-negative-p vt-zero-p vt-nonzero-p vt-even-p vt-odd-p` | 同上 | 返回 `float64` | 缺省 dtype `:bool`（§17） |
+| F6 | `vt-isnan vt-isinf vt-isfinite` | 同上 | 返回 `float64` | dtype 固定 `:bool`（§17） |
 
-> F4–F6 的裁决依据：CONVENTIONS §3.1「比较运算返回 :int8，取值 0/1，语义上
-> 等价于 NumPy bool」，§9.2「比较运算 → 返回 :int8 承载布尔」。
-> NumPy 侧布尔数组与 clvt `:int8` 的**值语义完全一致**，仅 dtype 标签不同，
-> 故本修复不构成与 NumPy 的冲突，而是向**本文档自身契约**收敛。
+> F4–F6 的裁决依据：§3.1 / §9.2 的「比较运算返回布尔」。**早期落地用的是
+> `:int8` 的 0/1**（当时还没有布尔 dtype），值语义与 NumPy 一致但标签不同；
+> 引入 `:bool` 后（§17）这些函数改回真布尔，`:dtype :int8` 仍可退回旧行为。
 > 计数类（`vt-count-nonzero`、`vt-all`/`vt-any` 的规约输出）保持整数 dtype。
 
 ### 15.2 审计确认「正确、无需修改」的函数
@@ -2352,7 +2366,7 @@ where/broadcast/copy-to!/write/save-load/array-equal/isclose… 全部直接可�
   元素值才是复数 —— 不受 `(type fixnum sel)` 声明影响。
 - `vt-outer`：删掉多余的 `:dtype` 实参，改为先广播乘再按需 `vt-astype`，
   并补 `:out` 硬契约（`vt-check-out` + `vt-copy-into`）。
-- `vt-any` / `vt-all`：**不重写归约内核** —— 先把复数转成 int8 的 0/1 真值掩码
+- `vt-any` / `vt-all`：**不重写归约内核** —— 先把复数转成 `:bool` 的真值掩码
   （`vt-nonzero-p`），再交给原实现。这样自动继承 `axis` / `keepdims` /
   `:out` / 空输入单位元（any→0、all→1）的全部既有契约。
 
@@ -3100,8 +3114,8 @@ dtype（`%WEAK-CAST1`）。代价 O(1)，类型检查能过、内联快路径回
 |---|---|
 | `SIZE = 1` | 只处理广播标量；大数组预转会多一次全量拷贝 |
 | dtype 与结果不同 | 否则无事可做 |
-| 种类秩 `源 ≤ 目标`（int< float< complex） | 只允许无损方向。反过来 `float → int` 会截断：`(vt-< f64数组 1.5)` 的结果是 **int8 掩码**，把 `1.5` 转成 int8 变成 1，`nan<1` 直接判错 |
-| 整数值装得下（`%SCALAR-FITS-P`） | `(vt-> 大数组 999000)` 的标量若转进 int8 掩码会变成 -8 —— 实测让 `argwhere(gt 999000)` 从 999 变成 999911 |
+| 种类秩 `源 ≤ 目标`（int< float< complex） | 只允许无损方向。反过来 `float → int` 会截断：`(vt-< f64数组 1.5)` 的结果是**布尔掩码**，把 `1.5` 转成整型会变成 1，`nan<1` 直接判错 |
+| 整数值装得下（`%SCALAR-FITS-P`） | `(vt-> 大数组 999000)` 的标量若转进窄整型会变成 -8 —— 实测让 `argwhere(gt 999000)` 从 999 变成 999911 |
 | 这组输入里至少有一个真张量（`SIZE>1`） | 全标量时没有「要对齐的大数组」，预转纯属添乱：`(vt-complex 1.0d0 2.0d0)` 内部就是 `(vt-map #'complex 1.0 2.0 :dtype :complex128)`，把实参转成复数会让构造函数收到 `#C(1 0)` 而报 `is not of type REAL` |
 
 后三道保护全是踩出来的 —— 第一版只按「单元素 + dtype 不同」转，依次挂了
@@ -3179,7 +3193,7 @@ dtype（`%WEAK-CAST1`）。代价 O(1)，类型检查能过、内联快路径回
 | B2 | `(let BIND (unless … (return-from X (funcall orig…))) <复数代码>)` | 删 `unless` 块 → 改名 `%CX-OP-X` |
 
 归约族（`all`/`any` 等 14 个）用「实现 + 门面」两层：复数语义是「先把复数转成
-int8 真值掩码，再喂回同一个实现」，单一定义下没有原实现可回调，只能调实现函数
+`:bool` 真值掩码，再喂回同一个实现」，单一定义下没有原实现可回调，只能调实现函数
 （`%REDUCE-*` 是内部名，公开符号仍然只有一个 `defun`）。
 
 #### 16.32.4 判据（必须全部输出 0）
@@ -3511,6 +3525,231 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 > `vt-expm1` 116→58 ms、`vt-log1p` 383→65 ms —— 与上一条同源但**不触发**
 > 编译期探测器，见 §16.8.1 第 4 条的「盲区」）。
 > 编年史见 `HISTORY.md`，各轮摘要见 `CHANGELOG.md`。
+
+---
+
+## 17. 布尔 dtype（`:bool`）
+
+**一句话**：`:bool` 是第九种非复数逻辑 dtype，对标 `numpy.bool_`。凡「NumPy 返回
+`bool_`」的函数，缺省结果 dtype 一律是 `:bool`，**不再**用 `:int8` 的 0/1 冒充。
+
+### 17.1 真值语义与物理表示
+
+| 项 | 值 |
+|---|---|
+| 逻辑名 | `:bool` |
+| 物理存储 | `(unsigned-byte 8)`，**1 字节**（与 `numpy` 的 `bool_` 同尺寸，`np.dtype(bool).itemsize == 1`） |
+| 元素类型 | `vt-dtype->lisp-type` → `(unsigned-byte 8)`；`vt-dtype-itemsize` → `1` |
+| 合法取值 | **只有 0 与 1**（0 = False，1 = True）—— 见下面的不变量 |
+| 存储 dtype 归属 | 不在 `*vt-storage-dtypes*` 里：它与 `:uint8` 共用同一物理表示，靠 `dtype` 槽区分 |
+
+**「数值 → 布尔」的唯一规则是真值化，不是截断**（`%bool-flag`，`dtype.lisp`）：
+
+| 输入 | 结果 | 依据 |
+|---|---|---|
+| `T` / `NIL` | 1 / 0 | Lisp 布尔 |
+| 整数 `0` / 非零 | 0 / 1 | `zerop` |
+| 浮点 `0.0` / 非零 | 0 / 1 | `zerop` |
+| `-0.0` | **0** | IEEE 的 `-0.0 = 0`（`np.bool_(-0.0)` 为 False） |
+| `NaN` | **1** | `nan ≠ 0`（`np.bool_(np.nan)` 为 True） |
+| `±Inf` | 1 | 非零 |
+| 复数 | 任一分量非零 → 1 | `bool(0+0j)`→False、`bool(nan+0j)`→True |
+
+> **为什么不能复用整数截断表**：`(truncate 0.5)` 是 0，而
+> `np.array(0.5).astype(bool)` 是 **True**；`(truncate nan)` 是 0，而
+> `np.array(nan).astype(bool)` 也是 **True**。截断表在 `|x| < 1` 与 NaN 两处
+> 全错，且错得无声。所以 `vt-astype` 在进特化表**之前**就把 `:bool` 目标
+> 分流到 `%to-bool`（`core.lisp`）。实测：
+>
+> ```lisp
+> (vt-to-list (vt-astype (vt-from-sequence #(0.5 -0.0 nan inf) ) :bool))  ; (1 0 1 1)
+> ```
+> 对应 `np.array([0.5,-0.0,nan,inf]).astype(bool)` → `[True False True True]`。
+
+**不变量 B1（布尔张量只含 0/1）**：任何 `dtype = :bool` 的张量，其每个字节必为
+0 或 1。所有「写进布尔数组」的路径都必须自己保证这一点：
+
+| 写入路径 | 保证方式 |
+|---|---|
+| `vt-astype ... :bool` | `%to-bool` 逐元素 `%bool-flag` |
+| `vt-arange` / `vt-linspace :dtype :bool` | 同上（`(vt-arange 3 :dtype :bool)` → `[False True True]`，与 `np.arange(3,dtype=bool)` 一致） |
+| 比较 / 逻辑 / 谓词 / 成员判定内核 | 内核返回 0/1（`%op-eq` 一族、`%op-logical-*`、`%membership-map`） |
+| 归约（`vt-any` / `vt-all` / `vt-isnan` …） | `+vt-mask-out-types+` 的输出类型矩阵用 `(unsigned-byte 8)` |
+| npy 读入 `\|b1` | 任何**非 0 字节**解成 1（`numpy` 只保证 0/1，但不保证别人的文件守规矩） |
+| 算术算子 | 见 §17.3 —— `+`/`*` 改派逻辑内核，`-` 直接报错 |
+
+> 之所以要把它写成不变量：`:bool` 的物理类型是无符号字节，负号或进位会**回绕**
+> 成一个仍在值域内的数（`-1` → 255），而写入路径是 `(safety 0)` 的，不会报错。
+> 一个含 255 的「布尔」张量会静默污染 `vt-where` 的掩码判定与 npy 落盘字节 ——
+> 这与「用 `:int8` 冒充布尔」是同一类隐患，只是更难发现。
+
+**打印与序列化**：
+
+* 打印走 `True` / `False` 字面量，表头写 `dtype:BOOL`（否则与 `:uint8` 无法区分，
+  这正是「类型不可区分」漏洞的可见形态）：
+  ```
+  #<VT shape:(2 2) dtype:BOOL
+    [[  True,  False],
+     [  True,   True]]>
+  ```
+* npy 描述符是 `|b1`（`%npy-dtype->descr` / `%npy-descr->dtype`），与
+  `numpy` 的 `np.bool_` 直接互通：`np.load` 读出 `dtype('bool')`。
+
+### 17.2 类型提升
+
+`:bool` 在提升里**不贡献位宽**，只在「全部操作数都是布尔」时才把结果留在 `:bool`
+（`%promote-real-dtype`，`dtype.lisp`）。逐格实测（NumPy 2.3.5）：
+
+| 运算 | 结果 dtype | NumPy 实测 |
+|---|---|---|
+| `bool ⊔ bool` | `:bool` | `np.result_type(np.bool_, np.bool_)` → `bool` |
+| `bool ⊔ int8` | `:int8` | `np.array([True])+np.array([0],np.int8)` → `int8` |
+| `bool ⊔ int16/32/64` | 同名宽度 | `int16` / `int32` / `int64` |
+| `bool ⊔ uint8/uint16` | 同名宽度 | `uint8` / `uint16` |
+| `bool ⊔ float32` | `:float32` | `float32` |
+| `bool ⊔ float64` | `:float64` | `float64` |
+
+**弱标量（NEP 50）的例外**（`%op-final-dtype`）：弱标量本来对任何 base 都
+「不改变 dtype」，但布尔 base 必须例外 —— 否则 `True + 1` 会留在 `:bool` 里存 2：
+
+| 表达式 | 结果 | NumPy 实测 |
+|---|---|---|
+| `bool张量 + 1`（弱整数） | `:int64` | `int64`（`np.array([True])+1`） |
+| `bool张量 + 1.0`（弱浮点） | `:float64` | `float64` |
+| `bool张量 + 1j`（弱复数） | `:complex128` | `complex128` |
+
+**归约的结果 dtype**（`%op-out-dtype`，`reduce-stats.lisp`）：
+
+| 归约 | `:bool` 输入 → 结果 | NumPy 实测 |
+|---|---|---|
+| `vt-any` / `vt-all` | `:bool`（全归约 → 0 维 `:bool`；带 `axis` → `:bool` 数组） | `np.any/np.all` → `bool_` |
+| `vt-sum` / `vt-prod` / `vt-nansum` / `vt-nanprod` | `:int64` | `int64` |
+| `vt-cumsum` / `vt-cumprod` | `:int64` | `int64` |
+| `vt-mean` / `vt-var` / `vt-std` / `vt-average` | `:float64` | `float64` |
+| `vt-amax` / `vt-amin` | `:bool`（单位元 1 / 0，见 `%small-int-extreme`） | `bool` |
+
+> **`vt-any` / `vt-all` 返回的是 0 维张量，不是 Lisp 布尔** —— 与
+> `vt-array-equal` / `vt-allclose` 不同（那两个对标 NumPy 里返回 **Python** `bool`
+> 的函数，故给 `T`/`NIL`）。取标量用 `(vt-item (vt-any ...))`。这条差异是
+> **刻意**的：`np.any` 返回 `np.bool_`（0 维数组语义），`np.allclose` 返回
+> `bool`（真标量），本库照抄两者各自的返回类别。
+
+### 17.3 布尔参与算术时的语义
+
+引入 `:bool` 后，`vt-+` 这类通用算术算子第一次可能**收到**布尔张量。若照整数算，
+`True + True = 2` 会直接写进布尔数组，破掉 §17.1 的不变量 B1。故算术入口按
+NumPy 的 `bool_` 语义分派（`elementwise.lisp`）：结果 dtype 为 `:bool` 且操作数
+全是布尔张量时，改派逻辑内核或报错。
+
+| 表达式 | NumPy 2.3.5 实测 | clvt | 落点 |
+|---|---|---|---|
+| `b + b` | `bool`，`True+True = True` | 逻辑或，`:bool` | `%bool-fold` + `%bool-or-op` |
+| `b * b` | `bool`，逻辑与 | 逻辑与，`:bool` | `%bool-fold` + `%bool-and-op` |
+| `b - b` / `-b` | **TypeError**（布尔减法未定义） | **报错**（提示用 `vt-logical-xor` / `vt-logical-not`） | `vt--` / `vt-sub` |
+| `b / b` / `b / 2` | `float64`（`[1., nan]`） | `float64` | `vt-/` 的 true_divide 提升 |
+| `b // b` | `int8` | `int8` | `vt-div` 显式落 `:int8` |
+| `b % b` | `int8` | `int8` | `vt-mod` 显式落 `:int8` |
+| `abs(b)` | `bool`（恒等） | `:bool`（恒等） | 无特化，天然正确 |
+| `maximum/minimum(b,b)` | `bool` | `:bool` | 同上 |
+| `b + 1` | `int64`（值 2） | `:int64`（值 2） | §17.2 弱标量例外 |
+
+数值目标是**逃生门**：显式 `:dtype :int8` 等仍走整数路径，得到引入 `:bool` 之前
+的旧结果（`(vt-+ b b :dtype :int8)` → `[2 2 0]`），保证已有代码逐位不变。
+
+**已知偏差（有意保留，非缺陷）**：
+
+| 项 | NumPy | clvt | 理由 |
+|---|---|---|---|
+| `b ** 2` | `int8` | `:int64` | NumPy 的 `power` 有一条历史遗留的 `bool ** int → int8` 专用循环，与 `2 ** b → int64` 自相矛盾。本库只保留统一的弱标量规则（§17.2），不复制这条循环 |
+| `vt-sign(b)` | **UFuncTypeError**（`sign` 无 bool 循环） | `:bool`（恒等） | 布尔没有「符号」，把它定义成恒等比抛错更符合 `sign` 的数学含义；且不破坏 B1 |
+| `matmul` / `outer(b, b)` | `bool`（按与/或缩并） | `:float64` | 缩并要求累加器，`bool` 累加器没有合法表示（和会越界）。NumPy 靠「按位与或」实现；本库暂不复制，结果与 `astype(float64) @ astype(float64)` 一致 |
+| `np.signbit(nan)` | `False`（Python 的 `nan` 是**正** QNaN） | `True` | 本库的规范 NaN 来自 x86 `0/0`，是**负** QNaN（`0xFFF8000000000000`）。`signbit` 读的是符号位本身，两边都没错；要对齐就给 NumPy 喂同一个负 NaN |
+
+### 17.4 返回布尔的函数清单
+
+「NumPy 返回 `bool_`」的函数，clvt 侧的缺省结果 dtype 一律 `:bool`。
+`dtype` 可显式覆盖（`§4` 的 `:out` 严格相等契约照旧生效）。
+
+| 族 | clvt 函数 | NumPy 对应 | 缺省 dtype |
+|---|---|---|---|
+| 真值归约 | `vt-any` / `vt-all` | `any` / `all` | `:bool` |
+| 内容测试 | `vt-isnan` / `vt-isinf` / `vt-isfinite` | `isnan` / `isinf` / `isfinite` | `:bool` |
+| 内容测试 | `vt-isposinf` / `vt-isneginf` / `vt-signbit` | `isposinf` / `isneginf` / `signbit` | `:bool` |
+| 比较 | `vt-=` `vt-/=` `vt-<` `vt-<=` `vt->` `vt->=` | `equal` `not_equal` `less` `less_equal` `greater` `greater_equal` | `:bool` |
+| 逻辑 | `vt-logical-and` / `-or` / `-not` / `-xor` | `logical_and/or/not/xor` | `:bool` |
+| 谓词 | `vt-positive-p` `vt-negative-p` `vt-zero-p` `vt-nonzero-p` `vt-even-p` `vt-odd-p` | （`>0` / `<0` / `==0` / `!=0` / `%2`） | `:bool` |
+| 关系检查 | `vt-isclose` | `isclose` | `:bool`（逐元素） |
+| 关系检查 | `vt-allclose` / `vt-array-equal` / `vt-array-equiv` | 同名 | **Lisp `T`/`NIL`**（对标 Python `bool`） |
+| 成员判定 | `vt-in1d` / `vt-isin` | `in1d` / `isin` | `:bool` |
+| 构造/转换 | `vt-astype ... :bool`、`vt-arange`/`vt-linspace :dtype :bool` | `astype(bool)`、`arange(dtype=bool)` | `:bool` |
+
+**不适用（尚无对应能力，不要硬造）**：
+
+| NumPy | 原因 |
+|---|---|
+| `np.isnat` | 本库没有 datetime / timedelta dtype，`NaT` 无从谈起。等引入日期类型时再补 |
+| `np.isscalar` | 本库的「标量」是 Lisp 数（`numberp` / `%scalar-kind`），不是张量属性；`np.isscalar(0-d数组)` 是 False 这条语义在 Lisp 侧没有概念承载 |
+| `np.char.*` / `np.strings.*` | 本库没有字符串 dtype（元素类型全是数值/复数/布尔） |
+| `np.iscomplex` / `np.isreal`（逐元素） | 元素级「是不是复数」在 `interleaved` 存储下恒真/恒假，无信息量；本库提供的是**整数组**判定 `vt-iscomplexobj` / `vt-isrealobj`（对标 `np.iscomplexobj` / `np.isrealobj`，返回 Lisp 布尔） |
+
+### 17.5 掩码消费方与执行层
+
+布尔张量的**唯一用途**是当掩码，因此「吃掩码」的函数必须能认出 `:bool`，
+且不能因此掉进慢路径：
+
+| 消费方 | 对 `:bool` 的处理 |
+|---|---|
+| `vt-where` / `vt-select` | 掩码类型矩阵 `+vt-mask-out-types+` 由 `(signed-byte 8)` 改为 `(unsigned-byte 8)`；`%select-fast` 的 `macrolet` 同时展开有符号与无符号两种掩码，否则会退回 `vt-map`（实测慢约 8×） |
+| `vt-compress` | 直接按非零判定，`0/1` 与 `T/F` 等价 |
+| `vt-count-nonzero` / `vt-count` | 用 `:bool` 掩码再 `vt-sum`（升 `:int64`），不再借道 `:float64` |
+| `vt-nonzero` / `vt-argwhere` | 按非零判定，与 `np.nonzero` 同 |
+| 归约内核 | `def-vt-reduce` 的 `all`/`any` 小整型分支按**字面量**展开（`+small-int-lts+` 逐项），不能把运行期变量名塞进类型声明 —— 那会生成 `undefined type` 的静默慢路径 |
+
+执行层的一条硬约束（承 §1 铁律）：**`dtype` 变化只影响选路与写回宽度，不影响结果**。
+`(vt-= a b)` 与 `(vt-= a b :dtype :int8)` 的布尔值必须逐个相等，差别只在落盘宽度 ——
+差分探针（`differential-probes-test{,2}.lisp`）用两种 dtype 各跑一遍来钉这条。
+
+### 17.6 向后兼容
+
+`:bool` 是**新增** dtype，不删不改任何旧入口：
+
+| 旧写法 | 现在的结果 |
+|---|---|
+| `(vt-= a b)` | 结果 dtype 由 `:int8` 变为 `:bool`（**唯一的行为变化**，值仍是 0/1） |
+| `(vt-= a b :dtype :int8)` | 与引入 `:bool` 之前逐位相同 |
+| 吃 `:int8` 掩码的既有代码 | `vt-where` / `vt-compress` / `vt-select` 对 `:int8` 掩码照旧工作（掩码判定只看非零） |
+| `vt-promote-type` 调用点 | `:bool` 落在整数族之下，任何含数值 dtype 的提升结果与旧表完全一致（§3.2 的 64 格未变） |
+
+> **升级提示**：若既有代码对比较结果做了算术（`(vt-+ (vt-= a b) (vt-= c d))`），
+> 现在会得到 **逻辑或** 而不是 `2`。这正是 NumPy 的语义；要旧行为就显式
+> `:dtype :int8`。若既有代码对比较结果做减法，现在会**报错**（§17.3）。
+
+### 17.7 示例脚本的连带修复
+
+`example/` 下的两个文件（`example.lisp` 6898 行 / 106 个 `test-*` 函数、
+`clvt-perf-test-examples.lisp` 96 条断言 + 约 60 项基准）此前不进任何自动化，
+跑通与否无人知晓。把 `:bool` 落进去之后跑这两个文件，翻出三处示例自身的缺陷
+—— 全部是**示例错、实现对**，但它们此前一直静默：
+
+| 位置 | 现象 | 根因 | 处理 |
+|---|---|---|---|
+| `example.lisp` 9 处 | `(assert (vt-all X))` **恒真** | `assert` 只判条件是否为 NIL，而 `vt-all` 返回 VT 对象，任何 VT 对象都不为 NIL | 新增 `vt-all-true-p`（`(= 1 (vt-item (vt-all x)))`）并替换 |
+| `example.lisp` 4027–4028 | 真断言一开就失败 | 「全 NaN 时 `nanmax`/`nanmin` 返回什么」的期望写成了 `±Inf`；NumPy 返回 **NaN**（`All-NaN slice encountered`），clvt 本来就一致 | 改断言为 `vt-isnan`，删掉猜测式注释 |
+| `clvt-perf-test-examples.lisp` 基准 | `extract` 216783 µs，且结果**不是** `a[mask]` | 参数顺序反了：写成 `(vt-extract a mask)`，即 1M 个 float 当条件、0/1 掩码当数据源 | 改为 `(vt-extract mask a)`（对标 `numpy.extract(condition, arr)`），耗时降到 21185 µs |
+
+由此新增门禁套件 `test/example-smoke-test.lisp`（已登记进 `test/run-tests.sh`
+的 `DEFAULT_ORDER`）：把两个示例当回归跑一遍，**只跑断言、不跑基准**——基准的
+绝对值随机器与 GC 漂移，做门禁会变成间歇性红灯；需要基准时手动
+`(clvt-examples:run)`。
+
+两条可以推广的教训：
+
+* **恒真断言比没有断言更危险**。没有断言时人知道自己没测；`(assert <非 NIL
+  对象>)` 看起来像在测，实际恒过 —— 它把「没测」伪装成「测过」，而且换成
+  `:bool` 之后连返回值语义都变了，断言文本却一个字没改。
+* **示例里的参数顺序错误会伪装成性能问题**。`(vt-extract a mask)` 慢 10 倍，
+  很容易被归因成「`vt-extract` 实现差」而去动内核；真正的原因是它在拿
+  1M 个 float 逐元素判真。
 
 ---
 

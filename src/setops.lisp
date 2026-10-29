@@ -49,11 +49,12 @@
     h))
 
 (defun %membership-map (elem table float-mode invert)
-  "对 ELEM 逐元素查表，返回 :int8 的 0/1（INVERT 时取反）。"
+  "对 ELEM 逐元素查表，返回 **:bool** 张量（INVERT 时取反）。
+   与 numpy 一致：`in1d` / `isin` 返回 bool_ 数组，不是整数掩码（§17）。"
   (vt-map (lambda (x)
             (let ((hit (if (gethash (%membership-key x float-mode) table) 1 0)))
               (if invert (- 1 hit) hit)))
-          elem :dtype :int8))
+          elem :dtype :bool))
 
 ;;; ==================================================================
 ;;; 唯一值（vt-unique）
@@ -446,8 +447,8 @@
     (vt-from-sequence (vt-numpy-sort merged #'<) :dtype dt)))
 
 (defun vt-in1d (t1 t2)
-  "逐元素判定是否属于 TEST（对标 numpy.in1d）。返回与元素形状相同的布尔张量。
-   dtype 为 :int8（F4：比较/逻辑结果一律 :int8）。
+  "逐元素判定是否属于 TEST（对标 numpy.in1d）。返回与元素形状相同的
+   **:bool** 布尔张量（§17）。
    v0.4.1 修复（差分测试 R7）：此前返回 :float64。
    v0.4.2 性能修复：哈希会员判定，O(n+m)（原 O(n×m)，1M×1k 需 87s）。"
   (when (%cx-any-p t1 t2)

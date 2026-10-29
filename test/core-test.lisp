@@ -622,41 +622,41 @@
 
 (section "⑥ 比较与逻辑 (149-171)")
 
-;; §3.1 / F4：比较运算返回 :int8 承载布尔（0/1）
-(check "vt-=(149): 相等→int8 0/1（F4）"
+;; §17：比较/逻辑/谓词返回 :bool 布尔张量（显式 :dtype :int8 仍可退回旧掩码）
+(check "vt-=(149): 相等→:bool（§17）"
   (vt-= (vt-from-sequence '(1 2) :dtype :int32) (vt-from-sequence '(1 3) :dtype :int32))
-  '(1 0) :dtype :int8)
-(check "vt-/=(150): 不等" (vt-/= (vt-ones '(2)) (vt-ones '(2))) '(0 0) :dtype :int8)
-(check "vt-<(151): 小于" (vt-< (vt-const '(2) 1.0d0) (vt-const '(2) 2.0d0)) '(1 1) :dtype :int8)
-(check "vt-<=(152): 小于等于" (vt-<= (vt-ones '(2)) (vt-ones '(2))) '(1 1) :dtype :int8)
-(check "vt->(153): 大于" (vt-> (vt-const '(2) 2.0d0) (vt-const '(2) 1.0d0)) '(1 1) :dtype :int8)
-(check "vt->=(154): 大于等于" (vt->= (vt-ones '(2)) (vt-ones '(2))) '(1 1) :dtype :int8)
-(check "vt-positive-p(155): >0→1（int8）"
-  (vt-positive-p (vt-from-sequence '(2.0d0 -2.0d0))) '(1 0) :dtype :int8)
+  '(1 0) :dtype :bool)
+(check "vt-/=(150): 不等" (vt-/= (vt-ones '(2)) (vt-ones '(2))) '(0 0) :dtype :bool)
+(check "vt-<(151): 小于" (vt-< (vt-const '(2) 1.0d0) (vt-const '(2) 2.0d0)) '(1 1) :dtype :bool)
+(check "vt-<=(152): 小于等于" (vt-<= (vt-ones '(2)) (vt-ones '(2))) '(1 1) :dtype :bool)
+(check "vt->(153): 大于" (vt-> (vt-const '(2) 2.0d0) (vt-const '(2) 1.0d0)) '(1 1) :dtype :bool)
+(check "vt->=(154): 大于等于" (vt->= (vt-ones '(2)) (vt-ones '(2))) '(1 1) :dtype :bool)
+(check "vt-positive-p(155): >0→1（:bool）"
+  (vt-positive-p (vt-from-sequence '(2.0d0 -2.0d0))) '(1 0) :dtype :bool)
 (check "vt-negative-p(156): <0→1"
-  (vt-negative-p (vt-from-sequence '(2.0d0 -2.0d0))) '(0 1) :dtype :int8)
+  (vt-negative-p (vt-from-sequence '(2.0d0 -2.0d0))) '(0 1) :dtype :bool)
 (check "vt-zero-p(157): =0→1"
-  (vt-zero-p (vt-from-sequence '(0.0d0 1.0d0))) '(1 0) :dtype :int8)
+  (vt-zero-p (vt-from-sequence '(0.0d0 1.0d0))) '(1 0) :dtype :bool)
 (check "vt-nonzero-p(158): ≠0→1"
-  (vt-nonzero-p (vt-from-sequence '(0.0d0 1.0d0))) '(0 1) :dtype :int8)
+  (vt-nonzero-p (vt-from-sequence '(0.0d0 1.0d0))) '(0 1) :dtype :bool)
 (check "vt-even-p(159): 偶数→1"
-  (vt-even-p (vt-from-sequence '(2 3) :dtype :int64)) '(1 0) :dtype :int8)
+  (vt-even-p (vt-from-sequence '(2 3) :dtype :int64)) '(1 0) :dtype :bool)
 (check "vt-odd-p(160): 奇数→1"
-  (vt-odd-p (vt-from-sequence '(2 3) :dtype :int64)) '(0 1) :dtype :int8)
+  (vt-odd-p (vt-from-sequence '(2 3) :dtype :int64)) '(0 1) :dtype :bool)
 (check "vt-logical-and(161): 逻辑与"
-  (vt-logical-and (vt-from-sequence '(1 0 1) :dtype :int8)
+  (vt-logical-and (vt-from-sequence '(1 0 1) :dtype :bool)
                   (vt-from-sequence '(1 1 0) :dtype :int8))
-  '(1 0 0) :dtype :int8)
+  '(1 0 0) :dtype :bool)
 (check "vt-logical-or(162): 逻辑或"
-  (vt-logical-or (vt-from-sequence '(1 0 0) :dtype :int8)
+  (vt-logical-or (vt-from-sequence '(1 0 0) :dtype :bool)
                  (vt-from-sequence '(0 1 0) :dtype :int8))
-  '(1 1 0) :dtype :int8)
+  '(1 1 0) :dtype :bool)
 (check "vt-logical-not(163): 逻辑非"
-  (vt-logical-not (vt-from-sequence '(1 0) :dtype :int8)) '(0 1) :dtype :int8)
+  (vt-logical-not (vt-from-sequence '(1 0) :dtype :int8)) '(0 1) :dtype :bool)
 (check "vt-logical-xor(164): 逻辑异或"
-  (vt-logical-xor (vt-from-sequence '(1 1 0) :dtype :int8)
+  (vt-logical-xor (vt-from-sequence '(1 1 0) :dtype :bool)
                   (vt-from-sequence '(1 0 0) :dtype :int8))
-  '(0 1 0) :dtype :int8)
+  '(0 1 0) :dtype :bool)
 (check "vt-all(165): 全真→1" (vt-all (vt-ones '(2 2))) 1)
 (check "vt-all(165): axis 归约" (vt-to-list (vt-all (vt-from-sequence '((1 0)) :dtype :int8) :axis 0)) '(1 0))
 (check "vt-any(166): 存在真→1" (vt-any (vt-from-sequence '(0 0 1) :dtype :int8)) 1)
@@ -670,11 +670,20 @@
 (check-false "vt-allclose(168): 有元素不接近→假"
   (= (vt-item (vt-all (vt-isclose (vt-ones '(3)) (vt-const '(3) 2.0d0)))) 1))
 (check "vt-isfinite(169): 有限→1，Inf/NaN→0"
-  (vt-isfinite (vt-from-sequence (list 1.0d0 +inf+ +nan+))) '(1 0 0) :dtype :int8)
+  (vt-isfinite (vt-from-sequence (list 1.0d0 +inf+ +nan+))) '(1 0 0) :dtype :bool)
 (check "vt-isinf(170): Inf→1（含 ±Inf）"
-  (vt-isinf (vt-from-sequence (list +inf+ +ninf+ 0.0d0))) '(1 1 0) :dtype :int8)
+  (vt-isinf (vt-from-sequence (list +inf+ +ninf+ 0.0d0))) '(1 1 0) :dtype :bool)
 (check "vt-isnan(171): NaN→1"
-  (vt-isnan (vt-from-sequence (list +nan+ 1.0d0))) '(1 0) :dtype :int8)
+  (vt-isnan (vt-from-sequence (list +nan+ 1.0d0))) '(1 0) :dtype :bool)
+(check "vt-=(149): 显式 :dtype :int8 仍可用（§17.6）"
+  (vt-= (vt-from-sequence '(1 2) :dtype :int32) (vt-from-sequence '(1 3) :dtype :int32)
+        :dtype :int8)
+  '(1 0) :dtype :int8)
+(check "vt-logical-and(161): 显式 :dtype :int8 仍可用（§17.6）"
+  (vt-logical-and (vt-from-sequence '(1 0) :dtype :int8)
+                  (vt-from-sequence '(1 1) :dtype :int8)
+                  :dtype :int8)
+  '(1 0) :dtype :int8)
 
 ;;; ================================================================
 ;;; 第 7 部分：归约与统计（导出符号 172–200）

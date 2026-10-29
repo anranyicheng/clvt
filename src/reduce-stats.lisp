@@ -50,6 +50,9 @@
       (:int8    '(signed-byte 8))
       (:uint8   '(unsigned-byte 8))
       (:uint16  '(unsigned-byte 16))
+      ;; :bool 与 :uint8 共用物理存储（§17.1）；归约内核只按元素类型特化，
+      ;; 因此布尔输入天然复用 (unsigned-byte 8) 的那套内核。
+      (:bool    '(unsigned-byte 8))
       (t nil)))
 
   (defun %et->lt (in-et)
@@ -93,12 +96,15 @@
 
   (defun %small-int-extreme (dtype which)
     "小整型 dtype 的可表示极值（which=:min 取最小值，:max 取最大值）。
-     运行时辅助，供 %kernel-small-general 的 max/min 初始化使用。"
+     运行时辅助，供 %kernel-small-general 的 max/min 初始化使用。
+     `:bool` 的极值是 0 / 1：布尔归约的 max 单位元为 0（False）、
+     min 单位元为 1（True），与 numpy 的 `np.max(bool_array)` 一致。"
     (ecase dtype
       (:int8   (if (eq which :min) -128  127))
       (:int16  (if (eq which :min) -32768 32767))
       (:uint8  (if (eq which :min) 0     255))
-      (:uint16 (if (eq which :min) 0     65535))))
+      (:uint16 (if (eq which :min) 0     65535))
+      (:bool   (if (eq which :min) 0     1))))
 
   (defun %cast-form (lt form)
     (cond ((eq lt 'double-float) `(coerce ,form 'double-float))
@@ -149,15 +155,18 @@
   
   (defun %op-out-dtype (op in-dtype)
     (case op
-      ;; numpy 逻辑归约返回 bool → 承载为 :int8（F4 契约）。
-      ;; v0.4.x 修复：原返回 :int64 违反 F4（全量归约路径已为 :int8）。
-      ((:all :any) :int8)
+      ;; numpy 的逻辑归约返回 bool_（§17）：全归约给 0 维 :bool 张量，
+      ;; 沿轴归约给 :bool 数组。此前承载为 :int8，导致 `vt-all` 的结果
+      ;; 能被当成整数继续算术（True+True=2），语义立刻跑偏。
+      ((:all :any) :bool)
       ;; numpy 的 argmax/argmin 返回 intp（64 位平台为 int64）；
       ;; 修正（审查 P2#1）：原实现返回 :int32，与 numpy 不符。
       ((:argmax :argmin :nanargmax :nanargmin) :int64)
       ((:sum :prod :nansum :nanprod)
        (case in-dtype
-         ((:int8 :uint8 :int16 :uint16 :int32) :int64)
+         ;; numpy：整数与布尔的 sum/prod 一律提升到 int64（bool 也是「整数类」，
+         ;; `np.sum(np.array([True,True]))` 是 2，dtype int64）。
+         ((:bool :int8 :uint8 :int16 :uint16 :int32) :int64)
          (t in-dtype)))
       (t in-dtype)))
 
@@ -606,14 +615,17 @@
                                     collect
                                     `((equal res-lt ',rlt)
                                       (,kernel-macro ,op ,lt ,rlt)))
-                            ;; v0.4.x：逻辑归约（all/any）结果为 :int8（F4 契约，
-                            ;; 原 :int64 违反「比较/逻辑返回 int8」约定）。
-                            ;; all/any 的累加器恒为 0/1，int8 不会溢出；内核宏
-                            ;; 对 res-lt 全参数化，按 int8 字面量生成实例即可
-                            ;; （sum/prod 等需要大累加域的算子不开放此路径）。
-                            ((and (member ',op '(:all :any))
-                                  (member res-lt +small-int-lts+ :test #'equal))
-                             (,kernel-macro ,op ,lt (signed-byte 8)))
+                            ;; all/any 的累加器恒为 0/1，窄整型不会溢出；内核宏
+                            ;; 对 res-lt 全参数化，按**字面量** res-lt 生成实例
+                            ;; （:bool 的物理类型是 (unsigned-byte 8)，与 :uint8
+                            ;; 同格；写死 (signed-byte 8) 会让内核里的
+                            ;; `(the (simple-array …))` 断言与真实缓冲区不符）。
+                            ;; sum/prod 等需要大累加域的算子不开放此路径。
+                            ,@(loop for rlt in +small-int-lts+
+                                    collect
+                                    `((and (member ',op '(:all :any))
+                                           (equal res-lt ',rlt))
+                                      (,kernel-macro ,op ,lt ,rlt)))
                             (t (error "unsupported output dtype ~a" res-lt)))))
                 (t (error "unsupported input dtype ~a" in-et)))))
       `(defun ,impl-name (tensor &key axis keepdims dtype out)
@@ -718,8 +730,9 @@
                                                      `((equal lt ',l)
                                                        ,(%op-init op l rlt)))
                                              (t 0))))
-                                 ;; v0.4.x：all/any 小整型输出（:int8）——
-                                 ;; 单位元与 int64 相同（all→1 / any→0）
+                                 ;; all/any 的窄整型输出（:bool 的物理类型
+                                 ;; 也在这一格里）——单位元与 int64 相同
+                                 ;; （all→1 / any→0）
                                  ((and (member ',op '(:all :any))
                                        (member res-lt +small-int-lts+ :test #'equal))
                                   (cond
@@ -880,8 +893,9 @@
 ;;;
 ;;; 类型声明（性能）：这三个函数原本以 lambda 形式交给 vt-map，
 ;;; 循环体里没有任何类型信息（泛型 aref + 装箱 funcall + 泛型 cast），
-;;; 而结果 dtype 固定 :int8，正落在 %vt-mask1-fast 的「窄整型输出」
-;;; 矩阵（double/single/int64/int32 进 → int8 出）内。
+;;; 而结果 dtype 固定 :bool（物理 (unsigned-byte 8)），正落在
+;;; %vt-mask1-fast 的「窄整型输出」矩阵
+;;; （double/single/int64/int32 进 → (unsigned-byte 8) 出）内。
 ;;; 改成具名 inline 算子后即可命中该特化循环。
 ;;; ------------------------------------------------------------------
 (declaim (inline %op-isfinite %op-isinf %op-isnan))
@@ -893,10 +907,10 @@
 (defun %op-isnan (x) (if (%nan-p x) 1 0))
 
 (defun vt-isclose (t1 t2 &key (rtol 1e-5) (atol 1e-8) out)
-  "逐元素判断 |a - b| <= atol + rtol*|b|，返回 :int8 布尔张量（1/0）。
+  "逐元素判断 |a - b| <= atol + rtol*|b|，返回 **:bool** 布尔张量（§17）。
    v0.4.x 修复两点：
      1) 公式原用 max(|a|,|b|)，与 numpy.isclose 的 |b| 不一致，已对齐；
-     2) 结果 dtype 原误为 :float64，违反 F4（比较返回 :int8），已修正。
+     2) 结果 dtype 原误为 :float64，违反「比较返回布尔」，已修正。
    NaN 恒不接近（numpy 默认 equal_nan=False）；±Inf 仅与相等的 ±Inf 接近。
    RTOL/ATOL 缺省 1e-5 / 1e-8（float64 计算精度，对标 numpy 内部实现）。
 
@@ -907,10 +921,10 @@
     (let* ((a (ensure-vt t1)) (b (ensure-vt t2))
            (out-shape (vt-broadcast-shapes (vt-shape a) (vt-shape b)))
            (res (if out
-                    (vt-check-out out out-shape :int8 :op-name "vt-isclose")
-                    (make-vt out-shape 0 :dtype :int8))))
+                    (vt-check-out out out-shape :bool :op-name "vt-isclose")
+                    (make-vt out-shape 0 :dtype :bool))))
       (macrolet ((close-kernel (lt)
-                   `(let ((od (the (simple-array (signed-byte 8) (*)) (vt-data res)))
+                   `(let ((od (the (simple-array (unsigned-byte 8) (*)) (vt-data res)))
                           (d0 (the (simple-array ,lt (*)) (vt-data a)))
                           (d1 (the (simple-array ,lt (*)) (vt-data b)))
                           (rt (coerce rtol 'double-float))
@@ -918,7 +932,7 @@
                           (n (the fixnum (vt-size res)))
                           (p0 (the fixnum (vt-offset a)))
                           (p1 (the fixnum (vt-offset b))))
-                      (declare (type (simple-array (signed-byte 8) (*)) od)
+                      (declare (type (simple-array (unsigned-byte 8) (*)) od)
                                (type (simple-array ,lt (*)) d0 d1)
                                (type double-float rt at)
                                (type fixnum n p0 p1))
@@ -933,8 +947,8 @@
                                                  (+ at (* rt (abs y))))
                                              1 0)))))))))
         (let ((et (array-element-type (vt-data a))))
-          (when (and (eq (vt-dtype res) :int8)
-                     (equal (array-element-type (vt-data res)) '(signed-byte 8))
+          (when (and (eq (vt-dtype res) :bool)
+                     (equal (array-element-type (vt-data res)) '(unsigned-byte 8))
                      (eq (vt-offset res) 0)
                      (equal (vt-strides res) (vt-compute-strides out-shape))
                      (vt-contiguous-p a) (vt-contiguous-p b)
@@ -959,36 +973,41 @@
                       (t (if (<= (abs (- fa fb))
                                  (+ atol (* rtol (abs fb))))
                              1 0)))))
-            t1 t2 :dtype :int8 :out out)))
+            t1 t2 :dtype :bool :out out)))
 
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
-  "判断两个张量在 RTOL/ATOL 容差下是否全部相等（对标 numpy.allclose），返回布尔。"
-  (= (vt-item (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol))) 1.0d0))
+  "判断两个张量在 RTOL/ATOL 容差下是否全部相等（对标 numpy.allclose），
+   返回 **Lisp 布尔值**（numpy 返回 Python bool，不是 0-d 数组）。
+   判据取 vt-all 的 :bool 结果的真值，而不是和 1.0d0 比大小 —— 后者对
+   任何非 1 的数值都会静默给 NIL，把「0/1 承载」的假设固化进调用方。"
+  (not (zerop (vt-item (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol))))))
 
 (defun vt-isfinite (vt &key out)
-  "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回 int8 布尔张量（1/0）。
-      dtype 固定 :int8（承载布尔语义，CONVENTIONS §3.1）。"
+  "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回 **:bool** 布尔张量。
+      dtype 固定 :bool（对标 numpy.isfinite，CONVENTIONS §17）。"
   (when (%cx-any-p vt)
     (return-from vt-isfinite
       (vt-fast-map (function %cx-finite-flag) (ensure-vt vt)
-                   :out out :dtype :int8)))
-  (vt-fast-map #'%op-isfinite vt :dtype :int8 :out out))
+                   :out out :dtype :bool)))
+  (vt-fast-map #'%op-isfinite vt :dtype :bool :out out))
 
 (defun vt-isinf (vt &key out)
-  "逐元素判断是否为 ±Inf，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
+  "逐元素判断是否为 ±Inf，返回 **:bool** 布尔张量。dtype 固定 :bool。"
   (when (%cx-any-p vt)
     (return-from vt-isinf
       (vt-fast-map (function %cx-inf-flag) (ensure-vt vt)
-                   :out out :dtype :int8)))
-  (vt-fast-map #'%op-isinf vt :dtype :int8 :out out))
+                   :out out :dtype :bool)))
+  (vt-fast-map #'%op-isinf vt :dtype :bool :out out))
 
 (defun vt-isnan (vt &key out)
-  "逐元素判断是否为 NaN，返回 int8 布尔张量（1/0）。dtype 固定 :int8。"
+  "逐元素判断是否为 NaN，返回 **:bool** 布尔张量。dtype 固定 :bool。
+   NaN 判定与 dtype 无关：整数/布尔输入恒为 False（numpy 同样如此，
+   整数数组不可能含 NaN，只是本库不为此报错）。"
   (when (%cx-any-p vt)
     (return-from vt-isnan
       (vt-fast-map (function %cx-nan-flag) (ensure-vt vt)
-                   :out out :dtype :int8)))
-  (vt-fast-map #'%op-isnan vt :dtype :int8 :out out))
+                   :out out :dtype :bool)))
+  (vt-fast-map #'%op-isnan vt :dtype :bool :out out))
 
 ;;; ------------------------------------------------------------------
 ;;; 均值 / 方差 / 标准差
@@ -1065,7 +1084,8 @@
              (weighted-sum (vt-sum prod :axis axis :keepdims keepdims))
              (sum-weights (vt-item (vt-sum weights)))
              (in-dtype (vt-dtype weighted-sum))
-             (need-promote (member in-dtype '(:int32 :int64 :int16 :int8 :uint8 :uint16)))
+             (need-promote (member in-dtype '(:bool :int32 :int64 :int16 :int8
+                                             :uint8 :uint16)))
              ;; ---- 结果 dtype：输入提升 + 显式 :dtype，不由 out 决定 ----
              (final-dtype (cond (dtype dtype)
                                 (need-promote :float64)
@@ -1247,7 +1267,8 @@
          ;; sum/prod 一致。
          (final-dtype (or dtype
                           (case (vt-dtype tensor)
-                            ((:int8 :uint8 :int16 :uint16 :int32) :int64)
+                            ;; 布尔与窄整型一致：cumsum(bool) 在 numpy 里是 int64。
+                            ((:bool :int8 :uint8 :int16 :uint16 :int32) :int64)
                             (t (vt-dtype tensor)))))
          (lisp-type (vt-dtype->lisp-type final-dtype))
          ;; 结果形状（逻辑契约）：numpy 在 axis=None 时先展平再累积。

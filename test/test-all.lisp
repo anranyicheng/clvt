@@ -914,7 +914,9 @@
     (check-eq "vt-nonzero-p" (vt-to-list (vt-nonzero-p a)) '(1 1 0))
     (check-eq "vt-even-p" (vt-to-list (vt-even-p a)) '(0 1 1))
     (check-eq "vt-odd-p" (vt-to-list (vt-odd-p a)) '(1 0 0))
-    (check-dtype "谓词默认 :int8 承载布尔（§9.2）" (vt-positive-p a) :int8))
+    (check-dtype "谓词默认 :bool 布尔（§17）" (vt-positive-p a) :bool)
+    ;; 向后兼容：显式 :dtype 仍可取旧的 0/1 整型掩码
+    (check-dtype "谓词显式 :int8 仍可用（§17.6）" (vt-positive-p a :dtype :int8) :int8))
   (let ((x (vt-from-sequence '(1 0 2) :dtype :int64))
         (y (vt-from-sequence '(0 3 2) :dtype :int64)))
     (check-eq "vt-logical-and" (vt-to-list (vt-logical-and x y)) '(0.0d0 0.0d0 1.0d0))
@@ -966,10 +968,11 @@
             '(2.0d0 3.0d0)))
 
 (deftest test-arith-comparisons
-    "elementwise: vt-= /= < <= > >= 全部返回 :int8 0/1（§9.2）"
+    "elementwise: vt-= /= < <= > >= 全部返回 :bool（§17）"
   (let ((a (vt-from-sequence '(1.0d0 2.0d0 3.0d0)))
         (b (vt-from-sequence '(1.0d0 0.0d0 3.0d0))))
-    (check-dtype "vt-= 默认 :int8" (vt-= a b) :int8)
+    (check-dtype "vt-= 默认 :bool" (vt-= a b) :bool)
+    (check-dtype "vt-= 显式 :int8 仍可用（§17.6）" (vt-= a b :dtype :int8) :int8)
     (check-eq "vt-=" (vt-to-list (vt-= a b)) '(1 0 1))
     (check-eq "vt-/=（不等，CL 风格命名）" (vt-to-list (vt-/= a b)) '(0 1 0))
     (check-eq "vt-<" (vt-to-list (vt-< a b)) '(0 0 0))

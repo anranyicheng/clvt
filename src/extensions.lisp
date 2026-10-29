@@ -3,13 +3,16 @@
 (in-package :clvt)
 
 (defun vt-count-nonzero (tensor &key axis keepdims (dtype :int64))
-  "统计非零元素个数。"
-  (vt-sum (vt-nonzero-p tensor :dtype :float64)
+  "统计非零元素个数（对标 numpy.count_nonzero）。
+   掩码用 :bool（§17），sum 再升到 DTYPE —— 此前把掩码转成 :float64 再求和，
+   对「布尔→浮点」的隐式转换只是为了绕过 :int8 掩码的整数语义。"
+  (vt-sum (vt-nonzero-p tensor)
 	  :axis axis :keepdims keepdims :dtype dtype))
 
 (defun vt-count (tensor value &key axis keepdims (dtype :int64))
-  "统计等于 value 的元素个数。"
-  (vt-sum (vt-= tensor value :dtype :float64)
+  "统计等于 VALUE 的元素个数（对标 (a == v).sum()）。
+   比较结果是 :bool（§17），sum 再升到 DTYPE。"
+  (vt-sum (vt-= tensor value)
 	  :axis axis :keepdims keepdims :dtype dtype))
 
 (defun vt-clip-tensor (tensor vmin vmax &key out dtype)

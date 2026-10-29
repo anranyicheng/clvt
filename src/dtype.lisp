@@ -4,11 +4,11 @@
 
 (defparameter *vt-dtypes*
   '(:complex128 :complex64
-    :float64 :float32 :int64 :int32 :int16 :int8 :uint8 :uint16)
+    :float64 :float32 :int64 :int32 :int16 :int8 :uint8 :uint16 :bool)
   "库内识别到的 dtype 全集（前 6 者为物理存储类型）。
-   顺序约定：宽 → 窄、类别由高到低（复数 > 浮点 > 整数），与
+   顺序约定：宽 → 窄、类别由高到低（复数 > 浮点 > 整数 > 布尔），与
    `+vt-elem-types+` 的「命中概率降序」排序保持同一风格。
-   complex 见 CONVENTIONS §16。")
+   complex 见 CONVENTIONS §16，bool 见 §17。")
 
 (defparameter *vt-storage-dtypes*
   '(:complex128 :complex64 :float64 :float32 :int64 :int32)
@@ -20,10 +20,12 @@
 
 (declaim
  (inline vt-dtype-p vt-float-dtype-p vt-int-dtype-p vt-storage-dtype-p
-         vt-complex-dtype-p vt-complex-real-dtype))
+         vt-complex-dtype-p vt-bool-dtype-p vt-complex-real-dtype))
 
 (defun vt-dtype->lisp-type (dtype)
-  "将内部 dtype 符号映射为 Common Lisp 数组元素类型。"
+  "将内部 dtype 符号映射为 Common Lisp 数组元素类型。
+   `:bool` 与 `:uint8` 共用 `(unsigned-byte 8)` 物理存储（见 §17）：
+   布尔值以 0/1 承载，1 字节，与 numpy 的 `bool_` 尺寸一致。"
   (declare (optimize (speed 3) (safety 0)))
   (ecase dtype
     (:complex128 '(complex double-float))
@@ -35,7 +37,8 @@
     (:int16   '(signed-byte 16))
     (:int8    '(signed-byte 8))
     (:uint8   '(unsigned-byte 8))
-    (:uint16  '(unsigned-byte 16))))
+    (:uint16  '(unsigned-byte 16))
+    (:bool    '(unsigned-byte 8))))
 
 (defun vt-dtype-itemsize (dtype)
   "返回每个元素的字节大小（复数 = 2 × 分量宽度，interleaved 存储）。"
@@ -50,15 +53,16 @@
     (:int16   2)
     (:int8    1)
     (:uint8   1)
-    (:uint16  2)))
+    (:uint16  2)
+    (:bool    1)))
 
 (defun vt-dtype-p (x)
-  "判定 X 是否为合法逻辑 dtype（见 *vt-dtypes*，共 8 种）。"
+  "判定 X 是否为合法逻辑 dtype（见 *vt-dtypes*，共 11 种：9 种非复数 + 2 种复数）。"
   (declare (optimize (speed 3) (safety 0)))
   (not (null (member x *vt-dtypes*))))
 
 (defun vt-storage-dtype-p (x)
-  "判定 X 是否为物理存储 dtype（见 *vt-storage-dtypes*，共 4 种：float64/float32/int64/int32）。"
+  "判定 X 是否为物理存储 dtype（见 *vt-storage-dtypes*，共 6 种：complex128/complex64/float64/float32/int64/int32）。"
   (declare (optimize (speed 3) (safety 0)))
   (not (null (member x *vt-storage-dtypes*))))
 
@@ -71,6 +75,17 @@
   "判定 DTYPE 是否为复数类型（:complex64 / :complex128）。CONVENTIONS §16.1。"
   (declare (optimize (speed 3) (safety 0)))
   (member dtype '(:complex64 :complex128)))
+
+(defun vt-bool-dtype-p (dtype)
+  "判定 DTYPE 是否为布尔类型（:bool）。CONVENTIONS §17。
+
+   `:bool` 是**逻辑 dtype**，物理存储与 `:uint8` 相同（(unsigned-byte 8)，
+   1 字节，取值只是 0/1）。它存在的理由是语义：比较、逻辑、谓词类函数
+   在 numpy 里返回 `bool_`，而在算术语义里布尔**不能**被当成整数参与
+   算术（`True + True` 在 numpy 里仍按逻辑或给 True，`sum(bool)` 则升到
+   int64）。把返回值标成 `:int8` 时这两种语义都表达不出来。"
+  (declare (optimize (speed 3) (safety 0)))
+  (eq dtype :bool))
 
 (defun vt-complex-real-dtype (dtype)
   "复数 dtype → 其分量的实数 dtype（:complex128→:float64，:complex64→:float32）。
@@ -118,17 +133,21 @@
 
 (declaim (inline %dtype-kind))
 (defun %dtype-kind (dtype)
-  "dtype 的大类：:COMPLEX / :FLOAT / :INT。"
+  "dtype 的大类：:COMPLEX / :FLOAT / :INT / :BOOL。"
   (cond ((member dtype '(:complex64 :complex128)) :complex)
         ((member dtype '(:float32 :float64)) :float)
+        ((eq dtype :bool) :bool)
         (t :int)))
 
 (declaim (inline %dtype-kind-rank))
 (defun %dtype-kind-rank (dtype)
-  "种类的「宽度秩」：int=0 < float=1 < complex=2。
+  "种类的「宽度秩」：bool=-1 < int=0 < float=1 < complex=2。
    单元素预转只允许 **源 ≤ 目标**（int→float→complex 是精确/无损方向）；
-   反向（float→int）会截断，把 `nan < 1` 这类比较直接算错。"
-  (case (%dtype-kind dtype) (:int 0) (:float 1) (t 2)))
+   反向（float→int）会截断，把 `nan < 1` 这类比较直接算错。
+   bool 的秩为 -1：任何数值 dtype 都能无损承载 0/1，故 bool→任意数值
+   方向永远放行；反过来 float→bool 是「真值化」（0.5 → 1）而不是截断，
+   不能当成普通预转处理。"
+  (case (%dtype-kind dtype) (:bool -1) (:int 0) (:float 1) (t 2)))
 
 (defun %int-family-dtype-p (dtype)
   "整数族（含无符号）。注意与 VT-INT-DTYPE-P 不同，后者只有有符号。"
@@ -138,7 +157,13 @@
 (defun %op-final-dtype (kinds dtypes)
   "逐元素运算的结果 dtype。KINDS 每项来自 %SCALAR-KIND（NIL=张量），
    DTYPES 是各操作数（张量）的 dtype。张量之间走 VT-PROMOTE-TYPE，
-   弱标量按 NEP 50 只贡献种类。"
+   弱标量按 NEP 50 只贡献种类。
+
+   `:bool` 的两条额外规则（numpy 实测，§17）：
+     · 布尔张量 ⊔ 布尔张量 → `:bool`（不进整数族，`True+True` 仍是 bool）；
+     · 布尔张量 ⊔ 弱整数标量 → `:int64`（`np.array([True]) + 1` 是 int64）。
+       弱整数标量原先对任何 base 都「不改变 dtype」，那会让 bool 结果
+       留住 2 这种越界值，破坏「布尔数组只含 0/1」的不变量。"
   (let ((base nil))
     (loop for k in kinds for d in dtypes
           do (unless k
@@ -148,12 +173,16 @@
             (setf base
                   (cond ((null base)
                          (ecase k (:int :int64) (:float :float64) (:complex :complex128)))
-                        ((eq k :int) base)          ; 整数标量：不改变任何 base
+                        ((eq k :int)
+                         ;; 整数标量：不改变数值 base；bool 例外（升至默认整数）
+                         (if (eq base :bool) :int64 base))
                         ((eq k :float)
-                         ;; 整型 base 装不下浮点种类 → 默认浮点；否则保持宽度
-                         (if (%int-family-dtype-p base) :float64 base))
+                         ;; 整型/布尔 base 装不下浮点种类 → 默认浮点；否则保持宽度
+                         (if (or (eq base :bool) (%int-family-dtype-p base))
+                             :float64 base))
                         ((eq k :complex)
-                         (cond ((%int-family-dtype-p base) :complex128)
+                         (cond ((or (eq base :bool) (%int-family-dtype-p base))
+                                :complex128)
                                ((eq base :float32) :complex64)
                                ((eq base :float64) :complex128)
                                (t base))))))
@@ -217,6 +246,13 @@
 (defun %promote-real-dtype (dtypes)
   "实数 dtype 的提升内核（复数的分量提升复用同一实现）。
 
+   `:bool` 的位置（numpy 实测，§17.2）：布尔**不贡献位宽**，只在
+   「全部操作数都是布尔」时才把结果留在 `:bool`。
+     bool ⊔ bool    → bool
+     bool ⊔ int8    → int8
+     bool ⊔ uint8   → uint8
+     bool ⊔ float32 → float32
+
    实现注记：入参刻意用**一个 list** 而不是 `&rest`。SBCL 2.6.8 在
    「&rest + (optimize (speed 3) (safety 0)) + 由 call-site 用 apply 调用」
    三条件同时成立时会踩到代码生成缺陷（实测：Memory fault at (nil)，
@@ -225,6 +261,7 @@
   (declare (optimize (speed 3) (safety 0)))
   (let ((has-f64 nil)
         (has-f32 nil)
+        (has-bool nil)
         (max-signed-bits 0)
         (max-unsigned-bits 0))
     (declare (type fixnum max-signed-bits max-unsigned-bits))
@@ -234,6 +271,8 @@
          (setf has-f64 t))
         ((eq d :float32)
          (setf has-f32 t))
+        ((eq d :bool)
+         (setf has-bool t))
         ((vt-signed-dtype-p d)
          (setf max-signed-bits
                (max max-signed-bits (the fixnum (vt-int-bits d)))))
@@ -267,6 +306,9 @@
       ;; 只有无符号整数
       ((> max-unsigned-bits 0)
        (vt-bits->unsigned-dtype max-unsigned-bits))
+
+      ;; 只有布尔（bool ⊔ bool）
+      (has-bool :bool)
 
       ;; 空输入或未知类型兜底
       (t :float64))))
@@ -378,6 +420,31 @@
   (let ((n (if (and (floatp v) (%nan-or-inf-p v)) 0 (truncate v))))
     (if (typep n '(unsigned-byte 16)) n (%wrap-uint16 n))))
 
+;;; ------------------------------------------------------------------
+;;; 布尔化原语（CONVENTIONS §17）
+;;;
+;;; 「真值」是布尔 dtype 的唯一语义入口：把任意元素收敛成 0/1。
+;;; 所有产生布尔张量的函数最终都写 0/1，因此这里必须覆盖
+;;; 「Lisp 布尔 / 整数 / 浮点（含 NaN、±Inf、-0.0）/ 复数」四种输入形态。
+;;; ------------------------------------------------------------------
+
+(declaim (inline %bool-flag))
+(defun %bool-flag (v)
+  "任意元素 → 布尔 0/1（numpy 的真值语义，§17.1）。
+
+   · `t` / `nil`：直接映射 1 / 0（Lisp 布尔写进布尔张量的自然入口）；
+   · 复数：**任一分量非零**即为真（`bool(0+0j)`→0、`bool(nan+0j)`→1）；
+   · 浮点 NaN：真（`np.bool_(np.nan)` 为 True，因为 `nan != 0`）；
+   · ±Inf：真；`-0.0`：假（`np.bool_(-0.0)` 为 False）；
+   · 其它数值：非零即真。
+
+   前置条件：调用方在 with-float-safe 内（`zerop`/`/=` 遇 NaN 需屏蔽陷阱）。"
+  (cond ((eq v t) 1)
+        ((null v) 0)
+        ((complexp v) (if (or (/= (realpart v) 0) (/= (imagpart v) 0)) 1 0))
+        ((numberp v) (if (zerop v) 0 1))
+        (t (error "%bool-flag: ~s 不是布尔/数值元素" v))))
+
 (defun vt-cast (val dtype)
   "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。
    NaN/Inf 转整数返回 0（确定性哨兵）。
@@ -385,10 +452,16 @@
      - 目标为复数：实部/虚部分别 coerce 到分量浮点类型（实数入参虚部补 0）；
      - 目标为实数/整数且入参为复数：取**实部**后按原规则转换
        （对标 numpy astype 的 ComplexWarning 语义：静默丢弃虚部，
-        本库不产生 warning，行为在文档中显式声明）。"
+        本库不产生 warning，行为在文档中显式声明）。
+   布尔语义（§17.1）：目标为 :bool 时按**真值**收敛（非零→1、零→0、
+   NaN→1），而不是像整数那样截断 —— `(vt-astype #(0.5) :bool)` 必须是
+   True，`(truncate 0.5)` 会给 0。"
+
   (with-float-safe
     (when (and (complexp val) (not (vt-complex-dtype-p dtype)))
       (setf val (realpart val)))
+    (when (eq dtype :bool)
+      (return-from vt-cast (%bool-flag val)))
     (ecase dtype
       (:complex128 (coerce val '(complex double-float)))
       (:complex64  (coerce val '(complex single-float)))
@@ -414,6 +487,8 @@
                 (coerce (if (complexp val) (realpart val) val) 'double-float)))
     (:float32 (lambda (val)
                 (coerce (if (complexp val) (realpart val) val) 'single-float)))
+    ;; 布尔目标：真值收敛（§17.1），不是截断。
+    (:bool    (function %bool-flag))
     ;; 整数目标：复数入参先取实部（§16.5 astype 语义），再走范围检查 + 回绕。
     (:int64   (lambda (val) (%coerce-int64 (if (complexp val) (realpart val) val))))
     (:int32   (lambda (val) (%coerce-int32 (if (complexp val) (realpart val) val))))
@@ -432,7 +507,7 @@
     (:complex64  (complex 0.0s0 0.0s0))
     (:float64 0.0d0)
     (:float32 0.0f0)
-    ((:int64 :int32 :int16 :int8 :uint8 :uint16) 0)))
+    ((:int64 :int32 :int16 :int8 :uint8 :uint16 :bool) 0)))
 
 ;;; ------------------------------------------------------------------
 ;;; 复数值级原语（CONVENTIONS §16.6）

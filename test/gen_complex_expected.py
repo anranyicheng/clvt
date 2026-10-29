@@ -162,22 +162,22 @@ case("abs-c64", "(vt-abs CX-C64-A)", np.abs(c64(A)))
 case("conj-c64", "(vt-conj CX-C64-A)", np.conj(c64(A)))
 
 # ---------------------------------------------------------------- 比较
-case("eq", "(vt-= CX-A CX-A)", (A == A).astype(np.int8), dtype=np.int8)
-case("ne", "(vt-/= CX-A CX-B)", (A != B).astype(np.int8), dtype=np.int8)
-case("lt", "(vt-< CX-A CX-B)", (A < B).astype(np.int8), dtype=np.int8)
-case("le", "(vt-<= CX-C CX-C)", (C <= C).astype(np.int8), dtype=np.int8)
+case("eq", "(vt-= CX-A CX-A)", (A == A), dtype=np.bool_)
+case("ne", "(vt-/= CX-A CX-B)", (A != B), dtype=np.bool_)
+case("lt", "(vt-< CX-A CX-B)", (A < B), dtype=np.bool_)
+case("le", "(vt-<= CX-C CX-C)", (C <= C), dtype=np.bool_)
 case("gt", "(vt-> CX-C (vt-const (list 3) #C(1.0d0 2.0d0) :dtype :complex128))",
      (C > np.array([1 + 2j] * 3)).astype(np.int8), dtype=np.int8)
-case("ge", "(vt->= CX-C CX-C)", (C >= C).astype(np.int8), dtype=np.int8)
+case("ge", "(vt->= CX-C CX-C)", (C >= C), dtype=np.bool_)
 case("lt-lex-imag", "(vt-< (vt-const (list 1) #C(1.0d0 1.0d0) :dtype :complex128) (vt-const (list 1) #C(1.0d0 2.0d0) :dtype :complex128))",
      (np.array([1 + 1j]) < np.array([1 + 2j])).astype(np.int8), dtype=np.int8)
 
 # ---------------------------------------------------------------- 判定
-case("eq-nan", "(vt-= CX-D CX-D)", (D == D).astype(np.int8), dtype=np.int8)
-case("ne-nan", "(vt-/= CX-D CX-D)", (D != D).astype(np.int8), dtype=np.int8)
-case("isnan", "(vt-isnan CX-D)", np.isnan(D).astype(np.int8), dtype=np.int8)
-case("isinf", "(vt-isinf CX-D)", np.isinf(D).astype(np.int8), dtype=np.int8)
-case("isfinite", "(vt-isfinite CX-D)", np.isfinite(D).astype(np.int8), dtype=np.int8)
+case("eq-nan", "(vt-= CX-D CX-D)", (D == D), dtype=np.bool_)
+case("ne-nan", "(vt-/= CX-D CX-D)", (D != D), dtype=np.bool_)
+case("isnan", "(vt-isnan CX-D)", np.isnan(D), dtype=np.bool_)
+case("isinf", "(vt-isinf CX-D)", np.isinf(D), dtype=np.bool_)
+case("isfinite", "(vt-isfinite CX-D)", np.isfinite(D), dtype=np.bool_)
 
 # ---------------------------------------------------------------- 极值 / 排序
 case("maximum", "(vt-maximum CX-A CX-B)", np.maximum(A, B))
