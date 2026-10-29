@@ -370,8 +370,10 @@
   ;; NaN 在比较中
   (let ((a (make-vt nil +vt-dfloat-nan+ :dtype :float64))
         (b (make-vt nil 1.0d0 :dtype :float64)))
-    (T! "nan == nan" 0.0d0 (vt-item (vt-= a (make-vt nil +vt-dfloat-nan+ :dtype :float64))))
-    (T! "nan < 1" 0.0d0 (vt-item (vt-< a b))))
+    ;; vt-item 对 :bool 给 T/NIL（§17.8），T! 走数值比较，这里显式归一
+    (T! "nan == nan" 0.0d0
+        (if (vt-item (vt-= a (make-vt nil +vt-dfloat-nan+ :dtype :float64))) 1.0d0 0.0d0))
+    (T! "nan < 1" 0.0d0 (if (vt-item (vt-< a b)) 1.0d0 0.0d0)))
 
   ;; 9.2 数学函数 NaN 返回 (SBCL 修复验证)
   ;; asin/acos 超范围返回 NaN 而非复数

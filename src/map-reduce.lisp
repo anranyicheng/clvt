@@ -212,6 +212,8 @@
   (and (= (vt-size x) 1)
        (not (eq (vt-dtype x) final-dtype))
        (<= (%dtype-kind-rank (vt-dtype x)) (%dtype-kind-rank final-dtype))
+       ;; x 为 :bool 时 VT-ITEM 给 T/NIL（§17.8），%SCALAR-FITS-P 对非整数
+       ;; 一律放行 —— 这里正确：布尔标量的 0/1 装进任何数值 dtype 都无损。
        (%scalar-fits-p (vt-item x) final-dtype)
        (some (lambda (y) (> (vt-size y) 1)) others)))
 

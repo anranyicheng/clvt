@@ -1035,12 +1035,14 @@
 
 (deftest test-reduce-all-any-boolean
     "reduce: vt-all / vt-any / vt-isfinite / isinf / isnan / isposinf / isneginf"
-  (check "vt-all 全真" (= (vt-item (vt-all (vt-ones '(3)))) 1.0d0))
-  (check "vt-all 含假 → 0" (= (vt-item (vt-all (vt-from-sequence '(1 0 1)))) 0.0d0))
-  (check "vt-any 有真 → 1" (= (vt-item (vt-any (vt-from-sequence '(0 1 0)))) 1.0d0))
-  (check "vt-any 全假 → 0" (= (vt-item (vt-any (vt-zeros '(3)))) 0.0d0))
-  (check "vt-all 空张量 → 1（单位元）" (= (vt-item (vt-all (vt-zeros '(0)))) 1.0d0))
-  (check "vt-any 空张量 → 0" (= (vt-item (vt-any (vt-zeros '(0)))) 0.0d0))
+  ;; 本文件的 CHECK 是两参数（描述 + 表达式，表达式为真即通过）。
+  ;; vt-item 对 :bool 给 T/NIL（§17.8），可直接当 Lisp 布尔用。
+  (check "vt-all 全真" (vt-item (vt-all (vt-ones '(3)))))
+  (check "vt-all 含假 → NIL" (null (vt-item (vt-all (vt-from-sequence '(1 0 1))))))
+  (check "vt-any 有真 → T" (vt-item (vt-any (vt-from-sequence '(0 1 0)))))
+  (check "vt-any 全假 → NIL" (null (vt-item (vt-any (vt-zeros '(3))))))
+  (check "vt-all 空张量 → T（单位元）" (vt-item (vt-all (vt-zeros '(0)))))
+  (check "vt-any 空张量 → NIL" (null (vt-item (vt-any (vt-zeros '(0))))))
   (let ((a (vt-from-sequence (list 1.0d0 (vt-float-nan :float64)
                                    (vt-float-pos-inf :float64) (vt-float-neg-inf :float64)))))
     (check-eq "vt-isfinite" (vt-to-list (vt-isfinite a)) '(1 0 0 0))

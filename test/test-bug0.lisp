@@ -115,8 +115,8 @@
   (check "vt-prod uint8 → 6" 6 (vt-item (vt-prod u8)) :test #'=)
   (check "vt-argmax uint16 → 1" 1 (vt-item (vt-argmax u16)) :test #'=)
   (check "vt-all/vt-any int8 → (t t)"
-         '(t t) (list (plusp (vt-item (vt-all v8)))
-                      (plusp (vt-item (vt-any v8)))))
+         '(t t) (list (vt-item (vt-all v8))
+                      (vt-item (vt-any v8))))
   (check "vt-sum int8 axis=1 → (6 7)" '(6 7)
          (map 'list #'identity (vt-to-list (vt-sum m8 :axis 1))))
   (check "vt-amax int8 转置(3x2)视图 axis=0 → (3 3)" '(3 3)

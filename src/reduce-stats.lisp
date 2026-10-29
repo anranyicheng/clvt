@@ -978,9 +978,10 @@
 (defun vt-allclose (t1 t2 &key (rtol 1e-5) (atol 1e-8))
   "判断两个张量在 RTOL/ATOL 容差下是否全部相等（对标 numpy.allclose），
    返回 **Lisp 布尔值**（numpy 返回 Python bool，不是 0-d 数组）。
-   判据取 vt-all 的 :bool 结果的真值，而不是和 1.0d0 比大小 —— 后者对
-   任何非 1 的数值都会静默给 NIL，把「0/1 承载」的假设固化进调用方。"
-  (not (zerop (vt-item (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol))))))
+   判据直接取 `VT-ITEM` 对 `:bool` 张量的解包结果（T/NIL，§17.8），
+   不是和 1.0d0 比大小 —— 后者对任何非 1 的数值都会静默给 NIL，
+   把「0/1 承载」的假设固化进调用方。"
+  (vt-item (vt-all (vt-isclose t1 t2 :rtol rtol :atol atol))))
 
 (defun vt-isfinite (vt &key out)
   "逐元素判断是否有限（既非 NaN 也非 ±Inf），返回 **:bool** 布尔张量。
@@ -2116,7 +2117,7 @@
               (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
                      data-max data-min)))
           (progn
-            (unless (= (vt-item (vt-all (vt-isfinite tensor))) 1.0d0)
+            (unless (vt-item (vt-all (vt-isfinite tensor)))
               (error "自动确定 bin 范围需要有限输入"))
             (setf data-min (vt-item (vt-amin tensor))
                   data-max (vt-item (vt-amax tensor)))

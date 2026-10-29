@@ -74,8 +74,9 @@
   (format t "~%[1] 空归约：单位元族填单位元~%")
   (check "sum (0) = 0" (= (vt-item (vt-sum (vt-zeros '(0)))) 0.0d0))
   (check "prod (0) = 1" (= (vt-item (vt-prod (vt-zeros '(0) :dtype :int64))) 1))
-  (check "all (0) = 1" (= (vt-item (vt-all (vt-zeros '(0)))) 1))
-  (check "any (0) = 0" (= (vt-item (vt-any (vt-zeros '(0)))) 0))
+  ;; 本文件的 CHECK 是两参数（label cond），vt-item 对 :bool 已给 T/NIL
+  (check "all (0) = T"   (vt-item (vt-all (vt-zeros '(0)))))
+  (check "any (0) = NIL" (null (vt-item (vt-any (vt-zeros '(0))))))
   (check "nansum (3 0) ax1 = (0 0 0)"
          (equalp (vt-to-list (vt-nansum (vt-zeros '(3 0)) :axis 1)) '(0.0d0 0.0d0 0.0d0)))
 

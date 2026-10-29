@@ -83,11 +83,18 @@
   (if (and (listp v) (eq (first v) :error))
       (%report name nil (format nil "意外报错: ~a" (second v)))
       ;; 0 维 vt 用 item 取 Lisp 标量比较（§6.5：归约返回 0 维 vt）
+      ;; :bool 的 VT-ITEM 给 T/NIL（§17.8），而本文件的期望一律按数值契约写成
+      ;; 1/0，这里归一回去；视图层语义由 bool-dtype-test 的 H 组专门覆盖。
       (let ((ok (cond
                   ((vt-p v)
                    (and (if shape (equal (vt-shape v) shape) t)
                         (if dtype (eq (vt-dtype v) dtype) t)
-                        (%val= (if (null (vt-shape v)) (vt-item v) v)
+                        (%val= (if (null (vt-shape v))
+                                   (let ((iv (vt-item v)))
+                                     (if (eq (vt-dtype v) :bool)
+                                         (if iv 1 0)
+                                         iv))
+                                   v)
                                expected)))
                   (t (%val= v expected)))))
         (%report name ok
@@ -666,9 +673,9 @@
 (check "vt-isclose(167): NaN 互不接近"
   (vt-isclose (vt-const '(1) +nan+) (vt-const '(1) +nan+)) '(0))
 (check-true "vt-allclose(168): 元素全部接近→真"
-  (= (vt-item (vt-all (vt-isclose (vt-ones '(3)) (vt-ones '(3))))) 1))
+  (vt-item (vt-all (vt-isclose (vt-ones '(3)) (vt-ones '(3))))))
 (check-false "vt-allclose(168): 有元素不接近→假"
-  (= (vt-item (vt-all (vt-isclose (vt-ones '(3)) (vt-const '(3) 2.0d0)))) 1))
+  (vt-item (vt-all (vt-isclose (vt-ones '(3)) (vt-const '(3) 2.0d0)))))
 (check "vt-isfinite(169): 有限→1，Inf/NaN→0"
   (vt-isfinite (vt-from-sequence (list 1.0d0 +inf+ +nan+))) '(1 0 0) :dtype :bool)
 (check "vt-isinf(170): Inf→1（含 ±Inf）"

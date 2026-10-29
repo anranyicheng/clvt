@@ -445,6 +445,24 @@
         ((numberp v) (if (zerop v) 0 1))
         (t (error "%bool-flag: ~s 不是布尔/数值元素" v))))
 
+(declaim (inline %truthy-p))
+(defun %truthy-p (v)
+  "任意元素 → Lisp 布尔（T / NIL）。与 `%bool-flag` 互为反向：那个收敛到
+   物理表示 0/1，这个收敛到 Lisp 语义 T/NIL。
+
+   存在理由是 `VT-ITEM` 的返回类型变了（§17.8）：`(vt-item bool张量)` 现在
+   给 T/NIL，而 `VT-COMPRESS` 这类「消费一个未知 dtype 的单元素张量」的
+   调用方仍要按「0 为假」判断。**不能**直接把 `(vt-item x)` 丢进 `if` ——
+   CL 里 0 是真值，`(if 0 'a 'b)` 给 A。
+
+   与 `%bool-flag` 不同，这里**自带** with-float-safe：NaN 的 ZEROP 在陷阱
+   开启时会抛 FLOATING-POINT-INVALID-OPERATION，而本函数的调用点分散在
+   索引/归约各处，指望每处都记得包一层不现实。"
+  (cond ((eq v t) t)
+        ((null v) nil)
+        ((numberp v) (with-float-safe (not (zerop v))))
+        (t t)))
+
 (defun vt-cast (val dtype)
   "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。
    NaN/Inf 转整数返回 0（确定性哨兵）。

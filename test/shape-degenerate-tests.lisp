@@ -70,10 +70,17 @@
              (:shape  (check-shape (format nil "~a [shape]" label) r (caddr expectation)))
              (:value  (check-list (format nil "~a [value]" label)
                                   (vt-to-list r) (caddr expectation)))
-             (:scalar (if (eq (caddr expectation) 'nan)
-                          (check (format nil "~a [nan约定]" label) (%test-nan-p r))
-                          (check-list (format nil "~a [scalar]" label) (list r)
-                                      (list (caddr expectation)))))
+             (:scalar (cond
+                        ((eq (caddr expectation) 'nan)
+                         (check (format nil "~a [nan约定]" label) (%test-nan-p r)))
+                        ;; 布尔标量（:bool 归约结果，§17.8）走 EQ，不能走
+                        ;; CHECK-LIST —— 那里要求两端都是 NUMBERP
+                        ((member (caddr expectation) '(t nil))
+                         (check (format nil "~a [scalar]" label)
+                                (eq r (caddr expectation))))
+                        (t
+                         (check-list (format nil "~a [scalar]" label) (list r)
+                                     (list (caddr expectation))))))
              (:nan    (check-shape-and-nan (format nil "~a [nan约定]" label) r (caddr expectation))))
            (when (and (vt-p r) (eq (cadr expectation) :shape))
              ;; 形状检查同时隐含"没崩"= L1 底线达成
@@ -131,8 +138,8 @@
   (run-case "argmax (0) 报错约定"    '(:error) (lambda () (vt-argmax (vt-zeros '(0)))))
   (run-case "argmax (3 0) ax1 报错约定" '(:error) (lambda () (vt-argmax (vt-zeros '(3 0)) :axis 1)))
   (run-case "argmax (3 0) ax0 输出空" '(:ok :shape (0)) (lambda () (vt-argmax (vt-zeros '(3 0)) :axis 0)))
-  (run-case "all (0)=T"   '(:ok :scalar 1) (lambda () (vt-item (vt-all (vt-zeros '(0))))))
-  (run-case "any (0)=NIL" '(:ok :scalar 0) (lambda () (vt-item (vt-any (vt-zeros '(0))))))
+  (run-case "all (0)=T"   '(:ok :scalar t)   (lambda () (vt-item (vt-all (vt-zeros '(0))))))
+  (run-case "any (0)=NIL" '(:ok :scalar nil) (lambda () (vt-item (vt-any (vt-zeros '(0))))))
   (run-case "cumsum (0)"  '(:ok :shape (0)) (lambda () (vt-cumsum (vt-zeros '(0)))))
 
   ;; ================================================================

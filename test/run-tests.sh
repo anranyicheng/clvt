@@ -53,7 +53,7 @@ SUITES[test-overlap]="6 重叠拷贝回归测试"
 SUITES[svd-fast-path-test]="SVD 双路径测试 (差分参考/选路不变量/数学性质/numpy对比/退化形状)"
 SUITES[linalg-fast-path-test]="LINALG 双路径测试 (lu/qr/solve/chol/eig: 差分参考/选路不变量/数学性质/numpy对比/边界)"
 SUITES[test-copy-into]="41 vt-copy-into 正确性测试 + 复数×非连续 typed-walk (转置/翻转/3-D 置换/非连续 dest 与独立参照逐位相等 + c128T 拷贝 ≤8× 实数线护栏)"
-SUITES[bool-dtype-test]="239 布尔 dtype 测试 (52 例 numpy 逐例对照: 内容测试/比较/逻辑/any-all(轴·keepdims·空·NaN)/isclose·array_equal·allclose/isin·in1d/astype 真值化/sum 升 int64 + dtype 契约·0/1 不变量·打印·npy |b1 往返 + 布尔算术语义)"
+SUITES[bool-dtype-test]="282 布尔 dtype 测试 (52 例 numpy 逐例对照: 内容测试/比较/逻辑/any-all(轴·keepdims·空·NaN)/isclose·array_equal·allclose/isin·in1d/astype 真值化/sum 升 int64 + dtype 契约·0/1 不变量·打印·npy |b1 往返 + 布尔算术语义 + 逻辑视图/物理视图分层与四个内部解包点)"
 SUITES[io-interop-test]="77 vt-load/vt-save 持久化与 numpy .npy 互操作测试（含 NaN payload 逐位/视图字节等价/不变性/覆盖语义）"
 SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
 SUITES[gemm-avx512-test]="49 AVX-512 f64 GEMM 机器码内核测试 (EVEX 发射器/掩码尾块/写边界哨兵/非对齐 SAP; 与 sb-simd 内核逐位对照, n%4 的尾部标量列按 §7.3 放宽为 ≤1e-15 且必须只落在这些列)"
@@ -214,6 +214,10 @@ clvt 自动化测试运行器
   --all           运行所有测试包括性能基准 (benchmark-copy / performance-bench)
   --verbose       显示完整 SBCL 输出
   --skip-build    跳过「全系统零 WARNING」编译体检 (默认执行，约 1.5~2 分钟)
+  --no-regen-probes
+                  跳过「按本机 numpy 重生成差分探针期望」(默认执行)。
+                  默认行为保证换机器/换 numpy 后探针不再因格式化漂移误报红，
+                  代价是本轮探针变成「自洽基线」；CI 严格回归请用本选项。
   --help          显示此帮助信息
 
 环境变量:
@@ -225,6 +229,8 @@ clvt 自动化测试运行器
   CLVT_TEST_OUT   流水线套件的产物目录 (默认: 临时目录，跑完自动清理)
   CLVT_SKIP_BUILD_CHECK
                   置 1 等价于 --skip-build
+  CLVT_SKIP_PROBE_REGEN
+                  置 1 等价于 --no-regen-probes
 
 本脚本是 clvt 全部测试的唯一入口：test/ 下每个测试套件（含「Lisp 生成 +
 NumPy 校验」两阶段流水线套件）都在此注册，启动时会自检运行列表是否覆盖
@@ -345,6 +351,78 @@ check_python() {
         warn "未找到 python3，跳过 numpy-compare-test"
         return 1
     fi
+}
+
+# ------------------------------------------------------------
+# 差分探针基线：跑套件前按本机 numpy 重生成期望表
+#
+# 为什么需要：两个差分探针的期望是**内嵌在 .lisp 里的字面量**，由
+# gen_probes.py / gen_probes2.py 生成。生成器输出会随 numpy 版本漂移
+# （str(float) 的格式化、个别 libm 函数的末位），于是「仓库里的期望」与
+# 「本机 numpy 的期望」可能差在第 16 位有效数字上：探针报红，而 diff 全是
+# 格式化差异。换机器 / 换 numpy 后若不先重生成，红灯会被当成语义回归排查，
+# 查半天发现是基线过期。
+#
+# 为什么单独一个阶段、而不是塞进 check_key_sync.py：那个门禁的职责是
+# **比对**（重新生成 → 语义比对 → git checkout 还原），它的 finally 一定把
+# 工作区还原成提交状态。要「把新基线留下」只能排在它后面单独做。
+#
+# 边界（必须讲清，否则探针会退化成自证）：
+#   · 本阶段把文件写回工作区 → 本轮差分探针是「按本机 numpy 现生成的自洽
+#     基线」，**不再是对提交期望的回归**。脚本会报出改了多少行。
+#   · 语义漂移（不是格式化）在上一阶段 check_key_sync.py 就已 FAIL 退出，
+#     走不到这里 —— 所以这里只可能刷新格式化差异。
+#   · CI 或需要严格回归时用 --no-regen-probes：不重生成，直接用仓库内期望
+#     判定，任何漂移都会红。
+#   · 中间产物走 FUZZ_TMP 指到临时目录，跑完删掉，绝不污染工作区。
+# ------------------------------------------------------------
+regen_probes() {
+    if [[ "${CLVT_SKIP_PROBE_REGEN:-0}" == "1" || "${skip_regen:-false}" == true ]]; then
+        warn "已跳过探针重生成（--no-regen-probes）：按仓库内期望严格判定"
+        return 0
+    fi
+    if [[ "$PY_AVAILABLE" == "0" ]]; then
+        warn "无 python3/numpy，跳过探针重生成（探针套件将按仓库内期望判定）"
+        return 0
+    fi
+    header "差分探针基线 — 按本机 numpy 重生成期望表"
+    local changed=0 pair gen lisp before after numstat errlog side
+    side="$(mktemp -d -t clvt-fuzz.XXXXXX)"
+    for pair in "gen_probes.py:differential-probes-test.lisp" \
+                "gen_probes2.py:differential-probes-test2.lisp"; do
+        gen="${pair%%:*}"
+        lisp="${pair##*:}"
+        before="$(md5sum "$SCRIPT_DIR/$lisp" | cut -d' ' -f1)"
+        errlog="$(mktemp -t clvt-gen.XXXXXX)"
+        if ! FUZZ_TMP="$side" PYTHONDONTWRITEBYTECODE=1 \
+                python3 "$SCRIPT_DIR/$gen" > /dev/null 2> "$errlog"; then
+            fail "生成器执行失败: test/$gen"
+            tail -5 "$errlog" | sed 's/^/    /'
+            rm -f "$errlog"; rm -rf "$side"
+            echo "    → 探针文件未被重写，继续跑会用陈旧期望，结果不可信；已中止。"
+            return 1
+        fi
+        rm -f "$errlog"
+        after="$(md5sum "$SCRIPT_DIR/$lisp" | cut -d' ' -f1)"
+        if [[ "$before" == "$after" ]]; then
+            ok "$lisp 与本机 numpy 一致（无需刷新）"
+        else
+            changed=$((changed + 1))
+            numstat="$(git -C "$PROJECT_DIR" diff --numstat -- "test/$lisp" 2>/dev/null \
+                        | awk '{print "+"$1" −"$2}' || true)"
+            warn "$lisp 已按本机 numpy 刷新 ${numstat:-（已改写）}"
+        fi
+    done
+    rm -rf "$side"
+    if [[ "$changed" -gt 0 ]]; then
+        warn "本轮差分探针是「自洽基线」，不是对提交期望的回归 —— 别把绿灯当回归证据。"
+        warn "要严格判定用 --no-regen-probes（CI 建议）；"
+        warn "确认刷新无误后请 git add test/differential-probes-test*.lisp 一并提交；"
+        warn "想撤销刷新用 git checkout -- test/differential-probes-test*.lisp。"
+    else
+        ok "两个探针期望与本机 numpy 一致"
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------
@@ -608,6 +686,7 @@ main() {
     local run_benchmarks=false
     local specific_suite=""
     local skip_build=false
+    local skip_regen=false
 
     # 解析参数
     while [[ $# -gt 0 ]]; do
@@ -646,6 +725,10 @@ main() {
                 skip_build=true
                 shift
                 ;;
+            --no-regen-probes)
+                skip_regen=true
+                shift
+                ;;
             --help|-h)
                 usage
                 exit 0
@@ -671,6 +754,13 @@ main() {
             fail "测试工具链 key 同步检查未通过（先修复漂移再运行套件，详见上方输出）"
             exit 1
         fi
+    fi
+
+    # 差分探针基线刷新（必须排在 check_key_sync 之后：那个门禁会
+    # git checkout 还原工作区，排在它前面写的基线会被抹掉）。
+    if ! regen_probes; then
+        fail "探针基线刷新失败（生成器有 bug 时宁可中止，也不要用陈旧期望跑）"
+        exit 1
     fi
 
     # 文档/注释一致性门禁（静态，秒级）：代码注释不得带轮次编号、

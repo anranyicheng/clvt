@@ -4,6 +4,65 @@
 
 ---
 
+## 2026-10-29（三十四）— feat(bool): 布尔值的「逻辑视图」改回 Lisp 惯例，run-tests 自动刷新探针基线
+
+**破坏性变更（两处，都在解包/显示层）**：
+
+| 旧 | 现在 |
+|---|---|
+| `(vt-item bool张量)` → `1` / `0` | → **`T` / `NIL`** |
+| 打印 `[ True, False]` | → `[   T,  NIL]` |
+
+**不受影响**：`vt-to-list` 默认仍返回 `(1 0)`；`vt-ref` / `vt-data` 仍返回 0/1
+字节；npy 落盘的 `|b1` 字节不变。
+
+**为什么改**：
+
+1. `np.bool_(True).item()` 返回 Python 的 `True`，Lisp 里与 `bool` 同位的对应物
+   就是 `T` / `NIL`。此前 `(when (vt-item (vt-all m)) ...)` 不成立，必须写
+   `(= 1 ...)`；漏写一次就变成**恒真断言**（上一轮 9 处 `(assert (vt-all ...))`
+   正是这么来的）。
+2. `T` / `NIL` 在 `*print-readably*` 下能被 `read` 回来；`True` 读回来是当前包
+   临时 intern 的未绑定符号（`common-lisp` 里没有 `TRUE` 这个名字）。
+3. 本库 0 维形状本来就印 `shape:NIL`（Lisp 惯例，不是 numpy 的 `()`），值却用
+   Python 惯例，同一次打印里两套风格。
+
+**迁移**：
+
+```lisp
+;; 旧
+(= 1 (vt-item (vt-all m)))
+;; 新：直接当布尔用
+(vt-item (vt-all m))
+
+;; 需要 0/1 数值时显式归一
+(if (vt-item x) 1 0)
+```
+
+**`vt-to-list` 为什么没跟着改**：`NIL` 在 CL 里既是布尔假、又是空表，
+`(vt-from-sequence (list t nil t))` 无法区分「元素 NIL」与「嵌套的空列表」
+（实测直接报「不规则嵌套」）。若 `vt-to-list` 返回 T/NIL，
+`(vt-from-sequence (vt-to-list x))` 这条往返就永久不成立 —— 而它的契约恰恰是
+「可重建的数值序列」。故默认保持 0/1，另提供 `(vt-to-list b :bool t)`。
+
+**`run-tests.sh` 新增「探针基线」阶段**：跑套件前按本机 numpy 重生成两个差分
+探针的期望表（`gen_probes.py` / `gen_probes2.py`）并保留结果。换机器 / 换 numpy
+后不再因为第 16 位有效数字的格式化差异误报红。四个边界：
+
+* 语义漂移（不是格式化）仍由 `check_key_sync.py` 在**此之前**拦下并退出；
+* 刷新时报告改动行数，并明说「本轮是自洽基线，不是对提交期望的回归」；
+* `--no-regen-probes` / `CLVT_SKIP_PROBE_REGEN=1` 走严格模式（CI 建议）；
+* 生成器的中间产物走临时目录，跑完删除，工作区不会多出 `tmp/`。
+
+**测试**：`bool-dtype-test` 增至 **282** 条（新增 H 组：视图分层 / 0-1 物理视图 /
+往返不变性 / 打印字面量 / `vt-extract`·`vt-compress`·`vt-bincount`·`vt-histogram`
+四个内部消费点 / `%truthy-p` 与 `%item-number`）；另有 8 个套件的 18 条断言
+随契约更新。契约写进 `CONVENTIONS.md` §17.8。
+
+**验收**：65 套件全绿（详见本轮运行报告）；`check_docs.py` 205 锚点全解析。
+
+---
+
 ## 2026-10-29（三十三）— feat(dtype): 引入 `:bool` 布尔 dtype，比较/逻辑/谓词类函数返回真布尔
 
 **行为变化（唯一一处）**：`vt-=` / `vt-/=` / `vt-<` / `vt-<=` / `vt->` / `vt->=`

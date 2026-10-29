@@ -66,17 +66,39 @@
                 ((equal (array-element-type data) '(signed-byte 32)) (set-ref (signed-byte 32)))
                 (t (setf (aref data ptr) cval))))))))
 
+(defun %vt-unbox (vt)
+  "单元素张量的物理值解包；`:bool` 归一成 Lisp 布尔（§17.8）。"
+  (let ((v (aref (vt-data vt) (vt-offset vt))))
+    (if (eq (vt-dtype vt) :bool) (if (zerop v) nil t) v)))
+
 (defun vt-item (x)
-  "单元素张量解包为原生数字（对标 numpy 的 .item()：任意秩、size=1）。
+  "单元素张量解包为原生标量（对标 numpy 的 .item()：任意秩、size=1）。
+
+   `:bool` 张量解包成 **Lisp 布尔 `T` / `NIL`**：numpy 的 `.item()` 返回
+   Python `bool`，Lisp 的对应物就是 T/NIL。这样
+   `(when (vt-item (vt-all m)) ...)` 直接可用，不必再绕 `(= 1 ...)`。
+   物理视图（`VT-REF` / `VT-DATA` / `VT-TO-LIST` 默认）保持 0/1 字节，
+   分层契约见 CONVENTIONS §17.8。
+
    v0.4.x 修复：原实现仅解包 0 维张量，(1,1) 等二维单元素张量被原样
    返回而非标量；现按 data[offset] 直取（零索引元素物理位置即 offset）。
    多元素张量报错（numpy.item 同样拒绝）；非张量原样返回。"
-  (cond ((and (vt-p x) (null (vt-shape x))) (vt-ref x))
-        ((vt-p x)
-         (unless (= (vt-size x) 1)
-           (error "vt-item: 张量含 ~d 个元素，仅 size=1 可解包" (vt-size x)))
-         (aref (vt-data x) (vt-offset x)))
-        (t x)))
+  (if (vt-p x)
+      (progn
+        (unless (= (vt-size x) 1)
+          (error "vt-item: 张量含 ~d 个元素，仅 size=1 可解包" (vt-size x)))
+        (%vt-unbox x))
+      x))
+
+(declaim (inline %item-number))
+(defun %item-number (x)
+  "`VT-ITEM` 的结果转成数值：T→1、NIL→0，其余原样。
+
+   给「要算数但可能收到布尔标量」的消费方用（如 `VT-BINCOUNT` 取最大值：
+   numpy 接受布尔输入，`np.bincount([True False])` → `[1 1]`）。
+   `:bool` 的逻辑视图是 T/NIL（§17.8），算术前必须过这一层。"
+  (let ((v (vt-item x)))
+    (cond ((eq v t) 1) ((null v) 0) (t v))))
 
 (defun vt-slice (vt &rest specs)
   "统一切片接口。每个 spec 为列表：
@@ -875,7 +897,10 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
         (tshape (vt-shape tensor)))
     (cond
       ((null cshape)
-       (if (/= (vt-item condition) 0)
+       ;; 不能写成 (if (vt-item condition) ...)：VT-ITEM 对 :bool 现在给
+       ;; T/NIL，但对 :int8 掩码仍给 1/0 —— 而 CL 里 0 是真值，
+       ;; (if 0 'a 'b) 会走 A。%TRUTHY-P 把两种形态统一成 Lisp 布尔（§17.8）。
+       (if (%truthy-p (vt-item condition))
            (vt-flatten tensor)
            (vt-zeros (list 0) :dtype (vt-dtype tensor))))
       ((equal cshape tshape)
@@ -1035,14 +1060,14 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
 
 (defun vt-bincount (x &key (minlength 0))
   "统计非负整数出现次数。"
-      (when (%cx-reject x)
+  (when (%cx-reject x)
     (error "vt-bincount: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(when (%cx-reject x)
-    (error "vt-bincount: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let* ((flat (vt-flatten x))
+  (let* ((flat (vt-flatten x))
+         ;; :bool 的 VT-ITEM 给 T/NIL（§17.8），这里要的是数值：numpy 接受
+         ;; 布尔输入（np.bincount([True False]) → [1 1]），走 %ITEM-NUMBER。
          (maxval (if (zerop (vt-size flat))
                      -1
-                     (vt-item (vt-amax flat))))
+                     (%item-number (vt-amax flat))))
          (size (max (1+ maxval) minlength))
          (result (make-array size :element-type '(signed-byte 64)
                                   :initial-element 0)))

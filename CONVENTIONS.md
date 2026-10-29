@@ -3572,7 +3572,7 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 | 写入路径 | 保证方式 |
 |---|---|
 | `vt-astype ... :bool` | `%to-bool` 逐元素 `%bool-flag` |
-| `vt-arange` / `vt-linspace :dtype :bool` | 同上（`(vt-arange 3 :dtype :bool)` → `[False True True]`，与 `np.arange(3,dtype=bool)` 一致） |
+| `vt-arange` / `vt-linspace :dtype :bool` | 同上（`(vt-arange 3 :dtype :bool)` 的字节是 `0 1 1`，打印为 `[NIL T T]`，与 `np.arange(3,dtype=bool)` 一致） |
 | 比较 / 逻辑 / 谓词 / 成员判定内核 | 内核返回 0/1（`%op-eq` 一族、`%op-logical-*`、`%membership-map`） |
 | 归约（`vt-any` / `vt-all` / `vt-isnan` …） | `+vt-mask-out-types+` 的输出类型矩阵用 `(unsigned-byte 8)` |
 | npy 读入 `\|b1` | 任何**非 0 字节**解成 1（`numpy` 只保证 0/1，但不保证别人的文件守规矩） |
@@ -3585,13 +3585,14 @@ SoA + 4 条实 GEMM 虽然能吃到实数线的 SIMD/并行内核，但**会改�
 
 **打印与序列化**：
 
-* 打印走 `True` / `False` 字面量，表头写 `dtype:BOOL`（否则与 `:uint8` 无法区分，
-  这正是「类型不可区分」漏洞的可见形态）：
+* 打印走 `T` / `NIL`（Lisp 布尔，**不是** numpy 的 `True` / `False`），表头写
+  `dtype:BOOL`（否则与 `:uint8` 无法区分，这正是「类型不可区分」漏洞的可见形态）：
   ```
   #<VT shape:(2 2) dtype:BOOL
-    [[  True,  False],
-     [  True,   True]]>
+    [[   T,  NIL],
+     [   T,    T]]>
   ```
+  为什么不用 numpy 的字面量，见 §17.8。
 * npy 描述符是 `|b1`（`%npy-dtype->descr` / `%npy-descr->dtype`），与
   `numpy` 的 `np.bool_` 直接互通：`np.load` 读出 `dtype('bool')`。
 
@@ -3733,7 +3734,7 @@ NumPy 的 `bool_` 语义分派（`elementwise.lisp`）：结果 dtype 为 `:bool
 
 | 位置 | 现象 | 根因 | 处理 |
 |---|---|---|---|
-| `example.lisp` 9 处 | `(assert (vt-all X))` **恒真** | `assert` 只判条件是否为 NIL，而 `vt-all` 返回 VT 对象，任何 VT 对象都不为 NIL | 新增 `vt-all-true-p`（`(= 1 (vt-item (vt-all x)))`）并替换 |
+| `example.lisp` 9 处 | `(assert (vt-all X))` **恒真** | `assert` 只判条件是否为 NIL，而 `vt-all` 返回 VT 对象，任何 VT 对象都不为 NIL | 新增 `vt-all-true-p` 并替换；其实现见 §17.8（`vt-item` 改返回 T/NIL 后只剩一层解包） |
 | `example.lisp` 4027–4028 | 真断言一开就失败 | 「全 NaN 时 `nanmax`/`nanmin` 返回什么」的期望写成了 `±Inf`；NumPy 返回 **NaN**（`All-NaN slice encountered`），clvt 本来就一致 | 改断言为 `vt-isnan`，删掉猜测式注释 |
 | `clvt-perf-test-examples.lisp` 基准 | `extract` 216783 µs，且结果**不是** `a[mask]` | 参数顺序反了：写成 `(vt-extract a mask)`，即 1M 个 float 当条件、0/1 掩码当数据源 | 改为 `(vt-extract mask a)`（对标 `numpy.extract(condition, arr)`），耗时降到 21185 µs |
 
@@ -3750,6 +3751,92 @@ NumPy 的 `bool_` 语义分派（`elementwise.lisp`）：结果 dtype 为 `:bool
 * **示例里的参数顺序错误会伪装成性能问题**。`(vt-extract a mask)` 慢 10 倍，
   很容易被归因成「`vt-extract` 实现差」而去动内核；真正的原因是它在拿
   1M 个 float 逐元素判真。
+
+### 17.8 逻辑视图与物理视图
+
+`:bool` 落地后，「从布尔张量里取一个元素」不再只有一个答案。这层区分必须写死，
+因为混用会直接变成 bug：`(if (vt-item x) ...)` 在 `x` 是 `T`/`NIL` 时正确，
+在 `x` 是 `1`/`0` 时**恒真** —— Common Lisp 里 0 是真值，`(if 0 'a 'b)` 给 `A`。
+
+**分层契约**：
+
+| 接口 | numpy 对应 | `:bool` 张量的返回 | 定位 |
+|---|---|---|---|
+| `vt-item` | `.item()` → Python `bool` | **`T` / `NIL`** | 逻辑视图：解包成 Lisp 标量 |
+| `print-object` | `repr` → `True`/`False` | **`T` / `NIL`** | 逻辑视图：给人看，且可 `read` 回 |
+| `vt-to-list`（默认） | `.tolist()` | `(1 0 1)` | 物理视图：可重建的数值序列 |
+| `vt-to-list ... :bool t` | `.tolist()` 的布尔 | `(T NIL T)` | 逻辑视图：显式要求才给 |
+| `vt-ref` | `arr[i]` | `1` / `0` | 物理视图：内存里的那个字节 |
+| `vt-data` | `.data` | `(unsigned-byte 8)` 0/1 | 物理视图：缓冲区本身 |
+
+一句话：**逻辑视图用 Lisp 布尔，物理视图保持 0/1 字节**。
+
+#### `vt-item` 为什么给 T/NIL
+
+1. **语义对应物**。`np.bool_(True).item()` 返回 Python 的 `True`（不是 `1`）；
+   Lisp 里与 Python `bool` 同位的就是 `T` / `NIL`。
+2. **可用性**。改完 `(when (vt-item (vt-all m)) ...)` 直接成立；此前必须写
+   `(= 1 (vt-item ...))`，而漏写一次就变成恒真断言（§17.7 那 9 处的来源）。
+3. **可读回**。`T` / `NIL` 被 `read` 回来还是布尔；`True` 在 `common-lisp` 包里
+   根本没有这个名字，`read` 会在当前包临时 intern 一个未绑定符号。
+
+连带改动 4 处内部消费点 —— 它们原本都假定 `vt-item` 给数字：
+
+| 位置 | 原写法 | 改法 |
+|---|---|---|
+| `vt-allclose` | `(not (zerop (vt-item (vt-all ...))))` | `(vt-item (vt-all ...))`（直接是 Lisp 布尔） |
+| `vt-histogram` | `(= (vt-item (vt-all ...)) 1.0d0)` | `(unless (vt-item (vt-all ...)) ...)` |
+| `vt-extract`（0 维 condition） | `(/= (vt-item condition) 0)` | `(%truthy-p (vt-item condition))` |
+| `vt-bincount`（取最大值） | `(vt-item (vt-amax flat))` | `(%item-number (vt-amax flat))` |
+
+后两处不能直接丢进 `if`：`vt-extract` 的 condition 可能是 `:int8` 掩码（此时
+`vt-item` 仍给 `1`/`0`，而 0 是真值）；`vt-bincount` 要对 bool 输入算出 0/1 数值
+（`np.bincount([True False])` → `[1 1]`）。于是配了两个转换原语：
+
+| 原语 | 方向 | 用途 |
+|---|---|---|
+| `%truthy-p` | 任意值 → `T`/`NIL` | 消费「可能是布尔也可能是数值」的单元素 |
+| `%item-number` | 任意值 → 数值（`T`→1、`NIL`→0） | 消费「可能是布尔」但要算数的单元素 |
+
+`%truthy-p` 自带 `with-float-safe`（NaN 的 `zerop` 在陷阱开启时会抛
+`FLOATING-POINT-INVALID-OPERATION`），因为它挂在索引/归约的各个分散调用点上。
+
+#### `vt-to-list` 默认为什么不布尔化
+
+因为 `NIL` 在 CL 里**既是布尔假又是空表**，`vt-from-sequence` 无法区分「元素
+NIL」与「嵌套的空列表」。实测：
+
+```lisp
+(vt-from-sequence (list t nil t))
+;; => 报错：不规则嵌套
+```
+
+也就是说，只要 `vt-to-list` 默认返回 `(T NIL T)`，`(vt-from-sequence
+(vt-to-list x))` 这条往返就**永久不可能成立** —— 而 `vt-to-list` 的契约恰恰是
+「可重建的数值序列」。所以默认给 `0`/`1`，需要 Lisp 布尔时显式
+`(vt-to-list b :bool t)`。非布尔张量加该关键字无副作用。
+
+#### 打印为什么用 T/NIL
+
+除了与 `vt-item` 一致，还有一条硬理由：`*print-readably*` 为真时，打印结果应当
+能被 `read` 回来。`T` / `NIL` 可以；`True` / `False` 不行。
+
+本库 0 维形状本来就印 `shape:NIL`（Lisp 惯例，不是 numpy 的 `()`），值却用
+Python 惯例会让同一次打印里出现两套风格。列宽不用特殊处理：`print-object` 的
+列宽是按 `(length (%format-number ...))` 实测的，`T`(1) / `NIL`(3) 自动右对齐。
+
+`%format-number` 的布尔分支返回的是**字面量字符串**，`*print-circle*` 为真时
+SBCL 会把它当共享结构（打印成 `#1=T, #2=NIL, #1#, #2#`），所以那里保留了
+`copy-seq`。
+
+#### 与 numpy 的已知差异
+
+| 项 | numpy | clvt | 说明 |
+|---|---|---|---|
+| 打印字面量 | `True` / `False` | `T` / `NIL` | 表示层差异，语义一致 |
+| `.item()` | Python `bool` | `T` / `NIL` | 同位对应物 |
+| `.tolist()` | `[True, False]` | `[1, 0]`（默认） | 见上面的 NIL 歧义；要布尔用 `:bool t` |
+| `np.extract(0维条件, a)` | `[a[0]]`（条件被当长度 1 数组） | 整个 `a`（真）/ 空（假） | `vt-extract` 的既有解释；这里只保证布尔条件不再崩、且与 `:int8` 条件行为一致 |
 
 ---
 

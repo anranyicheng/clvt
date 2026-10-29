@@ -19,10 +19,13 @@
 ;;;;      显式 :dtype :int8 仍可退回旧的 0/1 整型掩码（向后兼容）。
 ;;;;   C. 不变量：布尔张量的底层字节只含 0/1（打印、:out、astype 之后亦然）。
 ;;;;   D. 布尔与数值的互操作：sum/prod 升 int64、算术提升、where/compress 吃掩码。
-;;;;   E. 打印：布尔张量印 True/False 且头部 dtype 为 BOOL（不与 uint8 混淆）。
+;;;;   E. 打印：布尔张量印 T/NIL 且头部 dtype 为 BOOL（不与 uint8 混淆）。
 ;;;;   F. npy 往返：|b1 描述符保存/读回后仍是 :bool。
 ;;;;   G. 布尔算术：+/* 按逻辑或/与、- 报错、/ 升 float64、// 与 % 落 int8 ——
 ;;;;      numpy 的 bool_ 不按整数算，否则 True+True=2 会破掉 0/1 不变量。
+;;;;   H. 逻辑视图 vs 物理视图（§17.8）：vt-item / 打印给 T/NIL；
+;;;;      vt-ref / vt-data / vt-to-list 默认给 0/1 字节；:bool t 才布尔化。
+;;;;      含四个内部解包点（allclose / histogram / extract / bincount）的回归。
 ;;;;
 ;;;; 用法：sbcl --dynamic-space-size 4096 --non-interactive \
 ;;;;            --load test/bool-dtype-test.lisp
@@ -264,9 +267,12 @@
 (format t "~&== E. 打印 ==~%")
 
 (let* ((s (with-output-to-string (out) (prin1 (vt-> (vt-from-sequence '(1.0d0 -1.0d0)) 0.0d0) out))))
-  (check-true "print/True"  (search "True" s))
-  (check-true "print/False" (search "False" s))
+  ;; 布尔元素印 `T` / `NIL`（Lisp 惯例，§17.8），不再是 numpy 的 True/False
+  (check-true "print/T"   (search "T," s))
+  (check-true "print/NIL" (search "NIL" s))
   (check-true "print/dtype-tag" (search "BOOL" s))
+  (check-true "print/no-True"  (null (search "True" s)))
+  (check-true "print/no-False" (null (search "False" s)))
   ;; 不能出现 0/1 这样的整型渲染
   (check-true "print/no-ints" (null (search " 0," s))))
 
@@ -338,7 +344,8 @@
   ;; 真除：恒浮点（numpy: [1. nan 0.]，0/0 走 IEEE 而非 CL 的除零错误）
   (let ((r (vt-/ b c)))
     (check "arith/div-dtype" (vt-dtype r) :float64)
-    (check "arith/div-0-0-nan" (vt-item (vt-isnan (vt-ref r 2))) 1))
+    ;; vt-item 对 :bool 现在给 Lisp 布尔（§17.8），不再是 1
+    (check "arith/div-0-0-nan" (vt-item (vt-isnan (vt-ref r 2))) t))
   ;; floor_divide / remainder：商与余数不是布尔量 → int8（numpy 同）
   (check "arith/floordiv-dtype" (vt-dtype (vt-div b c)) :int8)
   (check "arith/floordiv-values" (flat-ints (vt-div b c)) '(1 1 0))
@@ -352,6 +359,96 @@
   (let ((r (vt-+ b c :dtype :int8)))
     (check "arith/explicit-int8-dtype" (vt-dtype r) :int8)
     (check "arith/explicit-int8-values" (flat-ints r) '(2 2 0))))
+
+;;; ==================================================================
+;;; H. 逻辑视图 vs 物理视图（§17.8）
+;;;    逻辑视图（vt-item / 打印）= Lisp 布尔 T / NIL
+;;;    物理视图（vt-ref / vt-data / vt-to-list 默认）= 0/1 字节
+;;; ==================================================================
+
+(format t "~&== H. 逻辑视图 / 物理视图 ==~%")
+
+(let* ((b  (vt-astype (vt-from-sequence #(1 0 1) :dtype :int8) :bool))
+       (b4 (vt-astype (vt-from-sequence #(1 1 0 1) :dtype :int8) :bool))
+       (m  (vt-reshape b4 '(2 2)))
+       (f  (vt-from-sequence '(1.0d0 2.0d0 3.0d0)))
+       (zero-t (vt-full nil t :dtype :bool))
+       (zero-f (vt-full nil nil :dtype :bool)))
+  ;; --- 逻辑视图：vt-item 给 T / NIL ---
+  (check "view/item-true"  (vt-item (vt-slice b '(0 1))) t)
+  (check "view/item-false" (vt-item (vt-slice b '(1 2))) nil)
+  (check "view/item-type"  (type-of (vt-item (vt-slice b '(0 1)))) 'boolean)
+  (check "view/item-0d-true"  (vt-item zero-t) t)
+  (check "view/item-0d-false" (vt-item zero-f) nil)
+  (check "view/item-2d-single"
+         (vt-item (vt-reshape (vt-astype (vt-from-sequence #(1) :dtype :int8) :bool) '(1 1)))
+         t)
+  (check "view/item-multi-throws"
+         (handler-case (progn (vt-item b) nil) (error () t)) t)
+  ;; 可以直接当 Lisp 布尔用，不必再写 (= 1 ...)
+  (check "view/if-item-all" (if (vt-item (vt-all m)) :yes :no) :no)
+  (check "view/if-item-any" (if (vt-item (vt-any m)) :yes :no) :yes)
+  (check "view/allclose-true"
+         (vt-allclose (vt-from-sequence '(1.0d0 2.0d0)) (vt-from-sequence '(1.0d0 2.0d0))) t)
+  (check "view/allclose-false"
+         (vt-allclose (vt-from-sequence '(1.0d0 2.0d0)) (vt-from-sequence '(1.0d0 9.0d0))) nil)
+
+  ;; --- 物理视图：仍然是 0/1 ---
+  (check "view/ref-stays-01" (vt-ref b 0) 1)
+  (check "view/ref-numeric-p" (integerp (vt-ref b 1)) t)
+  (check "view/data-bytes" (coerce (vt-data b) 'list) '(1 0 1))
+
+  ;; --- vt-to-list：默认数值，:bool t 才布尔化 ---
+  (check "view/tolist-default" (vt-to-list b) '(1 0 1))
+  (check "view/tolist-bool"    (vt-to-list b :bool t) '(t nil t))
+  (check "view/tolist-2d-bool" (vt-to-list m :bool t) '((t t) (nil t)))
+  ;; 非布尔张量加 :bool t 无副作用
+  (check "view/tolist-nonbool" (vt-to-list f :bool t) '(1.0d0 2.0d0 3.0d0))
+  ;; 往返不变式：默认的 0/1 能重建（T/NIL 因 NIL 兼作空表而无法重建）
+  (check "view/roundtrip-default"
+         (flat-ints (vt-from-sequence (vt-to-list b) :dtype :bool)) '(1 0 1))
+
+  ;; --- 打印：T / NIL，不再出现 True / False ---
+  (let ((s1 (format nil "~a" b))
+        (s2 (format nil "~a" m)))
+    (check "view/print-has-NIL" (and (search "NIL" s1) t) t)
+    (check "view/print-elem-T"  (and (search "T," s1) t) t)
+    (check "view/print-no-True" (null (search "True" s1)) t)
+    (check "view/print-no-False" (null (search "False" s1)) t)
+    (check "view/print-2d-NIL" (and (search "NIL" s2) t) t))
+  ;; 0 维：shape 本身就印 NIL，所以只能按「dtype:BOOL <值>」判
+  (check "view/print-0d-true"  (and (search "BOOL T" (format nil "~a" zero-t)) t) t)
+  (check "view/print-0d-false" (and (search "BOOL NIL" (format nil "~a" zero-f)) t) t)
+
+  ;; --- 内部解包点（改 vt-item 时最先崩的地方）---
+  (check "view/compress-bool-mask" (vt-to-list (vt-compress b f)) '(1.0d0 3.0d0))
+  (check "view/compress-int8-mask"
+         (vt-to-list (vt-compress (vt-from-sequence #(1 0 1) :dtype :int8) f)) '(1.0d0 3.0d0))
+  ;; vt-extract 的 0 维 condition 分支：bool 与 int8 掩码必须走同一判据
+  ;; （改 vt-item 之前这里写的是 (/= (vt-item condition) 0)，bool 会直接崩）。
+  ;; 注意与 numpy 的既有偏差：np.extract(np.array(True), a) 给 [1.]（0 维条件
+  ;; 被当成长度 1 的数组），clvt 给整个 a —— 这是 vt-extract 本来的解释，
+  ;; 本轮只保证「布尔条件不再崩溃且与 int8 条件一致」。
+  (check "view/extract-0d-true"  (vt-to-list (vt-extract zero-t f)) '(1.0d0 2.0d0 3.0d0))
+  (check "view/extract-0d-false" (null (vt-to-list (vt-extract zero-f f))) t)
+  (check "view/extract-int8-0d-true"
+         (vt-to-list (vt-extract (vt-reshape (vt-from-sequence #(1) :dtype :int8) nil) f))
+         '(1.0d0 2.0d0 3.0d0))
+  (check "view/bincount-bool" (vt-to-list (vt-bincount b)) '(1 2))
+  (check "view/histogram-nan-throws"
+         (handler-case (progn (vt-histogram (vt-from-sequence (list 1.0d0 (vt-float-nan)))) nil)
+           (error () t))
+         t))
+
+;; %truthy-p / %item-number：两个「视图转换」原语
+(check "view/truthy-0" (%truthy-p 0) nil)
+(check "view/truthy-1" (%truthy-p 1) t)
+(check "view/truthy-neg-zero" (%truthy-p -0.0d0) nil)
+(check "view/truthy-nan" (%truthy-p (vt-float-nan)) t)
+(check "view/truthy-nil" (%truthy-p nil) nil)
+(check "view/truthy-t" (%truthy-p t) t)
+(check "view/item-number-true" (%item-number (vt-full nil t :dtype :bool)) 1)
+(check "view/item-number-false" (%item-number (vt-full nil nil :dtype :bool)) 0)
 
 ;;; ==================================================================
 

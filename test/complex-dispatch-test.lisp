@@ -153,7 +153,8 @@
         (let ((z0 (vt-any (vt-from-sequence (list #C(0.0d0 0.0d0)))))
               (zn (vt-any (vt-from-sequence
                            (list (complex (vt-get-nan :float64) 0.0d0))))))
-          (and (= 0 (vt-item z0)) (= 1 (vt-item zn)))))
+          ;; vt-item 对 :bool 给 T/NIL（§17.8），直接当 Lisp 布尔用
+          (and (null (vt-item z0)) (vt-item zn))))
 
 (report "复数 argmax 返回 int64"
         (eq (vt-dtype (vt-argmax (vt-from-sequence (list #C(1.0d0 0.0d0)

@@ -181,8 +181,11 @@
       (T! "a<b" (funcall E "lt") (vt-to-list (vt-< a b)))
       (T! "a==b" (funcall E "eq") (vt-to-list (vt-= a b)))
       (T! "a>b" (funcall E "gt") (vt-to-list (vt-> a b))))
-    (T! "all(true)" (funcall E "all_true") (vt-item (vt-all (vt-from-sequence '(1.0 1.0 1.0)))))
-    (T! "any(true)" (funcall E "any_true") (vt-item (vt-any (vt-from-sequence '(0.0 0.0 1.0)))))
+    ;; vt-item 对 :bool 给 T/NIL（§17.8），期望来自 JSON 的数值，这里显式归一
+    (T! "all(true)" (funcall E "all_true")
+        (if (vt-item (vt-all (vt-from-sequence '(1.0 1.0 1.0)))) 1.0d0 0.0d0))
+    (T! "any(true)" (funcall E "any_true")
+        (if (vt-item (vt-any (vt-from-sequence '(0.0 0.0 1.0)))) 1.0d0 0.0d0))
     (T! "isfinite" (funcall E "isfinite") (vt-to-list (vt-isfinite (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+ 0.0d0)))))
     (T! "isnan" (funcall E "isnan") (vt-to-list (vt-isnan (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ 0.0d0)))))
     (T! "isinf" (funcall E "isinf") (vt-to-list (vt-isinf (vt-from-sequence (list 1.0d0 +vt-dfloat-nan+ +vt-dfloat-pos-inf+ +vt-dfloat-neg-inf+ 0.0d0)))))

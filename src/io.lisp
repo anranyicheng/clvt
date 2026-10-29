@@ -173,26 +173,37 @@
                  (nreverse result)))))
       (recurse dims))))
 
-(defun vt-to-list (vt)
-  "将张量转换为嵌套列表，正确处理任意 strides/offset 的视图。"
-  (labels
-      ((build (shape strides offset data)
-         (if (null shape)
-             (aref data offset)
-             (let ((dim (first shape))
-                   (stride (first strides))
-                   (result nil))
-               (loop for i fixnum from (1- dim) downto 0
-                     for sub = (+ offset (* i stride))
-                     do (push (build (rest shape) (rest strides) sub data)
-                              result))
-               result))))
-    (let ((shape (vt-shape vt))
-          (strides (vt-strides vt))
-          (offset (vt-offset vt)) (data (vt-data vt)))
-      (if shape
-          (build shape strides offset data)
-          (aref data offset)))))
+(defun vt-to-list (vt &key bool)
+  "将张量转换为嵌套列表，正确处理任意 strides/offset 的视图。
+
+   BOOL 为真且张量 dtype 是 `:bool` 时，叶子是 Lisp 布尔 `T` / `NIL`；
+   默认叶子仍是物理值 `0` / `1`。**默认不布尔化是刻意的**：`NIL` 在 CL 里
+   既是布尔假又是空表，`VT-FROM-SEQUENCE` 无法区分「元素 NIL」与「嵌套的
+   空列表」—— 实测 `(vt-from-sequence (list t nil t))` 直接报「不规则嵌套」。
+   返回 0/1 才能保住 `(vt-from-sequence (vt-to-list x))` 这条往返不变式。
+
+   需要 Lisp 布尔视图时用 `(vt-to-list b :bool t)`，取单标量用 `VT-ITEM`。
+   逻辑视图与物理视图的分层契约见 CONVENTIONS §17.8。"
+  (let ((want-bool (and bool (eq (vt-dtype vt) :bool))))
+    (labels
+        ((leaf (v) (if want-bool (if (zerop v) nil t) v))
+         (build (shape strides offset data)
+           (if (null shape)
+               (leaf (aref data offset))
+               (let ((dim (first shape))
+                     (stride (first strides))
+                     (result nil))
+                 (loop for i fixnum from (1- dim) downto 0
+                       for sub = (+ offset (* i stride))
+                       do (push (build (rest shape) (rest strides) sub data)
+                                result))
+                 result))))
+      (let ((shape (vt-shape vt))
+            (strides (vt-strides vt))
+            (offset (vt-offset vt)) (data (vt-data vt)))
+        (if shape
+            (build shape strides offset data)
+            (leaf (aref data offset)))))))
 
 (defun vt-to-array (vt &key dtype (fast nil))
   "将张量转换为原生多维数组。使用 vt-do-each 遍历，同时维护逻辑坐标。
@@ -298,11 +309,16 @@
 
 (defun %format-number (val type)
   (case (%type-category type)
+    ;; 布尔印 `T` / `NIL` 而不是 numpy 的 `True` / `False`（§17.8）：
+    ;;   · `*print-readably*` 下 `True` 读回来是**当前包里临时 intern 的符号**
+    ;;     （common-lisp 里没有 TRUE 这个名字），`T` / `NIL` 可以原样读回；
+    ;;   · 本库的 0 维形状已经印成 `shape:NIL`（Lisp 惯例），值却用 Python
+    ;;     惯例会让同一次打印里出现两套风格。
     ;; 注意 COPY-SEQ：字面量字符串是同一个常量对象，若直接返回，SBCL 在
     ;; *PRINT-CIRCLE* 为真时会把它当成共享结构，打印出
-    ;; "#1=True, #2=False, #1#, #2#" 这种噪音。浮点分支走 FORMAT 天然是新
+    ;; "#1=T, #2=NIL, #1#, #2#" 这种噪音。浮点分支走 FORMAT 天然是新
     ;; 字符串，没有这个问题；布尔分支是唯一返回字面量的分支。
-    (:boolean (copy-seq (if (zerop val) "False" "True")))
+    (:boolean (copy-seq (if (zerop val) "NIL" "T")))
     (:integer (format nil "~d" val))
     (:complex (%format-complex-number val))
     (:float (%format-real-part val))

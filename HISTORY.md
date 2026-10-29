@@ -2651,3 +2651,152 @@ where 吃 `:bool` 掩码 / `bool+bool` 是逻辑或 / `bool-bool` 必须报错�
 真的在测，比多写十条测试更有价值**。恒真断言不是「弱断言」，它是把
 「没测」伪装成「测过」—— 而且在语义变更（`:int8` → `:bool`）时，它的
 文字不需要改一个字就继续「通过」。
+
+---
+
+## H.3.27 第三十四轮：布尔的三层视图 —— `item` 给 T/NIL、打印给 T/NIL、`to-list` 保持 0/1
+
+> 对外结论见 `CHANGELOG.md`（三十四），契约见 `CONVENTIONS.md` §17.8。
+
+#### 一、先到来的不是需求，是两个红灯
+
+上游合并补丁后跑全量，两个差分探针红了（`496` 与 `405` 条全表的套件）。
+第一反应是「`:bool` 改动破坏了什么」，但本地同样代码全绿。查下去发现根因不在
+语义：**探针的期望表是内嵌在 `.lisp` 里的字面量**，由 `gen_probes*.py` 生成；
+换了机器或 numpy 版本后，「仓库里的期望」与「本机 numpy 的期望」会差在第 16
+位有效数字上。跑套件前没有人重新生成，红灯就被当成回归去排查了。
+
+`check_key_sync.py` 明明每次都在跑，为什么没解决？因为它的职责是**比对**：
+重新生成 → 逐字节/语义比对 → `finally` 里 `git checkout --` 把工作区还原成
+提交状态。它正确地报告了「格式化漂移 7 + 8 条」，然后**把新生成的版本扔了**。
+门禁要的是「发现问题」，而这里要的是「留下新基线」，是两件事。
+
+于是 `run-tests.sh` 多了一个阶段，位置必须卡在 `check_key_sync.py` **之后**
+（否则写的基线会被它的 `git checkout` 抹掉）：
+
+```bash
+check_key_sync.py   # 比对语义漂移，FAIL 即退出
+regen_probes        # 按本机 numpy 重生成并「留下」（新增）
+check_docs.py
+check_build_warnings
+→ 跑套件
+```
+
+边界写进了函数注释，因为这一步天然有「自证」风险 —— 自己生成期望、自己跑、
+当然绿：
+
+* 语义漂移在上一阶段就 FAIL 退出，走不到这里，所以这里只可能刷新格式化差异；
+* 刷新了就把**改了多少行**报出来，并明说「本轮是自洽基线，不是对提交期望的回归」；
+* `--no-regen-probes` / `CLVT_SKIP_PROBE_REGEN=1` 走严格模式（CI 用这个）；
+* 中间产物通过 `FUZZ_TMP` 指到临时目录，跑完删掉，工作区不会多出 `tmp/`。
+
+#### 二、`True` / `False` 是 Lisp 里的错字，不只是风格
+
+用户提的第二个问题：布尔张量打印成 `True` / `False`，不符合 Lisp 惯例。
+这不只是审美 ——
+
+```lisp
+(read-from-string "True")   ; → 符号 TRUE，当前包里临时 intern，未绑定
+(read-from-string "T")      ; → T
+```
+
+`common-lisp` 包里没有 `TRUE` 这个名字。所以 `*print-readably*` 为真时，
+`True` 根本读不回来；`T` / `NIL` 可以。而且本库的 0 维形状本来就印
+`shape:NIL`（Lisp 惯例，不是 numpy 的 `()`），值却用 Python 惯例，同一次打印里
+两套风格。
+
+改动只有 `%format-number` 的一个分支。列宽不用管 —— `print-object` 的
+`scan-axis` 是按 `(length (%format-number ...))` 实测的，`T`(1) / `NIL`(3)
+自动右对齐：
+
+```
+#<VT shape:(2 2) dtype:BOOL
+  [[   T,  NIL],
+   [   T,    T]]>
+```
+
+`*print-circle*` 那个坑照旧要防（字面量字符串是同一个常量对象），`copy-seq` 留着。
+
+#### 三、`vt-item` 给 T/NIL：一行改动，四个地方会崩
+
+`np.bool_(True).item()` 返回 Python 的 `True`，不是 `1`。Lisp 里与 Python
+`bool` 同位的就是 `T` / `NIL`。改完 `(when (vt-item (vt-all m)) ...)` 直接成立，
+上一轮为了修恒真断言而加的 `(= 1 (vt-item ...))` 这层包装也就可以拆掉了。
+
+但 `vt-item` 有 20 处内部调用，其中 4 处会因为返回类型变化而当场出事：
+
+| 位置 | 原写法 | 为什么崩 |
+|---|---|---|
+| `vt-allclose` | `(not (zerop (vt-item ...)))` | `zerop` 收到 `T` |
+| `vt-histogram` | `(= (vt-item ...) 1.0d0)` | `=` 收到 `T` |
+| `vt-extract`（0 维 condition） | `(/= (vt-item ...) 0)` | `/=` 收到 `T` |
+| `vt-bincount`（取最大值） | `(1+ (vt-item (vt-amax flat)))` | `1+` 收到 `T` |
+
+前两处改完反而更简洁（返回值本身就是 Lisp 布尔）。后两处不能直接丢进 `if`
+或算术：
+
+* `vt-extract` 的 condition 可能仍是 `:int8` 掩码 —— 那时 `vt-item` 给 `1`/`0`，
+  而 **CL 里 0 是真值**，`(if 0 'a 'b)` 给 `A`。必须过一层 `%truthy-p`。
+* `vt-bincount` 要算 0/1 数值（`np.bincount([True False])` → `[1 1]`），
+  过 `%item-number`。
+
+这两个转换原语就放在 `%bool-flag` 旁边，互为反向：`%bool-flag` 收敛到物理
+0/1，`%truthy-p` 收敛到 Lisp T/NIL，`%item-number` 把 `T`/`NIL` 推回数值。
+`%truthy-p` 自带 `with-float-safe` —— 它挂在索引/归约的分散调用点上，指望每个
+调用方记得包一层不现实，而 NaN 的 `zerop` 在陷阱开启时会抛
+`FLOATING-POINT-INVALID-OPERATION`（探针实测踩到过）。
+
+#### 四、`vt-to-list` 是这次唯一说「不」的地方
+
+按一致性，`vt-to-list` 也该返回 `(T NIL T)`。但它不能，理由是个 Lisp 特有的
+歧义：
+
+```lisp
+(vt-from-sequence (list t nil t))
+;; => 报错：不规则嵌套
+```
+
+`NIL` 既是布尔假、又是空表，`vt-from-sequence` 无法区分「元素 NIL」和「嵌套的
+空列表」。只要 `vt-to-list` 返回 T/NIL，`(vt-from-sequence (vt-to-list x))` 这条
+往返就**永久不成立** —— 而 `vt-to-list` 的契约恰恰是「可重建的数值序列」。
+
+所以定了三层：`vt-item`（标量）与打印走 Lisp 布尔，`vt-to-list` 默认保持
+`0`/`1`，要布尔视图显式 `:bool t`。`vt-ref` / `vt-data` 保持物理字节不动 ——
+它们是内存视图，改成 T/NIL 会让所有按字节遍历的内核失效。
+
+一句话总结这张表：**逻辑视图用 Lisp 布尔，物理视图保持 0/1 字节**。
+
+#### 五、连带修改：8 个测试文件的 18 条断言
+
+`vt-item` 换返回类型，直接踩中所有「拿 `vt-item` 结果和数字比」的断言：
+
+| 文件 | 条数 | 改法 |
+|---|---|---|
+| `core-test` | 2 | `(= (vt-item (vt-all ...)) 1)` → 直接布尔 |
+| `numpy-convention-tests` | 2 | 期望 `1`/`0` → `t`/`nil` |
+| `test-all` | 6 | 同上 |
+| `test-bug0` | 1 | 去掉 `plusp` 包装 |
+| `shape-degenerate-tests` | 2 | `'(:ok :scalar 1)` → `'(:ok :scalar t)` |
+| `robustness-test` | 2 | 数据驱动的 `T!` 用数值比较，显式 `(if ... 1.0d0 0.0d0)` |
+| `run_all_tests` | 2 | 同上（期望来自 JSON 的数值） |
+| `complex-dispatch-test` | 1 | `(= 0 (vt-item (vt-any ...)))` → `(null (vt-item ...))` |
+| `example.lisp` | 4 | `vt-all-true-p` 简化成 `(vt-item (vt-all x))`，三处 `(= ... 1.0d0)` 改成直接判 |
+
+其中前六个是「测试跟着契约走」，最后一个是「示例跟着契约走」。区分标准：
+测试改断言是**对的**（旧契约变了），但如果改的是**被测语义**那才是掩盖回归 ——
+这批全部属于前者，因为 `vt-item` 的返回值本身就是被测对象。
+
+#### 六、验收
+
+| 项 | 结果 |
+|---|---|
+| `bool-dtype-test` | 282 断言全过（新增 H 组 43 条：视图分层/0-1 物理/往返/打印/四个消费点） |
+| 全量套件 | 65 套件全绿（详见 `CHANGELOG.md` 三十四） |
+| `check_docs.py` | 205 个锚点全解析 |
+| `check_key_sync.py` | `codegen 同步 ✓`（格式化漂移由新的 regen 阶段消化） |
+
+一条可以推广的教训：**「门禁报的问题」和「门禁该做的事」不是一回事**。
+`check_key_sync.py` 一直在正确报告格式化漂移，但它按设计要把工作区还原 ——
+于是每次跑测试都看见红灯，每次都不知道该拿它怎么办。修法不是放宽门禁，
+而是在它后面补一个「负责留下结果」的阶段，并且把这个阶段的「自证」边界
+写成注释和开关。

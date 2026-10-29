@@ -27,7 +27,8 @@
   只判条件是否为 NIL，而 `vt-all` 返回的是一个 VT 对象，任何 VT 对象都不为
   NIL。`:bool` dtype 落地后 `vt-all` 返回 `shape:NIL dtype:BOOL` 的张量，
   于是这些断言原本想验证的「全为真」一点都没被检查到。"
-  (= 1 (vt-item (vt-all tensor))))
+  ;; :bool 的 vt-item 直接返回 T/NIL（§17.8），这里就是纯粹的解包
+  (vt-item (vt-all tensor)))
 
 ;; ============================================================
 ;; 浮点感知的测试比较器。
@@ -4749,18 +4750,18 @@
   ;; vt-all
   ;; np.all([true, true, false]) -> false
   (let ((a (vt-from-sequence '(1 1 0) :dtype :float64)))
-    (assert (= (vt-item (vt-all a)) 0.0d0)))
+    (assert (not (vt-item (vt-all a)))))
 
   ;; vt-any
   ;; np.any([0,0,1]) -> true
   (let ((a (vt-from-sequence '(0 0 1) :dtype :float64)))
-    (assert (= (vt-item (vt-any a)) 1.0d0)))
+    (assert (vt-item (vt-any a))))
 
   ;; vt-isclose
   ;; np.isclose(1.0, 1.000001) -> true
   (let ((a (vt-const '() 1.0d0))
         (b (vt-const '() 1.000001d0)))
-    (assert (= (vt-item (vt-isclose a b)) 1.0d0)))
+    (assert (vt-item (vt-isclose a b))))
 
   ;; vt-allclose
   (let ((a (vt-from-sequence '(1 2 3) :dtype :float64))

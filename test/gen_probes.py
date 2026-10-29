@@ -617,6 +617,11 @@ def cmd_gen():
 (defun fz-flat (x) (cond ((null x) nil) ((vt-p x) (fz-flat (vt-to-list x))) ((atom x) (list x)) (t (append (fz-flat (car x)) (fz-flat (cdr x))))))
 (defun fz-token (x)
   (typecase x
+    ;; LISP 布尔 → 1/0：:bool 张量经 VT-ITEM / VT-TO-LIST 出来的可能是 T/NIL
+    ;; （CONVENTIONS §17.8），而期望表里布尔一律存成 "1"/"0"。
+    ;; 这一支必须排在 (t ...) 前面：T / NIL 是符号，会先被 typecase 的
+    ;; 兜底分支接住，格式化出 "T" / "NIL" 让 fz-num 读成 "junk in string"。
+    (boolean (if x "1" "0"))
     (single-float (fz-token (coerce x 'double-float)))
     (double-float (cond ((sb-ext:float-nan-p x) "nan")
                         ((and (sb-ext:float-infinity-p x) (plusp x)) "inf")
