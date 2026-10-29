@@ -2,8 +2,12 @@
 
 (in-package :clvt)
 
-(defun vt-ref (vt &rest indices)
-  "获取指定位置元素（支持负索引，带边界检查）。"
+(defun %vt-ref-raw (vt &rest indices)
+  "按逻辑坐标取单个元素的**物理值**（`:bool` 也返回 0/1 字节）。
+
+   这是 `VT-REF` 的数值内核：所有内部算术/比较/累加一律走这里，既避开
+   布尔逻辑视图（T/NIL 不能进 `+`/`=`），也省掉每元素一次 dtype 判断。
+   外部用户应使用 `VT-REF`（§17.8 逻辑视图）。"
   (declare (optimize (speed 3)))
   (let* ((shape (vt-shape vt))
          (rank (length shape)))
@@ -30,8 +34,33 @@
               ((equal (array-element-type data) '(signed-byte 32)) (ref (signed-byte 32)))
               (t (aref data ptr)))))))
 
+(defun vt-ref (vt &rest indices)
+  "获取指定位置元素的**逻辑值**（支持负索引，带边界检查）。
+
+   `:bool` 张量返回 Lisp 布尔 `T` / `NIL`，与 `VT-ITEM` 一致：numpy 的
+   `a[0]` 给 `np.bool_`，Lisp 的对应物就是 T/NIL。写成
+   `(when (vt-ref mask i) ...)` 可直接用，不必再绕 `(= 1 ...)`。
+
+   分层契约（CONVENTIONS §17.8）：
+     · 逻辑视图 —— `VT-REF` / `VT-ITEM` / 打印 → T/NIL
+     · 物理视图 —— `%VT-REF-RAW` / `VT-DATA` / `VT-TO-LIST` 默认 → 0/1 字节
+
+   代价与 `VT-ITEM` 相同：布尔结果不能直接进算术（`(+ (vt-ref b 0) 1)` 报
+   类型错误）。要算数请显式 `(if (vt-ref b 0) 1 0)`，或内部用 `%VT-REF-RAW`。"
+  (declare (dynamic-extent indices))
+  (let ((v (apply #'%vt-ref-raw vt indices)))
+    (if (eq (vt-dtype vt) :bool)
+        (if (zerop v) nil t)
+        v)))
+
 (defun (setf vt-ref) (value vt &rest indices)
   "设置指定位置元素（支持负索引，带边界检查）。
+
+   `:bool` 目标接受 `T`/`NIL` 与任意数值（按 `%BOOL-FLAG` 真值化：非零→1、
+   零→0、NaN→1），与 `VT-FILL` / `VT-PUT` / `VT-CAST` 的布尔语义一致；
+   其余 dtype 走 `COERCE`。原实现只写 `COERCE`，于是
+   `(setf (vt-ref b 0) t)` 直接报 'T can't be converted to (UNSIGNED-BYTE 8)',
+   布尔化 `VT-REF` 之后这会变成最自然的写法，必须一并支持。
 
    H4 写入契约：目标若是只读的广播视图（存在 dim>1 且 stride=0 的轴），
    禁止写入 —— 该轴上的所有逻辑位置共享同一物理单元，写入语义歧义。
@@ -57,7 +86,9 @@
                  (unless (and (>= i 0) (< i dim))
                    (error "索引 ~a 越界（轴大小 ~a）" idx dim))
                  (incf ptr (the fixnum (* i stride)))))
-      (let ((cval (coerce value (vt-element-type vt))))
+      (let ((cval (if (eq (vt-dtype vt) :bool)
+                      (%bool-flag value)
+                      (coerce value (vt-element-type vt)))))
         (macrolet ((set-ref (lt)
                      `(setf (aref (the (simple-array ,lt (*)) data) ptr) cval)))
           (cond ((equal (array-element-type data) 'double-float) (set-ref double-float))
@@ -77,8 +108,8 @@
    `:bool` 张量解包成 **Lisp 布尔 `T` / `NIL`**：numpy 的 `.item()` 返回
    Python `bool`，Lisp 的对应物就是 T/NIL。这样
    `(when (vt-item (vt-all m)) ...)` 直接可用，不必再绕 `(= 1 ...)`。
-   物理视图（`VT-REF` / `VT-DATA` / `VT-TO-LIST` 默认）保持 0/1 字节，
-   分层契约见 CONVENTIONS §17.8。
+   `VT-REF` 给同样的逻辑视图；物理视图（`%VT-REF-RAW` / `VT-DATA` /
+   `VT-TO-LIST` 默认）保持 0/1 字节，分层契约见 CONVENTIONS §17.8。
 
    v0.4.x 修复：原实现仅解包 0 维张量，(1,1) 等二维单元素张量被原样
    返回而非标量；现按 data[offset] 直取（零索引元素物理位置即 offset）。
@@ -744,13 +775,23 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
                        (let ((flat (vt-flatten (ensure-vt indices))))
                          (loop for i below (vt-size flat)
                                collect (truncate (aref (vt-data flat) i))))))
-         (val-list (cond ((numberp values) (list values))
-                         ((or (listp values) (arrayp values))
-                          (vt-flatten-sequence values))
-                         ((vt-p values)
-                          (let ((flat (vt-flatten (ensure-vt values))))
-                            (loop for i below (vt-size flat)
-                                  collect (aref (vt-data flat) i))))))
+         (val-list (cond
+                     ;; T / NIL 是**单个**布尔值，必须先于 LISTP 判断：
+                     ;; NIL 既是布尔假又是空表，落到下面两支会得到空
+                     ;; VAL-LIST（N-VALUES=0 → VT-PUT 直接返回，静默空操作）。
+                     ((or (eq values t) (null values))
+                      (list (if values 1 0)))
+                     ((numberp values) (list values))
+                     ((or (listp values) (arrayp values))
+                      ;; 目标为 :bool 时按布尔叶子展平：默认规则把 NIL 当空
+                      ;; 子序列，`(list t nil t)` 会被压成 `(T T)`，值列表
+                      ;; 短一截后由 (mod vi n-values) 循环复用 → 静默错值。
+                      (vt-flatten-sequence values
+                                           :bool (eq (vt-dtype tensor) :bool)))
+                     ((vt-p values)
+                      (let ((flat (vt-flatten (ensure-vt values))))
+                        (loop for i below (vt-size flat)
+                              collect (aref (vt-data flat) i))))))
          (n-values (length val-list)) (shape (vt-shape tensor))
          (strides (vt-strides tensor)) (offset (vt-offset tensor)) (data (vt-data tensor)))
     ;; H4 写入契约（v0.4.x 修复）：dim>1 且 stride=0 的广播维度禁止就地写入，

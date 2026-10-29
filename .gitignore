@@ -17,3 +17,8 @@
 *.wx32fsl
 
 __pycache__/
+*.pyc
+
+# 差分探针生成器的中间产物（gen_probes*.py 默认写到 仓库/tmp/，可用 FUZZ_TMP 改路径）
+# run-tests.sh 走 FUZZ_TMP=mktemp 临时目录，这里的规则只防手工直跑时误提交。
+/tmp/

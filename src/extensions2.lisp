@@ -458,7 +458,7 @@
                      (dotimes (k new-dim)
                        (setf (aref rdata (+ (* bi new-dim inner)
                                             (* k inner) ii))
-                             (vt-ref ov k)))))))
+                             (%vt-ref-raw ov k)))))))
              result))
           (t (error "vt-apply-along-axis: func must return scalar or 1D VT")))))))
 

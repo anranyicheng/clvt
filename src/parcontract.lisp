@@ -327,7 +327,7 @@
                (unless (= (aref (vt-data strided)
                                 (%vt-flat-idx (vt-offset strided)
                                               (vt-strides strided) idx))
-                          (vt-ref strided i))
+                          (%vt-ref-raw strided i))
                  (error "parcontract 自检失败：strided 寻址不一致 (i=~d)" i))))
     ;; 2) 标量视图（0 维）
     (let ((s (ensure-vt 42.0s0)))

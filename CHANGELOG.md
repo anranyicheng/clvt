@@ -4,6 +4,98 @@
 
 ---
 
+## 2026-10-29（三十五）— feat(bool): 布尔值「写得进去」—— `vt-ref` 布尔化、`vt-view` 放行 bool→uint8/int8、`vt-from-sequence` 认 T/NIL 字面量
+
+> **取代（三十四）中的两条结论**：`vt-ref` 不再返回 0/1 字节（改返回 `T`/`NIL`）；
+> `(vt-to-list b :bool t)` → `(vt-from-sequence … :dtype :bool)` 这条往返**现在成立**。
+> 括号内的历史叙述保留原样，以避免改写流水账。
+
+**破坏性变更（四处）**：
+
+| 旧 | 现在 |
+|---|---|
+| `(vt-ref bool张量 i)` → `1` / `0` | → **`T` / `NIL`**（与 `vt-item` 一致） |
+| `(setf (vt-ref b 0) nil)` → 报 `can't be converted to (UNSIGNED-BYTE 8)` | → 接受 `T`/`NIL`/任意数值（按 `%bool-flag` 真值化） |
+| `(vt-from-sequence '(t nil t) :dtype :bool)` → 报「不规则嵌套」 | → `[T NIL T]`；`NIL` 一律是叶子 |
+| `(vt-view b :dtype :uint8)` → 报「仅支持复数两对」 | → `[1 0 1]`，形状不变 |
+
+**不受影响**：`vt-data` 仍是 `(unsigned-byte 8)` 的 0/1 缓冲区；`vt-to-list`
+默认仍是 `(1 0)`；npy 落盘的 `|b1` 字节不变；非 `:bool` dtype 的一切行为不变
+（`(vt-from-sequence (list 1 nil 3))` 仍报「不规则嵌套」）。
+
+**为什么改**：
+
+1. `vt-ref` 与 `vt-item` 是同一类接口（按坐标取一个元素），给不同表示本身
+   就是错的。`arr[i]` 在 numpy 里返回 `np.bool_`，Lisp 的同位对应物是 `T`/`NIL`。
+   改完 `(when (vt-ref mask i) ...)` 直接可用 —— 而 `0` 在 CL 里是真值，
+   漏写一次 `(= 1 ...)` 就变成**恒真判断**。
+2. 布尔化之后 `(setf (vt-ref b 0) (vt-ref b 1))` 成了最自然的写法，原实现走
+   `(coerce value (vt-element-type vt))` 会直接报类型错误 —— 等于「读得出来、
+   写不回去」。改用 `%bool-flag` 归一，顺带接受 `0.5` / `-0.0` / NaN，与
+   `vt-fill`、`vt-put`、`vt-astype` 的布尔语义对齐。
+3. `vt-from-sequence` 是 Lisp 列表 → 张量的主入口，不认 `T`/`NIL` 就意味着
+   布尔张量只能从 `0`/`1` 或者 `vt-astype` 绕进来。
+4. `bool`、`uint8`、`int8` 都是 1 字节，`view` 到整型本该逐位等价。
+
+**`vt-view` 为什么只放行 `bool → uint8/int8`，反向不放**：numpy 的
+`uint8.view(bool)` 是**纯字节直译** —— `np.array([1,2,0], dtype=np.uint8)
+.view(bool)` 打印 `[True True False]`，但值 `2` 原封不动留在数组里。照搬就
+等于允许「bool 数组里存着 2」，直接违反 0/1 不变量（打印、`vt-item`、npy 往返、
+`sum` 升 int64 全依赖它）。反向请用 `vt-astype :bool`：真值化 `2 → 1`，
+语义明确，不该藏在 `view` 这个名字底下。
+
+**迁移**：
+
+```lisp
+;; 旧
+(= 1 (vt-ref mask i))
+(setf (vt-ref b 0) 1)
+(vt-from-sequence (list 0 1 0) :dtype :bool)
+
+;; 新：逻辑值直接当布尔用
+(when (vt-ref mask i) ...)
+(setf (vt-ref b 0) t)                ; 0/1 也仍然接受
+(vt-from-sequence (list t nil t) :dtype :bool)
+
+;; 需要 0/1 数值时
+(if (vt-ref b i) 1 0)                ; 或内部用 clvt::%vt-ref-raw
+```
+
+**内部改动**：`vt-ref` 拆成两层 —— `%vt-ref-raw` 保留原实现（永远 0/1，
+供库内数值代码使用），`vt-ref` 在它外面加一层 dtype 判断。`src/` 内 23 处
+读点全部改调 `%vt-ref-raw`（`linalg` 的 Gram-Schmidt、`extensions3` 的协方差/
+相关系数/叉积、`reduce-stats` 的 `vt-interp` 单调性检查等），理由是这些点要的
+是数字，靠「bool 不会流进来」的假设兜底迟早失效；分流后数值热路径连一次 `eq`
+都不用付。
+
+**连带修的三处静默失败**（都不报错、只是结果不对，比报错难查得多）：
+
+| 场景 | 旧行为 | 现在 |
+|---|---|---|
+| `(vt-put b 0 t)` | 静默空操作（`t` 不匹配任何分支，`n-values`=0 直接返回） | 写入 1 |
+| `(vt-put b 1 nil)` | 静默空操作（`nil` 落进 `listp` 分支被展平成空表） | 写入 0 |
+| `(vt-put b '(0 1 2) '(t nil t))` | 得到 `(1 1 1 0)`（`vt-flatten-sequence` 把值列表压成 `(T T)` 后循环复用） | 得到 `(1 0 1 0)` |
+
+`vt-flatten-sequence` 因此新增 `&key bool`（默认行为不变，仍是 `(T T)`），
+`vt-put` 在目标为 `:bool` 时自动启用。
+
+**`vt-view` 顺带修的老 bug**：`(vt-view a :dtype dt)` 省略 shape 时，未指定被
+当成 `nil` 形状（0 维），对任何多元素张量都报「元素总数不一致 (旧 4, 新 1)」。
+现在用 `:none` 哨兵区分「未指定」与「显式 nil」，未指定即保持原形状，与 numpy
+的 `a.view(dt)` 一致。
+
+**仓库卫生**：删掉 `git add -f *` 带进来的 `tmp/{cases,cases2}.json`、
+`tmp/expected{,2}.txt` 与 `test/__pycache__/gen_probes.cpython-312.pyc`，恢复
+`/tmp/` 忽略规则并补 `*.pyc`。这些对任何流程都不必要：探针期望内嵌在
+`differential-probes-test*.lisp` 里，`tmp/` 只在 `gen_probes.py compare`
+子命令里用。
+
+**测试**：`bool-dtype-test` 增至 **327** 条（新增 I 组 33 条：布尔字面量构造 /
+0 维标量 / `NIL` 叶子 / `vt-view` 双向拒绝 / `flatten :bool` / `vt-put` 布尔
+标量；H 组由 43 扩到 55：`vt-ref` 布尔化与 setter）；两个差分探针
+`496/496` + `405/405`；65 套件全绿。契约写进 `CONVENTIONS.md` §17.9，
+分层表的 `vt-ref` 行改归逻辑视图并新增 `%vt-ref-raw` 行。
+
 ## 2026-10-29（三十四）— feat(bool): 布尔值的「逻辑视图」改回 Lisp 惯例，run-tests 自动刷新探针基线
 
 **破坏性变更（两处，都在解包/显示层）**：

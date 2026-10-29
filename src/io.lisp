@@ -6,11 +6,22 @@
 ;;; 展平与嵌套
 ;;; ------------------------------------------------------------------
 
-(defun vt-flatten-sequence (seq)
-  "深度优先遍历 seq 及其嵌套序列，返回所有原子元素的列表（行主序）。"
+(defun vt-flatten-sequence (seq &key bool)
+  "深度优先遍历 seq 及其嵌套序列，返回所有原子元素的列表（行主序）。
+
+   BOOL 为真时 `NIL` 视为叶子（布尔假）而不是空序列，与
+   `VT-FROM-SEQUENCE :dtype :bool` 的叶子规则一致（§17.8）。
+
+   默认保持旧行为：`NIL` 是空序列，于是
+   `(vt-flatten-sequence (list t nil t))` 得到 `(T T)` —— **静默丢掉 NIL**。
+   把布尔值列表喂给 `VT-PUT` 时必须带 `:bool t`：它按
+   `(mod vi n-values)` 循环复用值列表，值少一个就会静默写错。"
   (with-float-safe
     (labels ((sequence-p (obj)
-               (or (listp obj) (arrayp obj))))
+               ;; bool 模式：NIL 是叶子（arrayp/consp 对 nil 都不成立）
+               (if bool
+                   (or (arrayp obj) (consp obj))
+                   (or (listp obj) (arrayp obj)))))
       (if (not (sequence-p seq))
           (list seq)
           (let ((result '())
@@ -47,72 +58,95 @@
    未显式给 :dtype 时（v0.5.x 修复）：序列含复数叶子 → :complex128，
    否则 → :float64（保持旧行为）。旧实现把缺省值写死成 :float64，
    于是 (vt-from-sequence (list #C(1 2))) 静默丢虚部 —— 与
-   ensure-vt / vt-fromiter 的推断（§16.2：含复数即 complex128）不一致。"
+   ensure-vt / vt-fromiter 的推断（§16.2：含复数即 complex128）不一致。
+
+   `:DTYPE :BOOL` 的叶子规则（不这样定，Lisp 布尔字面量就没法建张量）：
+     · `T` / `NIL` 是叶子（1 / 0），**`NIL` 不再被当成空子序列** ——
+       否则 `(vt-from-sequence (list t nil t) :dtype :bool)` 报「不规则嵌套」，
+       而 `(vt-from-sequence (list nil) :dtype :bool)` 会得到形状 (1 0) 的空数组
+     · 数值按真值化（非零→1、零→0、NaN→1），与 `VT-CAST` 同规则
+     · **顶层** `NIL` 仍是形状 (0) 的空数组（对标 np.array([], dtype=bool)）
+     · 标量叶子：`(vt-from-sequence t :dtype :bool)` → 0 维 `T`
+       （对标 np.array(True)，形状 ()）
+
+   代价是 Lisp 独有的歧义：`(vt-from-sequence '(() ()) :dtype :bool)` 得到
+   长度 2 的 `[NIL NIL]`，而非 numpy 的 (2 0) 空数组 —— 要空数组请写
+   `(vt-zeros '(2 0) :dtype :bool)`。分层契约见 CONVENTIONS §17.8。"
   (when (null dtype)
     (setf dtype (if (%any-complex-in-sequence-p contents) :complex128 :float64)))
-  (with-float-safe
-    (labels
-        ((infer-shape (seq)
-           (typecase seq
-             (list
-              (if (null seq)
-                  (list 0)
-                  (let* ((first (car seq))
-                         (rest-shape (typecase first
-                                       (list (infer-shape first))
-                                       (vector (infer-shape first))
-                                       (t nil))))
-                    (if rest-shape
-                        (cons (length seq)
-                              (loop for sub in (cdr seq)
-                                    unless (equal (infer-shape sub) rest-shape)
-                                      do (error "不规则嵌套")
-                                    finally (return rest-shape)))
-                        (progn
-                          (loop for sub in (cdr seq)
-                                when (or (listp sub) (typep sub 'vector))
-                                  do (error "不规则嵌套"))
-                          (list (length seq)))))))
-             (vector
-              (let ((len (length seq)))
-                (if (zerop len) (list 0)
-                    (let* ((first (aref seq 0))
-                           (rest-shape (typecase first
-                                         (list (infer-shape first))
-                                         (vector (infer-shape first))
-                                         (t nil))))
+  (let ((bool-mode (eq dtype :bool)))
+    (with-float-safe
+      (labels
+          ((seq-p (x)
+             ;; bool 模式下 NIL 是叶子而非空序列；其余模式保持「nil 即空表」。
+             (if bool-mode
+                 (or (vectorp x) (consp x))
+                 (or (listp x) (vectorp x))))
+           (infer-shape (seq top)
+             "TOP 标记顶层调用：顶层的空序列是「空数组」，内层的空序列在
+              bool 模式下退化为叶子 NIL。"
+             (typecase seq
+               (list
+                (if (null seq)
+                    (if (and bool-mode (not top)) nil (list 0))
+                    (let* ((first (car seq))
+                           (rest-shape (if (seq-p first)
+                                           (infer-shape first nil)
+                                           nil)))
                       (if rest-shape
-                          (cons len
-                                (loop for i from 1 below len
-                                      for sub = (aref seq i)
-                                      unless (equal (infer-shape sub) rest-shape)
+                          (cons (length seq)
+                                (loop for sub in (cdr seq)
+                                      unless (equal (infer-shape sub nil) rest-shape)
                                         do (error "不规则嵌套")
                                       finally (return rest-shape)))
                           (progn
-                            (loop for i from 1 below len
-                                  for sub = (aref seq i)
-                                  when (or (listp sub) (typep sub 'vector))
+                            (loop for sub in (cdr seq)
+                                  when (seq-p sub)
                                     do (error "不规则嵌套"))
-                            (list len)))))))
-             (t (error "无法从 ~s 创建张量" seq))))
-         (fill-tensor (data seq shape strides flat-idx)
-           (if (null shape)
-               (setf (aref data flat-idx)
-                     (if fast
-                         (coerce seq (vt-dtype->lisp-type dtype))
-                         (vt-cast seq dtype)))
-               (let ((stride (first strides)) (current flat-idx))
-                 (typecase seq
-                   (list
-                    (dolist (elem seq)
-                      (fill-tensor data elem (rest shape) (rest strides) current)
-                      (incf current stride)))
-                   (vector
-                    (loop for elem across seq do
-                      (fill-tensor data elem (rest shape) (rest strides) current)
-                      (incf current stride)))
-                   (t (error "fill-tensor: 不支持的序列类型")))))))
-      (let* ((shape (infer-shape contents))
+                            (list (length seq)))))))
+               (vector
+                (let ((len (length seq)))
+                  (if (zerop len)
+                      (if (and bool-mode (not top)) nil (list 0))
+                      (let* ((first (aref seq 0))
+                             (rest-shape (if (seq-p first)
+                                             (infer-shape first nil)
+                                             nil)))
+                        (if rest-shape
+                            (cons len
+                                  (loop for i from 1 below len
+                                        for sub = (aref seq i)
+                                        unless (equal (infer-shape sub nil) rest-shape)
+                                          do (error "不规则嵌套")
+                                        finally (return rest-shape)))
+                            (progn
+                              (loop for i from 1 below len
+                                    for sub = (aref seq i)
+                                    when (seq-p sub) do (error "不规则嵌套"))
+                              (list len)))))))
+               ;; 标量叶子：bool 模式返回 NIL（= 0 维），其余模式维持报错。
+               (t (if bool-mode nil (error "无法从 ~s 创建张量" seq)))))
+           (fill-tensor (data seq shape strides flat-idx)
+             (if (null shape)
+                 (setf (aref data flat-idx)
+                       ;; FAST 走 COERCE，但 COERCE 不认 T/NIL（
+                       ;; 'T can't be converted to (UNSIGNED-BYTE 8)'），
+                       ;; 布尔模式一律走 VT-CAST 的真值化。
+                       (if (and fast (not bool-mode))
+                           (coerce seq (vt-dtype->lisp-type dtype))
+                           (vt-cast seq dtype)))
+                 (let ((stride (first strides)) (current flat-idx))
+                   (typecase seq
+                     (list
+                      (dolist (elem seq)
+                        (fill-tensor data elem (rest shape) (rest strides) current)
+                        (incf current stride)))
+                     (vector
+                      (loop for elem across seq do
+                        (fill-tensor data elem (rest shape) (rest strides) current)
+                        (incf current stride)))
+                     (t (error "fill-tensor: 不支持的序列类型")))))))
+      (let* ((shape (infer-shape contents t))
              (size (vt-shape-to-size shape))
              (lisp-type (vt-dtype->lisp-type dtype))
              (data (make-array size :element-type lisp-type
@@ -125,7 +159,11 @@
         ;; 一维是最常见形态（列表/向量的字面量构造），这里把「数据数组」
         ;; 「下标」「转换算子」三者都声明并内联，循环体可直接编译成
         ;; 「读一个、转一个、存一个」。多维情形仍走 FILL-TENSOR，语义不变。
-        (when (= (length shape) 1)
+        ;;
+        ;; bool 模式必须绕开这条快路径：FILL1D 的 put 带 (type real x) 声明
+        ;; （为速度），而布尔叶子是 T/NIL，不是 real —— safety 0 下会静默
+        ;; 写垃圾。布尔构造走 FILL-TENSOR 的 VT-CAST 真值化。
+        (when (and (= (length shape) 1) (not bool-mode))
           (macrolet ((fill1d (lt cast)
                        `(let ((dv (the (simple-array ,lt (*)) data))
                               (i 0))
@@ -157,7 +195,7 @@
               (%make-vt :data data :shape shape :strides strides
                         :offset 0 :dtype dtype))))
         (fill-tensor data contents shape strides 0)
-        (%make-vt :data data :shape shape :strides strides :offset 0 :dtype dtype)))))
+        (%make-vt :data data :shape shape :strides strides :offset 0 :dtype dtype))))))
 
 (defun vt-flatten-to-nested (dims data)
   "将行主序一维 data 转换为符合 dims 的嵌套列表。"

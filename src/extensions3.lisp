@@ -26,7 +26,7 @@
          (let ((f (vt-flatten x))
                (acc '()))
            (dotimes (i (vt-size f) (nreverse acc))
-             (push (vt-ref f i) acc))))
+             (push (%vt-ref-raw f i) acc))))
         ((consp x) (mapcan #'%e3-flatten-list x))
         (t (list x))))
 
@@ -502,7 +502,7 @@
                     for dim = (nth d ishape)
                     do (multiple-value-bind (q r) (floor rem (max 1 dim))
                          (setf (nth d icoords) r) (setf rem q)))
-              (let ((sel (vt-ref idx linear)))
+              (let ((sel (%vt-ref-raw idx linear)))
                 (setf sel (if (minusp sel) (+ sel ax-dim) sel))
                 (unless (<= 0 sel (1- ax-dim))
                   (error "vt-put-along-axis: 索引 ~a 越界（轴长 ~a）" sel ax-dim))
@@ -512,7 +512,7 @@
                                (let ((tcoords (copy-list coords)))
                                  (setf (nth ax tcoords) sel)
                                  (setf (aref out-data (+ out-off (lin tcoords shape strides)))
-                                       (vt-ref val-flat linear)))
+                                       (%vt-ref-raw val-flat linear)))
                                (if (= d ax)
                                    (progn (setf (nth d coords) (nth d icoords))
                                           (put (1+ d) coords))
@@ -1286,7 +1286,7 @@
       (flet ((fiber-nanquantile (fiber)
                (let* ((fs (vt-size fiber))
                       (vals (loop for i below fs
-                                  for v = (vt-ref fiber i)
+                                  for v = (%vt-ref-raw fiber i)
                                   unless (%nan-p v) collect (vt-cast v :float64))))
                  (cond ((null vals) (vt-get-nan :float64))
                        (t (let* ((sv (vt-numpy-sort vals #'<))
@@ -1411,7 +1411,7 @@
           (return-from vt-cov
             (let ((acc 0.0d0))
               (dotimes (j n-obs (make-vt nil (/ acc denom) :dtype :float64))
-                (incf acc (expt (- (vt-ref row j) mean) 2)))))))
+                (incf acc (expt (- (%vt-ref-raw row j) mean) 2)))))))
       ;; v0.4.2 性能修复：原实现是三重循环，且把「每行均值」放在 (i,j) 循环
       ;; **内部** 计算 —— n_var² 次 `vt-mean`（每次 O(n_obs)），再加逐元素
       ;; `vt-ref`（泛型 aref + 下标运算）。1000×1000 实测 **54 秒**
@@ -1457,11 +1457,11 @@
         (let ((r (vt-zeros (list n n) :dtype :float64)))
           (dotimes (i n r)
             (dotimes (j n)
-              (let ((cii (vt-ref c i i)) (cjj (vt-ref c j j)))
+              (let ((cii (%vt-ref-raw c i i)) (cjj (%vt-ref-raw c j j)))
                 (setf (vt-ref r i j)
                       (if (or (zerop cii) (zerop cjj))
                           (if (= i j) 1.0d0 0.0d0)
-                          (/ (vt-ref c i j) (sqrt (* cii cjj))))))))))))
+                          (/ (%vt-ref-raw c i j) (sqrt (* cii cjj))))))))))))
 
 (defun vt-cross (a b &key (axis nil) (axisa -1) (axisb -1) (axisc -1) dtype)
   "向量叉积（对标 numpy.cross）。
@@ -1488,10 +1488,10 @@
             (t
              (let* ((res (vt-zeros (list n-vec out-len) :dtype (or dtype (vt-dtype av)))))
                (dotimes (i n-vec res)
-                 (let ((a0 (vt-ref a2 i 0)) (a1 (vt-ref a2 i 1))
-                       (a2v (if (= al 3) (vt-ref a2 i 2) 0))
-                       (b0 (vt-ref b2 i 0)) (b1 (vt-ref b2 i 1))
-                       (b2v (if (= bl 3) (vt-ref b2 i 2) 0)))
+                 (let ((a0 (%vt-ref-raw a2 i 0)) (a1 (%vt-ref-raw a2 i 1))
+                       (a2v (if (= al 3) (%vt-ref-raw a2 i 2) 0))
+                       (b0 (%vt-ref-raw b2 i 0)) (b1 (%vt-ref-raw b2 i 1))
+                       (b2v (if (= bl 3) (%vt-ref-raw b2 i 2) 0)))
                    (if (= out-len 3)
                        (progn
                          (setf (vt-ref res i 0) (- (* a1 b2v) (* a2v b1)))
@@ -1504,7 +1504,7 @@
                (cond
                  ((= (vt-order av) 1)
                   (if (= out-len 1)
-                      (vt-ref res 0 0)                       ; 标量
+                      (%vt-ref-raw res 0 0)                  ; 标量
                       (vt-reshape res (list out-len))))
                  ((= out-len 1)
                   (vt-reshape res (list n-vec)))
@@ -1608,7 +1608,7 @@
                        (best 0.0d0))
                   (dotimes (j cols)
                     (let ((acc 0.0d0))
-                      (dotimes (i rows) (incf acc (abs (vt-ref m i j))))
+                      (dotimes (i rows) (incf acc (abs (%vt-ref-raw m i j))))
                       (setf best (max best acc))))
                   best)))
          (let ((ainv (vt-inv matrix)))
@@ -1620,7 +1620,7 @@
                        (best 0.0d0))
                   (dotimes (i rows)
                     (let ((acc 0.0d0))
-                      (dotimes (j cols) (incf acc (abs (vt-ref m i j))))
+                      (dotimes (j cols) (incf acc (abs (%vt-ref-raw m i j))))
                       (setf best (max best acc))))
                   best)))
          (let ((ainv (vt-inv matrix)))
@@ -1662,7 +1662,7 @@
                (n (vt-size av)))
            (with-float-safe
              (dotimes (i n t)
-               (unless (= (vt-ref af i) (vt-ref bf i))
+               (unless (= (%vt-ref-raw af i) (%vt-ref-raw bf i))
                  (return nil))))))))
 
 (defun vt-array-equiv (a b)

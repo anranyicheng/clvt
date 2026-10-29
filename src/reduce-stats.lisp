@@ -2919,9 +2919,9 @@
       (unless (= n (vt-size fp-vt))
         (error "vt-interp: xp 长度 ~a ≠ fp 长度 ~a" n (vt-size fp-vt)))
       (loop for i from 1 below n
-            when (< (vt-ref xp-vt i) (vt-ref xp-vt (1- i)))
+            when (< (%vt-ref-raw xp-vt i) (%vt-ref-raw xp-vt (1- i)))
               do (error "vt-interp: xp 必须在第 ~a 个位置递增（~a -> ~a 下降）"
-                        i (vt-ref xp-vt (1- i)) (vt-ref xp-vt i)))
+                        i (%vt-ref-raw xp-vt (1- i)) (%vt-ref-raw xp-vt i)))
       (let* ((x-vt (vt-contiguous
                     (vt-flatten (ensure-vt x :dtype :float64))))
              (xp-data (vt-data xp-vt))

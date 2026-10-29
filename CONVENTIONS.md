@@ -3763,13 +3763,31 @@ NumPy 的 `bool_` 语义分派（`elementwise.lisp`）：结果 dtype 为 `:bool
 | 接口 | numpy 对应 | `:bool` 张量的返回 | 定位 |
 |---|---|---|---|
 | `vt-item` | `.item()` → Python `bool` | **`T` / `NIL`** | 逻辑视图：解包成 Lisp 标量 |
+| `vt-ref` | `arr[i]` → `np.bool_` | **`T` / `NIL`** | 逻辑视图：按坐标取一个元素 |
 | `print-object` | `repr` → `True`/`False` | **`T` / `NIL`** | 逻辑视图：给人看，且可 `read` 回 |
 | `vt-to-list`（默认） | `.tolist()` | `(1 0 1)` | 物理视图：可重建的数值序列 |
 | `vt-to-list ... :bool t` | `.tolist()` 的布尔 | `(T NIL T)` | 逻辑视图：显式要求才给 |
-| `vt-ref` | `arr[i]` | `1` / `0` | 物理视图：内存里的那个字节 |
+| `%vt-ref-raw` | 无（内部） | `1` / `0` | 物理视图：内存里的那个字节 |
 | `vt-data` | `.data` | `(unsigned-byte 8)` 0/1 | 物理视图：缓冲区本身 |
 
 一句话：**逻辑视图用 Lisp 布尔，物理视图保持 0/1 字节**。
+
+`vt-ref` 归逻辑视图、另外拆出 `%vt-ref-raw`，是因为它同时是**内部数值代码的
+取数原语**（`src/` 内 23 处读点：`linalg` 的 Gram-Schmidt、`extensions3` 的
+协方差/相关系数/叉积、`reduce-stats` 的 `vt-interp` 单调性检查 …）。这些点
+需要的是数字，逐个论证「bool 不会流进来」既不可靠也没必要：一律改调
+`%vt-ref-raw`，语义与旧 `vt-ref` 完全一致，且省掉每元素一次 `eq` 判断。
+
+| 位置 | 原写法 | 改法 |
+|---|---|---|
+| 23 处内部读点 | `(vt-ref x i)` | `(%vt-ref-raw x i)` |
+| `(setf vt-ref)` | `(coerce value (vt-element-type vt))` | `:bool` 目标走 `%bool-flag`，其余不变 |
+
+`(setf vt-ref)` 必须一起改：布尔化之后 `(setf (vt-ref b 0) (vt-ref b 1))`
+成了最自然的写法，而 `(coerce nil '(unsigned-byte 8))` 会直接报
+`NIL can't be converted to type (UNSIGNED-BYTE 8)`。用 `%bool-flag` 归一
+还能顺带接受 `0.5`、`-0.0`、NaN 这些真值化输入，与 `vt-fill` / `vt-put` /
+`vt-astype` 的布尔语义对齐。
 
 #### `vt-item` 为什么给 T/NIL
 
@@ -3803,18 +3821,23 @@ NumPy 的 `bool_` 语义分派（`elementwise.lisp`）：结果 dtype 为 `:bool
 
 #### `vt-to-list` 默认为什么不布尔化
 
-因为 `NIL` 在 CL 里**既是布尔假又是空表**，`vt-from-sequence` 无法区分「元素
-NIL」与「嵌套的空列表」。实测：
+`NIL` 在 CL 里**既是布尔假又是空表**，所以「默认给 `T`/`NIL`」这条路天然带
+歧义。这条歧义本身不能靠猜解决，只能靠**显式声明 dtype** 来消解：
+`VT-FROM-SEQUENCE` 收到 `:dtype :bool` 时，`NIL` 一律当叶子布尔假（§17.9），
+于是 `(vt-to-list b :bool t)` → `(T NIL T)` → `(vt-from-sequence … :dtype :bool)`
+这条往返**现在是成立的**（`bool-dtype-test` 的 `ctor/roundtrip-bool-view`）。
 
-```lisp
-(vt-from-sequence (list t nil t))
-;; => 报错：不规则嵌套
-```
+即便如此，默认值仍是 `(1 0 1)`，理由有两条：
 
-也就是说，只要 `vt-to-list` 默认返回 `(T NIL T)`，`(vt-from-sequence
-(vt-to-list x))` 这条往返就**永久不可能成立** —— 而 `vt-to-list` 的契约恰恰是
-「可重建的数值序列」。所以默认给 `0`/`1`，需要 Lisp 布尔时显式
-`(vt-to-list b :bool t)`。非布尔张量加该关键字无副作用。
+1. **契约是「可重建的数值序列」**。`vt-to-list` 是导出接口，默认给数值才符合
+   「拿去喂 JSON / 写文件 / 做数值比较」的直觉；布尔视图属于表示层需求，
+   显式要更清楚。
+2. **改默认会静默破现有代码**。`(vt-to-list b)` 此前恒为 `(1 0 1)`，改成
+   `(T NIL T)` 之后任何 `(= 1 (car ...))`、`(apply #'+ ...)` 都会在运行时炸，
+   而且因为 `NIL` 是真值，`(if (car ...) ...)` 这类判断会**静默变真**。
+
+所以：默认 `0`/`1`，需要 Lisp 布尔时显式 `(vt-to-list b :bool t)`。非布尔张量
+加该关键字无副作用。
 
 #### 打印为什么用 T/NIL
 
@@ -3829,13 +3852,76 @@ Python 惯例会让同一次打印里出现两套风格。列宽不用特殊处�
 SBCL 会把它当共享结构（打印成 `#1=T, #2=NIL, #1#, #2#`），所以那里保留了
 `copy-seq`。
 
-#### 与 numpy 的已知差异
+### 17.9 布尔字面量构造与 dtype 重解释
+
+§17.8 解决了「怎么读出一个布尔」，这里解决「怎么写进去」。三处接口此前都停在
+「bool 就是 0/1 数字」的旧契约上，导致 Lisp 布尔字面量根本进不了张量。
+
+#### 17.9.1 `vt-from-sequence` 的 `:dtype :bool` 模式
+
+| 输入（`:dtype :bool`） | 结果 | 说明 |
+|---|---|---|
+| `(list t nil t)` | `[T NIL T]`，shape `(3)` | `NIL` 当叶子 |
+| `(list nil)` | `[NIL]`，shape `(1)` | **不是** shape `(1 0)` 的空数组 |
+| `(list nil nil)` | `[NIL NIL]`，shape `(2)` | 同上 |
+| `nil`（顶层） | 空数组，shape `(0)` | 对标 `np.array([], dtype=bool)` |
+| `t`（标量） | 0 维 `T`，shape `NIL` | 对标 `np.array(True)`，shape `()` |
+| `(list 2 -1 0 0.5d0)` | `[1 1 0 1]` | 数值走 `%bool-flag` 真值化 |
+| `(list (list t nil) (list t))` | 报「不规则嵌套」 | 布尔模式不放宽规则形状 |
+
+规则一句话：**指定了 `:bool` 就等于声明「内容是布尔值」，`NIL` 从此只是
+布尔假，不再兼任空表**。这一条只在 `:bool` 模式下生效 —— 其余 dtype 的
+`(vt-from-sequence (list 1 nil 3))` 仍然报「不规则嵌套」，行为不变。
+
+代价是 Lisp 独有的歧义：`(vt-from-sequence '(() ()) :dtype :bool)` 得到长度 2
+的 `[NIL NIL]`，而 numpy 的 `np.array([[],[]], dtype=bool)` 是 shape `(2, 0)`
+的空数组。两者不可能同时满足（Lisp 没有「空布尔标量」这种字面量），
+要空数组请写 `(vt-zeros '(2 0) :dtype :bool)`。
+
+连带的两处：
+
+| 接口 | 原行为 | 现行为 |
+|---|---|---|
+| `vt-flatten-sequence` | `(list t nil t)` → `(T T)`，静默丢 `NIL` | 新增 `:bool t`，→ `(T NIL T)`；默认不变 |
+| `vt-put` | `(vt-put b 0 t)` 静默空操作；`(vt-put b '(0 1 2) '(t nil t))` 静默给 `(1 1 1 0)` | `t`/`nil` 识别为标量值；目标为 `:bool` 时按布尔叶子展平值列表，正确得 `(1 0 1)` |
+
+`vt-put` 的静默空操作来自 `NIL` 落进 `(listp values)` 分支被展平成空表、
+`T` 三个分支都不匹配 —— 两者都让 `n-values` 为 0 后直接 `return-from`。
+这类「什么都不做」的失败比报错难查得多，所以 `t` / `nil` 的判断必须排在
+`listp` 之前。
+
+#### 17.9.2 `vt-view` 的 bool 重解释：只放行一个方向
+
+`bool`、`uint8`、`int8` 都是 1 字节，`(vt-view b :dtype :uint8)` 得到
+`[1 0 1]`（形状不变）。反向**不放行**：
+
+```lisp
+(vt-view (vt-from-sequence (list 1 2) :dtype :uint8) :dtype :bool)
+;; => 报错：不支持 UINT8 → BOOL 的重解释（仅 complex128↔float64、
+;;          complex64↔float32、bool→uint8/int8）
+```
+
+理由：numpy 的 `view(bool)` 是**纯字节直译**，`np.array([1,2],dtype=np.uint8)
+.view(bool)` 打印 `[True True]`，但值 `2` 原封不动留在数组里（`.view(np.uint8)`
+回来还是 `[1,2]`）。照搬就等于允许「bool 数组里存着 2」，直接违反 §17.1 的
+0/1 不变量 —— 打印、`vt-item`、`asarray` 的每条断言都会失效。需要反向时用
+`vt-astype :bool`（真值化，语义明确，`2 → 1`）。
+
+顺带修掉一个老 bug：`(vt-view a :dtype dt)` 省略 shape 时，未指定被当成
+`nil` 形状（0 维），对多元素张量报「元素总数不一致 (旧 4, 新 1)」。现在用
+`:none` 哨兵区分「未指定」与「显式 nil」，未指定即保持原形状，与 numpy 的
+`a.view(dt)` 一致。
+
+#### 与 numpy 的已知差异汇总
 
 | 项 | numpy | clvt | 说明 |
 |---|---|---|---|
 | 打印字面量 | `True` / `False` | `T` / `NIL` | 表示层差异，语义一致 |
-| `.item()` | Python `bool` | `T` / `NIL` | 同位对应物 |
-| `.tolist()` | `[True, False]` | `[1, 0]`（默认） | 见上面的 NIL 歧义；要布尔用 `:bool t` |
+| `.item()` / `arr[i]` | Python `bool` / `np.bool_` | `T` / `NIL` | 同位对应物；需要数值用 `%vt-ref-raw` |
+| `.tolist()` | `[True, False]` | `[1, 0]`（默认） | 见上面的理由；要布尔用 `:bool t` |
+| `.view(bool)` 反向（`uint8`→`bool`） | 允许，字节直译（值 2 会留下） | **拒绝**，需 `vt-astype :bool` | 保护 §17.1 的 0/1 不变量 |
+| 跨 dtype 的 view | 共享内存 | 独立副本 | CL 无法跨元素类型做位移数组（§16.18 D-C7） |
+| `np.array([[],[]], dtype=bool)` | shape `(2, 0)` 空数组 | `'(() ())` → shape `(2)` 的 `[NIL NIL]` | `NIL` 兼作空表；要空数组用 `(vt-zeros '(2 0) :dtype :bool)` |
 | `np.extract(0维条件, a)` | `[a[0]]`（条件被当长度 1 数组） | 整个 `a`（真）/ 空（假） | `vt-extract` 的既有解释；这里只保证布尔条件不再崩、且与 `:int8` 条件行为一致 |
 
 ---

@@ -2311,9 +2311,9 @@ w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=
                         ;; flatten 避免 2D-1D 广播分配
                         (let* ((uj (vt-flatten
 				    (vt-slice u-full '(:all) (list j))))
-                               (proj (vt-ref (vt-dot uj v))))
+                               (proj (%vt-ref-raw (vt-dot uj v))))
                           (setf v (vt-- v (vt-scale uj proj))))))
-                    (let ((norm (sqrt (vt-ref (vt-dot v v)))))
+                    (let ((norm (sqrt (%vt-ref-raw (vt-dot v v)))))
                       (if (> norm 1e-12)
                           (setf (vt-slice u-full '(:all) (list col))
                                 (vt-scale v (/ 1.0s0 norm)))
@@ -3074,9 +3074,9 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
                (k (vt-size s))
                (v-scaled (vt-zeros (list n k) :dtype :float64)))
           (loop for j fixnum from 0 below k do
-            (let ((sc (vt-ref s-pinv j)))
+            (let ((sc (%vt-ref-raw s-pinv j)))
               (loop for i fixnum from 0 below n do
-                (setf (vt-ref v-scaled i j) (* (vt-ref vt-mat j i) sc)))))
+                (setf (vt-ref v-scaled i j) (* (%vt-ref-raw vt-mat j i) sc)))))
           ;; v0.4.1（差分测试 R12）：Newton–Schulz 迭代精化
           ;; X ← X(2I − AX)，把 SVD 初始估计 ~1e-11 级的误差二次收敛到
           ;; 机器精度（对标 LAPACK 的 pinv 精度）。
@@ -3112,10 +3112,10 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
                (x (vt-zeros (list k nrhs) :dtype :float64)))
           (loop for j fixnum from 0 below nrhs do
             (loop for i fixnum from 0 below rank do
-              (setf (vt-ref x i j) (* (vt-ref utb i j) (/ 1.0d0 (aref s-data i))))))
+              (setf (vt-ref x i j) (* (%vt-ref-raw utb i j) (/ 1.0d0 (aref s-data i))))))
           (setf x (vt-@ (vt-transpose vt-mat) x))
           (let ((res (if (and (> m n) (= rank n))
-                         (vt-ref (vt-norm (vt-flatten (vt-- b-mat (vt-@ a x)))))
+                         (%vt-ref-raw (vt-norm (vt-flatten (vt-- b-mat (vt-@ a x)))))
                          0.0d0))
                 (xr (if (= nrhs 1) (vt-flatten (vt-slice x '(:all) '(0))) x)))
             (values xr res rank s)))))))

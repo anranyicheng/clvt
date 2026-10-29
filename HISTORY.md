@@ -2800,3 +2800,126 @@ check_build_warnings
 于是每次跑测试都看见红灯，每次都不知道该拿它怎么办。修法不是放宽门禁，
 而是在它后面补一个「负责留下结果」的阶段，并且把这个阶段的「自证」边界
 写成注释和开关。
+
+## H.3.28 第三十五轮：布尔写不进去 —— `vt-ref` 的 setter、`vt-view` 的白名单、`vt-from-sequence` 的 NIL 叶子
+
+> 对外结论见 `CHANGELOG.md`（三十五），契约见 `CONVENTIONS.md` §17.9。
+
+#### 一、上游合了补丁，但读写两端只通了「读」
+
+上一轮把逻辑视图（`vt-item` / 打印）改成了 `T`/`NIL`，读的方向通了。这一轮
+用户提的三件事其实是同一个缺口的三面：**写进去的路还停在「bool 就是 0/1
+数字」的旧契约上**。先把现状实测了一遍，避免凭印象改：
+
+| 场景 | 改前实际行为 |
+|---|---|
+| `(vt-ref b 0)` | `1`，`(type-of …)` 是 **`BIT`** |
+| `(setf (vt-ref b 0) nil)` | 报错 `NIL can't be converted to (UNSIGNED-BYTE 8)` |
+| `(vt-put b 0 t)` | **静默空操作**，数组没有任何变化 |
+| `(vt-put b '(0 1 2) '(t nil t))` | 得到 `(1 1 1 0)` —— 期望是 `(1 0 1 0)` |
+| `(vt-flatten-sequence '(t nil t))` | 得到 `(T T)`，静默丢掉 `NIL` |
+| `(vt-from-sequence '(t nil t) :dtype :bool)` | 报「不规则嵌套」 |
+| `(vt-from-sequence (list nil) :dtype :bool)` | 得到 shape `(1 0)` 的**空数组** |
+| `(vt-from-sequence t :dtype :bool)` | 报「无法从 T 创建张量」 |
+| `(vt-view b :dtype :uint8)` | 报「仅支持复数两对」 |
+| `(vt-view b :dtype :bool)` | 报「元素总数不一致 (旧 4, 新 1)」 |
+
+最后两条不在用户提的清单里，是排查时撞见的：`vt-view` 省略 `:dtype` 时把
+「未指定形状」当成 `nil` 形状（0 维），`%resolve-minus-one` 于是给 `(1)`，
+对任何多元素张量都报元素总数不一致。**只要 `:dtype` 与自身相同就会中招**，
+与 bool 无关，属于老 bug。
+
+#### 二、三个决策，以及每个决策否掉了什么
+
+**1. `vt-ref` 布尔化，并把内部读点分流到 `%vt-ref-raw`。**
+
+`vt-ref` 与 `vt-item` 是同一类东西（按坐标取一个元素），给不同表示没有道理。
+但 `vt-ref` 同时是库内部数值代码的取数原语 —— `src/` 里 23 处读点，分布在
+`linalg` 的 Gram-Schmidt、`extensions3` 的协方差/相关系数/叉积、
+`reduce-stats` 的 `vt-interp` 单调性检查。这些点要的是数字，改完如果还调
+`vt-ref`，就得逐个论证「bool 不会流进来」；而这类论证过三个月就失效。
+
+所以拆成两层：`%vt-ref-raw` 是原来的实现（永远 0/1，内部专用），`vt-ref`
+在它外面加一层 dtype 判断。23 个读点全部改调前者，好处是内部数值路径连一次
+`eq` 都不用付，也不必依赖任何「不会传入 bool」的假设。
+
+`(setf vt-ref)` 必须一起改。布尔化之后 `(setf (vt-ref b 0) (vt-ref b 1))`
+成了最自然的写法，而它原来走 `(coerce value (vt-element-type vt))` ——
+`(coerce nil '(unsigned-byte 8))` 直接报类型错误，等于「读得出来、写不回去」。
+改用 `%bool-flag` 归一，顺带接受 `0.5`、`-0.0`、NaN，与 `vt-fill` / `vt-put` /
+`vt-astype` 的布尔语义对齐。
+
+**2. `vt-view` 只放行 `bool → uint8/int8`，反向要求走 `vt-astype`。**
+
+numpy 是双向都允许的，为什么这里只放一个方向？因为 `uint8.view(bool)` 是
+**纯字节直译**：
+
+```python
+np.array([1, 2, 0], dtype=np.uint8).view(bool)   # [ True  True False]
+np.array([1, 2, 0], dtype=np.uint8).view(bool).view(np.uint8)   # [1 2 0]
+```
+
+打印是 `True`，值 `2` 原封不动躺在数组里。照搬就等于允许「bool 数组里存着
+2」，而 §17.1 的 0/1 不变量是打印、`vt-item`、npy 往返、`sum` 升 int64 这一整
+套断言的地基。反向若要做真值化，那是 `astype` 的语义（`2 → 1`），不该藏在
+`view` 这个名字底下。所以白名单只加安全方向，报错信息里点明
+「bool→uint8/int8」，让人知道替代路径。
+
+**3. `:dtype :bool` 下 `nil` 一律是叶子。**
+
+这是唯一有真歧义的地方，也是唯一必须靠「显式声明」消解的地方。`NIL` 在 CL
+里既是布尔假又是空表，不可能两全。选择是：**指定了 `:bool` 就等于声明
+「内容是布尔值」，`NIL` 从此只是假**。于是 `'(t nil t)` → `[T NIL T]`、
+`(list nil)` → shape `(1)`、`(list nil nil)` → `[NIL NIL]`，而顶层 `nil`
+仍然是 shape `(0)` 的空数组（对标 `np.array([], dtype=bool)`）。
+
+代价明确记录在案：`'(() ())` 得到 `[NIL NIL]` 而不是 numpy 的 `(2, 0)` 空数组。
+要空数组写 `(vt-zeros '(2 0) :dtype :bool)`。另一条路（加 `:nil-is-element t`
+开关、默认沿用旧解释）被否掉了 —— 那等于把坑留着，每次都得记得加开关。
+
+非 `:bool` 模式一行没动：`(vt-from-sequence (list 1 nil 3))` 仍然报「不规则
+嵌套」，与改前一致。
+
+#### 三、连带修的两处静默失败
+
+`vt-put` 的布尔标量不在这轮的需求清单里，但它是「`vt-ref` 布尔化」的直接
+下游 —— 读能给 `T` 了，写就不会再有人写 `1`。而 `(vt-put b 0 t)` 的实际行为
+是**什么都不做**：`T` 不匹配 `numberp` / `listp` / `arrayp` / `vt-p` 任何一个
+分支，`val-list` 为 `nil`，`n-values` 为 0，函数在 `(when (zerop n-values)
+(return-from vt-put tensor))` 处安静返回。`nil` 更糟，它落进 `(listp values)`
+被展平成空表，同样静默返回。
+
+值列表那条更隐蔽：`(vt-put b '(0 1 2) '(t nil t))` 里 `vt-flatten-sequence`
+把 `(T NIL T)` 压成 `(T T)`，值列表短一个，`(nth (mod vi n-values) val-list)`
+就循环复用，得到 `(1 1 1 0)` —— 一个不报错、也不对的答案。所以
+`vt-flatten-sequence` 加了 `:bool` 开关，`vt-put` 在目标为 `:bool` 时自动启用。
+
+**「静默什么都不做」比报错难查一个数量级**：报错有栈，空操作只有「怎么没
+生效」。这批修复的验收标准因此不是「新功能可用」，而是「旧写法要么正确、
+要么报错」。
+
+#### 四、仓库卫生
+
+用户提到 `git add -f *` 把 `tmp/` 加进了仓库。确认下来是 `gen_probes*.py`
+直跑时的默认输出目录（`tmp/{cases,cases2}.json` + `tmp/expected{,2}.txt`），
+以及 `test/__pycache__/gen_probes.cpython-312.pyc`。这些对任何流程都不需要：
+探针期望内嵌在 `differential-probes-test*.lisp` 里，测试运行时不读
+`tmp/expected.txt`（那只在 `gen_probes.py compare` 子命令里用）。
+
+顺带发现上一轮加的 `/tmp/` 忽略规则被上游删掉了，恢复并补上 `*.pyc`。
+`git add -f` 能绕过忽略规则，但 `.gitignore` 至少能让 `git add .` 不再捕获。
+
+#### 五、验收
+
+| 项 | 结果 |
+|---|---|
+| `bool-dtype-test` | **327** 断言全过（新增 I 组 33 条 + H 组由 43 扩到 55，另改写 4 条 astype 断言） |
+| 两个差分探针 | `496/496`、`405/405`（严格模式 `--no-regen-probes`） |
+| 全量套件 | 65 套件全绿（详见 `CHANGELOG.md` 三十五） |
+| `check_docs.py` | 208 个锚点全解析 |
+| 内部读点 | 23 处改调 `%vt-ref-raw`，13 处写点走改后的 setter |
+
+一条值得记住的判据：**判断一个视图接口属于逻辑层还是物理层，看它返回的东西
+能不能直接参与算术**。`vt-ref` 原来能（所以它是物理视图的伪装），`vt-item`
+改完不能（所以它是逻辑视图）。同一个张量上两个接口给不同表示，本身就是错的 ——
+这一轮把 `vt-ref` 拉齐到 `vt-item`，才让 §17.8 的分层自洽。

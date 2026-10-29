@@ -73,8 +73,10 @@
                (vt-from-sequence (if (listp x) x (list x))))))
     (if (zerop (vt-size v))
         '()
+        ;; 用物理视图内核取数：本函数是「拿字节做断言比较」的辅助，
+        ;; 布尔张量也要 0/1（§17.8/§17.9），而 VT-REF 现在是逻辑视图给 T/NIL。
         (let ((flat (vt-ravel v)))
-          (loop for i below (vt-size flat) collect (vt-ref flat i))))))
+          (loop for i below (vt-size flat) collect (clvt::%vt-ref-raw flat i))))))
 
 (defun shape-of (x)
   (if (typep x 'vt-like) (vt-shape x) (list (length x))))

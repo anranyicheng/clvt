@@ -43,17 +43,52 @@
             (setf (nth neg-idx shape) (truncate total-size known))
             shape)))))))
 
+(defun %bool-view-reinterpret (v shape dtype)
+  "把 `:bool` 张量按 DTYPE（`:uint8` / `:int8`）重新解释。
+
+   三者同为 1 字节元素宽度（§17），元素数与形状都不变，逐元素拷 0/1 即可
+   —— 比 `%cx-reinterpret` 的「拆/合分量 + 缩放最后一维」简单得多，也不必
+   处理 offset：先经 `VT-CONTIGUOUS` 落地。
+
+   为什么只放行这一个方向：`bool → uint8/int8` 的源只可能含 0/1，产物必然
+   是合法字节。反向 `uint8 → bool` 在 numpy 里是**纯字节直译**
+   （`np.array([1,2],dtype=np.uint8).view(bool)` 打印 `[True True]`，值 2
+   原封不动地留在数组里），照搬会直接破坏 §17 的「bool 只含 0/1」不变量 ——
+   需要真值化请用 `VT-ASTYPE :bool`，语义明确。
+
+   SHAPE 为 NIL 时保持原形状，对标 numpy 的 `a.view(np.uint8)`。"
+  (let* ((flat (vt-contiguous v))
+         (n (vt-size flat))
+         (out-shape (or shape (vt-shape v)))
+         (out-size (vt-shape-to-size out-shape)))
+    (unless (= out-size n)
+      (error "vt-view: 重解释后元素数不一致（~a 个 ~a，但 shape ~a 需要 ~a 个）"
+             n (vt-dtype v) out-shape out-size))
+    (let ((res (make-vt out-shape 0 :dtype dtype))
+          (src (vt-data flat))
+          (off (vt-offset flat)))
+      (let ((dst (vt-data res)))
+        (dotimes (i n)
+          (setf (aref dst i) (aref src (+ off i)))))
+      res)))
+
 (defun vt-view (vt &rest args)
   "零拷贝重塑视图（对标 pytorch tensor.view）；给出 :DTYPE 时按 numpy 语义重解释。
 
   调用形式：
     (vt-view a shape)                 ; 零拷贝、元素总数必须一致
     (vt-view a shape :dtype dt)       ; 重解释到 dt（形状需按字节数匹配）
-    (vt-view a :dtype dt)             ; 省略 shape：自动缩放最后一维
+    (vt-view a :dtype dt)             ; 省略 shape：保持原形状
                                       ; （对标 numpy 的 a.view(dt)）
 
-  :DTYPE 与输入不同时**重解释**：complex128 ↔ float64、complex64 ↔ float32
-  （只开放「分量宽度相同」的两对，保证逐位等价）。
+  :DTYPE 与输入不同时**重解释**，开放三对逐位等价的组合：
+    · complex128 ↔ float64、complex64 ↔ float32（1 个复数 = 2 个浮点分量）
+    · `:bool` → `:uint8` / `:int8`（同为 1 字节；**反向不放行**，
+      理由见 `%BOOL-VIEW-REINTERPRET`）
+
+  省略 SHAPE 与显式 SHAPE 在这里必须分开：`(vt-view a :dtype :bool)` 曾把
+  未指定当成 nil 形状（0 维），于是报「元素总数不一致 (旧 4, 新 1)」。现在
+  用 `:none` 哨兵区分，未指定即沿用原形状。
 
   ⚠ 与 numpy 的差异（§16.18 D-C7）：CL 数组无法跨元素类型做位移数组，
   因此重解释返回**独立副本**，不共享内存；numpy 的 view 是共享的。
@@ -66,19 +101,21 @@
   本函数是唯一入口：复数分支（重解释 dtype 等）在 complex-ops.lisp 的
   %CX-OP-VIEW，由这里的 `(when (%cx-any-p …))` 分流（§16.32）。"
   (let ((v (ensure-vt vt))
-        (shape nil)
+        (shape :none)
         (dtype nil))
     (cond
-      ((null args) (setf shape nil))
+      ((null args) (setf shape :none))
       ((keywordp (first args)) (setf dtype (getf args :dtype)))
       (t (setf shape (first args)
                dtype (getf (rest args) :dtype))))
     (cond
       ;; 实数路径：零拷贝视图（要求连续、元素总数一致）
       ((or (null dtype) (eq dtype (vt-dtype v)))
-       (let* ((new-shape (%resolve-minus-one
-                          shape
-                          (vt-shape-to-size (vt-shape v))))
+       (let* ((new-shape (if (eq shape :none)
+                             (copy-list (vt-shape v))
+                             (%resolve-minus-one
+                              shape
+                              (vt-shape-to-size (vt-shape v)))))
               (old-size (vt-shape-to-size (vt-shape v)))
               (new-size (vt-shape-to-size new-shape)))
          (unless (= old-size new-size)
@@ -88,10 +125,13 @@
          (%make-vt :data (vt-data v) :shape new-shape
                    :strides (vt-compute-strides new-shape)
                    :offset (vt-offset v) :dtype (vt-dtype v))))
+      ;; 布尔 → 1 字节整型的逐位重解释（副本）
+      ((and (eq (vt-dtype v) :bool) (member dtype '(:uint8 :int8)))
+       (%bool-view-reinterpret v (if (eq shape :none) nil shape) dtype))
       ((not (%cx-view-pair-p (vt-dtype v) dtype))
-       (error "vt-view: 不支持 ~a → ~a 的重解释（仅 complex128↔float64、complex64↔float32）"
+       (error "vt-view: 不支持 ~a → ~a 的重解释（仅 complex128↔float64、complex64↔float32、bool→uint8/int8）"
               (vt-dtype v) dtype))
-      (t (%cx-reinterpret v shape dtype)))))
+      (t (%cx-reinterpret v (if (eq shape :none) nil shape) dtype)))))
 
 (defun vt-reshape (vt new-shape)
   "重塑形状：连续则零拷贝视图，否则落地后重塑。"

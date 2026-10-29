@@ -23,9 +23,12 @@
 ;;;;   F. npy 往返：|b1 描述符保存/读回后仍是 :bool。
 ;;;;   G. 布尔算术：+/* 按逻辑或/与、- 报错、/ 升 float64、// 与 % 落 int8 ——
 ;;;;      numpy 的 bool_ 不按整数算，否则 True+True=2 会破掉 0/1 不变量。
-;;;;   H. 逻辑视图 vs 物理视图（§17.8）：vt-item / 打印给 T/NIL；
-;;;;      vt-ref / vt-data / vt-to-list 默认给 0/1 字节；:bool t 才布尔化。
+;;;;   H. 逻辑视图 vs 物理视图（§17.8）：vt-ref / vt-item / 打印给 T/NIL；
+;;;;      %vt-ref-raw / vt-data / vt-to-list 默认给 0/1 字节；:bool t 才布尔化。
 ;;;;      含四个内部解包点（allclose / histogram / extract / bincount）的回归。
+;;;;   I. 布尔字面量构造与 dtype 重解释：vt-from-sequence :dtype :bool 认
+;;;;      T/NIL 叶子（NIL 不再当空子序列）、0 维标量、vt-view 的
+;;;;      bool→uint8/int8、vt-flatten-sequence :bool、vt-put 布尔标量。
 ;;;;
 ;;;; 用法：sbcl --dynamic-space-size 4096 --non-interactive \
 ;;;;            --load test/bool-dtype-test.lisp
@@ -153,7 +156,7 @@
     (unless (or (eq dt :bool) (member dt '(:int8 :int16 :int32 :int64
                                            :uint8 :uint16)))
       (error "flat-ints: 期望布尔/整数张量，收到 ~a" dt))
-    (loop for i below n collect (truncate (vt-ref flat i)))))
+    (loop for i below n collect (truncate (%vt-ref-raw flat i)))))
 
 (let* ((path (merge-pathnames "bool-expected.sexp" cl-user::*clvt-test-dir*))
        (expected (with-open-file (s path :direction :input) (read s))))
@@ -218,7 +221,7 @@
   "张量表层的每个元素都必须是 0 或 1。"
   (let ((flat (vt-ravel tensor))
         (n (vt-size tensor)))
-    (loop for i below n always (member (vt-ref flat i) '(0 1)))))
+    (loop for i below n always (member (%vt-ref-raw flat i) '(0 1)))))
 
 (check-true "invariant/isnan"    (bool-bytes-ok-p (vt-isnan *bx*)))
 (check-true "invariant/gt"      (bool-bytes-ok-p (vt-> *bx* 0.0d0)))
@@ -226,10 +229,10 @@
 (check-true "invariant/any"     (bool-bytes-ok-p (vt-any *bm* :axis 0)))
 (check-true "invariant/logical" (bool-bytes-ok-p (vt-logical-xor *m1* *m2*)))
 ;; astype 的真值化：0.5 → True（不是截断成 0）、NaN → True、-0.0 → False
-(check "astype/0.5"   (vt-ref (vt-astype (vt-from-sequence '(0.5d0)) :bool) 0) 1)
-(check "astype/nan"   (vt-ref (vt-astype (vt-from-sequence (list (vt-float-nan))) :bool) 0) 1)
-(check "astype/negzero" (vt-ref (vt-astype (vt-from-sequence '(-0.0d0)) :bool) 0) 0)
-(check "astype/zero"  (vt-ref (vt-astype (vt-from-sequence '(0.0d0)) :bool) 0) 0)
+(check "astype/0.5"   (%vt-ref-raw (vt-astype (vt-from-sequence '(0.5d0)) :bool) 0) 1)
+(check "astype/nan"   (%vt-ref-raw (vt-astype (vt-from-sequence (list (vt-float-nan))) :bool) 0) 1)
+(check "astype/negzero" (%vt-ref-raw (vt-astype (vt-from-sequence '(-0.0d0)) :bool) 0) 0)
+(check "astype/zero"  (%vt-ref-raw (vt-astype (vt-from-sequence '(0.0d0)) :bool) 0) 0)
 
 ;;; ==================================================================
 ;;; D. 布尔与数值的互操作
@@ -362,8 +365,8 @@
 
 ;;; ==================================================================
 ;;; H. 逻辑视图 vs 物理视图（§17.8）
-;;;    逻辑视图（vt-item / 打印）= Lisp 布尔 T / NIL
-;;;    物理视图（vt-ref / vt-data / vt-to-list 默认）= 0/1 字节
+;;;    逻辑视图（vt-ref / vt-item / 打印）= Lisp 布尔 T / NIL
+;;;    物理视图（%vt-ref-raw / vt-data / vt-to-list 默认）= 0/1 字节
 ;;; ==================================================================
 
 (format t "~&== H. 逻辑视图 / 物理视图 ==~%")
@@ -393,9 +396,35 @@
   (check "view/allclose-false"
          (vt-allclose (vt-from-sequence '(1.0d0 2.0d0)) (vt-from-sequence '(1.0d0 9.0d0))) nil)
 
-  ;; --- 物理视图：仍然是 0/1 ---
-  (check "view/ref-stays-01" (vt-ref b 0) 1)
-  (check "view/ref-numeric-p" (integerp (vt-ref b 1)) t)
+  ;; --- 逻辑视图：VT-REF 与 VT-ITEM 同款，给 T / NIL ---
+  (check "view/ref-true"  (vt-ref b 0) t)
+  (check "view/ref-false" (vt-ref b 1) nil)
+  (check "view/ref-type"  (type-of (vt-ref b 0)) 'boolean)
+  (check "view/ref-2d" (vt-ref m 1 0) nil)
+  (check "view/ref-view-slice" (vt-ref (vt-slice m '(:all) '(1)) 0) t)
+  (check "view/ref-neg-index" (vt-ref b -1) t)
+  ;; 可以直接当条件用
+  (check "view/if-ref" (if (vt-ref b 0) :yes :no) :yes)
+  ;; setter 接受 T/NIL/数值（%bool-flag 真值化）
+  (let ((c (vt-copy b)))
+    (setf (vt-ref c 0) nil)
+    (check "view/setf-nil" (vt-to-list c) '(0 0 1)))
+  (let ((c (vt-copy b)))
+    (setf (vt-ref c 1) t)
+    (check "view/setf-t" (vt-to-list c) '(1 1 1)))
+  (let ((c (vt-copy b)))
+    (setf (vt-ref c 0) 0.5d0)
+    (check "view/setf-truthy" (vt-to-list c) '(1 0 1)))
+  (let ((c (vt-copy b)))
+    (setf (vt-ref c 0) -0.0d0)
+    (check "view/setf-neg-zero" (vt-to-list c) '(0 0 1)))
+  (let ((c (vt-copy b)))
+    (setf (vt-ref c 0) (vt-ref c 1))          ; 逻辑值直接对拷
+    (check "view/setf-copy-ref" (vt-to-list c) '(0 0 1)))
+
+  ;; --- 物理视图：%VT-REF-RAW / VT-DATA 仍是 0/1 字节 ---
+  (check "view/raw-ref-stays-01" (%vt-ref-raw b 0) 1)
+  (check "view/raw-ref-numeric-p" (integerp (%vt-ref-raw b 1)) t)
   (check "view/data-bytes" (coerce (vt-data b) 'list) '(1 0 1))
 
   ;; --- vt-to-list：默认数值，:bool t 才布尔化 ---
@@ -404,7 +433,7 @@
   (check "view/tolist-2d-bool" (vt-to-list m :bool t) '((t t) (nil t)))
   ;; 非布尔张量加 :bool t 无副作用
   (check "view/tolist-nonbool" (vt-to-list f :bool t) '(1.0d0 2.0d0 3.0d0))
-  ;; 往返不变式：默认的 0/1 能重建（T/NIL 因 NIL 兼作空表而无法重建）
+  ;; 往返不变式：默认的 0/1 能重建；T/NIL 视图也能重建（I 组给出完整对照）
   (check "view/roundtrip-default"
          (flat-ints (vt-from-sequence (vt-to-list b) :dtype :bool)) '(1 0 1))
 
@@ -449,6 +478,107 @@
 (check "view/truthy-t" (%truthy-p t) t)
 (check "view/item-number-true" (%item-number (vt-full nil t :dtype :bool)) 1)
 (check "view/item-number-false" (%item-number (vt-full nil nil :dtype :bool)) 0)
+
+;;; ==================================================================
+;;; I. 布尔字面量构造与 dtype 重解释
+;;;    这三处原先都停在「bool 就是 0/1 数字」的旧契约上：
+;;;      · VT-FROM-SEQUENCE :dtype :bool 把 NIL 当空子序列 → 报「不规则嵌套」
+;;;      · VT-VIEW 的重解释白名单只写了复数两对 → bool→uint8 直接拒
+;;;      · VT-FLATTEN-SEQUENCE 丢 NIL、VT-PUT 收到 T/NIL 静默空操作
+;;; ==================================================================
+
+(format t "~&== I. 布尔构造 / dtype 重解释 ==~%")
+
+;; --- VT-FROM-SEQUENCE :dtype :bool：T/NIL 是叶子 ---
+(check "ctor/list-t-nil-t"
+       (vt-to-list (vt-from-sequence (list t nil t) :dtype :bool) :bool t) '(t nil t))
+(check "ctor/shape-t-nil-t"
+       (vt-shape (vt-from-sequence (list t nil t) :dtype :bool)) '(3))
+;; NIL 不再被当成空子序列：形状是 (1) 而非 (1 0)
+(check "ctor/lone-nil-shape"
+       (vt-shape (vt-from-sequence (list nil) :dtype :bool)) '(1))
+(check "ctor/lone-nil-values"
+       (vt-to-list (vt-from-sequence (list nil) :dtype :bool)) '(0))
+;; 显式记录 Lisp 独有的歧义：'(NIL NIL) 是长度 2 的 [NIL NIL]，
+;; 不是 numpy 的 (2 0) 空数组 —— 要空数组写 (vt-zeros '(2 0) :dtype :bool)
+(check "ctor/two-nil-is-two-false"
+       (vt-shape (vt-from-sequence (list nil nil) :dtype :bool)) '(2))
+;; 顶层 NIL 仍是空数组（对标 np.array([], dtype=bool)）
+(check "ctor/top-nil-shape" (vt-shape (vt-from-sequence nil :dtype :bool)) '(0))
+(check "ctor/top-nil-size" (vt-size (vt-from-sequence nil :dtype :bool)) 0)
+;; 0 维标量叶子（对标 np.array(True) 形状 ())
+(check "ctor/scalar-t-shape" (vt-shape (vt-from-sequence t :dtype :bool)) nil)
+(check "ctor/scalar-t" (vt-item (vt-from-sequence t :dtype :bool)) t)
+;; 2D 与向量
+(check "ctor/2d"
+       (vt-to-list (vt-from-sequence (list (list t nil) (list nil t)) :dtype :bool) :bool t)
+       '((t nil) (nil t)))
+(check "ctor/2d-shape"
+       (vt-shape (vt-from-sequence (list (list t nil) (list nil t)) :dtype :bool)) '(2 2))
+(check "ctor/vector"
+       (vt-to-list (vt-from-sequence (vector t nil) :dtype :bool) :bool t) '(t nil))
+;; 数值走真值化（与 VT-CAST 同规则）
+(check "ctor/truthy-numbers"
+       (vt-to-list (vt-from-sequence (list 2 -1 0 0.5d0) :dtype :bool)) '(1 1 0 1))
+;; :fast t 也必须真值化（COERCE 不认 T/NIL）
+(check "ctor/fast-true"
+       (vt-to-list (vt-from-sequence (list t nil t) :dtype :bool :fast t) :bool t)
+       '(t nil t))
+;; ensure-vt 复用同一条路径
+(check "ctor/ensure-vt"
+       (vt-to-list (ensure-vt (list t nil t) :dtype :bool) :bool t) '(t nil t))
+;; 不规则嵌套仍然报错
+(check "ctor/ragged-throws"
+       (handler-case (progn (vt-from-sequence (list (list t nil) (list t)) :dtype :bool) nil)
+         (error () t))
+       t)
+;; 非布尔模式行为不变：NIL 依旧被当成空子序列
+(check "ctor/nonbool-nil-still-ragged"
+       (handler-case (progn (vt-from-sequence (list 1 nil 3)) nil) (error () t)) t)
+;; (vt-to-list b :bool t) → (vt-from-sequence … :dtype :bool) 往返成立
+(check "ctor/roundtrip-bool-view"
+       (vt-to-list (vt-from-sequence (vt-to-list *m1* :bool t) :dtype :bool) :bool t)
+       (vt-to-list *m1* :bool t))
+
+;; --- VT-VIEW：bool → uint8/int8 ---
+(let ((b (vt-from-sequence (list 1 0 1) :dtype :bool)))
+  (check "view/dtype-uint8" (vt-dtype (vt-view b :dtype :uint8)) :uint8)
+  (check "view/dtype-uint8-values" (vt-to-list (vt-view b :dtype :uint8)) '(1 0 1))
+  ;; 省略 shape 保持原形状（旧实现当成 0 维，报「元素总数不一致 旧 3 新 1」）
+  (check "view/omit-shape-keeps" (vt-shape (vt-view b :dtype :uint8)) '(3))
+  (check "view/omit-shape-same-dtype" (vt-shape (vt-view b :dtype :bool)) '(3))
+  (check "view/dtype-int8-values" (vt-to-list (vt-view b :dtype :int8)) '(1 0 1))
+  (check "view/dtype-with-shape"
+         (vt-shape (vt-view b '(3 1) :dtype :uint8)) '(3 1))
+  ;; 反向不放行：uint8 → bool 会带进 2、255 这类非法布尔，破坏 0/1 不变量
+  (check "view/uint8-to-bool-rejected"
+         (handler-case
+             (progn (vt-view (vt-from-sequence (list 1 0) :dtype :uint8) :dtype :bool) nil)
+           (error () t))
+         t)
+  (check "view/float-to-bool-rejected"
+         (handler-case
+             (progn (vt-view (vt-from-sequence (list 1.0d0)) :dtype :bool) nil)
+           (error () t))
+         t)
+  ;; 需要反向时用 VT-ASTYPE（真值化，语义明确）
+  (check "view/astype-is-the-way"
+         (vt-to-list (vt-astype (vt-from-sequence (list 1 2) :dtype :uint8) :bool)) '(1 1)))
+
+;; --- VT-FLATTEN-SEQUENCE / VT-PUT：布尔标量与值列表 ---
+(check "flat/default-drops-nil" (vt-flatten-sequence (list t nil t)) '(t t))
+(check "flat/bool-keeps-nil" (vt-flatten-sequence (list t nil t) :bool t) '(t nil t))
+(check "flat/bool-nested"
+       (vt-flatten-sequence (list (list t nil) (list nil t)) :bool t) '(t nil nil t))
+(let ((c (vt-from-sequence (list 1 1 1 1) :dtype :bool)))
+  (vt-put c '(0 1 2) (list t nil t))
+  (check "put/bool-list" (vt-to-list c) '(1 0 1 1)))
+(let ((c (vt-from-sequence (list 1 1 1) :dtype :bool)))
+  (vt-put c 1 nil)
+  (check "put/scalar-nil" (vt-to-list c) '(1 0 1)))
+(let ((c (vt-from-sequence (list 0 0 0) :dtype :bool)))
+  (vt-put c 1 t)
+  (check "put/scalar-t" (vt-to-list c) '(0 1 0)))
 
 ;;; ==================================================================
 
