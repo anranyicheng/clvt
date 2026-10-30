@@ -4,6 +4,74 @@
 
 ---
 
+## 2026-11-02（五十）— fix: AI 核心算子清单整张扫描 —— 混型降精度、卷积静默展平、保留符号的 ECASE
+
+这一遍的尺子不是「某个函数的某种形态」，而是**一张清单**：AI 计算里真正会被
+调到的那批算子（逐元素算术 / 一元数学 / 幂与三角 / 最值与比较 / matmul·dot·
+einsum / 卷积 / 归约 / 形状搬运 / gather·scatter·pad / astype·where / 激活），
+再加上它们多层组合出来的东西 —— softmax = exp→sum→div、layernorm =
+reduce→rsqrt→affine、attention = matmul→scale→softmax→matmul、MLP 层 =
+matmul→bias→activation、残差 = add∘f。
+
+**为什么组合比单算子更能说明问题**：NN 里没有一个算子是被孤立使用的，
+退化路径几乎都出现在接缝处 —— 广播把 `(4,)` 拉成 `(3 4)`、归约把 `keepdims`
+打开、激活前先 reshape、`:out` 复用同一块缓冲。单算子对得上而组合对不上，
+说明契约在两处之间丢了。
+
+做法：同一张用例表（155 条命名 + 192 条 4–7 层随机组合，共 347 条）在 Lisp
+与 numpy 2.4.6 两侧各跑一遍，Lisp 侧 `vt-save` 成 npy、Python 侧读回逐位比，
+按「精确 / ≤8 ULP / 相对 1e-12」三档判定，f32 结果另按 1e-5 放宽。
+
+**混型提升：`f64` 与 `f32` 混算必须给 `f64`**
+
+- `vt-hypot` 的 dtype 原先是「任一输入是 f32 就降 f32」：
+  `(vt-hypot float64数组 float32数组)` 返回 **float32**，而 numpy 的
+  `result_type(f8, f4)` 是 `f8`。6 位有效数字丢在一个「本该最稳」的函数上，
+  不报错、不警告。改为走 `vt-promote-type`，整数输入（提升结果不是浮点）
+  才落 f64 —— `np.hypot(int64, int8)` 也是 float64。
+- 顺带把 14 个二元算子（add/sub/mul/tdiv/maximum/minimum/fmax/hypot/
+  logaddexp/atan2/copysign/pow/mod/lerp）的 dtype 逐个列出比对，
+  只有 `vt-hypot` 一个不符，其余 13 个都走提升表。
+
+**秩：`convolve` / `correlate` 不许静默展平**
+
+- `(vt-convolve (vt-ones '(2 3)) (vt-ones '(2 2)))` 原来返回形状 `(9)` 的
+  一维结果（两个参数都被 `vt-flatten`），而 numpy 报
+  `object too deep for desired array`。形状与语义都不是调用方要的，而卷积
+  正是 NN 里最容易「以为自己在做二维」的地方。校验放在 `vt-correlate` 入口
+  （`vt-convolve` 委托到同一路径，函数名按 `same-anchor` 区分），
+  沿用「校验必须在两条 dtype 路径之前」的既有规矩。
+
+**保留符号：`:uint32` / `:uint64` 不许抛 ECASE**
+
+- 这两个 dtype 不在 `*vt-dtypes*` 的 11 种里，但 `vt-unsigned-dtype-of-width`
+  与 npy 的 `<u4`/`<u8` 都能产出它们。此前 `(vt-astype x :uint64)` 抛的是
+  `:UINT64 fell through ECASE expression. Wanted one of (:COMPLEX128 …)`
+  —— 把「函数没有这个分支」直接倒给用户。现在在 `vt-dtype->lisp-type`
+  入口判 `(member dtype *vt-dtypes*)`，给出「保留符号尚未实现，请改用
+  :int64 / :float64」+ 合法取值全集。
+
+**补齐偏差表（既有差异，此前只在代码注释里）**：`vt-gelu` 用 tanh 近似
+（numpy 无此函数，PyTorch 的 `approximate='tanh'` 口径，差 ≤ 2.2e-3）、
+`vt-hard-sigmoid` 用 Keras 的 `x/5+0.5`（PyTorch 是 `x/6+0.5`）、
+`vt-astype` 的 NaN/越界 → 整数恒为 0（§7.2）、`vt-view :dtype` 位重解释
+只允许三对、无符号窄整型归约给 `int64` 而 numpy 给 `uint64`。
+
+**零缺陷旁证（本轮实测，全部与 numpy 一致）**：重叠写四种形态（`out` 与输入
+共享缓冲、前向/反向偏移、负步长视图作 out）逐位相同；uint8/int8 溢出回绕
+（`200+200 → 144`）与 dtype 保持；4096 元素 f32 求和的误差与 numpy 同量级
+（4e-8 相对）；bool 归约（sum→int64、mean→float64、count_nonzero）；
+`einsum` 的 `ii->i`、`ii->`、省略号 `...ij,...jk->...ik`；`take_along_axis`；
+batched matmul 广播；`vt-softmax` 在 `-Inf` 行、1e30 量级、`axis=0` 三维；
+`vt-layer-norm` 的 f32 链；`vt-cross-entropy-logits`；`one-hot × argmax`。
+GEMM 与 numpy 的差异在 24–511 ULP（BLAS 分块顺序），属预期。
+
+**新增套件**：`test/nn-core-sweep-test.lisp` 610 条断言（A–P 十六组，
+元素数 ≤ 32 的 201 条用例，期望值全部 numpy 2.4.6 实测）。
+**文档**：`CONVENTIONS.md` 新增 §17.10.24。
+
+---
+
 ## 2026-11-01（四十九）— fix: 「合法请求的退化形态」暴露的七组缺陷 —— `(1- dim)` 与无符号 offset、单精度字面量、`zerop` 丢符号位
 
 前三轮问的都是「这个合法请求算得对不对」。这一遍换的问题是：**请求本身合法，

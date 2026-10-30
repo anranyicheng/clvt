@@ -5568,6 +5568,118 @@ double。所以修法必须是 `0.5d0`，而不是「给 `0.5s0` 加个 `coerce`
 
 ---
 
+#### 17.10.24 AI 核心算子清单的整张扫描：混型、秩、保留符号
+
+前面二十几节的尺子都是「一个函数的一种形态」。这一节的尺子是一张**清单**：
+把 AI 计算里真正会被调到的那批算子（逐元素算术 / 一元数学 / 幂与三角 /
+最值与比较 / matmul·dot·einsum / 卷积 / 归约 / 形状搬运 / gather·scatter·pad /
+astype·where / 激活 / softmax·layernorm·attention 这类组合）整张扫一遍，
+Lisp 与 numpy 2.4.6 两侧各跑一遍同一张用例表，逐位与 ULP 双判据。
+
+一共 347 条（155 条命名用例 + 192 条 4–7 层随机组合），撞出三组缺陷，
+另有五条**已经存在但没被写进偏差表**的差异，一并补齐。
+
+##### 一、混型提升：`f64` 与 `f32` 混算必须给 `f64`
+
+`vt-hypot` 的结果 dtype 原来是这样定的：
+
+```lisp
+(if (or (eq (vt-dtype v1) :float32)
+        (eq (vt-dtype v2) :float32))
+    :float32 :float64)
+```
+
+「任一输入是 f32 就降 f32」。这在 `np.hypot(float64_arr, float32_arr)` 上错了：
+numpy 的 `result_type(f8, f4) = f8`，而本库返回 f32 —— 6 位有效数字丢在一个
+「本该最稳」的函数上，且**不报错、不警告**。
+
+判据是混型提升表，不是「谁窄跟谁」：
+
+```lisp
+(let ((p (vt-promote-type (vt-dtype v1) (vt-dtype v2))))
+  (if (member p '(:float32 :float64)) p :float64))
+```
+
+最后那个 `:float64` 分支是给整数输入用的：`np.hypot(int64_arr, int8_arr)` 是
+`float64`（`result_type` 给整数，而 hypot 必须落浮点）。
+
+**同族的检查口径**：一个二元算子如果自己算 dtype（而不是调
+`vt-promote-type`），就要问一句「三种混型（f64/f32、f32/整数、整数/整数）
+分别给什么」。把 14 个二元算子逐个列出 dtype 比对，只有 `vt-hypot`
+一个不符 —— 其余 13 个都走提升表。
+
+##### 二、秩：`convolve` / `correlate` 不许静默展平
+
+numpy 的 `np.convolve` 只接受 1 维，2 维报
+`object too deep for desired array`。本库原来对两个参数都做 `vt-flatten`：
+
+```
+(vt-convolve (vt-ones '(2 3)) (vt-ones '(2 2)))  →  形状 (9) 的一维结果
+```
+
+形状和语义都不是调用方要的，而**卷积是 NN 里最容易「以为自己在做二维」的地方**
+（`np.convolve` 与 `torch.nn.functional.conv2d` 在同一批人手里混用是常态）。
+现在在 `vt-correlate` 入口判秩（`vt-convolve` 委托到同一条路径，函数名按
+`same-anchor` 区分），并保持与 §17.10.23 第七条同一条规矩：**校验放在两条
+dtype 路径都会经过的位置**。
+
+##### 三、保留符号：`:uint32` / `:uint64` 不许抛 ECASE
+
+`*vt-dtypes*` 的 11 种里没有这两个，`+kernel-lts+` 也没有，但从
+`vt-unsigned-dtype-of-width`（`(32 :uint32) (64 :uint64)`）和 npy 的 `<u4`/`<u8`
+都能拿到它们。此前它们一路落到 `vt-dtype->lisp-type` 的 `ECASE` 上：
+
+```
+:UINT64 fell through ECASE expression. Wanted one of (:COMPLEX128 …)
+```
+
+这是把「函数没有这个分支」直接倒给用户 —— 既没有函数名，也没说怎么绕过。
+现在在同一个入口判 `(member dtype *vt-dtypes*)`，给出「保留符号尚未实现，
+请改用 :int64 / :float64」+ 合法取值全集。
+
+> 判据：**内部实现细节不是错误消息**。`ECASE` 落空、`ETYPECASE` 不匹配、
+> `AREF` 越界，这三类都必须在到达用户之前被换成「哪个函数 + 什么值 + 怎么办」。
+
+##### 四、补齐的偏差表
+
+整张扫描同时确认了五条**既有**差异，此前散在代码注释里、没进 §17.10 的偏差表：
+
+| 项 | numpy | 本库 | 依据 |
+|---|---|---|---|
+| `vt-gelu` | `0.5x(1+erf(x/√2))` | tanh 近似（差 ≤ 2.2e-3 相对，14 ULP） | 性能取舍；与 `torch.nn.functional.gelu(approximate='tanh')` 一致 |
+| `vt-hard-sigmoid` | numpy 无 | `clip(x/5+0.5, 0, 1)`（Keras 口径） | PyTorch 用 `x/6+0.5`；本库随 Keras |
+| `vt-astype` 的 NaN/越界 → 整数 | 未定义（x86 实为 INT_MIN） | 恒为 `0` | §7.2 |
+| `vt-view :dtype` 位重解释 | 任意同宽 dtype 对 | 仅 complex128↔float64、complex64↔float32、bool→uint8/int8 | §17.6 |
+| 无符号窄整型归约 | `sum(uint8)` → `uint64` | → `int64` | 执行层只有 4 种存储级类型；`int64` 可无损容纳 uint32 的和 |
+
+后两条要特别注意**不要误用**：把 `uint8` 图像求和后当成 `uint64` 用（比如
+除以 `2^64` 做归一化）会得到完全不同的结果。
+
+##### 五、这张清单撞不到的，以及为什么
+
+347 条里 344 条一次通过，三组缺陷全部落在**接缝**上（混型提升、秩约束、
+保留符号），没有一条落在算法本身。这与既有的缺陷分布一致：正常值域内的
+逐元素算术与 GEMM 是最稳的部分（GEMM 与 numpy 的差异在 24–511 ULP，
+即 BLAS 分块顺序差，属预期）。**没有撞到的是**：
+
+- 归约的累加顺序（numpy 用 pairwise，本库按 §7.3 固定顺序）：4096 个 f32
+  求和两者误差同量级（4e-8 相对），没有「谁更准」的结论；
+- 重叠写（`out` 与输入共享缓冲、部分重叠、负步长视图）：四条实测与 numpy
+  **逐位相同**，不需要特判；
+- uint8/int8 的溢出回绕：与 numpy 一致（`200+200 → 144`），dtype 也保持 uint8。
+
+##### 六、本节的检查口径
+
+| 项 | 结果 |
+|---|---|
+| 换轴 | 一张算子清单（12 类）+ 多层组合（softmax / layernorm / attention / MLP / 残差 / 卷积经 matmul） |
+| 规模 | 347 条（155 命名 + 192 随机组合，4–7 层）；347/347 通过 |
+| 修复 | 3 组代码点（`vt-hypot` 混型、`vt-correlate`/`vt-convolve` 秩、`vt-dtype->lisp-type` 保留符号） |
+| 新增断言 | `test/nn-core-sweep-test.lisp` 610 条（A–P 十六组，元素数 ≤ 32 的 201 条用例） |
+| 偏差 | 5 条补进 §17.10 表（gelu / hard-sigmoid / astype NaN / bitcast / uint8 归约） |
+
+---
+
 ## 附录 C：实测缺陷复现脚本
 
 ```lisp
