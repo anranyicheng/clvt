@@ -4292,3 +4292,154 @@ Operation was (< #<DOUBLE-FLOAT quiet NaN> 0.0d0).
 | 连带修正 | 2 处既有测试的旧期望、1 处示例 |
 | 新增断言 | `reduce-shape-axis-test` 145 条 |
 | 套件 | 66/66（新增 `reduce-shape-axis-test`） |
+
+---
+
+## H.3.40 第十三轮：把维度推到边界 —— 随机输入踩不到的那一格
+
+> 对外结论见 `CHANGELOG.md`（四十七），契约见 `CONVENTIONS.md` §17.10.21。
+
+#### 一、上一把尺子的盲区
+
+H.3.39 用的是随机输入差分：8 个功能域、1800 条用例。它很有效，但有一个
+结构性盲区 —— **随机输入几乎不会生成 0**。`randint(1, 12)` 取到 0 长度的
+概率是 0；即使生成形状含 0，也要恰好落在那个格子上才触发。于是「shape 里含 0」
+从来没被踩过。
+
+这一轮换成「把维度推到边界」：形状含 0、0 维、单观测、`num=0`、分母为 0。
+不带随机性，全是确定的手工格子 —— 反而更快撞出东西。
+
+#### 二、撞出来的东西是同一个模式
+
+```
+(run-axis ()
+  (loop
+    (run sp dp dim istep ostep)      ; ← 先跑 body
+    (let ((carry t)) ...             ; ← 再判断要不要继续
+      (when carry (return)))))
+```
+
+这是标准的 do-while。当 `dim > 0` 但**别的**维是 0 时（如 `(0,3)` 沿 axis 1），
+`sp` 仍是 0，`run` 会读 `(aref src 0)` —— 而 buffer 长度为 0。
+
+同一个模式在三个**独立**内核里各写了一遍：
+
+| 内核 | 位置 | 何时被走到 |
+|---|---|---|
+| `run-axis`（类型特化） | `reduce-stats.lisp` `%vt-cumulative` | float64/float32/int64/int32 且输入输出元素类型相同 |
+| `advance`（通用 fallback） | 同上 | dtype 需要提升（int8→int64）或显式 `:dtype` 改宽度 |
+| `advance`（NaN 感知） | `extensions3.lisp` `%e3-cumulative-skip-nan` | `nancumsum` / `nancumprod` |
+
+「写三遍」不是巧合：这三个内核是三次独立的性能优化（每次都是「原来太慢，
+换成里程计 + 特化循环」），而 do-while 是里程计最自然的写法。**性能优化会
+偷偷复制语义，包括复制语义里的 bug。**
+
+修法是同一个：进入轴分支前 `(when (plusp (vt-size result)) ...)`。因为
+`size = Π dims`，size 为 0 时必然没有任何 fiber —— 这一条不需要分情况讨论。
+
+#### 三、`vt-indices` 的 stride=0
+
+`(vt-indices '(2 0 3))` 里第 0 层的 stride 是 `Π (nthcdr 1 sh)` = `0 × 3` = 0。
+原代码有一行 `(stride (if (zerop stride) 1 stride))` —— 读起来是「防除零」，
+实际是把一个「这层没有元素」的信号改成了「这层有元素，步长 1」，然后照常
+写满 `outer × axis-len` 个位置。
+
+这类「把 0 兜成 1」的防御性代码特别危险：它把一个**结构性的 0**（维度长度）
+当成了一个**数值上的 0**（除数为零）。前者是语义，后者是陷阱，处理方式正相反。
+
+#### 四、`denom <= 0` 的两条路
+
+`vt-cov` 里有一行 `(if (<= denom 0) n-obs denom)`。它的意图大概是「别让分母
+变成 0 或负数」，但 numpy 的做法恰恰相反：
+
+```python
+fact = X.shape[1] - ddof
+if fact <= 0: fact = 0.0
+c *= 1. / fact
+```
+
+`fact = 0` 之后 `1/0` 是 inf，`0 × inf` 是 nan。这不是 numpy 的疏忽，而是
+**在用 IEEE 语义表达「这个值不存在」**：
+
+| 输入 | numpy | 「兜一下」的答案 |
+|---|---|---|
+| `cov([5.])` | `nan` | `0.0` |
+| `cov([1,2], ddof=3)` | `inf` | `0.25` |
+
+`0.25` 这个答案最贵：它看起来合理，不会触发任何下游断言，只在结果里悄悄
+错着。`nan` 会传染、会显形，是更好的失败方式。
+
+同一件事在 `vt-corrcoef` 上是硬编码 `(vt-full nil 1.0d0)`。公式始终是
+`C / sqrt(C²)`，它对 `C=1` 给 1、`C=0` 给 nan、`C=nan` 给 nan —— 一个公式
+覆盖三种情形，而硬编码只覆盖一种，且把另外两种变成静默的错。
+
+#### 五、`num = 0` 与校验顺序
+
+`linspace(start, stop, 0)` 是「在区间上采 0 个点」，不是「参数非法」。
+numpy 返回 `array([], dtype=float64)`。批量生成时 n 常常是算出来的，
+算成 0 是正常结果而不是错误。
+
+但 `geomspace` 有一个顺序陷阱：`np.geomspace(0, 10, 0)` **仍然报错**
+（Geometric sequence cannot include zero）。也就是说端点的零/同号校验
+先于数量校验。把 `num` 判定提前，会让一个本该报错的输入静默返回空数组 ——
+这是「修一个 bug 引入另一个」的典型形态，所以回归网里专门有一条钉住它。
+
+#### 六、`bincount` 的 weights 有三条容易漏的规则
+
+1. 结果恒为 `float64` —— 即使 `weights` 是整型或布尔。文档原话是
+   "result is stored as a float64 array if weights is given"。很容易
+   想当然地「跟随 weights 的 dtype」，那样 `bincount(x, weights=[1,2,3])`
+   会给 int64，与 numpy 分叉。
+2. 负权重合法（加权直方图本来就有负贡献），所以不能在校验里拒绝负数。
+3. 复数权重**报 TypeError**。这一条最容易「出于好意」写反 —— 实现成
+   complex128 看起来更「完整」，但它给出的是一个 numpy 给不出的答案，
+   等于制造了一个新的方言。
+
+`vt-random-choice` 的 `:p` 是同一主题的另一面：numpy 的 `p` 就是 ndarray，
+而原实现对它直接走 `length` / `every` / `reduce` 的序列协议。**参数有两种
+合法形态，实现只写了它自己最常用的那一种** —— 这是 H.3.39 已经总结过的
+形状，在这一轮又出现了一次。修法是把三种形态（nil / Lisp 序列 / 张量）
+在入口归一成一个列表，然后用「同 seed 必须给出同一序列」的断言钉住归一
+没有改变语义。
+
+#### 七、裸 assert 不是契约
+
+```lisp
+(assert (> a 0) (a))   ; => The assertion (> A 0) failed with A = 0.
+```
+
+没有函数名，没有期望值，而且 `ASSERT` 在 SBCL 里是可以被优化级别干掉的
+调试工具。对外入口的校验必须是 `(error "vt-xxx: …")`，消息里带
+**函数名 + 实际值 + 期望**。random 族原有 6 处，全部改掉。
+
+#### 八、零缺陷的部分也是结果
+
+这一轮顺手扫了四条轴，全部零缺陷，同样值得记 —— 它们说明「哪里不需要再花
+时间」：
+
+| 轴 | 规模 | 结果 |
+|---|---|---|
+| IO 往返（`:lisp` + `:npy` 双格式，逐**位模式**） | 188 组合 | 全对 |
+| dtype 转换矩阵（11×11） | 121 组合 | 全对 |
+| 集合运算族（含 `unique` 四种 `return_*`） | 92 条 | 全对 |
+| 索引族（take / compress / delete / insert / append） | 35 条 | 全对 |
+| `nn` 族恒等式（softmax/log-softmax/sigmoid/tanh/softplus 互证） | 40 余条 | 全对 |
+
+IO 那条尤其值得记：`VT-ARRAY-EQUIV` 的语义是「NaN != NaN」，所以往返测试
+**不能**用它比值，必须比位模式（`sb-kernel:double-float-bits`）。用错工具
+会把一次全对的测试读成 6 条失败。
+
+#### 九、留下的判据
+
+> 零元素不是零值。
+>
+> 「长度 0」是结构，「数值 0」是数据。把结构上的 0 当数据 0 去兜
+> （`stride=0 → 1`、`denom=0 → n_obs`），得到的不是防御，是伪装。
+
+| 项 | 结果 |
+|---|---|
+| 换轴 | 随机输入 → 退化形状（shape 含 0 / 0 维 / 单观测 / `num=0` / 分母 0） |
+| 修复 | 11 组代码点 / 13 类表现 |
+| 旁证 | IO 188 + dtype 121 + 集合 92 + 索引 35 + nn 40 余条，全部零缺陷 |
+| 新增断言 | `degenerate-empty-test` 331 条（A–J 十组） |
+| 套件 | 67/67（新增 `degenerate-empty-test`） |

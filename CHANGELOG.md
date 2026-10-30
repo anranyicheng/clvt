@@ -4,6 +4,76 @@
 
 ---
 
+## 2026-10-30（四十七）— fix: 退化形状（shape 含 0 / 0 维 / 单观测 / num=0）暴露的十三类缺陷 —— 零元素不是零值
+
+上一遍用随机输入找问题，而随机输入**几乎不会生成 0**：`randint` 取到 0 长度
+的概率是 0。于是「shape 里含 0」这一格从未被踩过，而它在实现上恰好最危险。
+这一遍把维度推到边界，撞出的一类缺陷有共同形状：
+
+> 凡是「先跑一轮循环体、再判断要不要继续」的结构（里程计 / do-while /
+> `advance` 回调），在**总元素数为 0** 时都会先跑那一轮 —— 而那一轮会去
+> `aref` 一个长度 0 的 buffer。
+
+**空维度（此前直接崩或误报）**：
+
+- `vt-cumsum` / `vt-cumprod`：沿轴 + 元素数 0 时报
+  `Invalid index 0 for (SIMPLE-ARRAY DOUBLE-FLOAT (0))`。**两个内核各中一次**
+  （类型特化的 `run-axis` 与 dtype 提升时的通用 fallback），
+  现统一在进入轴分支前判 `(plusp (vt-size result))`。numpy 对
+  `np.cumsum(np.zeros((0,3)), axis=1)` 返回同形状空数组。
+- `vt-nancumsum` / `vt-nancumprod`：走的是第三个内核
+  （`%E3-CUMULATIVE-SKIP-NAN`），同一处 do-while 结构，同一保护。
+- `vt-indices`：维度里含 0 且不在首位（如 `(2,0,3)`）时报
+  `cannot index into an empty tensor`。原因是该层的 stride 算成 0 后被兜成 1，
+  然后照常写满 `outer × axis-len`。现按层大小为 0 跳过填充；
+  `np.indices((2,0,3)).shape == (3,2,0,3)`。
+- `vt-vsplit` / `vt-hsplit` / `vt-dsplit`：轴长为 0 时误报「不整除」——
+  `%require-equal-division` 的 `(plusp dim)` 先短路了 `(mod dim n)`，把 0
+  归进「不整除」。0 对任何正整数都整除，`np.vsplit(np.zeros((0,3)), 2)` 给
+  两个 `(0,3)`。
+
+**角参数（此前抛浮点陷阱或给出「看起来合理」的错数）**：
+
+- `vt-cov` / `vt-corrcoef`：零观测时 `FLOATING-POINT-INVALID-OPERATION` /
+  `DIVISION-BY-ZERO`（未屏蔽陷阱，§5.5）；现给 nan。
+- `vt-cov` 的角分母：原实现 `(if (<= denom 0) n-obs denom)` 是**凭空改分母**。
+  numpy 的写法是 `fact = max(n_obs - ddof, 0)` 然后 `c *= 1/fact` —— 于是
+  `cov([5.])` 是 nan（0/0，本库原给 0.0）、`cov([1,2], ddof=3)` 是 inf
+  （0.5/0，原给 0.25）。inf 与 nan 是**信息**，换成有限数等于给出无意义的数。
+- `vt-corrcoef` 的标量分支硬编码 1.0，正确公式始终是 `C / sqrt(C²)`：
+  `np.corrcoef([5.])` 是 nan（本库原给 1.0）。
+- `vt-linspace` / `vt-logspace` / `vt-geomspace`：`num = 0` 报
+  「num 必须大于 0」，而 numpy 返回空数组（空采样是合法请求）。
+  `num < 0` 仍报错；且 `vt-geomspace` 的端点零/同号校验**先于**数量校验
+  （`np.geomspace(0,10,0)` 仍报「不能含零」）。
+
+**API 补齐（一个参数只写了一半形态）**：
+
+- `vt-bincount` 新增 `:weights`。三条容易漏的 numpy 规则都对齐：结果恒为
+  `float64`（即使权重是整型或布尔）、负权重合法、复数权重**报错**
+  （numpy 在这里 TypeError，本库不「出于好意」给出 complex128）。
+- `vt-random-choice` 的 `:p` 接受张量。numpy 的 `p` 本来就是 ndarray，原实现
+  直接走序列协议（`length`/`every`/`reduce`），最常见的写法报
+  `The value #<VT …> is not of type SEQUENCE`。三种形态（nil / Lisp 序列 /
+  张量）归一到同一列表，同 seed 下必须给出同一序列。
+
+**错误契约**：random 族的 6 处裸 `ASSERT` 改成带函数名的消息。`(assert (> a 0)
+(a))` 报的是 `The assertion (> A 0) failed with A = 0.` —— 没有函数名、没有
+期望值，且 `ASSERT` 本身是可被优化级别干掉的调试工具，不是给调用方看的契约。
+
+**旁证（零缺陷，已固化为断言）**：IO 往返 188 组合（11 dtype × 7 形状 +
+非连续视图 + NaN/Inf/±0 + 复数，`:lisp` 与 `:npy` 双格式，逐**位模式**比）、
+dtype 转换矩阵 121 组合（11×11，含向零截断/窄化回绕/无符号回绕/真值化/
+复数丢虚部）、集合运算 92 条、索引族 35 条、`nn` 族恒等式 40 余条。
+
+**新增套件**：`test/degenerate-empty-test.lisp` 331 条断言（A–J 十组）。
+期望值全部 numpy 2.4.6 实测。
+
+**文档**：`CONVENTIONS.md` 新增 §17.10.21（空维度不是「另一种数值」，
+是「没有数值」）。
+
+---
+
 ## 2026-10-30（四十六）— fix: 差分模糊测试（约 1800 条随机用例）挖出的九类缺陷 —— 结果秩由数值决定、轴元组全线缺失、两种参数形态只写了一种
 
 这一遍的尺子不挑对象：**差分模糊测试**。Lisp 侧 `vt-save :as :npy` 落盘、

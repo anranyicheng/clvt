@@ -5102,6 +5102,113 @@ numpy 的 `bins` 有两种形态，语义完全不同却都叫一个名字，因
 | 连带修正 | 3 处既有断言的旧期望（`vt-ptp` 返回标量、`vt-solve` `(n,1)` 被压平），2 处示例 |
 | 新增断言 | `test/reduce-shape-axis-test.lisp` 145 条（A–I 九组） |
 
+#### 17.10.21 空维度不是「另一种数值」，是「没有数值」
+
+上一节的尺子是随机输入。随机输入有一条天然盲区：**它几乎不会生成 0**。
+randint 取到 0 长度的概率是 0，取到 0 值也只是少见的边界。于是「shape 里含 0」
+这一个格子从来没被踩过，而它在实现上恰好是最危险的一格。
+
+> 凡是「先跑一轮循环体、再判断要不要继续」的结构 —— 里程计、do-while、
+> `advance` 回调 —— 在**总元素数为 0** 时都会先跑那一轮。
+> 而那一轮会去 `aref` 一个长度 0 的 buffer。
+
+这不是某一处写错，而是同一个模式在**三个独立内核**里各写了一遍，全都中招：
+
+| # | 函数 | 触发 | 修复前 | 现在 |
+|---|---|---|---|---|
+| 1 | `vt-cumsum` / `vt-cumprod` | 沿轴 + 元素数 0（如 `(0,3)` 沿 axis 1） | `Invalid index 0 for (SIMPLE-ARRAY DOUBLE-FLOAT (0))` | 进入轴分支前判 `(plusp (vt-size result))`；空结果就是真空 |
+| 2 | 同上，**通用 fallback** | 同上，但 dtype 需提升（如 `int8` → `int64`） | 同上（快路径接不走时由它接，同样中招） | 同一保护 |
+| 3 | `vt-nancumsum` / `vt-nancumprod` | 同上 | 同上（第三个内核，`%E3-CUMULATIVE-SKIP-NAN`） | 同一保护 |
+| 4 | `vt-indices` | 维度里含 0 且**不在首位**（如 `(2,0,3)`） | `cannot index into an empty tensor` | 层大小为 0 时跳过填充；stride 为 0 不再兜成 1 硬写 |
+| 5 | `vt-vsplit` / `vt-hsplit` / `vt-dsplit` | 轴长为 0 | 报「不整除」（`(plusp dim)` 先短路了 `(mod dim n)`） | 0 对任何正整数都整除；返回 n 个空段 |
+| 6 | `vt-cov` / `vt-corrcoef` | 零观测（`n_obs = 0`） | `FLOATING-POINT-INVALID-OPERATION` / `DIVISION-BY-ZERO` | 屏蔽陷阱，给 nan（§5.5） |
+
+##### 一、「零元素」和「零值」是两件事，但错误消息长得一样
+
+`(vt-cumsum (vt-zeros '(0 3)) :axis 1)` 的报错是 `Invalid index 0 for
+(SIMPLE-ARRAY DOUBLE-FLOAT (0))` —— 它读起来像「索引 0 越界」，实际上是
+「**没有**索引 0 可读」。这类消息特别容易在 review 里被当成参数问题放过，
+因为 `axis 1` 看起来是合法的、`(0 3)` 看起来也是合法形状。
+
+判据很简单：**空张量上，任何「输出也为空」的算子都必须成功并返回空**。
+numpy 的规则是「元素数为 0 → 没有 fiber → 什么都不做」，而不是「报错」。
+
+| 情形 | numpy | 本库 |
+|---|---|---|
+| `np.cumsum(np.zeros((0,3)), axis=1)` | shape `(0,3)` | 同（原先崩） |
+| `np.cumsum(np.zeros((3,0)), axis=0)` | shape `(3,0)` | 同（原先崩） |
+| `np.max(np.zeros((3,0)), axis=0)` | shape `(0,)`（输出为空，不需要 identity） | 同 |
+| `np.max(np.zeros((0,3)), axis=0)` | 报错（输出非空、归约区为空） | 同（消息已明确） |
+| `np.vsplit(np.zeros((0,3)), 2)` | 两个 `(0,3)` | 同（原先报不整除） |
+| `np.indices((2,0,3))` | shape `(3,2,0,3)` | 同（原先崩） |
+
+##### 二、角分母不许「换个分母凑合」
+
+`vt-cov` 里有一行 `(if (<= denom 0) n-obs denom)`，读起来像防御性编程，
+实际是**凭空改分母**。numpy 的写法是：
+
+```python
+fact = n_obs - ddof
+if fact <= 0: fact = 0.0        # 不是「换成 n_obs」
+c *= 1. / fact                  # 于是 1/0 = inf，0*inf = nan
+```
+
+两种写法在正常输入上完全一致，只在角上分叉：
+
+| 输入 | numpy | 改成 `n_obs` 的错误答案 |
+|---|---|---|
+| `cov([5.])`（1 观测，ddof=1） | `nan`（0/0） | `0.0` |
+| `cov([1,2], ddof=3)` | `inf`（0.5/0） | `0.25` |
+
+`inf` 和 `nan` 是**信息**：它们告诉调用方「这个数不存在」。换成 0.25 等于
+给出一个看起来合理、实际无意义的数 —— 这种错最贵，因为它不会触发任何下游
+检查。
+
+同一条在 `vt-corrcoef` 上表现为硬编码：标量方差走 `(vt-full nil 1.0d0)`。
+正确的公式始终是 `C / sqrt(C²)`，它对 `C = 1` 给 1、对 `C = 0`（全等输入）
+给 nan、对 `C = nan` 给 nan。numpy 的 `corrcoef([5.])` 就是 nan。
+
+##### 三、`num = 0` 是「空采样」，不是「非法参数」
+
+`vt-linspace` / `vt-logspace` / `vt-geomspace` 都把 `num <= 0` 当错误。
+但 `num = 0` 在 numpy 里合法：`np.linspace(0, 1, 0)` 返回 `array([], dtype=float64)`。
+「在区间上采 0 个点」是一个有意义且常见的请求（批量生成时 n 可能算出 0）。
+
+只有 `num < 0` 才是非法。顺序也不能反：`np.geomspace(0, 10, 0)` **仍然报
+`Geometric sequence cannot include zero`** —— 端点的零/同号校验先于数量校验。
+把 `num` 判定提到前面会让一个本该报错的输入静默返回空数组。
+
+##### 四、`weights` 让 `bincount` 换的是 dtype，不是语义
+
+`np.bincount(x, weights=w)` 有三条容易漏的规则：
+
+1. 结果恒为 `float64`，**即使 `w` 是整型或布尔**（文档原话：result is stored
+   as a float64 array if weights is given）；
+2. 负权重合法（加权直方图本来就会有负贡献）；
+3. 复数权重**报 `TypeError`**（无法 cast 到 float64）—— 这一条尤其容易「出于
+   好意」实现成 complex128，结果给出一个 numpy 给不出的答案。
+
+`vt-random-choice` 的 `:p` 缺的是**同一个参数的另一半形态**：numpy 的 `p` 就是
+一个 ndarray，而原实现直接对它走 `length` / `every` / `reduce` 的序列协议，
+于是最常见的写法报 `The value #<VT …> is not of type SEQUENCE`。修法是把三种
+形态（`nil` / Lisp 序列 / 张量）在入口归一成一个列表 —— 归一之后三条路径
+**必须给出同一序列**，这条用同 seed 的等值断言钉住。
+
+##### 五、裸 `assert` 不是错误契约
+
+`(assert (> a 0) (a))` 报的是 `The assertion (> A 0) failed with A = 0.`：
+没有函数名、没有字段名、没有「应该是什么」。`ASSERT` 在 SBCL 里是可以被
+`*suppress-check-redefinition*` / 优化级别干掉的调试工具，不是给调用方看的
+契约。所有对外入口的校验必须走 `(error "vt-xxx: …")`，并且消息里带上
+**函数名 + 实际值 + 期望**。random 族原有的 6 处裸 `assert` 已全部改掉。
+
+| 项 | 结果 |
+|---|---|
+| 换轴 | 随机输入 → **退化形状**（shape 含 0 / 0 维 / 单观测 / `num=0` / 分母 0） |
+| 修复 | 11 组代码点 / 13 类表现（3 个累积内核、indices、split 族、cov、corrcoef、3 个构造函数、bincount、choice、错误契约） |
+| 旁证（零缺陷） | IO 往返 188 组合、dtype 转换矩阵 121 组合、集合运算 92 条、索引族 35 条、`nn` 族恒等式 40 余条 |
+| 新增断言 | `test/degenerate-empty-test.lisp` 331 条（A–J 十组） |
+
 ---
 
 ## 附录 C：实测缺陷复现脚本
