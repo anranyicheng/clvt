@@ -3902,3 +3902,171 @@ int16 ⊔ uint16 = int32 → int32 超 24 位 → float64
 | 修复 | 5 处（复数真除法 24 例、复数→实数写回 60 例、布尔标量入口 8 类、T 叶子构造、三元提升 8 组） |
 | 断言 | bool-dtype-test 575（新增 Q 组 26 条） |
 | 套件 | 65/65（275s） |
+
+## H.3.37 第十轮：同一件事有几个入口
+
+> 对外结论见 `CHANGELOG.md`（四十四），契约见 `CONVENTIONS.md` §17.10.18。
+
+#### 一、上一轮结尾自己留的题
+
+第九轮末尾我写下的是：
+
+> 判据不能只问「这个函数对不对」，要问「同一件事有几个入口」。
+> 入口数得靠枚举，规则实现数也得靠枚举，然后逐个对。
+
+那一轮 5 处缺陷全在这张网里 —— 说明网还没织完。这一轮就把网织完：先用
+`sb-introspect:function-lambda-list` 拉出全部导出符号，按**签名**分组、再按
+**词干**分组，看哪些族「同一件事有多个成员」。三张表：
+
+| 族 | 成员数 | 这一族的「必须成立的等式」 |
+|---|---|---|
+| `nan` 族 | 12 对 | `f_nan(x) == f(skip-nan(x))`，且形状/dtype 与 `f` 一致 |
+| 三视图 | 3 | `vt-item` / `vt-to-list` / `vt-ref` 对同一元素给出 T·0·字节 |
+| 转换入口 | 3 | `vt-cast` = `vt-astype` = `vt-map #'identity` |
+| 提升规则 | 4 | `%op-final-dtype` / `vt-promote-type` / `vt-concatenate` / `vt-stack` |
+| 分解入口 | 2 | `divmod` 的商 = `vt-div`；余数 = `vt-mod` |
+| 线代入口 | 3 | `vt-matmul` / `vt-dot` / `vt-einsum` 的秩规则同源 |
+
+族内两个成员互为标尺 —— 这把尺子不依赖 numpy，也就不怕「两边一起错」。
+
+#### 二、`nan` 族的形状与精度
+
+12 对 nan 变体跑了 327 组（12 对 × 4 dtype × 7 参数组合，48 组两边共同拒绝），
+一等式只在一处破：
+
+```
+(vt-nancumsum 2×4) → 形状 (2 4)      (vt-cumsum 2×4) → (8)
+```
+
+`%e3-cumulative-skip-nan` 建结果缓冲时直接用了输入 `shape`，无条件；而它和
+`%vt-cumulative` 的 docstring 都写着「AXIS 为 nil 时展平」。于是**值是对的、
+形状是错的**：展平后的 8 个累积值被按 (2 4) 摆回去。加一个 `res-shape`，
+与 `%vt-cumulative` 的 `RES-SHAPE` 同口径。
+
+同族第二个破口更隐蔽，是**精度**：
+
+```
+(vt-nancumsum int64 #(2^60 1 -2^60)) → (2^60 2^60 0)
+(vt-cumsum     int64 #(2^60 1 -2^60)) → (2^60 2^60+1 1)    ← numpy 同
+```
+
+函数体里无条件 `(vt-astype input :float64)`。整数进 double 超过 2^53 就丢低位。
+问题在于**整数输入里根本没有 NaN 可跳** —— 「NaN 感知版」对一个没有 NaN 的
+输入给出与普通版不同的答案，且错的那个是前者。修法是在 `with-float-safe`
+之前直接委托 `vt-cumulative`，附带把 int8/uint8 的回绕问题一并解决（那本来
+是第九轮 Q 组记下的待办）。
+
+#### 三、复数 matmul 的秩：一个函数里三层分叉
+
+`(vt-matmul 2×2复 向量)` 给 `(2 1)`，实数路径给 `(2)`。`%cx-matmul` 里
+1-D 提升只写了一半：
+
+```lisp
+(cond ((and (= ra 2) (= rb 1)) …)   ; 只认 a 是 2-D
+      ((and (= ra 1) (= rb 2)) …))
+```
+
+`3×2×2 · 向量` 更糟：掉进 `%cx-batched-matmul` 后 `nth (- ra 2)` 越界直接报错。
+numpy 的规则是**对称的**：A 为 1-D 前补 `(1,k)`、B 为 1-D 后补 `(k,1)`，算完
+把补出来的维去掉。按这条重写，删除两个特例分支，`drop` 用下标列表统一处理。
+
+同一段里还压着两个 dtype 问题：
+
+```
+(vt-matmul 实矩阵 复矩阵)          → %cx-dispatch: 非复数缓冲区 DOUBLE-FLOAT
+(vt-matmul 复 复 :out float32)    → 静默取实部降精度
+```
+
+前者因为 `%cx-matmul-2d` 按 `(vt-dtype a)` 分配结果缓冲 —— 混型必须先
+`vt-astype` 双方到 `vt-promote-type` 的公共 dtype，且**提升要早于建缓冲**。
+后者因为 `%cx-op-matmul` 的 `:out` 走 `vt-copy-into`（能装就装，静默转换），
+而全库其余 `:out` 走 `vt-check-out`（形状+dtype 精确相等，不符报错）。改成
+`vt-check-out` 后与 §4.4 一致。
+
+#### 四、`divmod`：docstring 与实现相反，商与 `vt-div` 分叉
+
+`vt-divmod` 的 docstring 明写「传 `:out` 将报错」，实现是
+`(declare (ignore out))` —— 静默吞掉：不报错、不写入、拿回两个新张量、`out`
+原封不动。这是本轮全库 `:out` 契约扫描（274 次探测）里唯一的漏网，其余 273
+次都在形状或 dtype 不符时按 §4.4 报错。
+
+改完之后顺手对比商，撞到第二处。`vt-divmod` 自带一份 floor 除法的副本，
+而副本里这一段：
+
+```lisp
+((zerop bf) (if (or (%nan-p af) (%nan-p bf))
+                (vt-get-nan :float64)
+                (vt-get-nan :float64)))
+```
+
+两支相同 —— 是从没写完的残迹，于是**分母为零时商恒 `NaN`**：
+
+```
+(vt-div    #(1.0 -1.0 0.0) #(0.0 0.0 0.0)) → (NaN NaN NaN)
+(nth-value 0 (vt-divmod …))                → (NaN NaN NaN)
+```
+
+而余数一直调的是 `vt-mod`。删掉副本、商改调 `vt-div`，两个入口就同源了。
+
+#### 五、零除的符号：`plusp` 对 ±0 恒 NIL
+
+上面那个 `vt-div` 本身也有问题，只是被 `divmod` 的 `NaN` 盖住了：
+
+```
+(vt-div #(1.0 -1.0 0.0) #(0.0 0.0 0.0))
+  修复前 (-Inf -Inf NaN)     numpy (Inf -Inf NaN)
+```
+
+`%floor-div-op` 用 `(or (and (plusp x) (plusp y)) (and (minusp x) (minusp y)))`
+判符号。可 `(plusp 0.0d0)` 与 `(minusp 0.0d0)` **都是 NIL** —— 分母是零时两个
+分支恒假，于是恒取 `-Inf`。分母的符号只能走 `float-sign`：
+
+```lisp
+(* (if (minusp x) -1d0 1d0)
+   (if (minusp (float-sign y)) -1d0 1d0)
+   (vt-get-pos-inf :float64))
+```
+
+顺带确认 `(float-sign -0.0d0)` 是 `-1.0d0`、`(eql 0.0d0 -0.0d0)` 是 `NIL`，
+即 Lisp 能区分正负零，这条规则可实现。全 NaN 与复数 NaN 的退化组（26 组）
+重跑，零失配。
+
+#### 六、`vt-dot` 的秩：实数不能算而复数能算
+
+`(vt-dot 3×2×2 向量)` 实数报 `unsupported dimensions`，复数却能算 —— 因为
+第三节给复数加了 1-D 提升，而实数路径的 `cond` 没有对应分支。补两个
+`einsum` 子式，与 `vt-matmul` 的同名分支逐字一致。
+
+这是本轮**唯一一处「修完 A 顺手把 B 也修了」的连带发现**，也说明「族内两个
+成员互为标尺」这条判据确实能反向用：复数侧改对了，实数侧立刻显形。
+
+#### 七、扫描结果与留下的判据
+
+| 探针 | 规模 | 结果 |
+|---|---|---|
+| `nan` 族 12 对 | 327 组（48 双拒） | 修前 2 类不符，修后 0 |
+| 退化输入（全 NaN / 空 / 部分 NaN） | 26 组 | 0 |
+| 物理布局 × 秩 × `:out` | 315 组 | 0 |
+| 跨族恒等式 | 55 组 | 修前 3 处，修后 0 |
+| 带 NaN 的 numpy 锚 | 168 组 | 0 |
+| `:out` 契约全库 | 274 次探测 | 修前 1 处漏网，修后 0 |
+| 复数 matmul/dot 秩 | 全秩组合 | 修前 5 类，修后 0 |
+| 提升表 | 二元 121 + 三元 286 | 0（第九轮已压过） |
+| 三条转换入口 | 605 组 | 0 |
+
+| 项 | 结果 |
+|---|---|
+| 修复 | 7 处（其中 2 处是 docstring 与实现相反：`divmod` 的 `:out`、`nancumsum` 的 shape） |
+| 断言 | bool-dtype-test 639（新增 R 组 64 条） |
+| 套件 | 65/65 |
+
+判据这一轮又长了一截：
+
+> 「同一件事有几个入口」要枚举成表，并且**每族必须写出一条等式**。
+> 写不出等式的族，就用退化输入逼（全 NaN / 空 / 0 除 / ±0）。
+> 等式两边互相当尺子，比拿 numpy 当尺子更早发现问题 ——
+> 因为 numpy 只覆盖它自己支持的那部分秩与 dtype。
+
+有意偏差三条，已记入 §17.10.18：`vt-var :ddof` 给 `NaN` 而 numpy 给 `inf`；
+`vt-quantile` 不接受序列 `q`；`vt-median` 缺 `:dtype`/`:out`（与 `vt-nanmedian`
+不对称，待补）。

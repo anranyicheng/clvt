@@ -1341,6 +1341,8 @@
    - 若 a 为 1d, b 为 2d → 向量乘矩阵，返回 1d 向量。 
    - 若 a,b 均为 2d → 矩阵乘法 a @ b。 
    - 若 a,b 秩均 ≥2 → 批量矩阵乘法 '...ij,...jk->...ik'。 
+   - 若 a 为 (≥3)d, b 为 1d → 沿末轴收缩，返回 (...,i)（numpy 同）。
+   - 若 a 为 1d, b 为 (≥3)d → 沿倒数第二轴收缩，返回 (...,k)（numpy 同）。
    其他情况请直接使用 vt-einsum。"
   (when (%cx-any-p a b)
     (return-from vt-dot (%cx-op-dot a b :dtype dtype :out out)))
@@ -1357,6 +1359,14 @@
              (vt-einsum "i,ij->j" a b :dtype dtype :out out)) 
             ((and (= ra 2) (= rb 2)) 
              (vt-einsum "ij,jk->ik" a b :dtype dtype :out out)) 
+            ;; (N≥3)d · 1d 与 1d · (N≥3)d：numpy 的 dot 会沿一个轴收缩并保留
+            ;; 其余轴。原先落到下面的 error，而复数路径（%CX-OP-DOT 经新增的
+            ;; 1-D 提升）能算 —— 同一个函数换个 dtype 就一个能算一个报错。
+            ;; 子式与 VT-MATMUL 的同名分支完全一致。
+            ((and (> ra 2) (= rb 1))
+             (vt-einsum "...ij,j->...i" a b :dtype dtype :out out))
+            ((and (= ra 1) (> rb 2))
+             (vt-einsum "j,...jk->...k" a b :dtype dtype :out out))
             ((and (>= ra 2) (>= rb 2)) 
              (vt-einsum "...ij,...jk->...ik" a b :dtype dtype :out out)) 
             (t (error "vt-dot: unsupported dimensions (a: ~d, b: ~d).

@@ -1268,6 +1268,199 @@
                          (vt-from-sequence '(3) :dtype :float32)))
        '(6.0))
 
+
+;;; ==================================================================
+;;; R 组：同义入口族 —— 「同一件事有几个入口」必须给出同一个答案
+;;; ==================================================================
+;;; 前十遍都是「一个函数的一组参数」；这一遍改问「一件事有几个函数」。
+;;; 族内成员各写各的实现时，分叉就藏在这里。下面每条断言都是
+;;; 「族内两个入口对同一输入应当相同」，而不是「跟某个外部标尺相同」。
+
+(defun flat-any (tensor)
+  "把任意 dtype 的张量展平成一维列表（复数保留复数）。"
+  (vt-to-list (vt-ravel tensor)))
+
+(defun r-pos-inf-p (x) (and (floatp x) (sb-ext:float-infinity-p x) (plusp x)))
+(defun r-neg-inf-p (x) (and (floatp x) (sb-ext:float-infinity-p x) (minusp x)))
+(defun r-nan-p (x) (and (floatp x) (sb-ext:float-nan-p x)))
+
+;;; ---- R1. nancumsum / nancumprod 的形状：axis=nil 必须先展平 --------------
+;;; 两者的 docstring 都写着「AXIS 为 nil 时展平」，%VT-CUMULATIVE 也做到了，
+;;; 但 %E3-CUMULATIVE-SKIP-NAN 原先无论如何都沿用输入形状 —— 把展平后的
+;;; 累积值按 (2 4) 摆回去。值对、形状说谎。
+(let ((m (vt-from-sequence '((1 2 3 4) (5 6 7 8)) :dtype :int32)))
+  (check "nancumsum/2d-无轴-形状" (vt-shape (vt-nancumsum m)) '(8))
+  (check "nancumsum/2d-无轴-值" (vt-to-list (vt-nancumsum m))
+         '(1 3 6 10 15 21 28 36))
+  (check "nancumprod/2d-无轴-形状" (vt-shape (vt-nancumprod m)) '(8))
+  (check "nancumprod/2d-无轴-值" (vt-to-list (vt-nancumprod m))
+         '(1 2 6 24 120 720 5040 40320))
+  ;; 与基础入口同形（同族不可分叉）
+  (check "nancumsum/与 cumsum 同形状"
+         (vt-shape (vt-nancumsum m)) (vt-shape (vt-cumsum m)))
+  ;; 沿轴时形状仍是输入形状
+  (check "nancumsum/axis0-形状" (vt-shape (vt-nancumsum m :axis 0)) '(2 4))
+  ;; 布尔输入：dtype 取 int64（与 cumsum 同一条提升规则），形状同样展平
+  (let ((b (vt-from-sequence '((t nil t t) (nil t t nil)) :dtype :bool)))
+    (check "nancumsum/bool-2d-形状" (vt-shape (vt-nancumsum b)) '(8))
+    (check "nancumsum/bool-2d-值" (flat-ints (vt-nancumsum b))
+           '(1 1 2 3 3 4 5 5))
+    (check "nancumsum/bool-dtype" (vt-dtype (vt-nancumsum b)) :int64)))
+
+;;; ---- R2. 整数精度：NaN 感知版不许把整数过一遍浮点 ------------------------
+;;; 该路径无条件 (VT-ASTYPE INPUT :FLOAT64)，于是 int64 超过 2^53 就丢低位。
+;;; 整数里根本没有 NaN 可跳，直接委托给无 NaN 的同一内核即可。
+(let* ((big (expt 2 60))
+       (v (vt-from-sequence (list big 1 (- big)) :dtype :int64)))
+  (check "nancumsum/int64-2^60-末位" (vt-to-list (vt-nancumsum v))
+         (list big (1+ big) 1))
+  (check "nancumsum/int64-与 cumsum 一致"
+         (vt-to-list (vt-nancumsum v)) (vt-to-list (vt-cumsum v)))
+  (let ((w (vt-from-sequence (list big 1 1) :dtype :int64)))
+    (check "nancumprod/int64-与 cumprod 一致"
+           (vt-to-list (vt-nancumprod w)) (vt-to-list (vt-cumprod w))))
+  ;; uint8 提升到 int64 后不丢精度
+  (check "nancumsum/uint8-提升"
+         (vt-to-list (vt-nancumsum (vt-from-sequence '(200 100 100) :dtype :uint8)))
+         '(200 300 400)))
+
+;;; ---- R3. 12 对 nan 变体在无 NaN 时必须与基础入口逐值相同 -----------------
+(let ((m (vt-from-sequence '((1.5d0 2.5d0 3.5d0) (4.5d0 5.5d0 6.5d0)) :dtype :float64)))
+  (dolist (pair (list (cons "sum" (cons #'vt-sum #'vt-nansum))
+                      (cons "prod" (cons #'vt-prod #'vt-nanprod))
+                      (cons "mean" (cons #'vt-mean #'vt-nanmean))
+                      (cons "var" (cons #'vt-var #'vt-nanvar))
+                      (cons "std" (cons #'vt-std #'vt-nanstd))
+                      (cons "median" (cons #'vt-median #'vt-nanmedian))
+                      (cons "argmax" (cons #'vt-argmax #'vt-nanargmax))
+                      (cons "argmin" (cons #'vt-argmin #'vt-nanargmin))))
+    (let ((a (car pair)) (fa (cadr pair)) (fb (cddr pair)))
+      (check (format nil "nan-pair/~a-全" a)
+             (funcall fb m) (funcall fa m)
+             :test (lambda (x y) (equal (vt-to-list x) (vt-to-list y))))
+      (check (format nil "nan-pair/~a-axis0" a)
+             (funcall fb m :axis 0) (funcall fa m :axis 0)
+             :test (lambda (x y) (equal (vt-to-list x) (vt-to-list y)))))))
+
+;;; ---- R4. 复数 matmul / dot 的秩处理必须与实数路径同形 --------------------
+;;; numpy 的「1-D 提升」：A 为 1-D 前补 1，B 为 1-D 后补 1，算完去掉。
+;;; 原实现只给 (1d,2d) 压了维，(2d,1d) 会把 (m,1) 原样返回，(3d,1d) 直接崩。
+(let ((Mr (vt-from-sequence '((1.0d0 2.0d0) (3.0d0 4.0d0)) :dtype :float64))
+      (vr (vt-from-sequence '(1.0d0 2.0d0) :dtype :float64))
+      (Mc (vt-from-sequence (list (list (complex 1d0 0d0) (complex 2d0 0d0))
+                                  (list (complex 3d0 0d0) (complex 4d0 0d0)))
+                            :dtype :complex128))
+      (vc (vt-from-sequence (list (complex 1d0 0d0) (complex 2d0 0d0))
+                            :dtype :complex128)))
+  (check "cx-matmul/2d×1d-形状" (vt-shape (vt-matmul Mc vc)) '(2))
+  (check "cx-matmul/2d×1d-与实数同形"
+         (vt-shape (vt-matmul Mc vc)) (vt-shape (vt-matmul Mr vr)))
+  (check "cx-dot/2d×1d-形状" (vt-shape (vt-dot Mc vc)) '(2))
+  (check "cx-matmul/1d×2d-形状" (vt-shape (vt-matmul vc Mc)) '(2))
+  (check "cx-matmul/1d×1d-0维" (vt-shape (vt-matmul vc vc)) '())
+  (check "cx-dot/1d-值" (vt-item (vt-dot vc vc)) (complex 5d0 0d0))
+  ;; 批量 × 向量：(3 2 2) @ (2) → (3 2)
+  (let ((B (vt-reshape (vt-from-sequence (loop for i from 1 to 12 collect (float i 1d0))
+                                         :dtype :float64) '(3 2 2)))
+        (Bc (vt-reshape (vt-from-sequence (loop for i from 1 to 12
+                                                collect (complex (float i 1d0) 0d0))
+                                          :dtype :complex128) '(3 2 2))))
+    (check "cx-matmul/批量×1d-形状" (vt-shape (vt-matmul Bc vc)) '(3 2))
+    (check "cx-matmul/批量×1d-与实数同形"
+           (vt-shape (vt-matmul Bc vc)) (vt-shape (vt-matmul B vc)))
+    ;; 值与手算一致，且复数/实数两条路径同值（族内不可分叉）
+    (check "cx-matmul/批量×1d-值"
+           (mapcar #'realpart (flat-any (vt-matmul Bc vc)))
+           '(5.0d0 11.0d0 17.0d0 23.0d0 29.0d0 35.0d0))
+    (check "cx-matmul/批量×1d-实数路径同值"
+           (mapcar #'realpart (flat-any (vt-matmul B vc)))
+           '(5.0d0 11.0d0 17.0d0 23.0d0 29.0d0 35.0d0))
+    ;; 实数的 3d×1d：原先直接报「unsupported dimensions」，复数却已支持
+    (check "real-dot/3d×1d-形状" (vt-shape (vt-dot B (vt-from-sequence '(1.0d0 2.0d0) :dtype :float64))) '(3 2))
+    (check "real-dot/3d×1d-值"
+           (flat-any (vt-dot B (vt-from-sequence '(1.0d0 2.0d0) :dtype :float64)))
+           '(5.0d0 11.0d0 17.0d0 23.0d0 29.0d0 35.0d0))
+    (check "real-dot/1d×3d-形状" (vt-shape (vt-dot (vt-from-sequence '(1.0d0 2.0d0) :dtype :float64) B)) '(3 2))))
+
+;;; ---- R5. 复数 matmul / dot 的 :out 契约（与实数路径同一把尺子） ----------
+;;; 实数路径走 VT-CHECK-OUT：dtype 与形状都必须精确相等。
+;;; 复数路径原先直接 VT-COPY-INTO —— 那是「能装就装」，
+;;; 把复数结果写进 float32 out 会静默取实部并降精度。
+(let ((Mc (vt-from-sequence (list (list (complex 1d0 0d0) (complex 2d0 0d0))
+                                  (list (complex 3d0 0d0) (complex 4d0 0d0)))
+                            :dtype :complex128)))
+  (check-errors "cx-matmul/:out-错dtype"
+                (vt-matmul Mc Mc :out (vt-zeros '(2 2) :dtype :float32)))
+  (check-errors "cx-matmul/:out-complex64"
+                (vt-matmul Mc Mc :out (vt-zeros '(2 2) :dtype :complex64)))
+  (check-errors "cx-matmul/:out-错形状"
+                (vt-matmul Mc Mc :out (vt-zeros '(3 3) :dtype :complex128)))
+  (check-errors "cx-dot/:out-错dtype"
+                (vt-dot Mc Mc :out (vt-zeros '(2 2) :dtype :float64)))
+  ;; 正确的 out 仍然要能写
+  (let ((o (vt-zeros '(2 2) :dtype :complex128)))
+    (check "cx-matmul/:out-正常写入" (vt-matmul Mc Mc :out o) o
+           :test (lambda (x y) (eq x y)))))
+
+;;; ---- R6. vt-divmod：docstring 说「传 out 将报错」，就必须报错 -------------
+(check-errors "divmod/:out-报错" (vt-divmod '(7) '(2) :out (vt-zeros '(1) :dtype :int64)))
+
+;;; ---- R7. 0 除的符号：vt-div / vt-divmod 的商必须同号 --------------------
+;;; 原实现用 (or (and (plusp x) (plusp y)) (and (minusp x) (minusp y))) 定符号，
+;;; 而 ±0 的 plusp/minusp 都是 NIL —— 分母为零时恒返回 -Inf。
+(let ((a (vt-from-sequence '(1.0d0 -1.0d0 0.0d0) :dtype :float64))
+      (z (vt-from-sequence '(0.0d0 0.0d0 0.0d0) :dtype :float64))
+      (zm (vt-from-sequence '(-0.0d0 -0.0d0 -0.0d0) :dtype :float64)))
+  (check-true "div/1÷+0=+Inf" (r-pos-inf-p (vt-ref (vt-div a z) 0)))
+  (check-true "div/-1÷+0=-Inf" (r-neg-inf-p (vt-ref (vt-div a z) 1)))
+  (check-true "div/0÷+0=NaN" (r-nan-p (vt-ref (vt-div a z) 2)))
+  (check-true "div/1÷-0=-Inf" (r-neg-inf-p (vt-ref (vt-div a zm) 0)))
+  (check-true "div/-1÷-0=+Inf" (r-pos-inf-p (vt-ref (vt-div a zm) 1)))
+  ;; 与 vt-/ 同号（真除法与 floor 除法在 ±Inf 上一致）
+  (check-true "div/与 vt-/ 同号-1÷+0"
+              (r-pos-inf-p (vt-ref (vt-/ a z) 0)))
+  ;; divmod 的商 == vt-div（族内恒等式）
+  (check "divmod/商=vt-div-+0"
+         (vt-to-list (nth-value 0 (vt-divmod a z)))
+         (vt-to-list (vt-div a z))
+         :test (lambda (x y)
+                 (and (= (length x) (length y))
+                      (every (lambda (p q)
+                               (cond ((and (r-nan-p p) (r-nan-p q)) t)
+                                     ((and (r-pos-inf-p p) (r-pos-inf-p q)) t)
+                                     ((and (r-neg-inf-p p) (r-neg-inf-p q)) t)
+                                     (t (equal p q))))
+                             x y))))
+  (check "divmod/商=vt-div--0"
+         (vt-to-list (nth-value 0 (vt-divmod a zm)))
+         (vt-to-list (vt-div a zm))
+         :test (lambda (x y)
+                 (and (= (length x) (length y))
+                      (every (lambda (p q)
+                               (cond ((and (r-nan-p p) (r-nan-p q)) t)
+                                     ((and (r-pos-inf-p p) (r-pos-inf-p q)) t)
+                                     ((and (r-neg-inf-p p) (r-neg-inf-p q)) t)
+                                     (t (equal p q))))
+                             x y)))))
+
+;;; ---- R8. 全 NaN 与空张量的退化面（Nan 感知族的另一半） ------------------
+(let ((nn clvt::+vt-dfloat-nan+))
+  (let ((all (vt-from-sequence (list nn nn) :dtype :float64)))
+    (check "nansum/全NaN" (vt-item (vt-nansum all)) 0.0d0)
+    (check "nanprod/全NaN" (vt-item (vt-nanprod all)) 1.0d0)
+    (check "nancumsum/全NaN" (vt-to-list (vt-nancumsum all)) '(0.0d0 0.0d0))
+    (check "nancumprod/全NaN" (vt-to-list (vt-nancumprod all)) '(1.0d0 1.0d0))
+    ;; numpy：全 NaN 切片的 nanargmax 抛 ValueError（本库同样报错且点名切片）
+    (check-errors "nanargmax/全NaN-报错" (vt-nanargmax all)))
+  ;; 复数：任一分支为 NaN 即整元素视为 NaN（与 np.isnan 同口径）
+  (let ((c (vt-from-sequence (list (complex 1d0 2d0) (complex nn 0d0)
+                                   (complex 3d0 0d0) (complex 1d0 nn))
+                             :dtype :complex128)))
+    (check "cx-nansum/跳过含NaN元素" (vt-item (vt-nansum c)) (complex 4d0 2d0))
+    (check "cx-nanmean" (vt-item (vt-nanmean c)) (complex 2d0 1d0))
+    (check "cx-nancumsum" (vt-to-list (vt-nancumsum c))
+           (list (complex 1d0 2d0) (complex 1d0 2d0) (complex 4d0 2d0) (complex 4d0 2d0)))))
+
 ;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)

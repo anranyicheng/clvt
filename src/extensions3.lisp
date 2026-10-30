@@ -964,20 +964,25 @@
    `(vt-divmod #(T NIL) #(T NIL))` 的商是 `(T T)`（numpy：int8 `[1 0]`）。
    示例：(multiple-value-bind (q r) (vt-divmod '(7 -7) '(2 3)) ...)
         => q=[3 -3], r=[1 2]"
-  (declare (ignore out))
+  ;; docstring 一直写着「传 out 将报错」，实现却是 (declare (ignore out)) ——
+  ;; 静默吞掉：用户给了 :out，既不报错也不写入，拿到的是两个新张量，
+  ;; 而 out 原封不动。这是本轮全库 :out 契约扫描（274 次探测）里唯一的漏网，
+  ;; 其余 273 次都在形状或 dtype 不符时按 §4.4 报错。
+  (when out
+    (error "vt-divmod: 本函数返回两个值（商、余数），不支持 :out。~%~
+            需要原地写入请分别调用 vt-div / vt-mod 并各自传 :out。~%~
+            见 CONVENTIONS §17.10.18"))
   (when (and (null dtype) (%all-bool-tensors-p (list x y)))
     (setf dtype :int8))
   (let* ((xv (ensure-vt x)) (yv (ensure-vt y))
-         ;; floor 除法（余数跟随除数）：商 = floor(x / y)（浮点亦按 floor 取整）
-         (quot (vt-map (lambda (a b)
-                         (let ((af (coerce a 'double-float))
-                               (bf (coerce b 'double-float)))
-                           (cond ((or (%nan-p af) (%nan-p bf)) af)
-                                 ((zerop bf) (if (or (%nan-p af) (%nan-p bf))
-                                                 (vt-get-nan :float64)
-                                                 (vt-get-nan :float64)))
-                                 (t (floor (/ af bf))))))
-                       xv yv :dtype dtype)))
+         ;; 商直接调 VT-DIV —— 与余数调 VT-MOD 对称，也保证
+         ;;   divmod(x,y) 的商 == vt-div(x,y)
+         ;; 这条恒等式成立。原实现自带一份 floor 除法副本，两处就分了叉：
+         ;;   (vt-div #(1.0 -1.0 0.0) #(0.0 0.0 0.0)) → (-Inf -Inf NaN)
+         ;;   (nth-value 0 (vt-divmod ...))            → (NaN NaN NaN)
+         ;; 同一个输入、同一族两个入口，三种答案（numpy 是 (Inf -Inf NaN)）。
+         ;; 副本里那个 (if (or nan-p nan-p) nan nan) 两支相同，是从没写完的残迹。
+         (quot (vt-div xv yv :dtype dtype)))
     (values quot (vt-mod xv yv :dtype dtype))))
 
 (defun %nan-to-num-buffer (flat nanv posv negv)
@@ -1171,13 +1176,31 @@
    `(or dtype (vt-dtype input))`，同族里只漏了这一处 —— `nancumsum`
    对 bool 返回 `:bool` 且把计数 2/3 写进 `(unsigned-byte 8)`
    （脏字节），对 int8/uint8/int16 则静默回绕（`#(100 100)` → -56）。"
+  ;; 整数 / 布尔输入里不存在 NaN，所以「跳过 NaN」是恒等操作，直接委托给
+  ;; 无 NaN 的同一内核 —— 顺带保住整数的精确性。
+  ;; 为什么必须绕开：下面无条件 `(vt-astype input :float64)`，int64 的大值
+  ;; 一旦超过 2^53 就在 double 里丢低位：
+  ;;   (vt-nancumsum #(2^60 1 -2^60)) → (2^60 2^60 0)
+  ;;   (vt-cumsum     #(2^60 1 -2^60)) → (2^60 2^60+1 1)   ← numpy 同
+  ;; 同一库内两个入口对同一个输入给出不同答案，且错的那个还是「NaN 感知」版
+  ;; ——而它压根没有 NaN 可跳。
+  (let ((head (ensure-vt tensor)))
+    (when (or (eq (vt-dtype head) :bool) (vt-int-dtype-p (vt-dtype head)))
+      (return-from %e3-cumulative-skip-nan
+        (vt-cumulative head (if (eq op :sum) #'+ #'*) init-val
+                       :axis axis :dtype dtype :out out))))
   (with-float-safe
    (let* ((input (ensure-vt tensor))
           (shape (vt-shape input))
           (final-dtype (%cumulative-result-dtype input dtype))
+          ;; 结果形状：axis=nil 时先展平，与 %VT-CUMULATIVE 的 RES-SHAPE 同口径
+          ;; （两者的 docstring 都写着「AXIS 为 nil 时展平」，此前这里没做到）。
+          ;; 原实现无论如何都沿用输入形状，于是 (vt-nancumsum 2x4) 把**展平后的**
+          ;; 累积值按 (2 4) 摆回去 —— 值对、形状说谎，与 vt-cumsum / numpy 分叉。
+          (res-shape (if axis shape (list (vt-size input))))
           (result (if out
-                     (vt-check-out out shape final-dtype :op-name op-name)
-                     (vt-zeros shape :dtype final-dtype)))
+                     (vt-check-out out res-shape final-dtype :op-name op-name)
+                     (vt-zeros res-shape :dtype final-dtype)))
           (work (vt-astype input :float64))
           (op-init (or init-val (if (eq op :sum) 0.0d0 1.0d0))))
     ;; 注：原有一个 `(flet ((cumstep (acc x) ...))` 包住两条路径，内部用

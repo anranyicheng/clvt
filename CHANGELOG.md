@@ -4,6 +4,62 @@
 
 ---
 
+## 2026-10-30（四十四）— fix: 第十遍审计（换轴：同义入口族）—— 复数 matmul 秩、`nancumsum` 形状与精度、`divmod` 的 `:out`、零除符号、`dot` 的秩
+
+这一遍的判据不是「这个函数对不对」，而是「**同一件事有几个入口**」。
+用 `sb-introspect` 把全部导出符号按签名和词干分组，得到六张族表，每族写一条
+必须成立的等式，然后让族内两个成员互为标尺（不依赖 numpy，也就不怕两边一起错）。
+等式写不出来的族用退化输入逼（全 NaN / 空 / 0 除 / ±0）。六张表压完，7 处不符。
+
+**破坏性变更（下面这些调用以前报错，现在给出结果）**：
+
+- `(vt-matmul 复数矩阵 向量)`、`(vt-matmul 复数批量 向量)`：现在按 numpy 的
+  1-D 提升规则返回 `(2)` / `(3 2)`。修复前前者给 `(2 1)`（多一维），后者
+  `%cx-batched-matmul` 里 `nth` 越界直接报错。
+- `(vt-matmul 实矩阵 复矩阵)`、`(vt-matmul c64 c128)`、`(vt-matmul f32 c128)`：
+  现在先提升到 `vt-promote-type` 的公共 dtype 再进内核，结果 `:complex128`。
+  修复前报 `%cx-dispatch: 非复数缓冲区 DOUBLE-FLOAT` —— `%cx-matmul-2d` 按
+  `(vt-dtype a)` 分配结果缓冲。
+- `(vt-dot 三维数组 向量)` / `(vt-dot 向量 三维数组)`（实数）：现在返回
+  `(3 2)` / `(2 3)`。修复前报 `unsupported dimensions`，而复数路径已支持 ——
+  同一个函数换个 dtype 就一个能算一个报错。
+- `(vt-nancumsum 二维数组)`：形状现在是 `(8)`，与 `vt-cumsum` 及 numpy 一致。
+  修复前值对、形状是 `(2 4)`：`%e3-cumulative-skip-nan` 建缓冲时无条件用了
+  输入 `shape`，而它的 docstring 写着「AXIS 为 nil 时展平」。
+
+**行为修正（数值变化）**：
+
+- `(vt-nancumsum int64大值)` 不再丢低位。修复前无条件
+  `(vt-astype input :float64)`，int64 超过 2^53 进 double 就损：
+  `#(2^60 1 -2^60)` 给 `(2^60 2^60 0)`，现在是 `(2^60 2^60+1 1)`。
+  整数/布尔输入里没有 NaN 可跳，直接委托 `vt-cumulative` —— 顺带修掉
+  int8/uint8 的回绕（第九轮 Q 组记下的待办）。
+- `(vt-div #(1 -1 0) #(0 0 0))` 首元素从 `-Inf` 变 `Inf`。`%floor-div-op` 用
+  `plusp`/`minusp` 判符号，而它们对 ±0 一律给 `NIL` → 恒 `-Inf`。改走
+  `float-sign`（`-0.0` 的 `float-sign` 是 `-1.0`）。
+- `(nth-value 0 (vt-divmod a b))` 不再恒为 `NaN`。原实现自带一份 floor 除法
+  副本，副本里 `(if (or nan-p nan-p) nan nan)` 两支相同（残迹），去掉副本、
+  商改调 `vt-div`，与余数调 `vt-mod` 对称。
+
+**契约收紧（从静默改为报错）**：
+
+- `(vt-divmod a b :out o)`：现在报错。docstring 一直写着「传 `:out` 将报错」，
+  实现是 `(declare (ignore out))` —— 静默吞掉，`out` 原封不动。这是全库
+  `:out` 契约扫描（274 次探测）里唯一的漏网。
+- `(vt-matmul 复 复 :out 实数数组)`：现在报错。原先走 `vt-copy-into`
+  （能装就装）静默取实部降精度，与 §4.4 的「形状+dtype 精确相等」不符；
+  改走 `vt-check-out`。
+
+**未改（有意）**：`vt-var :ddof` 在 `ddof >= n` 时给 `NaN` 而 numpy 给 `inf`；
+`vt-quantile` 不接受序列 `q`；`vt-median` 缺 `:dtype`/`:out`（与 `vt-nanmedian`
+不对称，待补）。三条记入 §17.10.18 的偏差表。
+
+**验收**：`bool-dtype-test` 639 断言（新增 R 组 64 条）；65 套件全绿；
+`check_docs.py` 通过（227 个 §锚点）。契约见 `CONVENTIONS.md` §17.10.18，
+过程见 `HISTORY.md` H.3.37。
+
+---
+
 ## 2026-10-30（四十三）— fix: 第九遍审计（换轴：混型提升与转换入口）—— 复数÷整型、复数→实数写回、布尔标量、三元提升折叠
 
 这一遍先去审第八遍用的那把尺子（`vt-astype … :bool`），再沿「dtype 提升 /

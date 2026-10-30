@@ -279,11 +279,19 @@
         ((and (floatp x) (%inf-p x)) x)
         ((and (floatp y) (%inf-p y)) (nth-value 0 (floor x y)))
         ((and (numberp y) (zerop y))
-         (if (zerop x) +vt-dfloat-nan+
-             (if (or (and (plusp x) (plusp y))
-                     (and (minusp x) (minusp y)))
-                 (vt-get-pos-inf :float64)
-                 (- (vt-get-pos-inf :float64)))))
+         (if (zerop x)
+             +vt-dfloat-nan+
+             ;; 符号 = signum(x) × signum(±0.0)。原实现写成
+             ;;   (or (and (plusp x) (plusp y)) (and (minusp x) (minusp y)))
+             ;; 而 (plusp 0.0d0) 与 (minusp 0.0d0) 都是 NIL —— 分母是零时
+             ;; 两个分支恒假，于是**恒返回 -Inf**：
+             ;;   (vt-div #(1.0 -1.0 0.0) #(0.0 0.0 0.0))
+             ;;     修复前 (-Inf -Inf NaN)   numpy (Inf -Inf NaN)
+             ;; 分母的符号必须走 FLOAT-SIGN（-0.0 的 float-sign 是 -1.0），
+             ;; 不能用 PLUSP/MINUSP —— 它们对 ±0 一律给 NIL。
+             (* (if (minusp x) -1d0 1d0)
+                (if (minusp (float-sign y)) -1d0 1d0)
+                (vt-get-pos-inf :float64))))
         (t (nth-value 0 (floor x y)))))
 
 (defun vt-div (a b &key dtype out)

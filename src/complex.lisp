@@ -1702,24 +1702,48 @@
     res))
 
 (defun %cx-matmul (a b)
-  "复数 matmul 分派（语义同 numpy.matmul）。"
+  "复数 matmul 分派（语义同 numpy.matmul）。
+
+   秩处理按 numpy 的「1-D 提升」规则统一做：A 为 1-D 时**前补**一个 1 变
+   (1,k)，B 为 1-D 时**后补**一个 1 变 (k,1)；算完再把补出来的维度去掉。
+   原实现只给 (1d,2d) 做了压维，(2d,1d) 却把 (m,1) 原样返回、
+   (3d,1d) 直接走进批量内核崩掉：
+
+     (vt-matmul 2x2 2)  → (2 1)    numpy / 实数路径都是 (2)
+     (vt-matmul 3d   2)  → 报错     numpy 给 (3 2)
+
+   两条路径（实数走 EINSUM 的 7 个秩分支、复数走本函数）本该同形，
+   这一处正是它们分叉的地方。
+
+   混型（实数 ⊔ 复数、complex64 ⊔ complex128）先提升到公共 dtype 再进内核：
+   %CX-MATMUL-2D / %CX-BATCHED-MATMUL 都按 (VT-DTYPE A) 分配结果缓冲，
+   不提升就会把复数写进 FLOAT64 数组（`%cx-dispatch: 非复数缓冲区`）——
+   于是 (vt-matmul 实矩阵 复矩阵) 从**第一个元素**就崩，而 numpy 给
+   complex128。两个入口都提升后，dt 恒为复数 dtype，缓冲类型自然对齐。"
   (let* ((a (ensure-vt a))
-	 (b (ensure-vt b))
-         (ra (length (vt-shape a)))
-	 (rb (length (vt-shape b)))
+         (b (ensure-vt b))
          (dt (vt-promote-type (vt-dtype a) (vt-dtype b)))
-         (ca (vt-contiguous a)) (cb (vt-contiguous b))
-         (res
-           (cond
-             ((and (= ra 1) (= rb 1)) (%cx-dot-1d ca cb))
-             ((and (= ra 2) (= rb 2)) (%cx-matmul-2d ca cb))
-             ((and (= ra 2) (= rb 1))
-              (let ((k (second (vt-shape ca))))
-                (%cx-matmul-2d ca (vt-reshape cb (list k 1)))))
-             ((and (= ra 1) (= rb 2))
-              (let ((k (vt-size ca)) (n (second (vt-shape cb))))
-                (vt-reshape (%cx-matmul-2d (vt-reshape ca (list 1 k)) cb) (list n))))
-             (t (%cx-batched-matmul ca cb)))))
+         ;; 提升必须早于建缓冲，见 docstring 末段
+         (a (if (eq (vt-dtype a) dt) a (vt-astype a dt)))
+         (b (if (eq (vt-dtype b) dt) b (vt-astype b dt)))
+         (sa (vt-shape a)) (sb (vt-shape b))
+         (ra (length sa)) (rb (length sb))
+         (pad-a (= ra 1))                  ; A 前补一维
+         (pad-b (= rb 1))                  ; B 后补一维
+         (a2 (if pad-a (vt-reshape a (list 1 (first sa))) a))
+         (b2 (if pad-b (vt-reshape b (list (first sb) 1)) b))
+         (ca (vt-contiguous a2)) (cb (vt-contiguous b2))
+         (raw (if (and (= (vt-order ca) 2) (= (vt-order cb) 2))
+                  (%cx-matmul-2d ca cb)
+                  (%cx-batched-matmul ca cb)))
+         (rshape (vt-shape raw))
+         (drop (remove nil (list (and pad-a (- (length rshape) 2))
+                                 (and pad-b (1- (length rshape))))))
+         (res (if drop
+                  (vt-reshape raw (loop for i from 0 below (length rshape)
+                                        unless (member i drop)
+                                          collect (nth i rshape)))
+                  raw)))
     (if (eq (vt-dtype res) dt) res (vt-astype res dt))))
 
 (defun %cx-op-matmul (a b &key dtype out)
@@ -1728,16 +1752,30 @@
    复数（§16.13）：走本层专用内核（不做共轭，与 numpy.matmul 一致：
    共轭点积要用 vt-vdot 语义，即 (vt-dot (vt-conj a) b)）。
    实数路径不变（einsum/SIMD 内核）。"
-(let ((r (%cx-matmul a b)))
-  (when dtype (setf r (vt-astype r dtype)))
-  (if out (progn (vt-copy-into out r) out) r)))
+  (let ((r (%cx-matmul a b)))
+    (when dtype (setf r (vt-astype r dtype)))
+    (if out
+        ;; :out 走 VT-CHECK-OUT 的严格契约（形状与 dtype 精确相等），
+        ;; 与实数路径（vt-einsum）同口径。原实现直接 VT-COPY-INTO ——
+        ;; 那是「能装就装」的宽松转换，于是把复数结果写进 float32 out
+        ;; 会**静默取实部并降精度**，而实数路径对同样的 out 是报错的。
+        (progn (vt-copy-into (vt-check-out out (vt-shape r) (vt-dtype r)
+                                           :op-name "vt-matmul")
+                             r)
+               out)
+        r)))
 
 
 (defun %cx-op-dot (a b &key dtype out)
   "点积 / 内积（对标 numpy.dot）。复数：同 vt-matmul 语义，不取共轭。"
-(let ((r (%cx-matmul a b)))
-  (when dtype (setf r (vt-astype r dtype)))
-  (if out (progn (vt-copy-into out r) out) r)))
+  (let ((r (%cx-matmul a b)))
+    (when dtype (setf r (vt-astype r dtype)))
+    (if out
+        (progn (vt-copy-into (vt-check-out out (vt-shape r) (vt-dtype r)
+                                           :op-name "vt-dot")
+                             r)
+               out)
+        r)))
 
 
 (defun %cx-op-outer (a b &key (flatten t) dtype out)
