@@ -91,6 +91,7 @@ SUITES[complex-scan-axis-test]="26 复数沿轴扫描回归（第九轮 §16.29:
 SUITES[complex-gap-test]="50 复数缺口回归（第八轮 §16.28: from-array/from-sequence/full 的 dtype 推断保住虚部 · float_power 复数主值分支与 NaN 边界 · cbrt 对齐 numpy 的确定性拒绝 · layer-norm 复数分支（复数均值+实数方差）· 已支持函数抽查）"
 SUITES[scan-first-element-test]="38 累积扫描首元素语义（第十四轮 §16.30.3: numpy 的 accumulate 首个输出是输入本身而非 OP(单位元,输入) —— cumsum([-0.0]) 的符号位、cumprod 的 inf*0、nan 族掩码后的首元素；覆盖实数线三条路径(快路径/axis/展平) + 复数回归 + dtype 提升 + :out 非连续落点。测试进程故意不屏蔽浮点陷阱）"
 SUITES[cumulative-axis-test]="70 累积沿轴 + nanmedian 多轴（第十五轮 §16.35: 沿轴累积从 196ms 降到 4ms 的**逐位回归** —— 用独立朴素参照(list+坐标换算，不碰 strides)对照 2D/3D/负轴/步长切片/转置/负步长/4 dtype/int8 提升/空轴/轴长1/:out 列视图与完全别名 + 性能护栏(沿轴 ≤40× 展平) · nanmedian axis 列表(含 keepdims/负轴/顺序无关/NaN/复数字典序/连续与非连续 :out/重复轴与越界报错)，期望值 numpy 2.4.6 实测）"
+SUITES[reduce-shape-axis-test]="145 归约/求解的「形状 × 轴 × 序列参数」契约回归（差分模糊测试挖出的九类真实缺陷: vt-solve/vt-inv 的结果秩只由输入秩决定（b 为 (n,1) 不再被压成 (n)、1×1 不再返回 shape (1)）· vt-ptp 全归约返回 0 维 vt 且支持 :keepdims · vt-nanmedian 全局 keepdims 返回全 1 形状 · vt-median 的多轴/单元素列表/负轴/顺序无关（含复数字典序与非连续视图）· vt-percentile/vt-quantile 的多轴 × 分位点序列 × keepdims 组合 · vt-left/right-shift 的第二操作数为张量（含广播与 NEP 50 dtype 规则）· vt-histogram 的 :bins 边界序列（左闭右开/区间外丢弃/NaN 不入箱/density）· 复数守卫去重后 nn 与统计函数仍按契约拒绝 · 多轴归约族的形状一致性交叉网；期望值 numpy 2.4.6 实测）"
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
 SUITES[test-all]="641 绝大多数函数的测试"
@@ -160,6 +161,7 @@ DEFAULT_ORDER=(
     complex-scan-axis-test
     scan-first-element-test
     cumulative-axis-test
+    reduce-shape-axis-test
     complex-gap-test
     complex-matmul-perf-test
     complex-test
