@@ -4080,6 +4080,90 @@ numpy 的 bool 减法按位回绕：`True-False = 1`、`False-True = -1`，落�
 **这条值得单独记**：`ECASE` 配 `T` 子句能编译、能通过 5 输入以内的全部测试，
 只在 n≥6 时炸，而 `vt-map` 的 6 输入是文档支持的合法用法。
 
+#### 17.10.10 布尔缩并的第二批：`convolve` / `correlate` / `cross`
+
+§17.10.6 修掉了矩阵乘法家族（`matmul` / `dot` / `inner` / `outer` /
+`tensordot` / `einsum`），但那轮是按「矩阵乘法」这个词去找的，漏掉了
+**同样是缩并、只是名字里没有 mat 的算子**。按「有没有『乘积求和』这个结构」
+重扫（而不是按名字）就能捞到三个：
+
+| 表达式 | numpy 2.3.5 | clvt（修复前） | 现在 |
+|---|---|---|---|
+| `(vt-convolve b b)` | `:bool` `[T F T T T T T]` | `:float64` `[1 0 2 2 1 2 1]` | `:bool`，逐值一致 |
+| `(vt-correlate b b)` | `:bool` `[T T T T T T T]` | `:float64` 数值和 | `:bool`，逐值一致 |
+| `(vt-cross b b)` | **报错**（boolean subtract） | `:bool` `(1 1 1)` | 报错 |
+
+前两个是「布尔代数被当成整数和」：`or_k (a[k] and b[k])` 与
+`(sum_k a[k]*b[k]) > 0` 在 bool 上**逐值等价**（乘积只可能是 0/1，
+和 >0 ⇔ 存在一个为真的乘积），所以实现不用改写内层循环 —— 收尾时
+`(vt-astype res :bool)` 即可，`vt-convolve` 复用 `vt-correlate` 自动受益。
+
+`vt-cross` 属于另一类：它**含减法**（`a1*b2 - a2*b1`），而布尔减法在
+本库和 numpy 里都不成立。原实现把结果数组建在输入 dtype 上
+（`(or dtype (vt-dtype av))`），于是 `-1` 被截断成 1、`1` 保持 1 ——
+一块 3 分量的向量全变 `(1 1 1)`，**没有任何报错**。现在是显式
+`error`，要数值结果请写 `:dtype :int64`。
+
+> 判据：找这类缺陷时，「按算子名搜」不如「按 dataflow 搜」。
+> 只要函数体里出现 `(incf sum (* ...))` 或 `(vt-- ...)` 而没有
+> bool 分支，就值得看一眼。
+
+#### 17.10.11 结果 dtype 的提升表：五个「值对不上是因为类型不对」的入口
+
+第三遍换的轴是**结果类型**而不是值：不问「这个算子的答案是多少」，
+而问「它宣称返回什么类型，实际返回什么类型」。理由是 §17.10.1–17.10.6
+的六类缺陷全都是「类型对、值错」，而反过来的「值看起来对、类型错」
+更难发现 —— 因为 `vt-to-list` 会把 0.785 显示成 0，看上去像「算错了」，
+其实是「存不下」。
+
+| 入口 | 修复前 | 现在 | numpy |
+|---|---|---|---|
+| `(vt-negative b)` | `:bool`，字节 **255** | 报错（可显式 `:dtype :int8`） | 报错 |
+| `(vt-atan2 b b)` | `:bool`，值 **全 0** | `:float64`，`0.785…` | `float16` |
+| `(vt-atan2 int64 int64)` | `:int64`，值 **全 0** | `:float64` | `float64` |
+| `(vt-pow b 2)` | `:float64` | `:int64` `(1 1 0 0)` | `int64` |
+| `(vt-rem b b)` | `:bool` | `:int8` | `int8` |
+
+四条根因，三种成因：
+
+1. **`vt-negative` 的 255**：`vt-fast-map #'-` 把 `-1` 交给
+   `%coerce-uint8`，写进 `(unsigned-byte 8)` 得 255 —— dtype 仍是 `:bool`，
+   字节已越界。`(vt-sum (vt-negative b))` 实测 765。与 §17.10.2 的
+   `vt-bit-not` 是同一个坑的两次踩（`lognot` 也是 254/255）。
+   **凡是「布尔数组里出现非 0/1 字节」，最终都会在某个归约里放大成怪数字**
+   —— 所以 `bad-bytes` 这类不变量检查比逐函数断言更值钱。
+
+2. **`vt-atan2` 从来没做过 dtype 提升**：它的 docstring 一直写
+   「整数输入输出 float64」，实现却直接把 `#'atan` 丢给 `vt-fast-map`，
+   结果类型走 `%op-final-dtype` 的**纯提升**规则（`bool ⊔ bool = :bool`、
+   `int64 ⊔ int64 = :int64`）。于是 0.785 写进整数数组被截断成 0。
+   这不是 bool 专有缺陷 —— **整数输入也全错**，只是 bool 更容易撞上。
+   修法用 `%infer-float-dtype` 的同一规则：`float32` 进 `float32` 出，
+   其余一律 `float64`。
+
+3. **`vt-pow` 的整数白名单漏了 `:bool`**：`(and int-pow-p (member in-dt
+   '(:int8 … :uint16)))` 这条规则的意图是「整数基 + 正整数指数保持整数」，
+   但成员表里没有 `:bool`，于是落到 `(t :float64)`。按 §17.10.1 的
+   「布尔 ⊔ 弱整数标量 → `:int64`」补上 `((and int-pow-p (eq in-dt :bool))
+   :int64)`。（§17.10.7 的偏差表早就把 `b ** 2` 记成「clvt 给 `:int64`」，
+   而实现给的是 `:float64` —— **文档与实现两边都没错，只是不一致**，
+   这类「偏差表自我固化」正是 §17.10.6 里提过的风险。）
+
+4. **`vt-rem` 少抄了三行**：`vt-mod` / `vt-div` 都有
+   `(when (and (null dtype) (%all-bool-tensors-p ...)) (setf dtype :int8))`，
+   `vt-rem` 没有。于是同一族余数函数里 `(vt-mod b b)` 给 `:int8`、
+   `(vt-rem b b)` 给 `:bool`。
+
+**验收方式**：把 dtype 本身当成被断言的对象（`(vt-dtype (f ...))` 而不是
+`(vt-to-list (f ...))`），并配一条「物理字节 ∈ {0,1}」的扫描。回归见 K 组
+（`negative/*`、`atan2/*`、`pow/bool-*`、`rem/bool-*`、`convolve/*`、
+`correlate/*`、`cross/*`，共 22 条）。
+
+> 三遍审计的轴互不重叠，这是刻意的：
+> **第一遍问「值对不对」（差分），第二遍问「字面量进不进得去」（探针），
+> 第三遍问「类型宣不宣称得住」（dtype 断言 + 字节不变量）。**
+> 同一批代码在三遍里各暴露不同的一部分，交集很小。
+
 ---
 
 ## 附录 C：实测缺陷复现脚本

@@ -78,11 +78,14 @@
         (let* ((in-dt (vt-dtype vt))
                (int-pow-p (and (integerp power) (plusp power)))
                ;; 整数基 + 正整数指数 → 保持整数 dtype（对标 numpy）；
+               ;; `:bool` 基先升到 :int64（CONVENTIONS §17.10.1 的
+               ;; 「布尔 ⊔ 弱整数标量 → :int64」同一条规则）；
                ;; 其余一律浮点（float32 进 float32 出，整数→float64）。
                (dt (cond (dtype dtype)
                          ((and int-pow-p (member in-dt '(:int8 :int16 :int32 :int64
                                                          :uint8 :uint16)))
                           in-dt)
+                         ((and int-pow-p (eq in-dt :bool)) :int64)
                          ((eq in-dt :float32) :float32)
                          (t :float64)))
                (nan (vt-get-nan (if (member dt '(:float64 :float32)) dt :float64))))
@@ -365,9 +368,16 @@
    （docstring 曾误标 numpy.remainder，现已更正）。
    除数为 0 时按 numpy dtype 语义（v0.3.6 起）：
    浮点语境（任一操作数为浮点）→ NaN；整型语境 → 0；
-   NaN 任一侧 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。"
+   NaN 任一侧 → NaN；被除数为 ±Inf → NaN；除数为 ±Inf → 被除数本身。
+
+   布尔输入（CONVENTIONS §17.3）：结果 dtype 取 **:int8** —— 与 `vt-mod`
+   同一条规则（numpy：`np.fmod(bool, bool)` → int8）。原实现漏了这一步，
+   于是 `(vt-rem b b)` 返回 `:bool`，而 `(vt-mod b b)` 返回 `:int8`：
+   同一族余数函数的 dtype 不一致，且 :bool 结果会把非零余数压成 1。"
     (when (%cx-reject vt divisor)
     (error "vt-rem: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+  (when (and (null dtype) (%all-bool-tensors-p (list vt divisor)))
+    (setf dtype :int8))
 (flet ((zero-div (x)
            ;; numpy 语义：浮点语境零除 → NaN，整型语境 → 0
            (if (floatp x) (%mod-float-nan x) 0)))
@@ -389,10 +399,29 @@
 
 (defun vt-atan2 (vty vtx &key out dtype)
   "逐元素双参数反正切 atan2(y, x)。参数顺序 VTY, VTX。
-      整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
+      整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。
+
+      dtype 提升（v0.4.20 修复）：原实现直接把 `:#'atan` 交给 `vt-fast-map`，
+      结果 dtype 走 `%op-final-dtype` 的**纯提升**规则 —— `bool ⊔ bool` 得
+      `:bool`、`int64 ⊔ int64` 得 `:int64`。于是
+        (vt-atan2 int64数组 int64数组) → :int64，值 **全 0**
+        (vt-atan2 bool数组  bool数组 ) → :bool，  值 **全 0**
+      因为 0.785… 写进整数/布尔数组被截断成 0。本函数的 docstring 一直写
+      「整数输入输出 float64」，实现却从未做到。现在按 `%infer-float-dtype`
+      的同一条规则显式推导：float32 进 float32 出，其余一律 float64。
+      （numpy 对整数/布尔输入给 float16，本库无 float16，统一 float64，
+      见 CONVENTIONS §17.10.11。）"
     (when (%cx-reject vty vtx)
     (error "vt-atan2: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-fast-map #'atan vty vtx :out out :dtype dtype))
+(let* ((a (ensure-vt vty))
+       (b (ensure-vt vtx))
+       (dt (or dtype
+               (let ((d (vt-promote-type (vt-dtype a) (vt-dtype b))))
+                 (if (eq d :float32) :float32 :float64)))))
+  (vt-fast-map (function atan)
+               (%coerce-float-input a dt)
+               (%coerce-float-input b dt)
+               :out out :dtype dt)))
 
 ;; floor 族对 NaN/±Inf 统一传播本身（对标 numpy：floor/ceil/trunc/round(nan)=nan，
 ;; floor(±inf)=±inf）。SBCL 对非有限值直接调用 floor/round 会 signal

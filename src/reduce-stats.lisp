@@ -2811,11 +2811,21 @@
     clvt   (vt-correlate a v)   默认 :mode :full
   三种模式本身与 numpy 逐值一致（:full/:valid/:same 均已对齐）；
   需要 numpy 默认行为时请显式写 :mode :valid。
-  core-test 与 test-all 均以 :full 为约定，故此处只修正文档，不改默认。"
+  core-test 与 test-all 均以 :full 为约定，故此处只修正文档，不改默认。
+
+  布尔输入（CONVENTIONS §17.10.10）：两侧都是 `:bool` 时结果也是 `:bool`，
+  累加按 numpy 的**逻辑与／或**语义（`or_k (a[k] and b[k])`）—— 内部仍按
+  数值求和，收尾时 `>0` 真值化，两者逐值等价（count>0 ⇔ 存在一个乘积为真）。
+  修复前 bool 输入返回 `:float64` 的**数值和**：`(vt-convolve b b)` 给
+  `[1 0 2 2 1 2 1]`，numpy 给 `[T F T T T T T]`。这与上一轮修的
+  `matmul`／`dot`／`einsum` 是同一族缺陷（布尔代数被当成数值和），
+  当时只扫了矩阵乘法家族，漏了信号处理这两个入口。"
   (when (%cx-any-p a v)
     (return-from vt-correlate (%cx-op-correlate a v :mode mode)))
   (when (null mode) (setf mode :full))
-  (let* ((mode-kw (%normalize-mode-keyword mode))
+  (let* ((bool-result (and (eq (vt-dtype (ensure-vt a)) :bool)
+                           (eq (vt-dtype (ensure-vt v)) :bool)))
+         (mode-kw (%normalize-mode-keyword mode))
          (a-flat (vt-contiguous (vt-flatten a)))
          (v-flat (vt-contiguous (vt-flatten v)))
          (n (vt-size a-flat))
@@ -2876,7 +2886,7 @@
                     ((and (equal et-a 'single-float) (equal et-b 'single-float))
                      (fill-full single-float))
                     (t (fill-full-generic))))))
-          (ecase mode-kw
+          (let ((res (ecase mode-kw
           (:full (%make-vt :data full :shape (list full-len) :strides '(1)
                            :offset 0 :dtype :float64))
           (:valid (let* ((len (max 0 (1+ (- n m)))) (start offset)
@@ -2891,7 +2901,8 @@
                    (loop for i from 0 below out-len do
                      (setf (aref data i) (aref full (+ start i))))
                    (%make-vt :data data :shape (list out-len) :strides '(1)
-                             :offset 0 :dtype :float64)))))))))
+                             :offset 0 :dtype :float64))))))
+            (if bool-result (vt-astype res :bool) res)))))))
 
 (defun vt-convolve (a v &key (mode :full))
   "1D 卷积，对标 np.convolve。mode 支持关键字(:full/:valid/:same)或字符串。"

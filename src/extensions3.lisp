@@ -1479,9 +1479,21 @@
    支持 2 分量（标量 z 分量输出）与 3 分量向量；沿 AXISA/AXISB 轴取向量，
    结果沿 AXISC 轴放置。AXIS 给定时等价 axisa=axisb=axisc=axis。
    示例：(vt-cross '(1 2 3) '(4 5 6)) => [-3 6 -3]
-        (vt-cross '(1 2) '(4 5))     => -3"
+        (vt-cross '(1 2) '(4 5))     => -3
+
+   布尔输入（CONVENTIONS §17.3）：**报错**，与 `vt-sub` 同源 —— numpy 的
+   `np.cross(bool,bool)` 直接抛 `TypeError: numpy boolean subtract ...`，
+   因为叉积定义里含减法。原实现把结果数组建在输入 dtype 上
+   （`(or dtype (vt-dtype av))`），bool 输入于是得到 **:bool**，
+   `-3`/`6` 这类分量被截成 1，静默输出 `(1 1 1)` —— 一个看起来合法、
+   实际毫无意义的答案。"
   (declare (ignorable axisc))   ; 结果轴暂固定为末轴；AXISC 仅作 API 兼容
   (let* ((av (ensure-vt a)) (bv (ensure-vt b)))
+    (when (and (null dtype) (eq (vt-dtype av) :bool))
+      (error "vt-cross: 布尔张量不支持叉积（numpy 同样拒绝：布尔减法未定义）。~%~
+              请先 (vt-astype a :int64) 显式升为数值类型；~%~
+              只要方向（正交性）请用 vt-logical-xor / vt-bit-and。~%~
+              见 CONVENTIONS §17.3"))
     (when axis (setf axisa axis
 		     axisb axis
 		     axisc axis))

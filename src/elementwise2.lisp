@@ -421,7 +421,20 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 
 (defun vt-negative (vt &key out dtype)
   "逐元素取负（-x）。这是一元 vt-- 的具名入口，
-      NaN/±Inf 原样传播（对标 numpy.negative）。:out 契约同 vt-+。"
+      NaN/±Inf 原样传播（对标 numpy.negative）。:out 契约同 vt-+。
+
+      布尔输入（CONVENTIONS §17.3）：**报错**，与 `vt-sub` 同一条理由 ——
+      numpy 明确拒绝 `-bool数组`（`TypeError: The numpy boolean negative,
+      the - operator, is not supported`）。此前本函数落到 `vt-fast-map #'-`
+      的整数路径，`-1` 经 `%coerce-uint8` 写回 `(unsigned-byte 8)` 得到
+      **255**：数组仍是 `:bool` 但物理字节已越界，`vt-to-list` 直接吐出
+      255，`vt-sum` 也按 255 累加（实测 `(vt-sum (vt-negative b))` = 765）。
+      这类「dtype 是 bool、字节不是 0/1」的脏数据是最难查的一类。"
+  (when (and (null dtype) (eq (vt-dtype (ensure-vt vt)) :bool))
+    (error "vt-negative: 布尔张量不支持取负（numpy 同样拒绝）。~%~
+            取反请用 vt-logical-not，异或取反请用 vt-logical-xor；~%~
+            若确实要数值取负，请显式给出 :dtype :int8 等数值类型。~%~
+            见 CONVENTIONS §17.3"))
   (when (%cx-any-p vt)
     (return-from vt-negative
       (let* ((in (ensure-vt vt))

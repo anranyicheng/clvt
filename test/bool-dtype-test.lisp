@@ -713,6 +713,64 @@
                                              *jb* *jb* *jb* *jb* *jb* *jb* *jb*))
        '(1 1 1 1))
 
+;; --- K. 结果 dtype 的提升表 & 布尔缩并的漏网（§17.10.10 / §17.10.11） ---
+;; 「值算对了但 dtype 错」和「dtype 对了但值是脏字节」是两类不同的失败，
+;; 本组两条都盯：dtype 断言 + 物理字节 / 值断言。
+(defmacro check-error (name form)
+  "断言 FORM 抛错（用于「numpy 同样拒绝」的契约）。"
+  `(handler-case (progn ,form
+                    (incf *fail*)
+                    (format t "~&FAIL ~a~%  got:  正常返回（期望报错）~%" ,name))
+     (error () (incf *pass*))))
+
+;; K1. vt-negative：numpy 拒绝 bool 取负；原实现写回 255（脏字节）
+(check-error "negative/bool" (vt-negative *jb*))
+(check "negative/bool-i8" (flat-ints (vt-negative *jb* :dtype :int8)) '(-1 -1 0 0))
+(check "negative/i64" (flat-ints (vt-negative (vt-from-sequence '(1 2) :dtype :int64))) '(-1 -2))
+
+;; K2. vt-atan2：docstring 一直写「整数输入输出 float64」，实现曾把结果留在
+;;     整数/布尔 dtype 上，0.785 被截断成 0
+(check "atan2/bool-dtype" (vt-dtype (vt-atan2 *jb* *jb*)) :float64)
+(check-true "atan2/bool-vals" (< (abs (- (vt-ref (vt-atan2 *jb* *jb*) 0)
+                                         0.7853981633974483d0)) 1d-12))
+(check "atan2/i64-dtype" (vt-dtype (vt-atan2 (vt-from-sequence '(1 2) :dtype :int64)
+                                             (vt-from-sequence '(1 2) :dtype :int64)))
+       :float64)
+(check-true "atan2/i64-vals" (< (abs (- (vt-ref (vt-atan2 (vt-from-sequence '(1 2) :dtype :int64)
+                                                         (vt-from-sequence '(1 2) :dtype :int64)) 1)
+                                         0.7853981633974483d0)) 1d-12))
+(check "atan2/f32-dtype" (vt-dtype (vt-atan2 (vt-astype *jb* :float32)
+                                             (vt-astype *jb* :float32))) :float32)
+
+;; K3. vt-pow：bool 基 + 正整数指数 → :int64（§17.10.1 的同一条提升规则）
+(check "pow/bool-2-dtype" (vt-dtype (vt-pow *jb* 2)) :int64)
+(check "pow/bool-2-vals"  (flat-ints (vt-pow *jb* 2)) '(1 1 0 0))
+
+;; K4. vt-rem：与 vt-mod 同为「布尔 → :int8」
+(check "rem/bool-dtype" (vt-dtype (vt-rem *jb* *jb*)) :int8)
+(check "rem/bool-vals"  (flat-ints (vt-rem *jb* *jb*)) '(0 0 0 0))
+(check "mod/bool-dtype" (vt-dtype (vt-mod *jb* *jb*)) :int8)
+
+;; K5. vt-convolve / vt-correlate：bool 输入走逻辑与/或，结果仍 :bool
+;;     （修复前返回 :float64 的数值和，[1 1 1 0 0 0 0] 的 1 会变成计数）
+(check "convolve/bool-dtype"   (vt-dtype (vt-convolve *jb* *jb*)) :bool)
+(check "convolve/bool-full"    (flat-ints (vt-convolve *jb* *jb*)) '(1 1 1 0 0 0 0))
+(check "convolve/bool-valid"   (flat-ints (vt-convolve *jb* *jb* :mode :valid)) '(0))
+(check "correlate/bool-dtype"  (vt-dtype (vt-correlate *jb* *jb*)) :bool)
+(check "correlate/bool-full"   (flat-ints (vt-correlate *jb* *jb*)) '(0 0 1 1 1 0 0))
+(check "correlate/bool-valid"  (flat-ints (vt-correlate *jb* *jb* :mode :valid)) '(1))
+;; 浮点路径不受影响
+(check "convolve/f64" (vt-dtype (vt-convolve (vt-astype *jb* :float64)
+                                             (vt-astype *jb* :float64))) :float64)
+
+;; K6. vt-cross：numpy 抛 TypeError（叉积含减法）；原实现静默给 :bool (1 1 1)
+(check-error "cross/bool" (vt-cross (vt-from-sequence '(t nil t) :dtype :bool)
+                                    (vt-from-sequence '(nil t t) :dtype :bool)))
+(check "cross/bool-i64" (flat-ints (vt-cross (vt-from-sequence '(t nil t) :dtype :bool)
+                                             (vt-from-sequence '(nil t t) :dtype :bool)
+                                             :dtype :int64))
+       '(-1 -1 1))
+
 ;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)
