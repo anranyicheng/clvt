@@ -4538,6 +4538,133 @@ numpy 写法之一，移植过来会删掉一批完全不相干的元素，而�
 
 ---
 
+#### 17.10.16 第八遍：`(f x … :dtype :bool)` 究竟等于什么
+
+前七遍都把 `:dtype` 当**输入**用：我要求布尔输出，你给不给、给得对不对。
+这一遍把它当**断言**来验，判据只有一条：
+
+> `(f x … :dtype :bool)` 必须逐值等于 `(vt-astype (f x …) :bool)`
+
+这不是新加的约定 —— `vt-map` 的 `(lambda (x) 5) :dtype :bool` 早就返回 `1`，
+`vt-linspace 0 1 5 :dtype :bool` 早就返回 `(0 1 1 1 1)`（G/N 两组测的就是它们）。
+既然「先按自然 dtype 算，再 astype」和「直接要 bool」在文档里是同一件事，
+两者就必须相等。
+
+用 `sb-introspect` 筛出 **139 个接受 `:dtype` 的导出函数**，各试 1/2/3 个
+布尔实参，得到 144 个可比对样本：**37 个不等**，落在 35 个函数上。
+
+##### 一、`the` 截断：0.84 变成 0，2.718 变成 2
+
+| 表达式 | 修复前 | 现在 = astype |
+|---|---|---|
+| `(vt-abs #(0.5 1.5 2.0 0.25 3.0 0.75) :dtype :bool)` | 字节 `0 1 2 0 3 0`（真值 `0 1 1 0 1 0`） | `1 1 1 1 1 1` |
+| `(vt-cos b :dtype :bool)`，b 为 2×3 布尔 | `(0 1 0 1 0 0)`（cos(1)=0.54 截成 0） | `(1 1 1 1 1 1)` |
+| `(vt-exp b :dtype :bool)` | 字节 `2`（越界） | 字节 `1` |
+| `(vt-log x :dtype :bool)` | `(0 0 0 0 0 0)` | `(1 1 1 1 1 1)` |
+
+两类后果都出现过：截断后落在 0 的**真值反了**（0.84 → NIL），落在 ≥2 的
+成了**脏字节**（2.718 → 2，破 §17.1）。
+
+根因在 `vt-fast-map` 的派发：`dtype-check` 让「输入 dtype = 结果 dtype」的
+调用进内联循环，`maskable` 又让 `:bool` 进掩码循环。两条内核都按元素类型
+特化，写 `(unsigned-byte 8)` 时只有一句 `(the (unsigned-byte 8) v)` ——
+那是**截断**；而 `vt-map` 的写回经 `vt-cast-fun` → `%bool-flag`，是**真值化**。
+同一语义两条实现，错的那条恰好是默认路径。
+
+修法不是给十几个内核各加一个 `if`，而是把 `:bool` 从这两条快路径里摘出去
+（`dtype-check` 加 `(not (eq (vt-dtype res) :bool))`、`maskable` 去掉 `:bool`），
+让布尔结果一律回落 `vt-map` 分支 —— 两条路合一条。代价只有布尔输出的映射
+少一次内联；`fastmap-invariant-test` 的计时上界仍通过（float64 路径未受影响，
+vt-sin 370ms ≈ 裸 vt-fast-map 370ms）。
+
+##### 二、`%float-map` 把**输入**先降成目标 dtype
+
+```lisp
+(vt-fast-map op (%coerce-float-input IN %DT) :dtype %DT)
+```
+
+目标 `DT` 是 `:bool` 时，这一步先把 0.5 变成 1、-0.5 变成 1，再取对数 ——
+算的是 `log(0/1)` 而不是 `log(x)`。`(vt-log x :dtype :bool)` 因此给出全 0。
+
+修法：`%float-map` / `%float-map-fn` / `%float-map-lambda` 三条入口在
+`DT = :bool` 时改走 `%FLOAT-MAP-BOOL` —— 按**自然浮点精度**（float32 进
+float32 出）算完，再 `%to-bool`。注意 `%float-map` 的展开形状必须保持
+`(if <FAST> <SLOW>)`：`fastmap-invariant-test` 按这个形状取快分支做静态检查，
+布尔分流只能挂在 `<SLOW>` 里。
+
+##### 三、累积族的第二条实现用了 `%cast-to`
+
+`%cumulative`（cumsum / cumprod）写回是 `(vt-cast cum final-dtype)`，对；
+`%e3-cumulative-skip-nan`（nancumsum / nancumprod）的展平路径走
+`%e3-store-double-vector`，用 `(setf (aref dd ptr) (%cast-to lt v))` ——
+`(unsigned-byte 8)` 那一支同样是截断：
+
+```
+(vt-nancumsum #(0.5 -0.5 0.25) :dtype :bool)   修复前 (0 0 0)   现在 (1 0 1)
+```
+
+修法：`%e3-store-double-vector` 里给「元素类型是 `(unsigned-byte 8)` 且
+dtype 是 `:bool`」单列一支真值化写回。`(unsigned-byte 8)` 同时承载 `:uint8`
+与 `:bool`，两者写回语义相反（uint8 截断、bool 真值化）—— 这是 §17 反复
+出现的那个根因。
+
+##### 四、`vt-negative` 的 `(and (null dtype) …)`
+
+```lisp
+(when (and (null dtype) (eq (vt-dtype (ensure-vt vt)) :bool)) (error …))
+```
+
+本意是给 `:dtype :int8` 留一条出口，但它把 `:dtype :bool` 也放行了：
+
+| 调用 | 修复前 | 现在 |
+|---|---|---|
+| `(vt-negative b)` | 报错 | 报错 |
+| `(vt-negative b :dtype :bool)` | dtype 说 BOOL，字节 **255**（-1 落进 unsigned-byte 8） | 报错 |
+| `(vt-negative b :dtype :int8)` | `(-1 0 -1)` | `(-1 0 -1)`（保留） |
+
+条件改成 `(or (null dtype) (eq dtype :bool))`：只要**结果 dtype 仍是布尔**
+就拒绝，`:dtype :int8` 的出口不变。
+
+##### 五、顺带：`&OPTIONAL` 吞掉 `&KEY`
+
+```
+(vt-clip a :dtype :bool)
+  =>  :DTYPE fell through ETYPECASE expression. Wanted one of (VT NUMBER SEQUENCE).
+```
+
+CL 的 `&OPTIONAL` 不认关键字，`&KEY` 只解析位置参数耗尽之后的尾巴。
+`vt-clip` 的签名是 `(vt &optional min-val max-val &key out dtype)`，于是
+`:dtype` 成了 MIN-VAL 的**值**，一路走到 `%op-clip` 的 etypecase。
+
+MIN-VAL 只可能是数值/nil，出现关键字就一定是被吞的 `&KEY` 起点 ——
+按这个判据把关键字原样交回 `&KEY` 位置重新分派即可（`vt-view` 对
+`(vt-view a :dtype dt)` 用的是同一条思路）。`vt-clamp` 转调 `vt-clip`，
+一并修好；「只给下限」的 numpy 报错语义不受影响。
+
+同类签名的还有 `vt-where`（`(vt-where c :dtype :bool)` 同理会把 `:dtype`
+当 X）—— 但 numpy 的 `where` 本就不允许单参数形式配 `dtype`，故未改。
+
+##### 六、确认无事的部分（写下来免得下次重做）
+
+这一遍先试的是**别名 / 共享缓冲**轴，三条都干净：
+
+- **`:out` 与输入别名**：`vt-add` / `vt-mul` × {自别名, 反向视图} ×
+  `{:bool, :int64, :float64}` 全部正确 —— `%vt-views-overlap-p` 命中后退回
+  `vt-map` 的 `vt-out-snapshot`，`vt-copy-into` 自己也有快照；
+  `vt-check-out` 还会拒绝只读广播视图。
+- **输入改写扫描**：60+ 函数 × 3 dtype × {1 维, 2 维}（布尔覆盖 106/134 次
+  调用成功，其余是布尔本来就不接受的算子）：0 处改写输入、0 处脏字节。
+- **布局等价性**：一元 / 二元 / 归约 × {连续, 切片, 转置, 翻转, 混合} 全一致。
+
+##### 七、有意偏差
+
+| 表达式 | clvt | numpy | 理由 |
+|---|---|---|---|
+| `(vt-exp b :dtype :bool)` | `(1 1 1 1 1 1)` | `TypeError: No loop matching …` | numpy 的 ufunc 没有 bool 输出循环就直接拒绝；本库允许「先算再 astype」的等价写法，但结果必须等于 astype（本节的判据） |
+| `(vt-negative b :dtype :bool)` | 报错 | `TypeError` | 与 numpy 一致；`:dtype :int8` 是本库多给的出口 |
+
+---
+
 ## 附录 C：实测缺陷复现脚本
 
 ```lisp

@@ -1073,7 +1073,11 @@
                            (vt-map (function ,op) ,@tvs :out ,out :dtype final-dtype)
 			   ,(let* ((dtype-check
                                      `(and ,@(loop for tv in tvs
-						   collect `(eq (vt-dtype ,tv) (vt-dtype res)))))
+						   collect `(eq (vt-dtype ,tv) (vt-dtype res)))
+                                           ;; 布尔结果**不进内联内核**（见 MASKABLE 处
+                                           ;; 的说明）：内联循环按元素类型特化，写
+                                           ;; (unsigned-byte 8) 时只做 `the` 截断。
+                                           (not (eq (vt-dtype res) :bool))))
 				   ;; 「可内联连续循环」的判定（类型声明驱动）。
 				   ;; 注意 (or (= (vt-size ,tv) 1) ...)：标量/0 维/单元素输入
 				   ;; 走的是 stride=0 的虚拟重复读，`%inline*-loop` 已按
@@ -1087,9 +1091,21 @@
 						   collect `(or (= (vt-size ,tv) 1)
 								 (and (vt-contiguous-p ,tv)
 								      (equal (vt-shape ,tv) out-shape))))))
+				   ;; 窄整型掩码快路径的适用 dtype。
+				   ;;
+				   ;; `:bool` **不在**这里，也不能加回来。掩码内核对输出只做
+				   ;; `(setf (aref od i) (the (unsigned-byte 8) v))`：v 是 0.84
+				   ;; 时写入 0、是 2 时写入 2。而布尔结果的契约（§17.1、
+				   ;; 以及 `vt-map` 的既有行为）是**真值化**：非零 → 1。
+				   ;; 于是同一个 `(vt-abs x :dtype :bool)`，走 `vt-map` 的
+				   ;; 调用给 (1 …)、走内联/掩码的调用给 (0 …) —— 两条实现
+				   ;; 语义不同，且错的那条恰好是默认路径。
+				   ;; 修法是让布尔结果一律回落到下面的 `vt-map` 分支
+				   ;; （它经 `vt-cast-fun` 写回，`%bool-flag` 自然真值化），
+				   ;; 即「两条路径合一」；代价只有布尔输出的映射少一次内联。
 				   (maskable
                                      `(member (vt-dtype res)
-					      '(:bool :int8 :int16 :uint8 :uint16))))
+					      '(:int8 :int16 :uint8 :uint16))))
                               (cond
 				((= n 1)
 				 `(cond

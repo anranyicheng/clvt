@@ -302,6 +302,22 @@
 
   复数分支在 complex-ops.lisp 的 %CX-OP-CLIP；本函数只做分流（§16.32）。
   若改成事后重定义，重载本文件后复数会被逐分量裁剪（静默错答案）。"
+  ;; —— &OPTIONAL 吞掉 &KEY ——
+  ;; `(vt-clip a :dtype :bool)` 里 `:dtype` 是**位置参数** MIN-VAL 的值：
+  ;; CL 的 &OPTIONAL 不认关键字，&KEY 只解析位置参数耗尽之后的尾巴。
+  ;; MIN-VAL 收到 :DTYPE 后一路走到 %OP-CLIP 的 etypecase，报
+  ;;   `:DTYPE fell through ETYPECASE expression. Wanted one of
+  ;;    (VT NUMBER SEQUENCE)`
+  ;; —— 用户看不出「少写了两个 nil」，也猜不到该补在哪里。
+  ;; MIN-VAL 只可能是数值/nil，出现关键字就一定是被吞的 &KEY 起点，于是
+  ;; 原样把它交回 &KEY 位置重新分派（vt-view 对 `(vt-view a :dtype dt)`
+  ;; 用的是同一条思路）。vt-clamp 转调本函数，一并受益。
+  (when (and min-p (keywordp min-val))
+    (return-from vt-clip
+      (apply #'vt-clip vt nil nil
+             (append (list min-val (when max-p max-val))
+                     (when out (list :out out))
+                     (when dtype (list :dtype dtype))))))
   (when (%cx-any-p vt)
     (return-from vt-clip
       (%cx-op-clip (ensure-vt vt) min-val max-val min-p max-p out dtype)))
@@ -435,8 +451,16 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
       的整数路径，`-1` 经 `%coerce-uint8` 写回 `(unsigned-byte 8)` 得到
       **255**：数组仍是 `:bool` 但物理字节已越界，`vt-to-list` 直接吐出
       255，`vt-sum` 也按 255 累加（实测 `(vt-sum (vt-negative b))` = 765）。
-      这类「dtype 是 bool、字节不是 0/1」的脏数据是最难查的一类。"
-  (when (and (null dtype) (eq (vt-dtype (ensure-vt vt)) :bool))
+      这类「dtype 是 bool、字节不是 0/1」的脏数据是最难查的一类。
+
+      原来的前置检查写成 `(and (null DTYPE) …)` —— 本意是给
+      `:dtype :int8` 留一条「我知道自己在做什么」的出口，但它同时把
+      `:dtype :bool` 也放行了：`(vt-negative b :dtype :bool)` 于是绕过
+      整条拒绝逻辑，`-1` 写进 `(unsigned-byte 8)` 得到 **255**，比不加
+      `:dtype` 的调用更糟。现在只在「结果 dtype 仍是布尔」时拒绝
+      （`(or (null dtype) (eq dtype :bool))`），`:dtype :int8` 的出口不变。"
+  (when (and (eq (vt-dtype (ensure-vt vt)) :bool)
+             (or (null dtype) (eq dtype :bool)))
     (error "vt-negative: 布尔张量不支持取负（numpy 同样拒绝）。~%~
             取反请用 vt-logical-not，异或取反请用 vt-logical-xor；~%~
             若确实要数值取负，请显式给出 :dtype :int8 等数值类型。~%~

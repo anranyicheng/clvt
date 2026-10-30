@@ -1081,6 +1081,86 @@
   (check "corr/same-4-3"  (flat-ints-any (vt-correlate a4 v3 :mode :same)) '(8 14 20 11)))
 
 ;;; ==================================================================
+;;; P 组：`:dtype :bool` 作为**断言**（≡ astype(自然结果, :bool)）
+;;; ------------------------------------------------------------------
+;;; 前七组都在验「布尔进去算什么」；这一组换个方向，验「我要布尔出来，
+;;; 你给的是不是我以为的那个」。
+;;;
+;;; 判据只有一条，且它已经是本库的既有契约（`vt-map` 的
+;;; `(lambda (x) 5) :dtype :bool` → 1、`vt-linspace … :dtype :bool`
+;;; → (0 1 1 1 1)）：
+;;;
+;;;     (f x … :dtype :bool)  ≡  (vt-astype (f x …) :bool)
+;;;
+;;; 即**真值化**，不是朝零截断。用反射扫 139 个接受 :dtype 的导出函数，
+;;; 144 个可比对样本里 37 个不等——全部集中在浮点算子的内联快路径上。
+;;; ==================================================================
+
+(defvar *pb* (vt-from-sequence '((1 0 1) (0 1 1)) :dtype :bool)
+  "2×3 布尔，含 0/1 两种真值。")
+(defvar *px* (vt-from-sequence '((0.5d0 1.5d0 2.0d0) (0.25d0 3.0d0 0.75d0))
+                               :dtype :float64)
+  "2×3 浮点，全部落在 (0,1) 或 >1 —— 前者被截断会变 0，后者被截断会变 >1。")
+(defvar *pr* (vt-from-sequence '(0.5d0 -0.5d0 0.25d0) :dtype :float64)
+  "1 维浮点，累积和会穿过 0（0.5 → 0.0 → 0.25）。")
+
+;; P1. 浮点算子 + :dtype :bool：真值化，不是截断。
+;;     0.5/0.25/0.75 截断成 0（真值反了），1.5/2.0/3.0 截断成 1/2/3（脏字节）。
+(check "dt/abs-real-bool"  (flat-ints (vt-abs *px* :dtype :bool)) '(1 1 1 1 1 1))
+(check "dt/log-real-bool"  (flat-ints (vt-log *px* :dtype :bool)) '(1 1 1 1 1 1))
+;; sin(0)=0、sin(1)=0.84 → 0.84 截断得 0，真值化得 1
+(check "dt/sin-bool"  (flat-ints (vt-sin *pb* :dtype :bool)) '(1 0 1 0 1 1))
+;; cos(0)=1、cos(1)=0.54 → 截断会把整张表打成 (0 1 0 1 0 0)
+(check "dt/cos-bool"  (flat-ints (vt-cos *pb* :dtype :bool)) '(1 1 1 1 1 1))
+;; exp(1)=2.718 → 截断写字节 2（脏），真值化写 1
+(check "dt/exp-bool-vals"  (flat-ints (vt-exp *pb* :dtype :bool)) '(1 1 1 1 1 1))
+(check "dt/exp-bool-bytes" (bool-bad-bytes (vt-exp *pb* :dtype :bool)) 0)
+(check "dt/sqrt-bool"     (flat-ints (vt-sqrt *pb* :dtype :bool)) '(1 0 1 0 1 1))
+(check "dt/hard-sigmoid-bool"
+       (flat-ints (vt-hard-sigmoid *pb* :dtype :bool)) '(1 1 1 1 1 1))
+
+;; P2. 等价性判据本身（抽 3 个函数逐值比对）：:dtype :bool ≡ astype(·, :bool)
+(dolist (spec (list (cons "abs" #'vt-abs) (cons "sin" #'vt-sin) (cons "tanh" #'vt-tanh)))
+  (let* ((nm (car spec)) (f (cdr spec))
+         (direct (flat-ints (funcall f *px* :dtype :bool)))
+         (via (flat-ints (vt-astype (funcall f *px*) :bool))))
+    (check (format nil "dt/~a-bool≡astype" nm) direct via)))
+
+;; P3. 累积族：bool 结果的写回必须走 vt-cast（真值化），不是 %cast-to（截断）
+;;     nancumsum 的展平路径此前用 %cast-to，(0.5 → 0) 三个位置全灭。
+(check "dt/nancumsum-bool"    (flat-ints (vt-nancumsum *pr* :dtype :bool)) '(1 0 1))
+(check "dt/nancumprod-bool"   (flat-ints (vt-nancumprod *pr* :dtype :bool)) '(1 1 1))
+(check "dt/nancumsum-boolin"  (flat-ints (vt-nancumsum *pb* :dtype :bool)) '(1 1 1 1 1 1))
+(check "dt/cumsum-bool"       (flat-ints (vt-cumsum *pb* :dtype :bool)) '(1 1 1 1 1 1))
+(check "dt/nancumsum-bytes"   (bool-bad-bytes (vt-nancumsum *pb* :dtype :bool)) 0)
+
+;; P4. vt-negative：`:dtype :bool` 曾经绕过拒绝逻辑 → -1 写进 (unsigned-byte 8) = 255
+(let ((m (handler-case (progn (vt-negative *pb* :dtype :bool) nil)
+           (error (e) (princ-to-string e)))))
+  (check-true "dt/negative-bool-rejects" (and m (search "vt-negative:" m)))
+  (check-true "dt/negative-bool-mentions-logical-not" (and m (search "vt-logical-not" m))))
+;; 但 :dtype :int8 这条出口必须保留（docstring 承诺过）
+(check "dt/negative-int8" (flat-ints (vt-negative *pb* :dtype :int8)) '(-1 0 -1 0 -1 -1))
+;; 浮点输入 + :dtype :bool 仍按真值化
+(check "dt/negative-real-bool"
+       (flat-ints (vt-negative (vt-from-sequence '(0.5d0 -0.5d0) :dtype :float64) :dtype :bool))
+       '(1 1))
+
+;; P5. &OPTIONAL 吞 &KEY：`(vt-clip a :dtype :bool)` 的 :dtype 落在 MIN-VAL 槽
+;;     上，原来报 `:DTYPE fell through ETYPECASE expression`。
+(check "dt/clip-keyword-dtype"  (flat-ints (vt-clip *pb* :dtype :bool)) '(1 0 1 0 1 1))
+(check "dt/clamp-keyword-dtype" (flat-ints (vt-clamp *pb* :dtype :bool)) '(1 0 1 0 1 1))
+;; :out 同样被吞，且不能被 rescue 丢掉
+(check "dt/clip-keyword-out"
+       (flat-ints (let ((o (vt-zeros '(2 3) :dtype :bool))) (vt-clip *pb* :out o) o))
+       '(1 0 1 0 1 1))
+;; 显式补 nil 的旧写法必须仍然可用
+(check "dt/clip-explicit-nil" (flat-ints (vt-clip *pb* nil nil :dtype :bool)) '(1 0 1 0 1 1))
+;; 而「只给下限」的原语义不能被 rescue 破坏
+(check-true "dt/clip-single-bound-still-errors"
+            (handler-case (progn (vt-clip *pb* 1) nil) (error () t)))
+
+;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)
 (when (plusp *fail*) (sb-ext:exit :code 1))

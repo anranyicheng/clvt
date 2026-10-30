@@ -4,7 +4,64 @@
 
 ---
 
-## 2026-10-30（四十一）— fix: 第七遍审计（换轴：非默认参数）—— dtype=bool 的脏字节、报错点错人、correlate 的 valid/same
+## 2026-10-30（四十二）— fix: 第八遍审计（换轴：`:dtype` 当断言）—— 布尔输出被 `the` 截断、`%float-map` 预降输入、`&optional` 吞关键字
+
+> 契约见 `CONVENTIONS.md` §17.10.16；决策过程见 `HISTORY.md` H.3.35。
+> 判据：`(f x … :dtype :bool)` 必须等于 `(vt-astype (f x …) :bool)`
+> —— 即**真值化**，不是朝零截断。反射筛出 139 个接受 `:dtype` 的导出
+> 函数，144 个样本里 37 个不等，落在 35 个函数上。
+
+**破坏性变更（35 个函数的 `:dtype :bool` 结果 + `vt-clip`/`vt-clamp` 的关键字解析）**：
+
+| 表达式 | 修复前 | 现在 |
+|---|---|---|
+| `(vt-abs #(0.5 1.5 2.0 0.25 3.0 0.75) :dtype :bool)` | 字节 `0 1 2 0 3 0` | `1 1 1 1 1 1` |
+| `(vt-cos b :dtype :bool)` | `(0 1 0 1 0 0)`（cos(1)=0.54 截成 0） | `(1 1 1 1 1 1)` |
+| `(vt-exp b :dtype :bool)` | 字节 `2`（越界） | 字节 `1` |
+| `(vt-log x :dtype :bool)` | `(0 0 0 0 0 0)` | `(1 1 1 1 1 1)` |
+| `(vt-nancumsum #(0.5 -0.5 0.25) :dtype :bool)` | `(0 0 0)` | `(1 0 1)` |
+| `(vt-negative b :dtype :bool)` | dtype 说 BOOL，字节 **255**（-1 落进 unsigned-byte 8） | 报错（同 numpy） |
+| `(vt-clip a :dtype :bool)` | `:DTYPE fell through ETYPECASE …` | 正常返回（关键字归位） |
+
+**根因一：内联/掩码内核用 `(the (unsigned-byte 8) v)` 收尾。**
+`vt-fast-map` 的 `dtype-check`（输入 dtype = 结果 dtype 走内联）与
+`maskable`（`:bool`/`:int8`/… 走掩码内核）让布尔结果进了特化循环，
+写回只有一句 `the` —— 对浮点就是截断：0.84 → 0（**真值反了**）、
+2.718 → 2（**脏字节**，破 §17.1）。而慢路径 `vt-map` 经 `vt-cast-fun`
+→ `%bool-flag` 是真值化。修法是把 `:bool` 从两条快路径摘出去、一律回落
+`vt-map`（两条实现合一），而不是给内核各加一个 `if`。
+`fastmap-invariant-test` 24/24 仍通过（float64 路径未受影响）。
+
+**根因二：`%float-map` 先把输入降成目标 dtype 再算。**
+`(vt-fast-map op (%coerce-float-input IN %DT) :dtype %DT)` 在 `DT = :bool`
+时把 0.5 先变成 1，于是 `log(0.5)` 算成了 `log(1)`。新增
+`%FLOAT-MAP-BOOL`：按自然浮点精度（float32 进 float32 出）算完再 `%to-bool`。
+注意 `%float-map` 的展开形状保持 `(if <FAST> <SLOW>)`，布尔分流挂在
+`<SLOW>` 里 —— 否则 `fastmap-invariant-test` 会判为「快路径被改没」。
+
+**根因三：累积族两条实现，一条 `vt-cast`、一条 `%cast-to`。**
+`%cumulative` 写 `(vt-cast cum dtype)`（对），`%e3-cumulative-skip-nan` 的
+展平路径走 `%e3-store-double-vector` 的 `(%cast-to lt v)`（截断）。给
+`(unsigned-byte 8)` + `:bool` 单列一支真值化写回。
+
+**另两处**：
+- `vt-negative` 的拒绝条件写成 `(and (null dtype) …)`，`:dtype :bool`
+  绕过检查。改为 `(or (null dtype) (eq dtype :bool))`；`:dtype :int8`
+  这条「我知道自己在做什么」的出口保留。
+- `vt-clip` / `vt-clamp` 的 `(vt &optional min max &key out dtype)`：
+  CL 的 `&OPTIONAL` 不认关键字，`(vt-clip a :dtype :bool)` 把 `:dtype`
+  当成了 MIN-VAL 的值。现在检测「MIN-VAL 是关键字」即把整段交回 `&KEY`
+  重新分派（`vt-view` 的同款做法）。「只给下限」的报错语义不变。
+
+**这一遍确认无事的轴**（记录以免重做）：`:out` 与输入别名（自别名/反向
+视图/切片 × 3 dtype）全部正确；60+ 函数 × 3 dtype 扫「谁改写了输入」
+0 处；同一逻辑数组换六种物理布局，一元/二元/归约结果全一致。
+
+验收：bool-dtype-test 549 断言（新增 P 组 25 条）；65 套件全绿（278s）；
+`fastmap-invariant-test` 24/24；check_docs 225 锚点。
+
+---
+
 
 > 契约见 `CONVENTIONS.md` §17.10.15；决策过程见 `HISTORY.md` H.3.34。
 > 前六遍的探针有个共同前提：**所有调用都用默认参数**。这一遍把

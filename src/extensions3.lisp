@@ -1129,8 +1129,25 @@
                     (vt-do-each (ptr val result)
                       (declare (ignore val))
                       (setf (aref dd ptr) (%cast-to ,lt (aref tmp i)))
+                      (incf i))))
+               (w-bool ()
+                 "布尔目标：真值化，不是截断。
+                    `(unsigned-byte 8)` 同时承载 `:uint8` 与 `:bool`，
+                    而两者的写回语义相反：uint8 要截断（2.5 → 2），bool 要
+                    真值化（0.5 → 1）。此前这里只有截断那条，于是
+                    `(vt-nancumsum #(0.5 -0.5 0.25) :dtype :bool)` 得到
+                    `(0 0 0)` —— 三个真值里有两个被截成了 NIL。"
+                 `(let ((dd (the (simple-array (unsigned-byte 8) (*)) d)))
+                    (declare (type (simple-array (unsigned-byte 8) (*)) dd)
+                             (type fixnum i))
+                    (vt-do-each (ptr val result)
+                      (declare (ignore val))
+                      (setf (aref dd ptr) (if (zerop (aref tmp i)) 0 1))
                       (incf i)))))
-      (cond ((equal (array-element-type d) 'double-float) (w double-float))
+      (cond ((and (equal (array-element-type d) '(unsigned-byte 8))
+                  (eq (vt-dtype result) :bool))
+             (w-bool))
+            ((equal (array-element-type d) 'double-float) (w double-float))
             ((equal (array-element-type d) 'single-float) (w single-float))
             ((equal (array-element-type d) '(signed-byte 64)) (w (signed-byte 64)))
             ((equal (array-element-type d) '(signed-byte 32)) (w (signed-byte 32)))

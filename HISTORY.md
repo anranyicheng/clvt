@@ -3619,3 +3619,157 @@ docstring 里明明白白写着：
 一条留给下次的判据：**「默认参数」不是简单情形，是另一条代码路径**。
 每一轮的探针都该问一句「我这次传了几个参数」，如果和上一轮一样，那这轮
 大概率在重复上一轮。
+
+---
+
+## H.3.35 第八轮：把「我要 bool」当成断言，而不是请求
+
+> 对外结论见 `CHANGELOG.md`（四十二），契约见 `CONVENTIONS.md` §17.10.16。
+
+#### 一、这一遍的轴换得比前七遍都彻底：不再问「给不给」，改问「等不等于」
+
+前七遍的每一处探针，形式上都是「我传一个布尔，看它怎么算/怎么报错/返回什么
+dtype」。这条线走到第七遍已经很细：默认参数、非默认参数、成对一致、消费者、
+构造、位置参数 —— 都犁过。
+
+第八遍一开始也顺着惯性找了两个轴（别名/共享缓冲、输入改写），都干净：
+
+- `:out` 指向输入自己、指向输入的反向视图、指向输入的切片，`vt-add`/`vt-mul`
+  × 三种 dtype 全对；
+- 60+ 函数 × 3 dtype × 1 维/2 维扫「谁偷偷改了输入」，0 处；
+- 同一逻辑数组换六种物理布局（连续/切片/转置/翻转/混合），一元/二元/归约
+  结果全一致。
+
+三条都干净，说明这块地被前面几轮顺带压过了。于是换了问法：
+
+> 我一直把 `:dtype :bool` 当**请求**（「我要布尔」）。它能不能当**断言**？
+> 即：`(f x … :dtype :bool)` 的结果，是不是恰好等于 `(vt-astype (f x …) :bool)`？
+
+这个问题之所以成立，是因为库自己早就把两者定义成同一件事：`vt-map` 的
+`(lambda (x) 5) :dtype :bool` 返回 `1`，`vt-linspace 0 1 5 :dtype :bool` 返回
+`(0 1 1 1 1)`，`bool-dtype-test` 的 G/N 两组就在测它。既然「先算再 astype」
+是文档语义，那「直接要 bool」就必须逐值相等 —— 不等就是 bug，而且不需要
+跟 numpy 对照，**用库自己的另一条路径当判据**。
+
+#### 二、144 个样本，37 个不等
+
+`sb-introspect` 筛出 139 个接受 `:dtype` 的导出函数，各试 1/2/3 个布尔实参，
+得到 144 个可比对样本（自然结果与 bool 结果都拿得到）。37 个不等，落在 35 个
+函数上，全部是浮点算子：`abs` / `sin` / `cos` / `tanh` / `log*` / `exp` /
+`acos*` / `asinh` / `atan` / `conj` / `square` / `nancumsum` / `negative` …
+
+看第一个就明白了：
+
+```
+(vt-abs #(0.5 1.5 2.0 0.25 3.0 0.75) :dtype :bool)
+  修复前  字节 0 1 2 0 3 0     → 真值 0 1 1 0 1 0
+  现在    字节 1 1 1 1 1 1
+```
+
+同一个表达式里有两种错：`0.5 → 0` 是**真值反了**（该 True 给了 False），
+`2.0 → 2` 是**脏字节**（破 §17.1）。两种错都来自同一句
+`(the (unsigned-byte 8) v)` —— `the` 对浮点做的是截断，不是真值化。
+
+有意思的是这个坑的形状：`vt-fast-map` 有 `dtype-check`（输入 dtype = 结果
+dtype 就走内联）和 `maskable`（`:bool`/`:int8`/… 走掩码内核）两条快路径，
+两条都按元素类型特化，都只做 `the` 截断；而慢路径 `vt-map` 经
+`vt-cast-fun` → `%bool-flag`，是真值化。**同语义两条实现，默认路径是错的
+那条** —— 这已经是本项目第七次遇到同一个形状（§17.10.12 的成对、§17.10.15
+的 `%KERNEL-ROW-ACC` 裸写都是它）。
+
+修法选择了「合并」而不是「打补丁」：把 `:bool` 从两条快路径里摘出去
+（`dtype-check` 加一个 `(not (eq (vt-dtype res) :bool))`、`maskable` 去掉
+`:bool`），布尔结果一律落 `vt-map`。这样只剩一条实现，永远不会再分叉。
+代价是布尔输出的映射少一次内联 —— 布尔 elementwise 本来就是冷路径，而
+`fastmap-invariant-test` 的计时上界（float64 路径）没有变化。
+
+#### 三、修完还剩 5 个，暴露了第二层
+
+合并快慢路径之后 37 → 5。剩下的是 `acos` / `acosh` / `log` / `log10` / `log2`
+的实数入参。它们不走 `vt-fast-map` 的布尔分支了，为什么还错？
+
+因为 `%float-map` 的常规分支是
+
+```lisp
+(vt-fast-map op (%coerce-float-input IN %DT) :dtype %DT)
+```
+
+—— 它先把**输入**降到目标 dtype 再算。目标恰好是 `:bool` 时，这一步把 0.5
+变成 1、-0.5 变成 1，于是算的是 `log(0/1)` 而不是 `log(x)`，结果全 0。
+
+这一处的修法不能是「也合并」，因为它是**精度契约**的实现：整数输入必须先
+提升到浮点再算（P1-1）。只能加一条专用分支 `%FLOAT-MAP-BOOL`：按自然浮点
+精度算完，再 `%to-bool`。
+
+写这条分支时踩了一个自己的坑：`fastmap-invariant-test` 是**静态**检查，
+它 `(macroexpand-1 '(%float-map …))` 之后按固定形状 `(let* … (if <FAST> <SLOW>))`
+取 `(third (third form))` 当快分支。我第一版把布尔分流包在**外层** if 上，
+测试立刻报 9 个「SIN 快路径为 vt-fast-map（非 vt-map）」—— 它看到的
+「快分支」变成了 `%FLOAT-MAP-BOOL`。这不是测试太脆，而是它在替我守
+「别把快路径改没了」；正确的做法是保持形状、把分流挂进 `<SLOW>`。
+
+#### 四、累积族的第二条实现：`%cast-to` vs `vt-cast`
+
+`(vt-cumsum b :dtype :bool)` 一直是对的（`(1 1 1 1 1 1)`），
+`(vt-nancumsum x :dtype :bool)` 却是 `(0 0 0)`。差别不在算子，在写回：
+
+- `%cumulative`（cumsum/cumprod）写 `(vt-cast cum final-dtype)`；
+- `%e3-cumulative-skip-nan`（nancumsum/nancumprod）的展平路径把结果先算进
+  一个 double vector，再 `%e3-store-double-vector` 按元素类型 8 路写回，
+  `(unsigned-byte 8)` 那一支是 `(%cast-to lt v)` —— 截断。
+
+又是 `(unsigned-byte 8)` 同时承载 `:uint8` 与 `:bool`、而两者写回语义相反
+（uint8 要截断、bool 要真值化）这个根因，第三次出现在本轮里。修法是给
+`%e3-store-double-vector` 单列一支真值化写回。
+
+#### 五、剩下两处是「检查写歪了」和「签名吞了关键字」
+
+`vt-negative` 的布尔拒绝写成 `(and (null dtype) …)`。本意是给
+`:dtype :int8` 留出口（docstring 里明说了「若确实要数值取负，请显式给出
+`:dtype :int8`」），但它顺手把 `:dtype :bool` 也放行了：
+
+```
+(vt-negative b :dtype :bool)  =>  dtype 说 BOOL，字节 255
+```
+
+`-1` 写进 `(unsigned-byte 8)` 就是 255，比不加 `:dtype` 的调用还糟。条件改成
+`(or (null dtype) (eq dtype :bool))` 即可 —— 判据是「**结果** dtype 是不是
+布尔」，而不是「用户有没有显式说话」。
+
+最后一处跟布尔无关，但是同一个入口上撞见的：
+
+```
+(vt-clip a :dtype :bool)
+  =>  :DTYPE fell through ETYPECASE expression. Wanted one of (VT NUMBER SEQUENCE).
+```
+
+`vt-clip` 签名是 `(vt &optional min-val max-val &key out dtype)`。CL 的
+`&OPTIONAL` 不认关键字，于是 `:dtype` 成了 MIN-VAL 的**值**、`:bool` 成了
+MAX-VAL 的值，一路走到 `%op-clip` 的 etypecase。用户看到的错误里没有
+「你少写了两个 nil」这条信息。
+
+修法：MIN-VAL 只可能是数值/nil，出现关键字就一定整体是 `&KEY`，原样交回
+`&KEY` 位置重新分派（`vt-view` 处理 `(vt-view a :dtype dt)` 用的是同一条
+思路）。`vt-clamp` 转调 `vt-clip`，一并好了；「只给下限」的 numpy 报错语义
+没动。同类签名还有 `vt-where`，但 numpy 的 `where` 本就不允许单参数形式配
+`dtype`，故只记录不改。
+
+#### 六、这一遍留下的判据
+
+**「同语义两条实现」可以反过来当测试工具用。** 这一轮的判据不是 numpy，
+而是库自己的另一条路径：`(f x :dtype :bool)` vs `(vt-astype (f x) :bool)`。
+前七遍一直拿 numpy 当唯一外部标尺，但库内只要存在两条实现同一件事的路径，
+它们互为标尺 —— 而且这种标尺比 numpy 更严：numpy 对 `np.exp(b, dtype=bool)`
+直接 TypeError（没有 bool 循环），根本没机会暴露「截断 vs 真值化」的差别。
+
+第二个判据是**覆盖率必须打印**。这一轮前三个探针都报「0 处失败」，
+但那是 106/134 —— 剩下 28 次是调用直接报错，被静默归入「没问题」。
+后来每次扫描都把「成功/报错」计数打出来，才看清哪些函数是真的没测到。
+
+| 项 | 结果 |
+|---|---|
+| 探针 | 139 个接受 `:dtype` 的导出函数 × 1/2/3 实参 → 144 样本 |
+| 修复 | 37 处不等 → 0 |
+| 断言 | bool-dtype-test 549（新增 P 组 25 条） |
+| 套件 | 65/65（278s） |
+| 编译体检 | 无新增 WARNING（`fastmap-invariant-test` 24/24） |

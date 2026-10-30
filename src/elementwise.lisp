@@ -339,6 +339,26 @@
    造成 dtype 标称 float64 但数值仅 float32 精度的静默精度损失。"
   (if (eq (vt-dtype vt) dt) vt (vt-astype vt dt)))
 
+(defun %float-map-bool (fn vt out)
+  "浮点数学函数在**结果 dtype 为 :bool** 时的落地方式：先按自然浮点精度
+   算完，再把真值写进布尔数组。
+
+   为什么不能沿用常规路径：`%float-map` 的常规分支是
+   `(%coerce-float-input IN %DT)` —— 先把**输入**降到目标 dtype 再算。
+   目标恰好是 :bool 时，这一步会把 0.5 变成 1、把 -0.5 变成 1，
+   于是 `(vt-log x :dtype :bool)` 算的是 log(0/1) 而不是 log(x)：
+   实测 `(vt-log #(0.5 1.5 2.0 0.25 3.0 0.75) :dtype :bool)` 得到
+   `(0 0 0 0 0 0)`，而「先按 float64 算完再 vt-astype 到 bool」给
+   `(1 1 1 1 1 1)`。
+
+   约定（CONVENTIONS §17.1）是 `:dtype :bool` 等价于
+   `(vt-astype (f x) :bool)`，即**真值化**而非截断；`vt-map` 与
+   `vt-linspace … :dtype :bool` 早就是这个语义，这条路径此前是唯一的例外。"
+  (let* ((in (ensure-vt vt))
+         (fdt (if (eq (vt-dtype in) :float32) :float32 :float64))
+         (res (%to-bool (vt-map fn (%coerce-float-input in fdt) :dtype fdt))))
+    (if out (progn (vt-copy-into out res) out) res)))
+
 (defmacro %float-map (fn vt out dt)
   "逐元素数学函数的统一入口：**内联快路径 + dtype 提升** 二者兼得。
 
@@ -370,18 +390,28 @@
 lambda 算子请使用 %%float-map-fn"))
   `(let* ((%in (ensure-vt ,vt))
           (%dt ,dt))
-     (if (eq (vt-dtype %in) %dt)
+     ;; 形状保持 (if <FAST> <SLOW>)：fastmap-invariant-test 按这个形状取
+     ;; 「快分支」做静态检查，布尔分流只能挂在 <SLOW> 里，不能包在外层
+     ;; （否则测试看到的首个 then 分支变成 %FLOAT-MAP-BOOL，判为回退）。
+     (if (and (not (eq %dt :bool)) (eq (vt-dtype %in) %dt))
          (vt-fast-map (function ,(cadr fn)) %in :out ,out :dtype %dt)
-         (vt-fast-map (function ,(cadr fn))
-                      (%coerce-float-input %in %dt)
-                      :out ,out :dtype %dt))))
+         (if (eq %dt :bool)
+             (%float-map-bool (function ,(cadr fn)) %in ,out)
+             (vt-fast-map (function ,(cadr fn))
+                          (%coerce-float-input %in %dt)
+                          :out ,out :dtype %dt)))))
 
 (defun %float-map-fn (fn vt out dt)
   "数学函数的**兜底**慢路径：接受任意 FN（含 lambda），内部走 `vt-map`。
    仅用于「无法在编译期内联算子」的场景（本库为 vt-asin/vt-acos/
    vt-sqrt 等需按元素返回 NaN 的 lambda 分支）。能在编译期拿到字面
-   算子的一律用 `%float-map` 宏走内联快路径。"
-  (vt-map fn (%coerce-float-input (ensure-vt vt) dt) :out out :dtype dt))
+   算子的一律用 `%float-map` 宏走内联快路径。
+
+   结果 dtype 为 :bool 时与 `%float-map` 一致：按自然浮点精度算完再真值化
+   （`%float-map-bool`），不把输入先降到布尔。"
+  (if (eq dt :bool)
+      (%float-map-bool fn vt out)
+      (vt-map fn (%coerce-float-input (ensure-vt vt) dt) :out out :dtype dt)))
 
 (defmacro %float-map-lambda (fn vt out dt)
   "lambda 算子的数学函数入口：与 `%float-map` 同构（含 dtype 提升
@@ -394,9 +424,11 @@ lambda 算子请使用 %%float-map-fn"))
    (2) 已浮点输入零拷贝直通，不做多余 astype。"
   `(let* ((%in (ensure-vt ,vt))
           (%dt ,dt))
-     (if (eq (vt-dtype %in) %dt)
-         (vt-map ,fn %in :out ,out :dtype %dt)
-         (vt-map ,fn (%coerce-float-input %in %dt) :out ,out :dtype %dt))))
+     (if (eq %dt :bool)
+         (%float-map-bool ,fn %in ,out)
+         (if (eq (vt-dtype %in) %dt)
+             (vt-map ,fn %in :out ,out :dtype %dt)
+             (vt-map ,fn (%coerce-float-input %in %dt) :out ,out :dtype %dt)))))
 
 (defun vt-sin (vt &key out dtype)
   "逐元素正弦。整数输入输出按 :dtype 或 float64（对标 numpy，
