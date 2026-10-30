@@ -259,6 +259,39 @@
     (5 (lambda (a b c d e) (%bool-flag (funcall fn a b c d e))))
     (t (lambda (&rest xs) (%bool-flag (apply fn xs))))))
 
+(declaim (inline %real-part-of))
+(defun %real-part-of (v)
+  "复数 → 实部，其余原样。与 `VT-CAST` / `VT-ASTYPE` 的 §16.5 规则同源：
+   目标为实数而值为复数时**取实部**（对标 numpy 的 ComplexWarning 语义，
+   静默丢弃虚部）。"
+  (if (complexp v) (realpart v) v))
+
+(defun %real-wrap (fn n)
+  "把用户函数包一层 `%REAL-PART-OF`，让复数结果在**写回之前**降成实数。
+
+   存在理由：`%VT-MAP-RUN` 的写回是
+   `(the double-float (coerce v 'double-float))`，对复数直接
+   TYPE-ERROR: The value #C(1.0d0 2.0d0) is not of type REAL。
+   于是 `(vt-map #'identity 复数张量 :dtype :float64)` 崩，
+   而同一件事的另两个入口 `(vt-astype c :float64)` 与
+   `(vt-cast #C(1 2) :float64)` 都正常返回实部 —— 三条同语义入口分叉。
+
+   为什么不在写回处加 `(if (complexp v) …)`：`%VT-MAP-RUN` 内层
+   `dotimes` 是全库最热的循环（2M 元素级），每元素多一次类型判断
+   会摊到所有实数路径上。而「输入含复数、目标却是实数」是极冷的分支，
+   包一层函数只在那种组合下发生，热路径一字未动。
+
+   与 `%BOOL-WRAP` 的关系：`:bool` 目标不需要本包装 —— `%BOOL-FLAG`
+   自己就把复数按「任一分量非零」收敛掉了（§17.1），而且那是**真值化**，
+   与「取实部」是两条不同的规则。所以 `VT-MAP` 里两者互斥：先判 `:bool`。"
+  (case n
+    (1 (lambda (a) (%real-part-of (funcall fn a))))
+    (2 (lambda (a b) (%real-part-of (funcall fn a b))))
+    (3 (lambda (a b c) (%real-part-of (funcall fn a b c))))
+    (4 (lambda (a b c d) (%real-part-of (funcall fn a b c d))))
+    (5 (lambda (a b c d e) (%real-part-of (funcall fn a b c d e))))
+    (t (lambda (&rest xs) (%real-part-of (apply fn xs))))))
+
 (defun vt-map (fn &rest args)
   "高效逐元素映射：支持标量/列表/张量混合输入并自动广播。
 
@@ -295,9 +328,17 @@
              (res (if out
                       (vt-check-out out out-shape final-dtype :op-name "vt-map")
                       (make-vt out-shape 0 :dtype final-dtype))))
-	(%vt-map-run (if (eq final-dtype :bool)
-                         (%bool-wrap fn (length inputs))
-                         fn)
+	(%vt-map-run (cond ((eq final-dtype :bool)
+                            ;; 布尔目标：真值化（§17.1）。%BOOL-FLAG 自己吃复数。
+                            (%bool-wrap fn (length inputs)))
+                           ((and (null (vt-complex-dtype-p final-dtype))
+                                 (some (lambda (x)
+                                         (vt-complex-dtype-p (vt-dtype x)))
+                                       inputs))
+                            ;; 实数目标 + 任一复数输入 → 结果必须取实部（§16.5），
+                            ;; 否则写回对复数直接 TYPE-ERROR（见 %REAL-WRAP）。
+                            (%real-wrap fn (length inputs)))
+                           (t fn))
                      (%weak-cast-inputs inputs final-dtype) res out-shape)
 	res))))
 

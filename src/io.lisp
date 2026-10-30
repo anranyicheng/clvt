@@ -50,6 +50,27 @@
                   (t (error "~s 不是序列" s)))))
             (nreverse result))))))
 
+(defun %fill1d-ineligible-p (seq)
+  "递归判断 SEQUENCE 里是否有「不能进一维快路径」的叶子。
+
+   两类：
+     · 复数 —— 实数 dtype 下需要「取实部」（§16.5），快路径的转换算子
+       直接 `coerce`，会丢规则；
+     · Lisp 布尔 `T` —— 快速路径的 `put` 对元素声明 `(type real x)`，
+       而 `T` 不是 REAL。`safety 0` 下既可能静默写垃圾，也可能抛
+       \"The value T is not of type REAL when binding X\"。
+
+   此前只判了复数，于是 `(vt-from-sequence '(t t) :dtype :float64)`
+   直接崩，而 numpy 的 `np.array([True, True], dtype=float)` 给 `[1., 1.]`。
+   （`NIL` 叶子不需要在这里判：非 bool 模式下它被当成空子序列，
+    `infer-shape` 早就以「不规则嵌套」拒掉了。）"
+  (cond
+    ((complexp seq) t)
+    ((eq seq t) t)
+    ((consp seq) (some #'%fill1d-ineligible-p seq))
+    ((vectorp seq) (some #'%fill1d-ineligible-p seq))
+    (t nil)))
+
 (defun vt-from-sequence (contents &key (dtype nil) (fast nil))
   "从嵌套序列创建张量（行主序）。支持任意维度规则嵌套；空序列 -> 形状 (0)。
    fast t 意味着直接使用 coerce 转换，可能报错
@@ -180,7 +201,8 @@
             ;; 含复数的序列不走 fill1d：fill1d 的转换算子带 (type real x)
             ;; 声明（为速度），而复数元素在实数 dtype 下需要「取实部」这条
             ;; CONVENTIONS §16.5 的规则，交给 fill-tensor 的 vt-cast 处理。
-            (if (%any-complex-in-sequence-p contents)
+            ;; 含 T 的序列同理（T 不是 REAL，见 %FILL1D-INELIGIBLE-P）。
+            (if (%fill1d-ineligible-p contents)
                 (fill-tensor data contents shape strides 0)
                 (cond ((eq dtype :float64) (fill1d double-float (coerce x 'double-float)))
                       ((eq dtype :float32) (fill1d single-float (coerce x 'single-float)))

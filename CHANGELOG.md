@@ -4,6 +4,49 @@
 
 ---
 
+## 2026-10-30（四十三）— fix: 第九遍审计（换轴：混型提升与转换入口）—— 复数÷整型、复数→实数写回、布尔标量、三元提升折叠
+
+这一遍先去审第八遍用的那把尺子（`vt-astype … :bool`），再沿「dtype 提升 /
+转换」铺开：混型二元算子 2021 组、提升表二元 121 + 三元 286、三条转换入口
+605 组、合并/选择/三元算术 847 组，全部与 numpy 2.3.5 逐格对照。矩阵是干净的；
+出问题的是**同一语义的多条实现**，共 5 处。
+
+**破坏性变更（下面这些调用以前是报错，现在给出结果）**：
+
+- `(vt-/ 复数数组 整型数组)` 与反向：结果 dtype 现在是 `:complex128` /
+  `:complex64`。**修复前 24 个 (复数, 整型) 组合两个方向全部
+  `TYPE-ERROR: The value #C(0.5d0 1.0d0) is not of type REAL`** —— `vt-/`
+  的 `FLOAT-TARGET` 分支一见整型张量就把目标改写成 `:float64`，虚部无处可写。
+  复数参与时改为交给 `vt-promote-type`（`c128 ⊔ int8 → c128`）。
+- `(vt-map #'identity 复数张量 :dtype :float64)` / `(vt-conj c :dtype :float64)`：
+  现在取实部（§16.5），不再 `TYPE-ERROR`。修法是新增 `%REAL-WRAP`，只在
+  「目标实数 + 有复数输入」时包一层 `realpart`，热循环未改。
+- `(vt-cast t :float64)`、`(vt-fill float数组 t)`、`(vt-full '(3) t :dtype
+  :float64)`、`(setf (vt-ref float数组 0) t)`、`(vt-* float数组 t)`：`T`/`NIL`
+  现在按 1/0 收敛，不再报 `The value T is not of type REAL`。数组入口
+  （`vt-astype`）一直是对的，只有标量入口缺这条。
+- `(setf (vt-ref float数组 0) #c(1 2))`：现在取实部（对标 numpy 的
+  ComplexWarning 静默丢弃虚部），不再报错。
+- `(vt-from-sequence '(t t) :dtype :float64)`：现在得到 `(1.0d0 1.0d0)`。
+  修复前报 `The value T is not of type REAL when binding X` —— 一维构造的
+  快路径对元素声明了 `(type real x)`。
+
+**行为修正（结果 dtype 变化）**：
+
+- `(vt-+ a b c)` 等三元及以上算术的 dtype。`%op-final-dtype` 原先是**逐对
+  折叠** `promote(promote(a,b),c)`，三元起与「一次看全部」分叉：
+  `int16, uint16, float32` 折叠得 `:float64`，而 numpy / `vt-promote-type` /
+  `vt-concatenate` 都给 `:float32`。8 组受影响。
+
+**未改（有意）**：`(setf (vt-ref int8数组 0) 300)` 仍报错 —— numpy 2.x 的
+`a[0] = 300` 也是 `OverflowError`，而 `astype` 走回绕（`np.array([300]).astype(int8)`
+→ `44`），两边都照 numpy。
+
+**验收**：`bool-dtype-test` 575 断言（新增 Q 组 26 条）；65 套件全绿（275s）；
+`check_docs.py` 通过。契约见 `CONVENTIONS.md` §17.10.17，过程见 `HISTORY.md` H.3.36。
+
+---
+
 ## 2026-10-30（四十二）— fix: 第八遍审计（换轴：`:dtype` 当断言）—— 布尔输出被 `the` 截断、`%float-map` 预降输入、`&optional` 吞关键字
 
 > 契约见 `CONVENTIONS.md` §17.10.16；决策过程见 `HISTORY.md` H.3.35。

@@ -164,10 +164,21 @@
      · 布尔张量 ⊔ 弱整数标量 → `:int64`（`np.array([True]) + 1` 是 int64）。
        弱整数标量原先对任何 base 都「不改变 dtype」，那会让 bool 结果
        留住 2 这种越界值，破坏「布尔数组只含 0/1」的不变量。"
-  (let ((base nil))
+  (let ((base nil)
+        (tensor-dtypes '()))
+    ;; 张量之间**一次提升全部**，不是逐对折叠。
+    ;; 折叠与一次提升在二元时等价，三元起会分叉：
+    ;;   (vt-+ int16 uint16 float32)
+    ;;     折叠：int16 ⊔ uint16 = int32，再 ⊔ float32 → int32 超 24 位 → float64
+    ;;     一次：最大有符号 16 位、最大无符号 16 位、有 float32 → float32
+    ;; numpy 的 np.result_type 是「一次看全部」（按最大位宽判定），给 float32；
+    ;; 库自己的 VT-PROMOTE-TYPE、VT-CONCATENATE（apply 全表）、
+    ;; VT-STACK 也都是 float32 —— 只有这里折叠成了 float64。
+    ;; 同一套提升规则在库内出现了两种结果，属于「同语义两条实现」。
     (loop for k in kinds for d in dtypes
-          do (unless k
-               (setf base (if base (vt-promote-type base d) d))))
+          do (unless k (push d tensor-dtypes)))
+    (when tensor-dtypes
+      (setf base (apply #'vt-promote-type (nreverse tensor-dtypes))))
     (loop for k in kinds
           when k do
             (setf base
@@ -485,6 +496,16 @@
     ;; 若先剥虚部再判，虚部就永久丢失了。
     (when (eq dtype :bool)
       (return-from vt-cast (%bool-flag val)))
+    ;; Lisp 布尔 → 1/0。九个数值 dtype 都要认，不只是 :bool 目标。
+    ;; 此前 `(vt-cast t :float64)` 直接
+    ;; TYPE-ERROR: The value T is not of type REAL，而同一件事的数组入口
+    ;; `(vt-astype (vt-from-sequence '(t) :dtype :bool) :float64)` 给 1.0 ——
+    ;; 又是「同语义两条入口分叉」。受影响的调用点不止一个：
+    ;;   (vt-fill float数组 t)、(vt-full '(3) t :dtype :float64)、
+    ;;   (setf (vt-ref float数组 0) t)、(vt-* float数组 t) 全部崩在这。
+    ;; numpy 一律接受（np.zeros(3)[0] = True → 1.0），故按 1/0 收敛。
+    (when (or (eq val t) (null val))
+      (setf val (if (eq val t) 1 0)))
     (when (and (complexp val) (not (vt-complex-dtype-p dtype)))
       (setf val (realpart val)))
     (ecase dtype

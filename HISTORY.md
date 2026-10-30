@@ -3773,3 +3773,132 @@ MAX-VAL 的值，一路走到 `%op-clip` 的 etypecase。用户看到的错误�
 | 断言 | bool-dtype-test 549（新增 P 组 25 条） |
 | 套件 | 65/65（278s） |
 | 编译体检 | 无新增 WARNING（`fastmap-invariant-test` 24/24） |
+
+---
+
+## H.3.36 第九轮：去审那把尺子
+
+> 对外结论见 `CHANGELOG.md`（四十三），契约见 `CONVENTIONS.md` §17.10.17。
+
+#### 一、这一轮的起点是上一轮的判据
+
+第八遍我拿 `(vt-astype (f x) :bool)` 当尺子量了 144 次，结论是「37 处不等 → 0」。
+可那把尺子本身从没被量过：如果 `vt-astype → :bool` 在某个 dtype 或某个特殊
+值上就是错的，那 144 次「相等」只证明了两条路径**一起错**。
+
+所以先审尺子，再顺着「dtype 提升 / 转换」这条线往下走：
+
+| 探针 | 规模 | 结果 |
+|---|---|---|
+| 值 → 布尔：11 dtype × 特殊值 × 三条入口 | 55 组 × 5 判据 | 全对 |
+| bool 往返：`:bool → D → :bool` | 11 | 全恒等 |
+| 二元算子 × 混型 | 11×11×17 = 2021 | (dtype, 值) 全对 |
+| 提升表 | 二元 121 + 三元 286 | 全对 |
+| 三条转换入口 `vt-cast`/`vt-astype`/`vt-map` | 605 | 全一致 |
+| 合并/选择/三元算术 | 847 | 先 8 处不符 → 修后 0 |
+
+尺子是准的。矩阵也是干净的 —— 说明这块地被前八轮顺带压过了。真正出问题的是
+**「同一语义有几条实现」**：五处缺陷，无一例外都是两条路径给出不同答案。
+
+#### 二、`vt-/` 见到整型就改判 dtype
+
+```
+(vt-/ #(1+2i 4+0i) int8数组)
+  → TYPE-ERROR: The value #C(0.5d0 1.0d0) is not of type REAL
+```
+
+`vt-/` 按 true_divide 的「除法恒浮点」规则，只要有一个整型**张量**参与，就把
+结果 dtype 改写成 `:float64`；`(complex128, int8)` 命中这一支，虚部于是被写进
+实数数组。**24 个 (复数, 整型) 组合，两个方向全崩**，而 `complex ⊔ float`、
+`complex ⊔ complex`、`complex ⊔ 标量整数` 都正常。
+
+有意思的是这一支的注释写着「int8/int16/uint8/uint16 与 float32 混合 → float32」——
+它是照 numpy 的 promote 规则写的，只是**没考虑复数已经在 `vt-promote-type`
+里被正确提升过**，再改一次就把它改没了。
+
+#### 三、`vt-map` 的写回不认复数
+
+```lisp
+(the double-float (coerce v 'double-float))   ; v = #C(1.0d0 2.0d0)
+```
+
+`(vt-map #'identity 复数张量 :dtype :float64)` 崩，`(vt-conj c :dtype :float64)`
+一并崩 —— 而同一件事的另两个入口 `(vt-astype c :float64)`、`(vt-cast #C(1 2)
+:float64)` 都正常取实部。§16.5 早就写明「复数 → 实数取实部」，`vt-cast-fun` 的
+`:float64` 分支甚至专门写了 `(if (complexp val) (realpart val) val)` —— 只是
+`%vt-map-run` 没走 `vt-cast-fun`。
+
+修法上犹豫过：直接在写回处加 `(if (complexp v) …)` 最省事，但那个 `dotimes`
+是全库最热的循环（2M 元素级），每元素多一次类型判断会摊到所有实数路径上。
+最后照第八遍 `%bool-wrap` 的样子加了 `%REAL-WRAP`，只在「目标实数 + 有复数输入」
+时把函数包一层，热路径一字未动。
+
+#### 四、标量入口不认 Lisp 布尔（一串）
+
+```lisp
+(vt-cast t :float64)                            ; The value T is not of type REAL
+(vt-fill (vt-zeros '(2) :dtype :float64) t)
+(setf (vt-ref f 0) t)
+(vt-full '(3) t :dtype :float64)
+(vt-* f t)
+```
+
+`%bool-flag` 认 `T`/`NIL`，但只在**目标**是 `:bool` 时被调用。数值目标是另一条
+`coerce` 的路，于是数组入口 `(vt-astype bool张量 :float64)` 给 `1.0`、标量入口
+直接崩。这是本轮第四次看到同一个形状：**同一个值，两条入口，两种答案**。
+
+顺手把 `(setf (vt-ref float数组 0) #c(1 2))` 也从「报错」改成「取实部」。
+越界整数写入**故意保留报错** —— numpy 2.x 的 `a[0] = 300` 也是
+`OverflowError`，而 `astype` 走回绕（`np.array([300]).astype(int8)` → `44`）。
+两边都是 numpy 自己的行为，不该「统一」掉。
+
+#### 五、`(type real x)` 那个声明
+
+`vt-from-sequence` 的一维快路径把转换算子内联，并对元素声明 `(type real x)`：
+
+```
+(vt-from-sequence '(t t) :dtype :float64)
+  → The value T is not of type REAL when binding X
+```
+
+原代码只让 bool 模式绕开这条快路径（布尔叶子全是 `T`/`NIL`），漏了「目标
+dtype 是数值、序列里却写了 `T`」这一组合。判据扩成 `%FILL1D-INELIGIBLE-P`
+（复数**或** `T`），仍是一次扫描 —— 原来那个「含复数」的判据本来就要扫一遍。
+
+#### 六、三元的提升：折叠 vs 一次看全部
+
+`%op-final-dtype` 对多个张量是逐对折叠：
+
+```lisp
+(setf base (if base (vt-promote-type base d) d))
+```
+
+二元时与「一次看全部」等价，三元起分叉：
+
+```
+int16 ⊔ uint16 = int32 → int32 超 24 位 → float64
+而 numpy / vt-promote-type / vt-concatenate 都给 float32
+```
+
+也就是说 `(vt-+ a b c)` 的结果 dtype 与库自己的提升表都对不上 ——
+`vt-concatenate` 用的正是 `(apply #'vt-promote-type …)`。改成同样的一次提升。
+
+这条之所以能藏这么久：`float64` 参与时两种算法恒等，只有「有符号 + 无符号 +
+窄浮点」这种组合才露馅。**矩阵要打到边界值**，这是这一轮学到的第二条。
+
+#### 七、留下的判据
+
+> 判据不能只问「这个函数对不对」，要问「同一件事有几个入口」。
+> 入口数得靠枚举（`vt-cast` / `vt-astype` / `vt-map`），规则实现数也得靠枚举
+> （`%op-final-dtype` / `vt-promote-type` / `vt-concatenate` / `vt-stack`），
+> 然后逐个对。这一轮的 5 处缺陷全部落在这张网里。
+
+| 项 | 结果 |
+|---|---|
+| 混型算子矩阵 | 2021 组，(dtype, 值) 与 numpy 零失配（报错 73 处均为两边共同拒绝） |
+| 提升表 | 二元 121 格 + 三元 286 组，零失配 |
+| 三条转换入口 | 605 组，零分歧 |
+| 合并/选择/三元 | 847 组，修前 8 处不符，修后 0 |
+| 修复 | 5 处（复数真除法 24 例、复数→实数写回 60 例、布尔标量入口 8 类、T 叶子构造、三元提升 8 组） |
+| 断言 | bool-dtype-test 575（新增 Q 组 26 条） |
+| 套件 | 65/65（275s） |

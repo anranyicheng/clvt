@@ -95,9 +95,20 @@
                  (unless (and (>= i 0) (< i dim))
                    (error "索引 ~a 越界（轴大小 ~a）" idx dim))
                  (incf ptr (the fixnum (* i stride)))))
-      (let ((cval (if (eq (vt-dtype vt) :bool)
-                      (%bool-flag value)
-                      (coerce value (vt-element-type vt)))))
+      (let* ((dtype (vt-dtype vt))
+             (cval (cond ((eq dtype :bool)
+                          (%bool-flag value))
+                         ;; T/NIL 与复数走 VT-CAST：
+                         ;;   (setf (vt-ref f 0) t)      → 原 coerce 报
+                         ;;     "The value T is not of type DOUBLE-FLOAT"；
+                         ;;   (setf (vt-ref f 0) #c(1 2)) → 取实部（§16.5，
+                         ;;     对标 numpy 的 ComplexWarning 静默丢弃虚部）。
+                         ;; 只在「值不是普通数」时才走这条慢路：热路径
+                         ;; （数值标量）仍是原来的 COERCE，逐元素调用不变慢。
+                         ((or (eq value t) (null value) (complexp value))
+                          (vt-cast value dtype))
+                         (t
+                          (coerce value (vt-element-type vt))))))
         (macrolet ((set-ref (lt)
                      `(setf (aref (the (simple-array ,lt (*)) data) ptr) cval)))
           (cond ((equal (array-element-type data) 'double-float) (set-ref double-float))

@@ -169,10 +169,27 @@
              (dt-int-p (lambda (dt)
                          (or (vt-int-dtype-p dt)
                              (member dt '(:uint8 :uint16 :bool)))))
+             ;; 复数参与标记。判据必须看 **ALL**（已 ensure-vt 的全部操作数）
+             ;; 而不是 TENSOR-DTS（后者过滤掉了弱标量）：
+             ;; `(vt-/ int8数组 #C(1 2))` 的复数只以标量形式出现，
+             ;; 若只看 TENSOR-DTS 就会漏判（见下面的 FLOAT-TARGET）。
+             (some-complex-p
+               (some (lambda (x) (vt-complex-dtype-p (vt-dtype x))) all))
              (float-target
                (cond (dtype
                       ;; 显式整型目标：保持截断语义，零除确定性报错
                       nil)
+                     ;; 复数参与时**不得**做下面的「整型→浮点」改写
+                     ;; （CONVENTIONS §16.3）。numpy 的 true_divide 对复数
+                     ;; 输入结果仍是复数，而 VT-PROMOTE-TYPE 已按「实部分量
+                     ;; 参与普通提升、再映射回复数」的规则算好了目标：
+                     ;;   c128 ⊔ int8 → c128、c64 ⊔ int8 → c64
+                     ;; 若在此把它改写成 :float64，虚部就会被写进一个实数
+                     ;; 数组 —— `(vt-/ #C(1 2) int8)` 直接
+                     ;; TYPE-ERROR: The value #C(0.5d0 1.0d0) is not of type REAL。
+                     ;; v0.4.x 修复：复数 × 整型（含 bool）的真除法此前
+                     ;; 24/24 全部崩在这个分支上（两个方向都崩）。
+                     (some-complex-p nil)
                      ((or (null tensor-dts) (every dt-int-p tensor-dts))
                       ;; 整型（含无符号）张量 → float64（true_divide 恒浮点）；
                       ;; 全是标量时也落 float64（numpy: 1/2 = 0.5）

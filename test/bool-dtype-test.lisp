@@ -1161,6 +1161,114 @@
             (handler-case (progn (vt-clip *pb* 1) nil) (error () t)))
 
 ;;; ==================================================================
+;;; Q 组：混型提升与「值 → dtype」入口（第九遍审计）
+;;;
+;;; 这一组的判据不是「跟 numpy 比某个函数」，而是**同一语义的多条入口
+;;; 必须给出同一个答案**：标量 `vt-cast` / 数组 `vt-astype` / 映射
+;;; `vt-map`、以及 `%OP-FINAL-DTYPE` 与 `vt-promote-type` 必须一致。
+;;; 每一条都对应一处实测缺陷。
+;;; ==================================================================
+
+;; Q1. 复数 × 整型/布尔的真除法：结果 dtype 必须留在复数族。
+;;     修复前 `vt-/` 的 FLOAT-TARGET 分支一见整型操作数就改写成 :float64，
+;;     于是虚部被写进实数数组 —— 24/24 个 (复数, 整型) 组合全部
+;;     TYPE-ERROR: The value #C(0.5d0 1.0d0) is not of type REAL。
+(check "mx/cdiv-int8"
+       (list (vt-dtype (vt-/ (vt-from-sequence (list (complex 1d0 2d0) (complex 4d0 0d0))
+                                             :dtype :complex128)
+                             (vt-from-sequence '(2 2) :dtype :int8)))
+             (vt-to-list (vt-/ (vt-from-sequence (list (complex 1d0 2d0) (complex 4d0 0d0))
+                                                 :dtype :complex128)
+                               (vt-from-sequence '(2 2) :dtype :int8))))
+       '(:complex128 (#C(0.5d0 1.0d0) #C(2.0d0 0.0d0))))
+;; 反向：整型 / 复数
+(check "mx/int8-div-complex"
+       (vt-dtype (vt-/ (vt-from-sequence '(2 2) :dtype :int8)
+                       (vt-from-sequence (list (complex 1d0 2d0) (complex 4d0 0d0))
+                                         :dtype :complex128)))
+       :complex128)
+;; 布尔分母（numpy: 1+2j / True 仍是复数）
+(check "mx/complex-div-bool"
+       (vt-dtype (vt-/ (vt-from-sequence (list (complex 1d0 2d0) (complex 4d0 0d0))
+                                         :dtype :complex128)
+                       (vt-from-sequence '(t t) :dtype :bool)))
+       :complex128)
+;; complex64 ⊔ int8 → complex64（24 位尾数规则，不能升到 complex128）
+(check "mx/c64-div-int8" (vt-dtype (vt-/ (vt-from-sequence (list (complex 1d0 2d0)) :dtype :complex64)
+                                         (vt-from-sequence '(2) :dtype :int8)))
+       :complex64)
+
+;; Q2. 复数 → 实数目标：三条入口都必须「取实部」（§16.5）。
+;;     修复前 `vt-map` 的写回是 `(the double-float (coerce v 'double-float))`，
+;;     对复数直接 TYPE-ERROR，而 `vt-astype` / `vt-cast` 都正常取实部。
+(let ((c (vt-from-sequence (list (complex 1d0 2d0) (complex 4d0 0d0)) :dtype :complex128)))
+  (check "mx/map-complex-to-f64" (vt-to-list (vt-map #'identity c :dtype :float64)) '(1.0d0 4.0d0))
+  (check "mx/map-complex-to-int8" (vt-to-list (vt-map #'identity c :dtype :int8)) '(1 4))
+  (check "mx/conj-complex-to-f64" (vt-to-list (vt-conj c :dtype :float64)) '(1.0d0 4.0d0))
+  (check "mx/astype-complex-to-f32" (vt-to-list (vt-astype c :float32)) '(1.0 4.0))
+  ;; 反向保护：目标仍是复数时不得丢虚部（REAL-WRAP 不能误伤）
+  (check "mx/map-complex-to-c64"
+         (vt-to-list (vt-map #'identity c :dtype :complex64)) '(#C(1.0 2.0) #C(4.0 0.0)))
+  (check "mx/complex-div-self" (vt-dtype (vt-/ c c)) :complex128))
+
+;; Q3. 标量入口必须接受 Lisp 布尔（与数组入口一致）。
+;;     修复前 `(vt-cast t :float64)` 报 "The value T is not of type REAL"。
+(check "mx/cast-t-f64" (vt-cast t :float64) 1.0d0)
+(check "mx/cast-nil-int64" (vt-cast nil :int64) 0)
+(check "mx/cast-t-complex" (vt-cast t :complex128) #C(1.0d0 0.0d0))
+(check "mx/fill-f64-with-t"
+       (vt-to-list (let ((a (vt-zeros '(2) :dtype :float64))) (vt-fill a t) a))
+       '(1.0d0 1.0d0))
+(check "mx/full-f64-t" (vt-to-list (vt-full '(3) t :dtype :float64)) '(1.0d0 1.0d0 1.0d0))
+(check "mx/setf-ref-f64-t"
+       (vt-to-list (let ((a (vt-zeros '(2) :dtype :float64))) (setf (vt-ref a 0) t) a))
+       '(1.0d0 0.0d0))
+(check "mx/mul-f64-by-t"
+       (vt-to-list (vt-* (vt-from-sequence '(1.0d0 2.0d0) :dtype :float64) t))
+       '(1.0d0 2.0d0))
+;; (setf vt-ref) 写入复数到实数槽：取实部（对标 numpy 的 ComplexWarning）
+(check "mx/setf-ref-f64-complex"
+       (vt-to-list (let ((a (vt-zeros '(2) :dtype :float64))) (setf (vt-ref a 0) #c(1 2)) a))
+       '(1.0d0 0.0d0))
+
+;; Q4. 一维构造快路径带 `(type real x)`——T 叶子必须绕开它。
+;;     修复前 `(vt-from-sequence '(t t) :dtype :float64)` 报
+;;     "The value T is not of type REAL when binding X"。
+(check "mx/from-seq-t-f64" (vt-to-list (vt-from-sequence '(t t) :dtype :float64)) '(1.0d0 1.0d0))
+(check "mx/from-seq-t-int8" (vt-to-list (vt-from-sequence '(t t) :dtype :int8)) '(1 1))
+;; 非 bool 模式下 NIL 仍是空子序列 → 「不规则嵌套」（§17.8 的分层契约不变）
+(check-true "mx/from-seq-nil-still-ragged"
+            (handler-case (progn (vt-from-sequence '(t nil) :dtype :float64) nil)
+              (error () t)))
+
+;; Q5. 多元提升必须**一次看全部**，而不是逐对折叠。
+;;     折叠：int16 ⊔ uint16 = int32 → ⊔ float32 = float64（超 24 位）
+;;     一次：最大有符号 16 位、最大无符号 16 位 + float32 → float32（numpy 同）
+(check "mx/promote-3-fold" (vt-promote-type :int16 :uint16 :float32) :float32)
+(check "mx/add-3-float32"
+       (vt-dtype (vt-+ (vt-from-sequence '(1) :dtype :int16)
+                       (vt-from-sequence '(2) :dtype :uint16)
+                       (vt-from-sequence '(3) :dtype :float32)))
+       :float32)
+(check "mx/add-3-complex64"
+       (vt-dtype (vt-+ (vt-from-sequence '(1) :dtype :int16)
+                       (vt-from-sequence '(2) :dtype :uint16)
+                       (vt-from-sequence '(3) :dtype :complex64)))
+       :complex64)
+;; 与另一条同规则实现（concatenate 走 apply 全表）对齐
+(check "mx/concat-3-float32"
+       (vt-dtype (vt-concatenate 0
+                                 (vt-from-sequence '(1) :dtype :int16)
+                                 (vt-from-sequence '(2) :dtype :uint16)
+                                 (vt-from-sequence '(3) :dtype :float32)))
+       :float32)
+(check "mx/add-3-value"
+       (vt-to-list (vt-+ (vt-from-sequence '(1) :dtype :int16)
+                         (vt-from-sequence '(2) :dtype :uint16)
+                         (vt-from-sequence '(3) :dtype :float32)))
+       '(6.0))
+
+;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)
 (when (plusp *fail*) (sb-ext:exit :code 1))

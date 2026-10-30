@@ -4663,6 +4663,139 @@ MIN-VAL 只可能是数值/nil，出现关键字就一定是被吞的 `&KEY` 起
 | `(vt-exp b :dtype :bool)` | `(1 1 1 1 1 1)` | `TypeError: No loop matching …` | numpy 的 ufunc 没有 bool 输出循环就直接拒绝；本库允许「先算再 astype」的等价写法，但结果必须等于 astype（本节的判据） |
 | `(vt-negative b :dtype :bool)` | 报错 | `TypeError` | 与 numpy 一致；`:dtype :int8` 是本库多给的出口 |
 
+#### 17.10.17 第九遍：审「尺子」本身 —— 混型提升与三条转换入口
+
+第八遍用 `(vt-astype (f x) :bool)` 当判据验了 144 次。这一遍反过来审那把尺子，
+并顺着「提升 / 转换」这条线铺开：
+
+- **二元算子矩阵**：11 个 dtype × 11 个 dtype × 17 个算子 → **2021 组**，
+  `(dtype, 值)` 与 numpy 2.3.5 逐格一致，0 处不符（73 处报错全是两边都拒绝的
+  复数 floor-div/mod 与布尔减法）。
+- **提升表**：`vt-promote-type` 的二元 121 格、三元 **286 组** 全对。
+- **三条转换入口**：`vt-cast`（标量）/ `vt-astype`（数组）/ `vt-map … :dtype`
+  × 11×11×全部特殊值 → **605 组**，三者逐位一致。
+
+矩阵干净的地方说明地被压过了；出问题的是**同一语义的多条实现**。这一遍
+共修 5 处，全部属于这一类。
+
+##### 一、`vt-/` 把复数降成 `:float64`
+
+`vt-/` 的 `FLOAT-TARGET` 分支按 true_divide 的「除法恒浮点」规则，一见整型
+操作数就把目标改写成 `:float64`：
+
+```lisp
+((some dt-int-p tensor-dts) (if (every … '(:float32 :int8 …)) :float32 :float64))
+```
+
+`(complex128, int8)` 命中了这一支（`int8` 是整型），于是结果 dtype 被定成
+`:float64`，虚部写进实数数组：
+
+```
+(vt-/ #(1+2i 4+0i) int8数组)
+  → TYPE-ERROR: The value #C(0.5d0 1.0d0) is not of type REAL
+```
+
+**24 个 (复数, 整型) 组合两个方向全崩**。而 `complex ⊔ float`、`complex ⊔ complex`、
+`complex ⊔ 标量整数` 都正常 —— 差别只在「有没有一个整型**张量**」。
+
+修法：复数参与时不做这条改写，交给 `vt-promote-type`（它已按「实部分量参与
+普通提升、再映射回复数」算好 `c128 ⊔ int8 → c128`、`c64 ⊔ int8 → c64`）。
+判据看**全部操作数**而不是 `tensor-dts`（后者过滤掉弱标量）。
+
+> `#c(2 0)` 在 CL 里被规范成整数 `2`（`(complexp #c(2 0))` → `NIL`），
+> 所以 `(vt-/ int8数组 #c(2 0))` 本就是 `int8数组 / 2` → `:float64`（NEP 50）。
+> 这不是缺陷，是 Lisp 无法表示「零虚部的复数标量」。
+
+##### 二、`vt-map` 的写回不认复数 → 实数
+
+```lisp
+(the double-float (coerce v 'double-float))   ; v = #C(1.0d0 2.0d0) → TYPE-ERROR
+```
+
+`(vt-map #'identity 复数张量 :dtype :float64)` 崩，而 `(vt-astype c :float64)`
+与 `(vt-cast #C(1 2) :float64)` 都正常取实部（§16.5）。连同 `(vt-conj c :dtype
+:float64)` 一起是 60 组。修法是加 `%REAL-WRAP`：只在「目标实数 + 有复数输入」
+时把函数包一层 `realpart`，**热循环一字未动**（不在写回处加每元素判断）。
+
+##### 三、标量入口不认 Lisp 布尔
+
+```lisp
+(vt-cast t :float64)            → TYPE-ERROR: The value T is not of type REAL
+(vt-fill (vt-zeros '(2) :dtype :float64) t)  → 同上
+(setf (vt-ref f 0) t)、 (vt-full '(3) t :dtype :float64)、 (vt-* f t) → 同上
+```
+
+`%bool-flag` 认 `T`/`NIL`，但只在**目标**是 `:bool` 时被调用。数值目标是
+另一条路（`coerce`），于是数组入口 `(vt-astype bool张量 :float64)` 给 `1.0`、
+标量入口直接崩。numpy 一律接受（`np.zeros(3)[0] = True` → `1.0`）。
+
+修：`vt-cast` 在剥虚部之前把 `T`/`NIL` 收敛成 `1`/`0`；`(setf vt-ref)` 只在
+值不是普通数（`T`/`NIL`/复数）时才绕道 `vt-cast`，数值标量仍走原 `coerce`，
+逐元素写入不变慢。
+
+顺带：`(setf (vt-ref float数组 0) #c(1 2))` 现在取实部而不是报错。
+越界整数写入**仍然报错**（`(setf (vt-ref int8数组 0) 300)`）——
+这与 numpy 2.x 的 `OverflowError: Python integer 300 out of bounds for int8`
+一致，而 `astype` 走回绕（`np.array([300]).astype(int8)` → `44`），两边都是
+numpy 自己的行为。
+
+##### 四、一维构造快路径的 `(type real x)`
+
+`vt-from-sequence` 的一维快路径把转换算子内联，并对元素声明 `(type real x)`。
+`T` 不是 `REAL`，于是：
+
+```
+(vt-from-sequence '(t t) :dtype :float64)
+  → The value T is not of type REAL when binding X
+```
+
+原代码只让 **bool 模式**绕开这条快路径（因为布尔叶子全是 `T`/`NIL`），漏了
+「目标 dtype 是数值、序列里却写了 `T`」这一组合。修法是把「含复数」那个
+判据扩成 `%FILL1D-INELIGIBLE-P`（复数 **或** `T`），仍是一次扫描。
+
+> `NIL` 叶子不需要判：非 bool 模式下它是空子序列，`infer-shape` 早已以
+> 「不规则嵌套」拒掉 —— `(vt-from-sequence '(t nil) :dtype :float64)` 仍报错，
+> 这是 §17.8 的分层契约，不是缺陷。
+
+##### 五、多元提升：逐对折叠 vs 一次看全部
+
+`%op-final-dtype` 对多个张量是**逐对折叠**：
+
+```lisp
+(setf base (if base (vt-promote-type base d) d))
+```
+
+二元时与「一次看全部」等价，三元起会分叉：
+
+| 三个 dtype | 折叠 | 一次（= numpy = `vt-promote-type` = `vt-concatenate`） |
+|---|---|---|
+| `int16, uint16, float32` | `int16⊔uint16 = int32` → 超 24 位 → `float64` | `float32` |
+| `int16, uint16, complex64` | 同上 → `complex128` | `complex64` |
+
+即 `(vt-+ a b c)` 的 dtype 与库自己的 `vt-promote-type`、`vt-concatenate`
+都对不上。改成先收集再 `(apply #'vt-promote-type …)`。8 组受影响。
+
+##### 六、这一遍的判据
+
+> **同一语义的每一条入口都必须给出同一个答案**，而「同一语义」不能靠
+> docstring 声明，得靠**枚举**：同一件事有几个入口（`vt-cast` / `vt-astype` /
+> `vt-map`），同一套规则有几处实现（`%op-final-dtype` / `vt-promote-type` /
+> `vt-concatenate` / `vt-stack`），逐个对。
+
+第二个教训是**矩阵要打到边界值**：`int16, uint16, float32` 这种「有符号 +
+无符号 + 窄浮点」的组合才暴露折叠与一次提升的差别，`float64` 参与时两者
+恒等，测了也看不出来。
+
+##### 七、有意偏差（本节新增）
+
+| 表达式 | clvt | numpy | 理由 |
+|---|---|---|---|
+| `(vt-/ 复数数组 整型数组)` | `:complex128` | `complex128` | 一致（本节修复前是 `TYPE-ERROR`） |
+| `(setf (vt-ref int8数组 0) 300)` | 报错 | `OverflowError` | 一致 |
+| `(vt-from-sequence '(t nil) :dtype :float64)` | 「不规则嵌套」 | `[1., nan]` 之类 | Lisp 的 `NIL` 既是假又是空表（§17.8），只能靠「bool 模式」消歧 |
+| `(vt-+ 复数数组 x :dtype :float64)` | 静默取实部 | `UFuncTypeError: Cannot cast …` | 与 §16.5 的「本库不产生 ComplexWarning」同一政策：显式要走实数时一律取实部，不因入口不同而有的报错有的静默 |
+
+
 ---
 
 ## 附录 C：实测缺陷复现脚本
