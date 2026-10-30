@@ -602,11 +602,21 @@
      angle(0.0)  = 0.0      angle(-0.0) = π（**看符号位**，不看数值比较）
      angle(1.0)  = 0.0      angle(-1.0) = π      angle(nan) = nan
    因此负零必须用 `float-sign` 判定（`minusp` 对 -0.0 返回 NIL，会漏掉），
-   非负分支必须返回 +0.0（不能 `(* 0 x)`，那会给 -0.0）。"
+   非负分支必须返回 +0.0（不能 `(* 0 x)`，那会给 -0.0）。
+
+   复数的 (0,0) 点更麻烦：atan2 在 (±0, ±0) 上按符号位给出 0/±π 四种答案，
+   全是 numpy 认可的结果——
+     angle( 0.0+0.0i)= 0.0    angle(-0.0+0.0i)= π
+     angle( 0.0-0.0i)=-0.0    angle(-0.0-0.0i)=-π
+   原先这里对「两分量都为零」统一返回 `(float 0 re)`，把负实轴上的点
+   （-0.0+0.0i）判成了 0 而不是 π —— 相差 180°（§17.10.23）。"
   (if (complexp x)
-      (let ((re (realpart x)) (im (imagpart x)))
-        (cond ((and (zerop re) (zerop im)) (float 0 re))
-              (t (atan im re))))
+      ;; 复数直接用 atan(y, x)：四象限 atan2 就是 numpy.angle 的定义，
+      ;; 而 CL 的 (atan y x) 在 (±0, ±0) 上按 IEEE 754 给出四种答案
+      ;; （0 / π / -0.0 / -π），与 numpy 逐位相同。原先为了「零就是零」
+      ;; 加了一层 (and (zerop re) (zerop im)) 的短路，反而把 −0.0 的
+      ;; 符号位吃掉（§17.10.23）。
+      (atan (imagpart x) (realpart x))
       (cond ((and (floatp x) (vt-float-nan-p x)) x)          ; NaN 传播
             ((or (minusp x)
                  (and (floatp x) (minusp (float-sign x))))    ; 负数 或 -0.0 → π

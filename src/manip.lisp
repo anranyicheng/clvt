@@ -311,16 +311,33 @@
 ;;; 翻转与滚动
 ;;; ------------------------------------------------------------------
 
+(defun %flip-shift (dim stride)
+  "翻转某轴时 offset 的位移：(dim-1)×stride。
+   长度为 0 的轴**位移必须是 0** —— 它没有元素可翻，(1- 0) = -1 会把
+   offset 推到负数，而 offset 的类型是 (unsigned-byte 44)，于是任何后续
+   把 offset 传进 %MAKE-VT 的操作（vt-view / vt-reshape / vt-flatten）
+   都在类型检查上炸掉：「The value -1 is not of type (UNSIGNED-BYTE 44)」。
+   空轴翻转的 offset 在 numpy 里同样保持 0（§17.10.23）。"
+  (declare (type fixnum dim stride))
+  (if (plusp dim) (* (1- dim) stride) 0))
+
 (defun vt-flip (vt &key axis)
-  "沿指定轴翻转（零拷贝视图）；axis 为 nil 时全部翻转。"
-  (let ((shape (vt-shape vt)) (strides (vt-strides vt)))
+  "沿指定轴翻转（零拷贝视图）；axis 为 nil 时全部翻转。
+
+  空张量（size = 0）的 offset 原样保留：没有元素可翻，任何位移都只会把
+  offset 推到缓冲区之外（缓冲长度也是 0），随后 `subseq` / `%make-vt`
+  的类型检查就会炸。numpy 对空数组同样不移动 data 指针。"
+  (let ((shape (vt-shape vt)) (strides (vt-strides vt))
+        (empty (zerop (vt-size vt))))
     (if (null axis)
         (%make-vt :data (vt-data vt) :shape shape
                   :strides (mapcar #'- strides)
                   :offset (+ (vt-offset vt)
-                             (loop for d in shape
-                                   for s in strides
-                                   sum (* (1- d) s)))
+                             (if empty
+                                 0
+                                 (loop for d in shape
+                                       for s in strides
+                                       sum (%flip-shift d s))))
                   :dtype (vt-dtype vt))
         (let* ((rank (length shape))
                (ax (vt-normalize-axis axis rank))
@@ -329,7 +346,8 @@
                (old-stride (nth ax strides)))
           (setf (nth ax strides) (- old-stride))
           (%make-vt :data (vt-data vt) :shape shape :strides strides
-                    :offset (+ (vt-offset vt) (* (1- dim) old-stride))
+                    :offset (+ (vt-offset vt)
+                               (if empty 0 (%flip-shift dim old-stride)))
                     :dtype (vt-dtype vt))))))
 
 (defun vt-roll (vt shift &key axis)
@@ -982,7 +1000,10 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
    side  = :left（左/上越界）或 :right（右/下越界）。
    前置条件：dist > 0；sk > 0 或 mode 为 :constant（由调用方处理）。"
   (when (and (<= sk 0) (not (eq mode :constant)))
-    (error "无法用 mode ~a 扩展空轴 (sk=~a)" mode sk))
+    ;; 前缀是契约的一部分：用户看到「无法用 mode EDGE 扩展空轴」时无从知道
+    ;; 这是 vt-pad 报的（numpy 的消息同样点名 can't extend empty axis）。
+    (error "vt-pad: 无法用 mode ~a 扩展空轴（轴长 ~a；numpy 只允许 :constant/:empty）"
+           mode sk))
   (ecase mode
     ;; ---- :edge：越界一律取最近端点 ----
     (:edge
@@ -998,7 +1019,7 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
     ;; sk = 1 时无法构成有效周期（period = 0），与 NumPy / scipy 一致报错。
     (:reflect
      (when (< sk 2)
-       (error "无法用 mode :reflect 扩展长度为 ~a 的轴（需 >= 2）" sk))
+       (error "vt-pad: 无法用 mode :reflect 扩展长度为 ~a 的轴（需 >= 2，numpy 同样拒绝）" sk))
      (let* ((period (* 2 (1- sk)))
             (x   (if (eq side :left)
                      dist

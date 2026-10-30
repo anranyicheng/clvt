@@ -983,10 +983,18 @@
          (af (%cx-flat (vt-copy (vt-astype av dt))))
          (vf (%cx-flat (vt-copy (vt-astype bv dt))))
          (n (vt-size af))
-         (m (vt-size vf))
-         (full (%cx-correlate-full af vf conj-p))
-         (full-len (length full)))
-    (declare (type fixnum n m full-len))
+         (m (vt-size vf)))
+    (declare (type fixnum n m))
+    ;; 空序列：与实数路径**同一份契约**（numpy: "a/v cannot be empty"）。
+    ;; 复数走的是另一条内核，而这条检查原先只写在 VT-CORRELATE 的实数
+    ;; 分支里 —— 于是 (vt-convolve 空复数 v) 静默返回空张量，同一个请求
+    ;; 在两条 dtype 路径上得到两种回答（§17.10.23）。
+    (flet ((op-name () (if (eq same-anchor :a) "vt-convolve" "vt-correlate")))
+      (when (zerop n) (error "~a: a 不能为空（numpy 同样拒绝）" (op-name)))
+      (when (zerop m) (error "~a: v 不能为空（numpy 同样拒绝）" (op-name))))
+    (let* ((full (%cx-correlate-full af vf conj-p))
+           (full-len (length full)))
+      (declare (type fixnum full-len))
     (flet ((slice (len start)
              (%make-vt :data (subseq full start (min full-len (+ start len)))
                        :shape (list (max 0 len)) :strides '(1)
@@ -1001,7 +1009,7 @@
         ;; 原为 (floor (- full-len (max n m)) 2)，|n-m| 为奇数时方向相反。
         (:same (slice (max n m)
                       (min (floor (1- m) 2)
-                           (floor (if (eq same-anchor :v) n (1- n)) 2))))))))
+                           (floor (if (eq same-anchor :v) n (1- n)) 2)))))))))
 
 (defun %cx-op-correlate (a v &key (mode :full) (same-anchor :v))
   "1D 互相关（对标 numpy.correlate）。复数走专用内核（累加器为复数）。

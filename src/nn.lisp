@@ -218,24 +218,47 @@
 (let ((scaled (vt-+ (vt-scale vt 0.2d0) 0.5d0 :dtype dtype)))
     (vt-clip scaled 0.0d0 1.0d0 :dtype dtype :out out)))
 
+(defun %nn-empty-result (in dtype out op-name)
+  "空输入时 NN 族的统一出口：同形状空张量（float64/float32 随输入）。
+   OUT 非 NIL 时按 §4.2 的 out 硬契约先校验再写入，返回 OUT。"
+  (let* ((dt (or dtype (if (eq (vt-dtype in) :float32) :float32 :float64)))
+         (shape (vt-shape in))
+         (empty (vt-zeros shape :dtype dt)))
+    (if out
+        (progn (vt-check-out out shape dt :op-name op-name)
+               (vt-copy-into out empty)
+               out)
+        empty)))
+
 (defun vt-softmax (vt &key (axis -1) dtype out)
   "softmax（沿 axis，默认最后一维）。数值稳定化：先减去该轴最大值再 exp。
   注意（对标 PyTorch）：若某行全为 -Inf，则 max = -Inf，exp(-Inf - (-Inf)) = NaN，
   即全 -Inf 行的 softmax 结果为 NaN——这是 IEEE 754 下减去最大值稳定化的固有语义。"
-  (let* ((max-val (vt-amax vt :axis axis :keepdims t :dtype dtype))
-         (exp-vt (vt-exp (vt-- vt max-val :dtype dtype) :dtype dtype))
-         (sum-exp (vt-sum exp-vt :axis axis :keepdims t :dtype dtype)))
-    (vt-/ exp-vt sum-exp :dtype dtype :out out)))
+  (let ((in (ensure-vt vt)))
+    ;; 空输入 → 空输出。没有元素就没有「该轴最大值」可归约，落到 vt-amax 会
+    ;; 抛它自己的「zero-size array」错误 —— 那是实现细节，不是本函数的契约
+    ;; （§17.10.23）。
+    (when (zerop (vt-size in))
+      (return-from vt-softmax
+        (%nn-empty-result in dtype out "vt-softmax")))
+    (let* ((max-val (vt-amax in :axis axis :keepdims t :dtype dtype))
+           (exp-vt (vt-exp (vt-- in max-val :dtype dtype) :dtype dtype))
+           (sum-exp (vt-sum exp-vt :axis axis :keepdims t :dtype dtype)))
+      (vt-/ exp-vt sum-exp :dtype dtype :out out))))
 
 (defun vt-log-softmax (vt &key (axis -1) dtype out)
   "log-softmax = x - logsumexp(x)，沿 axis（默认最后一维）。
   数值稳定化同 vt-softmax；结果 dtype 由输入提升 + 显式 :dtype 决定（§4.2 H3）。"
-  (let* ((max-val (vt-amax vt :axis axis :keepdims t :dtype dtype))
-         (shifted (vt-- vt max-val :dtype dtype))
-         (lse (vt-log (vt-sum (vt-exp shifted :dtype dtype)
-			      :axis axis :keepdims t :dtype dtype)
-                      :dtype dtype)))
-    (vt-- shifted lse :dtype dtype :out out)))
+  (let ((in (ensure-vt vt)))
+    (when (zerop (vt-size in))
+      (return-from vt-log-softmax
+        (%nn-empty-result in dtype out "vt-log-softmax")))
+    (let* ((max-val (vt-amax in :axis axis :keepdims t :dtype dtype))
+           (shifted (vt-- in max-val :dtype dtype))
+           (lse (vt-log (vt-sum (vt-exp shifted :dtype dtype)
+			        :axis axis :keepdims t :dtype dtype)
+                        :dtype dtype)))
+      (vt-- shifted lse :dtype dtype :out out))))
 
 (defun vt-mean-squared-error (y-true y-pred &key dtype out)
   "均方误差：mean((y_true - y_pred)²)。结果为标量（float64）。"

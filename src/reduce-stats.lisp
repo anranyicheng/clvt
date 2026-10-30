@@ -2344,117 +2344,189 @@
             (setf lo mid))))
     lo))
 
-(defun vt-histogram (tensor &key bins range density)
+(defun %histogram-total (hist)
+  "累加器 HIST 的元素之和（权重之和，无权重时即样本数）。"
+  (let ((total (if (and (plusp (length hist)) (floatp (aref hist 0))) 0.0d0 0)))
+    (dotimes (i (length hist) total)
+      (setf total (+ total (aref hist i))))))
+
+(defun %histogram-density! (hist widths total)
+  "原地把 HIST 归一化成密度：hist[i] / (TOTAL × WIDTHS[i])。
+   WIDTHS 逐箱给出宽度 —— 显式边界序列的箱宽可以不相等，用平均宽度归一
+   会让不均匀的边界序列算出「总和不为 1」的密度。
+   numpy 在 TOTAL = 0（空采样或权重全零）时给出 0/0 = NaN，而不是 0 ——
+   「没有数据」与「密度为零」是两件事，返回 0 会把前者伪装成后者（§17.10.21）。"
+  (if (or (zerop total)
+          (some (lambda (w) (not (plusp w))) (coerce widths 'list)))
+      (dotimes (i (length hist))
+        (setf (aref hist i) (vt-get-nan :float64)))
+      (dotimes (i (length hist))
+        (setf (aref hist i) (/ (coerce (aref hist i) 'double-float)
+                               (* total (aref widths i))))))
+  hist)
+
+(defun vt-histogram (tensor &key bins range density weights)
   "直方图统计（对标 numpy.histogram）。返回两个值：counts 与 edges。
 
   BINS 接受两种形态（与 numpy 一致）：
     正整数（缺省 10）—— 在 [data-min, data-max] 上等宽切分 BINS 个箱，
         边界由 RANGE 或数据极值决定；counts 长度为 BINS。
+        空输入且未给 RANGE 时取 numpy 的缺省区间 [0, 1)（见下）。
     边界序列（list / vector / vt，至少 2 个元素且严格递增）—— 直接作为
         箱边界；counts 长度为 边界数-1。区间 [edges[0], edges[-1]] 之外的
         元素**不计入**，恰好等于内部边界的元素归入右侧箱，等于最后一条
         边界的元素归入最后一个箱（对标 numpy 的 searchsorted side='right'）。
         此时 RANGE 被忽略（numpy 同样忽略并给出 DeprecationWarning）。
+    BINS 是浮点/复数等非整数标量时报错（numpy 抛 TypeError：bins 必须是
+    整数或边界序列）—— 不落到「边界序列」分支去，否则会得到
+    「边界序列至少需要 2 个元素」这种指错方向的错误。
 
-  counts 的 dtype：整数计数为 :int64；DENSITY=t 时为归一化密度 :float64
-  （每箱除以 总数×箱宽）。EDGES 恒为 :float64。
+  WEIGHTS（新增，对标 numpy 的 weights=）：与 TENSOR 形状**完全相同**的
+  实数权重，逐元素配对累加。此时 counts 不再是样本数而是权重之和：
+  整型/布尔权重 → :int64，浮点权重 → :float64（numpy 的 result_type 规则）。
+
+  counts 的 dtype：整数计数为 :int64；DENSITY=t 或浮点 WEIGHTS 时为 :float64。
+  DENSITY=t 时归一化为 hist[i]/(总计×箱宽)；**总计为 0 时全部给 NaN**
+  （numpy 是 0/0），因为「没有样本」不等于「密度为零」。EDGES 恒为 :float64。
 
   NaN/Inf：自动确定范围（未给 RANGE）时要求输入全为有限值，否则报错
   （numpy 抛 ValueError）；显式 RANGE 时区间外的值（含 NaN）自然被丢弃。
   复数输入报错（numpy 同样拒绝）。
+
+  等宽箱的边界一律在 double-float 上按 `min + i×(max-min)/bins` 计算，
+  与 numpy 的 linspace 逐位一致；除 R 外不保留有理数精度（整数输入与
+  浮点输入必须给出同一组边界，见 CONVENTIONS §17.10.23）。
 
   示例：
     (nth-value 0 (vt-histogram (vt-arange 10) :bins 5))            ; => 各箱计数
     (nth-value 1 (vt-histogram (vt-arange 10) :bins '(0 2 5 9)))   ; => (0 2 5 9)"
   (when (%cx-reject tensor)
     (error "vt-histogram: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+  (when (and weights (%cx-any-p weights))
+    (error "vt-histogram: weights 不支持复数（numpy 同样拒绝）。"))
   (with-float-safe
     (let* ((flat (vt-flatten tensor))
            (data (vt-data flat))
            (size (vt-size flat))
-           (bins (or bins 10)))
-      (if (not (integerp bins))
-          ;; ---------------- 显式边界 ----------------
-          (let* ((edge-vt (vt-astype (ensure-vt bins) :float64))
-                 (edge-list (vt-to-list (vt-flatten edge-vt)))
-                 (n (length edge-list))
-                 (ev (make-array n :element-type 'double-float))
-                 (counts (make-array (max (1- n) 0) :initial-element 0)))
-            (when (< n 2)
-              (error "vt-histogram: 边界序列至少需要 2 个元素，得到 ~a 个" n))
-            (dotimes (i n)
-              (setf (aref ev i) (coerce (nth i edge-list) 'double-float)))
-            (loop for i from 1 below n
-                  do (unless (< (aref ev (1- i)) (aref ev i))
-                       (error "vt-histogram: 边界序列必须严格递增（第 ~a 个边界 ~a 不大于前一个 ~a）"
-                              i (aref ev i) (aref ev (1- i)))))
-            (loop for i from 0 below size
-                  for bi = (%histogram-bucket ev n (aref data i))
-                  when bi do (incf (aref counts bi)))
-            (when density
-              (let ((total (reduce #'+ counts)))
-                (loop for i from 0 below (1- n) do
-                  (setf (aref counts i)
-                        (if (zerop total)
-                            0.0d0
-                            (/ (aref counts i)
-                               (* total (- (aref ev (1+ i)) (aref ev i)))))))))
-            (values (vt-from-sequence (coerce counts 'list)
-                                      :dtype (if density :float64 :int64))
-                    (vt-from-sequence (coerce ev 'list) :dtype :float64)))
+           (bins (or bins 10))
+           ;; ---- WEIGHTS 归一：形状必须与输入完全一致（numpy 也这么要求），
+           ;;      展平后按同一逻辑顺序逐元素配对 ----
+           (w-flat (when weights (vt-flatten weights)))
+           (w-dt (when weights (vt-dtype w-flat)))
+           (w-data (when weights (vt-data w-flat)))
+           ;; 整型/布尔权重 → int64 计数（numpy 保持整数）；浮点权重 → double
+           (w-float (and weights
+                         (not (or (vt-int-dtype-p w-dt) (eq w-dt :bool)))))
+           (counts-dtype (cond (density :float64) (w-float :float64) (t :int64))))
+      (when (and weights (not (equal (vt-shape weights) (vt-shape tensor))))
+        (error "vt-histogram: weights 形状 ~a 与输入 ~a 不一致（numpy 要求完全相同）"
+               (vt-shape weights) (vt-shape tensor)))
+      (flet ((weight-at (i)
+               ;; 无权重 → 1（计数语义）；有权重 → 取该元素并转成累加器类型
+               (if w-data
+                   (if w-float
+                       (coerce (aref w-data i) 'double-float)
+                       (coerce (aref w-data i) 'integer))
+                   (if w-float 1.0d0 1)))
+             (finish (hist edges widths)
+               (let ((total (%histogram-total hist)))
+                 (when density
+                   (%histogram-density! hist widths total))
+                 (values (vt-from-sequence (coerce hist 'list) :dtype counts-dtype)
+                         (vt-from-sequence edges :dtype :float64)))))
+        (cond
+          ;; ---------------- 非整数 BINS：可能是边界序列，也可能是错参数 -------
+          ((not (integerp bins))
+           (when (numberp bins)
+             (error "vt-histogram: bins (~a) 必须是正整数或严格递增的边界序列（numpy 同样拒绝浮点 bins）"
+                    bins))
+           (let* ((edge-vt (vt-astype (ensure-vt bins) :float64))
+                  (edge-list (vt-to-list (vt-flatten edge-vt)))
+                  (n (length edge-list))
+                  (ev (make-array n :element-type 'double-float))
+                  (counts (make-array (max (1- n) 0) :initial-element
+                                      (if w-float 0.0d0 0))))
+             (when (< n 2)
+               (error "vt-histogram: 边界序列至少需要 2 个元素，得到 ~a 个" n))
+             (dotimes (i n)
+               (setf (aref ev i) (coerce (nth i edge-list) 'double-float)))
+             (loop for i from 1 below n
+                   do (unless (< (aref ev (1- i)) (aref ev i))
+                        (error "vt-histogram: 边界序列必须严格递增（第 ~a 个边界 ~a 不大于前一个 ~a）"
+                               i (aref ev i) (aref ev (1- i)))))
+             (loop for i from 0 below size
+                   for bi = (%histogram-bucket ev n (aref data i))
+                   when bi do (incf (aref counts bi) (weight-at i)))
+             (finish counts (coerce ev 'list)
+                     (let ((w (make-array (max (1- n) 0) :element-type 'double-float)))
+                       (dotimes (i (max (1- n) 0) w)
+                         (setf (aref w i) (- (aref ev (1+ i)) (aref ev i))))))))
           ;; ---------------- 等宽箱 ----------------
-          (let* ((data-min nil)
-                 (data-max nil))
-            (unless (and (integerp bins) (plusp bins))
-              (error "vt-histogram: bins (~a) 必须是正整数或严格递增的边界序列" bins))
-            (if range
-                (progn
-                  (unless (and (listp range) (= (length range) 2))
-                    (error "vt-histogram: range 必须是 (min max) 二元列表，得到 ~a"
-                           range))
-                  (setf data-min (first range)
-                        data-max (second range))
-                  (unless (< data-min data-max)
-                    (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
-                           data-max data-min)))
-                (progn
-                  (unless (vt-item (vt-all (vt-isfinite tensor)))
-                    (error "vt-histogram: 自动确定 bin 范围需要有限输入"))
-                  ;; %ITEM-NUMBER 而不是 VT-ITEM：:bool 输入时 VT-ITEM 给 T/NIL
-                  ;; （§17.8 逻辑视图），下面 (- data-max data-min) 直接把 NIL 丢进
-                  ;; 算术会报 "NIL is not of type NUMBER"。numpy 的 histogram(bool)
-                  ;; 正常工作（按 0/1 数值分箱），所以这里必须取数值视图。
-                  (setf data-min (%item-number (vt-item (vt-amin tensor)))
-                        data-max (%item-number (vt-item (vt-amax tensor))))
-                  (when (= data-min data-max)
-                    (setf data-min (- data-min 0.5s0)
-                          data-max (+ data-max 0.5s0)))))
-            (let* ((bin-width (/ (- data-max data-min) bins))
-                   (hist (make-array bins :initial-element 0))
-                   (edges (make-array (1+ bins) :element-type t)))
-              (loop for i from 0 to bins do
-                (setf (aref edges i) (+ data-min (* i bin-width))))
-              (loop for i from 0 below size
-                    for val = (aref data i)
-                    when (and (>= val data-min) (<= val data-max))
-                      do (let ((bi (if (= val data-max)
-                                       (1- bins)
-                                       (floor (- val data-min) bin-width))))
-                           (incf (aref hist bi))))
-              (when density
-                (let ((total (reduce #'+ hist)))
-                  (if (zerop total)
-                      (loop for i from 0 below bins do
-                        (setf (aref hist i) 0.0d0))
-                      (loop for i from 0 below bins do
-                        (setf (aref hist i)
-                              (/ (aref hist i)
-                                 (* total bin-width)))))))
-              (values (vt-from-sequence hist
-                                        ;; 对标 numpy：counts 为整数（int64）；
-                                        ;; density=t 时为归一化密度（float64）。
-                                        :dtype (if density :float64 :int64))
-                      (vt-from-sequence edges :dtype :float64))))))))
+          (t
+           (unless (plusp bins)
+             (error "vt-histogram: bins (~a) 必须是正整数或严格递增的边界序列" bins))
+           (let* ((data-min nil)
+                  (data-max nil))
+             (if range
+                 (progn
+                   (unless (and (listp range) (= (length range) 2))
+                     (error "vt-histogram: range 必须是 (min max) 二元列表，得到 ~a"
+                            range))
+                   (setf data-min (first range)
+                         data-max (second range))
+                   (unless (< data-min data-max)
+                     (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
+                            data-max data-min)))
+                 (cond
+                   ;; 空输入：numpy 的 _get_outer_edges 用 [0, 1) —— 没有值可归约，
+                   ;; 但「没有最小值」不等于「不能分箱」。原先这里直接去取 amin，
+                   ;; 于是 vt-AMIN 的内部错误代替了 (0 0 0) 的结果（§17.10.23）。
+                   ((zerop size)
+                    (setf data-min 0d0
+                          data-max 1d0))
+                   (t
+                    (unless (vt-item (vt-all (vt-isfinite tensor)))
+                      (error "vt-histogram: 自动确定 bin 范围需要有限输入"))
+                    ;; %ITEM-NUMBER 而不是 VT-ITEM：:bool 输入时 VT-ITEM 给 T/NIL
+                    ;; （§17.8 逻辑视图），下面 (- data-max data-min) 直接把 NIL 丢进
+                    ;; 算术会报 "NIL is not of type NUMBER"。numpy 的 histogram(bool)
+                    ;; 正常工作（按 0/1 数值分箱），所以这里必须取数值视图。
+                    (setf data-min (coerce (%item-number (vt-item (vt-amin tensor)))
+                                           'double-float)
+                          data-max (coerce (%item-number (vt-item (vt-amax tensor)))
+                                           'double-float))
+                    (when (= data-min data-max)
+                      ;; 全等值：两侧各让 0.5 造出一个宽度。必须是 0.5d0 ——
+                      ;; 原来写的是 0.5s0（单精度），1e8 以上 |v|±0.5 在单精度里
+                      ;; 根本不可表示，于是 data-min 与 data-max 仍相等、再被
+                      ;; (coerce … 'double-float) 截断，边界退化成三个同一个数；
+                      ;; 1e18 时连比较都失败，样本一个都没落进箱（§17.10.23）。
+                      (setf data-min (- data-min 0.5d0)
+                            data-max (+ data-max 0.5d0))
+                      ;; 扩完还相等说明该量级下 ±0.5 不可表示（如 1e18），
+                      ;; 箱宽会是 0 —— numpy 同样在这时报「range 太小」。
+                      (when (= data-min data-max)
+                        (error "vt-histogram: 数据范围 (~a) 太小，无法在 double-float 上切出 ~a 个箱（numpy 同样拒绝）"
+                               (%item-number (vt-item (vt-amin tensor))) bins))))))
+             ;; BIN-WIDTH 必须是 double：RANGE 给整数且整除时 `(/ 2 2)` 是
+             ;; **精确整数** 1，后面的宽度数组（density 用）是 double 数组，
+             ;; 直接写进去会报 "The value 1 is not of type DOUBLE-FLOAT"。
+             (let* ((bin-width (coerce (/ (- data-max data-min) bins)
+                                       'double-float))
+                    (hist (make-array bins :initial-element (if w-float 0.0d0 0)))
+                    (edges (make-array (1+ bins) :element-type t)))
+               (loop for i from 0 to bins do
+                 (setf (aref edges i) (+ data-min (* i bin-width))))
+               (loop for i from 0 below size
+                     for val = (aref data i)
+                     when (and (>= val data-min) (<= val data-max))
+                       do (let ((bi (if (= val data-max)
+                                        (1- bins)
+                                        (floor (- val data-min) bin-width))))
+                            (incf (aref hist bi) (weight-at i))))
+               (finish hist (coerce edges 'list)
+                       (let ((w (make-array bins :element-type 'double-float)))
+                         (dotimes (i bins w) (setf (aref w i) bin-width))))))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 排序
@@ -3127,6 +3199,13 @@
          (m (vt-size v-flat))
          (a-data (vt-data a-flat))
          (v-data (vt-data v-flat)))
+    ;; 空序列：numpy 的 ValueError 是「a cannot be empty」/「v cannot be
+    ;; empty」。本库原先在 m = 0 时把 offset 算成 -1 拿去下标，抛的是
+    ;; 「The value -1 is not of type (UNSIGNED-BYTE 44)」—— 既没有前缀，
+    ;; 也指不到真正的原因（§17.10.23）。
+    (flet ((op-name () (if (eq same-anchor :v) "vt-correlate" "vt-convolve")))
+      (when (zerop n) (error "~a: a 不能为空（numpy 同样拒绝）" (op-name)))
+      (when (zerop m) (error "~a: v 不能为空（numpy 同样拒绝）" (op-name))))
     ;; ================================================================
     ;; v0.4.8 性能修复：内层点积按元素类型特化
     ;;
@@ -3332,7 +3411,11 @@
                      collect (if (= d ax) (list s e) '(:all))))
              (grad-along (ax sp)
                (let ((n (nth ax shape)))
-                 (when (< n 2) (error "轴 ~a 长度 ~a 太小" ax n))
+                 ;; 报错必须带前缀：numpy 是「Shape of array too small to
+                 ;; calculate a numerical gradient」；无前缀的「轴 0 长度 1
+                 ;; 太小」既看不出是谁报的，也没说清「至少要多长」（§17.10.23）。
+                 (when (< n 2)
+                   (error "vt-gradient: 轴 ~a 长度 ~a 太小，梯度至少需要 2 个点（numpy 同样拒绝）" ax n))
                  (if (numberp sp)
                      (if (= n 2)
                          (let ((edge (vt-/ (vt-- (apply #'vt-slice tensor (slice-specs ax 1 2))

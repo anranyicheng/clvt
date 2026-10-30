@@ -172,6 +172,9 @@
   (let* ((old-shape   (vt-shape vt))
          (old-strides (vt-strides vt))
          (old-offset  (vt-offset vt))
+         ;; 空输入 → 输出必然也是空；此时 offset 的任何位移都会越出（长度同样
+         ;; 为 0 的）缓冲区，故一律原样保留。见 §17.10.23 / vt-flip 同款注释。
+         (empty-in    (zerop (vt-size vt)))
          (old-rank    (length old-shape))
          (osv  (coerce old-shape   'simple-vector))
          (ostv (coerce old-strides 'simple-vector))
@@ -270,7 +273,12 @@
                                              (ceiling (- s* e*) (- step))
                                              0)))
                                (declare (fixnum s* e* len))
-                               (incf cur-offset (the fixnum (* s* stride)))
+                               ;; 空结果不动 offset：dim = 0 时 s* 被钳到 -1，
+                               ;; (s* × stride) 会把 offset 推成负数，而 offset
+                               ;; 的类型是 (unsigned-byte 44) —— 之后任何
+                               ;; %MAKE-VT 都会在类型检查上炸（§17.10.23）。
+                               (when (plusp len)
+                                 (incf cur-offset (the fixnum (* s* stride))))
                                (setf (aref new-shape   out-i) len
                                      (aref new-strides out-i) (* stride step))))
                          (incf out-i)
@@ -298,7 +306,7 @@
               (%make-vt :data (vt-data vt)
                         :shape   (coerce new-shape   'list)
                         :strides (coerce new-strides 'list)
-                        :offset  cur-offset
+                        :offset  (if empty-in old-offset cur-offset)
                         :dtype   (vt-dtype vt)))))))))
 
 (defun (setf vt-slice) (value vt &rest specs)
