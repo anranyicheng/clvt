@@ -862,7 +862,15 @@
 (check-true "ptp/bool-error-mentions-bool"
             (search "布尔" (handler-case (progn (vt-ptp *jb*) "")
                              (error (e) (princ-to-string e)))))
-(check "ptp/int-unchanged" (vt-ptp (vt-from-sequence '(3 9 1))) 8.0d0)
+;; M3 的实数回归现在按 §6.5 判「返回 vt 而非 Lisp 标量」：vt-ptp 的全归约
+;; 结果恒为 0 维张量，值仍是 8.0d0（float64 入参），int64 入参则保 int64。
+(check "ptp/real-unchanged" (vt-to-list (vt-ravel (vt-ptp (vt-from-sequence '(3 9 1)))))
+       '(8.0d0))
+(check "ptp/real-unchanged/shape" (vt-shape (vt-ptp (vt-from-sequence '(3 9 1)))) nil)
+(check "ptp/int-unchanged" (vt-to-list (vt-ravel (vt-ptp (vt-from-sequence '(3 9 1) :dtype :int64))))
+       '(8))
+(check "ptp/int-unchanged/dtype" (vt-dtype (vt-ptp (vt-from-sequence '(3 9 1) :dtype :int64)))
+       :int64)
 
 ;; M4. 形状工具收到张量：原实现在 (safety 0) + `(declare (list …))` 下取
 ;;     car 链，实测 `Unhandled memory fault at #x0`。误用应当拿到错误消息。

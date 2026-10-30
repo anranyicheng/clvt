@@ -1953,11 +1953,12 @@ lu/b/ob: 连续行主序句柄（通用: simple-array；AVX: SAP），s1=1。"
                      (= (first b-shape) n))
           (error "vt-solve: b 的行数 ~a 与系数矩阵阶数 ~a 不匹配（b 形状 ~a）"
                  (if b-shape (first b-shape) 0) n b-shape))
-        (let* ((nrhs (if (> (length b-shape) 1) (second b-shape) 1))
+        (let* ((b-vector-p (= (length b-shape) 1))
+               (nrhs (if b-vector-p 1 (second b-shape)))
                ;; 1D b 先 reshape 为 n×1 列向量（与原实现一致），再确保连续
                (b-copy (ensure-contiguous-2d-vt
                         (let ((b2 (vt-astype (vt-copy b-vt) :float64)))
-                          (if (= nrhs 1)
+                          (if b-vector-p
                               (vt-reshape b2 (list n 1))
                               b2))))
                (orig-b (vt-copy b-copy)))
@@ -2007,7 +2008,11 @@ lu/b/ob: 连续行主序句柄（通用: simple-array；AVX: SAP），s1=1。"
                       b-data b-off b-s0 b-s1
                       ob-data ob-off ob-s0 ob-s1
                       piv nrhs singular-threshold)))
-                  (let ((res (if (= nrhs 1)
+                  ;; 结果形状只由**输入的秩**决定，不能由 nrhs 是否等于 1 决定：
+                  ;; b 是 (n,1) 的二维单列右端项时，nrhs 恰好也是 1，按 nrhs
+                  ;; 判定会把用户给的二维结果压成一维（vt-inv 的 1×1 矩阵就是
+                  ;; 这条路径，实测返回 shape (1) 而 numpy 是 (1,1)）。
+                  (let ((res (if b-vector-p
                                  (vt-reshape b-copy (list n))
                                  b-copy)))
                     (if out

@@ -1973,8 +1973,60 @@
        (let ((w (elt seq (1- n))))
          (and (floatp w) (%nan-p w)))))
 
+(defun %fold-reduce-axes (tensor axes keepdims)
+  "把**多个**归约轴 AXES 折成末尾一维，返回 (values 2D视图 目标形状)。
+
+  思路：置换 (保留轴…, 归约轴…) → 重塑成 (H, D) —— H = 保留轴元素数，
+  D = 归约区元素数 —— 于是「沿 (0,1) 归约」变成「沿单轴 1 归约」，
+  可以直接复用测透了的单轴内核，不必再写一套多维 fiber 遍历。
+
+  正确性前提：调用方（median / nanmedian）对归约区内元素的**顺序不敏感**
+  （内部要排序），所以把归约轴搬到末尾、再把它们压成一维，不改变结果。
+  `vt-reshape` 对非连续视图会自动落地（先 vt-contiguous 再重塑），
+  因此任意 strides / 负步长 / 偏移的输入都成立。"
+  (let* ((shape (vt-shape tensor))
+         (rank (length shape))
+         (axes (sort (copy-list axes) #'<))
+         (kept (loop for i below rank unless (member i axes) collect i))
+         (kept-shape (mapcar (lambda (i) (nth i shape)) kept))
+         (red-size (reduce #'* (mapcar (lambda (i) (nth i shape)) axes)
+                           :initial-value 1))
+         (h (reduce #'* kept-shape :initial-value 1))
+         (two (vt-reshape (vt-transpose tensor (append kept axes))
+                          (list h red-size)))
+         (target (if keepdims
+                     (loop for d in shape for i from 0
+                           collect (if (member i axes) 1 d))
+                     kept-shape)))
+    (values two target)))
+
+(defun %multi-axis-reduce (fn tensor axis keepdims)
+  "把 FN（一个「沿单轴归约」的张量函数）扩成多轴版本。
+
+  做法：`%fold-reduce-axes` 折成 (H, D) → 调 (FN two :axis 1) → 重塑回目标
+  形状。FN 必须是 `(fn TENSOR &key axis)` 形态的单轴归约函数。"
+  (let* ((in (ensure-vt tensor))
+         (axes (vt-normalize-axes axis (length (vt-shape in)))))
+    (multiple-value-bind (two target)
+        (%fold-reduce-axes in axes keepdims)
+      (vt-reshape (funcall fn two :axis 1) target))))
+
 (defun vt-median (tensor &key axis keepdims)
-  "中位数（对标 numpy.median）。偶数个元素取中间两数平均。"
+  "中位数（对标 numpy.median）。偶数个元素取中间两数平均。
+
+   axis 接受 nil / 整数 / 整数列表。**多轴**（如 '(0 1)）与单元素列表
+   （如 '(0)）都已支持：多轴先折叠成 (H, D) 再复用单轴内核（见
+   %MULTI-AXIS-REDUCE），单元素列表退化成整数轴。此前 `:axis '(0 1)`
+   会直接抛 `The value (0 1) is not of type ...`，而 numpy 是支持的；
+   复数入参走同一折叠路径（折叠只用 transpose/reshape，与 dtype 无关）。
+   :keepdims 语义同 numpy：axis=nil 时结果形状为全 1（秩不变）。"
+  ;; 多轴 / 单元素列表：在复数分派**之前**处理，复数也能享受折叠路径
+  (when (listp axis)
+    (let ((axes (vt-normalize-axes axis (length (vt-shape (ensure-vt tensor))))))
+      (cond ((null axes) (setf axis nil))
+            ((null (cdr axes)) (setf axis (car axes)))
+            (t (return-from vt-median
+                 (%multi-axis-reduce #'vt-median tensor axes keepdims))))))
   (when (%cx-any-p tensor)
     (return-from vt-median (%cx-op-median tensor :axis axis :keepdims keepdims)))
   (with-float-safe
@@ -2067,7 +2119,11 @@
 
 (defun vt-percentile (tensor percentile &key axis keepdims (interpolation :linear))
   "计算百分位数（对标 numpy.percentile）。
-   PERCENTILE 必须在 [0, 100] 内：
+   PERCENTILE 可以是实数，也可以是**实数序列**（list / vector）：
+     - 实数：结果形状同单次归约（见下）；
+     - 序列：对每个分位点各算一遍，再沿**新的首轴**堆叠 —— 即结果形状为
+       (分位点个数, 其余维…)，与 numpy 一致（np.percentile(a, [25,50])）。
+   单个实数 PERCENTILE 必须在 [0, 100] 内：
      - 0   → 最小值
      - 50  → 中位数
      - 100 → 最大值
@@ -2076,13 +2132,43 @@
      对标 numpy.percentile 的 interpolation 参数。默认 :linear。
    KEEPDIMS = t 时，轴归约保留归约轴为 1，全局归约返回 (1 1 ... 1)，
      与 numpy 的 keepdims=True 一致。
+   AXIS 接受 nil / 整数 / 整数列表。**多轴**（如 '(0 1)）先经
+     %FOLD-REDUCE-AXES 折叠成 (H, D) 再复用单轴内核（与 VT-MEDIAN 同一条
+     路径），语义与 numpy 的轴元组一致；单元素列表退化成整数轴。
+     多轴与分位点序列可以同时用：先堆叠分位点（新首轴），再折轴 —— 与
+     numpy 的 np.percentile(a, [10 90], axis=(0,1)) 形状 (2, …) 一致。
    返回：0 维张量（当 axis=nil 且 keepdims=nil）、形状 (1 1 ... 1)
          的张量（当 axis=nil 且 keepdims=t）、或降维后的张量。"
-      (when (%cx-reject tensor percentile)
+  ;; ---- 分位点序列：逐个算再沿首轴堆叠（对标 numpy 的 q 数组语义）----
+  (when (or (null percentile)
+            (consp percentile)
+            (and (vectorp percentile) (not (stringp percentile))))
+    (let ((qs (if (null percentile) nil (coerce percentile 'list))))
+      (unless qs
+        (error "vt-percentile: percentile 序列不能为空"))
+      (return-from vt-percentile
+        (apply #'vt-stack 0 (mapcar (lambda (q)
+                              (vt-percentile tensor q :axis axis
+                                             :keepdims keepdims
+                                             :interpolation interpolation))
+                            qs)))))
+  ;; ---- 多轴 / 单元素列表：折成 (H, D) 后复用单轴内核（与 VT-MEDIAN 同路）----
+  ;; (vt-normalize-axis AXIS RANK) 只认整数；这里若直接把 '(0 1) 传下去，
+  ;; 下游 (= I AX) 会抛「The value (0 1) is not of type REAL」—— 内部类型
+  ;; 泄漏，用户看不出是轴的问题。numpy 的 percentile 支持轴元组，故补齐。
+  (when (listp axis)
+    (let ((axes (vt-normalize-axes axis (length (vt-shape (ensure-vt tensor))))))
+      (cond ((null axes) (setf axis nil))
+            ((null (cdr axes)) (setf axis (car axes)))
+            (t (multiple-value-bind (two target)
+                   (%fold-reduce-axes (ensure-vt tensor) axes keepdims)
+                 (return-from vt-percentile
+                   (vt-reshape (vt-percentile two percentile :axis 1
+                                              :interpolation interpolation)
+                               target)))))))
+  (when (%cx-reject tensor percentile)
     (error "vt-percentile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(when (%cx-reject tensor percentile)
-    (error "vt-percentile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(with-float-safe
+  (with-float-safe
     (unless (realp percentile)
       (error "vt-percentile: percentile 必须为实数，得到 ~a (type ~a)"
              percentile (type-of percentile)))
@@ -2153,18 +2239,28 @@
 
 (defun vt-quantile (tensor q &key axis keepdims (interpolation :linear))
   "计算分位数（对标 numpy.quantile）。
-   Q 必须在 [0, 1] 内：
+   Q 可以是实数，也可以是**实数序列**（list / vector）；序列结果沿新的首轴
+   堆叠，形状 (分位点个数, 其余维…)，与 numpy 一致。
+   单个实数 Q 必须在 [0, 1] 内：
      - 0.0  → 最小值
      - 0.5  → 中位数
      - 1.0  → 最大值
      越界（<0 或 >1）报错；NaN 亦报错（NaN 不满足 <= 比较）。
    等价于 (vt-percentile tensor (* q 100) ...)。
    INTERPOLATION 含义见 vt-percentile；KEEPDIMS 语义见 vt-percentile。"
-      (when (%cx-reject tensor q)
+  (when (or (consp q) (and (vectorp q) (not (stringp q))))
+    (let ((qs (coerce q 'list)))
+      (unless qs
+        (error "vt-quantile: q 序列不能为空"))
+      (return-from vt-quantile
+        (apply #'vt-stack 0 (mapcar (lambda (qq)
+                              (vt-quantile tensor qq :axis axis
+                                           :keepdims keepdims
+                                           :interpolation interpolation))
+                            qs)))))
+  (when (%cx-reject tensor q)
     (error "vt-quantile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(when (%cx-reject tensor q)
-    (error "vt-quantile: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(unless (realp q)
+  (unless (realp q)
     (error "vt-quantile: q 必须为实数，得到 ~a (type ~a)"
            q (type-of q)))
   (unless (<= 0 q 1)
@@ -2174,8 +2270,11 @@
                  :keepdims keepdims
                  :interpolation interpolation))
 
-(defun vt-ptp (tensor &key axis)
+(defun vt-ptp (tensor &key axis keepdims)
   "峰谷差 max - min（对标 numpy.ptp）。
+
+   axis / keepdims 语义同 vt-amax：axis=nil 为全归约，
+   结果恒为**张量**（全归约时是 0 维 vt，见 CONVENTIONS §6.5）。
 
    布尔输入报错（CONVENTIONS §17.3、§17.10.13）：峰谷差本身就是一个减法，
    numpy 明确拒绝（`TypeError: numpy boolean subtract, the - operator, is
@@ -2184,80 +2283,164 @@
    `(vt-item bool标量)` 自 §17.8 起返回 T/NIL —— 于是同一个函数在两个
    分支上报两种错：一个是「布尔减法未定义」，另一个是
    「The value T is not of type NUMBER」。后者是内部类型泄漏，用户既
-   看不出是布尔的问题，也不知道该换成什么。"
+   看不出是布尔的问题，也不知道该换成什么。
+
+   示例：
+     (vt-ptp (vt-from-sequence '((1 2) (3 5))))            ; => 0 维 vt，值 4
+     (vt-ptp (vt-from-sequence '((1 2) (3 5))) :axis 0)    ; => [2 3]
+     (vt-ptp (vt-from-sequence '((1 2) (3 5))) :keepdims t) ; => shape (1 1)"
   (let ((tv (ensure-vt tensor)))
     (when (eq (vt-dtype tv) :bool)
       (error "vt-ptp: 布尔张量不支持峰谷差（numpy 同样拒绝：布尔减法未定义）。 ~
               要计数请用 vt-count-nonzero，要看相邻差异请用 vt-diff（相邻异或）； ~
               见 CONVENTIONS §17.3"))
-    (if axis
-        (vt-- (vt-amax tv :axis axis) (vt-amin tv :axis axis))
-        (- (vt-item (vt-amax tv)) (vt-item (vt-amin tv))))))
+    ;; 两条分支都走 vt--：全归约时 vt-amax/vt-amin 返回 0 维 vt，
+    ;; 相减仍是 0 维 vt。原实现用 (vt-item …) 取标量再相减，得到的是
+    ;; Lisp 数 —— 违反 §6.5「张量函数一律返回 vt」，也让 :keepdims 无处可放。
+    (vt-- (vt-amax tv :axis axis :keepdims keepdims)
+          (vt-amin tv :axis axis :keepdims keepdims))))
+
+(defun %histogram-bucket (edges-vec n val)
+  "在升序边界向量 EDGES-VEC（长度 N）上定位 VAL 所属 bin 的下标。
+
+  返回 NIL 表示落在 [edges[0], edges[n-1]] 之外（不计入，对标 numpy）；
+  否则返回 0..n-2。边界语义同 numpy 的 searchsorted(side='right')-1：
+  恰好等于某条内部边界时归入**右侧** bin，等于最后一条边界时归入最后一个 bin。
+  EDGES-VEC 的下标 n-1 是最后一条边界。"
+  (declare (type (simple-array double-float (*)) edges-vec) (type fixnum n))
+  ;; NaN 不属于任何箱。不显式拦的话它会从两侧比较里漏过去（NaN 与任何数
+  ;; 的 < / > 都是假），一路走到二分末尾落进**最后一个箱** —— numpy 是丢弃。
+  (when (%nan-p val)
+    (return-from %histogram-bucket nil))
+  (when (or (< (coerce val 'double-float) (aref edges-vec 0))
+            (> (coerce val 'double-float) (aref edges-vec (1- n))))
+    (return-from %histogram-bucket nil))
+  ;; 最后一个 bin 单独处理：val == edges[n-1] 时 floor 会越界
+  (when (>= (coerce val 'double-float) (aref edges-vec (1- n)))
+    (return-from %histogram-bucket (- n 2)))
+  (let ((lo 0) (hi (1- n)))
+    (declare (type fixnum lo hi))
+    ;; 不变式：edges[lo] <= val（且 lo 是满足该式的**最大**下标），edges[hi] > val
+    (loop while (> hi (1+ lo)) do
+      (let ((mid (ash (+ lo hi) -1)))
+        (declare (type fixnum mid))
+        ;; 等于内部边界时走「右侧」bin，故 val < edges[mid] 才收窄上界
+        (if (< (coerce val 'double-float) (aref edges-vec mid))
+            (setf hi mid)
+            (setf lo mid))))
+    lo))
 
 (defun vt-histogram (tensor &key bins range density)
-  "直方图统计（对标 numpy.histogram）。返回 (values counts edges)。"
-      (when (%cx-reject tensor)
+  "直方图统计（对标 numpy.histogram）。返回两个值：counts 与 edges。
+
+  BINS 接受两种形态（与 numpy 一致）：
+    正整数（缺省 10）—— 在 [data-min, data-max] 上等宽切分 BINS 个箱，
+        边界由 RANGE 或数据极值决定；counts 长度为 BINS。
+    边界序列（list / vector / vt，至少 2 个元素且严格递增）—— 直接作为
+        箱边界；counts 长度为 边界数-1。区间 [edges[0], edges[-1]] 之外的
+        元素**不计入**，恰好等于内部边界的元素归入右侧箱，等于最后一条
+        边界的元素归入最后一个箱（对标 numpy 的 searchsorted side='right'）。
+        此时 RANGE 被忽略（numpy 同样忽略并给出 DeprecationWarning）。
+
+  counts 的 dtype：整数计数为 :int64；DENSITY=t 时为归一化密度 :float64
+  （每箱除以 总数×箱宽）。EDGES 恒为 :float64。
+
+  NaN/Inf：自动确定范围（未给 RANGE）时要求输入全为有限值，否则报错
+  （numpy 抛 ValueError）；显式 RANGE 时区间外的值（含 NaN）自然被丢弃。
+  复数输入报错（numpy 同样拒绝）。
+
+  示例：
+    (nth-value 0 (vt-histogram (vt-arange 10) :bins 5))            ; => 各箱计数
+    (nth-value 1 (vt-histogram (vt-arange 10) :bins '(0 2 5 9)))   ; => (0 2 5 9)"
+  (when (%cx-reject tensor)
     (error "vt-histogram: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(when (%cx-reject tensor)
-    (error "vt-histogram: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(with-float-safe
+  (with-float-safe
     (let* ((flat (vt-flatten tensor))
            (data (vt-data flat))
            (size (vt-size flat))
-           (bins (or bins 10))
-           (data-min nil)
-           (data-max nil))
-      (unless (and (integerp bins) (plusp bins))
-        (error "vt-histogram: bins (~a) 必须为正整数" bins))
-
-      (if range
-          (progn
-            (unless (and (listp range) (= (length range) 2))
-              (error "vt-histogram: range 必须是 (min max) 二元列表，得到 ~a"
-                     range))
-            (setf data-min (first range)
-                  data-max (second range))
-            (unless (< data-min data-max)
-              (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
-                     data-max data-min)))
-          (progn
-            (unless (vt-item (vt-all (vt-isfinite tensor)))
-              (error "自动确定 bin 范围需要有限输入"))
-            ;; %ITEM-NUMBER 而不是 VT-ITEM：:bool 输入时 VT-ITEM 给 T/NIL
-            ;; （§17.8 逻辑视图），下面 (- data-max data-min) 直接把 NIL 丢进
-            ;; 算术会报 "NIL is not of type NUMBER"。numpy 的 histogram(bool)
-            ;; 正常工作（按 0/1 数值分箱），所以这里必须取数值视图。
-            (setf data-min (%item-number (vt-item (vt-amin tensor)))
-                  data-max (%item-number (vt-item (vt-amax tensor))))
-            (when (= data-min data-max)
-              (setf data-min (- data-min 0.5s0)
-                    data-max (+ data-max 0.5s0)))))
-      (let* ((bin-width (/ (- data-max data-min) bins))
-             (hist (make-array bins :initial-element 0))
-             (edges (make-array (1+ bins) :element-type t)))
-        (loop for i from 0 to bins do
-          (setf (aref edges i) (+ data-min (* i bin-width))))
-        (loop for i from 0 below size
-              for val = (aref data i)
-              when (and (>= val data-min) (<= val data-max))
-                do (let ((bi (if (= val data-max)
-                                 (1- bins)
-                                 (floor (- val data-min) bin-width))))
-                     (incf (aref hist bi))))
-        (when density
-          (let ((total (reduce #'+ hist)))
-            (if (zerop total)
-                (loop for i from 0 below bins do
-                  (setf (aref hist i) 0.0d0))
-                (loop for i from 0 below bins do
-                  (setf (aref hist i)
-                        (/ (aref hist i)
-                           (* total bin-width)))))))
-        (values (vt-from-sequence hist
-                                  ;; 对标 numpy：counts 为整数（int64）；
-                                  ;; density=t 时为归一化密度（float64）。
-                                  :dtype (if density :float64 :int64))
-                (vt-from-sequence edges :dtype :float64))))))
+           (bins (or bins 10)))
+      (if (not (integerp bins))
+          ;; ---------------- 显式边界 ----------------
+          (let* ((edge-vt (vt-astype (ensure-vt bins) :float64))
+                 (edge-list (vt-to-list (vt-flatten edge-vt)))
+                 (n (length edge-list))
+                 (ev (make-array n :element-type 'double-float))
+                 (counts (make-array (max (1- n) 0) :initial-element 0)))
+            (when (< n 2)
+              (error "vt-histogram: 边界序列至少需要 2 个元素，得到 ~a 个" n))
+            (dotimes (i n)
+              (setf (aref ev i) (coerce (nth i edge-list) 'double-float)))
+            (loop for i from 1 below n
+                  do (unless (< (aref ev (1- i)) (aref ev i))
+                       (error "vt-histogram: 边界序列必须严格递增（第 ~a 个边界 ~a 不大于前一个 ~a）"
+                              i (aref ev i) (aref ev (1- i)))))
+            (loop for i from 0 below size
+                  for bi = (%histogram-bucket ev n (aref data i))
+                  when bi do (incf (aref counts bi)))
+            (when density
+              (let ((total (reduce #'+ counts)))
+                (loop for i from 0 below (1- n) do
+                  (setf (aref counts i)
+                        (if (zerop total)
+                            0.0d0
+                            (/ (aref counts i)
+                               (* total (- (aref ev (1+ i)) (aref ev i)))))))))
+            (values (vt-from-sequence (coerce counts 'list)
+                                      :dtype (if density :float64 :int64))
+                    (vt-from-sequence (coerce ev 'list) :dtype :float64)))
+          ;; ---------------- 等宽箱 ----------------
+          (let* ((data-min nil)
+                 (data-max nil))
+            (unless (and (integerp bins) (plusp bins))
+              (error "vt-histogram: bins (~a) 必须是正整数或严格递增的边界序列" bins))
+            (if range
+                (progn
+                  (unless (and (listp range) (= (length range) 2))
+                    (error "vt-histogram: range 必须是 (min max) 二元列表，得到 ~a"
+                           range))
+                  (setf data-min (first range)
+                        data-max (second range))
+                  (unless (< data-min data-max)
+                    (error "vt-histogram: range 中 max (~a) 必须严格大于 min (~a)"
+                           data-max data-min)))
+                (progn
+                  (unless (vt-item (vt-all (vt-isfinite tensor)))
+                    (error "vt-histogram: 自动确定 bin 范围需要有限输入"))
+                  ;; %ITEM-NUMBER 而不是 VT-ITEM：:bool 输入时 VT-ITEM 给 T/NIL
+                  ;; （§17.8 逻辑视图），下面 (- data-max data-min) 直接把 NIL 丢进
+                  ;; 算术会报 "NIL is not of type NUMBER"。numpy 的 histogram(bool)
+                  ;; 正常工作（按 0/1 数值分箱），所以这里必须取数值视图。
+                  (setf data-min (%item-number (vt-item (vt-amin tensor)))
+                        data-max (%item-number (vt-item (vt-amax tensor))))
+                  (when (= data-min data-max)
+                    (setf data-min (- data-min 0.5s0)
+                          data-max (+ data-max 0.5s0)))))
+            (let* ((bin-width (/ (- data-max data-min) bins))
+                   (hist (make-array bins :initial-element 0))
+                   (edges (make-array (1+ bins) :element-type t)))
+              (loop for i from 0 to bins do
+                (setf (aref edges i) (+ data-min (* i bin-width))))
+              (loop for i from 0 below size
+                    for val = (aref data i)
+                    when (and (>= val data-min) (<= val data-max))
+                      do (let ((bi (if (= val data-max)
+                                       (1- bins)
+                                       (floor (- val data-min) bin-width))))
+                           (incf (aref hist bi))))
+              (when density
+                (let ((total (reduce #'+ hist)))
+                  (if (zerop total)
+                      (loop for i from 0 below bins do
+                        (setf (aref hist i) 0.0d0))
+                      (loop for i from 0 below bins do
+                        (setf (aref hist i)
+                              (/ (aref hist i)
+                                 (* total bin-width)))))))
+              (values (vt-from-sequence hist
+                                        ;; 对标 numpy：counts 为整数（int64）；
+                                        ;; density=t 时为归一化密度（float64）。
+                                        :dtype (if density :float64 :int64))
+                      (vt-from-sequence edges :dtype :float64))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 排序
@@ -2672,38 +2855,11 @@
                (vt-copy-into out var)
                out)))))
 
-(defun %nanmedian-fold-axes (tensor axes keepdims)
-  "把**多个**归约轴 AXES 折成末尾一维，返回 (values 2D视图 目标形状)。
-
-  思路：置换 (保留轴…, 归约轴…) → 重塑成 (H, D) —— H = 保留轴元素数，
-  D = 归约区元素数 —— 于是「沿 (0,1) 归约」变成「沿单轴 1 归约」，
-  可以直接复用测透了的单轴内核，不必再写一套多维 fiber 遍历。
-
-  正确性前提：中位数对归约区内元素的**顺序不敏感**（内部要排序），
-  所以把归约轴搬到末尾、再把它们压成一维，不改变结果。
-  `vt-reshape` 对非连续视图会自动落地（先 vt-contiguous 再重塑），
-  因此任意 strides / 负步长 / 偏移的输入都成立。"
-  (let* ((shape (vt-shape tensor))
-         (rank (length shape))
-         (axes (sort (copy-list axes) #'<))
-         (kept (loop for i below rank unless (member i axes) collect i))
-         (kept-shape (mapcar (lambda (i) (nth i shape)) kept))
-         (red-size (reduce #'* (mapcar (lambda (i) (nth i shape)) axes)
-                           :initial-value 1))
-         (h (reduce #'* kept-shape :initial-value 1))
-         (two (vt-reshape (vt-transpose tensor (append kept axes))
-                          (list h red-size)))
-         (target (if keepdims
-                     (loop for d in shape for i from 0
-                           collect (if (member i axes) 1 d))
-                     kept-shape)))
-    (values two target)))
-
 (defun %nanmedian-multi (tensor axis keepdims out)
   "实数：多轴 nanmedian。折叠成 2-D 后复用单轴内核，再重塑回目标形状。"
   (let* ((in (ensure-vt tensor))
          (axes (vt-normalize-axes axis (length (vt-shape in)))))
-    (multiple-value-bind (two target) (%nanmedian-fold-axes in axes keepdims)
+    (multiple-value-bind (two target) (%fold-reduce-axes in axes keepdims)
       (let ((res (vt-reshape (vt-nanmedian two :axis 1) target)))
         (cond ((null out) res)
               ((eq res out) out)
@@ -2784,7 +2940,15 @@
                                        ":out 是只读的广播视图（存在 dim>1 且 stride=0 的轴）")))
                     (vt-fill out result)
                     out)
-                  (make-vt nil result :dtype :float64))))
+                  ;; 缺省返回值：keepdims 时必须是**全 1 形状**（秩不变）。
+                  ;; 原实现这里恒为 (make-vt nil …) —— 于是
+                  ;; (vt-nanmedian a :keepdims t) 返回 0 维，而同族的
+                  ;; vt-median 返回 (1 1)，同一个 keepdims 参数两个函数给出
+                  ;; 两种形状，且与 numpy.nanmedian 不符。
+                  (make-vt (if keepdims
+                               (make-list rank :initial-element 1)
+                               nil)
+                           result :dtype :float64))))
           (let* ((ax (vt-normalize-axis axis rank))
                  (ax-size (nth ax in-shape))
                  (ax-stride (nth ax in-strides))
@@ -3062,9 +3226,7 @@
      (vt-interp 2.5d0 #(1d0 3d0) #(10d0 30d0))  => [25.0]（float64；输出恒 1D）
      (vt-interp #(0d0 5d0) #(1d0 3d0) #(10d0 30d0) :left -1d0 :right -2d0)
        => #(-1.0d0 -2.0d0)"
-      (when (%cx-reject x xp fp)
-    (error "vt-interp: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(when (%cx-reject x xp fp)
+  (when (%cx-reject x xp fp)
     (error "vt-interp: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (with-float-safe
     ;; v0.4.8：%FLAT-OFFSET0 保证 offset=0 —— 主循环用裸 AREF 取数，而

@@ -256,20 +256,39 @@
   (vt-map #'lognot vt :dtype dtype :out out))
 
 (defun vt-left-shift (vt shift &key out dtype)
-  "逐元素左移 SHIFT 位（ash x shift）。SHIFT 为整数标量。
-      输入应为整数 dtype；:out 契约同 vt-+。"
-    (when (%cx-reject vt shift)
+  "逐元素左移（对标 numpy.left_shift / ash）。
+
+  SHIFT 可以是**整数标量**，也可以是**整数张量**（与 VT 广播，逐元素移位）。
+  此前只接受标量：第二个操作数给张量时会抛
+  `The value #<VT …> is not of type INTEGER` —— 而 numpy 的 left_shift 是
+  逐元素 ufunc，`np.left_shift(x, y)` 用两个数组是最常见写法。
+  输入应为整数 dtype；:out 契约同 vt-+。
+
+  示例：
+    (vt-left-shift (vt-from-sequence '(1 2 3) :dtype :int64) 2)        ; => [4 8 12]
+    (vt-left-shift (vt-from-sequence '(1 2 3) :dtype :int64)
+                   (vt-from-sequence '(0 1 2) :dtype :int64))          ; => [1 4 12]"
+  (when (%cx-reject vt shift)
     (error "vt-left-shift: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-map (lambda (x) (ash x shift))
-          vt :dtype dtype :out out))
+  (if (vt-p shift)
+      (vt-map (lambda (x s) (ash x s)) vt shift :dtype dtype :out out)
+      (vt-map (lambda (x) (ash x shift)) vt :dtype dtype :out out)))
 
 (defun vt-right-shift (vt shift &key out dtype)
-  "逐元素右移 SHIFT 位（ash x -shift，算术右移）。SHIFT 为整数标量。
-      输入应为整数 dtype；:out 契约同 vt-+。"
-    (when (%cx-reject vt shift)
+  "逐元素右移（对标 numpy.right_shift / 算术右移）。
+
+  SHIFT 可以是**整数标量**，也可以是**整数张量**（与 VT 广播，逐元素移位）。
+  此前只接受标量：第二个操作数给张量时会抛
+  `The value #<VT …> is not of type INTEGER`，原因同 vt-left-shift。
+  输入应为整数 dtype；:out 契约同 vt-+。
+
+  示例：
+    (vt-right-shift (vt-from-sequence '(-8 8 12) :dtype :int64) 2)     ; => [-2 2 3]"
+  (when (%cx-reject vt shift)
     (error "vt-right-shift: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-map (lambda (x) (ash x (- shift)))
-          vt :dtype dtype :out out))
+  (if (vt-p shift)
+      (vt-map (lambda (x s) (ash x (- s))) vt shift :dtype dtype :out out)
+      (vt-map (lambda (x) (ash x (- shift))) vt :dtype dtype :out out)))
 
 (declaim (inline %op-clip))
 (defun %op-clip (x minv maxv)

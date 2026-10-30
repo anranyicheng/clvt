@@ -874,7 +874,7 @@
 (defun %cx-nanmedian-multi (in axes keepdims out dtype)
   "复数：多轴 nanmedian —— 折叠成 (H, D) 后复用单轴内核，再重塑回目标形状。"
   (with-float-safe
-    (multiple-value-bind (two target) (%nanmedian-fold-axes in axes keepdims)
+    (multiple-value-bind (two target) (%fold-reduce-axes in axes keepdims)
       (let* ((dt (or dtype (vt-dtype in)))
              (res (vt-reshape (%cx-op-nanmedian two :axis 1 :dtype dt) target)))
         (cond ((null out) res)

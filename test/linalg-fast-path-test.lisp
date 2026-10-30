@@ -115,9 +115,14 @@
   (ln-t! "ref/det-sing3"    (< (abs (vt-ref (vt-det (vt-copy *m-sing3*)))) 1d-12))
   (ln-t! "ref/det-one1x1"   (ln-close-p (vt-ref (vt-det (vt-copy *m-one1x1*))) -5.0d0 1d-9))
   ;; SOLVE（参考: x=[5.75, -5.5, 2.75]；多右端项第 1 列同 x）
+  ;; 结果秩由**输入的秩**决定：b 是 (n,1) 就返回 (n,1)，不因 nrhs=1 塌成 1-D
+  ;; （numpy: np.linalg.solve(A, [[1],[2],[3]]) -> shape (3,1)）。
   (ln-t! "ref/solve-general3"
-         (ln-vec-close-p (vt-to-list (vt-solve (vt-copy *m-general3*) (a= '((1.0d0) (2.0d0) (3.0d0)))))
+         (ln-vec-close-p (vt-to-list (vt-flatten (vt-solve (vt-copy *m-general3*) (a= '((1.0d0) (2.0d0) (3.0d0))))))
                          '(5.75d0 -5.5d0 2.75d0)))
+  (ln-t! "ref/solve-general3/col-shape-not-flattened"
+         (equal (vt-shape (vt-solve (vt-copy *m-general3*) (a= '((1.0d0) (2.0d0) (3.0d0)))))
+                '(3 1)))
   (ln-t! "ref/solve-general3-multi"
          (ln-tensor-close-p (vt-solve (vt-copy *m-general3*)
                                       (a= '((1.0d0 4.0d0 7.0d0) (2.0d0 5.0d0 8.0d0) (3.0d0 6.0d0 9.0d0))))
@@ -375,9 +380,9 @@
           (ln-t! "numpy/det-general3"
                  (ln-close-p (vt-ref (vt-det (vt-copy *m-general3*)))
                              (first (numpy-eval (format nil "np.linalg.det(~A)" (matrix-literal *m-general3*)))) 1d-8))
-          ;; solve
+          ;; solve（b 给成列向量 (3,1) 时结果仍是 (3,1)，故比较前拉平）
           (ln-t! "numpy/solve-general3"
-                 (ln-vec-close-p (vt-to-list (vt-solve (vt-copy *m-general3*) (a= '((1.0d0) (2.0d0) (3.0d0)))))
+                 (ln-vec-close-p (vt-to-list (vt-flatten (vt-solve (vt-copy *m-general3*) (a= '((1.0d0) (2.0d0) (3.0d0))))))
                                  (numpy-eval (format nil "np.linalg.solve(~A,(1.0,2.0,3.0))"
                                                      (matrix-literal *m-general3*))) 1d-8))
           ;; cholesky

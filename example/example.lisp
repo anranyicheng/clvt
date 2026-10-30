@@ -4715,7 +4715,9 @@
   ;; np.ptp(a) -> 4
   ;; np.ptp(a, axis=0) -> [2,3]
   (let* ((a (vt-from-sequence '((1 5) (3 2)) :dtype :int64))
-         (p (vt-ptp a)))
+         ;; vt-ptp 与所有归约一样返回**张量**（全归约时是 0 维 vt，见
+         ;; CONVENTIONS §6.5），取标量值用 vt-item。
+         (p (vt-item (vt-ptp a))))
     (assert (= p 4.0d0))
     (let ((p0 (vt-to-list (vt-ptp a :axis 0))))
       (assert (equal p0 '(2 3)))))
