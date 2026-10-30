@@ -3059,7 +3059,7 @@
      · 无 period 参数。
      · xp 含 NaN 时行为未定义。
    示例：
-     (vt-interp 2.5d0 #(1d0 3d0) #(10d0 30d0))  => 25.0d0
+     (vt-interp 2.5d0 #(1d0 3d0) #(10d0 30d0))  => [25.0]（float64；输出恒 1D）
      (vt-interp #(0d0 5d0) #(1d0 3d0) #(10d0 30d0) :left -1d0 :right -2d0)
        => #(-1.0d0 -2.0d0)"
       (when (%cx-reject x xp fp)

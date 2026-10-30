@@ -469,6 +469,9 @@ vt-float-pos-inf-p
 vt-float-neg-inf-p
 vt-float-inf-=
 vt-float-nan-inf-=
+vt-get-nan          ;; 按 dtype 取 NaN 常量（对标 np.nan）
+vt-get-pos-inf      ;; 按 dtype 取 +Inf（对标 np.inf）
+vt-get-neg-inf      ;; 按 dtype 取 -Inf（对标 -np.inf）
 
 ;; 核心迭代与映射
 vt-map
@@ -610,7 +613,7 @@ vt-isin             ;; 元素是否在给定集合中 (对标 numpy.isin)
 (run-all-tests)
 ```
 
-自动化测试（统一入口 `test/run-tests.sh`，共 42 个套件：40 个默认 + 2 个性能基准）:
+自动化测试（统一入口 `test/run-tests.sh`，共 68 个套件：65 个默认 + 3 个性能基准）:
 ```bash
 # 运行所有默认套件（跳过性能基准）
 bash test/run-tests.sh
@@ -706,6 +709,25 @@ bash test/run-tests.sh --list
 | `extensions.lisp` | 扩展功能 |
 | `extensions2.lisp` | 第二批扩展功能（fliplr/geomspace/one-hot/layer-norm 等） |
 | `extensions3.lisp` | 第三批扩展功能（asarray/tri/rollaxis/block/take-along-axis/sign/nan*/cov/cross/vdot/eigvals/matrix-power/isin 等） |
+
+## 打印输出
+
+`print-object` 给的是「数组视图」：形状 + dtype + 元素。数值格式化有三条硬规则
+（推导见 [`CONVENTIONS.md`](CONVENTIONS.md) §17.10.19）：
+
+| 情形 | 输出 |
+|---|---|
+| NaN / ±Inf | `nan` / `inf` / `-inf` —— 不落进 `~f`，否则 SBCL 会给 `#<DOUBLE-FLOAT quiet NaN>` / `#.SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY` |
+| `\|x\| < 10^-P` 或 `\|x\| >= 10^(P+3)` | 科学计数：`2.220446e-16`、`1.0e+20` |
+| 其余 | 定点：`1.5`、`0.0001`、`999999.9` |
+
+P = `*vt-print-precision*`，默认 6（`(vt-set-print-options :precision n)`）。
+布尔印 `T` / `NIL`（§17.8），复数印 `1.0+2.0j` / `nan+nanj`。
+
+这一层承诺的是**不丢量级、不泄漏实现**，不是「可读回」：CL 里 `1.0e-300`
+默认读回 single-float 会下溢，要读回 double 得写 `1.0d-300`；把指数标记写成
+`d` 能解决读回，却会把 dtype 写死进输出。要精确值请用 `vt-item` / `vt-to-list`，
+不要从打印结果反推。
 
 ## 设计约定
 

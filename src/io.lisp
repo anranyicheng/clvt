@@ -346,14 +346,77 @@
          :complex)
         (t :other)))
 
-(defun %format-real-part (val)
-  "按浮点打印规则格式化一个实部分量（定精度 + 去尾零，至少保留一位小数）。"
-  (let* ((str (format nil "~,vf" *vt-print-precision* val))
+(defun %format-special-float (d)
+  "NaN / ±Inf 的打印：`nan` / `inf` / `-inf`（§17.10.19）。
+
+   不能让它们落进 `(format nil \"~,6f\" …)`：SBCL 对 NaN 给
+   `#<DOUBLE-FLOAT quiet NaN>`、对 +Inf 给
+   `#.SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY` —— 既不可读回，又把实现内部
+   表示泄漏进用户输出。判定走 SB-EXT 的谓词而不是 `%NAN-P`：后者靠
+   `(not (= x x))`，在没屏蔽浮点陷阱时自己就会抛
+   `FLOATING-POINT-INVALID-OPERATION`。"
+  (cond ((sb-ext:float-nan-p d) "nan")
+        ((plusp d) "inf")
+        (t "-inf")))
+
+(defun %format-fixed (d precision)
+  "定点表示：P 位小数 + 去尾零，至少保留一位小数。"
+  (let* ((str (format nil (concatenate 'string "~," (princ-to-string precision) "f") d))
          (trimmed (string-right-trim "0" str)))
     (when (and (> (length trimmed) 0)
                (char= (char trimmed (1- (length trimmed))) #\.))
       (setf trimmed (concatenate 'string trimmed "0")))
     trimmed))
+
+(defun %format-sci (d precision)
+  "科学计数表示：`1.0e-16` / `1.0e+20`。
+
+   指数标记统一成 `e` —— `~e` 按 `*read-default-float-format*` 给 `d` 或 `f`，
+   那会把数值精度写进输出（同一个数在 single / double 下印得不一样），
+   而本库的 dtype 另有位置标注。"
+  (let* ((s (format nil (concatenate 'string "~," (princ-to-string precision) "e") d))
+         (epos (position-if (lambda (c) (find c "defsl")) s))
+         (mant (string-right-trim "0" (subseq s 0 epos)))
+         (expo (subseq s (1+ epos))))
+    (when (or (zerop (length mant))
+              (char= (char mant (1- (length mant))) #\.))
+      (setf mant (concatenate 'string mant "0")))
+    (format nil "~ae~a" mant expo)))
+
+(defun %format-real-part (val)
+  "按浮点打印规则格式化一个实部分量。
+
+   两条硬规则（§17.10.19），此前都没有：
+
+   1. **NaN / ±Inf 单独走**，印 `nan` / `inf` / `-inf`。
+   2. **定点与科学计数按量级切换**：`|x| < 10^-P` 或 `|x| >= 10^(P+3)`
+      用科学计数，其余用定点。此前恒用 `~,Pf`，于是
+      `(vt-spacing 1.0)` 的 `2.220446e-16` 印成 `0.0` —— 相对误差 100%，
+      与「打印结果可读回」的承诺正好相反；`1d308` 则印出 309 位数字。
+
+   P = `*VT-PRINT-PRECISION*`，默认 6：`1e-6` 仍是 `0.000001`（这一位是准的），
+   `1.3e-6` 已切科学计数（定点会把它压成 `0.000001`）。"
+  (let ((p (max 0 *vt-print-precision*))
+        (d (coerce val 'double-float)))
+    (cond
+      ((or (sb-ext:float-nan-p d) (sb-ext:float-infinity-p d))
+       (%format-special-float d))
+      ((or (and (/= d 0d0) (< (abs d) (expt 10d0 (- p))))
+           (>= (abs d) (expt 10d0 (+ p 3))))
+       (%format-sci d p))
+      (t (%format-fixed d p)))))
+
+(defun %neg-sign-p (x)
+  "符号判定；NaN 一律当作「非负」。
+
+   不能直接 `(minusp x)`：`(minusp <nan>)` 抛
+   `FLOATING-POINT-INVALID-OPERATION` —— 与 §17.10.18 里 `%FLOOR-DIV-OP`
+   遇到的是同一个坑（那里是 `(plusp 0.0d0)` 恒 NIL，这里是 NaN 直接炸）。
+   后果是「含 NaN 的复数打印不出来」，而本节 docstring 正举着 `nan+nanj`
+   的例子。"
+  (and (realp x)
+       (not (and (floatp x) (sb-ext:float-nan-p x)))
+       (minusp x)))
 
 (defun %format-complex-number (val)
   "复数打印（CONVENTIONS §16.9）：`<实部><符号><|虚部|>j`，
@@ -364,7 +427,7 @@
         (im (%cimag val)))
     (format nil "~a~a~aj"
             (%format-real-part re)
-            (if (minusp im) "-" "+")
+            (if (%neg-sign-p im) "-" "+")
             (%format-real-part (abs im)))))
 
 (defun %format-number (val type)

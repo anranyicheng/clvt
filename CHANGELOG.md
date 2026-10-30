@@ -4,6 +4,69 @@
 
 ---
 
+## 2026-10-30（四十五）— fix: 第十一遍审计（最后一轮，换轴：docstring 示例）—— 打印层三条规则、含 NaN 的复数打印崩溃、`(vector #c)` 丢虚部
+
+这一遍的尺子不是 numpy，而是**每个 docstring 里写着 `=>` 的那一行**。
+366 个带 docstring 的导出函数里有 57 行 `=>`，45 行可执行，逐条照抄跑一遍，
+撞出 8 处不实：3 处打印层真缺陷 + 5 处示例与实现脱节。
+
+**破坏性变更（打印输出变了）**：
+
+- **小量不再退化成 0**。`%format-real-part` 原先恒用 `~,6f`，`|x| < 5e-7` 的
+  非零值一律舍成 `0.0`（相对误差 100%）：`(vt-spacing 1.0)` 的值是
+  `2.22e-16`，打印出来却是 `0.0`。现在按量级切换科学计数：
+  `2.220446e-16`、`1.0e-300`。
+- **大数不再印满一行**。`1.0d308` 原先印出 309 位数字，现在 `1.797693e+308`。
+- **NaN / ±Inf 印 `nan` / `inf` / `-inf`**。原先分别印成
+  `#<DOUBLE-FLOAT quiet NaN>` 与 `#.SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY`
+  —— 把 SBCL 的实现内部表示泄漏进用户输出，既不可读回也不可移植。
+
+阈值：`|x| < 10^-P` 或 `|x| >= 10^(P+3)` 用科学计数，P = `*vt-print-precision*`
+（默认 6）。`1e-6` 仍是 `0.000001`（这一位是准的），`1.3e-6` 切科学计数。
+**注意这一层不承诺「可读回」**：CL 的 `1.0e-300` 默认读回 single-float 会下溢，
+要读回 double 得写 `1.0d-300`；把指数写成 `d` 会把 dtype 写死进输出。
+这里的承诺是「不丢量级、不泄漏实现」（§17.10.19）。
+
+**破坏性变更（含 NaN 的复数以前根本打印不出来）**：
+
+- `(format nil "~a" <含 NaN 的复数张量>)` 原先抛
+  `FLOATING-POINT-INVALID-OPERATION`（`%format-complex-number` 用
+  `(minusp im)` 判虚部符号，而 `(minusp <nan>)` 抛陷阱）。现在印 `nan+nanj`，
+  与 docstring 举的例子一致。
+
+**破坏性变更（静默丢数据）**：
+
+- `(vt-from-array (vector #c(1d0 2d0)))` / `(vt-from-array #(#c(1d0 2d0)))`
+  原先得 `:float64`，**虚部静默消失**。`(vector …)` 与 `#(…)` 的元素类型是
+  `T`，所有 `subtypep` 判定全假 → 落到兜底的 `:float64`。v0.5.x 修过同一个
+  坑，但只补了「元素类型声明为 complex」的分支。现在元素类型为 `T` 时按值扫
+  一遍，含复数则 `:complex128`。非复数维持 `:float64`（见偏差表）。
+
+**API 新增（导出三个此前压在内部包里的函数）**：
+
+- `vt-get-nan` / `vt-get-pos-inf` / `vt-get-neg-inf`，对标 `np.nan` /
+  `np.inf` / `-np.inf`。文档原先拿裸符号 `nan` / `inf` 举例，而这两个名字
+  库里从来没有定义过 —— 用户照抄得到 `The value NAN is not of type REAL`。
+
+**文档修正 7 处**：`vt-array-equal` / `vt-nan-to-num`（示例改用
+`vt-get-nan` 一族，原先照抄必崩）、`vt-isin`（`[False True …]` → `[NIL T …]`，
+布尔印 T/NIL 是 §17.8 定的）、`vt-interp`（`=> 25.0d0` → 实际 1 元素张量，
+而它自己的 docstring 写着「输出恒 1D」）、`vt-vdot`（`70` → `70.0`，根因是
+`from-array` 对 `T` 元素类型给 float64）、`vt-compress`（补 `:dtype :int64`）、
+`vt-nextafter` / `vt-spacing`（示例改成 `(vt-item …)` 形式，表达精确值而不是
+6 位打印）。
+
+**未改（有意，记入 §17.10.19 偏差表）**：`(vt-from-array #(1 2 3))` 仍是
+`:float64` 而 numpy 是 `int64`；`(vt-from-sequence '(1 2))` 同理；
+`(vt-asarray '(1 2))` 是唯一给 `int64` 的构造入口。改成按值推断整数会波及
+全库既有测试与用户代码，留作独立变更。
+
+**验收**：`bool-dtype-test` 677 断言（新增 S 组 38 条）；65 套件全绿；
+`check_docs.py` 通过（228 个 §锚点）。契约见 `CONVENTIONS.md` §17.10.19，
+过程见 `HISTORY.md` H.3.38。
+
+---
+
 ## 2026-10-30（四十四）— fix: 第十遍审计（换轴：同义入口族）—— 复数 matmul 秩、`nancumsum` 形状与精度、`divmod` 的 `:out`、零除符号、`dot` 的秩
 
 这一遍的判据不是「这个函数对不对」，而是「**同一件事有几个入口**」。

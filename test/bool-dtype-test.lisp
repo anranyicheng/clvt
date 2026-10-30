@@ -1463,5 +1463,99 @@
 
 ;;; ==================================================================
 
+;;; ==================================================================
+;;; S 组：打印视图 —— 值可以看不见，但不能印错
+;;;
+;;; 起因：`(vt-spacing 1.0)` 的值是 2.22e-16，打印出来却是 `0.0` ——
+;;; 定点格式 `~,6f` 把 `|x| < 5e-7` 的非零值一律压成 0，相对误差 100%，
+;;; 而 `%FORMAT-COMPLEX-NUMBER` 的注释正写着「保证打印结果可读回」。
+;;; 同一处还有两个更糟的：NaN 印成 `#<DOUBLE-FLOAT quiet NaN>`、+Inf 印成
+;;; `#.SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY` —— 把实现内部表示泄漏进用户
+;;; 输出；含 NaN 的复数直接抛 FLOATING-POINT-INVALID-OPERATION（`(minusp
+;;; <nan>)`），而 docstring 举的例子正是 `nan+nanj`。
+;;; ==================================================================
+
+(defun render (x) (format nil "~a" x))
+(defun has (needle hay)
+  "HAY 里是否含 NEEDLE（返回 T/NIL，便于 check）。"
+  (and (search needle hay) t))
+
+;;; --- S1 小量不再消失 ---
+(check "print/标量 spacing" (has "2.220446e-16" (render (vt-spacing 1.0d0))) t)
+(check "print/数组 1e-16" (has "1.0e-16" (render (vt-from-array (vector 1.0d-16)))) t)
+(check "print/负小量" (has "-1.0e-16" (render (vt-from-array (vector -1.0d-16)))) t)
+(check "print/spacing 数组" (has "4.440892e-16"
+                                 (render (vt-spacing (vt-from-sequence (list 1.0d0 2.0d0)
+                                                                       :dtype :float64))))
+       t)
+
+;;; --- S2 定点/科学计数的切换边界（P=6：|x| < 1e-6 或 >= 1e9 走科学计数）---
+(check "print/1e-6 仍定点" (has "0.000001" (render (vt-from-array (vector 1.0d-6)))) t)
+(check "print/1e-4 仍定点" (has "0.0001" (render (vt-from-array (vector 1.0d-4)))) t)
+(check "print/999999.9 定点" (has "999999.9" (render (vt-from-array (vector 999999.9d0)))) t)
+(check "print/1e9 切科学" (has "1.0e+9" (render (vt-from-array (vector 1.0d9)))) t)
+(check "print/1e20 切科学" (has "1.0e+20" (render (vt-from-array (vector 1.0d20)))) t)
+(check "print/1d308 不印 309 位"
+       (< (length (render (vt-from-array (vector 1.7976931348623157d308)))) 60)
+       t)
+
+;;; --- S3 特殊值：印 nan / inf / -inf，且不泄漏实现表示 ---
+(check "print/nan 标量" (has " nan" (render (vt-from-array (vector (vt-get-nan :float64))))) t)
+(check "print/+inf 标量" (has " inf" (render (vt-from-array (vector (vt-get-pos-inf :float64))))) t)
+(check "print/-inf 标量" (has "-inf" (render (vt-from-array (vector (vt-get-neg-inf :float64))))) t)
+(check "print/nan 数组" (has "nan" (render (vt-from-array (vector 1.0d0 (vt-get-nan :float64))))) t)
+(check "print/不泄漏 #<DOUBLE-FLOAT"
+       (has "#<DOUBLE" (render (vt-from-array (vector (vt-get-nan :float64))))) nil)
+(check "print/不泄漏 SB-EXT"
+       (has "SB-EXT" (render (vt-from-array (vector (vt-get-pos-inf :float64))))) nil)
+(check "print/复数 nan" (has "nan+nanj"
+                               (render (vt-from-array (vector (complex (vt-get-nan :float64)
+                                                                       (vt-get-nan :float64))))))
+       t)
+(check "print/复数正常" (has "1.0+2.0j" (render (vt-from-array (vector (complex 1.0d0 2.0d0))))) t)
+(check "print/复数 -inf 虚部"
+       (has "1.0-infj" (render (vt-from-array (vector (complex 1.0d0 (vt-get-neg-inf :float64))))))
+       t)
+(check "print/0维 nan" (has " nan" (render (vt-asarray (vt-get-nan :float64)))) t)
+
+;;; --- S4 常量入口已导出（§17.10.19）---
+(check-true "const/nan f64" (sb-ext:float-nan-p (vt-get-nan :float64)))
+(check-true "const/nan f32" (typep (vt-get-nan :float32) 'single-float))
+(check-true "const/+inf" (sb-ext:float-infinity-p (vt-get-pos-inf :float64)))
+(check-true "const/-inf 负号" (minusp (vt-get-neg-inf :float64)))
+(check "const/-inf 是 float" (floatp (vt-get-neg-inf :float32)) t)
+
+;;; --- S5 打印阈值随 *VT-PRINT-PRECISION* 变化 ---
+(let ((old clvt::*vt-print-precision*))
+  (unwind-protect
+       (progn
+         (setf clvt::*vt-print-precision* 3)
+         (check "print/P=3 时 1e-3 定点" (has "0.001" (render (vt-from-array (vector 1.0d-3)))) t)
+         (check "print/P=3 时 1e-4 切科学" (has "1.0e-4" (render (vt-from-array (vector 1.0d-4)))) t))
+    (setf clvt::*vt-print-precision* old)))
+
+;;; --- S6 docstring 示例逐条可执行（照抄不崩，且值与注释一致）---
+(check "doc/nextafter" (vt-item (vt-nextafter 1.0d0 2.0d0)) 1.0000000000000002d0)
+(check "doc/spacing 1.0" (vt-item (vt-spacing 1.0d0)) 2.220446049250313d-16)
+(check "doc/spacing 0.0" (vt-item (vt-spacing 0.0d0)) 4.9406564584124654d-324)
+(check "doc/array-equal nan" (vt-array-equal (vt-from-array (vector (vt-get-nan :float64)))
+                                            (vt-from-array (vector (vt-get-nan :float64))))
+       nil)
+(check "doc/nan-to-num"
+       (vt-to-list (vt-nan-to-num (vt-from-array (vector (vt-get-nan :float64) 1.0d0))))
+       (list 0.0d0 1.0d0))
+(check "doc/isin 印 T/NIL"
+       (has "NIL" (render (vt-isin '(1 2 3 4) '(2 4))))
+       t)
+(check "doc/isin 值" (vt-to-list (vt-isin '(1 2 3 4) '(2 4)) :bool t) (list nil t nil t))
+(check "doc/vdot 整数保持整数"
+       (vt-item (vt-vdot (vt-asarray '((1 2) (3 4))) (vt-asarray '((5 6) (7 8)))))
+       70)
+(check "doc/compress"
+       (vt-to-list (vt-compress '(1 0 1 0 1) (vt-fromiter '(0 1 2 3 4) :dtype :int64)))
+       '(0 2 4))
+(check "doc/interp 输出恒 1D" (vt-shape (vt-interp 2.5d0 #(1d0 3d0) #(10d0 30d0))) '(1))
+(check "doc/interp 值" (vt-item (vt-interp 2.5d0 #(1d0 3d0) #(10d0 30d0))) 25.0d0)
+
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)
 (when (plusp *fail*) (sb-ext:exit :code 1))

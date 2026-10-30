@@ -189,6 +189,16 @@
   (vt-map (lambda (x) (expt base x))
           (vt-linspace start stop num :endpoint endpoint :dtype dtype)))
 
+(defun %array-contains-complex-p (arr size)
+  "ARR 的前 SIZE 个（行主序）元素里是否有复数。
+
+   只在 CL 的 ARRAY-ELEMENT-TYPE 为 T 时才需要调用 —— 那时类型不携带
+   任何信息：`(vector #c(1d0 2d0))` 造出的是 SIMPLE-VECTOR，元素类型就是 T，
+   与 `(vector 1 2)` 无法区分。"
+  (dotimes (i size nil)
+    (when (complexp (row-major-aref arr i))
+      (return t))))
+
 (defun vt-from-array (arr &key (dtype nil) (fast nil))
   "从标准 CL 多维数组创建张量（保持维度）。
    fast t 意味着直接使用 coerce 转换，可能报错
@@ -196,7 +206,12 @@
    未显式指定 :dtype 时按数组元素类型精确推断（覆盖逻辑层 dtype 全集）：
    v0.3.5 修复——旧实现对 (signed-byte 16/8) 与 (unsigned-byte 8/16)
    数组一律静默提升为 :int32/:float64，违背 dtype 单一事实来源原则，
-   现按最小精确类型推断（值域严格包含数组元素类型时才选用）。"
+   现按最小精确类型推断（值域严格包含数组元素类型时才选用）。
+
+   类型为 T 的数组（`(vector …)` / `#(…)` 字面量的元素类型都是 T）没有信息
+   可依，此时**只有复数**按值扫一遍：`(vt-from-array (vector #c(1d0 2d0)))`
+   曾落到兜底的 :float64 而静默丢虚部（与 v0.5.x 修的同一个坑，只是入口
+   从「声明类型」换成了「无类型」）。非复数维持 :float64。"
   (let* ((shape (array-dimensions arr))
          (size (vt-shape-to-size shape))
          (cl-etype (array-element-type arr))
@@ -220,7 +235,14 @@
                       ((subtypep cl-etype '(signed-byte 32)) :int32)
                       ((subtypep cl-etype '(signed-byte 64)) :int64)
                       ((subtypep cl-etype 'fixnum) :int64)
-                      (t :float64)))
+                      ;; 元素类型是 T（SIMPLE-VECTOR / SIMPLE-ARRAY T）时
+                      ;; 上面的 SUBTYPEP 全部为假，旧实现直接落到 :float64。
+                      ;; 对 `(vector #c(1d0 2d0))` 这就是**静默丢虚部** ——
+                      ;; 与 v0.5.x 修过的那条同一个坑，只是换成「类型不带信息」
+                      ;; 的入口：当时只补了 (complex double-float) 声明分支。
+                      ;; 这里按值扫一遍；非复数仍维持 :float64 的既有默认
+                      ;; （改成按值推断整数会波及全库，见 §17.10.19 偏差表）。
+                      (t (if (%array-contains-complex-p arr size) :complex128 :float64))))
          (final (or dtype infer))
 	 (lisp-type (vt-dtype->lisp-type final))
          (data (make-array size :element-type lisp-type)))

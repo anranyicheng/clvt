@@ -371,6 +371,12 @@
    #:vt-float-neg-inf-p
    #:vt-float-inf-=
    #:vt-float-nan-inf-=
+   ;; 按 dtype 取常量（§17.10.19）：对标 np.nan / np.inf / -np.inf。
+   ;; 此前只在库内部可见，文档却拿裸符号 `nan` / `inf` 当字面量举例，
+   ;; 照抄必报「The value NAN is not of type REAL」。
+   #:vt-get-nan
+   #:vt-get-pos-inf
+   #:vt-get-neg-inf
 
    ;; ------------------------------------------------------------------
    ;; 核心迭代与映射 (map-reduce.lisp)

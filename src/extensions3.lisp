@@ -528,7 +528,8 @@
   "沿 AXIS 按布尔 CONDITION 选取切片（对标 numpy.compress）。
    CONDITION 为长度 ≤ 该轴长度的序列（不足部分视为假）；
    AXIS 为 nil 时展平后选取。
-   示例：(vt-compress '(1 0 1 0 1) (vt-fromiter '(0 1 2 3 4))) => [0 2 4]
+   示例：(vt-compress '(1 0 1 0 1) (vt-fromiter '(0 1 2 3 4) :dtype :int64)) => [0 2 4]
+   注意 VT-FROMITER 的 dtype 缺省是 :float64，省略 :dtype 时结果是 [0.0 2.0 4.0]。
 
    v0.4.5 性能修复：numpy 的 compress 等价于 take(nonzero(cond))，本实现现在
    真的这么走 —— 先扫一遍条件得到选中的下标向量，再委托 vt-take。
@@ -868,7 +869,9 @@
 (defun vt-nextafter (x y &key out dtype)
   "逐元素「朝 Y 方向的最近可表示浮点数」（对标 numpy.nextafter）。
    以 double-float 精度计算。:out 契约同 vt-abs（支持广播）。
-   示例：(vt-nextafter 1.0 2.0) => 1.0000000000000002"
+   示例：(vt-item (vt-nextafter 1.0d0 2.0d0)) => 1.0000000000000002d0
+   打印按 6 位有效数字显示为 `1.0`（§17.10.19）：要看出一格之差的差别，
+   必须取标量值而不是读打印结果。"
     (when (%cx-reject x y)
     (error "vt-nextafter: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 ;; 性能：原来是 (lambda (a b) ...) → vt-map 的 funcall 路径（1M 元素
@@ -900,7 +903,9 @@
 (defun vt-spacing (tensor &key out dtype)
   "逐元素返回与该值相邻浮点数之间的距离（对标 numpy.spacing）。
    以 double-float 精度计算。:out 契约同 vt-abs。
-   示例：(vt-spacing 1.0) => 2.220446049250313e-16；(vt-spacing 0.0) => 5e-324"
+   示例：(vt-item (vt-spacing 1.0d0)) => 2.220446049250313d-16
+        (vt-item (vt-spacing 0.0d0)) => 4.9406564584124654d-324（最小非规格化数）
+   打印形式分别是 `2.220446e-16` 与 `4.940656e-324`（§17.10.19）。"
     (when (%cx-reject tensor)
     (error "vt-spacing: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 ;; 性能：原实现对每个元素做一次 lambda 调用 + 一次 with-float-safe
@@ -1027,7 +1032,9 @@
   "把 NaN 替换为 NAN、+Inf 替换为 POSINF、-Inf 替换为 NEGINF（对标 numpy.nan_to_num）。
    POSINF/NEGINF 缺省为对应 dtype 的最大/最小有限值（对齐 numpy）。
    COPY 仅作 API 兼容（本库不改输入，恒返回新张量）。:out 契约同 vt-abs。
-   示例：(vt-nan-to-num '(nan inf -inf 1.0)) => [0.0 1.797e308 -1.797e308 1.0]"
+   示例：(vt-nan-to-num (vt-from-array (vector (vt-get-nan :float64) 1.0d0))) => [0.0 1.0]
+        (vt-nan-to-num (vt-from-array (vector (vt-get-pos-inf :float64) 1.0d0)))
+        => [1.797693e+308 1.0]（+Inf 换成该 dtype 的最大有限值）"
   (when (%cx-any-p tensor)
     (return-from vt-nan-to-num (%cx-op-nan-to-num tensor :copy copy :nan nan :posinf posinf :neginf neginf :out out :dtype dtype)))
   (let* ((v (ensure-vt tensor))
@@ -1604,7 +1611,9 @@
    与 vt-dot 的差异：vdot 恒按展平后的 1 维内积计算，忽略原始形状。
    :out 契约同 vt-dot（标量输出 → 0 维张量）。
    示例：(vt-vdot '(1 2 3) '(4 5 6)) => 32
-        (vt-vdot (vt-from-array #2A((1 2)(3 4))) (vt-from-array #2A((5 6)(7 8)))) => 70"
+        (vt-vdot (vt-asarray '((1 2) (3 4))) (vt-asarray '((5 6) (7 8)))) => 70
+   （嵌套 list 走 VT-ASARRAY，推断 :int64；若换成 (vt-from-array #2A((1 2)(3 4)))，
+   元素类型 T 会推断出 :float64，结果是 70.0 —— 见 §17.10.19 的偏差表。）"
   (when (%cx-any-p a b)
     (return-from vt-vdot (%cx-op-vdot a b :dtype dtype :out out)))
   (let ((af (vt-ravel (ensure-vt a)))
@@ -1729,7 +1738,8 @@
   "判定两张量形状相同且逐元素相等（对标 numpy.array_equal）。
    NaN != NaN（含 NaN 恒不相等，同 numpy）；返回 Lisp 布尔值（非张量）。
    示例：(vt-array-equal '(1 2) '(1 2)) => T
-        (vt-array-equal '(1 nan) '(1 nan)) => NIL"
+        (vt-array-equal (vt-from-array (vector (vt-get-nan :float64)))
+                        (vt-from-array (vector (vt-get-nan :float64)))) => NIL"
   (let ((av (ensure-vt a)) (bv (ensure-vt b)))
     (and (equal (vt-shape av) (vt-shape bv))
          (let ((af (vt-ravel (vt-astype av :float64)))
@@ -1774,7 +1784,7 @@
   "逐元素判定是否存在于 TEST-ELEMENTS 中（对标 numpy.isin）。
    返回与 ELEMENT 形状相同的 **:bool** 布尔张量（§17）。
    INVERT=t 取反；ASSUME-UNIQUE 为性能提示（本库忽略，语义等价）。
-   示例：(vt-isin '(1 2 3 4) '(2 4)) => [False True False True]"
+   示例：(vt-isin '(1 2 3 4) '(2 4)) => [NIL T NIL T]（布尔印 T/NIL，见 §17.8）"
   ;; v0.4.2 性能修复：与 vt-in1d 共用哈希会员判定（原 O(n×m) 线性 member，
   ;; 1M×1k 实测 87 秒）。
   (when (%cx-any-p element test-elements)
