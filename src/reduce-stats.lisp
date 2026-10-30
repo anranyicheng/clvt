@@ -11,6 +11,44 @@
                     (floor rem stride)
                   (setf rem r) idx)))
 
+(defun %bool-clamp! (v)
+  "把 `:bool` 张量的**逻辑元素**就地收敛到 {0,1}（非零 → 1），返回 V。
+
+   存在的理由：`%BOOL-FLAG` 只在「元素经过一次显式转换」时才起作用。归约
+   内核里有一整条路径（`%SMALL-INT-AXIS-FORM` 生成的 `%KERNEL-ROW-ACC` /
+   `%KERNEL-SINGLE-AXIS` 实例）是**直接把累加器写进结果缓冲区**的：
+
+       (setf (aref od out-ptr) acc)          ; od 声明为 (unsigned-byte 8)
+
+   于是一个列的布尔计数 2 被原样写进布尔数组 —— `(vt-sum b :axis 0)`
+   的 dtype 说结果是 `:bool`，`vt-to-list` 却给出 `(2 1 1 2)`。这不是
+   「值不对」，是**布尔数组里出现了越界字节**，破的是 §17.1 那条 0/1
+   不变量；再往后任何 `(aref data i)` 的直接读取都会拿到 2。
+
+   `vt-cast` 那条路（`%KERNEL-SMALL-GENERAL` 的写回）本来就是对的，本函数
+   对它是幂等的，所以放在归约出口统一调用，不必判断走了哪条内核。
+
+   只碰**逻辑元素**（按 shape/strides 走），共享缓冲里的其它位置不动 ——
+   归约结果经常是 `:out` 传进来的视图。"
+  (let ((d (vt-data v)))
+    (when (typep d '(simple-array (unsigned-byte 8) (*)))
+      (let ((shape (vt-shape v))
+            (strides (vt-strides v))
+            (off (vt-offset v)))
+        (if (vt-contiguous-p v)
+            ;; 连续：直接线性扫（offset 已经算进起止）
+            (loop for i from off below (+ off (vt-size v))
+                  do (when (> (aref d i) 1) (setf (aref d i) 1)))
+            ;; 非连续 / 0 维 / 1 维：按 strides 走
+            (labels ((walk (dims strs o)
+                       (if (null dims)
+                           (when (> (aref d o) 1) (setf (aref d o) 1))
+                           (dotimes (i (car dims))
+                             (walk (cdr dims) (cdr strs)
+                                   (+ o (* i (car strs))))))))
+              (walk shape strides off))))))
+  v)
+
 ;;; ============================================================
 ;;; 编译期算子描述
 ;;; ============================================================
@@ -24,6 +62,27 @@
   (defun %op-arg-p (op)
     "是否为 arg 类归约（输出索引）。"
     (member op '(:argmax :argmin :nanargmax :nanargmin)))
+
+  (defun %reduce-dtype-error (op-name in-dtype out-dtype)
+    "归约器遇到「内核没有这个 (输入 dtype × 结果 dtype) 实例」时抛的错。
+
+     原来两处报的是 `unsupported output dtype (UNSIGNED-BYTE 8)` —— 那是
+     **物理 Lisp 元素类型**，而用户手里写的是 `:dtype :bool`。两边对不上，
+     报错等于没报：用户看到 `(UNSIGNED-BYTE 8)` 只会以为自己传错了 dtype。
+
+     真正的原因有两类，分开说：
+       · 结果要 :bool 但输入不是 :bool —— 布尔结果只能从布尔输入直接归约；
+         整数/浮点的「非零判定」得先算出数值再 `vt-astype`（numpy 允许
+         `np.sum(int_arr, dtype=bool)`，本库不做，见 §17.10.15 的偏差表）。
+       · 其它组合 —— 内核只为 8 种逻辑 dtype 实例化，换一个就行。"
+    (flet ((kn (d) (if (keywordp d) (format nil ":~(~a~)" d) (string-downcase (princ-to-string d)))))
+      (error "~a: 不支持「~a 输入 → ~a 结果」这对 dtype。~a"
+             (string-downcase (princ-to-string op-name)) (kn in-dtype) (kn out-dtype)
+             (if (eq out-dtype :bool)
+                 (if (eq in-dtype :bool)
+                     "布尔归约的内核没有实例化到这个组合，请报告。"
+                     ":bool 结果只接受 :bool 输入；需要布尔结果请先按数值归约，再 (vt-astype 结果 :bool)。")
+                 "内核只覆盖 8 种逻辑 dtype，请换一个 :dtype 或先用 vt-astype 转换输入。"))))
 
   (defun %op-base (op)
     (ecase op
@@ -333,7 +392,7 @@
                              (if (>= inner +row-acc-min-inner+)
                                  (%kernel-row-acc ,op ,lt ,rlt)
                                  (%kernel-single-axis ,op ,lt ,rlt))))
-                   (t (error "vt-~a: unsupported output dtype ~a" ',op res-lt)))))
+                   (t (%reduce-dtype-error (format nil "vt-~a" ',op) (vt-dtype tensor) final-out-dtype)))))
        (t (error "vt-~a: unsupported input dtype ~a" ',op in-et))))
 
   (defun %contig-axis-test ()
@@ -626,7 +685,7 @@
                                     `((and (member ',op '(:all :any))
                                            (equal res-lt ',rlt))
                                       (,kernel-macro ,op ,lt ,rlt)))
-                            (t (error "unsupported output dtype ~a" res-lt)))))
+                            (t (%reduce-dtype-error (format nil "vt-~a" ',name) (vt-dtype tensor) final-out-dtype)))))
                 (t (error "unsupported input dtype ~a" in-et)))))
       `(defun ,impl-name (tensor &key axis keepdims dtype out)
          ,(format nil "沿 AXIS 归约（~a 算子）；AXIS 为 NIL 时归约全部元素。
@@ -689,7 +748,7 @@
                     (res-off  (vt-offset res)))
                (declare (fixnum rank axis-size in-size))
                (unless res-lt
-                 (error "vt-~a: unsupported output dtype ~a" ',name final-out-dtype))
+                 (%reduce-dtype-error (format nil "vt-~a" ',name) (vt-dtype tensor) final-out-dtype))
                ;; ---- 空归约语义（numpy 对齐，v0.3.6 起）----
                ;; numpy 2.1.3 实测（修正旧 §5 表中 mean/amax 行的误记）：
                ;;   * 输出为空（size=0，如 (3,0) axis=0）→ 所有算子直接返回空结果；
@@ -801,7 +860,10 @@
                          (non-size (reduce #'* non-sizes :initial-value 1)))
                     (declare (fixnum n-red n-non red-size non-size))
                     ,(dispatch '%kernel-general :small-int-p t))))
-               ;; 主分派结束：res 即最终结果（out 存在时已就地写入并返回同一对象）
+               ;; 主分派结束：res 即最终结果（out 存在时已就地写入并返回同一对象）。
+               ;; `:bool` 输出统一收口：内核里「直接写字节」的那条路径会把计数
+               ;; （2、3…）原样落进布尔缓冲区，见 %BOOL-CLAMP! 的文档。
+               (when (eq (vt-dtype res) :bool) (%bool-clamp! res))
                res)))))))
 
 ;;; ============================================================
@@ -1161,6 +1223,11 @@
   即总体方差）。有效样本数 ≤ ddof 时结果为 NaN。"
   (when (%cx-any-p tensor)
     (return-from vt-var (%cx-op-var tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
+  (when (eq dtype :bool)
+    ;; 拦截在 vt-- 之前：方差要算 (x - mean)²，布尔减法本身未定义（numpy 也
+    ;; 拒绝），但让它透出来时错误里写的是「vt--: 布尔张量不支持减法」——
+    ;; 用户从没调用 vt--，看到这条只会以为是库的 bug。
+    (error "vt-var: 方差结果不能是 :bool（布尔减法未定义，numpy 同样拒绝）。省略 :dtype 或指定 :float64。"))
   (let* ((shape (vt-shape tensor))
          (rank (length shape)))
     (multiple-value-bind (axes n) (%get-axes-count axis rank shape)
@@ -1222,6 +1289,8 @@
   "标准差 sqrt(vt-var)（对标 numpy.std）。dtype 语义同 vt-var。"
   (when (%cx-any-p tensor)
     (return-from vt-std (%cx-op-std tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
+  (when (eq dtype :bool)
+    (error "vt-std: 标准差结果不能是 :bool（布尔减法未定义，numpy 同样拒绝）。省略 :dtype 或指定 :float64。"))
   (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
          ;; 结果 dtype 同 vt-mean/vt-var：输入提升 + 显式 :dtype，不由 out 决定。
          (final-dtype (or dtype compute-dtype))
@@ -2538,6 +2607,10 @@
   原实现的 10+ 趟中间张量流水线在 1M double 上实测 331ms。"
   (when (%cx-any-p tensor)
     (return-from vt-nanvar (%cx-op-nanvar tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
+  (when (eq dtype :bool)
+    ;; 与 VT-VAR 同一条判据（numpy 也拒绝）。这里不拦的话 `%BOOL-FLAG` 会把
+    ;; 0.25 压成 1，静默给出「方差是否为 0」这种看着像答案的东西。
+    (error "vt-nanvar: 方差结果不能是 :bool（布尔减法未定义，numpy 同样拒绝）。省略 :dtype 或指定 :float64。"))
   (let* ((compute-dtype (if (eq (vt-dtype (ensure-vt tensor)) :float32)
                             :float32 :float64))
          (final-dtype (or dtype compute-dtype)))
@@ -2583,6 +2656,11 @@
   "忽略 NaN 的标准差（sqrt(vt-nanvar)）。dtype 语义同 vt-nanvar。"
   (when (%cx-any-p tensor)
     (return-from vt-nanstd (%cx-op-nanstd tensor :axis axis :keepdims keepdims :ddof ddof :dtype dtype :out out)))
+  (when (eq dtype :bool)
+    ;; 成对一致性：VT-STD 早就该拒绝（本轮补上），VT-NANSTD 原来给出
+    ;; `(0 1 1 0)` —— 同一份数据、同一个 `:dtype :bool`，一个报错一个
+    ;; 静默把 0.5 压成 1。numpy 两个都抛 TypeError。
+    (error "vt-nanstd: 标准差结果不能是 :bool（布尔减法未定义，numpy 同样拒绝）。省略 :dtype 或指定 :float64。"))
   (let* ((compute-dtype (if (eq (vt-dtype tensor) :float32) :float32 :float64))
          (final-dtype (or dtype compute-dtype)))
     (let ((var (vt-nanvar tensor :axis axis :keepdims keepdims :ddof ddof
@@ -2838,14 +2916,17 @@
     (keyword mode)
     (string (intern (string-upcase mode) "KEYWORD"))))
 
-(defun vt-correlate (a v &key (mode :full))
+(defun vt-correlate (a v &key (mode :full) (same-anchor :v))
   "1D 互相关。mode 支持关键字(:full/:valid/:same)或字符串。
 
   ⚠ 默认值与 numpy **不同**（v0.4.2 记录；行为保持不变，以免破坏既有调用方）：
     numpy  np.correlate(a, v)   默认 mode='valid'
     clvt   (vt-correlate a v)   默认 :mode :full
-  三种模式本身与 numpy 逐值一致（:full/:valid/:same 均已对齐）；
-  需要 numpy 默认行为时请显式写 :mode :valid。
+  三种模式的**长度与裁切位置**均按 numpy 的实测规则：`full` 长 n+m-1；
+  `valid` 长 |n-m|+1、起点 min(n,m)-1；`same` 长 max(n,m)、起点
+  min((m-1)/2, n/2)。SAME-ANCHOR 是内部参数（`vt-convolve` 传 `:a`），
+  因为 numpy 的 convolve 用 (n-1)/2 而非 n/2 作第二项的除数。
+  需要 numpy 默认行为（:valid）时请显式写 :mode :valid。
   core-test 与 test-all 均以 :full 为约定，故此处只修正文档，不改默认。
 
   布尔输入（CONVENTIONS §17.10.10）：两侧都是 `:bool` 时结果也是 `:bool`，
@@ -2856,7 +2937,8 @@
   `matmul`／`dot`／`einsum` 是同一族缺陷（布尔代数被当成数值和），
   当时只扫了矩阵乘法家族，漏了信号处理这两个入口。"
   (when (%cx-any-p a v)
-    (return-from vt-correlate (%cx-op-correlate a v :mode mode)))
+    (return-from vt-correlate
+      (%cx-op-correlate a v :mode mode :same-anchor same-anchor)))
   (when (null mode) (setf mode :full))
   (let* ((bool-result (and (eq (vt-dtype (ensure-vt a)) :bool)
                            (eq (vt-dtype (ensure-vt v)) :bool)))
@@ -2924,14 +3006,24 @@
           (let ((res (ecase mode-kw
           (:full (%make-vt :data full :shape (list full-len) :strides '(1)
                            :offset 0 :dtype :float64))
-          (:valid (let* ((len (max 0 (1+ (- n m)))) (start offset)
-                                                    (data (make-array len :element-type 'double-float)))
+          ;; :valid —— 只需两者**完全重叠**的那一段。
+          ;;   长度 = |n-m| + 1（numpy 的 max-min+1，本库原来写 (1+ (- n m))，
+          ;;   在 n<m 时是负数被 clamp 成 0 —— 短序列配长核直接得到空张量）；
+          ;;   起点 = min(n,m) - 1（原来沿用 offset = m-1，只在 n>=m 时正确）。
+          (:valid (let* ((len (1+ (abs (- n m))))
+                         (start (1- (min n m)))
+                         (data (make-array len :element-type 'double-float)))
                     (loop for i from 0 below len do
                       (setf (aref data i) (aref full (+ start i))))
                     (%make-vt :data data :shape (list len) :strides '(1)
                               :offset 0 :dtype :float64)))
+          ;; :same —— 长度 max(n,m)，起点让**第二个参数的重心**对齐 a 的中心。
+          ;;   原来的 (floor (- full-len out-len) 2) 在 |n-m| 为奇数时朝 0 取整，
+          ;;   与 numpy 的「下半区取大」相反（n=2,m=7 时给 full[0..6] 而非 [1..7]）。
+          ;;   实测 1..60 共 400 组随机 (n,m) 拟合：start = min((m-1)/2, n/2)。
           (:same (let* ((out-len (max n m))
-                        (start (floor (- full-len out-len) 2))
+                        (start (min (floor (1- m) 2)
+                                    (floor (if (eq same-anchor :v) n (1- n)) 2)))
                         (data (make-array out-len :element-type 'double-float)))
                    (loop for i from 0 below out-len do
                      (setf (aref data i) (aref full (+ start i))))
@@ -2940,12 +3032,17 @@
             (if bool-result (vt-astype res :bool) res)))))))
 
 (defun vt-convolve (a v &key (mode :full))
-  "1D 卷积，对标 np.convolve。mode 支持关键字(:full/:valid/:same)或字符串。"
+  "1D 卷积，对标 np.convolve。mode 支持关键字(:full/:valid/:same)或字符串。
+
+  SAME 的裁切位置与 `vt-correlate` **不同**：numpy 的两个入口各自算偏移
+  （convolve 用 (n-1)/2，correlate 用 n/2），n 为偶数且核远长于序列时
+  两者差一个位置。故此处必须传 `:same-anchor :a`，不能默认复用。"
   (when (%cx-any-p a v)
     (return-from vt-convolve (%cx-op-convolve a v :mode mode)))
   (vt-correlate (vt-contiguous a)
                 (vt-contiguous (vt-flip v))
-                :mode (%normalize-mode-keyword mode)))
+                :mode (%normalize-mode-keyword mode)
+                :same-anchor :a))
 
 (defun vt-interp (x xp fp &key (left nil) (right nil))
   "一维线性插值（对标 numpy.interp）。

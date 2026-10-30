@@ -299,8 +299,12 @@
   (when (%cx-any-p vt)
     (return-from vt-standardize (%cx-op-standardize vt :axis axis :ddof ddof :dtype dtype :out out)))
   (when (and dtype (member dtype '(:int8 :int16 :int32 :int64
-                                   :uint8 :uint16)))
-    (error "vt-standardize: 标准化结果必须为浮点 dtype，收到 ~a" dtype))
+                                   :uint8 :uint16 :bool)))
+    ;; :bool 必须在这里拦住。漏掉它会一路走到内部的 `(vt-- vt m :dtype :bool)`，
+    ;; 于是用户传 `:dtype :bool` 收到的是「vt--: 布尔张量不支持减法/取负」——
+    ;; 报错归因到了用户从没调用的函数上（实测于 §17.10.15）。
+    (error "vt-standardize: 标准化结果必须为浮点 dtype，收到 ~a~@[（:bool 也是非浮点）~]"
+           dtype (eq dtype :bool)))
   (let* ((final-dtype (or dtype
                           (if (eq (vt-dtype vt) :float32) :float32 :float64)))
          (m (vt-mean vt :axis axis :keepdims t :dtype final-dtype))

@@ -143,8 +143,21 @@
 (defun vt-slice (vt &rest specs)
   "统一切片接口。每个 spec 为列表：
    (:all)/(t) 全选；(:newa) 新轴；(:elli) 省略号；
-   (idx) 整数索引降维；(start end &optional step) 范围切片。"
+   (idx) 整数索引降维；(start end &optional step) 范围切片。
+
+   注意 spec 是**列表**，不是关键字：`(vt-slice a '(0 2))` 取 [0:2]，
+   `(vt-slice a '(nil nil -1))` 反转。没有 :start/:stop/:step 这种写法。"
   (declare (optimize (speed 3)))
+  ;; 关键字误用单独拦：`(vt-slice a :start 0 :stop 2)` 会变成四个位置参数
+  ;; (:START 0 :STOP 2)，走到下面报「索引数 4 超过秩 1」—— 用户完全无法
+  ;; 从这个消息反推出「应该写成列表」。而这是从 numpy / Clojure 迁过来时
+  ;; 最容易踩的一步。
+  (dolist (s specs)
+    (when (keywordp s)
+      (error "vt-slice: 切片说明必须是**列表**，不是关键字（收到 ~s 之类）。~%~
+              写法：(vt-slice vt '(start stop &optional step))，~%~
+                例 (vt-slice a '(0 2)) 取 [0:2]、(vt-slice a '(nil nil -1)) 反转、~
+                (vt-slice a '(:all)) 全选。不支持 :start/:stop/:step 关键字。" s)))
   (let* ((old-shape   (vt-shape vt))
          (old-strides (vt-strides vt))
          (old-offset  (vt-offset vt))

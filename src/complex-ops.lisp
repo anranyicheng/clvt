@@ -970,8 +970,12 @@
                        (setf (aref full i) sum)))))))
     full))
 
-(defun %cx-correlate (a v mode-kw &key (conj-p t))
-  "复数 1D 互相关（三 mode）。CONJ-P 见 %CX-CORRELATE-FULL。"
+(defun %cx-correlate (a v mode-kw &key (conj-p t) (same-anchor :v))
+  "复数 1D 互相关（三 mode）。CONJ-P 见 %CX-CORRELATE-FULL。
+
+   SAME-ANCHOR：`same` 的裁切起点第二项用 n/2（`:v`，correlate）还是
+   (n-1)/2（`:a`，convolve）。numpy 两个入口的偏移公式不同，见
+   `VT-CORRELATE` 的文档与 CONVENTIONS §17.10.15。"
   (let* ((av (ensure-vt a))
          (bv (ensure-vt v))
          (dt (vt-promote-type (vt-dtype av) (vt-dtype bv)))
@@ -981,9 +985,8 @@
          (n (vt-size af))
          (m (vt-size vf))
          (full (%cx-correlate-full af vf conj-p))
-         (full-len (length full))
-         (offset (1- m)))
-    (declare (type fixnum n m full-len offset))
+         (full-len (length full)))
+    (declare (type fixnum n m full-len))
     (flet ((slice (len start)
              (%make-vt :data (subseq full start (min full-len (+ start len)))
                        :shape (list (max 0 len)) :strides '(1)
@@ -991,25 +994,33 @@
       (ecase mode-kw
         (:full (%make-vt :data full :shape (list full-len) :strides '(1)
                          :offset 0 :dtype dt))
-        (:valid (slice (max 0 (1+ (- n m))) offset))
-        (:same (slice (max n m) (floor (- full-len (max n m)) 2)))))))
+        ;; VALID：长 |n-m|+1、起点 min(n,m)-1（原为 (max 0 (1+ (- n m))) +
+        ;; offset，n<m 时给空张量、n>=m 时起点恰好等同）。
+        (:valid (slice (1+ (abs (- n m))) (1- (min n m))))
+        ;; SAME：起点 min((m-1)/2, n/2) 或 min((m-1)/2, (n-1)/2)，
+        ;; 原为 (floor (- full-len (max n m)) 2)，|n-m| 为奇数时方向相反。
+        (:same (slice (max n m)
+                      (min (floor (1- m) 2)
+                           (floor (if (eq same-anchor :v) n (1- n)) 2))))))))
 
-(defun %cx-op-correlate (a v &key (mode :full))
+(defun %cx-op-correlate (a v &key (mode :full) (same-anchor :v))
   "1D 互相关（对标 numpy.correlate）。复数走专用内核（累加器为复数）。
 
    复数语义（与 numpy 一致）：c[k] = Σ a[n+k]·conj(v[n])，即**第二个操作数取共轭**。
-   注意默认值是 :full（与 numpy 的 :valid 不同，见原实现文档）。"
+   注意默认值是 :full（与 numpy 的 :valid 不同，见原实现文档）。
+   SAME-ANCHOR 见 `%CX-CORRELATE`（内部参数，convolve 传 :a）。"
 (let ((mk (if (null mode) :full (%normalize-mode-keyword mode))))
-  (%cx-correlate a v mk :conj-p t)))
+  (%cx-correlate a v mk :conj-p t :same-anchor same-anchor)))
 
 
 (defun %cx-op-convolve (a v &key (mode :full))
   "1D 卷积（对标 numpy.convolve）。复数：c[k] = Σ a[n]·v[k-n]，**不取共轭**。
 
    实数路径转发原实现；复数复用互相关内核（对 flip(v) 不共轭地相关），
-   与 numpy 的 convolve/correlate 分工一致。"
+   与 numpy 的 convolve/correlate 分工一致。SAME 的起点要按 convolve 的
+   (n-1)/2 算（`same-anchor :a`），否则偶数 n + 长核时差一个位置。"
 (let ((mk (if (null mode) :full (%normalize-mode-keyword mode))))
-  (%cx-correlate a (vt-flip (ensure-vt v)) mk :conj-p nil)))
+  (%cx-correlate a (vt-flip (ensure-vt v)) mk :conj-p nil :same-anchor :a)))
 
 
 ;;; ==================================================================

@@ -989,6 +989,98 @@
        (vt-dtype (vt-geomspace 1 1000 4)) :float64)
 
 ;;; ==================================================================
+;;; O 组：关键字参数矩阵（:axis / :keepdims / :dtype / :ddof）
+;;; ------------------------------------------------------------------
+;;; A–N 组全部用**默认参数**调用。这一组把 `:dtype :bool`、`:axis` 打开，
+;;; 盯两件事：
+;;;   · 结果 dtype 说是 :bool，物理字节就必须 ∈ {0,1}（§17.1 不变量）；
+;;;   · 报错必须点名**用户调用的那个函数**，不能透出内部的 vt-- / vt-sum。
+;;; 另外收两处非布尔缺陷（同一轮顺手修的）：correlate/convolve 的
+;;; :valid/:same 在「短序列 × 长核」下的长度与裁切位置。
+;;; ==================================================================
+
+(defun flat-ints-any (tensor)
+  "展平成整数列表（任意数值 dtype，按 TRUNCATE）。`flat-ints` 只收布尔/整数，
+   而 correlate/convolve 恒返回 :float64。"
+  (mapcar #'truncate (vt-to-list (vt-ravel tensor))))
+
+(defvar *ob2* (vt-from-sequence '((t nil t t) (t t nil t)) :dtype :bool)
+  "2×4 布尔。列计数 2/1/1/2、行计数 3/3 —— 计数刻意 >1，
+   才能暴露「累加器直接写进布尔缓冲区」的字节截断。")
+
+;; O1. 数值归约 + :dtype :bool：内核把 acc 直接 (aref od ...) 写盘，
+;;     2、3 原样落进布尔数组（dtype 说 BOOL，vt-to-list 给 (2 1 1 2)）。
+(dolist (spec (list (cons "sum" #'vt-sum)
+                    (cons "nansum" #'vt-nansum)
+                    (cons "l1-norm" #'vt-l1-norm)))
+  (let ((nm (car spec)) (f (cdr spec)))
+    (check (format nil "kw/~a-ax0-bool-vals" nm)
+           (flat-ints (funcall f *ob2* :axis 0 :dtype :bool)) '(1 1 1 1))
+    (check (format nil "kw/~a-ax0-bool-bytes" nm)
+           (bool-bad-bytes (funcall f *ob2* :axis 0 :dtype :bool)) 0)))
+(check "kw/sum-ax1-bool-vals" (flat-ints (vt-sum *ob2* :axis 1 :dtype :bool)) '(1 1))
+(check "kw/sum-ax1-bool-bytes" (bool-bad-bytes (vt-sum *ob2* :axis 1 :dtype :bool)) 0)
+(check "kw/sum-all-bool" (flat-ints (vt-sum *ob2* :dtype :bool)) '(1))
+;; 乘积的真值化等于「任一为 0 则 0」，numpy 的 np.prod(b, dtype=bool) 同值
+(check "kw/prod-ax0-bool-vals" (flat-ints (vt-prod *ob2* :axis 0 :dtype :bool)) '(1 0 0 1))
+(check "kw/prod-ax0-bool-bytes" (bool-bad-bytes (vt-prod *ob2* :axis 0 :dtype :bool)) 0)
+;; arg 族：指标 0..n-1 里也可能出现 2 以上
+(check "kw/argmax-ax0-bool-bytes" (bool-bad-bytes (vt-argmax *ob2* :axis 0 :dtype :bool)) 0)
+;; :keepdims 走同一条出口
+(check "kw/sum-ax0-kd-shape" (vt-shape (vt-sum *ob2* :axis 0 :keepdims t :dtype :bool)) '(1 4))
+(check "kw/sum-ax0-kd-bytes"
+       (bool-bad-bytes (vt-sum *ob2* :axis 0 :keepdims t :dtype :bool)) 0)
+
+;; O2. 非布尔输入 + :dtype :bool：拒绝，且消息里不能是 (UNSIGNED-BYTE 8)
+(flet ((err-msg (thunk)
+         (handler-case (progn (funcall thunk) nil)
+           (error (e) (princ-to-string e)))))
+  (let ((m (err-msg (lambda () (vt-sum (vt-from-sequence '((5 0) (2 9)) :dtype :int64)
+                                       :dtype :bool)))))
+    (check-true "kw/sum-int2bool-names-vt-sum" (and m (search "vt-sum:" m)))
+    (check-true "kw/sum-int2bool-advice" (and m (search ":bool 结果只接受 :bool 输入" m)))
+    (check-true "kw/sum-int2bool-no-lisp-type" (and m (null (search "UNSIGNED-BYTE" m)))))
+
+  ;; O3. 统计/范数族对 :dtype :bool 的拒绝，必须点名调用者本身
+  (flet ((names (needle thunk)
+           (let ((m (err-msg thunk)))
+             (and m (not (null (search needle m)))))))
+    (check-true "kw/var-bool-msg" (names "vt-var:"
+                                         (lambda () (vt-var *ob2* :dtype :bool))))
+    (check-true "kw/std-bool-msg" (names "vt-std:"
+                                         (lambda () (vt-std *ob2* :dtype :bool))))
+    (check-true "kw/nanvar-bool-msg" (names "vt-nanvar:"
+                                            (lambda () (vt-nanvar *ob2* :dtype :bool))))
+    (check-true "kw/nanstd-bool-msg" (names "vt-nanstd:"
+                                            (lambda () (vt-nanstd *ob2* :dtype :bool))))
+    (check-true "kw/norm-bool-msg" (names "vt-norm:"
+                                          (lambda () (vt-norm *ob2* :dtype :bool))))
+    (check-true "kw/frob-bool-msg" (names "vt-frobenius-norm:"
+                                          (lambda () (vt-frobenius-norm *ob2* :dtype :bool))))
+    (check-true "kw/standardize-bool-msg" (names "vt-standardize:"
+                                                 (lambda () (vt-standardize *ob2* :dtype :bool))))))
+
+;; O4. correlate / convolve 的 :valid 与 :same（非布尔缺陷，同一轮修）
+;;     原来 :valid 的长度写的是 (1+ (- n m))，n<m 时是负数被 clamp 成 0。
+(let ((a2 (vt-from-sequence '(1 2) :dtype :float64))
+      (v7 (vt-from-sequence '(1 0 1 0 1 0 1) :dtype :float64)))
+  (check "corr/valid-short-vs-long" (flat-ints-any (vt-correlate a2 v7 :mode :valid)) '(2 1 2 1 2 1))
+  (check "conv/valid-short-vs-long" (flat-ints-any (vt-convolve a2 v7 :mode :valid)) '(2 1 2 1 2 1))
+  ;; same 的起点公式两个入口不同（numpy 如此）：correlate 用 n/2、convolve 用 (n-1)/2
+  (check "corr/same-short-vs-long" (flat-ints-any (vt-correlate a2 v7 :mode :same)) '(2 1 2 1 2 1 2))
+  (check "conv/same-short-vs-long" (flat-ints-any (vt-convolve a2 v7 :mode :same)) '(1 2 1 2 1 2 1)))
+(let ((a3 (vt-from-sequence '(1 2 3) :dtype :float64))
+      (v4 (vt-from-sequence '(1 2 3 4) :dtype :float64)))
+  (check "corr/valid-3-4" (flat-ints-any (vt-correlate a3 v4 :mode :valid)) '(20 14))
+  (check "corr/same-3-4"  (flat-ints-any (vt-correlate a3 v4 :mode :same)) '(11 20 14 8))
+  (check "conv/same-3-4"  (flat-ints-any (vt-convolve a3 v4 :mode :same)) '(4 10 16 17)))
+;; 4×3（a 更长，原实现本来就对的路径，防回归）
+(let ((a4 (vt-from-sequence '(1 2 3 4) :dtype :float64))
+      (v3 (vt-from-sequence '(1 2 3) :dtype :float64)))
+  (check "corr/valid-4-3" (flat-ints-any (vt-correlate a4 v3 :mode :valid)) '(14 20))
+  (check "corr/same-4-3"  (flat-ints-any (vt-correlate a4 v3 :mode :same)) '(8 14 20 11)))
+
+;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)
 (when (plusp *fail*) (sb-ext:exit :code 1))

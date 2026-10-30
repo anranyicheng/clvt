@@ -4,6 +4,74 @@
 
 ---
 
+## 2026-10-30（四十一）— fix: 第七遍审计（换轴：非默认参数）—— dtype=bool 的脏字节、报错点错人、correlate 的 valid/same
+
+> 契约见 `CONVENTIONS.md` §17.10.15；决策过程见 `HISTORY.md` H.3.34。
+> 前六遍的探针有个共同前提：**所有调用都用默认参数**。这一遍把
+> `:axis` / `:keepdims` / `:dtype` / `:ddof` 打开，对 46 个接受 `axis`
+> 的导出函数做参数矩阵，共 303 组。
+
+**破坏性变更（八处）**：
+
+| 表达式 | 修复前 | 现在 | numpy |
+|---|---|---|---|
+| `(vt-sum b :axis 0 :dtype :bool)` | `:bool` `(2 1 1 2)`（脏字节） | `(1 1 1 1)` | `[T T T T]` |
+| `(vt-sum b :axis 1 :dtype :bool)` | `(3 3)` | `(1 1)` | `[T T]` |
+| `(vt-nansum b :axis 0 :dtype :bool)` | `(2 1 1 2)` | `(1 1 1 1)` | 同 |
+| `(vt-l1-norm b :axis 0 :dtype :bool)` | `(2 1 1 2)` | `(1 1 1 1)` | — |
+| `(vt-correlate #(1 2) #(1 0 1 0 1 0 1) :mode :valid)` | 形状 `(0)`（空） | `(2 1 2 1 2 1)` | 同 |
+| `(vt-convolve … :mode :same)`（n 偶、核长） | 偏移差一位 | 与 numpy 同 | — |
+| `(vt-nanstd b :dtype :bool)` | **静默** `:bool` `(0 1 1 0)` | 报错（同 numpy） | `TypeError` |
+| `(vt-var/vt-std/vt-norm/vt-standardize b :dtype :bool)` | 报错但**点名内部函数**（`vt--` / `vt-sum`） | 点名调用者 | — |
+
+**根因一：归约内核有两条写回路径，一条经过 `vt-cast`、一条裸写。**
+全归约走 `%KERNEL-SMALL-GENERAL`，写回是 `(vt-cast acc dt)`，`%bool-flag`
+把 2 收成 1；沿轴归约（窄整型）走 `%SMALL-INT-AXIS-FORM` 生成的
+`%KERNEL-ROW-ACC`，写回是 `(setf (aref od i) acc)` —— `od` 声明为
+`(unsigned-byte 8)`，2 原样落盘。于是布尔数组里出现**越界字节**，破
+§17.1 的 0/1 不变量。修法不在内核里加 `if`（十几个宏实例），而是在
+归约出口统一调 `%BOOL-CLAMP!`（按 shape/strides 只碰逻辑元素，对已
+cast 过的路径幂等）。
+
+**根因二：`correlate`/`convolve` 的 `:valid` 与 `:same` 裁切算错。**
+
+- `:valid` 长度写成 `(max 0 (1+ (- n m)))` —— n<m 时是负数被 clamp 成 0，
+  「短序列配长核」直接得空张量。numpy 的规则是 `|n-m|+1`，与谁长无关；
+  起点应为 `min(n,m)-1`（原来用 `offset = m-1`）。
+- `:same` 起点写成 `(floor (- full-len (max n m)) 2)`，`|n-m|` 为奇数时
+  方向与 numpy 相反。实测 1..60 共 400 组拟合出**两条**公式：
+  `correlate: min((m-1)/2, n/2)`、`convolve: min((m-1)/2, (n-1)/2)`
+  —— numpy 的两个入口自己就不一致，所以 `vt-convolve` 不能直接委托，
+  要传内部参数 `same-anchor`。复数路径 `%CX-CORRELATE` 是同一份逻辑的
+  另一份拷贝，同样修。
+
+验收：实数 3750 组、复数 2400 组与 numpy 逐值零失配。
+
+**根因三：报错点错了人。** `unsupported output dtype (UNSIGNED-BYTE 8)`
+把物理 Lisp 类型当 dtype 报给用户（用户写的是 `:dtype :bool`）；
+`vt-var`/`vt-std`/`vt-standardize` 的 `:bool` 错误从内部的 `vt--` 冒出，
+`vt-norm` 的从 `vt-sum` 冒出 —— 错误消息里的函数恰好是用户没调用的那个。
+改为在公开入口前置校验，并在消息里给出下一步建议。
+
+**成对不一致（第四遍的轴又出现）**：`vt-std` 拒绝 `:bool` 而 `vt-nanstd`
+静默真值化成 `(0 1 1 0)`（读起来还挺像「标准差是否为零」）。numpy 两个都
+抛 `TypeError`。`vt-nanvar` 一并补上。
+
+**偏差（记入 §17.10.15）**：`(vt-sum int64数组 :dtype :bool)` 报错并建议
+先数值归约再 `vt-astype`，numpy 则直接给真值化结果 —— 支持它需要给内核
+分派加第三条路径（任意 in-et × 小整型 out），风险大于收益。
+`(vt-std b :dtype :int8)` 本库按 int8 截断给 `(0 0 0 0)`，numpy 在 sqrt
+处抛 `UFuncTypeError`（本库更宽松）。
+
+**同时确认无事的**：轴矩阵的**值**层面 82 项全对；`argmax`/`argmin` 接受
+元组轴（numpy 直接 `TypeError`）并给归约区内线性下标，语义自洽；
+`mean`/`nanmean`/`prod` 的 `:dtype :bool` 与 numpy 同值。
+
+**验收**：`bool-dtype-test` 524 断言全过（新增 O 组 33 条）；65 套件全绿
+（严格模式）；`check_docs.py` 224 锚点全解析；无新增 WARNING。
+
+---
+
 ## 2026-10-30（四十）— fix: 布尔当「位置参数」的两分法（delete/insert 掩码）+ geomspace 收 bool
 
 > 契约见 `CONVENTIONS.md` §17.10.14；决策过程见 `HISTORY.md` H.3.33。

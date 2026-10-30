@@ -1432,6 +1432,13 @@
    - 若提供 out，求和与开方将原地执行，零临时内存分配。"
   (when (%cx-any-p vt)
     (return-from vt-norm (%cx-op-norm vt :axis axis :keepdims keepdims :dtype dtype :out out)))
+  (when (eq dtype :bool)
+    ;; 拦截在 vt-sum 之前。放行的话错误会写成
+    ;;   「vt-sum: 不支持「:float64 输入 → :bool 结果」」
+    ;; —— 用户调的是 vt-norm，报错主角却是 vt-sum；更糟的是若输入恰好是
+    ;; 布尔，sum 那一层会真值化，于是 norm 给出「平方和是否非零」。范数是
+    ;; 浮点量，numpy 也不接受 bool dtype。
+    (error "vt-norm: 范数结果不能是 :bool。省略 :dtype 或指定 :float64。"))
   (with-float-safe
     (let* ((in-dtype (vt-dtype vt))
            (effective-dtype (or dtype
@@ -1463,6 +1470,10 @@
 
 (defun vt-frobenius-norm (matrix &key axis keepdims dtype out)
   "frobenius 范数 (专用于矩阵)"
+  (when (eq dtype :bool)
+    ;; 与 VT-NORM 同一条判据；不重复拦的话用户会看到「vt-norm: ...」，
+    ;; 而自己调的是 vt-frobenius-norm。
+    (error "vt-frobenius-norm: 范数结果不能是 :bool。省略 :dtype 或指定 :float64。"))
   (with-float-safe
     (vt-norm matrix :axis axis :keepdims keepdims :dtype dtype :out out)))
 

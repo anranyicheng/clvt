@@ -4417,6 +4417,127 @@ numpy 写法之一，移植过来会删掉一批完全不相干的元素，而�
 
 ---
 
+#### 17.10.15 第七遍：把「默认参数」这个隐藏前提拆掉
+
+前六遍有一个共同前提，一直没被审视过：**所有调用都用默认参数**。
+布尔参与运算算得对不对、传不传得进去、返回什么类型、两处是否一致、
+被谁读走、从哪造出来 —— 这些问题的每一次探针，第二个参数之后都是空的。
+
+这一遍把 `:axis` / `:keepdims` / `:dtype` / `:ddof` 打开，对 46 个接受
+`axis` 的导出函数做参数矩阵（`axis ∈ {0,1,-1,-2,(0,1),(1,2),(0,2)}` ×
+`keepdims ∈ {nil,t}` × `dtype ∈ {省略,:bool,:int64,:float64}`），
+共 303 组。
+
+##### 一、`dtype` 说是 `:bool`，字节就可以不是 0/1
+
+| 表达式 | 修复前 | 现在 | numpy |
+|---|---|---|---|
+| `(vt-sum b :axis 0 :dtype :bool)` | `:bool`，`vt-to-list` 给 `(2 1 1 2)` | `(1 1 1 1)` | `[True True True True]` |
+| `(vt-sum b :axis 1 :dtype :bool)` | `(3 3)` | `(1 1)` | `[True True]` |
+| `(vt-nansum b :axis 0 :dtype :bool)` | `(2 1 1 2)` | `(1 1 1 1)` | 同 |
+| `(vt-l1-norm b :axis 0 :dtype :bool)` | `(2 1 1 2)` | `(1 1 1 1)` | — |
+
+根因是**归约内核里有两条写回路径**：
+
+- `%KERNEL-SMALL-GENERAL` 写 `(setf (aref od out-ptr) (vt-cast acc final-out-dtype))`
+  —— 经过 `vt-cast`，`%bool-flag` 会把 2 收成 1；
+- `%SMALL-INT-AXIS-FORM` 生成的 `%KERNEL-ROW-ACC` / `%KERNEL-SINGLE-AXIS`
+  实例写的是 `(setf (aref od out-ptr) acc)` —— **裸写**，而 `od` 声明为
+  `(simple-array (unsigned-byte 8) (*))`，于是 2 原样落盘。
+
+这不是「值不对」而是**布尔数组里出现越界字节**，破的是 §17.1 那条从第一轮
+守到现在的 0/1 不变量；之后任何 `(aref data i)` 的直接读取都会拿到 2。
+
+修法不在内核里加 `if`（要改十几个宏实例），而是在归约出口统一调
+`%BOOL-CLAMP!`（按 shape/strides 只碰逻辑元素，共享缓冲的其它位置不动）。
+对已经过 `vt-cast` 的路径它是幂等的，所以不必判断走了哪条内核。
+
+##### 二、报错点名了三层以内的函数
+
+| 用户调用 | 修复前的消息 | 现在 |
+|---|---|---|
+| `(vt-sum int64 :dtype :bool)` | `unsupported output dtype (UNSIGNED-BYTE 8)` | `vt-sum: 不支持「:int64 输入 → :bool 结果」…请先按数值归约，再 (vt-astype 结果 :bool)` |
+| `(vt-var b :dtype :bool)` | `vt--: 布尔张量不支持减法/取负` | `vt-var: 方差结果不能是 :bool（…numpy 同样拒绝）` |
+| `(vt-std b :dtype :bool)` | 同上（透出 `vt--`） | `vt-std: …` |
+| `(vt-nanstd b :dtype :bool)` | **静默返回 `(0 1 1 0)`** | `vt-nanstd: …` |
+| `(vt-norm b :dtype :bool)` | `vt-sum: 不支持「:float64 输入 → :bool 结果」` | `vt-norm: 范数结果不能是 :bool` |
+| `(vt-standardize b :dtype :bool)` | `vt--: 布尔张量不支持减法/取负` | `vt-standardize: 标准化结果必须为浮点 dtype，收到 :bool` |
+
+还有一处不属于 bool、但同属「报错说不到点上」的，顺手一起修了：
+
+```
+(vt-slice a :start 0 :stop 2)
+  =>  vt-slice: 索引数 4 超过秩 1        （把四个关键字当成四个位置索引）
+现在
+  =>  vt-slice: 切片说明必须是**列表**，不是关键字（收到 :START 之类）。
+      写法：(vt-slice vt '(start stop &optional step))
+```
+
+`vt-slice` 的 spec 是**列表**（`'(0 2)` 取 `[0:2]`、`'(nil nil -1)` 反转），
+而 numpy / Clojure 迁过来的第一直觉都是 `:start/:stop/:step`。原消息里的
+「索引数 4」对用户毫无信息量 —— 它数的是四个参数，用户只写了两个「东西」。
+
+两件事值得单独记：
+
+1. `(UNSIGNED-BYTE 8)` 是**物理 Lisp 元素类型**，用户手里写的是 `:dtype :bool`。
+   两边对不上，报错等于没报 —— 用户只会以为自己传错了 dtype。
+2. `vt-nanstd` 那条是**成对不一致**（§17.10.12 的轴）：`vt-std` 拒绝 `:bool`，
+   `vt-nanstd` 却接受并把 `0.5` 经 `%bool-flag` 压成 1，静默给出「标准差
+   是否为零」这种看着像答案的东西。numpy 两个都抛 `TypeError`。
+   同族里 `vt-nanvar` 一并补上。
+
+##### 三、顺带修的非布尔缺陷：`correlate` / `convolve` 的 `:valid` 与 `:same`
+
+这是这一遍最值钱的一处，也是**「偏差表自我固化」的第四个实例**。
+
+`vt-correlate` 的 docstring 一直写着「三种模式本身与 numpy 逐值一致
+（:full/:valid/:same 均已对齐）」。实测：
+
+| (n, m) | mode | 修复前 | 现在 = numpy |
+|---|---|---|---|
+| (2, 7) | `:valid` | 形状 `(0)`（空） | `(2 1 2 1 2 1)` |
+| (3, 6) | `:valid` | 形状 `(0)` | 4 个值 |
+| (2, 7) | `:same` | `(2 1 2 1 2 1 2)` | 同（原本就对） |
+| (2, 7) | convolve `:same` | `(2 1 2 1 2 1 2)` | `(1 2 1 2 1 2 1)` |
+
+- `:valid` 的长度写的是 `(max 0 (1+ (- n m)))` —— n 是第一个序列、m 是核。
+  **n < m 时是负数，被 clamp 成 0**，于是「短序列配长核」直接得到空张量。
+  numpy 的规则是 `max(n,m) - min(n,m) + 1`，与谁长谁短无关。
+  起点 `offset = m-1` 同理只在 n ≥ m 时正确，应为 `min(n,m) - 1`。
+- `:same` 的起点写的是 `(floor (- full-len (max n m)) 2)`。`|n-m|` 为偶数时
+  它与 numpy 一致，为奇数时**方向相反**（向下取整 vs numpy 的下半区取大）。
+  实测 1..60 共 400 组随机 (n,m) 拟合出两条公式：
+  `correlate: min((m-1)/2, n/2)`、`convolve: min((m-1)/2, (n-1)/2)`。
+
+第二条公式说明 **numpy 的两个入口自己就不一致**：`np.convolve(a,v,'same')`
+不等于 `np.correlate(a, v[::-1], 'same')`，偶数 n + 长核时差一个位置。
+所以 `vt-convolve` 不能简单委托 `vt-correlate`，要传一个内部的
+`same-anchor`（`:v` / `:a`）区分。复数路径 `%CX-CORRELATE` 同样处理。
+
+验收：实数 25×25×3×2 = 3750 组、复数 20×20×3×2 = 2400 组，
+与 numpy 逐值零失配。
+
+##### 四、确认无事的部分（写下来免得下次重做）
+
+- **轴矩阵值层面**：`sum`/`any`/`all`/`count-nonzero`/`prod`/`amax`/`amin`
+  × `axis ∈ {0,1,-1,-2,(0,1),(1,2),(0,2)}` × `keepdims` 共 82 项，
+  与 numpy 逐值一致（脏字节是 dtype 层面的问题，值本身没错）。
+- **`argmax`/`argmin` 接受元组轴**：numpy 直接 `TypeError`（axis 必须是
+  int），本库给归约区内的线性下标。属**更宽松**，语义自洽（已核对
+  `argmax(b3, axis=(0,1))` 给 `(0 1 0)`），保留。
+- **`mean`/`nanmean` 的 `:dtype :bool`**：numpy 给 `[True True True True]`，
+  本库同值（走 `vt-sum` 的出口收敛）。
+- **`prod` 的 `:dtype :bool`**：`(1 0 0 1)`，与 numpy 的「任一为 0 则 0」一致。
+
+##### 五、有意偏差
+
+| 表达式 | clvt | numpy | 理由 |
+|---|---|---|---|
+| `(vt-sum int64数组 :dtype :bool)` | 报错（附 `vt-astype` 建议） | `[True True True]` | 布尔结果只从布尔输入直接归约。要「非零判定」先算数值再 `vt-astype` 更清楚；支持它需要给内核分派加第三条路径（任意 in-et × 小整型 out），风险大于收益 |
+| `(vt-std b :dtype :int8)` | `(0 0 0 0)` | `UFuncTypeError`（sqrt 不能输出 int8） | 本库按 int8 截断（与 `var` 的 int8 行为一致），numpy 在 sqrt 处才炸。更宽松 |
+
+---
+
 ## 附录 C：实测缺陷复现脚本
 
 ```lisp
