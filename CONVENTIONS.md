@@ -3653,6 +3653,9 @@ NumPy 的 `bool_` 语义分派（`elementwise.lisp`）：结果 dtype 为 `:bool
 | `abs(b)` | `bool`（恒等） | `:bool`（恒等） | 无特化，天然正确 |
 | `maximum/minimum(b,b)` | `bool` | `:bool` | 同上 |
 | `b + 1` | `int64`（值 2） | `:int64`（值 2） | §17.2 弱标量例外 |
+| `b @ b` / `dot` / `outer` / `inner` / `tensordot` / `einsum` | `bool`（按与/或缩并） | `:bool`（int32 计数后真值化） | §17.10 |
+| `invert(b)` | `bool`（逻辑非） | `:bool`（逻辑非） | §17.10 |
+| `histogram(b)` / `diff(b)` / `trapz(b)` | `int64` / `bool` / `float64` | 同左 | §17.10 |
 
 数值目标是**逃生门**：显式 `:dtype :int8` 等仍走整数路径，得到引入 `:bool` 之前
 的旧结果（`(vt-+ b b :dtype :int8)` → `[2 2 0]`），保证已有代码逐位不变。
@@ -3663,7 +3666,6 @@ NumPy 的 `bool_` 语义分派（`elementwise.lisp`）：结果 dtype 为 `:bool
 |---|---|---|---|
 | `b ** 2` | `int8` | `:int64` | NumPy 的 `power` 有一条历史遗留的 `bool ** int → int8` 专用循环，与 `2 ** b → int64` 自相矛盾。本库只保留统一的弱标量规则（§17.2），不复制这条循环 |
 | `vt-sign(b)` | **UFuncTypeError**（`sign` 无 bool 循环） | `:bool`（恒等） | 布尔没有「符号」，把它定义成恒等比抛错更符合 `sign` 的数学含义；且不破坏 B1 |
-| `matmul` / `outer(b, b)` | `bool`（按与/或缩并） | `:float64` | 缩并要求累加器，`bool` 累加器没有合法表示（和会越界）。NumPy 靠「按位与或」实现；本库暂不复制，结果与 `astype(float64) @ astype(float64)` 一致 |
 | `np.signbit(nan)` | `False`（Python 的 `nan` 是**正** QNaN） | `True` | 本库的规范 NaN 来自 x86 `0/0`，是**负** QNaN（`0xFFF8000000000000`）。`signbit` 读的是符号位本身，两边都没错；要对齐就给 NumPy 喂同一个负 NaN |
 
 ### 17.4 返回布尔的函数清单
@@ -3923,6 +3925,160 @@ SBCL 会把它当共享结构（打印成 `#1=T, #2=NIL, #1#, #2#`），所以�
 | 跨 dtype 的 view | 共享内存 | 独立副本 | CL 无法跨元素类型做位移数组（§16.18 D-C7） |
 | `np.array([[],[]], dtype=bool)` | shape `(2, 0)` 空数组 | `'(() ())` → shape `(2)` 的 `[NIL NIL]` | `NIL` 兼作空表；要空数组用 `(vt-zeros '(2 0) :dtype :bool)` |
 | `np.extract(0维条件, a)` | `[a[0]]`（条件被当长度 1 数组） | 整个 `a`（真）/ 空（假） | `vt-extract` 的既有解释；这里只保证布尔条件不再崩、且与 `:int8` 条件行为一致 |
+| `a[mask]` 花式索引 | 支持，返回被选中元素 | **不支持**（`vt-ref` 的索引必须是整数） | 布尔掩码的消费路径是 `vt-extract`（展平语义）与 `(vt-take a (vt-nonzero mask))`，见 §17.10 |
+
+---
+
+### 17.10 布尔写入路径与缩并的收口
+
+「布尔全链路」审计（numpy 2.3.5 逐例对照，152 + 66 条差分用例，另加两轮
+手工探针）补齐了**写入侧**的漏洞 —— 读侧的分层契约见 §17.8 / §17.9。这些漏洞
+的共同点是 `:bool` 与 `:uint8` 共用 `(unsigned-byte 8)` 存储带来的「值域失守」，
+或者 `vt-item` 布尔化之后漏改的内部解包点。
+
+分两遍扫：第一遍（17.10.1–17.10.7）问「算出来的值对不对」，第二遍
+（17.10.8–17.10.9）问「布尔**字面量**传不传得进去」—— 后者挖出的四处
+都是 `T fell through ETYPECASE` 一个形状。
+
+#### 17.10.1 `vt-map` 是唯一「用户函数决定元素值」的入口
+
+| 表达式 | 修复前 | 修复后 | numpy |
+|---|---|---|---|
+| `(vt-map (lambda (x) 2) b)` | `(2 2)` —— 布尔数组里躺着 2 | `(1 1)` | `astype(bool)` → True |
+| `(vt-map (lambda (x) 0.5d0) b)` | `(0 0)` —— 写回时被截断成 0 | `(1 1)` | True |
+| `(vt-map (lambda (x) 5) b :dtype :bool)` | `(5 5)` | `(1 1)` | True |
+
+修法不是「写完再扫一遍归一」，而是**在写回之前**把结果包一层 `%bool-flag`：
+`0.5` 走 `%coerce-uint8` 就已经变成 0，事后看数组已经救不回来了。`vt-map`
+按输入个数 1..5 生成对应的包装闭包（与 `%vt-map-run` 的 `call-fn` 特化同构），
+超出的走 `&rest` 兜底。非 `:bool` 结果一行不受影响 —— `(vt-map (lambda (x) 200)
+uint8数组)` 仍然是 200。
+
+#### 17.10.2 `vt-bit-not`：布尔没有「位」
+
+`(lognot 1)` 是 `-2`，写进 `(unsigned-byte 8)` 存储就是 **254**。这既不是
+`False`，也直接破掉 §17.1 的 0/1 不变量（`vt-to-list` 给 `(254 255)`、
+`vt-astype :int8` 给 `(-2 -1)`）。现在布尔输入改派 `vt-logical-not`，与
+numpy 的 `invert(bool)` 逐值一致；显式 `:dtype :int8` 仍是字节取反（逃生门）。
+
+#### 17.10.3 `vt-histogram`：`vt-item` 布尔化的漏网之鱼
+
+`(vt-item bool张量)` 返回 `T`/`NIL`（§17.8）之后，凡是要拿结果继续做算术的
+内部点都必须改调 `%item-number`。`vt-histogram` 自动定 bin 范围那一支漏了：
+
+```lisp
+(setf data-min (vt-item (vt-amin tensor))   ; => NIL / T
+      data-max (vt-item (vt-amax tensor)))
+;; 下一行 (- data-max data-min) → "NIL is not of type NUMBER"
+```
+
+`(vt-histogram bool数组)` 因此**直接报错**，而 numpy 正常工作（按 0/1 分箱，
+`[T,F,T]` 给 `[1 0 ... 0 2]`）。改 `%item-number` 即可 —— 这也是判别「该用哪个
+解包原语」的规则：**后面还要参与算术的，用 `%item-number`；只当条件用的，
+直接 `vt-item`（T/NIL 在 `if`/`unless` 里语义正确）。**
+
+#### 17.10.4 `vt-diff` 布尔 ≡ 逐次异或
+
+numpy 的 bool 减法按位回绕：`True-False = 1`、`False-True = -1`，落回 bool
+都是 `True`，所以 `np.diff(bool)` 恰好等价于相邻**异或**链（`n=2` 也一致：
+`[T,F,T,F]` → `[False,False]`）。clvt 的 `vt--` 对布尔是明确拒绝的（§17.3），
+原来也就跟着报错，且报错文案还写成「numpy 同样拒绝」—— 这句是错的。
+现在 `vt-diff` 对布尔走 `vt-logical-xor`，报错文案同步修正。
+
+#### 17.10.5 `vt-trapz`：整数/布尔按 float64 累加
+
+被积项是 `0.5*(l+r)*h`，结果 dtype 跟着输入走的话，`0.5` 写进 `:bool` 得 0、
+写进 `:int8` 也得 0 —— `(vt-trapz bool数组)` 静默返回 **0**（numpy 给 1.0）。
+现在整数与布尔输入统一按 `:float64` 累加，浮点输入行为不变。
+
+#### 17.10.6 布尔缩并：`b @ b` 是逻辑运算，不是数值和
+
+| 表达式 | 修复前 | 修复后 | numpy |
+|---|---|---|---|
+| `(vt-matmul b b)` | `:float64`，值 `[[2 1][1 2]]` | `:bool`，`[[T T][T T]]` | 同左 |
+| `(vt-dot b b)` | `:float64` | `:bool` | 同左 |
+| `(vt-einsum "ij,jk->ik" b b)` | `:float64` | `:bool` | 同左 |
+| `(vt-outer b b)` / `(vt-inner b b)` / `(vt-tensordot b b)` | `:float64` | `:bool` | 同左 |
+| `(vt-trace b)` | `:int64` | `:int64`（不变） | `np.trace(bool)` 也是 int64 |
+
+实现：`vt-einsum`（`dot`/`matmul`/`outer`/`inner`/`tensordot` 全部汇聚到它）
+在「全部输入 `:bool` 且未显式给 `:dtype`」时，以 `:int32` 累加 0/1 的乘积，
+最后一次 `vt-astype :bool` 收回真值。`sum(a&b) > 0` 与 numpy 的
+`or(a&b)` 逐位等价，且 int32 计数不会像 bool/int8 累加器那样越界
+（200 个 1 的内积实测仍是 `T`）。
+
+这里曾记作「有意保留的偏差」，理由是「bool 累加器没有合法表示」—— 这个理由
+只对**累加器**成立，对**结果**不成立：用中间 int32 计数、末步真值化就没有
+越界问题。`:out` 为 `:bool` 时也按真值写回；显式 `:dtype :float64`
+等仍是数值路径（逃生门）。
+
+#### 17.10.7 仍然不同意的三处（记录在案，不是缺陷）
+
+| 项 | numpy | clvt | 理由 |
+|---|---|---|---|
+| `a[mask]` | 支持 | 不支持，`(vt-ref a mask)` 报「索引必须是整数」 | 布尔掩码的消费路径是 `vt-extract`（展平）/ `(vt-take a (vt-nonzero mask))`。`vt-ref` 的契约是「取一个标量」，返回拷贝会破坏它 |
+| `b ** b` / `b ** 2` | `int8` | `:bool` / `:int64` | `power` 在 numpy 里的 bool 循环是历史包袱（见 §17.3） |
+| `vt-sign(b)` | 报错 | `:bool`（恒等） | 同上 |
+
+#### 17.10.8 `T`/`NIL` 当「值」用：`ensure-vt` 与五个值位置
+
+第一遍审计（§17.10.1–17.10.6）收的是「算错了」；第二遍按「哪些入口收得下
+布尔**字面量**」扫，收的是「根本传不进去」。四处失败长得一模一样：
+
+| 表达式 | 修复前 | 修复后 | numpy |
+|---|---|---|---|
+| `(vt-insert b 0 t)` | `T fell through ETYPECASE` | 插入一个真 | `np.insert(b,0,True)` |
+| `(vt-pad b '(1 1) :constant-values t)` | `invalid constant-values: T` | 四边各一个真 | `np.pad(b,1,constant_values=True)` |
+| `(vt-fill-diagonal m t)` | 只填对角第一个元素 | 整条对角线 | `np.fill_diagonal(m,True)` |
+| `(vt-where b t nil)` | `T fell through ETYPECASE` | `:bool`，`np.where(b,True,False)` | 同左 |
+
+前三处的根都在 `ENSURE-VT`：它的 `ETYPECASE` 只有 `vt` / `number` / `sequence`
+三个分支，`T` 是符号，一个都不匹配。第四处一半在 `VT-WHERE`（分支走
+`ensure-vt`），一半在 `VT-FILL-DIAGONAL` 的「标量还是序列」判据
+（`(numberp value)` 对 `T` 判否）。
+
+**`T` 与 `NIL` 的待遇不同，这是刻意的：**
+
+| 入口 | `T` | `NIL` |
+|---|---|---|
+| `ENSURE-VT` | 值 1（未给 `:dtype` 时按 `:bool` 落 0 维真） | **空表**（shape `(0)`），除非显式 `:dtype :bool` → 值 0 |
+| `VT-FROM-SEQUENCE` | 叶子（需 `:dtype :bool`） | 顶层 shape `(0)`；`:bool` 下是叶子（§17.10.1） |
+| 五个值位置（下表） | 值 1 | 值 0 |
+
+`T` 没有二义性 —— 它不可能是空表，所以任何 dtype 下都当值 1
+（`(ensure-vt t :dtype :int64)` → `1`），这样 `(vt-append b t)`、
+`(vt-insert int数组 0 t)` 也一并通了。
+
+`NIL` 有真二义性，且在 `ENSURE-VT` 上**沿用「空表」**：300 多个内部调用点
+靠 `(ensure-vt nil)` 得到空表来表示「没有序列」，改成「假」等于让一批
+可选参数悄悄变成 0。所以只在**显式声明了 `:bool`** 时才把 `NIL` 读成假。
+想要「一个假元素」写 `(list nil)` 或 `0`。
+
+**值位置清单**（这里是「一个元素」的期望位置，`NIL` 只能是假）：
+
+| 位置 | 处理 |
+|---|---|
+| `VT-PUT` 的值 / 值列表 | `%BOOL-FLAG`（§17.10.1 的连带修复） |
+| `VT-FILL` 的 value | `VT-CAST` → `%BOOL-FLAG` |
+| `VT-INSERT` 的 values | `ENSURE-VT … :dtype :bool` |
+| `VT-PAD` 的 `:constant-values` | `%PAD-CV-BOOL-TREE` 递归换 1/0（支持 `'(nil t)` 与逐维 `'((t nil)(nil t))`） |
+| `VT-FILL-DIAGONAL` 的 value | 标量判据加 `T`/`NIL` 分支 |
+| `VT-WHERE` 的 x / y | 分支 `T`/`NIL` → 0 维 `:bool`（两分支都是符号时结果 `:bool`） |
+
+`VT-FILL-DIAGONAL` 那条还有个「静默错值」的味道：`T` 落进序列分支后
+`(ensure-vt t)` 是 0 维、`vt-ravel` 只剩 1 个元素，于是只填对角线第一个
+位置，不报错。**静默错值 > 报错**，所以它比前三处更值得修。
+
+#### 17.10.9 `%bool-wrap` 的 `ECASE`：`T` 不是默认子句
+
+`%bool-wrap`（§17.10.1）按输入个数 1..5 生成包装闭包、其余走 `&REST` 兜底。
+第一版写的是 `ECASE`，而 `ECASE` 里的 `T` **只是一个普通键**（匹配符号 `T`），
+不是 `CASE` 的默认子句 —— 于是 `(vt-map f b1 … b6)`（6 输入）在
+`%vt-map-run` 那边明明有 `otherwise` 分支，却先在 `%bool-wrap` 报
+`no key`。改用 `CASE` 即可。回归见 J 组 `map/six-inputs` / `map/seven-inputs`。
+
+**这条值得单独记**：`ECASE` 配 `T` 子句能编译、能通过 5 输入以内的全部测试，
+只在 n≥6 时炸，而 `vt-map` 的 6 输入是文档支持的合法用法。
 
 ---
 

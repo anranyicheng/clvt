@@ -637,8 +637,19 @@
            (dlen (min rows cols))
            (rank-1 (= rank 2))
            (batch (if rank-1 1 (reduce #'* (subseq shape 0 (- rank 2)))))
-           (vals (cond ((numberp value) nil)
-                       (t (coerce (vt-data (vt-astype (vt-ravel (ensure-vt value)) :int64))
+           ;; 目标为 :bool 时 T/NIL 是**标量值**（§17.10.8）。不加这一条就会
+           ;; 落进序列分支：`(ensure-vt t)` 是 0 维、`vt-ravel` 后只剩 1 个
+           ;; 元素，于是 `(vt-fill-diagonal m t)` 只填对角线第一个位置。
+           (scalar-p (or (numberp value)
+                         (and (eq (vt-dtype tensor) :bool)
+                              (or (eq value t) (null value)))))
+           (vals (cond (scalar-p nil)
+                       (t (coerce (vt-data (vt-astype
+                                            (vt-ravel (ensure-vt
+                                                       value
+                                                       :dtype (and (eq (vt-dtype tensor) :bool)
+                                                                   :bool)))
+                                            :int64))
                                   'list)))))
       (when (and vals (> (length vals) dlen) (not wrap))
         (error "vt-fill-diagonal: value 长度 ~a 超过对角线长度 ~a"

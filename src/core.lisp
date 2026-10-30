@@ -196,7 +196,30 @@
   "将标量/序列/张量统一转换为张量。标量 -> 0 维张量；序列 -> 一维以上张量。
    复数（#C(re im)）：标量推断 complex64/complex128（按分量浮点宽度），
    序列中只要含一个复数叶子即整体 complex128（对标 numpy，
-   见 CONVENTIONS §16.2）。"
+   见 CONVENTIONS §16.2）。
+
+   `T` 是**值 1**（未给 `:DTYPE` 时按 `:bool` 落 0 维真），`NIL` 只有显式
+   `:DTYPE :BOOL` 才是值 0 —— 否则仍是空表（见下面的取舍说明）。本函数的契约
+   是「值 → 张量」，符号在这里只能当值；空数组请用
+   `(vt-zeros '(0) :dtype :bool)`。
+
+   `NIL` 的两读不能同时满足：`(ensure-vt nil)` 现状是 shape `(0)` 的空表，
+   这是 `VT-FROM-SEQUENCE` 的既定规则（§17.10.1），300+ 内部调用点都按这个
+   语义传「没有序列」。所以只在**显式声明了 `:bool`** 时把 `NIL` 读成假；
+   需要「一个假元素」的地方写 `(list nil)` 或 `0`。`T` 没有这种二义性，
+   任何 dtype 下都是值 1。"
+  (when (eq obj t)
+    (let* ((final (or dtype :bool))
+           (lisp-type (vt-dtype->lisp-type final)))
+      (return-from ensure-vt
+        (%make-vt :data (make-array 1 :element-type lisp-type
+                                      :initial-element (vt-cast 1 final))
+                  :shape nil :strides nil :offset 0 :dtype final))))
+  (when (and (eq dtype :bool) (null obj))
+    (return-from ensure-vt
+      (%make-vt :data (make-array 1 :element-type (vt-dtype->lisp-type :bool)
+                                    :initial-element 0)
+                :shape nil :strides nil :offset 0 :dtype :bool)))
   (etypecase obj
     (vt (if (and dtype (not (eq (vt-dtype obj) dtype)))
             (vt-copy-into (make-vt (vt-shape obj) 0 :dtype dtype) obj)

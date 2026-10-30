@@ -2119,8 +2119,12 @@
           (progn
             (unless (vt-item (vt-all (vt-isfinite tensor)))
               (error "自动确定 bin 范围需要有限输入"))
-            (setf data-min (vt-item (vt-amin tensor))
-                  data-max (vt-item (vt-amax tensor)))
+            ;; %ITEM-NUMBER 而不是 VT-ITEM：:bool 输入时 VT-ITEM 给 T/NIL
+            ;; （§17.8 逻辑视图），下面 (- data-max data-min) 直接把 NIL 丢进
+            ;; 算术会报 "NIL is not of type NUMBER"。numpy 的 histogram(bool)
+            ;; 正常工作（按 0/1 数值分箱），所以这里必须取数值视图。
+            (setf data-min (%item-number (vt-item (vt-amin tensor)))
+                  data-max (%item-number (vt-item (vt-amax tensor))))
             (when (= data-min data-max)
               (setf data-min (- data-min 0.5s0)
                     data-max (+ data-max 0.5s0)))))
@@ -2741,7 +2745,17 @@
           (return-from vt-diff
             (vt-zeros (append (subseq sh 0 ax) '(0) (subseq sh (1+ ax)))
                       :dtype (vt-dtype result))))
-        (setf result (vt-- (vt-narrow result ax 1 len) (vt-narrow result ax 0 (1- len)))))
+        (setf result (let ((hi (vt-narrow result ax 1 len))
+                           (lo (vt-narrow result ax 0 (1- len))))
+                       ;; 布尔差分（§17.10）：numpy 的 bool 减法按位回绕，
+                       ;; `True-False = 1`、`False-True = -1`，两者落回 bool
+                       ;; 都是 True —— 等价于**异或**。实测 np.diff([T,F,T])
+                       ;; → [True,True]，np.diff(...,n=2) → [False,False]，
+                       ;; 与逐次 XOR 完全一致。而 vt-- 对 bool 是明确拒绝的
+                       ;; （§17.3），不在这条分支上特判就只能报错。
+                       (if (eq (vt-dtype result) :bool)
+                           (vt-logical-xor hi lo)
+                           (vt-- hi lo)))))
           finally (return result))))
 
 (declaim (inline %trapz-term))
@@ -2751,16 +2765,25 @@
   (* 0.5d0 (+ l r) hh))
 
 (defun vt-trapz (y &key (x nil) (dx 1.0d0) (axis -1))
-  "梯形法则数值积分（对标 numpy.trapz）。X 给定则用非均匀间距，否则用 DX。"
+  "梯形法则数值积分（对标 numpy.trapz）。
+
+   整数/布尔输入按 **:float64** 累加（§17.10）：被积项是 `0.5*(l+r)*h`，
+   若结果 dtype 跟着输入走，`(0.5*1)` 写进 :bool 得 0、写进 :int8 得 0，
+   于是 `(vt-trapz bool数组)` 静默返回 0（numpy 给 1.0）。"
   (let* ((sh (vt-shape y))
          (ax (vt-normalize-axis axis (length sh)))
-         (n (nth ax sh)))
+         (n (nth ax sh))
+         (ydt (vt-dtype y))
+         (acc-dt (if (or (eq ydt :bool)
+                         (member ydt '(:int8 :int16 :int32 :int64 :uint8 :uint16)))
+                     :float64
+                     ydt)))
     (when (< n 2)
       (return-from vt-trapz
-        (vt-zeros (append (subseq sh 0 ax) (subseq sh (1+ ax))) :dtype (vt-dtype y))))
+        (vt-zeros (append (subseq sh 0 ax) (subseq sh (1+ ax))) :dtype acc-dt)))
     (let ((h (if x
                  (vt-diff (ensure-vt x))
-                 (make-vt (list (1- n)) dx :dtype (vt-dtype y)))))
+                 (make-vt (list (1- n)) dx :dtype acc-dt))))
       (setf h (vt-reshape h (append (make-list ax :initial-element 1) (list (1- n))
                                     (make-list (- (length sh) ax 1) :initial-element 1))))
       (let* ((left (vt-narrow y ax 0 (1- n)))
@@ -2771,7 +2794,7 @@
              ;; 通用 AREF。1M 元素实测 112420us（numpy.trapezoid 4638us）。
              ;; 换成「命名算子 + vt-fast-map」即可命中第 1 轮建好的
              ;; inline3-strided 快路径（三输入、按输出元素类型特化、支持广播）。
-             (integrand (vt-fast-map #'%trapz-term left right h)))
+             (integrand (vt-fast-map #'%trapz-term left right h :dtype acc-dt)))
         (vt-sum integrand :axis ax)))))
 
 (defun %normalize-mode-keyword (mode)

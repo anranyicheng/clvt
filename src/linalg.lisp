@@ -1229,19 +1229,37 @@
            ;; 天然正确；三类快路径（逐元素/内积/GEMM）在复数层注册钩子后
            ;; 也一并对复数生效（§16.21）。钩子缺席时自动回落通用路径。
            (supported-types '(:float64 :float32 :int64 :int32
-                              :complex64 :complex128)))
+                              :complex64 :complex128))
+           ;; 全部输入都是 :bool 且未显式给 :dtype → 布尔缩并（见下面的
+           ;; BOOL-RESULT）。放在这里是因为 :out 的白名单校验比内部 let* 早。
+           (all-bool-inputs (and (null dtype-arg)
+                                 (every (lambda (v) (eq (vt-dtype v) :bool))
+                                        clean-tensors))))
       ;; 校验显式 dtype
       (when (and dtype-arg (not (member dtype-arg supported-types)))
         (error "vt-einsum: 不支持的显式 dtype (~a)。允许: ~a。"
 	       dtype-arg supported-types))
-      ;; 校验 out 类型
-      (when (and out-arg (not (member (vt-dtype out-arg) supported-types)))
+      ;; 校验 out 类型（布尔缩并的结果与 out 都允许 :bool）
+      (when (and out-arg
+                 (not (member (vt-dtype out-arg)
+                              (if all-bool-inputs
+                                  (cons :bool supported-types)
+                                  supported-types))))
         (error "vt-einsum: 不支持的 out 张量类型 (~a)。允许: ~a。"
-	       (vt-dtype out-arg) supported-types))
+	       (vt-dtype out-arg)
+               (if all-bool-inputs (cons :bool supported-types) supported-types)))
       ;; 类型推导与统一 ===
-      (let* ((final-dtype
+      (let* (;; 布尔缩并（§17.10）：numpy 里 `bool @ bool` 是按「与/或」缩并的，
+             ;; 结果仍是 bool。本库的 einsum 计算层只认数值 dtype，故以 :int32
+             ;; 累加 0/1 的乘积 —— `sum(a[i,k]&b[k,j]) > 0` 与 numpy 的
+             ;; `or(a[i,k]&b[k,j])` 逐位等价 —— 最后再一次性收回 :bool。
+             ;; 不这么做的话 `bool @ bool` 会走 float64 数值和（[2 1;1 2]），
+             ;; 与 numpy 的 `[[True,True],[True,True]]` 值都不同。
+             (bool-result all-bool-inputs)
+             (final-dtype
                (cond
                  (dtype-arg dtype-arg)
+                 (bool-result :int32)
                  (t (apply #'vt-promote-type
                            (mapcar #'vt-dtype clean-tensors)))))
              ;; 类型转换 (零拷贝优化)
@@ -1253,9 +1271,13 @@
         ;; 显式 :dtype」决定，**不由 out 决定**。einsum-execute 内部还会对
         ;; 形状（H2）做精确校验；此处提前给出带 "vt-einsum" 前缀的清晰报错。
         (when out-arg
-          (unless (eq (vt-dtype out-arg) final-dtype)
-            (error "vt-einsum: :out dtype ~a 与结果 dtype ~a 不匹配"
-                   (vt-dtype out-arg) final-dtype)))
+          (if bool-result
+              (unless (eq (vt-dtype out-arg) :bool)
+                (error "vt-einsum: 布尔缩并的 :out dtype 必须是 :bool，得到 ~a"
+                       (vt-dtype out-arg)))
+              (unless (eq (vt-dtype out-arg) final-dtype)
+                (error "vt-einsum: :out dtype ~a 与结果 dtype ~a 不匹配"
+                       (vt-dtype out-arg) final-dtype))))
         (multiple-value-bind (raw-inputs raw-output explicit-p)
             (get-parsed-subscripts subscripts)          
           (unless (= (length raw-inputs) (length cast-tensors))
@@ -1266,9 +1288,13 @@
             ;; 语义分析 (构建维度映射)
             (multiple-value-bind (all-labels label-dims output-subs-final)
                 (analyze-einsum input-subs output-subs cast-tensors explicit-p)
-              (einsum-execute 
-               all-labels label-dims output-subs-final input-subs cast-tensors
-               :out out-arg))))))))
+              (let ((r (einsum-execute
+                        all-labels label-dims output-subs-final input-subs cast-tensors
+                        :out (if bool-result nil out-arg))))
+                ;; 布尔缩并收尾：int32 计数 → 真值（0 假 / 非 0 真）。
+                (cond ((not bool-result) r)
+                      (out-arg (vt-copy-into out-arg (vt-astype r :bool)) out-arg)
+                      (t (vt-astype r :bool)))))))))))
 
 (defun vt-matmul (a b &key dtype out)
   "矩阵乘法，兼容 1d 向量（对标 numpy 的 @ 运算符）。"

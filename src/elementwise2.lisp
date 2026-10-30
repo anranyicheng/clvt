@@ -240,10 +240,20 @@
 (vt-map #'logxor (ensure-vt t1) (ensure-vt t2) :dtype dtype :out out))
 
 (defun vt-bit-not (vt &key out dtype)
-  "逐元素按位取反 lognot。输入应为整数 dtype；:out 契约同 vt-+。"
-    (when (%cx-reject vt)
+  "逐元素按位取反 lognot。输入应为整数 dtype；:out 契约同 vt-+。
+
+   布尔输入（§17.10）：走 `vt-logical-not`，不是字节取反。`(lognot 1)` 给
+   -2，写进 `(unsigned-byte 8)` 存储后是 **254** —— 既不是 `False`，也直接
+   破掉 §17.1 的 0/1 不变量。numpy 的 `invert(bool)` 就是逻辑非，逐值对齐。
+   显式给数值 :DTYPE 时仍走位取反（逃生门，与 §17.3 一致）。"
+  (when (%cx-reject vt)
     (error "vt-bit-not: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-map #'lognot vt :dtype dtype :out out))
+  (let ((v (ensure-vt vt)))
+    (when (and (eq (vt-dtype v) :bool)
+               (or (null dtype) (eq dtype :bool))
+               (or (null out) (eq (vt-dtype out) :bool)))
+      (return-from vt-bit-not (vt-logical-not v :dtype :bool :out out))))
+  (vt-map #'lognot vt :dtype dtype :out out))
 
 (defun vt-left-shift (vt shift &key out dtype)
   "逐元素左移 SHIFT 位（ash x shift）。SHIFT 为整数标量。

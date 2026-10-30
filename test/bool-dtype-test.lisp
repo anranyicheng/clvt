@@ -581,6 +581,139 @@
   (check "put/scalar-t" (vt-to-list c) '(0 1 0)))
 
 ;;; ==================================================================
+;;; J. 审计修复回归（§17.10）：用户函数写 bool、按位取反、直方图、
+;;;    布尔差分/积分、布尔缩并（matmul/dot/outer/inner/tensordot/einsum）
+;;; ==================================================================
+
+(format t "~&== J. 审计修复回归 (§17.10) ==~%")
+
+(defparameter *jb* (vt-from-sequence '(1 1 0 0) :dtype :bool)
+  "J 组的布尔样本：两个真、两个假。")
+
+;; --- J1. VT-MAP 写 :bool：必须写回之前真值化，且不能截断 ---
+(check "map/int-2"   (flat-ints (vt-map (lambda (x) 2) *jb*)) '(1 1 1 1))
+(check "map/float-half" (flat-ints (vt-map (lambda (x) 0.5d0) *jb*)) '(1 1 1 1))
+(check "map/float-zero" (flat-ints (vt-map (lambda (x) 0.0d0) *jb*)) '(0 0 0 0))
+(check "map/nil"     (flat-ints (vt-map (lambda (x) nil) *jb*)) '(0 0 0 0))
+(check "map/t"       (flat-ints (vt-map (lambda (x) t) *jb*)) '(1 1 1 1))
+(check "map/dtype"   (vt-dtype (vt-map (lambda (x) 7) *jb*)) :bool)
+(check-true "map/invariant" (bool-bytes-ok-p (vt-map (lambda (x) 7) *jb*)))
+(check "map/explicit-bool" (flat-ints (vt-map (lambda (x) 5) *jb* :dtype :bool)) '(1 1 1 1))
+;; 写入非连续 out（转置视图）时也只碰逻辑位置
+(let ((d (vt-zeros '(2 2) :dtype :bool)))
+  (vt-map (lambda (x) 1) (vt-reshape *jb* '(2 2)) :out (vt-transpose d))
+  (check "map/out-view" (vt-to-list d) '((1 1) (1 1))))
+;; 数值 dtype 不受影响（不能把 uint8 的 200 也归一成 1）
+(check "map/uint8-200" (flat-ints (vt-map (lambda (x) 200) (vt-from-sequence '(1 0) :dtype :uint8)))
+       '(200 200))
+
+;; --- J2. VT-BIT-NOT：布尔走逻辑非，不是字节取反 254/255 ---
+(check "bitnot/bool" (flat-ints (vt-bit-not *jb*)) '(0 0 1 1))
+(check "bitnot/bool-dtype" (vt-dtype (vt-bit-not *jb*)) :bool)
+(check-true "bitnot/invariant" (bool-bytes-ok-p (vt-bit-not *jb*)))
+(check "bitnot/bool-vs-logical"
+       (flat-ints (vt-bit-not *jb*)) (flat-ints (vt-logical-not *jb*)))
+;; 数值逃生门保持字节语义
+(check "bitnot/int8" (flat-ints (vt-bit-not (vt-from-sequence '(1 0) :dtype :int8))) '(-2 -1))
+(check "bitnot/bool->int8" (flat-ints (vt-bit-not *jb* :dtype :int8)) '(-2 -2 -1 -1))
+
+;; --- J3. VT-HISTOGRAM：布尔不再因 T/NIL 进算术而报错 ---
+(let ((h (vt-histogram *jb*)))
+  (check "hist/counts" (flat-ints h) '(2 0 0 0 0 0 0 0 0 2))
+  (check "hist/dtype" (vt-dtype h) :int64))
+(let ((h (vt-histogram *jb* :bins 2 :range '(0 2))))
+  (check "hist/range" (flat-ints h) '(2 2)))
+
+;; --- J4. VT-DIFF：布尔差分 ≡ 逐次异或（numpy 的 bool 减法回绕） ---
+(check "diff/bool" (flat-ints (vt-diff *jb*)) '(0 1 0))
+(check "diff/bool-n2" (flat-ints (vt-diff *jb* :n 2)) '(1 1))
+(check "diff/bool-dtype" (vt-dtype (vt-diff *jb*)) :bool)
+(check "diff/float-unchanged"
+       (vt-to-list (vt-diff (vt-from-sequence '(1 0 3)))) '(-1.0d0 3.0d0))
+
+;; --- J5. VT-TRAPZ：整数/布尔按 float64 累加，不再截断成 0 ---
+(check "trapz/bool" (vt-item (vt-trapz *jb*)) 1.5d0 :test #'=)
+(check "trapz/bool-dtype" (vt-dtype (vt-trapz *jb*)) :float64)
+(check "trapz/int8" (vt-item (vt-trapz (vt-from-sequence '(1 0 1) :dtype :int8))) 1.0d0 :test #'=)
+(check "trapz/float-unchanged" (vt-item (vt-trapz (vt-from-sequence '(1.0 0.0 1.0)))) 1.0d0 :test #'=)
+
+;; --- J6. 布尔缩并：numpy 按「与/或」缩并，结果仍是 :bool ---
+(defparameter *bm4* (vt-reshape (vt-from-sequence '(1 0 1 1) :dtype :bool) '(2 2)))
+(check "mm/dtype" (vt-dtype (vt-matmul *bm4* *bm4*)) :bool)
+(check "mm/values" (flat-ints (vt-matmul *bm4* *bm4*)) '(1 0 1 1))
+(check-true "mm/invariant" (bool-bytes-ok-p (vt-matmul *bm4* *bm4*)))
+(check "mm/dot-same" (flat-ints (vt-dot *bm4* *bm4*)) '(1 0 1 1))
+(check "mm/outer" (flat-ints (vt-outer (vt-from-sequence '(1 0) :dtype :bool)
+                                       (vt-from-sequence '(1 1) :dtype :bool)))
+       '(1 1 0 0))
+(check "mm/inner" (flat-ints (vt-inner *bm4* *bm4*)) '(1 1 1 1))
+(check "mm/tensordot" (vt-item (vt-tensordot *jb* (vt-from-sequence '(1 0 1 1) :dtype :bool)
+                                             :axes 1))
+       t)
+(check "mm/einsum"
+       (flat-ints (vt-einsum "ij,jk->ik" *bm4* *bm4*)) '(1 0 1 1))
+;; 逻辑缩并而不是数值和：[[T,F],[T,T]] @ 自身 不会出现 2
+(check-true "mm/no-numeric-sum"
+            (notany (lambda (v) (> v 1)) (flat-ints (vt-matmul *bm4* *bm4*))))
+;; 200 个 1 的内积：int32 计数累加 → 真值，不溢出不误报
+(check "mm/long-dot" (vt-item (vt-matmul (vt-ones '(200) :dtype :bool)
+                                         (vt-ones '(200) :dtype :bool)))
+       t)
+(check "mm/zero-dot" (vt-item (vt-matmul (vt-zeros '(3) :dtype :bool)
+                                         (vt-ones '(3) :dtype :bool)))
+       nil)
+;; 逃生门：显式 :dtype 仍走数值路径
+(check "mm/explicit-f64" (vt-dtype (vt-einsum "i,i->" *jb* *jb* :dtype :float64)) :float64)
+(check "mm/mixed-promotes"
+       (vt-dtype (vt-dot *jb* (vt-from-sequence '(1.0 0.0 1.0 1.0)))) :float64)
+;; :out 为 :bool 时按真值写回
+(let ((o (vt-zeros '(2 2) :dtype :bool)))
+  (vt-matmul *bm4* *bm4* :out o)
+  (check "mm/out-bool" (vt-to-list o) '((1 0) (1 1))))
+;; trace 仍走数值（numpy 的 np.trace(bool) 也是 int64）
+(check "mm/trace-int64" (vt-dtype (vt-trace *bm4*)) :int64)
+(check "mm/trace-value" (vt-item (vt-trace *bm4*)) 2)
+
+;; --- J7. 「值位置」上的 T/NIL：传得进去，且不误伤空表语义 (§17.10.8) ---
+;; ensure-vt：T 是值 1（缺省 :bool），NIL 只有显式 :bool 才是 0
+(check "ensure/t"      (list (vt-dtype (ensure-vt t)) (vt-item (ensure-vt t))) '(:bool t))
+(check "ensure/t-i64"  (list (vt-dtype (ensure-vt t :dtype :int64))
+                             (vt-item (ensure-vt t :dtype :int64))) '(:int64 1))
+(check "ensure/nil-empty" (vt-shape (ensure-vt nil)) '(0))
+(check "ensure/nil-bool"  (vt-item (ensure-vt nil :dtype :bool)) nil)
+;; vt-insert：values 为 T/NIL 时按布尔标量插入
+(check "insert/t"   (vt-to-list (vt-insert *jb* 0 t)) '(1 1 1 0 0))
+(check "insert/nil" (vt-to-list (vt-insert *jb* 0 nil)) '(0 1 1 0 0))
+(check "insert/axis" (vt-to-list (vt-insert *bm4* 0 t :axis 1))
+       '((1 1 0) (1 1 1)))
+;; vt-pad：constant-values 的 T/NIL（标量 / 一对 / 逐维）
+(check "pad/t"   (vt-to-list (vt-pad *jb* '(1 1) :constant-values t))
+       '(1 1 1 0 0 1))
+(check "pad/nil" (vt-to-list (vt-pad *jb* '(1 1) :constant-values nil))
+       '(0 1 1 0 0 0))
+(check "pad/pair" (vt-to-list (vt-pad *jb* '(1 1) :constant-values '(nil t)))
+       '(0 1 1 0 0 1))
+;; vt-where：三元选择的两个分支都是值位置，(vt-where b t nil) ≡ np.where(b,T,F)
+(check "where/tnil" (list (vt-dtype (vt-where *jb* t nil))
+                          (vt-to-list (vt-where *jb* t nil))) '(:bool (1 1 0 0)))
+(check "where/nilt" (vt-to-list (vt-where *jb* nil t)) '(0 0 1 1))
+(check "where/t-int" (vt-dtype (vt-where *jb* t 0)) :int64)
+;; vt-append / vt-fill-diagonal / vt-fill：T/NIL 当元素值
+(check "append/t" (vt-to-list (vt-append *jb* t)) '(1 1 0 0 1))
+(let ((m (vt-zeros '(2 2) :dtype :bool)))
+  (vt-fill-diagonal m t)
+  (check "fill-diagonal/t" (vt-to-list m) '((1 0) (0 1))))
+(check "fill/nil" (let ((c (vt-copy *jb*))) (vt-fill c nil) (vt-to-list c))
+       '(0 0 0 0))
+;; vt-map 的 6/7 输入走 &REST 分支（ECASE 的 T 子句不是默认子句）
+(check "map/six-inputs" (flat-ints (vt-map (lambda (a b c d e f) 2)
+                                           *jb* *jb* *jb* *jb* *jb* *jb*))
+       '(1 1 1 1))
+(check "map/seven-inputs" (flat-ints (vt-map (lambda (a b c d e f g) 3)
+                                             *jb* *jb* *jb* *jb* *jb* *jb* *jb*))
+       '(1 1 1 1))
+
+;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)
 (when (plusp *fail*) (sb-ext:exit :code 1))

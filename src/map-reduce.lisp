@@ -238,6 +238,27 @@
       (mapcar (lambda (x) (%weak-cast1 x final-dtype inputs)) inputs)
       inputs))
 
+(defun %bool-wrap (fn n)
+  "把用户函数包一层 `%bool-flag`，让 `:bool` 结果的每个元素在**写回之前**
+   就收敛成 0/1（§17.10）。
+
+   为什么不能等写回后再归一化：`:bool` 与 `:uint8` 共用 `(unsigned-byte 8)`
+   存储，写回走 `%coerce-uint8` —— `0.5` 在这一步已被截断成 0，事后看数组
+   只能看到 0，真值信息已经丢了。实测：`(vt-map (lambda (x) 0.5) bool数组)`
+   在「先写后归一」下给 `False`，numpy 的 `astype(bool)` 给 `True`。
+
+   N 是输入个数（`%vt-map-run` 的 `call-fn` 按 1..5 特化）；超出的走 &REST
+   兜底，与 `call-fn` 的 `(apply fn vals)` 分支同构。用 `CASE` 而不是 `ECASE`：
+   `ECASE` 里的 `T` 只是「匹配符号 T」这个普通键，不是默认子句 —— n≥6 会直接
+   报 no key（`vt-map` 的 6 输入是合法的，`call-fn` 有 &REST 分支）。"
+  (case n
+    (1 (lambda (a) (%bool-flag (funcall fn a))))
+    (2 (lambda (a b) (%bool-flag (funcall fn a b))))
+    (3 (lambda (a b c) (%bool-flag (funcall fn a b c))))
+    (4 (lambda (a b c d) (%bool-flag (funcall fn a b c d))))
+    (5 (lambda (a b c d e) (%bool-flag (funcall fn a b c d e))))
+    (t (lambda (&rest xs) (%bool-flag (apply fn xs))))))
+
 (defun vt-map (fn &rest args)
   "高效逐元素映射：支持标量/列表/张量混合输入并自动广播。
 
@@ -274,7 +295,10 @@
              (res (if out
                       (vt-check-out out out-shape final-dtype :op-name "vt-map")
                       (make-vt out-shape 0 :dtype final-dtype))))
-	(%vt-map-run fn (%weak-cast-inputs inputs final-dtype) res out-shape)
+	(%vt-map-run (if (eq final-dtype :bool)
+                         (%bool-wrap fn (length inputs))
+                         fn)
+                     (%weak-cast-inputs inputs final-dtype) res out-shape)
 	res))))
 
 (defun %vt-map-run (fn inputs res out-shape)

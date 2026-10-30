@@ -4,6 +4,61 @@
 
 ---
 
+## 2026-10-30（三十六）— fix(bool): 布尔全链路审计（两遍）—— 六类静默错值 + `T`/`NIL` 值位置
+
+> 契约见 `CONVENTIONS.md` §17.10（17.10.1–17.10.9）；实现细节见 `HISTORY.md` H.3.29。
+> 本轮的六类问题全部有 numpy 2.3.5 逐例对照（152 + 66 条差分用例），
+> 另加两轮手工探针扫「字面量传不传得进去」。
+
+**破坏性变更（三处，都是「原来给错答案」）**：
+
+| 旧 | 现在 | 影响面 |
+|---|---|---|
+| `(vt-bit-not bool数组)` → `(254 255)` | → 逻辑非 `(0 1)`，dtype `:bool` | 只影响布尔输入；显式 `:dtype :int8` 仍是字节取反 |
+| `(vt-matmul b b)` / `dot` / `outer` / `inner` / `tensordot` / `einsum` → `:float64`，值 `[[2 1][1 2]]` | → `:bool`，值 `[[T T][T T]]`（按与/或缩并） | 只影响「全部输入 `:bool` 且未显式给 `:dtype`」；显式 `:dtype` 仍是数值路径 |
+| `(vt-map (lambda (x) 2) bool数组)` → `(2 2)` | → `(1 1)` | 只影响 `:bool` 结果；`uint8` 的 200 不受影响 |
+
+**修好的六类静默错值**：
+
+| 表达式 | 修复前 | 修复后 | numpy |
+|---|---|---|---|
+| `(vt-map (lambda (x) 0.5d0) b)` | `(0 0)`（截断） | `(1 1)` | `True` |
+| `(vt-bit-not b)` | `(254 255)` | `(0 1)` | `invert` |
+| `(vt-histogram b)` | 报 `NIL is not of type NUMBER` | `(2 0 … 0 2)` | 同左 |
+| `(vt-diff b)` | 报「布尔减法未定义」 | 相邻异或 | `np.diff` |
+| `(vt-trapz b)` | **0** | `1.5d0`（`:float64`） | `1.5` |
+| `b @ b` | `:float64` 值 `2` | `:bool` | 同左 |
+
+**修好的「传不进去」**（`T`/`NIL` 作为值）：
+
+```lisp
+(vt-insert b 0 t)                       ; 原来 T fell through ETYPECASE
+(vt-pad b '(1 1) :constant-values t)    ; 原来 invalid constant-values: T
+(vt-pad b '(1 1) :constant-values '(nil t))
+(vt-where b t nil)                      ; 原来 ETYPECASE；现在结果 :bool
+(vt-fill-diagonal m t)                  ; 原来静默只填对角第一个元素
+(vt-append b t)
+(vt-map f b1 b2 b3 b4 b5 b6)            ; 6 输入：原来 no key（ECASE 的 T 子句）
+```
+
+**`NIL` 的规则（唯一需要记的）**：
+
+| 位置 | `NIL` 的含义 |
+|---|---|
+| `vt-from-sequence` 顶层 | shape `(0)` 的空数组；`:dtype :bool` 下才是叶子 |
+| `ensure-vt`（无 `:dtype`） | 仍是空表（300+ 内部调用点依赖） |
+| `ensure-vt … :dtype :bool` | 值 0 |
+| `vt-put` / `vt-fill` / `vt-insert` / `vt-pad` / `vt-where` 的**值位置** | 值 0 |
+
+**没改的三处**（numpy 同样报错，clvt 报错是对的）：`np.percentile(bool)`、
+`np.gradient(bool)`、`np.ptp(bool)`。另外 `a[mask]`（不走 `vt-ref`）、
+`b ** 2` 的 dtype、`vt-sign(b)` 三条偏差仍记录在 §17.10.7。
+
+**验收**：`bool-dtype-test` 388 断言全过；65 套件全绿（严格模式）；
+两个差分探针 496/496、405/405；`check_docs.py` 218 锚点全解析；编译零 WARNING。
+
+---
+
 ## 2026-10-29（三十五）— feat(bool): 布尔值「写得进去」—— `vt-ref` 布尔化、`vt-view` 放行 bool→uint8/int8、`vt-from-sequence` 认 T/NIL 字面量
 
 > **取代（三十四）中的两条结论**：`vt-ref` 不再返回 0/1 字节（改返回 `T`/`NIL`）；

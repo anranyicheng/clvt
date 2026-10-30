@@ -1017,6 +1017,15 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
            (- period idx 1))))))
 
 
+(defun %pad-cv-bool-tree (x)
+  "把 CONSTANT-VALUES 规格里的 `T`/`NIL` 换成 1/0（只在目标为 `:bool` 时用，
+   见 §17.10.8）。这条路径上 `T`/`NIL` 只能是「填充值」，不会被误读成结构 ——
+   `(vt-pad b '(1 1) :constant-values nil)` 就是「四边各填一个假」。"
+  (cond ((eq x t) 1)
+        ((null x) 0)
+        ((consp x) (mapcar #'%pad-cv-bool-tree x))
+        (t x)))
+
 (defun vt-pad (vt pad-width &key (mode :constant) (constant-values 0))
   "对张量填充。mode: :constant/:edge/:wrap/:reflect/:symmetric。
 
@@ -1024,30 +1033,34 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
    - 标量：所有维度左右填充相同值；
    - (left right)：所有维度使用同一对前/后值；
    - ((l0 r0) (l1 r1) ...)：每个维度指定前/后值（长度须等于 rank）。
-   角点取值符合 NumPy 逐轴填充顺序：后处理的轴覆盖先处理的轴。"
+   角点取值符合 NumPy 逐轴填充顺序：后处理的轴覆盖先处理的轴。
+   目标为 :bool 时 T/NIL 也可作填充值（`(vt-pad b '(1 1) :constant-values t)`）。"
   (let* ((shape (vt-shape vt))
          (rank (length shape))
          (pad (%normalize-pad-width pad-width rank))
 
          ;; 规范化 constant-values
          (cv-norm
-           (cond
-             ((numberp constant-values)
-              (make-list rank :initial-element (list constant-values constant-values)))
-             ((and (listp constant-values)
-                   (= (length constant-values) 2)
-                   (every #'numberp constant-values))
-              (make-list rank :initial-element constant-values))
-             ((and (listp constant-values)
-                   (= (length constant-values) rank)
-                   (every (lambda (x)
-                            (and (listp x)
-                                 (= (length x) 2)
-                                 (every #'numberp x)))
-                          constant-values))
-              constant-values)
-             (t
-              (error "invalid constant-values: ~a" constant-values))))
+           (let ((cv (if (eq (vt-dtype vt) :bool)
+                         (%pad-cv-bool-tree constant-values)
+                         constant-values)))
+             (cond
+               ((numberp cv)
+                (make-list rank :initial-element (list cv cv)))
+               ((and (listp cv)
+                     (= (length cv) 2)
+                     (every #'numberp cv))
+                (make-list rank :initial-element cv))
+               ((and (listp cv)
+                     (= (length cv) rank)
+                     (every (lambda (x)
+                              (and (listp x)
+                                   (= (length x) 2)
+                                   (every #'numberp x)))
+                            cv))
+                cv)
+               (t
+                (error "invalid constant-values: ~a" constant-values)))))
 
          (c-lefts (coerce (mapcar (lambda (cv) (vt-cast (first cv) (vt-dtype vt)))
                                   cv-norm)

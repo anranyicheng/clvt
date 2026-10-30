@@ -46,8 +46,17 @@
      · 物理视图 —— `%VT-REF-RAW` / `VT-DATA` / `VT-TO-LIST` 默认 → 0/1 字节
 
    代价与 `VT-ITEM` 相同：布尔结果不能直接进算术（`(+ (vt-ref b 0) 1)` 报
-   类型错误）。要算数请显式 `(if (vt-ref b 0) 1 0)`，或内部用 `%VT-REF-RAW`。"
+   类型错误）。要算数请显式 `(if (vt-ref b 0) 1 0)`，或内部用 `%VT-REF-RAW`。
+
+   花式索引（布尔掩码 / 索引数组）不支持（§17.10.7）：`VT-REF` 的契约是
+   「取一个标量」，返回拷贝会破坏它。这里给一条明确的去路，否则用户看到的
+   是 `The value #<VT shape:(3) dtype:BOOL ...> is not of type FIXNUM`。"
   (declare (dynamic-extent indices))
+  (let ((bad (find-if-not #'integerp indices)))
+    (when bad
+      (error "vt-ref: 索引必须是整数，收到 ~a (~a)。布尔掩码请用 (vt-extract mask a) ~
+              或 (vt-take a (vt-nonzero mask))；索引数组请用 vt-take。"
+             bad (type-of bad))))
   (let ((v (apply #'%vt-ref-raw vt indices)))
     (if (eq (vt-dtype vt) :bool)
         (if (zerop v) nil t)
@@ -321,9 +330,17 @@
        (error "vt-where: 单参数形式只接受 (vt-where cond)；\
 若要三元选择必须同时提供 X 与 Y（当前缺少 Y）"))
       (t
-       (setf condition (ensure-vt condition)
-             x (ensure-vt x)
-             y (ensure-vt y))
+       ;; 分支是「值位置」：`T`/`NIL` 在这里只能是布尔真/假（§17.10.8）。
+       ;; 与 `ensure-vt` 的 `NIL` 二义性无关 —— 三元选择的两个分支各自
+       ;; 只放一个值，`(vt-where b t nil)` 就是 numpy 的
+       ;; `np.where(b, True, False)`（结果 :bool），不存在「空分支」这种读法。
+       (flet ((branch (v)
+                (if (or (eq v t) (null v))
+                    (ensure-vt (if v 1 0) :dtype :bool)
+                    (ensure-vt v))))
+         (setf condition (ensure-vt condition)
+               x (branch x)
+               y (branch y)))
        (let* ((target-shape (vt-broadcast-shapes
                              (vt-shape condition)
                              (vt-broadcast-shapes (vt-shape x) (vt-shape y))))
