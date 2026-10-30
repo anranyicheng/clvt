@@ -136,9 +136,10 @@ case("pinv", "(vt-pinv CX-LA-A)", np.linalg.pinv(A))
 case("pinv-tall", "(vt-pinv CX-LA-T)", np.linalg.pinv(T))
 _sol = np.linalg.lstsq(T, np.array([1 + 0j, 2 + 0j, 3 + 0j]), rcond=None)
 case("lstsq-x", "(nth-value 0 (vt-lstsq CX-LA-T CX-LA-B3))", _sol[0])
-# clvt 的 lstsq 返回 **2-范数**（不是 numpy 的平方和），保持库内既有契约
+# residual 已对齐 numpy：**平方和**（不是 2-范数），形状 (K,)。
+# 旧版本此处取 sqrt 并写死「2-范数是库内契约」（D-C13），§17.10.22 已废除。
 case("lstsq-res", "(nth-value 1 (vt-lstsq CX-LA-T CX-LA-B3))",
-     float(np.sqrt(_sol[1][0])), dtype="float64")
+     np.asarray(_sol[1], dtype=np.float64))
 case("lstsq-rank", "(nth-value 2 (vt-lstsq CX-LA-T CX-LA-B3))",
      np.array(_sol[2]), dtype="int64")
 case("rank", "(vt-matrix-rank CX-LA-A)", np.array(np.linalg.matrix_rank(A)),

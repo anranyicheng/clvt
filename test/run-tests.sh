@@ -94,6 +94,7 @@ SUITES[cumulative-axis-test]="70 累积沿轴 + nanmedian 多轴（第十五轮 
 SUITES[reduce-shape-axis-test]="145 归约/求解的「形状 × 轴 × 序列参数」契约回归（差分模糊测试挖出的九类真实缺陷: vt-solve/vt-inv 的结果秩只由输入秩决定（b 为 (n,1) 不再被压成 (n)、1×1 不再返回 shape (1)）· vt-ptp 全归约返回 0 维 vt 且支持 :keepdims · vt-nanmedian 全局 keepdims 返回全 1 形状 · vt-median 的多轴/单元素列表/负轴/顺序无关（含复数字典序与非连续视图）· vt-percentile/vt-quantile 的多轴 × 分位点序列 × keepdims 组合 · vt-left/right-shift 的第二操作数为张量（含广播与 NEP 50 dtype 规则）· vt-histogram 的 :bins 边界序列（左闭右开/区间外丢弃/NaN 不入箱/density）· 复数守卫去重后 nn 与统计函数仍按契约拒绝 · 多轴归约族的形状一致性交叉网；期望值 numpy 2.4.6 实测）"
 SUITES[degenerate-empty-test]="331 「退化形状 / 空张量 / 角参数」契约回归（换轴：把维度推到边界——shape 含 0、0 维、单观测、num=0、分母为 0。十组真实缺陷: cumsum/cumprod 沿轴 × 元素数 0 的 aref 越界（快路径里程计与通用 fallback 两处，nancumsum/nancumprod 第三个内核同病）· vt-indices 深层维度含 0 时 stride 被兜成 1 后越界写 · vsplit/hsplit/dsplit 把轴长 0 判成「不整除」 · vt-cov/vt-corrcoef 零观测未屏蔽浮点陷阱、角分母被换成 n_obs（cov([5.]) 应 nan）、corrcoef 标量分支硬编码 1.0（应 C/sqrt(C²)）· linspace/logspace/geomspace 的 num=0 报错（numpy 返回空，且 geomspace 的零校验先于 num）· vt-bincount 缺 :weights（结果恒 float64、负权重合法、复数权重按 numpy 拒绝）· vt-random-choice 的 :p 不接受张量（numpy 的 p 就是 ndarray）· 随机族裸 assert 改带函数名的消息 · IO 往返位模式保真（空/0 维/非连续/NaN/±0/复数，188 组合零失败的固化）· dtype 转换矩阵抽样（11×11 全组合 121 条差分零失败的固化）；期望值 numpy 2.4.6 实测）"
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
+SUITES[view-consistency-test]="3548 物理形态无关性与分解纯函数性（换轴：随机输入 → 同一逻辑张量的不同物理形态 + 调用次数。A 视图一致性 1743 项：10 类视图(转置/翻转/子块/负步长/广播/转置后切片/单列/行反向/子块转置) × 45 函数 × 3 dtype 逐位相等 + 3D 全排列归约 + 算子不得改写视图；B :out 指向转置/负步长的写穿透与底层 buffer 镜像布局、out 与输入同一 buffer 的读写别名；C SVD 纯函数性（同输入两次逐位相等 + 不消费全局随机流，覆盖实数/:full-matrices/复数）；D 复数 SVD 的 U 必须酉（零奇异值列正交补全，含零矩阵/秩1/满秩/tall-full）；E VT-LSTSQ 契约（x 形状跟 b、residual 是平方和、无残差给 (0,) 空数组，实/复两版）；F eig/cholesky 只读下三角是 LAPACK 语义；G MATMUL 收缩轴校验（复数路径原先不校验，按 k 越界读 B 返回 1e77 量级的垃圾矩阵且无任何信号；实/复两路现在报同一条消息）；CONVENTIONS §17.10.22）"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
 SUITES[test-all]="641 绝大多数函数的测试"
 SUITES[example-smoke-test]="98 example/ 两个示例脚本冒烟 (example.lisp 106 个 test-* 全部 ASSERT 通过 + clvt-perf-test-examples 96 条正确性断言；只跑断言不跑基准。第 33 轮引入 :bool 后靠它翻出示例自身的 3 处问题: 9 条恒真的 (assert (vt-all ...)) / 全 NaN 时 nanmax 期望写错 / vt-extract 参数顺序反了) "
@@ -164,6 +165,7 @@ DEFAULT_ORDER=(
     cumulative-axis-test
     reduce-shape-axis-test
     degenerate-empty-test
+    view-consistency-test
     complex-gap-test
     complex-matmul-perf-test
     complex-test

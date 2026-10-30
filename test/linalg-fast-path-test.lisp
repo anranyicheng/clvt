@@ -222,12 +222,16 @@
   ;; RANK / LSTSQ（参考）
   (ln-t! "ref/rank-sing3"  (= (vt-matrix-rank (vt-copy *m-sing3*)) 2))
   (ln-t! "ref/rank-diag3"  (= (vt-matrix-rank (vt-copy *m-diag3*)) 3))
+  ;; b 给的是 (4 1)：x 必须是 (3 1) 而不是 (3,)（§17.10.22）；
+  ;; residual 是 numpy 口径的**平方和**，故值为 1.0969…² = 1.2032…。
   (multiple-value-bind (x res rank s) (vt-lstsq *m-tall43* (a= '((1.0d0) (0.0d0) (2.0d0) (1.0d0))))
     (declare (ignore s))
     (ln-t! "ref/lstsq-tall43"
-           (and (ln-vec-close-p (vt-to-list x)
+           (and (equalp (vt-shape x) '(3 1))
+                (ln-vec-close-p (vt-to-list (vt-flatten x))
                                 '(1.117647058823528d0 -0.010695187165778552d0 -0.5828877005347559d0) 1d-9)
-                (ln-close-p res 1.096908636190696d0 1d-9)
+                (equalp (vt-shape res) '(1))
+                (ln-close-p (vt-ref res 0) 1.2032085561497325d0 1d-9)
                 (= rank 3)))))
 
 ;;; ============================================================

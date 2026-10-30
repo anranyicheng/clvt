@@ -171,9 +171,14 @@
 (defun run-view-cases ()
   (format t "~&--- 2. 切片视图（offset 非零）/ 非连续输入 ---~%")
   ;; a 取自更大张量的切片：contiguous 零拷贝返回，offset 保留
+  ;;
+  ;; 注：B 必须是 (20,40) —— 这里原先写 (40,40)，A(20,20) 与 B 的收缩轴
+  ;; 不匹配，测试之所以「通过」是因为内核与 NAIVE-MATMUL 参照都只按 A 的 k
+  ;; 去读 B 的前 k 行，两边错得一样。收缩轴校验（§17.10.22）加上后这种输入
+  ;; 会直接报错，所以参照两侧都改成形状合法的 (20,40)。
   (let* ((big (mk (list 40 40) 7 :dt :complex128))
          (a (vt-slice big '(10 30) '(10 30)))   ; (20,20)，offset = 10*40+10
-         (b (mk (list 40 40) 8 :dt :complex128))
+         (b (mk (list 20 40) 8 :dt :complex128))
          (got (vt-matmul a b))
          (want (naive-matmul (vt-contiguous a) (vt-contiguous b))))
     (report "切片 A（offset≠0）结果正确" (same-bits-p got want)

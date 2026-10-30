@@ -153,21 +153,38 @@ recon-err = max|u·diag(s)·vt − a|；orth-err = max|uᵀu − I|。"
     (svd-t! "ref/one1x1/s"        (svd-vec-close-p s-list '(5.0d0) 1d-12))
     (svd-t! "ref/one1x1/recon"    (< err 1d-12))
     (svd-t! "ref/one1x1/u00"      (svd-close-p (vt-ref u 0 0) 1.0d0 1d-12)))
-  ;; 零矩阵：奇异值全 0，U 列为随机正交补（固定种子 777 可复现）
-  (vt-random-seed 777)
+  ;; 零矩阵：奇异值全 0，U 列为正交补全。补全现在是**确定性**的
+  ;; （不消费全局随机流，§17.10.22），所以不再需要播种，两次调用同值。
   (multiple-value-bind (u s vt err uerr s-list) (svd-props *m-zero2x3*)
     (declare (ignore vt s))
     (svd-t! "ref/zero2x3/s"       (svd-vec-close-p s-list '(0.0d0 0.0d0) 1d-12))
     (svd-t! "ref/zero2x3/recon"   (< err 1d-12))
     (svd-t! "ref/zero2x3/orth"    (< uerr 1d-12))
-    (svd-t! "ref/zero2x3/u00"     (svd-close-p (vt-ref u 0 0) 0.4507195595519486d0 1d-9))
-    (svd-t! "ref/zero2x3/u10"     (svd-close-p (vt-ref u 1 0) 0.8926656029204314d0 1d-9)))
-  ;; 秩亏随机补全列（固定种子 777）：第 3 列
-  (vt-random-seed 777)
+    (svd-t! "ref/zero2x3/u00"     (svd-close-p (vt-ref u 0 0) -0.19081826884033656d0 1d-9))
+    (svd-t! "ref/zero2x3/u10"     (svd-close-p (vt-ref u 1 0) 0.9816253808234467d0 1d-9)))
+  ;; 秩亏：σ₂=σ₃=0，两列都走同一确定性补全。u02 的数值是补全流的指纹
+  ;; （LCG 由列号派生，同输入恒同），不是数学上唯一的方向 —— 方向自由度
+  ;; 由 `ref/rankdef3-seed/orth` 的 UᵀU = I 与重构判定，u02 只钉「没有回退
+  ;; 到随机流」。
   (multiple-value-bind (u s vt err uerr s-list) (svd-props *m-rankdef3*)
-    (declare (ignore vt err uerr s))
-    (svd-t! "ref/rankdef3-seed/s"  (svd-vec-close-p s-list '(14.000000000000002d0 0.0d0 0.0d0) 1d-9))
-    (svd-t! "ref/rankdef3-seed/u02" (svd-close-p (vt-ref u 0 2) 0.8923807245936775d0 1d-9)))
+    (declare (ignore vt s))
+    (svd-t! "ref/rankdef3-seed/s"   (svd-vec-close-p s-list '(14.000000000000002d0 0.0d0 0.0d0) 1d-9))
+    (svd-t! "ref/rankdef3-seed/rec" (< err 1d-13))
+    (svd-t! "ref/rankdef3-seed/orth" (< uerr 1d-13))
+    (svd-t! "ref/rankdef3-seed/u02" (svd-close-p (vt-ref u 0 2) 0.11875676147663268d0 1d-12)))
+  ;; 确定性：同输入两次 SVD 必须逐位相等，且不消费全局随机流（§17.10.22）
+  (let* ((a *m-rankdef3*)
+         (u1 (nth-value 0 (svd-props a)))
+         (u2 (nth-value 0 (svd-props a))))
+    (svd-t! "det/rankdef3-svd-pure"
+             (loop for i below (vt-size u1)
+                   always (eql (vt-ref (vt-flatten u1) i)
+                               (vt-ref (vt-flatten u2) i)))))
+  (let ((before (progn (vt-random-seed 20260101) (vt-to-list (vt-random '(4)))))
+        (after (progn (vt-random-seed 20260101)
+                      (svd-props *m-rankdef3*)
+                      (vt-to-list (vt-random '(4))))))
+    (svd-t! "det/svd-does-not-consume-rng" (equalp before after)))
   ;; 随机 5×5（固定种子 2026）
   (vt-random-seed 2026)
   (multiple-value-bind (u s vt err uerr s-list)
