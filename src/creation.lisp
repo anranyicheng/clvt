@@ -133,8 +133,13 @@
 (defun vt-linspace (start end num &key (endpoint t) (dtype :float64))
   "创建线性间隔数组，对标 numpy.linspace。
 
-优化：按 dtype 特化填充循环，避免逐元素 vt-cast 的 ecase 分派开销。"
-  (when (<= num 0) (error "num 必须大于 0，当前值为 ~d" num))
+优化：按 dtype 特化填充循环，避免逐元素 vt-cast 的 ecase 分派开销。
+
+NUM = 0 返回形状 (0) 的空张量（对标 np.linspace 的 num=0：采样点为空是
+合法请求，不是错误）；NUM < 0 仍报错。"
+  (when (minusp num) (error "num 必须 >= 0，当前值为 ~d" num))
+  (when (zerop num)
+    (return-from vt-linspace (vt-zeros (list 0) :dtype dtype)))
   (when (= num 1)
     (return-from vt-linspace
       (make-vt (list 1) (vt-cast start dtype) :dtype dtype)))

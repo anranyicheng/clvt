@@ -1140,10 +1140,56 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
               :strides (vt-compute-strides out-shape)
               :offset 0 :dtype :int64)))
 
-(defun vt-bincount (x &key (minlength 0))
-  "统计非负整数出现次数。"
+(defun %bincount-weighted (x weights minlength)
+  "VT-BINCOUNT 的 WEIGHTS 分支。对标 numpy.bincount(x, weights=w)：
+   结果 dtype **恒为 float64**，即使 weights 本身是整型或布尔也如此 ——
+   numpy 文档明说「result is stored as a float64 array if weights is
+   given」，累加的是权重而不是计数。WEIGHTS 与 X 的元素数必须一致，
+   负数权重允许（加权直方图常见）。
+   复数 weights 报错：numpy 在这里直接 TypeError（无法 cast 到 float64），
+   本库同样拒绝而不是给出一个 numpy 给不出的结果。"
+  (let* ((flat (vt-flatten x))
+         (wf (vt-flatten (ensure-vt weights)))
+         (n (vt-size flat))
+         (maxval (if (zerop n) -1 (%item-number (vt-amax flat))))
+         (size (max (1+ maxval) minlength)))
+    (unless (= n (vt-size wf))
+      (error "vt-bincount: weights 的元素数 (~a) 与 x 的元素数 (~a) 不一致（numpy 同样要求同形）"
+             (vt-size wf) n))
+    (when (member (vt-dtype wf) '(:complex64 :complex128))
+      (error "vt-bincount: weights 不支持复数（numpy 同样报 TypeError：无法 cast 到 float64）。见 CONVENTIONS §16.11"))
+    (let ((res (make-array size :element-type 'double-float :initial-element 0d0))
+          (wdata (vt-data (vt-astype wf :float64))))
+      (let ((i 0))
+        (vt-do-each (ptr val flat)
+          (declare (ignore ptr))
+          (let ((idx (truncate (%item-number val))))
+            ;; 不声明 FIXNUM：TRUNCATE 对大浮点可以给 BIGNUM，而声明冲突会
+            ;; 把「越界」报成「The value … is not of type FIXNUM」。
+            (when (or (minusp idx) (>= idx size))
+              (error "vt-bincount: 索引 ~a 越界（须 0 <= x < ~a）" idx size))
+            (incf (aref res idx) (aref wdata i)))
+          (incf i)))
+      (%make-vt :data res :shape (list size) :strides '(1)
+                :offset 0 :dtype :float64))))
+
+(defun vt-bincount (x &key (minlength 0) weights)
+  "统计非负整数出现次数。
+
+   WEIGHTS 给定时按权重累加而非计数（对标 numpy.bincount 的 weights 参数）：
+   结果 dtype 恒为 :float64（即使权重本身是整型或布尔，numpy 也是如此）；
+   负权重合法（加权直方图常见）；复数权重**报错** —— numpy 在这里同样抛
+   TypeError（无法 cast 到 float64），本库不「出于好意」给出 complex128。
+   WEIGHTS 的元素数必须等于 X 的元素数。
+
+   示例：(vt-bincount (vt-from-sequence '(1 1 3) :dtype :int64))          ; => (0 2 0 1)
+        (vt-bincount (vt-from-sequence '(1 1 3) :dtype :int64)
+                     :weights (vt-from-sequence '(0.5 0.25 2.0) :dtype :float64))
+        ; => (0.0 0.75 0.0 2.0)"
   (when (%cx-reject x)
     (error "vt-bincount: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
+  (when weights
+    (return-from vt-bincount (%bincount-weighted x weights minlength)))
   (let* ((flat (vt-flatten x))
          ;; :bool 的 VT-ITEM 给 T/NIL（§17.8），这里要的是数值：numpy 接受
          ;; 布尔输入（np.bincount([True False]) → [1 1]），走 %ITEM-NUMBER。

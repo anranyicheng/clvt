@@ -610,14 +610,20 @@
                (flat (vt-ravel layer))
                ;; 该层沿 ax 轴的步长（行主序），以及每个「i 值」重复块的大小
                (stride (apply #'* (nthcdr (1+ ax) sh)))
+               ;; STRIDE 为 0 说明该层后面有 0 长维（如 (2 0 3) 的第 0 层），
+               ;; 整层没有任何元素可写。原先把它兜成 1 再照常写，就落到
+               ;; 空 buffer 上 —— 实测 (vt-indices '(2 0 3)) 报
+               ;; "cannot index into an empty tensor"，而 numpy 返回
+               ;; (3 2 0 3) 全空。层大小同样为 0 时直接跳过填充。
                (stride (if (zerop stride) 1 stride))
                (outer (apply #'* (subseq sh 0 ax)))
                (axis-len (nth ax sh)))
-          (dotimes (o outer)
-            (dotimes (i axis-len)
-              (dotimes (s stride)
-                (setf (vt-ref flat (+ (* o stride axis-len) (* i stride) s))
-                      (vt-cast i dtype)))))
+          (when (plusp (apply #'* sh))
+            (dotimes (o outer)
+              (dotimes (i axis-len)
+                (dotimes (s stride)
+                  (setf (vt-ref flat (+ (* o stride axis-len) (* i stride) s))
+                        (vt-cast i dtype))))))
           (push layer layers)))
       (let ((ordered (nreverse layers)))
         (if sparse
@@ -1225,49 +1231,52 @@
           ;; 类型声明（性能）：WORK 恒为连续 float64，声明后内层 aref
           ;; 走元素类型特化，省掉每元素一次 widetag 分派。
           (declare (type (simple-array double-float (*)) in-data))
-          (labels ((advance ()
-                     (loop for d from (1- rank) downto 0
-                           when (/= d ax)
-                             do (incf (aref indices d))
-                                (if (< (aref indices d) (nth d shape))
-                                    (return-from advance t)
-                                    (setf (aref indices d) 0)))))
-            (loop
-              ;; 每条 fiber 只算一次起点（输入与目标各一份），内层按
-              ;; `起点 + i*stride` 递推 —— 把逐元素
-              ;; `(setf (apply #'vt-ref result coords) …)` 换掉：那里
-              ;; 每个元素都要 cons 一次坐标列表 + 一次通用坐标折算，
-              ;; 1M 元素沿轴实测 260ms（numpy 6ms）。机制 B（offset +
-              ;; strides 驱动）在这里只差一个指针。
-              (let ((ptr in-off) (dptr out-off))
-                (loop for d from 0 below rank
-                      do (incf ptr (* (aref indices d) (nth d in-strs)))
-                         (incf dptr (* (aref indices d) (nth d out-strs))))
-                (let ((cum (coerce (if (eq op :sum) 0 op-init) 'double-float))
-                      (ax-stride (nth ax in-strs))
-                      (ax-dstride (nth ax out-strs))
-                      (ax-dim (nth ax shape))
-                      (sum-p (eq op :sum))
-                      ;; 结果 dtype 就是 float64 时省掉逐元素 VT-CAST
-                      ;; （ecase + 泛型算术，是这条路径剩下的主要开销）。
-                      (raw-store-p (eq final-dtype :float64)))
-                  (declare (type double-float cum))
-                  (dotimes (i ax-dim)
-                    ;; 首元素取「掩码后的输入本身」而不是 OP(单位元, 输入)：
-                    ;; numpy.nancumsum([-0.0]) => [-0.]，而 0.0 + (-0.0) = +0.0
-                    ;; 会洗掉符号位（CONVENTIONS §16.30.3 的实数线遗留项）。
-                    (let ((x (aref in-data (+ ptr (* i ax-stride)))))
-                      (if (zerop i)
-                          (setf cum (if (%nan-p x)
-                                        (if sum-p 0.0d0 1.0d0)
-                                        x))
-                          ;; op 内联进循环：原来每元素一次 FUNCALL，
-                          ;; 装箱开销比算术本身还大。
-                          (unless (%nan-p x)
-                            (setf cum (if sum-p (+ cum x) (* cum x))))))
-                    (setf (aref out-data (+ dptr (* i ax-dstride)))
-                          (if raw-store-p cum (vt-cast cum final-dtype))))))
-              (unless (advance) (return))))
+          ;; 空数组整体跳过（与 %VT-CUMULATIVE 同一条）：ADVANCE 先跑 body
+          ;; 再进位，shape 含 0 维时会拿 ptr = 0 去读长度 0 的 buffer。
+          (when (plusp (vt-size result))
+            (labels ((advance ()
+                       (loop for d from (1- rank) downto 0
+                             when (/= d ax)
+                               do (incf (aref indices d))
+                                  (if (< (aref indices d) (nth d shape))
+                                      (return-from advance t)
+                                      (setf (aref indices d) 0)))))
+              (loop
+                ;; 每条 fiber 只算一次起点（输入与目标各一份），内层按
+                ;; `起点 + i*stride` 递推 —— 把逐元素
+                ;; `(setf (apply #'vt-ref result coords) …)` 换掉：那里
+                ;; 每个元素都要 cons 一次坐标列表 + 一次通用坐标折算，
+                ;; 1M 元素沿轴实测 260ms（numpy 6ms）。机制 B（offset +
+                ;; strides 驱动）在这里只差一个指针。
+                (let ((ptr in-off) (dptr out-off))
+                  (loop for d from 0 below rank
+                        do (incf ptr (* (aref indices d) (nth d in-strs)))
+                           (incf dptr (* (aref indices d) (nth d out-strs))))
+                  (let ((cum (coerce (if (eq op :sum) 0 op-init) 'double-float))
+                        (ax-stride (nth ax in-strs))
+                        (ax-dstride (nth ax out-strs))
+                        (ax-dim (nth ax shape))
+                        (sum-p (eq op :sum))
+                        ;; 结果 dtype 就是 float64 时省掉逐元素 VT-CAST
+                        ;; （ecase + 泛型算术，是这条路径剩下的主要开销）。
+                        (raw-store-p (eq final-dtype :float64)))
+                    (declare (type double-float cum))
+                    (dotimes (i ax-dim)
+                      ;; 首元素取「掩码后的输入本身」而不是 OP(单位元, 输入)：
+                      ;; numpy.nancumsum([-0.0]) => [-0.]，而 0.0 + (-0.0) = +0.0
+                      ;; 会洗掉符号位（CONVENTIONS §16.30.3 的实数线遗留项）。
+                      (let ((x (aref in-data (+ ptr (* i ax-stride)))))
+                        (if (zerop i)
+                            (setf cum (if (%nan-p x)
+                                          (if sum-p 0.0d0 1.0d0)
+                                          x))
+                            ;; op 内联进循环：原来每元素一次 FUNCALL，
+                            ;; 装箱开销比算术本身还大。
+                            (unless (%nan-p x)
+                              (setf cum (if sum-p (+ cum x) (* cum x))))))
+                      (setf (aref out-data (+ dptr (* i ax-dstride)))
+                            (if raw-store-p cum (vt-cast cum final-dtype))))))
+                (unless (advance) (return)))))
           result)
         ;; 展平路径：原实现每元素 VT-REF 读 + VT-REF 写（各一次泛型
         ;; aref 与坐标折算）+ VT-CAST，1M 元素实测 474ms。
@@ -1466,37 +1475,47 @@
   ;; 而 np.cov(a, ddof=0) 除以 N。用 DDOF-P 区分「未传」与「显式 0」。
   (when (%cx-any-p m)
     (return-from vt-cov (%cx-op-cov m :y y :rowvar rowvar :ddof ddof :bias bias)))
-  (let ((ddof (if ddof-p ddof 1)))
-    (let* ((mm (%e3-as-1d-float-transform m rowvar))
-           (xx (if y (%e3-as-1d-float-transform y rowvar) nil)))
-      (let* ((stacked (if xx (vt-concatenate 0 mm xx) mm))
-             (n-var (first (vt-shape stacked)))
-             (n-obs (second (vt-shape stacked)))
-             (denom (if bias n-obs (- n-obs ddof)))
-             (denom (if (<= denom 0) n-obs denom)))
-      (when (= n-var 1)
-        ;; 单变量 → 标量方差
-        (let ((row (vt-slice stacked '(0)))
-              (mean (vt-item (vt-mean (vt-slice stacked '(0))))))
-          (return-from vt-cov
-            (let ((acc 0.0d0))
-              (dotimes (j n-obs (make-vt nil (/ acc denom) :dtype :float64))
-                (incf acc (expt (- (%vt-ref-raw row j) mean) 2)))))))
-      ;; v0.4.2 性能修复：原实现是三重循环，且把「每行均值」放在 (i,j) 循环
-      ;; **内部** 计算 —— n_var² 次 `vt-mean`（每次 O(n_obs)），再加逐元素
-      ;; `vt-ref`（泛型 aref + 下标运算）。1000×1000 实测 **54 秒**
-      ;; （numpy 约 30 ms，差 1800 倍）。
-      ;; 改为矩阵形式：cov = (X - mean(X)) · (X - mean(X))ᵀ / denom，
-      ;; 复用库内已验证的 SIMD/多线程 matmul；并按 numpy 的做法对称化。
-      (let* ((x (vt-contiguous stacked))                       ; n_var × n_obs
-             (mu (vt-mean x :axis 1 :keepdims t))              ; n_var × 1
-             (xc (vt-- x mu))                                  ; 广播居中
-             (raw (vt-matmul xc (vt-transpose xc)))            ; n_var × n_var
-             (sym (vt-scale (vt-+ raw (vt-transpose raw)) 0.5d0))
-             (res (vt-astype sym :float64)))
-        (if (= denom 1)
-            res
-            (vt-scale res (/ 1.0d0 denom))))))))
+  ;; 零观测（n_obs = 0）时 numpy 给 nan 并 continue，而 SBCL 默认把
+  ;; 0/0 与 1/0 作为陷阱抛出（实测 (vt-cov (vt-zeros '(0))) 报
+  ;; FLOATING-POINT-INVALID-OPERATION、(vt-cov (vt-zeros '(3 0))) 报
+  ;; DIVISION-BY-ZERO）。§5.5：浮点异常一律 mask，输出 nan/inf。
+  (with-float-safe
+    (let ((ddof (if ddof-p ddof 1)))
+      (let* ((mm (%e3-as-1d-float-transform m rowvar))
+             (xx (if y (%e3-as-1d-float-transform y rowvar) nil)))
+        (let* ((stacked (if xx (vt-concatenate 0 mm xx) mm))
+               (n-var (first (vt-shape stacked)))
+               (n-obs (second (vt-shape stacked)))
+               (denom (if bias n-obs (- n-obs ddof)))
+               ;; numpy 的写法是 `fact = n_obs - ddof; if fact <= 0: fact = 0.0`
+               ;; 然后 `c *= 1./fact` —— 也就是角分母**不做替换**，让 1/0 变成
+               ;; inf，再由 0*inf 得 nan。原先这里把 denom<=0 直接换成 n_obs，
+               ;; 相当于凭空改分母：np.cov([5.]) 是 nan（0/0），本库给 0.0；
+               ;; np.cov([1,2], ddof=3) 是 inf（0.5/0），本库给 0.25。
+               (denom (max denom 0)))
+          (when (= n-var 1)
+            ;; 单变量 → 标量方差
+            (let ((row (vt-slice stacked '(0)))
+                  (mean (vt-item (vt-mean (vt-slice stacked '(0))))))
+              (return-from vt-cov
+                (let ((acc 0.0d0))
+                  (dotimes (j n-obs (make-vt nil (/ acc denom) :dtype :float64))
+                    (incf acc (expt (- (%vt-ref-raw row j) mean) 2)))))))
+          ;; v0.4.2 性能修复：原实现是三重循环，且把「每行均值」放在 (i,j) 循环
+          ;; **内部** 计算 —— n_var² 次 `vt-mean`（每次 O(n_obs)），再加逐元素
+          ;; `vt-ref`（泛型 aref + 下标运算）。1000×1000 实测 **54 秒**
+          ;; （numpy 约 30 ms，差 1800 倍）。
+          ;; 改为矩阵形式：cov = (X - mean(X)) · (X - mean(X))ᵀ / denom，
+          ;; 复用库内已验证的 SIMD/多线程 matmul；并按 numpy 的做法对称化。
+          (let* ((x (vt-contiguous stacked))                       ; n_var × n_obs
+                 (mu (vt-mean x :axis 1 :keepdims t))              ; n_var × 1
+                 (xc (vt-- x mu))                                  ; 广播居中
+                 (raw (vt-matmul xc (vt-transpose xc)))            ; n_var × n_var
+                 (sym (vt-scale (vt-+ raw (vt-transpose raw)) 0.5d0))
+                 (res (vt-astype sym :float64)))
+            (if (= denom 1)
+                res
+                (vt-scale res (/ 1.0d0 denom)))))))))
 
 (defun %e3-as-1d-float-transform (m rowvar)
   "把输入规范为 2 维（n-var × n-obs）float64 矩阵（对标 numpy.cov 的 rowvar 处理）。"
@@ -1519,19 +1538,25 @@
   (declare (ignore y-p))
   (when (%cx-any-p m)
     (return-from vt-corrcoef (%cx-op-corrcoef m :y y :rowvar rowvar)))
-  (let* ((c (vt-cov m :y y :rowvar rowvar))
-         (n (first (vt-shape c))))
-    (if (null (vt-shape c))
-        ;; 标量方差 → 相关系数恒为 1
-        (vt-full nil 1.0d0 :dtype :float64)
-        (let ((r (vt-zeros (list n n) :dtype :float64)))
-          (dotimes (i n r)
-            (dotimes (j n)
-              (let ((cii (%vt-ref-raw c i i)) (cjj (%vt-ref-raw c j j)))
-                (setf (vt-ref r i j)
-                      (if (or (zerop cii) (zerop cjj))
-                          (if (= i j) 1.0d0 0.0d0)
-                          (/ (%vt-ref-raw c i j) (sqrt (* cii cjj))))))))))))
+  ;; 零观测时 vt-cov 给出 nan 矩阵，归一化的 (/ nan nan) 同样是陷阱
+  ;; （§5.5）。numpy 的 corrcoef([]) 给 nan 标量。
+  (with-float-safe
+    (let* ((c (vt-cov m :y y :rowvar rowvar))
+           (n (first (vt-shape c))))
+      (if (null (vt-shape c))
+          ;; 标量方差 → R = C / sqrt(C²)。不硬编码 1.0：numpy 对单变量同样
+          ;; 走这条除法，而 C 可能是 0（全等输入）或 nan（单观测 / 空输入），
+          ;; 那时 0/0 与 nan/nan 都该给 nan —— np.corrcoef([5.]) = nan。
+          (let ((v (vt-item c)))
+            (vt-full nil (/ v (sqrt (* v v))) :dtype :float64))
+          (let ((r (vt-zeros (list n n) :dtype :float64)))
+            (dotimes (i n r)
+              (dotimes (j n)
+                (let ((cii (%vt-ref-raw c i i)) (cjj (%vt-ref-raw c j j)))
+                  (setf (vt-ref r i j)
+                        (if (or (zerop cii) (zerop cjj))
+                            (if (= i j) 1.0d0 0.0d0)
+                            (/ (%vt-ref-raw c i j) (sqrt (* cii cjj)))))))))))))
 
 (defun vt-cross (a b &key (axis nil) (axisa -1) (axisb -1) (axisc -1) dtype)
   "向量叉积（对标 numpy.cross）。

@@ -274,7 +274,8 @@
   (setf rng (%ensure-random-state rng))
   (let ((size (if (integerp size) (list size) size))
         (range (- high low)))
-    (assert (>= range 0) (high low))
+    (unless (>= range 0)
+      (error "vt-random-int: 要求 low <= high，收到 low=~a high=~a（numpy 同样报错）" low high))
     (if (zerop range)
         (if size
             (vt-full size low :dtype dtype)
@@ -300,14 +301,18 @@
    size     : nil → 返回 0 维张量；否则返回形状为 size 的张量。
               整数 → 1D 张量；list → 多维张量。
    replace  : t（默认）有放回；nil 无放回。
-   p        : 权重列表（长度 = n，非负，总和 > 0）。
+   p        : 权重（长度 = n，非负，总和 > 0）。接受 Lisp 实数序列（list /
+              vector）或一维张量 —— numpy 的 p 本来就是 ndarray；三种形态在
+              入口归一到同一列表，同 seed 下给出同一序列。
    dtype    : 输出 dtype，默认与 a 一致。
    rng      : nil / random-state / vt-generator。
    对标 numpy.random.choice / torch.multinomial。"
   (setf rng (%ensure-random-state rng))
   (let* ((source (if (integerp a)
-                     (progn (assert (> a 0) (a))
-                            (vt-arange a :dtype (or dtype :int64)))
+                     (progn
+                       (unless (plusp a)
+                         (error "vt-random-choice: a 为正整数时必须是 n >= 1，收到 ~a（numpy 同样拒绝）" a))
+                       (vt-arange a :dtype (or dtype :int64)))
                      (ensure-vt a)))
          (n (vt-size source))
          (out-dtype (or dtype (vt-dtype source)))
@@ -317,17 +322,37 @@
                        (if (listp size) size (list size))))
          (size-total (if size-shape
                          (reduce #'* size-shape :initial-value 1)
-                         1)))
-    (assert (> n 0) (n))
-    (let ((cdf (when p
-                 (assert (= (length p) n) (p n))
-                 (assert (every (lambda (w) (>= w 0)) p) ())
-                 (let ((total (reduce #'+ p)))
-                   (assert (> total 0) ())
+                         1))
+         ;; P 允许三种形态：NIL / Lisp 实数序列 / vt 张量。
+         ;; numpy 的 p 本来就是 ndarray，只认列表等于把最常见的用法挡在门外
+         ;; （原实现直接用 LENGTH / EVERY / REDUCE 走序列协议，张量落到
+         ;; "The value #<VT …> is not of type SEQUENCE"）。
+         (pw (when p
+               (cond ((vt-p p)
+                      (unless (= 1 (vt-order p))
+                        (error "vt-random-choice: p 必须是一维，收到 ~a 维" (vt-order p)))
+                      (map 'list #'identity (vt-to-list p)))
+                     ((listp p) p)
+                     ((vectorp p) (coerce p 'list))
+                     (t (error "vt-random-choice: p 必须是张量或实数序列，收到 ~a"
+                               (type-of p)))))))
+    (unless (plusp n)
+      (error "vt-random-choice: a 不能为空（元素数 0），numpy 同样报错"))
+    (when pw
+      (unless (= (length pw) n)
+        (error "vt-random-choice: p 的长度 (~a) 必须等于 a 的元素数 (~a)"
+               (length pw) n))
+      (unless (every (lambda (w) (and (realp w) (>= w 0))) pw)
+        (error "vt-random-choice: p 必须全部为非负实数，收到 ~s" pw))
+      (unless (plusp (reduce #'+ pw))
+        (error "vt-random-choice: p 的总和必须为正（否则无法归一化成概率），收到总和 ~a"
+               (reduce #'+ pw))))
+    (let ((cdf (when pw
+                 (let ((total (reduce #'+ pw)))
                    (let ((cum 0.0d0))
                      (coerce (mapcar (lambda (w)
                                        (incf cum (/ w total)) cum)
-                                     p)
+                                     pw)
                              'vector))))))
       (when (and (not replace) size)
         (when (> size-total n)
@@ -356,7 +381,7 @@
 
            (sample-weighted-no-replace-batch (k)
              (let* ((weights
-                      (coerce (or p (make-list n :initial-element 1.0d0))
+                      (coerce (or pw (make-list n :initial-element 1.0d0))
                               'vector))
                     (result (make-array k)))
                (dotimes (slot k)
@@ -455,14 +480,31 @@
     tensor))
 
 (defun vt-random-multinomial (n pvals &key (size nil) (rng nil))
-  "多项式分布采样（对标 numpy.random.multinomial）。"
+  "多项式分布采样（对标 numpy.random.multinomial）。
+
+   PVALS 接受实数序列或一维张量；元素须非负、总和 > 0（numpy 同样拒绝
+   负数与总和为 0 的概率向量，但报的是 ValueError，而非 SBCL 的裸断言
+   「The assertion (> TOTAL 0) failed」）。"
   (setf rng (%ensure-random-state rng))
-  (let* ((probs (if (vt-p pvals) (vt-to-list pvals) (coerce pvals 'list)))
+  (unless (and (integerp n) (>= n 0))
+    (error "vt-random-multinomial: n 必须是非负整数，收到 ~a（numpy 同样拒绝负试验数）" n))
+  (let* ((probs (cond ((vt-p pvals)
+                       (unless (= 1 (vt-order pvals))
+                         (error "vt-random-multinomial: pvals 必须是一维，收到 ~a 维"
+                                (vt-order pvals)))
+                       (map 'list #'identity (vt-to-list pvals)))
+                      ((listp pvals) pvals)
+                      ((vectorp pvals) (coerce pvals 'list))
+                      (t (error "vt-random-multinomial: pvals 必须是张量或实数序列，收到 ~a"
+                                (type-of pvals)))))
          (k (length probs)))
-    (assert (> k 0) () "pvals 不能为空")
-    (assert (every (lambda (p) (>= p 0)) probs) ())
+    (when (zerop k)
+      (error "vt-random-multinomial: pvals 不能为空"))
+    (unless (every (lambda (p) (and (realp p) (>= p 0))) probs)
+      (error "vt-random-multinomial: pvals 必须全部为非负实数，收到 ~s" probs))
     (let ((total (reduce #'+ probs)))
-      (assert (> total 0) ())
+      (unless (plusp total)
+        (error "vt-random-multinomial: pvals 的总和必须为正，收到总和 ~a" total))
       (let ((cdf (make-array k :element-type 'double-float
                                :initial-element 0.0d0)))
         (let ((cum 0.0d0))

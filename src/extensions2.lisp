@@ -76,8 +76,11 @@
      (vt-geomspace 1 -100 5)               => error（异号）
      (vt-geomspace 0 100 5)                => error（含零）"
   (declare (fixnum num))
-  (when (< num 1)
-    (error "vt-geomspace: num 必须 >= 1，当前为 ~a" num))
+  ;; NUM = 0 返回空张量（对标 np.geomspace：采样点为空是合法请求）。
+  ;; 注意顺序 —— numpy 先做 start/stop 的零与同号校验，所以
+  ;; np.geomspace(0, 10, 0) 仍然报错，只有合法的端点才允许空序列。
+  (when (minusp num)
+    (error "vt-geomspace: num 必须 >= 0，当前为 ~a" num))
   ;; dtype 合法性校验：整型或浮点，其他非法
   (unless (member dtype '(:float64 :float32
                           :int64 :int32 :int16 :int8
@@ -90,6 +93,8 @@
       (error "vt-geomspace: start (~a) 和 stop (~a) 均不能为零" start stop))
     (when (not (eql (minusp s) (minusp e)))
       (error "vt-geomspace: start (~a) 和 stop (~a) 必须同号" start stop))
+    (when (zerop num)
+      (return-from vt-geomspace (vt-zeros (list 0) :dtype dtype)))
     (when (= num 1)
       (return-from vt-geomspace
         (vt-full (list 1) s :dtype dtype)))

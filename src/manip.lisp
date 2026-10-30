@@ -403,7 +403,10 @@
    （此前 hsplit / dsplit 直接转交 vt-split，沿用了 array_split 的余数
    语义，与 numpy 的 hsplit/dsplit 契约不符。）"
   (when (and (integerp sections) (plusp sections))
-    (unless (and (plusp dim) (zerop (mod dim sections)))
+    ;; 长度为 0 的轴对任何正整数段数都「整除」（0 = 0 × n），numpy 对此返回
+    ;; 若干个空段（np.vsplit(np.zeros((0,3)),2) → 两个 (0,3)）。原先的
+    ;; (plusp dim) 把 0 归进了「不整除」，于是一个合法的均分被误报成错误。
+    (unless (zerop (mod dim sections))
       (error "~a: array split does not result in an equal division（该轴长度 ~a ÷ ~a 段不整除；numpy 的 split/vsplit/hsplit/dsplit 对整数段数要求整除，需不等分请改用 vt-split）"
              op-name dim sections))))
 

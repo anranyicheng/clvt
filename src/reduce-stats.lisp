@@ -1434,30 +1434,39 @@
                            (run-axis ()
                              ;; 沿轴：除 AX 外各维做里程计，每条 fiber 只算一次
                              ;; 起点；内层整段交给 RUN（步长 = 该轴 stride，可为负）。
-                             (let ((dim (the fixnum (nth ax shape)))
-                                   (istep (the fixnum (nth ax in-strides)))
-                                   (ostep (the fixnum (nth ax out-strides)))
-                                   (idx (make-array (max 1 rank)
-                                                    :element-type 'fixnum
-                                                    :initial-element 0)))
-                               (declare (type (simple-array fixnum (*)) idx))
-                               (loop
-                                 (let ((sp in-offset) (dp out-offset))
-                                   (dotimes (d rank)
-                                     (unless (= d ax)
-                                       (incf sp (* (aref idx d) (nth d in-strides)))
-                                       (incf dp (* (aref idx d) (nth d out-strides)))))
-                                   (run sp dp dim istep ostep))
-                                 ;; 里程计：跳过 AX 维，逐位向左进位
-                                 (let ((carry t))
-                                   (loop for d of-type fixnum from (1- rank) downto 0
-                                         while carry
-                                         do (unless (= d ax)
-                                              (incf (aref idx d))
-                                              (if (< (aref idx d) (nth d shape))
-                                                  (setf carry nil)
-                                                  (setf (aref idx d) 0))))
-                                   (when carry (return)))))))
+                             ;;
+                             ;; 「总元素数为 0」必须在这里整体跳过：下面的里程计是
+                             ;; do-while 结构（先跑 body 再判断进位），shape 里只要有
+                             ;; 一个 0 维，它仍会先跑一轮，于是 (aref src sp) 落在
+                             ;; 长度 0 的 buffer 上 —— 实测 (vt-cumsum (vt-zeros
+                             ;; '(0 3)) :axis 1) 报 "Invalid index 0 for
+                             ;; (SIMPLE-ARRAY DOUBLE-FLOAT (0))"，而 numpy 正常返回
+                             ;; 同形状空数组（无 fiber 可跑）。
+                             (when (plusp (vt-size result))
+                               (let ((dim (the fixnum (nth ax shape)))
+                                     (istep (the fixnum (nth ax in-strides)))
+                                     (ostep (the fixnum (nth ax out-strides)))
+                                     (idx (make-array (max 1 rank)
+                                                      :element-type 'fixnum
+                                                      :initial-element 0)))
+                                 (declare (type (simple-array fixnum (*)) idx))
+                                 (loop
+                                   (let ((sp in-offset) (dp out-offset))
+                                     (dotimes (d rank)
+                                       (unless (= d ax)
+                                         (incf sp (* (aref idx d) (nth d in-strides)))
+                                         (incf dp (* (aref idx d) (nth d out-strides)))))
+                                     (run sp dp dim istep ostep))
+                                   ;; 里程计：跳过 AX 维，逐位向左进位
+                                   (let ((carry t))
+                                     (loop for d of-type fixnum from (1- rank) downto 0
+                                           while carry
+                                           do (unless (= d ax)
+                                                (incf (aref idx d))
+                                                (if (< (aref idx d) (nth d shape))
+                                                    (setf carry nil)
+                                                    (setf (aref idx d) 0))))
+                                     (when carry (return))))))))
                      (if ax (run-axis) (run-flat))))))
       (when (and (member op (list #'+ #'*))
                  (equal (array-element-type in-data)
@@ -1483,37 +1492,42 @@
         ;; 通用回退路径：dtype 不在四种存储类型内、或输入/结果元素类型不同
         ;; （如 int8→int64 提升、显式 :dtype 改变宽度）。语义正确但慢
         ;; （逐元素 funcall + vt-cast），正常情况都被上面的特化路径接走。
-        (let* ((ax-dim (nth ax shape))
-               (indices (make-array rank :element-type '(signed-byte 64)
-                                         :initial-element 0)))
-          (labels ((advance ()
-                     (loop for d from (1- rank) downto 0
-                           when (/= d ax)
-                             do (incf (aref indices d))
-                                (if (< (aref indices d) (nth d shape))
-                                    (return-from advance t)
-                                    (setf (aref indices d) 0)))))
-            (loop
-              (let ((in-ptr in-offset) (out-ptr out-offset))
-                (loop for d from 0 below rank do
-                  (incf in-ptr (* (aref indices d)
-                                  (nth d in-strides)))
-                  (incf out-ptr (* (aref indices d)
-                                   (nth d out-strides))))
-                (let ((in-stride (nth ax in-strides))
-                      (out-stride (nth ax out-strides))
-                      (cum (coerce init-val lisp-type)))
-                  ;; 首元素直拷（numpy accumulate 语义，§16.30.3）：
-                  ;; 每条 fiber 的第一个输出 = 输入本身，不是 OP(单位元, 输入)。
-                  (when (plusp ax-dim)
-                    (let ((v (aref in-data in-ptr)))
-                      (setf cum v)
-                      (setf (aref out-data out-ptr) (vt-cast v final-dtype))))
-                  (loop for i from 1 below ax-dim do
-                    (setf cum (funcall op cum (aref in-data (+ in-ptr (* i in-stride)))))
-                    (setf (aref out-data (+ out-ptr (* i out-stride)))
-                          (vt-cast cum final-dtype)))))
-              (unless (advance) (return)))))
+        ;;
+        ;; 与快路径同一条空数组问题：ADVANCE 是「先跑 body 再进位」的结构，
+        ;; 元素数为 0 时仍会跑一轮 body —— ax-dim > 0 而**其他**维为 0
+        ;; （如 (0,3) 沿 axis 1）就走 (aref in-data 0)。整段跳过。
+        (when (plusp (vt-size result))
+          (let* ((ax-dim (nth ax shape))
+                 (indices (make-array rank :element-type '(signed-byte 64)
+                                           :initial-element 0)))
+            (labels ((advance ()
+                       (loop for d from (1- rank) downto 0
+                             when (/= d ax)
+                               do (incf (aref indices d))
+                                  (if (< (aref indices d) (nth d shape))
+                                      (return-from advance t)
+                                      (setf (aref indices d) 0)))))
+              (loop
+                (let ((in-ptr in-offset) (out-ptr out-offset))
+                  (loop for d from 0 below rank do
+                    (incf in-ptr (* (aref indices d)
+                                    (nth d in-strides)))
+                    (incf out-ptr (* (aref indices d)
+                                     (nth d out-strides))))
+                  (let ((in-stride (nth ax in-strides))
+                        (out-stride (nth ax out-strides))
+                        (cum (coerce init-val lisp-type)))
+                    ;; 首元素直拷（numpy accumulate 语义，§16.30.3）：
+                    ;; 每条 fiber 的第一个输出 = 输入本身，不是 OP(单位元, 输入)。
+                    (when (plusp ax-dim)
+                      (let ((v (aref in-data in-ptr)))
+                        (setf cum v)
+                        (setf (aref out-data out-ptr) (vt-cast v final-dtype))))
+                    (loop for i from 1 below ax-dim do
+                      (setf cum (funcall op cum (aref in-data (+ in-ptr (* i in-stride)))))
+                      (setf (aref out-data (+ out-ptr (* i out-stride)))
+                            (vt-cast cum final-dtype)))))
+                (unless (advance) (return))))))
         ;; ---------------- 全局累积（axis=nil）：展平后线性累加 ----------------
         ;; 原实现是「递归遍历 + funcall op + 逐元素 vt-cast」：rank>=2 时
         ;; 直接崩，且 1M 元素耗时 227ms。此处改为对展平视图的一次线性扫描，
