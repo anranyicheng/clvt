@@ -108,11 +108,15 @@
            (error (e) (format t "  crash: ~a~%" e) :crash))))
   (check "BUG-2a (0)-(1) 广播 → shape (0)" '(0)
          (if (eq r :crash) :crash (vt-shape r))))
+;; 空输入：v0.3.6 曾按 scipy 报 ValueError（scipy 自己也只在「归约轴长 0」时报，
+;; (0,3) 沿 axis=-1 反而返回空）。vt-softmax 的文档基准是 PyTorch，torch 2.10
+;; 对 (0,) / (0,3) / (3,0) 一律返回同形状空张量 —— 空轴上没有元素要归一化，
+;; 输出就是空的（CONVENTIONS §17.10.23）。这里改为断言形状。
 (let ((s (handler-case
-             (progn (vt-softmax (vt-from-sequence '() :dtype :float64)) :ok)
+             (vt-softmax (vt-from-sequence '() :dtype :float64))
            (error (e) (format t "  crash: ~a~%" e) :crash))))
-  (check "BUG-2b softmax 空向量 → ValueError（v0.3.6：scipy 对齐，内部 amax 空归约）"
-         t (eq s :crash)))
+  (check "BUG-2b softmax 空向量 → 空张量（torch 对齐；v0.3.6 的 scipy 语义已废）"
+         '(0) (if (eq s :crash) :crash (vt-shape s))))
 ;; (2,0) op (2,1) 同类广播（strided 路径）
 (let ((r (handler-case
              (vt-- (vt-reshape (vt-from-sequence '() :dtype :float64) '(2 0))

@@ -93,6 +93,7 @@ SUITES[scan-first-element-test]="38 累积扫描首元素语义（第十四轮 �
 SUITES[cumulative-axis-test]="70 累积沿轴 + nanmedian 多轴（第十五轮 §16.35: 沿轴累积从 196ms 降到 4ms 的**逐位回归** —— 用独立朴素参照(list+坐标换算，不碰 strides)对照 2D/3D/负轴/步长切片/转置/负步长/4 dtype/int8 提升/空轴/轴长1/:out 列视图与完全别名 + 性能护栏(沿轴 ≤40× 展平) · nanmedian axis 列表(含 keepdims/负轴/顺序无关/NaN/复数字典序/连续与非连续 :out/重复轴与越界报错)，期望值 numpy 2.4.6 实测）"
 SUITES[reduce-shape-axis-test]="145 归约/求解的「形状 × 轴 × 序列参数」契约回归（差分模糊测试挖出的九类真实缺陷: vt-solve/vt-inv 的结果秩只由输入秩决定（b 为 (n,1) 不再被压成 (n)、1×1 不再返回 shape (1)）· vt-ptp 全归约返回 0 维 vt 且支持 :keepdims · vt-nanmedian 全局 keepdims 返回全 1 形状 · vt-median 的多轴/单元素列表/负轴/顺序无关（含复数字典序与非连续视图）· vt-percentile/vt-quantile 的多轴 × 分位点序列 × keepdims 组合 · vt-left/right-shift 的第二操作数为张量（含广播与 NEP 50 dtype 规则）· vt-histogram 的 :bins 边界序列（左闭右开/区间外丢弃/NaN 不入箱/density）· 复数守卫去重后 nn 与统计函数仍按契约拒绝 · 多轴归约族的形状一致性交叉网；期望值 numpy 2.4.6 实测）"
 SUITES[degenerate-empty-test]="331 「退化形状 / 空张量 / 角参数」契约回归（换轴：把维度推到边界——shape 含 0、0 维、单观测、num=0、分母为 0。十组真实缺陷: cumsum/cumprod 沿轴 × 元素数 0 的 aref 越界（快路径里程计与通用 fallback 两处，nancumsum/nancumprod 第三个内核同病）· vt-indices 深层维度含 0 时 stride 被兜成 1 后越界写 · vsplit/hsplit/dsplit 把轴长 0 判成「不整除」 · vt-cov/vt-corrcoef 零观测未屏蔽浮点陷阱、角分母被换成 n_obs（cov([5.]) 应 nan）、corrcoef 标量分支硬编码 1.0（应 C/sqrt(C²)）· linspace/logspace/geomspace 的 num=0 报错（numpy 返回空，且 geomspace 的零校验先于 num）· vt-bincount 缺 :weights（结果恒 float64、负权重合法、复数权重按 numpy 拒绝）· vt-random-choice 的 :p 不接受张量（numpy 的 p 就是 ndarray）· 随机族裸 assert 改带函数名的消息 · IO 往返位模式保真（空/0 维/非连续/NaN/±0/复数，188 组合零失败的固化）· dtype 转换矩阵抽样（11×11 全组合 121 条差分零失败的固化）；期望值 numpy 2.4.6 实测）"
+SUITES[empty-axis-binning-test]="255 长度为 0 的轴 / −0.0 / 先算摘要再判断 契约回归（(1- dim) 在 dim=0 处是 −1 而 offset 是 (unsigned-byte 44)：vt-flip 全轴与单轴、vt-slice 负步长在空轴上把 offset 推负，崩在下一次 %make-vt 的类型检查上（numpy 的 data 指针不动）；vt-histogram 空输入不再泄漏 vt-AMIN 内部错误、全等值的 ±0.5 由单精度字面量改 double（1e8/1e10/1e15 边界逐位对齐、1e18 与 numpy 一样拒绝）；%carg 用 zerop 判零丢掉 −0.0 的符号位（angle(−0.0+0.0i) 应 π）；整型/浮点输入必须给同一组边界；:weights（整型/布尔→int64、浮点→float64、形状校验、复数拒绝）与 density（总计 0→NaN、逐箱宽度归一）；复数 correlate/convolve 的空序列校验原先只写在实数分支；期望值 numpy 2.4.6 实测，CONVENTIONS §17.10.23）"
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
 SUITES[view-consistency-test]="3548 物理形态无关性与分解纯函数性（换轴：随机输入 → 同一逻辑张量的不同物理形态 + 调用次数。A 视图一致性 1743 项：10 类视图(转置/翻转/子块/负步长/广播/转置后切片/单列/行反向/子块转置) × 45 函数 × 3 dtype 逐位相等 + 3D 全排列归约 + 算子不得改写视图；B :out 指向转置/负步长的写穿透与底层 buffer 镜像布局、out 与输入同一 buffer 的读写别名；C SVD 纯函数性（同输入两次逐位相等 + 不消费全局随机流，覆盖实数/:full-matrices/复数）；D 复数 SVD 的 U 必须酉（零奇异值列正交补全，含零矩阵/秩1/满秩/tall-full）；E VT-LSTSQ 契约（x 形状跟 b、residual 是平方和、无残差给 (0,) 空数组，实/复两版）；F eig/cholesky 只读下三角是 LAPACK 语义；G MATMUL 收缩轴校验（复数路径原先不校验，按 k 越界读 B 返回 1e77 量级的垃圾矩阵且无任何信号；实/复两路现在报同一条消息）；CONVENTIONS §17.10.22）"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
@@ -165,6 +166,7 @@ DEFAULT_ORDER=(
     cumulative-axis-test
     reduce-shape-axis-test
     degenerate-empty-test
+    empty-axis-binning-test
     view-consistency-test
     complex-gap-test
     complex-matmul-perf-test

@@ -206,8 +206,10 @@
   (run-case "relu (0 2)"          '(:ok :shape (0 2)) (lambda () (vt-relu (vt-zeros '(0 2)))))
   (run-case "sigmoid (0)"         '(:ok :shape (0))   (lambda () (vt-sigmoid (vt-zeros '(0)))))
   (run-case "softmax (0 2) ax1"   '(:ok :shape (0 2)) (lambda () (vt-softmax (vt-zeros '(0 2)) :axis 1)))
-  (run-case "softmax (0) numpy报错（scipy 对齐：内部 amax 空归约）" '(:error)
-            (lambda () (vt-softmax (vt-zeros '(0)))))
+  ;; 空输入返回空张量（torch 对齐）。numpy 没有 softmax；scipy 只在「归约轴
+  ;; 长 0」时报 ValueError，且 (0,3) 沿 axis=-1 反而返回空 —— 那是内部
+  ;; amax 的产物，不是语义（CONVENTIONS §17.10.23）。
+  (run-case "softmax (0) 空张量"   '(:ok :shape (0))   (lambda () (vt-softmax (vt-zeros '(0)))))
   (run-case "unique (0)"          '(:ok :shape (0))   (lambda () (vt-unique (vt-zeros '(0)))))
   (run-case "union1d (0)+(2,2,2)" '(:ok :value (2.0d0))
             (lambda () (vt-union1d (vt-zeros '(0)) (vt-const '(3) 2d0))))
