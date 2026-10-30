@@ -4254,6 +4254,100 @@ clvt 报错是对的」。实测 clvt **不报错**：`(vt-percentile b 50)` 给
 | `percentile(b, 50)` / `quantile(b, 0.5)` | **报错** | `float64` 正确值（有意偏差） |
 | `ptp(b)` / `gradient(b)` / `ediff1d(b)` | 报错 | 报错（语义本身就是减法） |
 
+#### 17.10.13 第五遍：不问「布尔当数据算得对不对」，问「布尔被谁读走」
+
+前四遍都在布尔**作为操作数**的位置找问题：值（差分）、字面量（入口）、
+结果类型（dtype + 字节）、成对一致性。第五遍换的轴是**消费侧**——布尔张量
+被当成别的东西读走的地方：当索引、当形状、当「用户函数返回值的容器」。
+
+这一遍不再人工挑函数，改成机械穷举：把 `:clvt` 的 375 个导出函数按参数
+个数试调 `(f b)` / `(f b b)` / `(f b int64)` / `(f int64 b)`，共 ~1250 次，
+逐条记录 dtype / 形状 / 值 / **物理字节**，再与 numpy 的同名函数对照。
+捞出的六处都不在算术族里，按算子名扫是扫不到的。
+
+| 入口 | 修复前 | 现在 | numpy |
+|---|---|---|---|
+| `(vt-reciprocal b)` | `:bool`，`(1 1 1 1)`（假值位置变真） | `:int8`，零除报错 | `int8` `[1 0 1 1]` |
+| `(vt-divmod b b)` | 商 `:bool`，`(T T T T)` | 商 `:int8` `(1 0 1 1)` | `int8` `[1 0 1 1]` |
+| `(vt-ptp b)` | `T is not of type NUMBER` | 布尔减法消息 | 报错 |
+| `(vt-broadcast-shapes b '(2))` | `Unhandled memory fault at #x0` | 参数类型消息 | — |
+| `(vt-apply-along-axis #'vt-sum 1 b)` | `:bool`，`(1 1)` | `:int64`，`(3 3)` | `int64` |
+| `(vt-apply-along-axis … 返回 #(5 6))` | `:bool`，字节 **5、6** | `:int64` | 跟随返回值 |
+| `(vt-vander b)` | `:bool` | `:int64` | `int64` |
+
+**第 1、2 条是同一个缺口的两侧**：`vt-int-dtype-p` 只认 `:int8/:int16/
+:int32/:int64`，不认 `:bool`（这是对的——布尔不是整数），但需要「整数语义」
+的两处却用这个判定当分支条件。`vt-reciprocal` 因此落到浮点路径：
+`1/0` 在 with-float-safe 下是 `+Inf`，写回 `:bool` 又被 `%bool-flag` 收成 1，
+`(T NIL T T)` 静默变成 `(T T T T)`。`vt-divmod` 则是 `dtype` 缺省走提升规则
+（bool ⊔ bool = bool），`floor(0/0)` 的 NaN 同样被收成 1。两处都改成
+「全布尔输入 → `:int8`」，与 `vt-mod`/`vt-rem`/`vt-div`（§17.10.11 第 4 条）
+并齐。
+
+**第 3 条是偏差表自我固化的第三个实例**（前两个：`b ** 2`、`matmul`）。
+§17.10.12 的表格写的是「`ptp(b)` 报错」，实现也「报错」——但报的是
+`The value T is not of type NUMBER`：非 axis 分支写的是
+`(- (vt-item …) (vt-item …))`，而 `vt-item` 自 §17.8 起对布尔返回 T/NIL。
+**表格只记了「报不报」，没记「报什么」**，于是「报错」这一栏一直在骗人。
+同一函数的 `:axis` 分支走 `vt--`，报的却是正确的布尔减法消息。
+
+**第 4 条与新轴无关、但值得留一笔**：`vt-broadcast-shapes` /
+`vt-broadcast-strides` 带 `(declare (list …))` + `(safety 0)`，传一个 VT
+结构体进去时 `(length shape1)` 被编成取 car 链，读到结构体的非法槽位。
+误用理应拿到一句错误消息，而不是让整个 Lisp 进程躺下。改法是**删掉 list
+声明、换成运行时 `listp` 检查**——留着声明，编译器会把检查优化成 T。
+代价是每次调用两次 `listp`（这两个函数在每个二元算子都会跑，实测无可测
+差异）。
+
+**第 5 条是这一遍最值钱的**：`vt-apply-along-axis` 的结果 dtype 固定取
+输入 dtype，于是布尔输入下 1D→1D 分支直接 `aref` 写 5、6 ——
+**布尔数组里出现越界字节**，正是 §17.1 的核心不变量。现在布尔输入的结果
+dtype 由 FUNC 的返回值决定（1D→scalar 分支看返回标量/0 维张量的 dtype，
+1D→1D 看返回张量的 dtype），非布尔输入维持旧契约（结果跟随输入）。这条
+同时修掉了「`(vt-sum row)` 的 3 被压成 1」。
+
+**偏差族：numpy 对布尔的超越函数落 `float16`，本库落 `float64`。**
+机械扫描捞到的最大一簇不是 bug 而是这个：`sqrt` / `log` / `log2` /
+`log10` / `exp` / `sin` / `cos` / `tan` / `sinh` / `cosh` / `tanh` /
+`asin` / `acos` / `atan` / `asinh` / `acosh` / `atanh` / `log1p` / `expm1` /
+`cbrt` / `spacing` / `deg2rad` / `rad2deg` / `atan2` / `hypot` /
+`copysign` / `nextafter` / `logaddexp` / `round` / `rint` 共约 30 个，
+numpy 2.3.5 对 `bool` 输入一律选 `float16` 的循环。本库一律 `float64`
+（§17.10.11 的 `atan2` 就是按这条定的）。**不跟**：`float16` 只有 3 位
+十进制有效数字，`sqrt(2)` 给 1.414，比「与 numpy 的 dtype 字符串一致」
+重要得多。记为**有意偏差**，与 §17.10.7 的偏差表同性质。
+
+同类但更小的三处（值相同、dtype 不同，同样不跟）：
+
+| 表达式 | numpy | clvt | 理由 |
+|---|---|---|---|
+| `square(b)` / `conj(b)` | `int8` | `:bool` | numpy 自己的 `b*b` 是 bool、`square(b)` 是 int8，内部就不自洽；本库取自洽的一侧 |
+| `round(b)` / `rint(b)` | `float16` | `:bool` | 布尔的 round 是恒等，保留 bool 比升 float16 更不意外 |
+| `clip(b, 0, 1)` | **报错**（`positive` 无 bool 循环） | `:bool` 恒等 | 本库的 clip 不走 ufunc 的 positive，能算对就不拒绝 |
+
+**第五遍确认「没有问题」的部分**（记在这里免得下次重做）：
+
+* **布尔当索引/掩码/计数**：`take` / `put` / `choose` / `select` /
+  `compress` / `extract` / `take-along-axis` / `put-along-axis` /
+  `searchsorted` / `bincount` / `digitize` / `unique` / `isin` / `in1d` /
+  `delete` / `setxor1d` / `setdiff1d` / `intersect1d` / `union1d` /
+  `nonzero` / `flatnonzero` / `argwhere` / `count-nonzero` —— 23 个入口
+  与 numpy 逐项一致（`take`/`put`/`choose` 按 0/1 整数索引，
+  `compress`/`extract` 按掩码，两套语义并存，与 numpy 相同）。
+* **写入路径的字节卫生**：`:out` 为 `:bool` 且结果 dtype 不符时一律报错
+  （§4.4 的严格性）；`vt-copy-into` / `vt-copy-to!` / `(setf (vt-slice …))`
+  标量分支与张量分支、`vt-fill` / `vt-fill-diagonal` / `vt-put` 全部经
+  `%bool-flag`，`(setf (vt-slice b …) 2)` 得 1 而不是 2。
+* **`vt-from-sequence` 的混合嵌套**：`'((t nil) (1 0))` / `'(t 1 nil)` 在
+  `:dtype :bool` 下都把 T/NIL 与 0/1 读成同一个真值；不给 `:dtype` 时
+  报「不规则嵌套」（与 numpy 给 object 数组不同，这是刻意的确定性）。
+
+> 方法论上的一个坑：**机械扫描时每个用例必须重建输入**。第一版扫描复用
+> 同一对 `*b*` / `*bi*`，`vt-random-shuffle` / `vt-sort` / `vt-put` 这类
+> 原地函数把它们改掉之后，后面的 `vt-mul` / `vt-vstack` / `vt-take` 全部
+> 报出「差异」—— 查了半小时才发现是测试夹具被污染，不是库的缺陷。
+> 一个只读工具的扫描器里混进一个就地写入的函数，污染的是**之后的所有行**。
+
 ---
 
 ## 附录 C：实测缺陷复现脚本

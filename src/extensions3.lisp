@@ -958,9 +958,15 @@
   "逐元素同时返回商与余数（对标 numpy.divmod）。
    余数符号跟随除数（floor 语义）；返回 (values quotient remainder)。
    :out 契约：本函数返回两个结果，暂不支持 :out（传 out 将报错）。
+   布尔输入（CONVENTIONS §17.10.13）：结果 dtype 取 **:int8**，与
+   `vt-mod` / `vt-rem` / `vt-div` 同一条规则 —— 原实现没有这一步，商沿用
+   输入的 `:bool`，`floor(0/0)` 得 NaN 再被 `%bool-flag` 收成 1，于是
+   `(vt-divmod #(T NIL) #(T NIL))` 的商是 `(T T)`（numpy：int8 `[1 0]`）。
    示例：(multiple-value-bind (q r) (vt-divmod '(7 -7) '(2 3)) ...)
         => q=[3 -3], r=[1 2]"
   (declare (ignore out))
+  (when (and (null dtype) (%all-bool-tensors-p (list x y)))
+    (setf dtype :int8))
   (let* ((xv (ensure-vt x)) (yv (ensure-vt y))
          ;; floor 除法（余数跟随除数）：商 = floor(x / y)（浮点亦按 floor 取整）
          (quot (vt-map (lambda (a b)

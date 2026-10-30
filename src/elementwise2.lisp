@@ -401,17 +401,23 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
 
    dtype 语义（对标 numpy.reciprocal，v0.3.6 起）：
      整数输入 → **保持整数 dtype**（numpy 1//x 整数除法，1/2 → 0）；
+     布尔输入 → **:int8**（numpy 的 bool 循环落在 int8，`np.reciprocal(bool)`
+                → `int8`，见 CONVENTIONS §17.10.13）；
      浮点输入 → 保持原浮点 dtype（float32 进 float32 出）；
      显式 :dtype 优先。
-   零除：浮点 → ±Inf（IEEE 754）；整数 → 确定性报错，与 numpy
-     整数零除行为一致。"
+   零除：浮点 → ±Inf（IEEE 754）；整数/布尔 → 确定性报错。
+     布尔这一支曾经落到浮点路径：`1/0` 在 with-float-safe 下是 +Inf，
+     写回 `:bool` 又被 `%bool-flag` 收成 1 —— `(vt-reciprocal #(T NIL T T))`
+     静默返回 `(T T T T)`，假值位置变成了真。布尔按 int8 参与整数语义后，
+     这个静默错值变成显式报错（numpy 在整数零除时给 0 + RuntimeWarning，
+     本库一贯拒绝静默错值，见 §17.10.5 的同一取舍）。"
   (when (%cx-any-p vt)
     (return-from vt-reciprocal
       (let* ((in (ensure-vt vt))
              (dt (%cx-result-complex-dtype (vt-dtype in) dtype "VT-RECIPROCAL")))
         (vt-fast-map (function %cop-recip) in :out out :dtype dt))))
   (let* ((in-dt (vt-dtype (ensure-vt vt)))
-         (dt (or dtype in-dt)))
+         (dt (or dtype (if (eq in-dt :bool) :int8 in-dt))))
     (if (vt-int-dtype-p dt)
         ;; 整数倒数：保持整数语义（1//x），零除交给 CL 整数除零错误
         (vt-map (lambda (v) (if (zerop v) (error "vt-reciprocal: 整数零除") (truncate (/ 1 v))))

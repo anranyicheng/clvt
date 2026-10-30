@@ -2106,9 +2106,24 @@
                  :interpolation interpolation))
 
 (defun vt-ptp (tensor &key axis)
-  "峰谷差 max - min（对标 numpy.ptp）。"
-  (if axis (vt-- (vt-amax tensor :axis axis) (vt-amin tensor :axis axis))
-      (- (vt-item (vt-amax tensor)) (vt-item (vt-amin tensor)))))
+  "峰谷差 max - min（对标 numpy.ptp）。
+
+   布尔输入报错（CONVENTIONS §17.3、§17.10.13）：峰谷差本身就是一个减法，
+   numpy 明确拒绝（`TypeError: numpy boolean subtract, the - operator, is
+   not supported`）。原实现的 `:axis` 分支走 `vt--`（报的是正确的布尔
+   减法消息），非 axis 分支写成 `(- (vt-item …) (vt-item …))`，而
+   `(vt-item bool标量)` 自 §17.8 起返回 T/NIL —— 于是同一个函数在两个
+   分支上报两种错：一个是「布尔减法未定义」，另一个是
+   「The value T is not of type NUMBER」。后者是内部类型泄漏，用户既
+   看不出是布尔的问题，也不知道该换成什么。"
+  (let ((tv (ensure-vt tensor)))
+    (when (eq (vt-dtype tv) :bool)
+      (error "vt-ptp: 布尔张量不支持峰谷差（numpy 同样拒绝：布尔减法未定义）。 ~
+              要计数请用 vt-count-nonzero，要看相邻差异请用 vt-diff（相邻异或）； ~
+              见 CONVENTIONS §17.3"))
+    (if axis
+        (vt-- (vt-amax tv :axis axis) (vt-amin tv :axis axis))
+        (- (vt-item (vt-amax tv)) (vt-item (vt-amin tv))))))
 
 (defun vt-histogram (tensor &key bins range density)
   "直方图统计（对标 numpy.histogram）。返回 (values counts edges)。"

@@ -4,6 +4,63 @@
 
 ---
 
+## 2026-10-30（三十九）— fix: 布尔「被消费」的六个入口（倒数 / 整除 / 峰谷差 / 形状工具 / along-axis / vander）
+
+> 契约见 `CONVENTIONS.md` §17.10.13；决策过程见 `HISTORY.md` H.3.32。
+> 这一轮不再挑函数，改用程序遍历全部 **375 个导出符号**（4 种调用形态，
+> ~1250 次），记录 dtype / 值 / 物理字节并与 numpy 同名实现对照。
+
+**破坏性变更（六处，全部是「原来给错答案或直接崩」）**：
+
+| 表达式 | 修复前 | 现在 | numpy |
+|---|---|---|---|
+| `(vt-reciprocal #(T NIL T T))` | `:bool` **`(1 1 1 1)`**（假值变真） | `:int8`；含假值时报「整数零除」 | `int8` `[1 0 1 1]` |
+| `(vt-divmod b b)` | 商 `:bool` **`(T T T T)`** | 商 `:int8` `(1 0 1 1)` | `int8` |
+| `(vt-ptp b)` | `The value T is not of type NUMBER` | 「布尔张量不支持峰谷差」 | 报错 |
+| `(vt-broadcast-shapes b '(2))` | **`Unhandled memory fault at #x0`** | 「参数必须是形状列表」 | — |
+| `(vt-broadcast-strides b '(2) '(1))` | **内存错误** | 同上 | — |
+| `(vt-apply-along-axis #'vt-sum 1 b)` | `:bool` **`(1 1)`**（3 被压成 1） | `:int64` `(3 3)` | `int64` |
+| `(vt-apply-along-axis … 返回 #(5 6))` | `:bool`，字节 **5、6** | `:int64`，值 `5 6` | 跟随返回值 |
+| `(vt-vander b)` | `:bool` | `:int64` | `int64` |
+
+两条根因：
+
+1. **`vt-int-dtype-p` 不认 `:bool`，却被当成「整数语义」的分支条件**。
+   `vt-reciprocal` 因此落到浮点路径：`1/0` 在 with-float-safe 下是 `+Inf`，
+   写回 `:bool` 被 `%bool-flag` 收成 1。`vt-divmod` 是 `dtype` 缺省走提升
+   规则（bool ⊔ bool = bool），`floor(0/0)` 的 NaN 同样收成 1。两处都改成
+   「全布尔输入 → `:int8`」，与 `vt-mod`/`vt-rem`/`vt-div` 并齐。
+2. **`vt-apply-along-axis` 的结果 dtype 固定取输入 dtype**。布尔输入下
+   1D→scalar 把 `(vt-sum row)` 的 3 压成 1，1D→1D 直接 `aref` 写 5、6 ——
+   **布尔数组里出现越界字节**（破 §17.1 的 0/1 不变量）。现在布尔输入按
+   FUNC 的返回类型定结果 dtype，非布尔输入维持旧契约。
+
+**顺带修的两处健壮性**：`vt-ptp` 的布尔检查（原来非 `:axis` 分支报的是
+内部类型泄漏，同一函数的 `:axis` 分支报的却是正确的布尔消息）；
+`vt-broadcast-shapes`/`-strides` 去掉 `(declare (list …))`、换成运行时
+`listp` 检查——保留声明时编译器会把这个检查优化掉，而传张量进来会读到
+结构体的非法槽位，直接把进程打掉。
+
+**偏差（不跟 numpy，已记入 §17.10.13）**：约 30 个超越函数在 numpy 里对
+`bool` 输入给 `float16`，本库给 `float64`。`float16` 只有 3 位十进制有效
+数字（`sqrt(2)` → 1.414），对齐 dtype 字符串不如算对。同性质三处：
+`square`/`conj`（numpy `int8`，但它自己的 `b*b` 是 bool，内部不自洽）、
+`round`/`rint`（numpy `float16`）、`clip(b,0,1)`（numpy 报错）。
+
+**这一轮同时确认无误的**（记在 §17.10.13，免得下次重做）：23 个「布尔当
+索引/掩码/计数」的入口（`take`/`put`/`choose`/`select`/`compress`/`extract`/
+`take-along-axis`/`put-along-axis`/`searchsorted`/`bincount`/`digitize`/
+`unique`/`isin`/`in1d`/`delete`/`setxor1d`/`setdiff1d`/`intersect1d`/
+`union1d`/`nonzero`/`flatnonzero`/`argwhere`/`count-nonzero`）与 numpy 逐项
+一致；`:out`/`copy-into`/`copy-to!`/`(setf (vt-slice …))`/`vt-fill`/
+`vt-fill-diagonal`/`vt-put` 的字节卫生；`vt-from-sequence` 的 T/NIL 与 0/1
+混合嵌套。
+
+**验收**：`bool-dtype-test` 461 断言全过（新增 M 组 29 条）；65 套件全绿
+（严格模式）；`check_docs.py` 222 锚点全解析；编译零 WARNING。
+
+---
+
 ## 2026-10-30（三十八）— fix: 累积提升表与「标量 → 布尔」的两处不一致
 
 > 契约见 `CONVENTIONS.md` §17.10.12；决策过程见 `HISTORY.md` H.3.31。

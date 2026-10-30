@@ -189,11 +189,15 @@
    - increasing = t : 第 j 列为 x^j
    - increasing = nil : 第 j 列为 x^(ncols-1-j)
    实现用一行内 O(ncols) 递推，避免每个元素重复做幂运算。
-   ★ 对整数类型，溢出时按 NumPy 语义回绕（wrap），不再因 bignum 写入报错。"
+   ★ 对整数类型，溢出时按 NumPy 语义回绕（wrap），不再因 bignum 写入报错。
+   ★ 布尔输入的结果 dtype 取 **:int64**（numpy：`np.vander(bool)` → int64）。
+     保持 `:bool` 会让「第 3 列 = x²」与 `(vt-pow b 2)`（§17.10.11 已定为
+     int64）在同一个表达式上给出两种 dtype；值虽然都是 0/1，但下游一旦
+     就地写入（`(setf (vt-slice …) 3)`）就会撞上 bool 的 0/1 值域。"
   (let* ((xv (vt-contiguous (vt-flatten x)))
          (len (vt-size xv))
          (ncols (or n len))
-         (dtype (vt-dtype xv))
+         (dtype (let ((d (vt-dtype xv))) (if (eq d :bool) :int64 d)))
          (int-p (not (vt-float-dtype-p dtype)))
          (result (vt-zeros (list len ncols) :dtype dtype))
          (xdata (vt-data xv))
@@ -394,10 +398,28 @@
 ;;; ------------------------------------------------------------------
 ;;; 10. apply-along-axis
 ;;; ------------------------------------------------------------------
+(defun %apply-along-axis-result-dtype (sample in-dtype)
+  "VT-APPLY-ALONG-AXIS 的结果 dtype。
+
+   非布尔输入保持旧契约（结果跟随输入 dtype）。布尔输入是特例：结果 dtype
+   由 FUNC 的返回值决定 —— 把 `(vt-sum row)` 的 3 塞进 `:bool` 数组，要么被
+   `%bool-flag` 压成 1（静默错值），要么在 1D→1D 分支里直接把 5、6 这种越界
+   字节写进去（破坏 §17.1 的 0/1 不变量）。numpy 同样按 FUNC 的返回类型定
+   结果 dtype。"
+  (if (not (eq in-dtype :bool))
+      in-dtype
+      (cond ((vt-p sample) (vt-dtype sample))
+            ((integerp sample) :int64)
+            ((floatp sample) :float64)
+            ((complexp sample) :complex128)
+            (t :bool))))
+
 (defun vt-apply-along-axis (func axis vt)
   "沿指定轴对 1D 切片应用函数，对标 np.apply_along_axis。
    支持 func 返回标量（1D→scalar）或 1D 张量（1D→1D）。
-   注意：func 会被额外调用一次用于探测输出形状，因此不应有副作用。"
+   注意：func 会被额外调用一次用于探测输出形状，因此不应有副作用。
+   布尔输入的结果 dtype 取 FUNC 返回值的 dtype（见
+   `%APPLY-ALONG-AXIS-RESULT-DTYPE`，CONVENTIONS §17.10.13）。"
   (with-float-safe
     (let* ((vt-c (vt-contiguous vt))
            (shape (vt-shape vt-c))
@@ -416,12 +438,13 @@
       (let* ((probe (make-array ax-dim :element-type ltype
                                          :initial-element (coerce 0 ltype)))
              (probe-vt (vt-from-array probe :dtype (vt-dtype vt-c)))
-             (sample (funcall func probe-vt)))
+             (sample (funcall func probe-vt))
+             (out-dt (%apply-along-axis-result-dtype sample (vt-dtype vt-c))))
         (cond
           ;; 1D -> scalar
           ((or (numberp sample) (and (vt-p sample) (null (vt-shape sample))))
            (let* ((out-shape (append before after))
-                  (result (vt-zeros out-shape :dtype (vt-dtype vt-c)))
+                  (result (vt-zeros out-shape :dtype out-dt))
                   (rdata (vt-data result)))
              (dotimes (bi outer)
                (dotimes (ii inner)
@@ -433,15 +456,15 @@
                                          (* k inner) ii))))
                    (let* ((sl (vt-from-array arr :dtype (vt-dtype vt-c)))
                           (rv (funcall func sl))
-                          (raw (if (vt-p rv) (vt-item rv) rv)))
+                          (raw (%item-number rv)))
                      (setf (aref rdata (+ (* bi inner) ii))
-                           (vt-cast raw (vt-dtype vt-c)))))))
+                           (vt-cast raw out-dt))))))
              result))
           ;; 1D -> 1D
           ((and (vt-p sample) (= (length (vt-shape sample)) 1))
            (let* ((new-dim (car (vt-shape sample)))
                   (out-shape (append before (list new-dim) after))
-                  (result (vt-zeros out-shape :dtype (vt-dtype vt-c)))
+                  (result (vt-zeros out-shape :dtype out-dt))
                   (rdata (vt-data result)))
              (declare (fixnum new-dim))
              (dotimes (bi outer)
@@ -458,7 +481,7 @@
                      (dotimes (k new-dim)
                        (setf (aref rdata (+ (* bi new-dim inner)
                                             (* k inner) ii))
-                             (%vt-ref-raw ov k)))))))
+                             (vt-cast (%vt-ref-raw ov k) out-dt)))))))
              result))
           (t (error "vt-apply-along-axis: func must return scalar or 1D VT")))))))
 

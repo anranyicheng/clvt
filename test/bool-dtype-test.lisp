@@ -822,6 +822,88 @@
 (check "pad/complex-0+1j"   (flat-ints (vt-pad (vt-from-sequence '(t) :dtype :bool) '(1 1)
                                                :constant-values (complex 0 1))) '(1 1 1))
 
+;; --- M. 「消费布尔」的入口（§17.10.13）---
+;; 前四遍审计都是「布尔当数据算」；这一遍换的是「布尔被谁读走」：倒数/整除
+;; 把 0/1 当数字、峰谷差把 vt-item 的 T 当数、apply-along-axis 把函数返回值
+;; 塞回 bool 数组、形状工具收到张量直接段错误。共同点是**入口不在算术族里**，
+;; 所以按算子名扫不到。
+(defparameter *mb* (vt-from-sequence '((t nil t t) (t t nil t)) :dtype :bool))
+
+;; M1. vt-reciprocal：numpy 的 bool 循环落 int8（1//x）。原实现因为
+;;     `(vt-int-dtype-p :bool)` 为假而落到浮点路径，1/0 在 with-float-safe
+;;     下是 +Inf，写回 :bool 又被 %bool-flag 收成 1 —— (T NIL T T) 静默变
+;;     成 (T T T T)，假值位置变真。
+(check "reciprocal/all-true-dtype"
+       (vt-dtype (vt-reciprocal (vt-from-sequence '(t t) :dtype :bool))) :int8)
+(check "reciprocal/all-true-vals"
+       (flat-ints (vt-reciprocal (vt-from-sequence '(t t) :dtype :bool))) '(1 1))
+(check-error "reciprocal/with-false" (vt-reciprocal *jb*))  ; 整数零除（本库契约）
+(check "reciprocal/int8-unchanged"
+       (flat-ints (vt-reciprocal (vt-from-sequence '(2 4) :dtype :int8))) '(0 0))
+(check "reciprocal/float32-unchanged"
+       (vt-dtype (vt-reciprocal (vt-from-sequence '(2.0 4.0) :dtype :float32))) :float32)
+
+;; M2. vt-divmod：商必须与 mod/rem/div 同族（:int8）。原实现让 floor(0/0)
+;;     的 NaN 落进 :bool 得到真，商数组整个变成 (T T ...)。
+(check "divmod/bool-dtype" (vt-dtype (nth-value 0 (vt-divmod *jb* *jb*))) :int8)
+(check "divmod/bool-quot" (flat-ints (nth-value 0 (vt-divmod *jb* *jb*))) '(1 1 0 0))
+(check "divmod/bool-rem"  (flat-ints (nth-value 1 (vt-divmod *jb* *jb*))) '(0 0 0 0))
+(check "divmod/dtype-same-as-mod"
+       (vt-dtype (nth-value 0 (vt-divmod *jb* *jb*))) (vt-dtype (vt-mod *jb* *jb*)))
+(check "divmod/mixed-dtype"
+       (vt-dtype (nth-value 0 (vt-divmod *jb* (vt-from-sequence '(2 3 4 5) :dtype :int64))))
+       :int64)
+
+;; M3. vt-ptp：布尔峰谷差就是减法，numpy 拒绝。原实现的非 axis 分支把
+;;     `(vt-item bool标量)` 的 T 直接丢进 `-`，报的是「T is not of type
+;;     NUMBER」；同一函数的 :axis 分支走 vt--，报的却是正确的布尔消息。
+(check-error "ptp/bool" (vt-ptp *jb*))
+(check-error "ptp/bool-axis" (vt-ptp *mb* :axis 0))
+(check-true "ptp/bool-error-mentions-bool"
+            (search "布尔" (handler-case (progn (vt-ptp *jb*) "")
+                             (error (e) (princ-to-string e)))))
+(check "ptp/int-unchanged" (vt-ptp (vt-from-sequence '(3 9 1))) 8.0d0)
+
+;; M4. 形状工具收到张量：原实现在 (safety 0) + `(declare (list …))` 下取
+;;     car 链，实测 `Unhandled memory fault at #x0`。误用应当拿到错误消息。
+(check-error "broadcast-shapes/rejects-vt" (vt-broadcast-shapes *jb* '(2)))
+(check-error "broadcast-strides/rejects-vt" (vt-broadcast-strides *jb* '(2) '(1)))
+(check "broadcast-shapes/ok" (vt-broadcast-shapes '(3 1) '(1 4)) '(3 4))
+(check "broadcast-strides/ok" (vt-broadcast-strides '(3 1) '(3 4) '(1 1)) '(1 0))
+
+;; M5. vt-apply-along-axis：结果 dtype 原来固定取输入 dtype。布尔输入时
+;;     1D→scalar 分支把 (vt-sum row) 的 3 压成 1；1D→1D 分支直接 AREF
+;;     写入 5、6 这种越界字节（破 0/1 不变量）。现在布尔输入按 FUNC 的
+;;     返回类型定 dtype，非布尔输入维持旧契约。
+(check "apply-along/sum-dtype" (vt-dtype (vt-apply-along-axis #'vt-sum 1 *mb*)) :int64)
+(check "apply-along/sum-vals"  (flat-ints (vt-apply-along-axis #'vt-sum 1 *mb*)) '(3 3))
+(check "apply-along/1d1d-dtype"
+       (vt-dtype (vt-apply-along-axis (lambda (r) (vt-from-sequence '(5 6) :dtype :int64)) 1 *mb*))
+       :int64)
+(check "apply-along/1d1d-vals"
+       (flat-ints (vt-apply-along-axis (lambda (r) (vt-from-sequence '(5 6) :dtype :int64)) 1 *mb*))
+       '(5 6 5 6))
+(check-true "apply-along/1d1d-no-dirty-bytes"
+            (zerop (bool-bad-bytes
+                    (vt-apply-along-axis (lambda (r) (vt-from-sequence '(5 6) :dtype :int64))
+                                         1 *mb*))))
+(check "apply-along/bool-stays-bool"
+       (vt-dtype (vt-apply-along-axis #'vt-logical-not 1 *mb*)) :bool)
+(check "apply-along/int8-keeps"
+       (vt-dtype (vt-apply-along-axis #'vt-sum 1 (vt-from-sequence '((1 2) (3 4)) :dtype :int8)))
+       :int8)
+
+;; M6. vt-vander：numpy 给 int64。保持 :bool 会让「第 3 列 = x²」与
+;;     (vt-pow b 2)（§17.10.11 定为 int64）在同一个表达式上给出两种 dtype。
+(check "vander/bool-dtype" (vt-dtype (vt-vander *jb*)) :int64)
+(check "vander/bool-vals"
+       (flat-ints (vt-vander (vt-from-sequence '(t nil t) :dtype :bool)))
+       '(1 1 1 0 0 1 1 1 1))
+(check "vander/int-unchanged"
+       (vt-dtype (vt-vander (vt-from-sequence '(1 2) :dtype :int64))) :int64)
+(check "vander/float-unchanged"
+       (vt-dtype (vt-vander (vt-from-sequence '(1.0 2.0)))) :float64)
+
 ;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)

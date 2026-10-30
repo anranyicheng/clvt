@@ -250,9 +250,18 @@
 (declaim (inline vt-broadcast-shapes))
 
 (defun vt-broadcast-shapes (shape1 shape2)
-  "计算广播后的结果形状，严格对标 NumPy（右对齐，短形状左侧补 1）。"
-  (declare (list shape1 shape2)
-           (optimize (speed 3) (safety 0)))
+  "计算广播后的结果形状，严格对标 NumPy（右对齐，短形状左侧补 1）。
+
+   参数必须是形状列表。这里**不再声明** `(list shape1 shape2)`：本函数是
+   `(safety 0)` + inline 的热路径，类型声明会让编译器把 `(length shape1)`
+   直接编成「取 car 链」——传进来一个 VT 结构体（用户把张量当成形状传，
+   是本库最常见的误用）就会读到结构体的非法槽位，实测是
+   `Unhandled memory fault at #x0`，进程直接躺下。改成运行时检查后，
+   误用拿到的是可读的错误消息，代价是每次调用两次 `listp`。"
+  (declare (optimize (speed 3) (safety 0)))
+  (unless (and (listp shape1) (listp shape2))
+    (error "vt-broadcast-shapes: 参数必须是形状列表（整数列表），收到 ~s 与 ~s"
+           shape1 shape2))
   (let* ((len1 (length shape1))
          (len2 (length shape2))
          (max-len (max len1 len2))
@@ -276,9 +285,14 @@
 (declaim (inline vt-broadcast-strides))
 
 (defun vt-broadcast-strides (orig-shape target-shape orig-strides)
-  "计算 orig-shape 广播到 target-shape 后的步长（被广播的维度步长为 0）。"
-  (declare (list orig-shape target-shape orig-strides)
-           (optimize (speed 3) (safety 0)))
+  "计算 orig-shape 广播到 target-shape 后的步长（被广播的维度步长为 0）。
+
+   与 `vt-broadcast-shapes` 同一条理由：不声明 `(list …)`，改成运行时检查。
+   原来传一个 VT 结构体进来会 `Unhandled memory fault`。"
+  (declare (optimize (speed 3) (safety 0)))
+  (unless (and (listp orig-shape) (listp target-shape) (listp orig-strides))
+    (error "vt-broadcast-strides: 参数必须是形状/步长列表，收到 ~s / ~s / ~s"
+           orig-shape target-shape orig-strides))
   (let* ((target-len (length target-shape))
          (orig-len (length orig-shape))
          (rank-diff (- target-len orig-len))
