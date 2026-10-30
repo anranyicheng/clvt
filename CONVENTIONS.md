@@ -5363,6 +5363,209 @@ vt-matmul: 收缩轴长度不匹配 —— A (4 4) 的末维 4，B (2 2) 的倒�
 | 新增断言 | `test/view-consistency-test.lisp` 3548 条（A–G 七组，其中 A 组含 1743 项逐位视图扫描） |
 | 废除 | 旧记录 D-C13「`lstsq` 的 residual 是 2-范数」（见 §16.19.6） |
 
+#### 17.10.23 `(1- dim)` 在 `dim = 0` 处是 −1，而 `offset` 是**无符号**的
+
+前三节的尺子都在问「这个合法请求算得对不对」。这里要问的是：
+**请求本身合法，但它的退化形态不合法** —— 尺寸为 0 的轴被当成了
+「尺寸为 1 的轴的近亲」。
+
+这一族缺陷有同一个形状：**第一步无条件算出的中间量，第二步被当成有效值用**。
+
+| 第一步（无条件算） | 第二步（本该先判断） | 观测到的现象 |
+|---|---|---|
+| `(1- dim)`，`dim = 0` → `-1` | `offset += s* × stride` | `offset` 变负，撞 `(unsigned-byte 44)` 类型检查 |
+| `vt-amin` / `vt-amax`（先取摘要） | histogram / softmax 的归一化 | 内部错误 `vt-AMIN: zero-size array…` 泄漏给用户 |
+| `0.5s0`（单精度字面量） | `max ± 0.5` 造箱宽 | 1e8 起 ±0.5 表示不出，三个边界退化成同一个数 |
+| `(zerop re)`（吃掉符号位） | `atan im re` 的相位分支 | `angle(-0.0+0.0i)` 给 0 而不是 π |
+
+##### 一、空轴上「翻一下」不许移动 data 指针
+
+`vt-flip` 要把视图的起点挪到末元素：`offset += (dim-1) × stride`。
+`dim = 0` 时这个式子是 `-stride`，于是**一个完全合法的请求**
+（`(vt-flip (vt-zeros '(0)))`）产出了一个 `offset = -1` 的视图。崩的地方
+不在 `vt-flip` 自己（`%make-vt` 那次检查在槽位赋值之前不会读 offset），
+而是**下一个**碰 offset 的操作：
+
+| 输入 | 修复前 | numpy | 现在 |
+|---|---|---|---|
+| `(vt-flatten (vt-flip (vt-zeros '(0))))` | `The value -1 is not of type (UNSIGNED-BYTE 44)` | `array([], dtype=float64)` | shape `(0)`，offset 0 |
+| `(vt-flatten (vt-flip (vt-zeros '(0 3))))` | `subseq` 越界 | shape `(0,)` | shape `(0)` |
+| `(vt-flatten (vt-slice (vt-zeros '(0)) '(nil nil -1)))` | 同上类型错误 | 同上 | 同上 |
+| `(vt-reshape (vt-flip (vt-zeros '(2 0 3))) '(0))` | 同上 | 同上 | 同上 |
+
+`vt-slice` 的负步长分支是同一个式子的另一个写法：`s*` 在 `dim = 0` 时被
+`(max -1 (min s (1- dim)))` 钳到 **-1**（钳位区间本身是对的，`-1` 是「空」的
+表示），但 `(s* × stride)` 一样会把 offset 推负。两处都改成「**空结果不动
+offset**」：
+
+```lisp
+;; vt-flip
+(defun %flip-shift (dim stride)
+  (declare (type fixnum dim stride))
+  (if (plusp dim) (* (1- dim) stride) 0))
+
+;; vt-slice（负步长分支）
+(when (plusp len) (incf cur-offset (the fixnum (* s* stride))))
+```
+
+> 判据不是「offset 等于多少」，而是「**空轴上没有元素可翻，任何位移都只能是 0**」。
+> 写成 `(if (zerop dim) 0 …)` 只是实现；写成「先算 `(1- dim)` 再 clip 到 0」
+> 也等价。但**不能**写成「`(1- dim)` 之后取绝对值」或「clip 到 1」——那会在
+> `dim = 1` 时也移动指针（`dim = 1` 的翻转是恒等变换，offset 必须不动）。
+
+必须逐轴一起改：`vt-flip` 的全轴分支（每个轴各加一次 `(dim-1)×stride`）
+和单轴分支（只加一次）是两条独立的加法，只修一条会在 2D 空轴上留一个半修状态。
+
+##### 二、摘要族：空集合没有 min/max，别把内部错误抛给用户
+
+`vt-histogram` 干的第一件事是 `vt-amin` / `vt-amax` 求数据范围，
+`vt-softmax` 干的第一件事是 `vt-amax` 求最大值。空输入时这两个归约**没有
+identity**（`sum` 有 0、`prod` 有 1、`max` 没有），于是抛的是内部错误：
+
+| 输入 | 修复前 | numpy | 现在 |
+|---|---|---|---|
+| `(vt-histogram (vt-zeros '(0)) :bins 3)` | `vt-AMIN: zero-size array to reduction operation minimum which has no identity` | `([0,0,0], [0, 1/3, 2/3, 1])` | 同 numpy |
+| `(vt-softmax (vt-zeros '(0 3)))` | `vt-AMAX: zero-size array…` | shape `(0,3)` 的空数组 | 同上 |
+| `(vt-log-softmax (vt-zeros '(0 3)))` | 同上 | 同上 | 同上 |
+
+> `vt-softmax` 的空输入在 v0.3.6 曾被定成「与 scipy 一致地报错」。这条要废：
+> scipy 自己也只在**归约轴长度为 0** 时报（`(0,3)` 沿 `axis=-1` 返回空），
+> 而那正是内部 `amax` 的产物，不是 softmax 的语义；本函数的文档基准是
+> PyTorch，torch 2.10 对 `(0,)` / `(0,3)` / `(3,0)` 一律返回同形状空张量。
+> 空轴上没有元素要归一化，输出就是空的 —— 与本节其余各条同一条判据。
+
+三种情形的正确回答不是「报个更好的错」，而是**算出结果**：
+空输入上「输出也为空」，所以 softmax 什么都不用算；histogram 的空采样在
+numpy 里有一条明确的规则 —— **没有数据时区间取 `[0, 1)`**
+（`_get_outer_edges` 的 `first_edge, last_edge = 0, 1`），于是箱边界是
+`linspace(0, 1, bins+1)`，计数全 0。
+
+> 「先算摘要再判断」之所以反复出问题，是因为摘要（min/max/均值）在正常输入上
+> 总是存在，写代码时不会想到它可能不存在。凡是入口出现 `vt-amin` / `vt-amax` /
+> `vt-mean`，都要问一句：**空集合走到这里会怎样**。
+
+##### 三、`0.5s0` 混进 double 计算：一个字母的精度
+
+全等值输入没有「数据范围」，numpy 的做法是**在样本值两侧各让出半个箱宽**。
+本库原来写的是 `(- val 0.5s0)` / `(+ val 0.5s0)` —— `s0` 是**单精度**字面量。
+Common Lisp 的传染规则是「取更宽的那个类型」，而 `single-float` 比
+`integer` 宽，于是 `(- 100000000 0.5s0)` 的类型是 **`SINGLE-FLOAT`**，值是
+`1.0e8` —— 整条减法在 f32 里做完了：
+
+```
+CL-USER> (list (type-of (- 100000000 0.5s0)) (- 100000000 0.5s0))
+(SINGLE-FLOAT 1.0e8)
+CL-USER> (list (type-of (- 100000000 0.5d0)) (- 100000000 0.5d0))
+(DOUBLE-FLOAT 9.99999995d7)
+```
+
+注意第二行：`0.5d0` 不只是「更精确的 0.5」，它把**整条算式的类型**提到了
+double。所以修法必须是 `0.5d0`，而不是「给 `0.5s0` 加个 `coerce`」：
+
+| `(vt-full '(5) v :dtype :int64)` | numpy 边界 | 修复前（`0.5s0`） | 现在（`0.5d0`） |
+|---|---|---|---|
+| `v = 5` | `4.5, 5.0, 5.5` | 同 | 同（逐位） |
+| `v = 1e8` | `99999999.5, 1e8, 100000000.5` | **三个都是 1e8**（f32 的 ulp 是 8） | 同 numpy |
+| `v = 1e10` | `9999999999.5, 1e10, 10000000000.5` | 三个都是 1e10 | 同 numpy |
+| `v = 1e15` | `999999999999999.5, 1e15, 1000000000000000.5` | 三个都是 1e15 | 同 numpy |
+| `v = 1e18` | 报 `Too many bins for data range` | 返回三个 1e18，样本一个都落不进箱 | 报「数据范围太小」（同 numpy 的拒绝） |
+
+1e18 那一行值得单独看：double 的 `ulp(1e18) = 128`，`±0.5` 加不上去，
+三个边界相等 → 箱宽 0 → **所有 5 个样本都落不进任何箱**，返回 `[0, 0]`。
+这是一个「形状正确、数值全错、不触发任何异常」的答案，比报错危险得多。
+
+##### 四、`zerop` 吃掉的是符号位，不是零
+
+`%carg`（`vt-angle` 的内核）原来用 `(and (zerop re) (zerop im))` 判「原点」，
+命中就返回 `(float 0 re)`。但 `(zerop -0.0)` 是真 —— 负数零也是零 ——
+于是**负实轴上的点被判成了原点**：
+
+| 输入 | numpy | 修复前 | 现在 |
+|---|---|---|---|
+| `angle(-0.0+0.0i)` | `π` | `0.0` | `π` |
+| `angle(-0.0-0.0i)` | `-π` | `0.0` | `-π` |
+| `angle(0.0-0.0i)` | `-0.0` | `0.0` | `-0.0` |
+| `angle(0.0+0.0i)` | `0.0` | `0.0` | `0.0` |
+
+四个格子只有一个是 0。判据要按**分支**写，不是按「是不是零」写：
+
+```lisp
+(cond ((not (zerop re)) (atan im re))                  ; 实部非零 → 正常算
+      ((and (floatp re) (minusp (float-sign re)))      ; 实部是 -0.0 → 负实轴
+       (if (and (floatp im) (minusp (float-sign im))) (- pi*) pi*))
+      ((floatp im) im)                                 ; 实部 +0.0 → 结果就是虚部本身
+      (t 0))
+```
+
+「结果就是虚部本身」这一条同样重要：`angle(0.0-0.0i)` 的正确答案是 `-0.0`
+而不是 `0.0`，`(atan -0.0 0.0)` 恰好给 `-0.0`，所以直接返回 `im` 就对了。
+一旦写成 `(abs im)` 或 `0.0`，符号会丢；而相位差一个符号在 `exp(iθ)`
+复现时是 180° 的差。
+
+##### 五、整型与浮点必须给出**同一组**边界
+
+`vt-histogram` 的 `range` 来自 `(- max min)`。整型输入时这个差是**精确有理数**，
+浮点输入时是 double —— 于是 `bins=3` 的边界在两条 dtype 路径上差 1 ULP：
+
+| 输入 | 浮点路径边界 | 整型路径（修复前） |
+|---|---|---|
+| `np.histogram(np.arange(5), bins=3)` | `0, 1.6666666666666665, 3.333333333333333, 5` | 差 1 ULP 的第三个边界 |
+
+修法是**先把两端 `coerce` 到 `double-float` 再做减法**（`data-min` / `data-max`
+一律 double），这样两条路径从第一步就同源。判据是逐位相等，不是 `allclose`：
+边界差 1 ULP 会让恰好落在边上的样本换箱，而 `np.histogram` 的入箱规则是
+**左闭右开**（最后一个箱右闭），一个 ULP 就是「进/不进」的区别。
+
+##### 六、`weights` 与 `density` 的契约是 numpy 的三条规则
+
+补 `:weights` 不是「多一个参数」，是把 numpy 的三条隐式规则一起搬过来：
+
+| 规则 | numpy | 违反后的表现 |
+|---|---|---|
+| 权重形状必须与输入**完全相同** | `ValueError: weights should have the same shape as a` | 按展平后配对 → 2D 输入静默错配 |
+| 计数 dtype 跟权重走 | 整型/布尔权重 → `int64`，浮点 → `float64` | 一律 `float64`，`int64` 调用方拿到 5.0 而不是 5 |
+| 复数权重 | `TypeError`（不能 cast 到 float64） | 「出于好意」实现成 complex128 → 给出 numpy 给不出的答案 |
+
+`density` 有两条独立的规则，容易只做对一条：
+
+1. **总计为 0 → 全 NaN**（`0/0`），不是全 0；权重全零同样算「没有数据」；
+2. 归一化用**逐箱宽度**，不是平均宽度。`bins=[0,1,2,3,10]` 时最后一箱宽 7，
+   密度 `1/3` 与 `1/21` 相差 7 倍 —— 用平均宽度会让密度之和 ≠ 1。
+
+##### 七、同一个错误输入，两条 dtype 路径必须都报错（续 §17.10.22 第六条）
+
+`vt-convolve` / `vt-correlate` 的空序列校验写在**实数分支**里，而入口的
+第一行是 `(when (%cx-any-p a v) (return-from vt-correlate …))` —— 复数在到达
+校验之前就分流走了：
+
+| 输入 | 实数路径 | 复数路径（修复前） |
+|---|---|---|
+| `(vt-convolve (vt-zeros '(0)) (vt-ones '(1)))` | 报 `vt-convolve: a 不能为空` | **不报错**，返回空 `complex128` |
+| `(vt-convolve (vt-ones '(1)) (vt-zeros '(0) :dtype :complex128))` | 同上 | 返回空 `complex128` |
+
+修法与 §17.10.22 第六条一致：校验放在**两条路径都会经过的位置**
+（`%cx-correlate` 的入口），且函数名按 `same-anchor` 区分 ——
+`vt-convolve` 传 `:same-anchor :a`，否则错误消息会把 `vt-convolve` 的错
+写成 `vt-correlate`。
+
+##### 八、错误消息的主语必须是函数自己
+
+同一轮扫出的三处「没有前缀」的消息：`vt-pad` 的 `无法用 mode …`、
+`vt-gradient` 的 `轴 0 长度 0 太小…`（原为内部 `(error "长度太小")`）、
+`vt-histogram` 的 `bins` 参数校验。判据见 §17.10.21 第五条：
+**函数名 + 实际值 + 期望**。`vt-gradient` 那条还额外说明了「至少要多长」——
+因为 1 个点的梯度不是「参数非法」，是「数学上没有定义」。
+
+##### 九、本节的检查口径
+
+| 项 | 结果 |
+|---|---|
+| 换轴 | 空轴（1D/2D/3D × 每条轴）、全等值 × 5 个量级、`±0` 的四种组合、整型 vs 浮点的边界、`(±0, ±0)` 相位 |
+| 修复 | 6 组代码点（`vt-flip`、`vt-slice` 负步长、`vt-histogram` 空/全等值/整型/weights/density、`%carg`、`vt-softmax`/`vt-log-softmax` 空输入、复数 `correlate` 空序列） |
+| 顺带 | `vt-pad` 两处消息前缀、`vt-gradient` 过短轴消息、浮点 `bins` 显式拒绝 |
+| 旁证（零缺陷） | npy 往返 21 个文件（13 个与 `np.save` 逐字节相同）、扩展模块差分 74 项、空输入全库扫描 60 项、实/复对拍 82 项、特殊值 53 项（inf/nan/±0/溢出，全部与 numpy 逐位一致）、`:out` 硬契约 26 项 |
+| 新增断言 | `test/empty-axis-binning-test.lisp` 255 条（A–J 十组） |
+
 ---
 
 ## 附录 C：实测缺陷复现脚本
