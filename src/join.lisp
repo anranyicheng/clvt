@@ -283,6 +283,41 @@ axis 给定：两者秩必须一致，且除 axis 外各维度必须相等，
 ;;; 插入
 ;;; ------------------------------------------------------------------
 
+(defun %bool-mask-positions (mask limit caller)
+  "把 `:bool` 张量按 numpy 的**掩码**语义转成位置列表（升序）。
+
+  numpy 对「位置参数」（positions / obj）有两套并存语义，按 dtype 分叉
+  （CONVENTIONS §17.10.14）：
+
+    · 掩码：`delete` / `insert` / `place` —— 布尔数组逐元素表示
+      「这一位要不要动」，长度必须等于被索引轴的长度；
+    · 索引：`take` / `put` / `choose` / `bincount` —— 布尔数组被当作
+      0/1 整数索引，长度任意。
+
+  这是 numpy 里极少数**按 dtype 而非值**分叉的地方：同样的 `#(1 0 1 1)`，
+  `:uint8` 走索引、`:bool` 走掩码。本库原先两处都走索引，导致移植代码
+  `np.delete(a, a > 3)` 落到索引语义上**静默删错元素**（`(0 1 2 3)` 配
+  `(T NIL T T)` 得 `(2 3)`，numpy 得 `(1)`）。
+
+  MASK 必须一维且长度等于 LIMIT（numpy 同样限制，消息也照抄其措辞）。"
+  (unless (= 1 (length (vt-shape mask)))
+    (error "~a: 布尔位置参数必须是一维且长度与被索引轴一致，收到形状 ~a"
+           caller (vt-shape mask)))
+  (let ((n (vt-size mask)))
+    (unless (= n limit)
+      (error "~a: 布尔位置参数长度 ~a 与被索引轴长度 ~a 不一致"
+             caller n limit))
+    (let* ((flat (vt-flatten mask))
+           (data (vt-data flat))
+           (off (vt-offset flat))
+           (acc '()))
+      ;; 倒序 collect 再 push，结果天然升序，%kept-runs-for 与
+      ;; %insert-flat 都要求按位置升序处理。
+      (loop for i downfrom (1- n) to 0
+            when (/= 0 (aref data (+ off i)))
+              do (push i acc))
+      acc)))
+
 (declaim (inline %insert-norm-pos))
 
 (defun %insert-norm-pos (raw size)
@@ -459,7 +494,16 @@ NaN/Inf：纯数据搬运，逐位保留。
                            ((vt-p positions) (null (vt-shape positions)))
                            (t nil)))
          (insertions
-           (cond ((vt-p positions)
+           (cond ((and (vt-p positions) (eq (vt-dtype positions) :bool))
+                  ;; §17.10.14：布尔位置参数是掩码，不是 0/1 索引
+                  (%bool-mask-positions positions
+                                        (if axis
+                                            (nth (vt-normalize-axis
+                                                  axis (length (vt-shape tensor-vt)))
+                                                 (vt-shape tensor-vt))
+                                            (vt-size tensor-vt))
+                                        "vt-insert"))
+                 ((vt-p positions)
                   (%check-integer-index "vt-insert 的 positions" positions)
                   (let ((flat (vt-flatten positions)))
                     (loop for i below (vt-size flat)
@@ -620,7 +664,14 @@ NaN/Inf：纯数据搬运，逐位保留。
          (rank (length shape))
          (dtype (vt-dtype tensor-vt))
          (positions-list
-           (cond ((vt-p positions)
+           (cond ((and (vt-p positions) (eq (vt-dtype positions) :bool))
+                  ;; §17.10.14：布尔位置参数是掩码，不是 0/1 索引
+                  (%bool-mask-positions positions
+                                        (if axis
+                                            (nth (vt-normalize-axis axis rank) shape)
+                                            (vt-size tensor-vt))
+                                        "vt-delete"))
+                 ((vt-p positions)
                   (let ((flat (vt-flatten positions)))
                     (loop for i below (vt-size flat)
                           collect (truncate (aref (vt-data flat) i)))))

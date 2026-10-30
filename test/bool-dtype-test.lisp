@@ -905,6 +905,90 @@
        (vt-dtype (vt-vander (vt-from-sequence '(1.0 2.0)))) :float64)
 
 ;;; ==================================================================
+;;; N 组（第六遍，CONVENTIONS §17.10.14）：布尔当「位置参数」的两分法
+;;; ==================================================================
+;;; numpy 对 positions / obj 参数有两套并存语义，且**按 dtype 而非值**分叉：
+;;;   · 掩码：delete / insert / place —— 逐元素表示「这一位动不动」，
+;;;           长度必须等于被索引轴的长度；
+;;;   · 索引：take / put / choose / bincount —— 当 0/1 整数索引，长度任意。
+;;; 同样一份 #(1 0 1 1)，:uint8 走索引、:bool 走掩码，这是 numpy 里极少数
+;;; 按 dtype 分叉的地方。本库原先 delete/insert 对两者都当索引，
+;;; `np.delete(a, a > 3)` 的移植代码会**静默删错元素**。
+
+(defparameter *na* (vt-from-sequence '(0 1 2 3) :dtype :int64))
+(defparameter *nm* (vt-from-sequence '(t nil t t) :dtype :bool))
+(defparameter *na2* (vt-from-sequence '((0 1 2) (3 4 5)) :dtype :int64))
+
+(format t "~&== N. 布尔当位置参数（掩码 vs 索引）==~%")
+
+;; N1. delete：bool 是掩码
+(check "delete/mask-1d" (flat-ints (vt-delete *na* *nm*)) '(1))
+(check "delete/mask-all-true"
+       (flat-ints (vt-delete *na* (vt-from-sequence '(t t t t) :dtype :bool))) '())
+(check "delete/mask-all-false"
+       (flat-ints (vt-delete *na* (vt-from-sequence '(nil nil nil nil) :dtype :bool)))
+       '(0 1 2 3))
+(check "delete/mask-flat"
+       (flat-ints (vt-delete *na2* (vt-from-sequence '(t t nil nil nil t) :dtype :bool)))
+       '(2 3 4))
+(check "delete/mask-axis0-shape"
+       (vt-shape (vt-delete *na2* (vt-from-sequence '(t nil) :dtype :bool) :axis 0)) '(1 3))
+(check "delete/mask-axis0-vals"
+       (flat-ints (vt-delete *na2* (vt-from-sequence '(t nil) :dtype :bool) :axis 0))
+       '(3 4 5))
+(check "delete/mask-axis1-vals"
+       (flat-ints (vt-delete *na2* (vt-from-sequence '(t nil t) :dtype :bool) :axis 1))
+       '(1 4))
+;; uint8 仍走索引 —— 同一个值序列，两种 dtype 两种语义
+(check "delete/uint8-still-index"
+       (flat-ints (vt-delete *na* (vt-from-sequence '(1 0 1 1) :dtype :uint8))) '(2 3))
+(check "delete/int-list" (flat-ints (vt-delete *na* '(1 3))) '(0 2))
+;; 掩码形状校验（numpy 同样报 "must be one dimensional and match the axis length"）
+(check-errors "delete/mask-len-mismatch"
+              (vt-delete *na* (vt-from-sequence '(t nil) :dtype :bool)))
+(check-errors "delete/mask-2d"
+              (vt-delete *na* (vt-from-sequence '((t nil t t)) :dtype :bool)))
+(check-errors "delete/mask-0d" (vt-delete *na* (vt-all *nm*)))
+;; 结果字节卫生（掩码路径不能绕过 %bool-flag）
+(check-true "delete/mask-bytes"
+            (let ((r (vt-delete (vt-from-sequence '(t t nil t) :dtype :bool) *nm*)))
+              (and (eq (vt-dtype r) :bool) (bool-bytes-ok-p r))))
+
+;; N2. insert：同一个两分法（True 位置之前插入）
+(check "insert/mask-1d" (flat-ints (vt-insert *na* *nm* 9)) '(9 0 1 9 2 9 3))
+(check "insert/mask-all-false"
+       (flat-ints (vt-insert *na* (vt-from-sequence '(nil nil nil nil) :dtype :bool) 9))
+       '(0 1 2 3))
+(check "insert/mask-axis0"
+       (flat-ints (vt-insert *na2* (vt-from-sequence '(t nil) :dtype :bool) 9 :axis 0))
+       '(9 9 9 0 1 2 3 4 5))
+(check "insert/uint8-still-index"
+       (flat-ints (vt-insert *na* (vt-from-sequence '(1 0 1 1) :dtype :uint8) 9))
+       '(9 0 9 9 9 1 2 3))
+(check "insert/int-scalar" (flat-ints (vt-insert *na* 1 9)) '(0 9 1 2 3))
+(check-errors "insert/mask-len-mismatch"
+              (vt-insert *na* (vt-from-sequence '(t nil) :dtype :bool) 9))
+(check-errors "insert/mask-2d"
+              (vt-insert *na* (vt-from-sequence '((t nil t t)) :dtype :bool) 9))
+
+;; N3. 索引侧的三个入口维持旧语义（不能被这一轮带偏）
+(check "take/bool-index" (flat-ints (vt-take *na* *nm*)) '(1 0 1 1))
+(check "bincount/bool-index" (flat-ints (vt-bincount *nm*)) '(1 3))
+(check "compress/bool-mask" (flat-ints (vt-compress *nm* *na*)) '(0 2 3))
+
+;; N4. 按区间采样的构造函数：linspace/logspace/geomspace 三者都收 :dtype :bool
+;;     （geomspace 原先白名单漏了 bool，是三者里唯一拒绝的）
+(check "geomspace/bool-dtype" (vt-dtype (vt-geomspace 1 8 3 :dtype :bool)) :bool)
+(check "geomspace/bool-vals" (flat-ints (vt-geomspace 1 8 3 :dtype :bool)) '(1 1 1))
+(check "geomspace/bool-half" (flat-ints (vt-geomspace 0.5d0 2 3 :dtype :bool)) '(1 1 1))
+(check "linspace/bool-vals" (flat-ints (vt-linspace 0 1 5 :dtype :bool)) '(0 1 1 1 1))
+(check "logspace/bool-vals" (flat-ints (vt-logspace 0 2 3 :dtype :bool)) '(1 1 1))
+(check "geomspace/int-unchanged"
+       (flat-ints (vt-geomspace 1 1000 4 :dtype :int64)) '(1 10 100 1000))
+(check "geomspace/float-unchanged"
+       (vt-dtype (vt-geomspace 1 1000 4)) :float64)
+
+;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)
 (when (plusp *fail*) (sb-ext:exit :code 1))

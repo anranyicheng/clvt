@@ -62,6 +62,11 @@
        :float64 / :float32 → 浮点返回
        整型（:int64/:int32/:int16/:int8/:uint8/:uint16）
                           → 走 vt-astype，NumPy 截断/回绕语义
+       :bool              → 非零为真（vt-astype 真值化；numpy 的
+                            np.geomspace(…, dtype=bool) 同样是 != 0）。
+                            §17.10.14 之前这里**唯一**拒绝 bool 的
+                            「按区间采样」构造函数，与 vt-linspace /
+                            vt-logspace 不一致（那两个一直支持）。
 
    示例：
      (vt-geomspace 1 1000 4)               => [1.0, 10.0, 100.0, 1000.0] (float64)
@@ -76,7 +81,7 @@
   ;; dtype 合法性校验：整型或浮点，其他非法
   (unless (member dtype '(:float64 :float32
                           :int64 :int32 :int16 :int8
-                          :uint8 :uint16))
+                          :uint8 :uint16 :bool))
     (error "vt-geomspace: 不支持的 dtype ~a" dtype))
   (let ((s (coerce start 'double-float))
         (e (coerce stop  'double-float)))

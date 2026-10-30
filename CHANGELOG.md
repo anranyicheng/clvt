@@ -4,6 +4,64 @@
 
 ---
 
+## 2026-10-30（四十）— fix: 布尔当「位置参数」的两分法（delete/insert 掩码）+ geomspace 收 bool
+
+> 契约见 `CONVENTIONS.md` §17.10.14；决策过程见 `HISTORY.md` H.3.33。
+> 这一轮换到前五轮没碰过的一侧：前五轮问的都是动词（算、传、返、比、读），
+> 这一轮问名词 —— 布尔张量**从哪造出来**、被放在**位置参数**上是什么含义。
+
+**破坏性变更（三处）**：
+
+| 表达式 | 修复前 | 现在 | numpy |
+|---|---|---|---|
+| `(vt-delete #(0 1 2 3) #(T NIL T T))` | `(2 3)`（当索引，删掉 0 和 1） | `(1)`（掩码） | `[1]` |
+| `(vt-insert #(0 1 2 3) #(T NIL T T) 9)` | `(9 0 9 9 9 1 2 3)`（插 4 次） | `(9 0 1 9 2 9 3)` | 同 |
+| `(vt-geomspace 1 8 3 :dtype :bool)` | 报「不支持的 dtype BOOL」 | `:bool` `(T T T)` | `[True True True]` |
+
+**根因一：`%check-integer-index` 只校验「是不是整数」，而 `:bool` 的底层
+类型就是 `(unsigned-byte 8)`**。于是布尔张量一路畅通地走了整数索引路径，
+把掩码当成了「要删哪些下标」。危险不在结果错，而在**静默** ——
+`np.delete(a, a > 3)` 是 numpy 最常见写法之一，移植过来不报错，只会删掉
+一批完全不相干的元素。
+
+numpy 对 `positions` / `obj` 参数有**两套并存语义，且按 dtype 而非按值
+分叉**。同一份 `#(1 0 1 1)`，`:uint8` 走索引、`:bool` 走掩码：
+
+| 走掩码（长度必须等于轴长） | 走索引（长度任意） |
+|---|---|
+| `delete` / `insert` / `place` / `putmask` / `compress` / `extract` | `take` / `put` / `choose` / `bincount` / `searchsorted` / `digitize` |
+
+本库在索引侧全对，在掩码侧错了两个。修法是按 dtype 显式分叉
+（`%BOOL-MASK-POSITIONS`），不是给 `:bool` 打个「也当索引」的补丁。
+掩码形状不合规时报错（照抄 numpy 的措辞：必须一维且长度与被索引轴一致）：
+`(vt-delete a #(T NIL))`、二维掩码、0 维掩码都拒绝。
+
+**根因二（漏网）**：三处「按区间采样」的构造函数里，`linspace` /
+`logspace` 一直支持 `:dtype :bool`（走 `vt-astype` 真值化），`geomspace`
+的白名单漏了 `:bool`。同族三个入口两种行为。
+
+**这一轮同时核实完的（第五遍的抽样结论）**：上一轮 1250 次机械调用里
+685 条报错，当时用「参数语义不匹配」一句带过。这一轮补上 int64 /
+float64 基线做三元对比，逐条核实：7 个「bool 挂 + 基线通」全部是减法族
+（`vt--`/`negative`/`ptp`/`ediff1d`/`gradient`/`softmax`/`log-softmax`）的
+刻意拒绝；「bool 通 + 基线报错」0 个；脏字节（dtype BOOL 但字节 ∉{0,1}）
+**0 个**（1296 次调用）。
+
+**确认无事的**：构造函数全族 19 个入口（含 `full` 的 `2`/`0.5`/`T`/`NIL`
+四种值、`eye :k`、三个 `-like`、`meshgrid`）dtype 与字节全对；打印层四条
+路径都渲染 `T`/`NIL`（二维对齐、0 维单个）；`(0,)`/`(3 0)`/`(0 0)` 空布尔
+在 `sum`/`reshape`/`concatenate`/`vstack` 正常、空归约报 numpy 同款错误；
+`gcd`/`lcm` 拒绝 bool 与 numpy 一致。
+
+**偏差（记入 §17.10.14）**：`vt-empty`/`vt-empty-like` 给 0，numpy 给
+未初始化内存（本库更安全）；`vt-arange :dtype :bool` 给结果，numpy 报错
+（签名本就不同族）。
+
+**验收**：`bool-dtype-test` 491 断言全过（新增 N 组 30 条）；65 套件全绿
+（严格模式）；`check_docs.py` 223 锚点全解析；编译零 WARNING。
+
+---
+
 ## 2026-10-30（三十九）— fix: 布尔「被消费」的六个入口（倒数 / 整除 / 峰谷差 / 形状工具 / along-axis / vander）
 
 > 契约见 `CONVENTIONS.md` §17.10.13；决策过程见 `HISTORY.md` H.3.32。
