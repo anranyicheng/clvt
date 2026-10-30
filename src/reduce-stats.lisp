@@ -3186,6 +3186,17 @@
   `[1 0 2 2 1 2 1]`，numpy 给 `[T F T T T T T]`。这与上一轮修的
   `matmul`／`dot`／`einsum` 是同一族缺陷（布尔代数被当成数值和），
   当时只扫了矩阵乘法家族，漏了信号处理这两个入口。"
+  ;; 秩检查必须在两条 dtype 路径**之前**（§17.10.24）：numpy 的
+  ;; convolve/correlate 只接受 1 维，2 维输入报
+  ;; `object too deep for desired array`。本库原来对两个参数都做
+  ;; VT-FLATTEN，于是一个 (2 3)×(2 2) 的「二维卷积」会静默变成 9 元素的
+  ;; 一维卷积、返回长度 9 的一维结果 —— 形状和语义都不是调用方要的，
+  ;; 而卷积是 NN 里最容易「以为自己在做二维」的地方。
+  (let ((name (if (eq same-anchor :v) "vt-correlate" "vt-convolve")))
+    (dolist (pair (list (cons "a" a) (cons "v" v)))
+      (when (> (length (vt-shape (ensure-vt (cdr pair)))) 1)
+        (error "~a: ~a 必须是 1 维（numpy 同样拒绝多维：object too deep for desired array）"
+               name (car pair)))))
   (when (%cx-any-p a v)
     (return-from vt-correlate
       (%cx-op-correlate a v :mode mode :same-anchor same-anchor)))

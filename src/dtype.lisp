@@ -27,6 +27,19 @@
    `:bool` 与 `:uint8` 共用 `(unsigned-byte 8)` 物理存储（见 §17）：
    布尔值以 0/1 承载，1 字节，与 numpy 的 `bool_` 尺寸一致。"
   (declare (optimize (speed 3) (safety 0)))
+  ;; :uint32 / :uint64 是**保留符号**（VT-UNSIGNED-DTYPE-OF-WIDTH 会返回它们，
+  ;; npy 的 <u4/<u8 也能映射到它们），但执行层从未实现 —— 它们不在
+  ;; *VT-DTYPES* 的 11 种里，没有内核、没有 astype、没有存储类型。
+  ;; 此前它们一路落到下面的 ECASE 上，抛出的是
+  ;;   ":UINT64 fell through ECASE expression. Wanted one of (:COMPLEX128 …)"
+  ;; 这是把「函数没有这个分支」直接倒给用户（§17.10.24）：既没有函数名，
+  ;; 也没说该怎么绕过。判据是「是不是本库的逻辑 dtype」，在入口一次说清。
+  (unless (member dtype *vt-dtypes*)
+    (error "dtype ~s 不是本库的逻辑 dtype。~@[保留符号 ~a 尚未实现（numpy 有该类型），请改用 :int64 或 :float64。~]~
+合法取值：~{~a~^ ~}"
+           dtype
+           (and (member dtype '(:uint32 :uint64)) (string-downcase (symbol-name dtype)))
+           *vt-dtypes*))
   (ecase dtype
     (:complex128 '(complex double-float))
     (:complex64  '(complex single-float))

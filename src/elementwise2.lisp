@@ -424,9 +424,13 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
     (error "vt-hypot: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (let* ((v1 (ensure-vt t1))
          (v2 (ensure-vt t2))
-         (dt (or dtype (if (or (eq (vt-dtype v1) :float32)
-                               (eq (vt-dtype v2) :float32))
-                           :float32 :float64))))
+         ;; 结果 dtype 按**混型提升表**走，不是「任一输入是 f32 就降 f32」：
+         ;; float64 与 float32 混算时 numpy 给 float64（§17.10.24）。原写法
+         ;; 会让 (vt-hypot f64 f32) 静默降到 f32，6 位有效数字直接丢在
+         ;; 一个「本该最稳」的函数上；整数输入（提升结果不是浮点）才落 f64。
+         (dt (or dtype
+                 (let ((p (vt-promote-type (vt-dtype v1) (vt-dtype v2))))
+                   (if (member p '(:float32 :float64)) p :float64)))))
     (if (eq dt :float32)
         (vt-fast-map #'%hypot-sf v1 v2 :out out :dtype dt)
         (vt-fast-map #'%hypot-df v1 v2 :out out :dtype dt))))
