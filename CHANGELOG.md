@@ -4,6 +4,69 @@
 
 ---
 
+## 2026-10-30（四十六）— fix: 差分模糊测试（约 1800 条随机用例）挖出的九类缺陷 —— 结果秩由数值决定、轴元组全线缺失、两种参数形态只写了一种
+
+这一遍的尺子不挑对象：**差分模糊测试**。Lisp 侧 `vt-save :as :npy` 落盘、
+Python 侧 `np.load` 逐位比对，八个功能域（归约/操纵/算术/线代/边界/复数/
+布尔/杂项）共约 1800 条随机用例。撞出的缺陷有同一个形状：**返回形状由某个
+具体数值决定**（右端项个数、参数是不是标量），或者**一个参数有两种合法形态，
+实现只写了一种**（轴元组、边界序列、分位点序列、张量位移）。
+
+**破坏性变更（`vt-ptp` 的返回值从 Lisp 数变成 0 维张量）**：
+
+- `(vt-ptp a)` 原先返回 Lisp 标量，与同族的 `vt-amax`/`vt-amin`/`vt-sum`
+  不一致（它们都返回 vt），也让 `:keepdims` 无处可放 —— 参数加了也没语义。
+  现在恒走 `vt--`，全归约给 0 维张量（§6.5）。要标量请 `(vt-item …)`。
+  同批修掉：`vt-ptp` 新增 `:keepdims`；布尔输入的两个分支现在报**同一条**
+  消息（此前 `:axis` 分支报「布尔减法未定义」，非 axis 分支把 `T` 丢进 `-`
+  报「T is not of type NUMBER」）。
+- `(vt-solve A b)` / `(vt-inv A)` 的结果秩改由**输入的秩**决定。
+  `b` 形状 `(n,1)` 时不再被压成 `(n)`；1×1 方程组的 `vt-inv` 返回
+  `(1 1)` 而不是 `(1)`（对标 `np.linalg.solve` / `np.linalg.inv`）。
+  判据从 `(= nrhs 1)` 改成 `b-vector-p`：**用「某维度是否等于 1」代替
+  「秩是几」永远会错**，因为 1 是合法维度。
+
+**API 补齐（此前报「必须为正整数 / 必须为实数 / not of type」的地方）**：
+
+- `vt-median` / `vt-nanmedian`：`:axis` 支持**轴元组**（`'(0 1)`、负轴、
+  任意顺序）。此前 `(vt-median a :axis '(0 1))` 抛
+  `The value (0 1) is not of type …`，而 `vt-sum`/`vt-mean`/`vt-amax` 一族
+  早就支持 —— 属「同族不同能力」。
+- `vt-percentile` / `vt-quantile`：`:axis` 同样支持轴元组；且**轴元组 ×
+  分位点序列**可同时使用（先按分位点堆叠新首轴，再折轴），
+  `(vt-percentile a '(10 90) :axis '(0 1))` 给 `(2 4)`，与 numpy 同形。
+- `vt-percentile` / `vt-quantile`：`percentile` / `q` 支持**序列**，
+  沿新首轴堆叠（`(vt-percentile a '(25 50 75))` → shape `(3)`）。
+- `vt-histogram`：`:bins` 支持**边界序列**（≥2 且严格递增），counts 长
+  `n-1`，`[e0, e_{n-1}]` 之外的值不计入，桶定位等价
+  `searchsorted(side='right')-1`。此前只认正整数，序列报「必须为正整数」。
+  同批修掉：`NaN` 会从两侧过滤里漏过去（`NaN` 与任何数的 `<`/`>` 都是假），
+  一路落进**最后一个箱** —— numpy 是丢弃。
+- `vt-left-shift` / `vt-right-shift`：第二操作数可以是**张量**（逐元素 +
+  广播）。此前报 `not of type INTEGER`，numpy 支持。dtype 按混型规则提升
+  （`uint8 << int64张量` → `int64`，而 `uint8 << 1` 仍是 `uint8`）。
+- `vt-nanmedian`：全局归约 + `:keepdims t` 返回全 1 形状（原先返回 0 维，
+  与 `vt-median` 的 `(1 1)` 不一致）。
+
+**清理**：`src/nn.lisp` 9 处 + `src/reduce-stats.lisp` 1 处的 `%cx-reject`
+守卫各被粘贴成两份（第一份是死代码，缩进顶格）。只留一份，行为不变。
+
+**连带修正的既有断言**（它们把旧缺陷写成了期望）：`bool-dtype-test` 的
+`ptp/int-unchanged`（原先断言返回 Lisp 标量 8.0d0）、
+`linalg-fast-path-test` 的 `ref/solve-general3` 与 `numpy/solve-general3`
+（原先靠 `(vt-to-list <(3,1) 结果>)` 得 `(5.75 -5.5 2.75)` 的假象）、
+`example/example.lisp` 的 `(assert (= (vt-ptp a) 4.0d0))`。
+
+**新增套件**：`test/reduce-shape-axis-test.lisp` 145 条断言（A–I 九组：
+solve 秩 / ptp / nanmedian keepdims / median 多轴 / percentile 多轴×序列 /
+位移张量 / histogram 边界 / 复数守卫去重 / 多轴归约族形状一致性交叉网）。
+期望值全部 numpy 2.4.6 实测。
+
+**文档**：`CONVENTIONS.md` 新增 §17.10.20（形状、轴元组、序列参数是三件
+独立的事），并把「序列 `q` 尚未实现」从 §17.10.18 的偏差表里移出。
+
+---
+
 ## 2026-10-30（四十五）— fix: 第十一遍审计（最后一轮，换轴：docstring 示例）—— 打印层三条规则、含 NaN 的复数打印崩溃、`(vector #c)` 丢虚部
 
 这一遍的尺子不是 numpy，而是**每个 docstring 里写着 `=>` 的那一行**。
