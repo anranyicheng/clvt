@@ -1141,11 +1141,17 @@
 (defun %e3-cumulative-skip-nan (tensor op init-val &key axis dtype out op-name)
   "NaN 感知的累积原语：沿 AXIS 累积 OP，遇到 NaN 时跳过（不改变累积值），
    但输出的该位置仍写入当前累积值（对标 numpy.nancumsum/nancumprod）。
-   AXIS 为 nil 时展平。init-val 为累积初值（0 / 1）。"
+   AXIS 为 nil 时展平。init-val 为累积初值（0 / 1）。
+
+   结果 dtype 与 `VT-CUMSUM` / `VT-CUMPROD` 共用一张提升表
+   （`%CUMULATIVE-RESULT-DTYPE`）。§17.10.12：这里原先是
+   `(or dtype (vt-dtype input))`，同族里只漏了这一处 —— `nancumsum`
+   对 bool 返回 `:bool` 且把计数 2/3 写进 `(unsigned-byte 8)`
+   （脏字节），对 int8/uint8/int16 则静默回绕（`#(100 100)` → -56）。"
   (with-float-safe
    (let* ((input (ensure-vt tensor))
           (shape (vt-shape input))
-          (final-dtype (or dtype (vt-dtype input)))
+          (final-dtype (%cumulative-result-dtype input dtype))
           (result (if out
                      (vt-check-out out shape final-dtype :op-name op-name)
                      (vt-zeros shape :dtype final-dtype)))

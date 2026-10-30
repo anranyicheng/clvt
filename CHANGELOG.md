@@ -4,6 +4,60 @@
 
 ---
 
+## 2026-10-30（三十八）— fix: 累积提升表与「标量 → 布尔」的两处不一致
+
+> 契约见 `CONVENTIONS.md` §17.10.12；决策过程见 `HISTORY.md` H.3.31。
+> 这一轮不测新函数，只把**同一族的两个实现**和**同一语义的两个入口**
+> 并排比较。
+
+**破坏性变更（一处，bool 与窄整型都受影响）**：
+
+| 表达式 | 修复前 | 现在 | numpy |
+|---|---|---|---|
+| `(vt-nancumsum b)` | `:bool`，物理字节 **2** | `:int64` `[1 2 2 2]` | `int64` |
+| `(vt-nancumsum #(100 100) :dtype :int8)` | `:int8` **`[100 -56]`**（回绕） | `:int64` `[100 200]` | `int64` |
+| `(vt-nancumsum #(200 200) :dtype :uint8)` | `:uint8` **`[200 144]`** | `:int64` `[200 400]` | `uint64` |
+| `(vt-nancumsum #(30000 30000) :dtype :int16)` | `:int16` **`[30000 -5536]`** | `:int64` `[30000 60000]` | `int64` |
+| `(vt-nancumprod #(100 100) :dtype :int8)` | `:int8` **`[100 16]`** | `:int64` `[100 10000]` | `int64` |
+
+根因：`vt-cumsum`/`vt-cumprod` 走 `%VT-CUMULATIVE`，里面有一张
+`:bool :int8 :uint8 :int16 :uint16 :int32 → :int64` 的提升表；
+`vt-nancumsum`/`vt-nancumprod` 走另一条内核 `%E3-CUMULATIVE-SKIP-NAN`，
+那里只有 `(or dtype (vt-dtype input))`。同一判据两条内核给不同答案。
+修法是把表抽成 `%CUMULATIVE-RESULT-DTYPE` 共用，而不是给 bool 单打补丁。
+
+**修好的「同一个值、五个入口、四个答案」**：
+
+| 入口 | 修复前 `(… #C(0 1) …)` | 现在 |
+|---|---|---|
+| `(vt-cast #C(0 1) :bool)` | `0` | `1` |
+| `(vt-write x '(0) #C(0 1))` | `0` | `1` |
+| `(vt-put x '(0) (list #C(0 1)))` | `0` | `1` |
+| `(vt-fill x #C(0 1))` | `0` | `1` |
+| `(vt-pad … :constant-values #C(0 1))` | `0` | `1` |
+| `(setf (vt-ref x 0) #C(0 1))` | `1`（唯一正确的） | `1` |
+
+`vt-cast` 原先「先剥虚部、再判 `:bool`」，于是 `#C(0 1)` 变成 `0`；
+而 `%BOOL-FLAG` 的契约是「复数任一分量非零即为真」。把 `:bool` 分支
+提到剥虚部之前，标量路径重新服从同一个定义。
+
+**文档更正（不改行为）**：§17.10.11 曾写「`np.percentile(bool)` 报错，
+clvt 报错是对的」。实测 clvt **不报错**且给出正确值（`1.0d0`）。
+numpy 抛错只是因为它内部要算 `hi - lo`；本库在 float64 缓冲上取位，
+没有理由为了对齐实现细节去拒绝一个算对的答案。契约已在 §17.10.12 写明：
+`median`/`percentile`/`quantile` 对 bool 返回 `float64`（有意偏差），
+`ptp`/`gradient`/`ediff1d` 报错（语义本身就是减法）。
+
+**这一轮同时确认无误的**（记在 §17.10.12，免得下次重做）：归约器的
+`:axis`/`:keepdims`/`:axis '(0 2)`/`:axis '()` 全矩阵；`bool ⊗
+{int8,int64,float32,float64}` 与 `concatenate`/`stack`/`where` 的提升表；
+42 个算子 × 8 种布局的 352 次布局不变性；npy（`|b1`）与 `:lisp` 的往返。
+
+**验收**：`bool-dtype-test` 432 断言全过（新增 L 组 22 条）；65 套件全绿
+（严格模式）；`check_docs.py` 221 锚点全解析；编译零 WARNING。
+
+---
+
 ## 2026-10-30（三十七）— fix(bool): 第三遍审计（换轴：结果 dtype 与物理字节）
 
 > 契约见 `CONVENTIONS.md` §17.10.10 / §17.10.11；决策过程见 `HISTORY.md` H.3.30。

@@ -4164,6 +4164,96 @@ numpy 的 bool 减法按位回绕：`True-False = 1`、`False-True = -1`，落�
 > 第三遍问「类型宣不宣称得住」（dtype 断言 + 字节不变量）。**
 > 同一批代码在三遍里各暴露不同的一部分，交集很小。
 
+#### 17.10.12 第四遍：不问「这个函数对不对」，只问「同族/同义的两处是否一致」
+
+前三遍都是**逐个函数**问「它算得对不对」。第四遍换了提问方式：不问单个
+函数，只找**成对的东西**——同一族里走了两条内核的，和同一个语义有两个入口
+的。前提是前三遍留下的一个观察：bool 的缺陷几乎从不出现在「只有一处实现」
+的地方，而总是出现在「这里改了、那里没改」的接缝上（§17.10.11 的
+`vt-rem` 就是），所以成对比较比逐函数穷举更省力，也更容易命中。
+
+| 对 | 一侧 | 另一侧 | 结果 |
+|---|---|---|---|
+| 累积族 | `vt-cumsum` / `vt-cumprod` | `vt-nancumsum` / `vt-nancumprod` | **不一致**（下面第 1 条） |
+| 布尔真值判定 | `vt-astype` 数组路径 / `(setf vt-ref)` / `%bool-flag` | `vt-cast` 标量路径 | **不一致**（下面第 2 条） |
+| 缩并族 | `vt-matmul` 家族（§17.10.6） | `vt-trace` / `vt-vdot` / `vt-kron` / `vt-matrix-power` / `vt-multi-dot` | 一致 |
+| 提升族 | `vt-add` 系列 | `vt-concatenate` / `vt-stack` / `vt-where` | 一致 |
+| 布局 | 连续视图 | 转置 / 负步长 / 广播（stride 0） | 一致（352 次比较） |
+| 序列化 | `vt-to-list` | `vt-save`/`vt-load`（`:lisp` 与 `:npy`） | 一致（npy 头是 `|b1`） |
+
+**第 1 条：`nancumsum` / `nancumprod` 漏掉提升表 → 静默溢出**
+
+`vt-cumsum` 走的 `%VT-CUMULATIVE` 里有一张提升表（`:bool :int8 :uint8
+:int16 :uint16 :int32 → :int64`，注释还专门写了「布尔与窄整型一致」）。
+`nancumsum` 走的是另一条内核 `%E3-CUMULATIVE-SKIP-NAN`，那里只有
+`(or dtype (vt-dtype input))`：
+
+| 表达式 | numpy | 修复前 | 现在 |
+|---|---|---|---|
+| `(vt-nancumsum b)` | `int64` `[1 2 2 2]` | `:bool`，**字节 2** | `int64` `[1 2 2 2]` |
+| `(vt-nancumsum #(100 100) :dtype :int8)` | `int64` `[100 200]` | `int8` **`[100 -56]`** | `int64` `[100 200]` |
+| `(vt-nancumsum #(200 200) :dtype :uint8)` | `uint64` `[200 400]` | `uint8` **`[200 144]`** | `int64` `[200 400]` |
+| `(vt-nancumsum #(30000 30000) :dtype :int16)` | `int64` | `int16` **`[30000 -5536]`** | `int64` `[30000 60000]` |
+| `(vt-nancumprod #(100 100) :dtype :int8)` | `int64` `[100 10000]` | `int8` **`[100 16]`** | `int64` `[100 10000]` |
+
+注意这条**不只是 bool 的问题**：bool 那行只是「脏字节」，窄整型那三行是
+**静默回绕成负数**，比 bool 更难发现——累加器溢出后值域整体翻负，输出仍
+「看起来像合法数据」。修法不是给 bool 打补丁，而是把那张表抽成
+`%CUMULATIVE-RESULT-DTYPE` 给两条内核共用。
+
+> 判据：**累积类算子永远不能沿用输入的窄类型**。sum/prod/cumsum 早就
+> 这么做了，`nan` 前缀的那一族是后加的，加的时候没回头看。
+
+**第 2 条：`vt-cast` 把 `:bool` 分支放在了「剥虚部」之后**
+
+```lisp
+;; 修复前：先剥虚部，再判 :bool
+(when (and (complexp val) (not (vt-complex-dtype-p dtype)))
+  (setf val (realpart val)))        ; #C(0 1) → 0
+(when (eq dtype :bool)
+  (return-from vt-cast (%bool-flag val)))   ; 0 → False
+```
+
+于是 `(vt-cast #C(0 1) :bool)` = **0**，而同一个值的数组路径
+`(vt-astype … :bool)` = **1**、`(setf (vt-ref …) #C(0 1))` = **1** ——
+`%BOOL-FLAG` 的 docstring 明写「复数：任一分量非零即为真」，标量路径却
+先把虚部扔了。受影响的是所有走 `vt-cast` 的写入入口：
+`vt-write` / `vt-put` / `vt-fill` / `vt-pad :constant-values`。
+（`(setf vt-ref)` 没受影响，因为它直接调 `%bool-flag`——这正是「成对比较」
+能捞出来的原因：五个入口里四个错、一个对。）
+
+修法是把 `:bool` 分支提到剥虚部之前。这不是 bool 专属语义的改动：
+它让「标量 → 布尔」重新服从 `%BOOL-FLAG` 这一个定义，而不是在
+`vt-cast` 里另立一份。
+
+**第四遍同时确认「没有问题」的部分**（记在这里免得下次重做）：
+
+* **归约器的关键字矩阵**：`sum`/`prod`/`mean`/`amax`/`amin`/`any`/`all`/
+  `argmax`/`argmin`/`std`/`var`/`median` × `{默认, :keepdims, :axis 0,
+  :axis -1, :axis '(0 2), :axis '()}` 与 numpy 逐项一致；`sum`/`prod`/
+  `cumsum`/`cumprod`/`argmax`/`trace` → `:int64`，`amax`/`amin`/`any`/`all`/
+  `nanmax`/`nanmin` → `:bool`，`mean`/`std`/`var`/`median` → `:float64`。
+* **dtype 提升表**：`bool ⊗ {int8,int64,float32,float64}` 的算术、
+  `vt-concatenate`/`vt-stack`/`vt-append`/`vt-where` 的混合输入，全部与
+  numpy 一致（bool 在前时取另一侧 dtype，两侧都 bool 时仍是 bool）。
+* **布局不变性**：对 42 个一元算子 × 8 种布局（转置、flip、步长 2、
+  负步长、广播、组合），比较 `f(view)` 与 `f(连续副本)`，352 次全等。
+* **`:out` 的严格性**：`(vt-sum b :out int8数组)` 报错而不是像 numpy 那样
+  静默降级转换——这是本库早于 bool 就有的约定（§4.4），与 bool 无关。
+
+**顺带更正一处旧结论**：§17.10.11 里写过「`np.percentile(bool)` 报错，
+clvt 报错是对的」。实测 clvt **不报错**：`(vt-percentile b 50)` 给 `1.0d0`、
+`(vt-quantile b 0.5)` 给 `1.0d0`（`vt-ptp` / `vt-gradient` / `vt-ediff1d`
+确实报错）。这个差异是**有意的**：numpy 的分位数实现要用 `hi - lo`
+（布尔减法未定义）才抛错，而本库在 float64 缓冲上取位，结果在数学上是
+对的，没必要为了对齐实现细节去拒绝一个能算对的答案。契约改为：
+
+| 表达式 | numpy | clvt（契约） |
+|---|---|---|
+| `median(b)` / `nanmedian(b)` | `float64` 正常 | 同 |
+| `percentile(b, 50)` / `quantile(b, 0.5)` | **报错** | `float64` 正确值（有意偏差） |
+| `ptp(b)` / `gradient(b)` / `ediff1d(b)` | 报错 | 报错（语义本身就是减法） |
+
 ---
 
 ## 附录 C：实测缺陷复现脚本

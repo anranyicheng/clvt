@@ -473,13 +473,20 @@
         本库不产生 warning，行为在文档中显式声明）。
    布尔语义（§17.1）：目标为 :bool 时按**真值**收敛（非零→1、零→0、
    NaN→1），而不是像整数那样截断 —— `(vt-astype #(0.5) :bool)` 必须是
-   True，`(truncate 0.5)` 会给 0。"
+   True，`(truncate 0.5)` 会给 0。
+   **复数 → :bool 不走「取实部」那条**：真值优先按整体判定（任一分量非零），
+   与 `%BOOL-FLAG` 的契约、`VT-ASTYPE` 的数组路径、`(SETF VT-REF)` 一致。
+   §17.10.12：把 `:bool` 分支放在剥虚部之前是刻意的 —— 放在之后就得到
+   `(vt-cast #C(0 1) :bool)` = 0，而 `(vt-astype … #C(0 1) … :bool)` = 1，
+   同一个值在两条入口上给出相反答案。"
 
   (with-float-safe
-    (when (and (complexp val) (not (vt-complex-dtype-p dtype)))
-      (setf val (realpart val)))
+    ;; 先判 :bool —— 见 docstring 末段。%bool-flag 自己处理复数（任一分量非零），
+    ;; 若先剥虚部再判，虚部就永久丢失了。
     (when (eq dtype :bool)
       (return-from vt-cast (%bool-flag val)))
+    (when (and (complexp val) (not (vt-complex-dtype-p dtype)))
+      (setf val (realpart val)))
     (ecase dtype
       (:complex128 (coerce val '(complex double-float)))
       (:complex64  (coerce val '(complex single-float)))

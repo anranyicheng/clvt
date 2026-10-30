@@ -771,6 +771,57 @@
                                              :dtype :int64))
        '(-1 -1 1))
 
+;; --- L. 累积提升表与「复数 → 布尔」的两条入口（§17.10.12） ---
+;; L 组盯的是**同一族里只改了一个**这类缺陷：`cumsum` 与 `nancumsum`
+;; 走两条内核，前者有提升表、后者没有；`vt-cast` 与 `vt-astype` 是两个
+;; 入口，前者先剥虚部再判 :bool、后者按整体判。两组都是「各自单看都自洽，
+;; 放在一起才矛盾」。
+(defun bool-bad-bytes (tensor)
+  "统计 :bool 张量里物理字节不在 {0,1} 的个数（0/1 不变量扫描）。"
+  (let ((d (vt-data tensor)) (n 0))
+    (when (eq (vt-dtype tensor) :bool)
+      (dotimes (i (length d)) (unless (<= 0 (aref d i) 1) (incf n))))
+    n))
+
+;; L1. nancumsum / nancumprod：结果必须是 int64 的**计数**，不是 :bool
+(check "nancumsum/bool-dtype" (vt-dtype (vt-nancumsum *jb*)) :int64)
+(check "nancumsum/bool-vals"  (flat-ints (vt-nancumsum *jb*)) '(1 2 2 2))
+(check-true "nancumsum/bool-bytes" (zerop (bool-bad-bytes (vt-nancumsum *jb*))))
+(check "nancumprod/bool-dtype" (vt-dtype (vt-nancumprod *jb*)) :int64)
+(check "nancumprod/bool-vals"  (flat-ints (vt-nancumprod *jb*)) '(1 1 0 0))
+;; 与同族的 cumsum 必须给出同一个 dtype
+(check "nancumsum/dtype-same-as-cumsum"
+       (vt-dtype (vt-nancumsum *jb*)) (vt-dtype (vt-cumsum *jb*)))
+
+;; L2. 同一个提升表也覆盖窄整型（原实现静默回绕）
+(check "nancumsum/int8-narrow"  (vt-dtype (vt-nancumsum (vt-from-sequence '(100 100) :dtype :int8))) :int64)
+(check "nancumsum/int8-vals"    (flat-ints (vt-nancumsum (vt-from-sequence '(100 100) :dtype :int8))) '(100 200))
+(check "nancumsum/uint8-vals"   (flat-ints (vt-nancumsum (vt-from-sequence '(200 200) :dtype :uint8))) '(200 400))
+(check "nancumsum/int16-vals"   (flat-ints (vt-nancumsum (vt-from-sequence '(30000 30000) :dtype :int16))) '(30000 60000))
+(check "nancumprod/int8-vals"   (flat-ints (vt-nancumprod (vt-from-sequence '(100 100) :dtype :int8))) '(100 10000))
+;; 大 dtype 不该被无谓提升
+(check "nancumsum/int64-dtype"  (vt-dtype (vt-nancumsum (vt-from-sequence '(1 2) :dtype :int64))) :int64)
+(check "nancumsum/float32-dtype" (vt-dtype (vt-nancumsum (vt-from-sequence '(1.0 2.0) :dtype :float32))) :float32)
+
+;; L3. 复数 → :bool：任一分量非零即为真（%bool-flag 的契约）
+(check "cast/complex-0+1j" (vt-cast (complex 0 1) :bool) 1)
+(check "cast/complex-0+0j" (vt-cast (complex 0 0) :bool) 0)
+(check "cast/complex-1+0j" (vt-cast (complex 1 0) :bool) 1)
+;; 与数组路径一致
+(check "astype/complex-0+1j"
+       (flat-ints (vt-astype (vt-from-sequence (list (complex 0.0d0 1.0d0))) :bool)) '(1))
+;; 与 (setf vt-ref) 一致 —— 四个写入入口必须认同一个真值判定
+(check "write/complex-0+1j" (flat-ints (let ((x (vt-zeros '(2) :dtype :bool)))
+                                         (vt-write x '(0) (complex 0 1)) x)) '(1 0))
+(check "put/complex-0+1j"   (flat-ints (let ((x (vt-zeros '(2) :dtype :bool)))
+                                         (vt-put x '(0) (list (complex 0 1))) x)) '(1 0))
+(check "fill/complex-0+1j"  (flat-ints (let ((x (vt-zeros '(2) :dtype :bool)))
+                                         (vt-fill x (complex 0 1)) x)) '(1 1))
+(check "setf-ref/complex-0+1j" (flat-ints (let ((x (vt-zeros '(2) :dtype :bool)))
+                                            (setf (vt-ref x 0) (complex 0 1)) x)) '(1 0))
+(check "pad/complex-0+1j"   (flat-ints (vt-pad (vt-from-sequence '(t) :dtype :bool) '(1 1)
+                                               :constant-values (complex 0 1))) '(1 1 1))
+
 ;;; ==================================================================
 
 (format t "~&~%==== bool dtype: ~d passed, ~d failed ====~%" *pass* *fail*)

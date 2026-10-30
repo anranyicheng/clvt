@@ -1251,6 +1251,30 @@
 ;;; 累积
 ;;; ------------------------------------------------------------------
 
+(defun %cumulative-result-dtype (tensor dtype)
+  "累积类算子的结果 dtype：显式 DTYPE 优先，否则按提升表推导。
+   累积是**会溢出**的算子（第 i 个结果是前 i 个元素的和），所以不能沿用输入
+   的窄类型：
+
+   | 输入 dtype | 结果 dtype |
+   |---|---|
+   | `:bool` `:int8` `:uint8` `:int16` `:uint16` `:int32` | `:int64` |
+   | 其余（`:int64` / 浮点 / 复数） | 同输入 |
+
+   `:bool` 归进窄整型一档的原因：`cumsum(bool)` 在 numpy 里是 `int64` 的
+   **计数**（`[T F T T]` → `[1 1 2 3]`），不是逻辑或。若沿用 `:bool`，
+   `2`/`3` 会写进 `(unsigned-byte 8)` 的布尔数组 —— 既破 0/1 不变量，
+   又让 `(vt-sum (vt-cumsum b))` 变成 7 而不是 4。
+
+   §17.10.12：这张表原先只写在 `%VT-CUMULATIVE` 里，`nancumsum`/`nancumprod`
+   走了另一条内核（`%E3-CUMULATIVE-SKIP-NAN`）自带一份
+   `(or dtype (vt-dtype input))`，于是同一族里 `cumsum` 提升、
+   `nancumsum` 不提升 —— `(nancumsum int8 #(100 100))` 静默回绕成 -56。"
+  (or dtype
+      (case (vt-dtype tensor)
+        ((:bool :int8 :uint8 :int16 :uint16 :int32) :int64)
+        (t (vt-dtype tensor)))))
+
 (defun %vt-cumulative (tensor op init-val &key axis dtype out)
   "VT-CUMULATIVE 的内核（不含浮点陷阱屏蔽）；语义与契约见下方的公开入口。"
   ;; 别名保护（§4.3 H6）：累积是**流式**读写 —— 读到第 i 个就写第 i 个位置。
@@ -1264,13 +1288,9 @@
          ;; 结果 dtype 由「输入 dtype + 显式 :dtype」决定，不由 out 决定。
          ;; v0.4.x 修复：numpy cumsum/cumprod 对精度低于平台整型的整型
          ;; 输入提升为 int64（np.cumsum(int8) → int64），原实现保持 int8
-         ;; 导致 100+100 溢出回绕为 -56。提升表与 %op-out-dtype 的
-         ;; sum/prod 一致。
-         (final-dtype (or dtype
-                          (case (vt-dtype tensor)
-                            ;; 布尔与窄整型一致：cumsum(bool) 在 numpy 里是 int64。
-                            ((:bool :int8 :uint8 :int16 :uint16 :int32) :int64)
-                            (t (vt-dtype tensor)))))
+         ;; 导致 100+100 溢出回绕为 -56。提升表见 %CUMULATIVE-RESULT-DTYPE
+         ;; （与 %op-out-dtype 的 sum/prod 一致）。
+         (final-dtype (%cumulative-result-dtype tensor dtype))
          (lisp-type (vt-dtype->lisp-type final-dtype))
          ;; 结果形状（逻辑契约）：numpy 在 axis=None 时先展平再累积。
          ;; 原实现沿用输入形状，且 axis=nil 的递归遍历在 rank>=2 上直接
