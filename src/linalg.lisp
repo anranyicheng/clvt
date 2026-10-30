@@ -1296,8 +1296,32 @@
                       (out-arg (vt-copy-into out-arg (vt-astype r :bool)) out-arg)
                       (t (vt-astype r :bool)))))))))))
 
+(defun %matmul-check-core (a b)
+  "校验 MATMUL 的收缩轴：A 的末维必须等于 B 的倒数第二维（1-D 按 numpy 的
+   提升规则取各自唯一的轴）。
+
+   为什么单独校验而不是交给 EINSUM 的标签冲突检查：**复数路径不经 EINSUM**。
+   实数 (4 4)@(2 2) 会在 EINSUM 里报 `dimension conflict for label j`，
+   而复数走 %CX-MATMUL-2D 的三重循环 —— 它直接按 (m k) 与 (k n) 取 m/k/n，
+   从不比较两个 k。结果是 (4 4)@(2 2) **不报错**，按 k=4 越界读 B，返回一个
+   (4 2) 的垃圾矩阵（实测元素量级 1e77）。同一个错误输入，实数抛条件、
+   复数给静默错答案 —— 这类分叉比缺功能更危险。
+
+   0 维不在这里管：numpy 对 0 维操作数是另一种错误（not enough dimensions），
+   由各自的分支负责。"
+  (when (and (vt-p a) (vt-p b))
+    (let* ((sa (vt-shape a)) (sb (vt-shape b))
+           (ra (length sa)) (rb (length sb)))
+      (when (and (>= ra 1) (>= rb 1))
+        (let ((ka (nth (1- ra) sa))
+              (kb (if (= rb 1) (first sb) (nth (- rb 2) sb))))
+          (unless (= ka kb)
+            (error "vt-matmul: 收缩轴长度不匹配 —— A ~a 的末维 ~a，B ~a 的倒数第二维 ~a"
+                   sa ka sb kb)))))))
+
 (defun vt-matmul (a b &key dtype out)
   "矩阵乘法，兼容 1d 向量（对标 numpy 的 @ 运算符）。"
+  (%matmul-check-core a b)
   (when (%cx-any-p a b)
     (return-from vt-matmul (%cx-op-matmul a b :dtype dtype :out out)))
   (let ((ra (vt-order a))
@@ -2344,32 +2368,88 @@ w: 工作缓冲（数组，两路径同构）；w-h: w 的引擎句柄（通用=
 		    nil)))
       rank))))
 
-(defun extend-orthogonal-basis (u-econ &key (rng *vt-default-random-state*))
-  "将 m×k 的 u_econ 通过随机向量 + gram-schmidt 补全为 m×m 正交矩阵。"
-  (declare (random-state rng))
+(defun %svd-fill-vector (n salt buf)
+  "把长度 N 的 BUF 填成「由 SALT 决定的」确定性伪随机向量（分量落在 [-1,1)）。
+
+   用途：SVD 零奇异值列的**正交补全**需要一个「不在已有列张成空间里」的
+   起始向量。原先这一步用 `(vt-random … :rng *vt-default-random-state*)`，
+   于是同一个输入两次调用给出**不同的 U**（实测秩亏 2×2 的第二列方向相反），
+   而且把全局随机流推走一截 —— 此后 `(vt-random …)` 的序列取决于中间
+   有没有人调过 SVD。数值分解是输入的纯函数，不该有这两种副作用。
+
+   这里改用局部 LCG（Numerical Recipes 的 32 位常数），种子里揉进列号与
+   重试次数：同输入永远同输出，且不与全局随机状态交互。"
+  (declare (type fixnum n salt)
+           (type (simple-array double-float (*)) buf))
+  (let ((state (ldb (byte 32 0) (+ (* (ldb (byte 32 0) salt) 2654435761)
+                                   1013904223))))
+    (declare (type (unsigned-byte 32) state))
+    (dotimes (i n buf)
+      (setf state (ldb (byte 32 0) (+ (* state 1664525) 1013904223)))
+      ;; 取高 24 位映射到 [-1, 1)
+      (setf (aref buf i)
+            (- (* 2.0d0 (/ (coerce (ash state -8) 'double-float) 16777216.0d0))
+               1.0d0)))))
+
+(defun %svd-complete-col (data m stride ncols j)
+  "把 DATA（M 行、行距 STRIDE）的第 J 列补成与第 0…NCOLS-1 列正交的单位向量。
+
+   用于零奇异值列：σ = 0 时 U 的那一列没有定义（该方向在 A 里是零），
+   但 SVD 的定义要求 U 的列**正交归一** —— 零向量不是单位向量，留着它会让
+   `UᵀU ≠ I`（复数版原先就是这样，见 %CSVD-CORE）。这里补一个确定性向量，
+   两轮 Gram–Schmidt 去掉已有列上的分量；若某次起始向量几乎落在已有张成
+   空间里（范数 < 1e-6）就换个盐重试。
+
+   返回 T 表示补上了；NIL 表示 4 次尝试都退化 —— 只有当补空间维数为 0 时
+   才会发生，而调用点保证补空间维数 ≥ 1，所以这个返回值只是兜底信号。"
+  (declare (type (simple-array double-float (*)) data)
+           (type fixnum m stride ncols j))
+  (let ((v (make-array m :element-type 'double-float)))
+    (declare (type (simple-array double-float (*)) v))
+    (dotimes (attempt 4 nil)
+      (%svd-fill-vector m (+ (* 7919 (1+ j)) (* 104729 (1+ attempt))) v)
+      (loop repeat 2 do
+        (dotimes (jj ncols)
+          (unless (= jj j)
+            (let ((proj 0.0d0))
+              (declare (type double-float proj))
+              (dotimes (r m)
+                (incf proj (* (aref data (+ (* r stride) jj)) (aref v r))))
+              (dotimes (r m)
+                (decf (aref v r)
+                      (* proj (aref data (+ (* r stride) jj)))))))))
+      (let ((nrm 0.0d0))
+        (declare (type double-float nrm))
+        (dotimes (r m) (incf nrm (* (aref v r) (aref v r))))
+        (when (> nrm 1.0d-12)
+          (let ((inv (/ 1.0d0 (sqrt nrm))))
+            (declare (type double-float inv))
+            (dotimes (r m)
+              (setf (aref data (+ (* r stride) j)) (* (aref v r) inv))))
+          (return t))))))
+
+(defun extend-orthogonal-basis (u-econ)
+  "将 m×k 的 u_econ 补全为 m×m 正交矩阵（列仍正交归一）。
+
+   补全方向由 %SVD-FILL-VECTOR 决定（确定性）；原实现用 `(vt-random …)`，
+   于是 `(vt-svd a :full-matrices t)` 对同一个 a 两次给出不同的 U，并且
+   消费全局随机流。"
   (with-float-safe
     (let* ((m (first (vt-shape u-econ)))
            (k (second (vt-shape u-econ)))
            (extra (- m k)))
       (if (zerop extra) u-econ
-          (let ((u-full (vt-zeros (list m m) :dtype :float64)))
+          (let* ((u-full (vt-zeros (list m m) :dtype :float64))
+                 (dst (vt-data u-full))
+                 (src (vt-data (vt-contiguous u-econ))))
+            (declare (type (simple-array double-float (*)) dst src))
             (dotimes (i k)
-              (setf (vt-slice u-full '(:all) (list i))
-                    (vt-slice u-econ '(:all) (list i))))
+              (dotimes (r m)
+                (setf (aref dst (+ (* r m) i)) (aref src (+ (* r k) i)))))
             (loop for col from k below m
-                  for v = (vt-random (list m) :rng rng) do
-                    (loop repeat 2 do
-                      (dotimes (j col)
-                        ;; flatten 避免 2D-1D 广播分配
-                        (let* ((uj (vt-flatten
-				    (vt-slice u-full '(:all) (list j))))
-                               (proj (%vt-ref-raw (vt-dot uj v))))
-                          (setf v (vt-- v (vt-scale uj proj))))))
-                    (let ((norm (sqrt (%vt-ref-raw (vt-dot v v)))))
-                      (if (> norm 1e-12)
-                          (setf (vt-slice u-full '(:all) (list col))
-                                (vt-scale v (/ 1.0s0 norm)))
-                          (error "failed to generate orthogonal vector"))))
+                  do (unless (%svd-complete-col dst m m col col)
+                       (error "extend-orthogonal-basis: 补空间维数为 0，无法补全（m=~a k=~a）"
+                              m k)))
             u-full)))))
 
 ;;; ============================================================
@@ -2682,35 +2762,10 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
                                      (* inv (aref w-data (+ src r)))))))
                 (incf new-i)))))
 
-        ;; ---- 零奇异值 → 随机正交补（两轮 Gram-Schmidt，同原实现）----
+        ;; ---- 零奇异值 → 正交补（确定性补全，见 %SVD-COMPLETE-COL）----
         (dotimes (i k)
           (when (zerop (aref s-vec i))
-            (let* ((rv-t (vt-random (list m) :rng *vt-default-random-state*))
-                   (rv   (vt-data rv-t)))
-              (declare (type (simple-array double-float (*)) rv))
-              (loop repeat 2 do
-                (dotimes (j i)
-                  (let ((proj 0.0d0))
-                    (declare (type double-float proj))
-                    (loop for r of-type fixnum from 0 below m
-                          do (incf proj (* (aref u-data (+ (* r k) j))
-                                           (aref rv r))))
-                    (loop for r of-type fixnum from 0 below m
-                          do (decf (aref rv r)
-                                   (* proj (aref u-data (+ (* r k) j))))))))
-              (let ((norm (sqrt (loop for r of-type fixnum from 0 below m
-                                      sum (* (aref rv r) (aref rv r))
-                                      of-type double-float))))
-                (declare (type double-float norm))
-                (if (> norm 1e-12)
-                    (let ((inv (/ 1.0d0 norm)))
-                      (declare (type double-float inv))
-                      (loop for r of-type fixnum from 0 below m
-                            do (setf (aref u-data (+ (* r k) i))
-                                     (* (aref rv r) inv))))
-                    (loop for r of-type fixnum from 0 below m
-                          do (setf (aref u-data (+ (* r k) i))
-                                   (aref rv r))))))))))
+            (%svd-complete-col u-data m k k i)))))
 
     ;; ---- 构造 vt（= V^T，n×n）：前 k 行取排序后的 VT 行，其余升序补齐 ----
     (let* ((vt-out (vt-zeros (list n n) :dtype :float64))
@@ -3142,32 +3197,71 @@ Gram-Schmidt）、构造 vt（= V^T），并按 full-matrices 分派形状。
 ;;; 4. 最小二乘
 ;;; ============================================================
 
+(defun %lstsq-check-b (b-shape m)
+  "校验 B 的形状，返回 (values b-1d-p nrhs)。
+   对标 np.linalg.lstsq：b 可以是 (m,) 或 (m,k)；其它形状 numpy 报
+   「Incompatible dimensions」。" 
+  (let ((r (length b-shape)))
+    (cond
+      ((= r 1)
+       (unless (= (first b-shape) m)
+         (error "vt-lstsq: b 的长度 (~a) 必须等于 A 的行数 (~a)" (first b-shape) m))
+       (values t 1))
+      ((= r 2)
+       (unless (= (first b-shape) m)
+         (error "vt-lstsq: b 的首维 (~a) 必须等于 A 的行数 (~a)" (first b-shape) m))
+       (values nil (second b-shape)))
+      (t (error "vt-lstsq: b 必须是 (m,) 或 (m,k)，收到 ~a 维形状 ~a"
+                r b-shape)))))
+
+(defun %lstsq-residual (a x b-mat m n rank)
+  "numpy 口径的残差：**每右端一列的平方和**，形状 (K,)；无残差时形状 (0,)。
+
+   两个容易写错的点：
+   1. numpy 的 residuals 是 sum((b - Ax)^2)，**不是** 2-范数
+      （原实现取 vt-norm，于是 0.0093 与 0.0967 的差别恰好是开了一次根）；
+   2. 「没有残差」（m <= n 或 rank < n）返回**空数组**而不是 0.0 ——
+      0.0 会被读成「残差为零」，即「拟合完美」。
+   复数输入的平方和按 |r|^2 算（vt-abs 先取模，再平方）。"
+  (if (and (> m n) (= rank n))
+      (vt-sum (vt-square (vt-abs (vt-- b-mat (vt-@ a x)))) :axis 0 :dtype :float64)
+      (vt-zeros (list 0) :dtype :float64)))
+
 (defun vt-lstsq (a b &key (rcond 1e-15))
-  "最小二乘解 min ||Ax - b||_2。"
+  "最小二乘解 min ||Ax - b||_2（对标 numpy.linalg.lstsq）。
+
+   返回 (values x residuals rank s)：
+   - x         : b 给 (m,) → 形状 (n,)；b 给 (m,k) → 形状 (n,k)。
+                 **b 给 (m,1) 时 x 是 (n,1)**，不压成 (n,)：1 是合法维数，
+                 「某一维等于 1」不能当成「秩是 1」（§17.10.20 的同一课）。
+   - residuals : 形状 (K,)，每右端一列的**平方和**；m <= n 或 rank < n 时
+                 为形状 (0,) 的空数组（numpy 同样给空数组）。
+   - rank      : 整数（按奇异值 > rcond·s_max 计数）。
+   - s         : 奇异值（float64，降序）。"
   (when (%cx-any-p a b)
     (return-from vt-lstsq (%cx-op-lstsq a b :rcond rcond)))
-  (assert (= 2 (vt-order a)))
+  (let ((a (ensure-vt a)))
+    (unless (= 2 (vt-order a))
+      (error "vt-lstsq: 系数矩阵必须是 2 维，收到形状 ~a" (vt-shape a))))
   (with-float-safe
     (let* ((m (first (vt-shape a)))
            (n (second (vt-shape a)))
            (b-vt (ensure-vt b))
-           (b-shape (vt-shape b-vt))
-           (nrhs (if (= (length b-shape) 1) 1 (second b-shape)))
-           (b-mat (if (= (length b-shape) 1) (vt-reshape b-vt (list m 1)) b-vt)))
-      (multiple-value-bind (u s vt-mat) (vt-svd a)
-        (let* ((s-data (vt-data s))
-               (k (vt-size s))
-               (s-max (loop for i fixnum from 0 below k maximize (aref s-data i)))
-               (cutoff (* rcond s-max))
-               (rank (loop for i fixnum from 0 below k count (> (aref s-data i) cutoff)))
-               (utb (vt-@ (vt-transpose u) b-mat))
-               (x (vt-zeros (list k nrhs) :dtype :float64)))
-          (loop for j fixnum from 0 below nrhs do
-            (loop for i fixnum from 0 below rank do
-              (setf (vt-ref x i j) (* (%vt-ref-raw utb i j) (/ 1.0d0 (aref s-data i))))))
-          (setf x (vt-@ (vt-transpose vt-mat) x))
-          (let ((res (if (and (> m n) (= rank n))
-                         (%vt-ref-raw (vt-norm (vt-flatten (vt-- b-mat (vt-@ a x)))))
-                         0.0d0))
-                (xr (if (= nrhs 1) (vt-flatten (vt-slice x '(:all) '(0))) x)))
-            (values xr res rank s)))))))
+           (b-shape (vt-shape b-vt)))
+      (multiple-value-bind (b-1d-p nrhs) (%lstsq-check-b b-shape m)
+        (let ((b-mat (if b-1d-p (vt-reshape b-vt (list m 1)) b-vt)))
+          (multiple-value-bind (u s vt-mat) (vt-svd a)
+            (let* ((s-data (vt-data s))
+                   (k (vt-size s))
+                   (s-max (loop for i fixnum from 0 below k maximize (aref s-data i)))
+                   (cutoff (* rcond s-max))
+                   (rank (loop for i fixnum from 0 below k count (> (aref s-data i) cutoff)))
+                   (utb (vt-@ (vt-transpose u) b-mat))
+                   (x (vt-zeros (list k nrhs) :dtype :float64)))
+              (loop for j fixnum from 0 below nrhs do
+                (loop for i fixnum from 0 below rank do
+                  (setf (vt-ref x i j) (* (%vt-ref-raw utb i j) (/ 1.0d0 (aref s-data i))))))
+              (setf x (vt-@ (vt-transpose vt-mat) x))
+              (values (if b-1d-p (vt-flatten x) x)
+                      (%lstsq-residual a x b-mat m n rank)
+                      rank s))))))))

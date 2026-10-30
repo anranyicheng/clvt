@@ -660,6 +660,49 @@
               (incf filled))))))
     out))
 
+(defun %csvd-complete-col (u m stride ncols j)
+  "把 U（M 行、行距 STRIDE、复数）的第 J 列补成与第 0…NCOLS-1 列正交的单位向量。
+
+   零奇异值列的来历：A 的某一列在 Jacobi 之后数值上为零，于是 σ = 0，
+   而 U 的该列按 `A列/σ` 无处可算 —— 原实现直接填 (0+0i)。
+   结果是 U^H U 的对角线上出现 0：**U 不再是酉矩阵**，而 SVD 的定义要求
+   U、V 的列正交归一。实数路径对自己的零奇异值做了正交补全（虽然原先
+   用全局随机流），复数路径漏了这一步 —— 这是实/复两条线不对称的典型。
+
+   补全向量由 %SVD-FILL-VECTOR（实部）与其虚部流共同决定 —— 确定性，
+   不消费 *VT-DEFAULT-RANDOM-STATE*。两轮 Gram–Schmidt 去掉已有列上的
+   分量，范数退化时换盐重试（4 次）。"
+  (declare (type (simple-array (complex double-float) (*)) u)
+           (type fixnum m stride ncols j))
+  (let ((re (make-array m :element-type 'double-float))
+        (im (make-array m :element-type 'double-float))
+        (v (%cl-make-buf m)))
+    (declare (type (simple-array double-float (*)) re im)
+             (type (simple-array (complex double-float) (*)) v))
+    (dotimes (attempt 4 nil)
+      (%svd-fill-vector m (+ (* 7919 (1+ j)) (* 104729 (1+ attempt))) re)
+      (%svd-fill-vector m (+ (* 31013 (1+ j)) (* 65537 (1+ attempt)) 12345) im)
+      (dotimes (i m)
+        (setf (aref v i) (complex (aref re i) (aref im i))))
+      (loop repeat 2 do
+        (dotimes (jj ncols)
+          (unless (= jj j)
+            (let ((proj (%cl-c0)))
+              (declare (type (complex double-float) proj))
+              (dotimes (i m)
+                (incf proj (* (%cconj (aref u (%cl-i stride i jj))) (aref v i))))
+              (dotimes (i m)
+                (decf (aref v i) (* proj (aref u (%cl-i stride i jj)))))))))
+      (let ((nrm 0.0d0))
+        (declare (type double-float nrm))
+        (dotimes (i m) (incf nrm (%cx-abs2 (aref v i))))
+        (when (> nrm 1.0d-12)
+          (let ((inv (/ 1.0d0 (sqrt nrm))))
+            (declare (type double-float inv))
+            (dotimes (i m)
+              (setf (aref u (%cl-i stride i j)) (* (aref v i) inv))))
+          (return t))))))
+
 (defun %csvd-core (a m n &key (max-sweeps 60) (tol 1e-15))
   "对 m×n 复矩阵 A（会被销毁）做 SVD，返回
    (values u-buffer(m×k) s(double k) vh-buffer(k×n) k)，奇异值降序。"
@@ -696,6 +739,10 @@
                             (%cl-c0))))
                 (dotimes (i n)
                   (setf (aref vh (%cl-i n j i)) (%cconj (aref v (%cl-i n i oj)))))))
+            ;; ---- 零奇异值列 → 正交补（U 必须酉；零向量不是单位向量）----
+            (dotimes (j k)
+              (when (zerop (aref s j))
+                (%csvd-complete-col u m k k j)))
             (values u s vh k)))
         ;; ---- 宽矩阵：对 A^H 做 SVD，再换回 U/V 的角色 ----
         (let ((ah (%cl-conj-t-of a m n)))       ; n×m
@@ -931,7 +978,11 @@
 
 (defun %cx-op-lstsq (a b &key (rcond 1e-15))
   "最小二乘 min‖Ax-b‖₂（复数版）。返回 (values x residual rank s)。
-   residual：仅当 m>n 且满列秩时给出；否则 0.0d0（与实数版一致）。"
+
+   形状与残差语义与实数版**同一条契约**（%LSTSQ-CHECK-B / %LSTSQ-RESIDUAL）：
+   - x 形状跟着 b：b (m,) → (n,)，b (m,k) → (n,k)（**含 k=1**）；
+   - residual 是每右端一列的 |r|² 之和，形状 (K,)；无残差时形状 (0,) 空数组。
+   原实现在这里也用了 `(= nrhs 1)` 与 `vt-norm`，两处都与 numpy 差一格。"
   (let ((av (ensure-vt a))
         (bv (ensure-vt b)))
     (with-float-safe
@@ -940,51 +991,41 @@
         (error "vt-lstsq: 系数矩阵必须是 2 维，收到形状 ~a" shape))
       (let* ((m (first shape))
              (n (second shape))
-             (b-shape (vt-shape bv))
-             (nrhs (if (or (null b-shape) (= 1 (length b-shape)))
-                       1
-                       (second b-shape)))
-             (bmat (if (or (null b-shape) (= 1 (length b-shape)))
-                       (vt-reshape (vt-astype (vt-copy bv) :complex128) (list m 1))
-                       (vt-astype (vt-copy bv) :complex128))))
-        (multiple-value-bind (u s vh) (%csvd-of av "vt-lstsq")
-          (let* ((k (vt-size s))
-                 (sd (vt-data s))
-                 (smax 0.0d0)
-                 (cutoff 0.0d0)
-                 (rank 0))
-            (declare (type fixnum rank) (type double-float smax cutoff))
-            (dotimes (i k) (setf smax (max smax (aref sd i))))
-            (setf cutoff (* rcond smax))
-            (dotimes (i k) (when (> (aref sd i) cutoff) (incf rank)))
-            ;; x = V·Σ⁺·U^H·b
-            (let* ((sp (%cl-make-buf (* k k)))
-                   (uhb (vt-matmul (vt-transpose (vt-conj u)) bmat))  ; k×nrhs
-                   (scaled (%cl-make-buf (* k nrhs))))
-              (declare (type (simple-array (complex double-float) (*)) scaled))
-              (dotimes (i k)
-                (when (> (aref sd i) cutoff)
-                  (setf (aref sp (%cl-i k i i))
-                        (complex (/ 1.0d0 (aref sd i)) 0.0d0))))
-              (dotimes (i k)
-                (dotimes (j nrhs)
-                  (setf (aref scaled (%cl-i nrhs i j))
-                        (* (aref (vt-data uhb) (%cl-i nrhs i j))
-                           (aref sp (%cl-i k i i))))))
-              (let* ((scaled-vt (%cl-vt scaled (list k nrhs) :complex128))
-                     (vv (vt-transpose (vt-conj vh)))
-                     (x (vt-matmul vv scaled-vt)))
-                ;; residual 与实数版契约一致
-                (let ((res (if (and (> m n) (= rank n))
-                               (float (vt-item (vt-norm
-                                                (vt-flatten
-                                                 (vt-- bmat (vt-matmul av x)))))
-                                      1.0d0)
-                               0.0d0))
-                      (xr (if (= nrhs 1)
-                              (vt-flatten (vt-slice x '(:all) '(0)))
-                              x)))
-                  (values xr res rank s)))))))))))
+             (b-shape (vt-shape bv)))
+        (multiple-value-bind (b-1d-p nrhs) (%lstsq-check-b b-shape m)
+          (let ((bmat (if b-1d-p
+                          (vt-reshape (vt-astype (vt-copy bv) :complex128) (list m 1))
+                          (vt-astype (vt-copy bv) :complex128))))
+            (multiple-value-bind (u s vh) (%csvd-of av "vt-lstsq")
+              (let* ((k (vt-size s))
+                     (sd (vt-data s))
+                     (smax 0.0d0)
+                     (cutoff 0.0d0)
+                     (rank 0))
+                (declare (type fixnum rank) (type double-float smax cutoff))
+                (dotimes (i k) (setf smax (max smax (aref sd i))))
+                (setf cutoff (* rcond smax))
+                (dotimes (i k) (when (> (aref sd i) cutoff) (incf rank)))
+                ;; x = V·Σ⁺·U^H·b
+                (let* ((sp (%cl-make-buf (* k k)))
+                       (uhb (vt-matmul (vt-transpose (vt-conj u)) bmat))  ; k×nrhs
+                       (scaled (%cl-make-buf (* k nrhs))))
+                  (declare (type (simple-array (complex double-float) (*)) scaled))
+                  (dotimes (i k)
+                    (when (> (aref sd i) cutoff)
+                      (setf (aref sp (%cl-i k i i))
+                            (complex (/ 1.0d0 (aref sd i)) 0.0d0))))
+                  (dotimes (i k)
+                    (dotimes (j nrhs)
+                      (setf (aref scaled (%cl-i nrhs i j))
+                            (* (aref (vt-data uhb) (%cl-i nrhs i j))
+                               (aref sp (%cl-i k i i))))))
+                  (let* ((scaled-vt (%cl-vt scaled (list k nrhs) :complex128))
+                         (vv (vt-transpose (vt-conj vh)))
+                         (x (vt-matmul vv scaled-vt)))
+                    (values (if b-1d-p (vt-flatten x) x)
+                            (%lstsq-residual av x bmat m n rank)
+                            rank s))))))))))))
 
 
 (defun %cx-op-matrix-rank (v tol)

@@ -1413,15 +1413,20 @@
    「扁平化 + 强制 offset=0」一节。"
   (let* ((m (first (vt-shape a)))
          (k (second (vt-shape a)))
-         (n (second (vt-shape b)))
-         (res (make-vt (list m n) 0 :dtype (vt-dtype a))))
-    (when (plusp (* m k n))
-      (%cx-matmul-run (vt-data a) (vt-data b) (vt-data res)
-                      (the fixnum (vt-offset a))
-                      (the fixnum (vt-offset b))
-                      (the fixnum (vt-offset res))
-                      m k n))
-    res))
+         (n (second (vt-shape b))))
+    ;; 收缩轴校验：本内核按 (m k) (k n) 直接取下标，从不比较 A 的末维与 B 的
+    ;; 倒数第二维 —— 不校验时 (4 4)@(2 2) 会按 k=4 越界读 B 并返回 (4 2) 的
+    ;; 垃圾（VT-MATMUL 的入口校验兜住常规调用，这里兜住 %CX-MATMUL 的其它
+    ;; 调用方，如 %CX-OP-DOT）。
+    (%matmul-check-core a b)
+    (let ((res (make-vt (list m n) 0 :dtype (vt-dtype a))))
+      (when (plusp (* m k n))
+        (%cx-matmul-run (vt-data a) (vt-data b) (vt-data res)
+                        (the fixnum (vt-offset a))
+                        (the fixnum (vt-offset b))
+                        (the fixnum (vt-offset res))
+                        m k n))
+      res)))
 
 ;;; ------------------------------------------------------------------
 ;;; 11.5.1 复数 GEMM 的「行内核」（对照 linalg.lisp 的 %MATMUL-DF-ROWS）
@@ -1733,9 +1738,14 @@
          (a2 (if pad-a (vt-reshape a (list 1 (first sa))) a))
          (b2 (if pad-b (vt-reshape b (list (first sb) 1)) b))
          (ca (vt-contiguous a2)) (cb (vt-contiguous b2))
-         (raw (if (and (= (vt-order ca) 2) (= (vt-order cb) 2))
-                  (%cx-matmul-2d ca cb)
-                  (%cx-batched-matmul ca cb)))
+         ;; 收缩轴校验必须在选路**之前**：批量与 2D 内核都只从 A 取 k，
+         ;; 然后按 k 去读 B —— 不校验就会越界读（见 %CX-MATMUL-2D）。
+         ;; 用 A2/B2 校验（1-D 提升会改变秩，用原始形状会取错轴）。
+         (raw (progn
+                (%matmul-check-core a2 b2)
+                (if (and (= (vt-order ca) 2) (= (vt-order cb) 2))
+                    (%cx-matmul-2d ca cb)
+                    (%cx-batched-matmul ca cb))))
          (rshape (vt-shape raw))
          (drop (remove nil (list (and pad-a (- (length rshape) 2))
                                  (and pad-b (1- (length rshape))))))
