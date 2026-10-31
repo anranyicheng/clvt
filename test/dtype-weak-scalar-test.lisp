@@ -51,6 +51,15 @@
      (report ,name (eq (dt r) ,want)
              (format nil "got ~a want ~a" (dt r) ,want))))
 
+(defmacro expect-sym (name e1 e2)
+  "断言两个表达式的 dtype 相等。用于「同一算子交换操作数顺序」。
+
+   二元算子的提升与顺序无关（`a ⊔ b == b ⊔ a`），只交换顺序就换 dtype
+   说明标量身份在传参途中丢了 —— 这个判据不依赖对照 numpy。"
+  `(let ((a ,e1) (b ,e2))
+     (report ,name (eq (dt a) (dt b))
+             (format nil "张量在前=~a 标量在前=~a" (dt a) (dt b)))))
+
 (defun vals (v)
   (let* ((c (vt-contiguous (vt-ravel v)))
          (d (vt-data c)) (o (the fixnum (vt-offset c))) (n (the fixnum (vt-size c))))
@@ -113,6 +122,126 @@
                     (list (complex 1.0d0 2.0d0) (complex 1.0d0 2.0d0) (complex 1.0d0 2.0d0))))
   (report "i8 + 1 的值仍正确且不溢出"
           (equal (vals (vt-+ (vt-zeros '(3) :dtype :int8) 1)) '(1 1 1))))
+
+;;; ==================================================================
+;;; §16.31.7：自己先算 dtype 再把已 ensure 的值往下传的那批
+;;; ==================================================================
+;;; §16.31.4 只把弱标量接进了 vt-map / vt-fast-map / vt-/ / vt-maximum。
+;;; 下面这些函数各自算 dtype、再交给下游，于是「谁是标量」在传参途中丢失。
+;;; 每条都先断言「交换顺序不改 dtype」（expect-sym），再断言绝对值
+;;; （expect-dtype）—— 只有对称性只能说明「一致地错」，必须两条一起。
+
+(format t "~&-- §16.31.7：交换顺序不许换 dtype --~%")
+
+(let* ((f32 (vt-astype (vt-from-sequence '(1.0 2.0 3.0)) :float32))
+       (i8  (vt-astype (vt-from-sequence '(1 2 3)) :int8))
+       (i32 (vt-astype (vt-from-sequence '(1 2 3)) :int32))
+       (c64 (vt-astype (vt-from-sequence (list #C(1 2) #C(3 4))) :complex64)))
+
+  ;; ---- 对称性：vt-- ----
+  (expect-sym "vt-- f32：交换操作数顺序不改 dtype"
+              (vt-- f32 1.0d0) (vt-- 1.0d0 f32))
+  (expect-sym "vt-- i8：交换操作数顺序不改 dtype"
+              (vt-- i8 1) (vt-- 1 i8))
+  (expect-sym "vt-- i32：交换操作数顺序不改 dtype"
+              (vt-- i32 1) (vt-- 1 i32))
+  (expect-sym "vt-- c64：交换操作数顺序不改 dtype"
+              (vt-- c64 (complex 1.0d0 2.0d0)) (vt-- (complex 1.0d0 2.0d0) c64))
+
+  ;; ---- 对称性：vt-pow ----
+  (expect-sym "vt-pow f32（张量指数）：交换顺序不改 dtype"
+              (vt-pow f32 i32) (vt-pow i32 f32))
+  (expect-sym "vt-pow i8：整数标量底数不改宽度"
+              (vt-pow i8 2) (vt-pow 2 i8))
+
+  ;; ---- 对称性：一元数学的二元形态 ----
+  (expect-sym "vt-atan2 f32：交换顺序不改 dtype"
+              (vt-atan2 f32 1.5d0) (vt-atan2 1.5d0 f32))
+  (expect-sym "vt-hypot f32：交换顺序不改 dtype"
+              (vt-hypot f32 1.5d0) (vt-hypot 1.5d0 f32))
+
+  ;; ---- 对称性：整数族 ----
+  (expect-sym "vt-gcd i8：整数标量不改宽度"
+              (vt-gcd i8 2) (vt-gcd 2 i8))
+  (expect-sym "vt-lcm i8：整数标量不改宽度"
+              (vt-lcm i8 2) (vt-lcm 2 i8))
+
+  ;; ---- 对称性：「以 double 计算」那一族 ----
+  (expect-sym "vt-logaddexp f32：交换顺序不改 dtype"
+              (vt-logaddexp f32 1.5d0) (vt-logaddexp 1.5d0 f32))
+  (expect-sym "vt-copysign f32：交换顺序不改 dtype"
+              (vt-copysign f32 1.5d0) (vt-copysign 1.5d0 f32))
+  (expect-sym "vt-nextafter f32：交换顺序不改 dtype"
+              (vt-nextafter f32 1.5d0) (vt-nextafter 1.5d0 f32))
+  (expect-sym "vt-float-power f32：交换顺序不改 dtype"
+              (vt-float-power f32 2) (vt-float-power 2 f32))
+
+  ;; ---- 三元选择：两个分支各自可能是标量 ----
+  (let ((mask (vt-from-sequence '(1 0 1) :dtype :bool)))
+    (expect-sym "vt-where (cond, f32, 1.5d0)：交换分支不改 dtype"
+                (vt-where mask f32 1.5d0) (vt-where mask 1.5d0 f32))
+    (expect-dtype "vt-where (cond, f32, 1.5d0) → float32（修复前 float64）"
+                  (vt-where mask f32 1.5d0) :float32)
+    (report "vt-where (cond, f32, 1.5d0) 的值正确"
+            (approx-p (vt-where mask f32 1.5d0) '(1.0d0 1.5d0 3.0d0))))
+
+  ;; ---- 绝对值（对称性只能排除「换个顺序就变」，还要钉住「变对了」）----
+  (expect-dtype "vt-- 1.0d0 - f32 数组 → float32（修复前 float64）"
+                (vt-- 1.0d0 f32) :float32)
+  (expect-dtype "vt-- 1 - i8 数组 → int8（修复前 int64）"
+                (vt-- 1 i8) :int8)
+  (expect-dtype "vt-- #C(1 2) - c64 数组 → complex64（修复前 complex128）"
+                (vt-- (complex 1.0d0 2.0d0) c64) :complex64)
+  (expect-dtype "vt-pow 2.0d0 ** f32 数组 → float32（修复前 float64）"
+                (vt-pow 2.0d0 f32) :float32)
+  (expect-dtype "vt-pow 2 ** i8 数组 → int8（修复前 int64）"
+                (vt-pow 2 i8) :int8)
+  (expect-dtype "vt-atan2 f32 遇 double 标量 → float32（修复前 float64）"
+                (vt-atan2 f32 1.5d0) :float32)
+  (expect-dtype "vt-hypot f32 遇 double 标量 → float32（修复前 float64）"
+                (vt-hypot f32 1.5d0) :float32)
+  (expect-dtype "vt-gcd 2 与 i8 数组 → int8（修复前 int64）"
+                (vt-gcd 2 i8) :int8)
+  (expect-dtype "vt-lcm 2 与 i8 数组 → int8（修复前 int64）"
+                (vt-lcm 2 i8) :int8)
+  (expect-dtype "vt-logaddexp 两侧全 f32 → float32（修复前 float64）"
+                (vt-logaddexp f32 f32) :float32)
+  (expect-dtype "vt-copysign 两侧全 f32 → float32（修复前 float64）"
+                (vt-copysign f32 f32) :float32)
+  (expect-dtype "vt-nextafter 两侧全 f32 → float32（修复前 float64）"
+                (vt-nextafter f32 f32) :float32)
+  (expect-dtype "vt-float-power 两侧全 f32 → float32（修复前 float64）"
+                (vt-float-power f32 f32) :float32)
+
+  ;; ---- 值：改的必须是 dtype，不能是数值 ----
+  ;; 参照物用「显式在 float64 下算完再降 f32」，f32 精度内应一致。
+  (report "vt-- 1.0d0 - f32 的值正确"
+          (approx-p (vt-- 1.0d0 f32)
+                    (mapcar (lambda (x) (- 1.0d0 x)) '(1.0d0 2.0d0 3.0d0))))
+  (report "vt-pow 2.0d0 ** f32 的值正确"
+          (approx-p (vt-pow 2.0d0 f32)
+                    (mapcar (lambda (x) (expt 2.0d0 x)) '(1.0d0 2.0d0 3.0d0))))
+  (report "vt-atan2 f32 的值正确（0.785398 ≈ π/4）"
+          (approx-p (vt-atan2 f32 f32)
+                    (list (atan 1.0d0 1.0d0) (atan 2.0d0 2.0d0) (atan 3.0d0 3.0d0))
+                    1d-6))
+  (report "vt-hypot f32 的值正确（sqrt(2)·(1,2,3)）"
+          (approx-p (vt-hypot f32 f32)
+                    (list (sqrt 2.0d0) (* 2 (sqrt 2.0d0)) (* 3 (sqrt 2.0d0)))
+                    1d-6))
+  (report "vt-logaddexp f32 的值正确（log(e^x + e^1.5)）"
+          (approx-p (vt-logaddexp f32 1.5d0)
+                    (mapcar (lambda (x) (log (+ (exp x) (exp 1.5d0))))
+                            '(1.0d0 2.0d0 3.0d0))
+                    1d-6))
+  (report "vt-gcd 2 与 i8 的值正确"
+          (equal (vals (vt-gcd (vt-from-sequence '(12 18 20) :dtype :int8) 2))
+                 '(2 2 2)))
+  (report "vt-lcm 2 与 i8 的值正确"
+          (equal (vals (vt-lcm (vt-from-sequence '(4 6 8) :dtype :int8) 2))
+                 '(4 6 8)))
+  (report "vt-copysign f32 遇 -2.5 的符号位正确（全 -0.0）"
+          (every (lambda (v) (minusp (float-sign v))) (vals (vt-copysign f32 -2.5d0)))))
 
 (format t "~&=====================================~%")
 (format t "Total: ~d / Pass: ~d / Fail: ~d~%" (+ *pass* *fail*) *pass* *fail*)

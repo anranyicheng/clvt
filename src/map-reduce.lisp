@@ -217,6 +217,60 @@
        (%scalar-fits-p (vt-item x) final-dtype)
        (some (lambda (y) (> (vt-size y) 1)) others)))
 
+;;; ------------------------------------------------------------------
+;;; 二元算子的统一入口（NEP 50 弱标量的「最后一公里」）
+;;;
+;;; **为什么与 %WEAK-CAST1 同文件**：本文件就是弱标量机制的家 ——
+;;; `vt-map` / `vt-fast-map` 在这里接 `%op-final-dtype`，单元素预转
+;;; `%weak-cast1` 也在这里。两个封装必须早于 indexing.lisp（`vt-where`）
+;;; 与 elementwise*.lisp（`vt--` / `vt-pow` / `vt-atan2` …），而 map-reduce
+;;; 排在它们全部之前。
+;;;
+;;; 不放在 dtype.lisp：那两个函数要读 `(vt-dtype …)`，`VT` 结构体在
+;;; core.lisp 才定义、core 又排在 dtype 之后。写在 dtype.lisp 里会让
+;;; `(declaim (inline vt-dtype …))` 多出一条「Proclaiming VT-DTYPE to be
+;;; INLINE, but N calls were previously compiled」，把编译体检（§16.34.2，
+;;; STYLE-WARNING 白名单恰好 4 条）判红。
+;;;
+;;; §16.31 把弱标量接进了 `vt-map` / `vt-fast-map` / `vt-/` / `vt-maximum`，
+;;; 但漏掉了**自己先算 dtype 再把已 ensure 的值往下传**的那批函数：
+;;; `vt--`、`vt-pow` 的张量指数分支、`vt-atan2`、`vt-hypot`、`vt-gcd`、
+;;; `vt-lcm`、`vt-logaddexp`、`vt-copysign`、`vt-nextafter`、`vt-float-power`。
+;;; 它们的共同错误是拿 `(vt-dtype (ensure-vt 标量))` 参与 promote ——
+;;; ensure 之后标量成了 float64/complex128 的 0 维张量，身份没了，于是
+;;;   (vt-- f32数组 1.0d0) → f32   但   (vt-- 1.0d0 f32数组) → f64
+;;; **同一算子同一组操作数，只交换顺序就换 dtype** —— 这不是任何提升
+;;; 规则的设计意图，而是「标量身份在传参途中丢失」。
+;;;
+;;; 约定：结果 dtype **只**由「张量 dtype 提升 + 弱标量种类」决定；
+;;; 实现内部用 double 还是 float 计算，是另一件事（`%weak-float-dtype`
+;;; 与「以 double 算」可以并存，见 vt-nextafter）。
+;;; ------------------------------------------------------------------
+
+(declaim (inline %weak-final-dtype))
+(defun %weak-final-dtype (raw-a a raw-b b)
+  "二元算子的结果 dtype。RAW-A / RAW-B 是**原始实参**（可能是 Lisp 标量），
+   A / B 是各自 `ensure-vt` 之后的对象。
+
+   参数必须成对传入，且 RAW 一定要是 ensure 之前的那个值 —— 这是
+   §16.31.4「这个信息只能沿着原始实参传」的同一条教训：`vt-/` 曾因为
+   只改了 dtype 判定、却仍把已 ensure 的 `(first all)` 传下去，导致
+   `f32/2` 依旧升宽。"
+  (%op-final-dtype (list (%scalar-kind raw-a) (%scalar-kind raw-b))
+                   (list (vt-dtype a) (vt-dtype b))))
+
+(declaim (inline %weak-float-dtype))
+(defun %weak-float-dtype (raw-a a raw-b b)
+  "同上，再套一层「数学函数恒出浮点」规则：`%weak-final-dtype` 给出
+   float32 → 保持 float32；其余（float64 / 整型 / 布尔）→ float64。
+
+   即 numpy 的「整型进 float64 出、float32 进 float32 出」，但宽度由
+   **张量**决定、弱标量只贡献种类。缺了后半句就会写成
+   「任一侧是 float64 标量就升宽」，那正是本次要修的病。"
+  (let ((d (%weak-final-dtype raw-a a raw-b b)))
+    (if (eq d :float32) :float32 :float64)))
+
+
 (declaim (inline %weak-cast1))
 (defun %weak-cast1 (x final-dtype others)
   "把「单元素且 dtype 与结果不同」的输入转成结果 dtype，其余原样返回。

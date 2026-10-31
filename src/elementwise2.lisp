@@ -428,9 +428,13 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
          ;; float64 与 float32 混算时 numpy 给 float64（§17.10.24）。原写法
          ;; 会让 (vt-hypot f64 f32) 静默降到 f32，6 位有效数字直接丢在
          ;; 一个「本该最稳」的函数上；整数输入（提升结果不是浮点）才落 f64。
-         (dt (or dtype
-                 (let ((p (vt-promote-type (vt-dtype v1) (vt-dtype v2))))
-                   (if (member p '(:float32 :float64)) p :float64)))))
+         ;;
+         ;; 但「张量之间的混型」与「张量遇弱标量」是两件事（§16.31 NEP 50）：
+         ;; `(vt-hypot f32数组 1.5d0)` 的 1.5d0 是弱标量，只贡献 float 种类、
+         ;; 不贡献宽度，numpy 给 float32。原写法把已 ensure 的 float64 0 维
+         ;; 张量一起 promote，于是恒得 float64。`%weak-float-dtype` 同时
+         ;; 保住上面这条混型规则（全张量时它与 vt-promote-type 等价）。
+         (dt (or dtype (%weak-float-dtype t1 v1 t2 v2))))
     (if (eq dt :float32)
         (vt-fast-map #'%hypot-sf v1 v2 :out out :dtype dt)
         (vt-fast-map #'%hypot-df v1 v2 :out out :dtype dt))))

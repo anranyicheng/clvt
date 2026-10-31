@@ -119,7 +119,13 @@
     (multiple-value-bind (tensors dtype out) (parse-vt-op-args args)
       (when (%bool-arith-p dtype (cons vt tensors))
         (error "vt--: 布尔张量不支持减法/取负（numpy 同样拒绝：布尔减法未定义）。~%  否定请用 vt-logical-not，异或请用 vt-logical-xor；~%  若确实想要整数减法，请显式给出 :dtype :int8 等数值类型。见 CONVENTIONS §17.3"))
-      (let ((all (cons (ensure-vt vt) tensors)))
+      ;; 原始实参**不得**提前 ensure-vt：`(vt-- 1.0d0 f32数组)` 一旦把
+      ;; 首操作数换成 float64 的 0 维张量，弱标量身份就没了，结果升宽成
+      ;; float64 —— 而 `(vt-- f32数组 1.0d0)` 是 float32。同一算子交换
+      ;; 操作数顺序换 dtype 是 §16.31 NEP 50 明令禁止的。`vt-+` / `vt-*`
+      ;; 一直把原始 `tensors` 直接交给 `vt-fast-map`（宏内先绑原始、再
+      ;; ensure），此处对齐它们即可。
+      (let ((all (cons vt tensors)))
         (case (length all)
           (1 (vt-fast-map #'- (first all)
                               :dtype dtype :out out))

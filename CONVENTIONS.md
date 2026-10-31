@@ -3147,6 +3147,121 @@ dtype（`%WEAK-CAST1`）。代价 O(1)，类型检查能过、内联快路径回
 
 套件 `dtype-weak-scalar-test`。逐条断言见该文件头注释；套件说明见 `bash test/run-tests.sh --list`。
 
+#### 16.31.7 剩下的十一个算子（判据：「交换顺序就换 dtype」）
+
+§16.31.4 的表写着「接进四处」，实际只覆盖了 `vt-map` / `vt-fast-map` /
+`vt-/` / `vt-maximum` 家族。**凡是自己先算 dtype、再把已 ensure 的值往下传
+的函数，全都绕过了弱标量。** 本节把它们补齐。
+
+##### 判据：不需要 numpy，只需要交换操作数
+
+二元算子的结果 dtype 与操作数顺序无关（`a ⊔ b == b ⊔ a`）。于是：
+
+```lisp
+(vt-dtype (vt-- f32数组 1.0d0))   ;=> :float32
+(vt-dtype (vt-- 1.0d0 f32数组))   ;=> :float64   ← 只换了顺序
+```
+
+**同一算子、同一组操作数，仅交换顺序就换 dtype**，这不可能出自任何提升
+规则的设计意图 —— 它是「标量身份在传参途中丢失」的直接指纹。这条判据比
+「对照 numpy」更硬：它不依赖对方实现、也不依赖我读对了 numpy 的哪一条规则。
+
+##### 实测：十一处
+
+| 函数 | 修复前（标量在前） | 修复后 = numpy |
+|---|---|---|
+| `vt--` | `(vt-- 1.0d0 f32)` → **f64**；i8/i32 → **int64**；c64 → **c128** | f32 / int8 / int32 / c64 |
+| `vt-pow`（张量指数分支） | `(vt-pow 2.0d0 f32)` → **f64**；`(vt-pow 2 i8)` → **int64** | f32 / int8 |
+| `vt-atan2` | 任一侧有 double 标量 → **f64** | f32 |
+| `vt-hypot` | 同上 | f32 |
+| `vt-gcd` / `vt-lcm` | `(vt-gcd 2 i8数组)` → **int64** | int8 |
+| `vt-logaddexp` | **两侧都是 f32 张量**也返回 f64 | f32 |
+| `vt-copysign` | 同上 | f32 |
+| `vt-nextafter` | 同上 | f32 |
+| `vt-float-power` | 同上 | f32 |
+| `vt-where` | `(vt-where c f32数组 1.5d0)` → **f64** | f32 |
+
+`vt-atan2` / `vt-hypot` 这两处尤其难堪：它们的 docstring 从 v0.4.20 起就
+写着「float32 进 float32 出」，纯张量调用也确实做到了 —— 只有遇到标量才
+失效。文档、实现、测试三者各自只覆盖了对方没覆盖的那半。
+
+##### 三类根因
+
+1. **提前 `ensure-vt`** —— `vt--` 写的是 `(cons (ensure-vt vt) tensors)`。
+   一旦把首操作数换成 float64 的 0 维张量，下游 `vt-fast-map` 再想看「谁是
+   标量」已经晚了。`vt-+` / `vt-*` 一直把**原始** `tensors` 直接交下去
+   （宏内先绑原始、再 ensure），所以它们从来没这个问题 —— 同一个文件里两种
+   写法，只有一种对。
+2. **自己用 `vt-promote-type`** —— `vt-pow` / `vt-atan2` / `vt-hypot` /
+   `vt-gcd` / `vt-lcm` / `vt-where`。`vt-promote-type` 只看 dtype，天然
+   看不见「这曾是一个 Lisp 标量」。
+3. **把 in-dtype 硬编码成 `:float64`** —— `%e3-float-prefer-dtype dtype :float64`
+   那一族（logaddexp / copysign / nextafter / float-power）。
+
+##### 修法：三个辅助函数
+
+```lisp
+(%weak-final-dtype raw-a a raw-b b)
+;; RAW-* 是**原始实参**（可能是 Lisp 标量），A/B 是 ensure-vt 之后的对象。
+;; 成对传入是刻意的：§16.31.4 记过 vt-/ 的教训 —— 只改 dtype 判定、却仍把
+;; 已 ensure 的 (first all) 传下去，f32/2 依旧升宽。
+
+(%weak-float-dtype raw-a a raw-b b)
+;; 再套「数学函数恒出浮点」：float32 → float32，其余 → float64。
+;; 即 numpy 的「整型进 float64 出」，但宽度由张量决定。
+
+(%e3-double-result-dtype dtype raw-x xo raw-y yo)
+;; 给「以 double 计算」的那族用：计算精度与输出 dtype 分开。
+```
+
+`vt--` 的修法最简单：把 `(cons (ensure-vt vt) tensors)` 改成
+`(cons vt tensors)`，与 `vt-+` / `vt-*` 对齐。
+
+##### `vt-where` 的两个分支也是「值位置」
+
+`(vt-where cond f32数组 1.5d0)` 原先把 x/y 都 `ensure-vt` 之后再 promote，
+于是 1.5d0 成了 float64 的 0 维张量，结果升宽 —— numpy 给 float32。
+两处细节：
+
+- `T` / `NIL` 分支经 `branch` 变成 `:bool` 张量，此时**按张量**参与提升，
+  与 `np.where(cond, arr, True)` 的规则一致（`%scalar-kind` 对 `T` 返回
+  NIL，正合此意）；
+- 原始实参必须在 `branch` **之前**保存，否则 `T`/`NIL` 与数字的区分也一起
+  丢了。
+
+##### 「用 double 算」不等于「结果必须是 double」
+
+`vt-nextafter` 的语义要求一格之差的精度，必须用 double 算；但
+`numpy.nextafter(float32数组, 1.5)` 返回 float32。原实现把两件事混成一件：
+
+```lisp
+(%e3-float-prefer-dtype dtype :float64)   ; in-dtype 硬编码 → 恒 f64
+```
+
+现在拆成「输入提到 f64 计算」+「输出 dtype 按 `%weak-final-dtype`」。
+
+这处第一版还栽了一次：`%e3-double-result-dtype` 的入参传的是
+`(%coerce-float-input xo :float64)`（已提精度），判定自然还是 f64 ——
+**为了计算而做的类型提升，把判定的输入也一起改了**。必须传
+`(ensure-vt x)` 的 dtype。修完一测仍全是 FLOAT64，才回头看出是参数给错。
+
+##### 为什么辅助函数落在 `elementwise.lisp` 而不是 `dtype.lisp`
+
+它们要读 `(vt-dtype …)`，而 `VT` 结构体在 `core.lisp` 定义、`core` 又排在
+`dtype` 之后。写在 `dtype.lisp` 里会让 `(declaim (inline vt-dtype …))` 多出
+一条「Proclaiming VT-DTYPE to be INLINE, but N calls were previously
+compiled」，把 `test/run-tests.sh` 的编译体检（§16.34.2，STYLE-WARNING
+白名单恰好 4 条）判红。第一次就是这么红的。
+
+##### 测试
+
+`dtype-weak-scalar-test` 从 14 条扩到 **52 条**，新增三部分：
+- 对称性断言（15 条）：每个修过的算子都跑「张量在前 / 标量在前」两向，要求 dtype 相等；
+- 绝对值断言（14 条）：对称性只能排除「换个顺序就变」，还要钉住「变对了」——
+  例如 `(vt-- 1.0d0 f32数组)` 必须是 float32 而不是「两向一致地错」；
+- 值断言（9 条）：窄 dtype 结果与 double 下算完再降精度的参照在 f32 精度内一致，
+  确认改的只是 dtype、不是数值。
+
 ### 16.32 单一 DEFUN 分派（禁止覆盖式复数层）
 
 > 为什么要拆、三种覆盖机制长什么样、迁移怎么分阶段做的，见 `HISTORY.md` §H.3.5。

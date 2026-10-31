@@ -46,6 +46,26 @@
         ((eq dtype :float64) :float64)
         (t dtype)))                            ; 显式整型目标原样返回
 
+(defun %e3-double-result-dtype (dtype raw-x xo raw-y yo)
+  "「以 double 计算」的那批二元函数（logaddexp / copysign / nextafter /
+   float-power）的输出 dtype。
+
+   两个维度必须分开看：
+     · **计算精度**：这些函数一律先把输入提到 float64 再算（double 精度
+       是它们的语义，`vt-nextafter` 的「一格之差」必须用 double 才看得见）。
+     · **输出 dtype**：由 `%weak-final-dtype` 按 NEP 50 决定 —— 张量宽度
+       说了算，弱标量只贡献种类（§16.31）。
+
+   XO / YO 必须是 `(ensure-vt x)` 而**不是** `(%coerce-float-input xo :float64)`：
+   把已经提到 float64 的值传进来，判定照样得 float64，等于没改。这正是
+   本函数第一版踩的坑 —— 修完 dtype 一测还是 FLOAT64，因为参数给错了。
+
+   原来的写法是 `(%e3-float-prefer-dtype dtype :float64)`，把 in-dtype
+   硬编码成 float64，于是 `(vt-logaddexp f32数组 1.5d0)`、乃至
+   `(vt-logaddexp f32数组 f32数组)` 都返回 float64，numpy 是 float32。
+   「用 double 算」不等于「结果必须是 double」。"
+  (%e3-float-prefer-dtype dtype (%weak-final-dtype raw-x xo raw-y yo)))
+
 (defun %e3-as-1d-float (x)
   "把输入折叠成 1 维 float64 张量（用于 cov / corrcoef 的输入规范化）。"
   (let ((v (ensure-vt x :dtype :float64)))
@@ -780,10 +800,15 @@
 
 (defun vt-logaddexp (x y &key out dtype)
   "逐元素 log(exp(x) + exp(y))，数值稳定（对标 numpy.logaddexp）。
-   整数输入输出 float64。:out 契约同 vt-abs（支持广播）。"
+   整数输入输出 float64，float32 张量进 float32 出（弱标量不升宽，§16.31）。
+   :out 契约同 vt-abs（支持广播）。"
     (when (%cx-reject x y)
     (error "vt-logaddexp: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let ((fn (lambda (a b)
+(let* ((xo (ensure-vt x))
+       (yo (ensure-vt y))
+       (xe (%coerce-float-input xo :float64))
+       (ye (%coerce-float-input yo :float64))
+       (fn (lambda (a b)
               (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
                 (cond ((%nan-p af) af)
                       ((%nan-p bf) bf)
@@ -793,8 +818,8 @@
                       ((%neg-inf-p bf) af)
                       (t (let ((m (max af bf)))
                            (+ m (log (+ 1.0d0 (exp (- (min af bf) m))))))))))))
-    (vt-map fn (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
-            :out out :dtype (%e3-float-prefer-dtype dtype :float64))))
+    (vt-map fn xe ye
+            :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
 
 (defun vt-float-power (x y &key out dtype)
   "逐元素幂运算，结果恒为浮点（对标 numpy.float_power）。
@@ -814,14 +839,18 @@
              (dt (if (vt-complex-dtype-p promoted) promoted :complex128))
              (dt (%cx-result-complex-dtype dt (and dtype dtype) "VT-FLOAT-POWER")))
         (vt-map (function %cx-pow-2) xe ye :out out :dtype dt))))
-  (vt-map (lambda (a b)
-            (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
-              (cond ((%nan-p af) af)
-                    ((%nan-p bf) bf)
-                    ((and (minusp af) (/= bf (floor bf))) (vt-get-nan :float64))
-                    (t (expt af bf)))))
-          (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
-          :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
+  (let* ((xo (ensure-vt x))
+         (yo (ensure-vt y))
+         (xe (%coerce-float-input xo :float64))
+         (ye (%coerce-float-input yo :float64)))
+    (vt-map (lambda (a b)
+              (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
+                (cond ((%nan-p af) af)
+                      ((%nan-p bf) bf)
+                      ((and (minusp af) (/= bf (floor bf))) (vt-get-nan :float64))
+                      (t (expt af bf)))))
+            xe ye
+            :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
 
 (defun %e3-sign-bit-p (x)
   "IEEE 754 符号位判定（含 -0.0 与 NaN 的符号位）。
@@ -835,13 +864,17 @@
    :out 契约同 vt-abs（支持广播）。"
     (when (%cx-reject x y)
     (error "vt-copysign: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-map (lambda (a b)
-            ;; v0.4.1 修复（差分测试 R4）：符号取自 y 的 IEEE 符号位，
-            ;; minusp 无法识别 -0.0（copysign(1,-0.0) 应为 -1.0）。
-            (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
-              (if (%e3-sign-bit-p bf) (- (abs af)) (abs af))))
-          (ensure-vt x :dtype :float64) (ensure-vt y :dtype :float64)
-          :out out :dtype (%e3-float-prefer-dtype dtype :float64)))
+(let* ((xo (ensure-vt x))
+       (yo (ensure-vt y))
+       (xe (%coerce-float-input xo :float64))
+       (ye (%coerce-float-input yo :float64)))
+    (vt-map (lambda (a b)
+              ;; v0.4.1 修复（差分测试 R4）：符号取自 y 的 IEEE 符号位，
+              ;; minusp 无法识别 -0.0（copysign(1,-0.0) 应为 -1.0）。
+              (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
+                (if (%e3-sign-bit-p bf) (- (abs af)) (abs af))))
+            xe ye
+            :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
 
 (defun vt-signbit (tensor &key out)
   "逐元素符号位判定，返回 **:bool** 布尔张量（对标 numpy.signbit，§17）。
@@ -880,13 +913,17 @@
    必须取标量值而不是读打印结果。"
     (when (%cx-reject x y)
     (error "vt-nextafter: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-;; 性能：原来是 (lambda (a b) ...) → vt-map 的 funcall 路径（1M 元素
+  ;; 性能：原来是 (lambda (a b) ...) → vt-map 的 funcall 路径（1M 元素
   ;; 实测 270ms）。%e3-nextafter 已是 inline 函数，直接用 vt-fast-map
-  ;; 内联成二元特化循环；仅显式 :dtype :float32（需要先降精度）保留
+  ;; 内联成二元特化循环；仅结果 dtype 为 :float32（需要先降精度）保留
   ;; 通用路径，保证「double 精度计算、输出降精度」的既有语义不变。
-  (let ((dt (%e3-float-prefer-dtype dtype :float64))
-        (xv (ensure-vt x :dtype :float64))
-        (yv (ensure-vt y :dtype :float64)))
+  ;; 结果 dtype 走 %e3-double-result-dtype：原先把 in-dtype 硬编码成
+  ;; :float64，于是 f32 张量哪怕两侧都是 f32 也返回 float64（§16.31）。
+  (let* ((xo (ensure-vt x))
+         (yo (ensure-vt y))
+         (xv (%coerce-float-input xo :float64))
+         (yv (%coerce-float-input yo :float64))
+         (dt (%e3-double-result-dtype dtype x xo y yo)))
     (if (eq dt :float32)
         (vt-map #'%e3-nextafter xv yv :out out :dtype dt)
         (vt-fast-map #'%e3-nextafter xv yv :out out :dtype dt))))
@@ -945,7 +982,10 @@
       (error "vt-gcd: 仅支持整型输入（收到 ~a / ~a）"
              (vt-dtype xv) (vt-dtype yv)))
     (vt-map (lambda (a b) (%e3-gcd2 (truncate a) (truncate b)))
-            xv yv :out out :dtype (or dtype (vt-promote-type (vt-dtype xv) (vt-dtype yv))))))
+            xv yv :out out
+            ;; 弱标量（NEP 50，§16.31）：`(vt-gcd 2 int8数组)` 应保持 int8，
+            ;; 原写法 promote 已 ensure 的 int64 0 维张量 → 升宽成 int64。
+            :dtype (or dtype (%weak-final-dtype x xv y yv)))))
 
 (defun %e3-lcm2 (a b)
   "非负整数最小公倍数（a,b 均为 0 → 0）。"
@@ -963,7 +1003,9 @@
       (error "vt-lcm: 仅支持整型输入（收到 ~a / ~a）"
              (vt-dtype xv) (vt-dtype yv)))
     (vt-map (lambda (a b) (%e3-lcm2 (truncate a) (truncate b)))
-            xv yv :out out :dtype (or dtype (vt-promote-type (vt-dtype xv) (vt-dtype yv))))))
+            xv yv :out out
+            ;; 同 vt-gcd：弱整数标量不参与宽度判定（§16.31 NEP 50）。
+            :dtype (or dtype (%weak-final-dtype x xv y yv)))))
 
 (defun vt-divmod (x y &key out dtype)
   "逐元素同时返回商与余数（对标 numpy.divmod）。

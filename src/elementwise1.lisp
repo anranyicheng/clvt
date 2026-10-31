@@ -59,21 +59,29 @@
       :out 契约同 vt-+。"
   (when (%cx-any-p vt power)
     (return-from vt-pow (%cx-op-pow vt power :out out :dtype dtype)))
-  (let ((vt (ensure-vt vt)))
+  (let* ((raw-vt vt)                        ; ensure 之前的原始实参，见下
+         (vt (ensure-vt vt)))
     (if (vt-p power)
         ;; ---- 张量指数：逐元素广播幂（自然提升，与 numpy.power 一致）----
-        (let* ((promoted (if dtype
-                             dtype
-                             (vt-promote-type (vt-dtype vt) (vt-dtype power))))
+        ;; 张量指数这条路原本用 `(vt-promote-type (vt-dtype vt) (vt-dtype power))`，
+        ;; 而 vt 已被 ensure-vt —— 于是 `(vt-pow 2.0d0 f32数组)` 的底数是
+        ;; float64 的 0 维张量，弱标量身份丢失，结果升宽成 float64；反过来
+        ;; `(vt-pow f32数组 2)` 走标量指数分支得 float32。交换顺序换 dtype
+        ;; 违反 §16.31 NEP 50。用 `%weak-final-dtype` 按**原始实参**判定。
+        ;;
+        ;; 结果 dtype 必须显式下传：`vt-map` 只看到两个已 ensure 的张量，
+        ;; 让它自己推断等于白算一遍（也是升宽的现场）。全张量输入下
+        ;; `%op-final-dtype` 与 `vt-promote-type` 等价，故不改变既有行为。
+        (let* ((promoted (or dtype (%weak-final-dtype raw-vt vt power power)))
                (int-result (member promoted
                                    '(:int8 :int16 :int32 :int64 :uint8 :uint16)))
                (nan (vt-get-nan :float64)))
           (if int-result
               ;; numpy 整型幂：负整数指数 → 0（C99 pow 后截断为整型）
               (vt-map (lambda (x y) (if (minusp y) 0 (expt x y)))
-                      vt power :out out :dtype dtype)
+                      vt power :out out :dtype promoted)
               (vt-map (lambda (x y) (%pow-op x y nan))
-                      vt power :out out :dtype dtype)))
+                      vt power :out out :dtype promoted)))
         ;; ---- 标量指数：原路径 ----
         (let* ((in-dt (vt-dtype vt))
                (int-pow-p (and (integerp power) (plusp power)))
@@ -415,9 +423,12 @@
     (error "vt-atan2: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (let* ((a (ensure-vt vty))
        (b (ensure-vt vtx))
-       (dt (or dtype
-               (let ((d (vt-promote-type (vt-dtype a) (vt-dtype b))))
-                 (if (eq d :float32) :float32 :float64)))))
+       ;; 弱标量（NEP 50，§16.31）：`(vt-atan2 f32数组 1.5d0)` 应保持
+       ;; float32。原写法 promote 的是两个已 ensure 的值，标量已成
+       ;; float64 0 维张量，于是恒得 float64 —— 与本函数 docstring
+       ;; 「float32 进 float32 出」直接矛盾。`%weak-float-dtype` 已经
+       ;; 就是「float32 或 float64」，不必再套一层判断。
+       (dt (or dtype (%weak-float-dtype vty a vtx b))))
   (vt-fast-map (function atan)
                (%coerce-float-input a dt)
                (%coerce-float-input b dt)

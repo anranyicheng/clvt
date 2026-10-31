@@ -366,37 +366,43 @@
        ;; 与 `ensure-vt` 的 `NIL` 二义性无关 —— 三元选择的两个分支各自
        ;; 只放一个值，`(vt-where b t nil)` 就是 numpy 的
        ;; `np.where(b, True, False)`（结果 :bool），不存在「空分支」这种读法。
-       (flet ((branch (v)
-                (if (or (eq v t) (null v))
-                    (ensure-vt (if v 1 0) :dtype :bool)
-                    (ensure-vt v))))
-         (setf condition (ensure-vt condition)
-               x (branch x)
-               y (branch y)))
-       (let* ((target-shape (vt-broadcast-shapes
-                             (vt-shape condition)
-                             (vt-broadcast-shapes (vt-shape x) (vt-shape y))))
-              (promoted (vt-promote-type (vt-dtype x) (vt-dtype y)))
-              (final-dtype (or dtype promoted))
-              ;; 统一硬契约（H1–H4）：形状/dtype 严格相等/可写
-              ;; 分配用不填充版：下面两条路都会写满每个元素
-              (result (if out
-                          (vt-check-out out target-shape final-dtype
-                                        :op-name "vt-where")
-                          (%alloc-vt target-shape final-dtype)))
-              ;; 快路径前置：结果连续 + 每个输入「要么长度 1（广播），
-              ;; 要么连续且形状与结果相同」，且 x/y/结果同元素类型、掩码为 :int8。
-              ;; 不满足就退回 vt-map 的闭包路径（语义完全一致）。
-              (fast-p (and (vt-contiguous-p result)
-                           (flet ((ok (tv)
-                                    (or (= (vt-size tv) 1)
-                                        (and (vt-contiguous-p tv)
-                                             (equal (vt-shape tv) target-shape)))))
-                             (and (ok condition) (ok x) (ok y))))))
+       ;; RAW-X / RAW-Y 保存 branch 之前的原始实参：弱标量判定必须看它们
+       ;; （§16.31），拿 ensure 之后的 dtype promote 会让
+       ;; `(vt-where cond f32数组 1.5d0)` 升成 float64（numpy 给 float32）。
+       ;; `T`/`NIL` 经 branch 变成 :bool 张量，此时按张量参与提升，
+       ;; 与 `np.where(cond, arr, True)` 的规则一致。
+       (let ((raw-x x) (raw-y y))
+         (flet ((branch (v)
+                  (if (or (eq v t) (null v))
+                      (ensure-vt (if v 1 0) :dtype :bool)
+                      (ensure-vt v))))
+           (setf condition (ensure-vt condition)
+                 x (branch x)
+                 y (branch y)))
+         (let* ((target-shape (vt-broadcast-shapes
+                               (vt-shape condition)
+                               (vt-broadcast-shapes (vt-shape x) (vt-shape y))))
+                (promoted (%weak-final-dtype raw-x x raw-y y))
+                (final-dtype (or dtype promoted))
+                ;; 统一硬契约（H1–H4）：形状/dtype 严格相等/可写
+                ;; 分配用不填充版：下面两条路都会写满每个元素
+                (result (if out
+                            (vt-check-out out target-shape final-dtype
+                                          :op-name "vt-where")
+                            (%alloc-vt target-shape final-dtype)))
+                ;; 快路径前置：结果连续 + 每个输入「要么长度 1（广播），
+                ;; 要么连续且形状与结果相同」，且 x/y/结果同元素类型、掩码为 :int8。
+                ;; 不满足就退回 vt-map 的闭包路径（语义完全一致）。
+                (fast-p (and (vt-contiguous-p result)
+                             (flet ((ok (tv)
+                                      (or (= (vt-size tv) 1)
+                                          (and (vt-contiguous-p tv)
+                                               (equal (vt-shape tv) target-shape)))))
+                               (and (ok condition) (ok x) (ok y))))))
          (unless (and fast-p (%select-fast condition x y result))
            (vt-map (lambda (c a b) (if (/= c 0) a b))
                    condition x y :out result :dtype final-dtype))
-         result)))))
+         result))))))
 
 (defun vt-argwhere (condition &key (dtype :int64))
   "返回非零元素坐标，形状 (n, rank)。"

@@ -4845,3 +4845,103 @@ npy 的 `<u4`/`<u8` 都能产出它。此前：
 | 旁证 | 重叠写 4、整数回绕 6、f32 归约精度 3、bool 归约 4、einsum 形态 3、GEMM ULP，全部对齐 |
 | 新增断言 | `nn-core-sweep-test` 610 条（A–P 十六组） |
 | 套件 | 70/70（新增 `nn-core-sweep-test`） |
+
+---
+
+## H.3.44 弱标量补漏：判据「交换顺序就换 dtype」，与十一个算子
+
+H.3.43 的第九节结论里有一条：「一个二元算子自己算 dtype 时，必须回答三种
+混型分别给什么」。当时只把它当判据写下来，没有回头去查**谁没回答**。
+
+### 一、漏在哪儿
+
+§16.31 的修法表列了四处接入点：`vt-map` / `vt-fast-map` / `vt-/` /
+`vt-maximum` 家族。这四处都是「把原始实参和已 ensure 的值配对」的地方。
+可库里有另一类写法：**函数自己先算 dtype，再把已 ensure 的值交给下游**。
+这类写法完全不经过那四个接入点 —— 标量在进入它们的视野之前就已经变成
+float64 的 0 维张量了。
+
+### 二、判据：不需要 numpy
+
+最初想的是「逐个对照 numpy」，但那要求我先正确理解 numpy 的每一条规则，
+错了也发现不了。换了个更硬的角度：
+
+> 二元算子的提升与操作数顺序无关（`a ⊔ b == b ⊔ a`）。
+> 只交换顺序就换 dtype，一定是标量身份在传参途中丢了。
+
+这个判据自我封闭 —— 不需要外部参照，也不需要读别人的文档。跑一遍
+`(op 张量 标量)` 与 `(op 标量 张量)` 就行。
+
+结果分成两类，后者是「对称性看不出来」的：
+
+| 形态 | 算子 | 为什么能看出来 |
+|---|---|---|
+| 不对称 | `vt--` / `vt-pow` / `vt-gcd` / `vt-lcm` / `vt-where` | 交换顺序就变 |
+| 一致地宽 | `vt-atan2` / `vt-hypot` / `vt-logaddexp` / `vt-copysign` / `vt-nextafter` / `vt-float-power` | 看不出来，要对照 numpy 或 docstring |
+
+第二类里 `vt-atan2` / `vt-hypot` 的 docstring 从 v0.4.20 起就写着「float32
+进 float32 出」，纯张量调用也确实做到了 —— 只有遇到标量才失效。文档、实现、
+测试各自只覆盖了对方没覆盖的那半。
+
+### 三、三个辅助函数，两次自我纠错
+
+```lisp
+(%weak-final-dtype raw-a a raw-b b)   ; 原始 + ensure 后，成对传
+(%weak-float-dtype raw-a a raw-b b)   ; 再套「数学函数恒出浮点」
+(%e3-double-result-dtype dtype raw-x xo raw-y yo)
+```
+
+**纠错一：放错文件。** 最初放在 `src/dtype.lisp`（语义上最像它的家）。编译
+体检立刻红了：`(declaim (inline vt-dtype …))` 在 core.lisp，而 dtype 排在
+core 之前，于是 SBCL 报「Proclaiming VT-DTYPE to be INLINE, but N calls
+were previously compiled」。挪到 `elementwise.lisp` 后又发现 `indexing.lisp`
+（`vt-where`）排在 elementwise **之前**，拿不到这两个函数。最终落在
+`src/map-reduce.lisp` —— 弱标量机制本来就住在这里（`%weak-cast1` 就在隔壁），
+且它早于 indexing 与 elementwise 全体。
+
+**纠错二：参数给错。** `%e3-double-result-dtype` 第一版的入参传的是
+`(%coerce-float-input xo :float64)`，也就是「为了用 double 计算而提过精度」
+的那个值。判定读它，自然还是 float64 —— 修完一测，`vt-logaddexp` 依旧
+返回 FLOAT64。**为了计算而做的类型提升，把判定的输入也一起改了。**
+必须传 `(ensure-vt x)` 的 dtype。
+
+**纠错三（写在文档里之前就抓住了）：把 `vt-mod` 误判为有问题。** CHANGELOG
+初稿写了「`vt-mod` / `vt-rem` 的标量当被除数未修」，实测 `(vt-mod 5.0d0
+f32数组)` 返回 **float32** 数组 —— 完全正确，因为它们把两个原始实参直接
+交给 `vt-map`。这条反例反而印证了根因：错的不是提升规则，是「先把标量
+ensure 掉、再算 dtype」这个动作。
+
+### 四、文件清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/map-reduce.lisp` | 新增 `%weak-final-dtype` / `%weak-float-dtype`（放在 `%weak-cast1` 之前） |
+| `src/elementwise.lisp` | `vt--`：`(cons (ensure-vt vt) tensors)` → `(cons vt tensors)` |
+| `src/elementwise1.lisp` | `vt-pow` 张量指数分支改 `%weak-final-dtype` 并把结果 dtype 显式下传；`vt-atan2` 同上 |
+| `src/elementwise2.lisp` | `vt-hypot` 改 `%weak-float-dtype` |
+| `src/extensions3.lisp` | 新增 `%e3-double-result-dtype`；`vt-logaddexp` / `vt-copysign` / `vt-nextafter` / `vt-float-power` 改为「提精度计算 + 按弱标量定输出」；`vt-gcd` / `vt-lcm` 改 `%weak-final-dtype` |
+| `src/indexing.lisp` | `vt-where` 保存 branch 前的原始实参，用 `%weak-final-dtype` |
+| `test/dtype-weak-scalar-test.lisp` | 14 → 52 条（对称 15 / 绝对值 14 / 值 9 + 原 14） |
+
+### 五、验证
+
+| 项 | 结果 |
+|---|---|
+| 对称性扫描 | 11 个算子 × 多种 dtype（f32 / i8 / i32 / c64 / f64）→ 全部对称 |
+| 弱标量套件 | 52/52 |
+| 全量（`--no-regen-probes`） | 70 个套件 0 失败，含 496 + 405 差分探针、195 项 numpy 逐位校验 |
+| 编译体检 | WARNING 0；STYLE-WARNING 4 条 = 白名单（§16.34.2） |
+
+「全量 0 失败」在这里的作用与别处不同：它证明**值没变**。这批改动只该动
+窄 dtype 的 dtype，一旦有数值漂移就说明动到了计算路径。
+
+### 六、留下的判据
+
+> 一个函数如果在内部先算 dtype，就必须同时拿到「原始实参」的副本。
+> 只要中途 `ensure-vt` 过一次，弱标量语义就再也找不回来了 —— 这不是
+> 「要小心」的问题，是信息已经不存在了。
+
+补完这 11 处之后，全库的二元算子不再有「先 ensure 再算 dtype」的写法。
+`vt-+` / `vt-*` / `vt-/` / `vt-mod` / `vt-rem` 一直是对的，因为它们把原始
+实参直接交给了 `vt-map` / `vt-fast-map` —— 同一件事有两种写法，只有一种
+能保住弱标量语义。
