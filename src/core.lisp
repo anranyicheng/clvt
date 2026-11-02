@@ -984,6 +984,31 @@
            (multiple-value-bind (b-lo b-hi) (span b)
              (and (<= a-lo b-hi) (<= b-lo a-hi)))))))
 
+(defun %vt-same-view-p (a b)
+  "两个 vt 是否为**同一个视图**：同一缓冲区、同一 offset、同一 strides、同一 shape。
+
+   完全相同的视图是唯一「原地逐元素更新安全」的别名形态：写 out[i] 时
+   读的正是刚被写过的 a[i]，不依赖任何尚未读到的源数据，因此
+   `(vt-+ a b :out a)` 可以走逐元素快路径，无需 vt-map 的全局快照。"
+  (and (eq (vt-data a) (vt-data b))
+       (= (vt-offset a) (vt-offset b))
+       (equal (vt-shape a) (vt-shape b))
+       (equal (vt-strides a) (vt-strides b))))
+
+(defun %vt-unsafe-alias-p (out inputs)
+  "OUT 与 INPUTS 的别名中，是否存在**必须**回退到全局快照的那些。
+
+   安全的情形（返回 NIL）：
+     · 输入与 OUT 完全不共享物理区间 —— 无别名；
+     · 与 OUT 重叠的输入**全部**是同一个视图（原地更新）。
+   不安全的情形（返回 T）：存在与 OUT 重叠、但并非同一视图的输入
+   （错位切片、翻转、转置别名），此时逐元素写入会破坏尚未读取的源数据。"
+  (and out
+       (some (lambda (in)
+               (and (not (%vt-same-view-p out in))
+                    (%vt-views-overlap-p out in)))
+             inputs)))
+
 (defun %copy-strided-hi (dest-data dest-dtype dest-strides dest-off
                          src-data src-strides src-off
                          shape size same-dtype)

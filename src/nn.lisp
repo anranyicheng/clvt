@@ -150,6 +150,113 @@
 			(lambda (x) (%relu-single (coerce x 'single-float))))
 		    af :dtype dt :out res))))))
 
+;;; ------------------------------------------------------------------
+;;; 激活/损失的具名算子（性能契约）
+;;;
+;;; `vt-fast-map` 只在 `(function <符号>)` 这种字面形式下展开内联循环；
+;;; 传 `(lambda (x) ...)` 会退化到 `vt-map` 的闭包路径 —— 每元素一次
+;;; funcall + 一次泛型 aref + 一次装箱。1M float64 实测：gelu 65ms（闭包）
+;;; vs 12ms（具名算子内联），softplus 同量级。
+;;;
+;;; 表达式体与本文件原先的 lambda **逐字相同**（连字面量的精度后缀都不改），
+;;; 因此结果的舍入链不变 —— 只是不再为每个元素建立一次函数调用。
+;;;
+;;; 带参数的算子（elu/leaky-relu/bce 的 ALPHA、EPS）把参数绑在特殊变量上：
+;;; `vt-fast-map` 要求算子必须是符号，闭包传不进去。SBCL 的特殊变量绑定
+;;; 是线程局部的，因此并发调用互不干扰（与 `with-float-safe` 的绑定同一机制）。
+;;; ------------------------------------------------------------------
+(defvar *nn-act-param* 1.0d0
+  "带参激活算子的当前参数（ALPHA）。由调用方 let 绑定。")
+
+;;; 表达式体只写一次，按元素类型分别实例化成两个**已知参数类型**的算子。
+;;;
+;;; 为什么必须让编译器知道参数类型：`vt-fast-map` 内联的是「循环 + 直接
+;;; 调用」，而算子自身的算术仍按它自己的编译结果走。参数类型未知时算子体
+;;; 退化成泛型算术（每元素一次装箱 + 泛型分派），1M gelu 实测 86ms —— 比
+;;; 原来的闭包路径还慢。见 `%def-nn-kernel`：现在用 `(coerce x 'lt)` 而不是
+;;; `(declare (type lt x))` 拿到这个类型信息，理由写在宏的 docstring 里。
+;;;
+;;; 为什么 f32 版本**不**先把 x 提升成 double：字面量（0.044715d0 / 0.5d0）
+;;; 本身就把传染后的中间结果带到 double，而 `(* x x x)` 在 single 上先舍入
+;;; 两次。先提升会改变 x³ 的舍入，结果与旧实现不一致 —— 声明的唯一作用是
+;;; 让编译器知道入参类型，不是改精度。
+;;;
+;;; 为什么还要 `(declaim (ftype ...))`：`%softplus-form` 是
+;;; `(if (> x 20) x (log (+ 1 (exp x))))`，SBCL 由它推导出
+;;; `%softplus-df` 的返回类型是 `(double-float 0.0d0)`（softplus 恒非负，
+;;; 推导本身没错），随后按「可信派生类型」在**每个调用点**插一条返回值
+;;; 检查。NaN 不落在这个区间里，于是 `(vt-softplus #(… nan …))` 在通用
+;;; 路径的 `funcall` 之后抛 `TYPE-ERROR … (DOUBLE-FLOAT 0.0d0)` —— 语义上
+;;; 完全合法的 NaN 被拒。显式宣告 ftype 后派生类型以声明为准，不再收窄。
+(defmacro %def-nn-kernel (name args lt ret body)
+  "把 BODY 固化成 ARGS 全为 LT 的算子（参数归一 + safety 0 + 显式 ftype）。
+
+   RET 是**真实的**返回类型（由 `%simple-fun-type` 实测得来），不是猜的：
+   声明必须比编译器推出来的**宽**，且必须覆盖 NaN。`(function (t) RET)` 的
+   形参位置一律写 `t`，见下。
+
+   参数用 `(coerce x ',lt)` 重绑定，而不是 `(declare (type ,lt ,@args))`：
+   `vt-fast-map` 在编译期会把同一个算子编进**全部候选分支**（窄整型掩码、
+   各宽度整型内联循环……），运行期才按 dtype 选。那些分支里的
+   `(aref (simple-array (unsigned-byte 8) (*)) i)` 与 double-float 形参的
+   断言冲突，SBCL 会为每个调用点各报一条 derived-type WARNING，而
+   「零 WARNING 编译」是本库门禁。
+   热路径上参数本来就是 LT（内联循环的数组已声明元素类型），
+   `coerce` 被常量折叠成恒等，不产生任何指令。
+
+   形参位置同样只能写 `t`：写成 LT 等于在每个调用点给实参加了一条类型
+   断言，窄整型分支的 aref 立刻报「derived type 是 (signed-byte 16)，
+   与断言 SINGLE-FLOAT 冲突」（同一个理由，第二次踩）。RET 也不能写成
+   LT：`%gelu-sf` 的字面量是 double，返回值本来就是 double-float，硬说
+   single-float 会报「derived type DOUBLE-FLOAT 与声明冲突」。"
+  `(progn
+     (declaim (ftype (function (t) ,ret) ,name))
+     (defun ,name ,args
+       (declare (optimize (speed 3) (safety 0)))
+       (let ,(mapcar (lambda (a) `(,a (coerce ,a ',lt))) args)
+         ,body))))
+
+(defmacro %nn-act-map (df sf x dt out)
+  "按结果 dtype 选 DF / SF 算子做内联映射（两条分支都是内联循环）。"
+  `(if (eq ,dt :float64)
+       (vt-fast-map (function ,df) ,x :dtype ,dt :out ,out)
+       (vt-fast-map (function ,sf) ,x :dtype ,dt :out ,out)))
+
+(defmacro %leaky-relu-form (x)
+  `(if (> ,x 0.0d0) ,x (* *nn-act-param* ,x)))
+
+(defmacro %softplus-form (x)
+  `(if (> ,x 20.0d0) ,x (log (+ 1.0d0 (exp ,x)))))
+
+(defconstant +gelu-sqrt-2-over-pi+
+  (sqrt (/ 2.0d0 (coerce pi 'double-float)))
+  "GELU tanh 近似的常数 √(2/π)。提成常量而不是在算子体内重算：
+   算子按**每元素**调用一次，体内求值等于给每个元素加一次 sqrt。")
+
+(defmacro %gelu-form (x)
+  `(let* ((x3 (* ,x ,x ,x))
+          (inner (+ ,x (* 0.044715d0 x3)))
+          (tanh-val (tanh (* +gelu-sqrt-2-over-pi+ inner))))
+     (* 0.5d0 ,x (+ 1.0d0 tanh-val))))
+
+;;; RET 取自 `%simple-fun-type` 的实测值（去掉区间收窄的那部分）：
+;;;   leaky-relu 的 `(* *nn-act-param* x)` 里 ALPHA 是**无类型声明的特殊变量**
+;;;   （用户可以传 single/整数），所以乘法在编译器看来可能落进 complex ——
+;;;   声明如实照抄，不为了「好看」把它写成 double-float（那会让传整型
+;;;   ALPHA 的调用变成未定义行为）。
+;;;   gelu 的两个版本都返回 DOUBLE-FLOAT：体里的字面量是 double，且刻意
+;;;   不改成 single（见上文「f32 版本不先提升」那段）。
+(%def-nn-kernel %leaky-relu-df (x) double-float
+  (or double-float (complex double-float)) (%leaky-relu-form x))
+(%def-nn-kernel %leaky-relu-sf (x) single-float
+  (or float (complex single-float) (complex double-float)) (%leaky-relu-form x))
+(%def-nn-kernel %softplus-df  (x) double-float
+  double-float (%softplus-form x))
+(%def-nn-kernel %softplus-sf  (x) single-float
+  (or single-float double-float) (%softplus-form x))
+(%def-nn-kernel %gelu-df       (x) double-float double-float (%gelu-form x))
+(%def-nn-kernel %gelu-sf       (x) single-float double-float (%gelu-form x))
+
 (defun vt-leaky-relu (vt &key (alpha 0.01d0) dtype out)
   "Leaky ReLU 激活：x > 0 时为 x，否则为 alpha * x（ALPHA 缺省 0.01）。
    dtype 语义：缺省按输入推导——float32 进 float32 出、其余（含整数）
@@ -158,10 +265,8 @@
   (when (%cx-reject vt)
     (error "vt-leaky-relu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (let ((dt (%nn-float-dtype vt dtype)))
-    (vt-map (lambda (x) (if (> x 0.0d0)
-			    x
-			    (* alpha x)))
-	    (%nn-as-float vt dt) :dtype dt :out out)))
+    (let ((*nn-act-param* alpha))
+      (%nn-act-map %leaky-relu-df %leaky-relu-sf (%nn-as-float vt dt) dt out))))
 
 (defun vt-swish (vt &key dtype out)
   "Swish / SiLU 激活：x * sigmoid(x)。"
@@ -177,11 +282,7 @@
   (when (%cx-reject vt)
     (error "vt-softplus: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (let ((dt (%nn-float-dtype vt dtype)))
-    (vt-map (lambda (x)
-              (if (> x 20.0d0)
-                  x
-                  (log (+ 1.0d0 (exp x)))))
-            (%nn-as-float vt dt) :dtype dt :out out)))
+    (%nn-act-map %softplus-df %softplus-sf (%nn-as-float vt dt) dt out)))
 
 (defun vt-gelu (vt &key dtype out)
   "GELU 激活（tanh 近似式，对标 PyTorch F.gelu 默认近似）。
@@ -189,14 +290,8 @@
    其余（含整数）进 float64 出。"
   (when (%cx-reject vt)
     (error "vt-gelu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let ((c (sqrt (/ 2.0d0 (coerce pi 'double-float))))
-        (dt (%nn-float-dtype vt dtype)))
-    (vt-map (lambda (x)
-              (let* ((x3 (* x x x))
-		     (inner (+ x (* 0.044715d0 x3)))
-                     (tanh-val (tanh (* c inner))))
-                (* 0.5d0 x (+ 1.0d0 tanh-val))))
-            (%nn-as-float vt dt) :dtype dt :out out)))
+(let ((dt (%nn-float-dtype vt dtype)))
+    (%nn-act-map %gelu-df %gelu-sf (%nn-as-float vt dt) dt out)))
 
 (defun vt-mish (vt &key dtype out)
   "Mish 激活：x * tanh(softplus(x))。"
@@ -242,7 +337,13 @@
       (return-from vt-softmax
         (%nn-empty-result in dtype out "vt-softmax")))
     (let* ((max-val (vt-amax in :axis axis :keepdims t :dtype dtype))
-           (exp-vt (vt-exp (vt-- in max-val :dtype dtype) :dtype dtype))
+           ;; 减最大值与 exp 保持**两趟**：`max-val` 的形状是 (…, 1) 的列广播，
+           ;; `(vt-- in max-val)` 落在 `%sew2` 的 :col 向量循环上（1M 约 1 ms），
+           ;; 而把两者融合成一个标量算子只能走 odometer（exp 无法向量化，
+           ;; 融合后又必须逐元素）、实测 20 ms。多一趟 8 MB 中转换 10 ms+。
+           ;; 表达式与分步写法逐字相同，舍入链不变。
+           (shifted (vt-- in max-val :dtype dtype))
+           (exp-vt (vt-exp shifted :dtype dtype))
            (sum-exp (vt-sum exp-vt :axis axis :keepdims t :dtype dtype)))
       (vt-/ exp-vt sum-exp :dtype dtype :out out))))
 
@@ -255,8 +356,9 @@
         (%nn-empty-result in dtype out "vt-log-softmax")))
     (let* ((max-val (vt-amax in :axis axis :keepdims t :dtype dtype))
            (shifted (vt-- in max-val :dtype dtype))
-           (lse (vt-log (vt-sum (vt-exp shifted :dtype dtype)
-			        :axis axis :keepdims t :dtype dtype)
+           ;; 与 vt-softmax 同一取舍：减法走 :col 向量循环、exp 单独一趟。
+           (exp-vt (vt-exp shifted :dtype dtype))
+           (lse (vt-log (vt-sum exp-vt :axis axis :keepdims t :dtype dtype)
                         :dtype dtype)))
       (vt-- shifted lse :dtype dtype :out out))))
 

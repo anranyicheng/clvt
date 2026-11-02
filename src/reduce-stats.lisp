@@ -1217,6 +1217,33 @@
           (vt-map (lambda (s) (/ s div))
                   sum-result :dtype exec-dtype :out out))))))
 
+;;; (x−mean)² 的具名内核。两处声明分列 df/sf：`vt-fast-map` 只内联
+;;; `(function <符号>)` 字面形式，闭包会退回 vt-map 的逐元素 funcall。
+;; FTYPE 与 %DEF-NN-KERNEL 同因：由体推出的 `(or (member 0.0) (double-float 0.0))`
+;; 把 NaN 排除在外，编译器会据此插返回值检查/做区间假设。声明成全域浮点，
+;; 让「平方必然非负」这条假设不出现在类型系统里。
+(declaim (inline %sq-diff-df %sq-diff-sf))
+(declaim (ftype (function (t t) double-float) %sq-diff-df))
+(declaim (ftype (function (t t) single-float) %sq-diff-sf))
+(defun %sq-diff-df (x y)
+  "方差用的 (x−y)²（double-float）。先减后乘，各一次舍入。
+
+   参数用 COERCE 归一而不是直接声明 `(type double-float x y)`：`vt-fast-map`
+   会把同一个算子编进「窄整型结果」等全部候选分支（编译期给所有分支都生成
+   代码，运行期才选），其中 `(aref (simple-array (unsigned-byte 8) (*)) i)`
+   与 double-float 形参的断言冲突，SBCL 对每个这样的调用点各报一条
+   derived-type WARNING —— 而「零 WARNING 编译」是本库的门禁。
+   两侧已是 double-float 时 `coerce` 被常量折叠成恒等，热路径不受影响。"
+  (declare (optimize (speed 3) (safety 0)))
+  (let ((d (- (coerce x 'double-float) (coerce y 'double-float))))
+    (* d d)))
+
+(defun %sq-diff-sf (x y)
+  "方差用的 (x−y)²（single-float）。COERCE 的理由同 `%sq-diff-df`。"
+  (declare (optimize (speed 3) (safety 0)))
+  (let ((d (- (coerce x 'single-float) (coerce y 'single-float))))
+    (* d d)))
+
 (defun vt-var (tensor &key axis keepdims (ddof 0) dtype out)
   "方差（对标 numpy.var）。
   dtype 语义同 vt-mean（§4.2 H3「严格相等」）。DDOF 为自由度增量（缺省 0，
@@ -1278,8 +1305,14 @@
           (t
            (let* ((mean-val (vt-mean tensor :axis axes :keepdims t
                                      :dtype exec-dtype))
-                  (sq-diff (vt-square (vt-- tensor mean-val :dtype exec-dtype)
-                                      :dtype exec-dtype))
+                  ;; (x−mean)² 一趟算完：原来的 (vt-square (vt-- ...)) 是两趟
+                  ;; 两个全尺寸临时数组。合成一个算子后每个元素仍是「先减后乘、
+                  ;; 各一次舍入」，舍入链与两趟写法逐位相同（不是近似）。
+                  (sq-diff (if (eq exec-dtype :float64)
+                               (vt-fast-map #'%sq-diff-df tensor mean-val
+                                            :dtype exec-dtype)
+                               (vt-fast-map #'%sq-diff-sf tensor mean-val
+                                            :dtype exec-dtype)))
                   (sum-sq (vt-sum sq-diff :axis axes :keepdims keepdims
                                   :dtype exec-dtype))
                   (res (vt-/ sum-sq divisor :dtype exec-dtype)))

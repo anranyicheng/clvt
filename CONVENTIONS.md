@@ -334,6 +334,17 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 - **策略**：一旦检测到输出与任一输入重叠，**先对重叠的输入做快照 `vt-copy`**，再执行计算。
 - 这是**唯一**能保证 `np.add(z, z, out=z[::-1])` 类语义正确的做法（NumPy 实测输出 `[8,6,4,2]`，即先读全量再写）。
 
+**唯一例外（`%vt-same-view-p` / `%vt-unsafe-alias-p`，v0.6.x）**：当重叠的输入与 `out`
+是**同一个视图**（同 `data`、同 `offset`、同 `strides`、同 `shape`）时**不做快照**。
+理由是可判定的：逐元素算子写 `out[i]` 时读的正是同一位置的 `a[i]`，不存在
+「尚未读到的源数据」，写成 memmove 也不会更安全。`(vt-+ a b :out a)`、
+`(vt-* a s :out a)` 这类**原地更新**是 NN 前向/后向的常态写法，此前一律整块
+`vt-copy` 再落到通用闭包循环（1M f64 实测 55 ms，快路径只要 1 ms）。
+
+判定保持保守：只要**存在**一个与 `out` 重叠、且不是同一视图的输入（错位切片、
+翻转、转置别名），仍然走全局快照 —— `(vt-+ z z :out z[::-1])` 的 `[8,6,4,2]`
+语义不变（`test/perf-simd-ew-test.lisp` E 段钉住这两头）。
+
 > **注意**：快路径中的别名处理必须**与通用路径一致**。`%vt-map-run` 的 `same-k` 分支、`vt-fast-map`、SIMD matmul 的 `a-c`/`b-c` 分支都必须执行同一套快照规则。当前 `simd-matmul.lisp` 只比较 `(eq (vt-data out) (vt-data a-c1))`，**只覆盖完全同一 data 指针的情况，漏掉"同 data 但 offset 不同"的重叠**——这是任务3 必须修的缺陷。
 
 ### 4.4 精度解耦（v0.3.6 引入，保留并推广）
@@ -668,6 +679,40 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 | 归约（arg 族） | `%kernel-single-axis` | 单轴 + 存储级 dtype（numpy 的 `argmax`/`argmin` 不接受轴元组；窄整型留在通用路径） | `%kernel-general` |
 | 类型转换 | `vt-astype` 的 `spec` 特化（10×10 + 4×8 窄整型），提成局部函数 `%cast-run` 后**两条落点共用同一张表** | 连续视图 → 整数组一次；非连续且内层 run ≥ `+astype-fuse-min-run+` → 逐 run 一趟直接写目标 | `%gather-contiguous` → 递归 astype（run 太短或未知元素类型） |
 | 连续化 | `%gather-contiguous` | 非连续视图 | 未知元素类型 → `vt-copy-into` |
+
+#### 7.4.1 逐元素 SIMD（`src/simd-ew.lisp`，v0.6.x）
+
+逐元素算术此前走 `%inline*-loop`：1 元素/迭代。1M f64 的 `(vt-+ a b)` 实测
+2.3 ms，而内存带宽允许 0.5 ms —— 差的是指令数不是带宽。
+
+| 项 | 内容 |
+|---|---|
+| 接管点 | `vt-fast-map` 的 n=2 分支，`*simd-ew2-fn*` / `*simd-ew1-fn*` 两个钩子（§8.3 模式：返回 T 表示已写满结果，NIL 交由调用方回退） |
+| 算子 | 二元 `+ - * /` 与 `%sq-diff-{df,sf}`（方差融合内核 `(x−y)²`）；一元 `-` / `abs` / `sqrt` |
+| 宽度 | f64 4 路（`f64.4`）、f32 8 路（`f32.8`），尾块走**同一个标量表达式** |
+| 形态（逐操作数） | `:full` 同形连续 / `:row` 末轴对齐的行广播（`(N,K)∘(K)`）/ `:col` 末轴为 1 的列广播（`(N,K)∘(N,1)`，每行一个标量，行前进 1 个元素）/ `:scalar` 长度 1 / 其余一律 NIL 回退 |
+| 逐位保证 | 只改「一条指令算几个元素」，不改任何单个元素的运算式；取负用符号位异或、绝对值用符号位清零（`0.0 − +0.0` 会给 `+0.0`，而 `(− +0.0)` 必须是 `−0.0`） |
+| 明确排除 | `maximum`/`minimum`/`fmax`/`fmin`（NaN 传播与 ±0 定号跟 AVX maxpd 不一致）、归约（改累加顺序，§7.3）、超越函数（libm 与向量实现末位不同） |
+
+`:col` 是归一化层与偏置的常见形态（`(N,K)` 减 `(N,1)` 的 mean/std），此前因
+「不满足末轴对齐」整段落在 odometer 通用路径上：1M 元素 8 ms → 1 ms，
+`vt-layer-norm` 94 ms → 12 ms。选路与逐位一致由
+`test/perf-simd-ew-test.lisp`（A/B/C/D/E 五段）与 `test/run-tests.sh` 的
+`perf-simd-ew-test` 套件守护。
+
+> **具名标量内核必须显式 `declaim ftype`**。SBCL 会由内核体
+> 推导返回类型，再按「可信派生函数类型」在**每个调用点**插一条返回值检查。
+> `%softplus-df` 的体 `(if (> x 20) x (log (+ 1 (exp x))))` 让返回值被推成
+> `(double-float 0.0d0)`（softplus 恒非负，推导本身没错），而 NaN 不落在
+> 区间里 —— 于是 `(vt-softplus #(… nan …))` 在通用路径的 `funcall` 之后抛
+> `TYPE-ERROR … (DOUBLE-FLOAT 0.0d0)`，合法 NaN 被拒。`%def-nn-kernel` 现在
+> 为每个内核产出 `(declaim (ftype (function (t) RET) name))`，RET 是该内核
+> **实测**的真实返回类型（`%simple-fun-type` 得来），必须比编译器推的宽、且
+> 覆盖 NaN。两个位置都踩过：形参写 LT 会让窄整型分支的 aref 撞上「实参是
+> SINGLE-FLOAT」的断言（一批 WARNING）；RET 一律写 LT 也不行 —— `%gelu-sf`
+> 的字面量是 double，返回值本来就是 double-float。凡是「返回浮点 + 值域会被
+> 编译期推成区间」（log/exp/sqrt 的各种组合）的内核，都要照此办理 —— 这类
+> 失败与输入有关，普通用例全绿也查不出来，只有 NaN/±Inf 探针会红。
 
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 

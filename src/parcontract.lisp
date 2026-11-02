@@ -159,11 +159,17 @@
      若按顺序逐元素读写同一缓冲区，未读取的源数据会被先写的结果覆盖，
      退化为 memmove 的经典错误。numpy 实测该场景输出 [8,6,4,2]，
      即「先读全量、再写」。快照是达到该语义的唯一正确做法。
+
+   例外：输入与 OUT 是**同一个视图**时不需要快照 —— 逐元素写 out[i] 读的
+   正是同一位置的 a[i]（区间与顺序完全重合），没有「尚未读到的源数据」。
+   `(vt-+ a b :out a)` 这类原地更新在 NN 里是常态，为它整块拷贝一次
+   源数据纯属白花一趟内存带宽（1M f64 约 1 ms，且会触发 GC）。
    返回：新的 inputs 列表（顺序不变）。"
   (if (null out)
       inputs
       (mapcar (lambda (in)
-                (if (%vt-views-overlap-p out in)
+                (if (and (not (%vt-same-view-p out in))
+                         (%vt-views-overlap-p out in))
                     (vt-copy in)
                     in))
               inputs)))

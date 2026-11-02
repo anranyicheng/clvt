@@ -944,9 +944,13 @@ def g13():
     add('out-contig-p 步进切片',
         "(if (vt-out-contig-p (vt-slice (vt-zeros '(2 4)) '(:all) '(0 4 2))) 1 0)",
         lambda: np.asarray(0))
-    add('out-snapshot 别名快照',
+    # 同一视图（data/offset/shape/strides 全等）不做快照：逐元素写 out[i]
+    # 读的就是同一位置的 a[i]，不存在「尚未读到的源数据」（CONVENTIONS §4.3
+    # 的唯一例外，为 `(vt-+ a b :out a)` 省掉整块拷贝）。因此这里期望
+    # 「透传原对象」(首项 0)，而错位/翻转视图仍然必须拷贝 —— 见下一条。
+    add('out-snapshot 同一视图不拷贝',
         "(let* ((a (vt-from-sequence (list 1.0d0 2.0d0 3.0d0) :dtype :float64)) (ins (vt-out-snapshot a (list a)))) (list (if (eq (car ins) a) 0 1) (vt-to-list (car ins))))",
-        lambda: np.concatenate([[1], np.array([1, 2, 3])]), 'tol')
+        lambda: np.concatenate([[0], np.array([1, 2, 3])]), 'tol')
     add('out-snapshot 无重叠透传',
         "(let* ((a (vt-from-sequence (list 1.0d0) :dtype :float64)) (o (vt-zeros '(1) :dtype :float64)) (ins (vt-out-snapshot o (list a)))) (if (eq (car ins) a) 1 0))",
         lambda: np.asarray(1))
@@ -1290,6 +1294,25 @@ def g19():
     add('isposinf int输入', f"(vt-isposinf (vt-from-sequence (list 1 2) :dtype :int64))",
         lambda: np.isposinf(np.array([1, 2], dtype=np.int64)))
 
+def g20():
+    """别名快照的边界：同一视图免拷贝（§4.3 唯一例外）之外，一切重叠都要拷贝。
+
+    追加在末尾而不是插进 G13：探针 id 是插入序（p%04d），插队会让后面
+    几百个 id 全部位移，diff 完全不可读。"""
+    # 翻转视图：区间重合但 stride 相反 —— 逐元素「边读边写」会读到刚写过的
+    # 元素，必须快照（否则 x+x->x[::-1] 退化成 memmove 的经典错值）。
+    add('out-snapshot 翻转视图必拷贝',
+        "(let* ((z (vt-from-sequence (list 1.0d0 2.0d0 3.0d0 4.0d0) :dtype :float64))"
+        " (rev (vt-slice z '(3 nil -1))) (ins (vt-out-snapshot z (list rev))))"
+        " (list (if (eq (car ins) rev) 0 1) (vt-to-list (car ins))))",
+        lambda: np.concatenate([[1], np.array([4.0, 3.0, 2.0, 1.0])]), 'tol')
+    # 错位视图（offset 差 1）：区间重叠但不是同一视图 → 必拷贝。
+    add('out-snapshot 错位视图必拷贝',
+        "(let* ((z (vt-from-sequence (list 1.0d0 2.0d0 3.0d0 4.0d0) :dtype :float64))"
+        " (tail (vt-slice z '(1 4))) (ins (vt-out-snapshot z (list tail))))"
+        " (list (if (eq (car ins) tail) 0 1) (vt-to-list (car ins))))",
+        lambda: np.concatenate([[1], np.array([2.0, 3.0, 4.0])]), 'tol')
+
 # =====================================================================
 # 生成与比对（沿用第 1 阶段文件布局，产物加 2 后缀）
 # =====================================================================
@@ -1301,7 +1324,7 @@ def tok1(v):
 
 def cmd_gen():
     g1(); g2(); g3(); g4(); g5(); g6(); g7(); g8(); g9(); g10(); g11(); g12(); g13()
-    g14(); g15(); g16(); g17(); g18(); g19()
+    g14(); g15(); g16(); g17(); g18(); g19(); g20()
     os.makedirs(TMP, exist_ok=True)
     exps = {}
     for cid, desc, lisp, npfn, policy, expect in CASES:

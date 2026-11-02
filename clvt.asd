@@ -47,6 +47,10 @@
                (:file "src/complex-kernels")
                (:file "src/parcontract")
                (:file "src/map-reduce")
+               ;; 逐元素 SIMD 快路径（f64 4 路 / f32 8 路）：紧随 map-reduce，
+               ;; 因为它只通过 §8.3 的钩子变量接入 —— 排在本文件前后都能工作，
+               ;; 放在这里是为了让「选路点 → 实现」的阅读顺序与代码一致。
+               #+sbcl (:file "src/simd-ew")
                (:file "src/io")
                (:file "src/creation")
                (:file "src/manip")

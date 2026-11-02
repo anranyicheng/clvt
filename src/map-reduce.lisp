@@ -9,6 +9,19 @@
 
 (in-package :clvt)
 
+;;; ------------------------------------------------------------------
+;;; SIMD 逐元素钩子（§8.3 快路径钩子模式）
+;;;
+;;; 声明在本文件（选路点所在），由 `simd-ew.lisp` 在加载时 setf 注册。
+;;; 钩子约定与 GEMM 那组一致：返回 T = 已接管，NIL = 回退到标量内联循环。
+;;; 之所以走钩子而不是直接调用，是因为本文件早于 `simd-ew.lisp` 编译 ——
+;;; 直接调用会引入前向依赖（§8.2）。
+;;; ------------------------------------------------------------------
+(defvar *simd-ew2-fn* nil
+  "二元逐元素 SIMD 快路径钩子：(OP A B RES) → T/NIL。")
+(defvar *simd-ew1-fn* nil
+  "一元逐元素 SIMD 快路径钩子：(OP A RES) → T/NIL。")
+
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defparameter +vt-elem-types+
     '(double-float single-float
@@ -883,14 +896,22 @@
              (t (vt-map (function ,op) ,a ,b ,c :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-inline1-fast (op a res)
-  "一元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
+  "一元连续快路径（SIMD → 实数 8 路 + 复数 2 路派发，内联 op）。
+
+   SIMD 钩子排在派发表之前：它只接管「连续 + f64/f32 + 算子属 + - * / abs
+   sqrt」，其余返回 NIL 后继续走下面的标量内联循环 —— 两条路的单个元素
+   表达式相同，故结果逐位相同。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
-       (cond ,@(%elem-type-cond rd '%inline1-loop (list op a res))
-             (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
+       (or (and *simd-ew1-fn* (funcall *simd-ew1-fn* ',op ,a ,res))
+           (cond ,@(%elem-type-cond rd '%inline1-loop (list op a res))
+                 (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res))))))))
 
 (defmacro %vt-inline2-fast (op a b res)
-  "二元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。"
+  "二元连续快路径（实数 8 路 + 复数 2 路派发，内联 op）。
+
+   SIMD 钩子由 `vt-fast-map` 在**进入本宏之前**尝试：它还要覆盖 :row 形态，
+   而本宏的前置条件要求「输入与结果同形」。这里不再重复。"
   (let ((rd (gensym "RD")))
     `(let ((,rd (vt-data ,res)))
        (cond ,@(%elem-type-cond rd '%inline2-loop (list op a b res))
@@ -974,43 +995,59 @@
 ;;; 无法命中时仍回退 vt-map，语义不变（铁律 2）。
 ;;; ==================================================================
 
-(defmacro %mask1-loop (out-lt in-lt op a res)
-  "窄整型输出的一元连续内联循环：读 IN-LT → 算 OP → 按 OUT-LT 回绕写回。"
-  `(let ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
-         (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
-         (p0 (vt-offset ,a))
-         (s0 (if (= (vt-size ,a) 1) 0 1))
-         (n (the fixnum (vt-size ,res)))
-         (op (vt-offset ,res)))
-     (declare (type (simple-array ,out-lt (*)) od)
-              (type (simple-array ,in-lt (*)) d0)
-              (type fixnum p0 s0 n op))
-     (dotimes (i n)
-       (declare (type fixnum i))
-       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0)) ,in-lt))
-       (incf op) (incf p0 s0))))
+(defmacro %mask1-loop (out-lt in-lt op a res &key bool)
+  "窄整型输出的一元连续内联循环：读 IN-LT → 算 OP → 按 OUT-LT 写回。
 
-(defmacro %mask2-loop (out-lt in-lt op a b res)
-  "窄整型输出的二元连续内联循环。"
-  `(let ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
-         (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
-         (d1 (the (simple-array ,in-lt (*)) (vt-data ,b)))
-         (p0 (vt-offset ,a)) (p1 (vt-offset ,b))
-         (s0 (if (= (vt-size ,a) 1) 0 1))
-         (s1 (if (= (vt-size ,b) 1) 0 1))
-         (n (the fixnum (vt-size ,res)))
-         (op (vt-offset ,res)))
-     (declare (type (simple-array ,out-lt (*)) od)
-              (type (simple-array ,in-lt (*)) d0 d1)
-              (type fixnum p0 p1 s0 s1 n op))
-     (dotimes (i n)
-       (declare (type fixnum i))
-       (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))
-       (incf op) (incf p0 s0) (incf p1 s1))))
+   BOOL 语义见 `%mask2-loop`。"
+  (let ((writer (if bool
+                    `(%bool-flag (,op (aref d0 p0)))
+                    `(%cast-to ,out-lt (,op (aref d0 p0)) ,in-lt))))
+    `(let ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
+           (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
+           (p0 (vt-offset ,a))
+           (s0 (if (= (vt-size ,a) 1) 0 1))
+           (n (the fixnum (vt-size ,res)))
+           (op (vt-offset ,res)))
+       (declare (type (simple-array ,out-lt (*)) od)
+                (type (simple-array ,in-lt (*)) d0)
+                (type fixnum p0 s0 n op))
+       (dotimes (i n)
+         (declare (type fixnum i))
+         (setf (aref od op) ,writer)
+         (incf op) (incf p0 s0)))))
 
-(defmacro %mask2-strided (out-lt in-lt op a b res)
+(defmacro %mask2-loop (out-lt in-lt op a b res &key bool)
+  "窄整型输出的二元连续内联循环。
+
+   BOOL 为真时按**布尔真理值**写回（`%bool-flag`：非零 → 1，NaN → 1，
+   −0.0 → 0），而不是 `%cast-to` 的截断。两者的区别只在「算子结果不是 0/1」
+   时显现：`(vt-abs x :dtype :bool)` 的 0.84 截断得 0、真值化得 1，而
+   `vt-map` 走的是真值化 —— 布尔结果必须与它逐位相同。"
+  (let ((writer (if bool
+                    `(%bool-flag (,op (aref d0 p0) (aref d1 p1)))
+                    `(%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))))
+    `(let ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
+           (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
+           (d1 (the (simple-array ,in-lt (*)) (vt-data ,b)))
+           (p0 (vt-offset ,a)) (p1 (vt-offset ,b))
+           (s0 (if (= (vt-size ,a) 1) 0 1))
+           (s1 (if (= (vt-size ,b) 1) 0 1))
+           (n (the fixnum (vt-size ,res)))
+           (op (vt-offset ,res)))
+       (declare (type (simple-array ,out-lt (*)) od)
+                (type (simple-array ,in-lt (*)) d0 d1)
+                (type fixnum p0 p1 s0 s1 n op))
+       (dotimes (i n)
+         (declare (type fixnum i))
+         (setf (aref od op) ,writer)
+         (incf op) (incf p0 s0) (incf p1 s1)))))
+
+(defmacro %mask2-strided (out-lt in-lt op a b res &key bool)
   "窄整型输出 + 任意 strides（含广播）的二元内联循环。"
-  `(let* ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
+  (let ((writer (if bool
+                    `(%bool-flag (,op (aref d0 p0) (aref d1 p1)))
+                    `(%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))))
+    `(let* ((od (the (simple-array ,out-lt (*)) (vt-data ,res)))
           (d0 (the (simple-array ,in-lt (*)) (vt-data ,a)))
           (d1 (the (simple-array ,in-lt (*)) (vt-data ,b)))
           (rs (coerce (vt-strides ,res) 'simple-vector))
@@ -1029,14 +1066,13 @@
               (type simple-vector rs s0 s1 dims)
               (type fixnum rank p0 p1 op))
      (if (= rank 0)
-         (setf (aref od op) (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))
+         (setf (aref od op) ,writer)
          (unless (= (the fixnum (vt-size ,res)) 0)
            (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
              (declare (type (simple-array fixnum (*)) idx))
              (block outer
                (loop
-                 (setf (aref od op)
-                       (%cast-to ,out-lt (,op (aref d0 p0) (aref d1 p1)) ,in-lt))
+                 (setf (aref od op) ,writer)
                  (let ((d (1- rank)))
                    (declare (type fixnum d))
                    (loop
@@ -1051,10 +1087,12 @@
                        (decf op (* dim (svref rs d)))
                        (setf (aref idx d) 0)
                        (decf d)
-                       (when (< d 0) (return-from outer))))))))))))
+                       (when (< d 0) (return-from outer)))))))))))))
 
-(defmacro %vt-mask1-fast (op a res)
-  "一元「窄整型输出」快路径（4 种实数输入 + 2 种复数输入）。"
+(defmacro %vt-mask1-fast (op a res &key bool)
+  "一元「窄整型输出」快路径（4 种实数输入 + 2 种复数输入）。
+
+   BOOL 为真表示结果 dtype 是 `:bool`（物理同为 ub8），写回走真值化。"
   (let ((rd (gensym "RD")) (ea (gensym "EA")))
     `(let* ((,rd (vt-data ,res))
             (,ea (array-element-type (vt-data ,a))))
@@ -1067,10 +1105,10 @@
                              collect
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt))
-                               (%mask1-loop ,olt ,ilt ,op ,a ,res))))
+                               (%mask1-loop ,olt ,ilt ,op ,a ,res :bool ,bool))))
          (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
-(defmacro %vt-mask2-fast (op a b res)
+(defmacro %vt-mask2-fast (op a b res &key bool)
   "二元「窄整型输出」连续快路径（4 种实数输入 + 2 种复数输入）。"
   (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
     `(let* ((,rd (vt-data ,res))
@@ -1086,10 +1124,10 @@
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt)
                                     (equal ,eb ',ilt))
-                               (%mask2-loop ,olt ,ilt ,op ,a ,b ,res))))
+                               (%mask2-loop ,olt ,ilt ,op ,a ,b ,res :bool ,bool))))
          (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
-(defmacro %vt-mask2-strided-fast (op a b res)
+(defmacro %vt-mask2-strided-fast (op a b res &key bool)
   "二元「窄整型输出」+ 非连续/广播快路径（4 种实数输入 + 2 种复数输入）。"
   (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
     `(let* ((,rd (vt-data ,res))
@@ -1105,7 +1143,7 @@
                              `((and (equal (array-element-type ,rd) ',olt)
                                     (equal ,ea ',ilt)
                                     (equal ,eb ',ilt))
-                               (%mask2-strided ,olt ,ilt ,op ,a ,b ,res))))
+                               (%mask2-strided ,olt ,ilt ,op ,a ,b ,res :bool ,bool))))
          (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro vt-fast-map (fn &rest args)
@@ -1160,11 +1198,15 @@
                             (res (if ,out
                                      (vt-check-out ,out out-shape final-dtype
                                                    :op-name "vt-fast-map")
-                                     (make-vt out-shape 0 :dtype final-dtype))))
-                       ;; 别名保护统一走 vt-out-snapshot；重叠时退回 vt-map 全局快照路径
+                                     ;; 不填充分配：下面每条分支都会写满每个元素（含 0 维与 0 长度），
+                                     ;; 先 memset 一趟纯属多一次全量写。
+                                     (%alloc-vt out-shape final-dtype))))
+                       ;; 别名保护统一走 vt-out-snapshot；重叠时退回 vt-map 全局快照路径。
+                       ;; 但「输入就是 out 本身」的原地更新（`(vt-+ a b :out a)`）
+                       ;; 逐元素读写同一位置，不依赖未读数据，可以留在快路径上：
+                       ;; 判据收在 `%vt-unsafe-alias-p`（错位/翻转别名仍然快照）。
 		       (if (and ,out
-                                (some (lambda (in) (%vt-views-overlap-p ,out in))
-                                      (list ,@tvs)))
+                                (%vt-unsafe-alias-p ,out (list ,@tvs)))
                            (vt-map (function ,op) ,@tvs :out ,out :dtype final-dtype)
 			   ,(let* ((dtype-check
                                      `(and ,@(loop for tv in tvs
@@ -1188,19 +1230,22 @@
 								      (equal (vt-shape ,tv) out-shape))))))
 				   ;; 窄整型掩码快路径的适用 dtype。
 				   ;;
-				   ;; `:bool` **不在**这里，也不能加回来。掩码内核对输出只做
-				   ;; `(setf (aref od i) (the (unsigned-byte 8) v))`：v 是 0.84
-				   ;; 时写入 0、是 2 时写入 2。而布尔结果的契约（§17.1、
-				   ;; 以及 `vt-map` 的既有行为）是**真值化**：非零 → 1。
-				   ;; 于是同一个 `(vt-abs x :dtype :bool)`，走 `vt-map` 的
-				   ;; 调用给 (1 …)、走内联/掩码的调用给 (0 …) —— 两条实现
-				   ;; 语义不同，且错的那条恰好是默认路径。
-				   ;; 修法是让布尔结果一律回落到下面的 `vt-map` 分支
-				   ;; （它经 `vt-cast-fun` 写回，`%bool-flag` 自然真值化），
-				   ;; 即「两条路径合一」；代价只有布尔输出的映射少一次内联。
+				   ;; `:bool` 在这里，但必须走 **:bool 变体**的写回形式。
+				   ;; 物理上 `:bool` 与 `:uint8` 同为 (unsigned-byte 8)，
+				   ;; 而掩码内核的普通写回是 `%cast-to`（截断）：v 是 0.84
+				   ;; 时写入 0、是 2 时写入 2。布尔结果的契约却是**真值化**
+				   ;; （§17.1，`vt-map` 经 `vt-cast-fun` 走的正是 `%bool-flag`）：
+				   ;; 于是同一个 `(vt-abs x :dtype :bool)` 会因走哪条路而给出
+				   ;; (1 …) 或 (0 …)。
+				   ;; 现在两条路合一：布尔结果进掩码内核，但写回改走 `%bool-flag`
+				   ;; （宏的 :BOOL 参数），与 `vt-map` 逐位相同 —— 比较/判定类
+				   ;; 算子的结果恒为 0/1 时两条写法等价，真值化只是把「非 0/1
+				   ;; 的算子结果」也归到同一口径。
 				   (maskable
                                      `(member (vt-dtype res)
-					      '(:int8 :int16 :uint8 :uint16))))
+					      '(:int8 :int16 :uint8 :uint16 :bool)))
+				   (bool-mask
+                                     `(eq (vt-dtype res) :bool)))
                               (cond
 				((= n 1)
 				 `(cond
@@ -1209,19 +1254,35 @@
 					 (%vt-inline1-fast ,op ,(first tvs) res)
 					 (%vt-inline1-strided-fast ,op ,(first tvs) res)))
 				    ((and ,simple-check ,maskable)
-				     (%vt-mask1-fast ,op ,(first tvs) res))
+				     (if ,bool-mask
+					 (%vt-mask1-fast ,op ,(first tvs) res :bool t)
+					 (%vt-mask1-fast ,op ,(first tvs) res)))
 				    (t (vt-map (function ,op) ,(first tvs)
 					       :out res :dtype final-dtype))))
 				((= n 2)
 				 `(cond
 				    (,dtype-check
-				     (if ,simple-check
-					 (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
-					 (%vt-inline2-strided-fast ,op ,(first tvs) ,(second tvs) res)))
+				     ;; SIMD 抢在 simple-check 之前：它的 :row 形态
+				     ;; （`(vt-+ A 行向量)` 这类 bias 相加）不满足
+				     ;; simple-check 的「输入与结果同形」，却恰好是
+				     ;; NN 里最常见、也最值得向量化的那一种。
+				     (or (and *simd-ew2-fn*
+					      (funcall *simd-ew2-fn* ',op
+						       ,(first tvs) ,(second tvs) res))
+					 (if ,simple-check
+					     (%vt-inline2-fast ,op ,(first tvs) ,(second tvs) res)
+					     (%vt-inline2-strided-fast ,op ,(first tvs)
+							       ,(second tvs) res))))
 				    (,maskable
-				     (if ,simple-check
-					 (%vt-mask2-fast ,op ,(first tvs) ,(second tvs) res)
-					 (%vt-mask2-strided-fast ,op ,(first tvs) ,(second tvs) res)))
+				     (if ,bool-mask
+					 (if ,simple-check
+					     (%vt-mask2-fast ,op ,(first tvs) ,(second tvs) res
+							     :bool t)
+					     (%vt-mask2-strided-fast ,op ,(first tvs) ,(second tvs) res
+								     :bool t))
+					 (if ,simple-check
+					     (%vt-mask2-fast ,op ,(first tvs) ,(second tvs) res)
+					     (%vt-mask2-strided-fast ,op ,(first tvs) ,(second tvs) res))))
 				    (t (vt-map (function ,op) ,(first tvs) ,(second tvs)
 					       :out res :dtype final-dtype))))
 				(t
