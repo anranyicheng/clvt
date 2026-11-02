@@ -252,22 +252,33 @@
       (:all  `(when (zerop ,val) (setf ,acc 0)))
       (:any  `(when (/= ,val 0) (setf ,acc 1)))
       (:max  (cond ((and skip float)
-                    `(cond ((%nan-p ,val) nil)
-                           ((%nan-p ,acc) (setf ,acc ,casted))
-                           ((> ,val ,acc) (setf ,acc ,casted))))
+                    ;; 跳过 NaN（nanmax）：初值本身就是 NaN（全 NaN 时结果即 NaN），
+                    ;; 所以「acc 是 NaN 且 val 不是」必须替换。与下面的传播写法
+                    ;; 结构相同、NaN 判据互补 —— 快路径都只做一次比较，
+                    ;; NaN 只在「没变大」时才去分辨，省掉原先每元素两次
+                    ;; `%NAN-P` 无条件求值。
+                    `(if (> ,val ,acc)
+                         (setf ,acc ,casted)
+                         (when (and (not (%nan-p ,val)) (%nan-p ,acc))
+                           (setf ,acc ,casted))))
                    ((and prop float)
-                    `(cond ((%nan-p ,acc) nil)
-                           ((%nan-p ,val) (setf ,acc ,casted))
-                           ((> ,val ,acc) (setf ,acc ,casted))))
+                    ;; 传播 NaN（amax）：acc 一旦成为 NaN，后续 `(> val acc)` 恒假，
+                    ;; 自动保持；「首个 NaN 优先」靠慢分支里的 `(%nan-p acc)` 保证。
+                    `(if (> ,val ,acc)
+                         (setf ,acc ,casted)
+                         (when (and (%nan-p ,val) (not (%nan-p ,acc)))
+                           (setf ,acc ,casted))))
                    (t `(when (> ,val ,acc) (setf ,acc ,casted)))))
       (:min  (cond ((and skip float)
-                    `(cond ((%nan-p ,val) nil)
-                           ((%nan-p ,acc) (setf ,acc ,casted))
-                           ((< ,val ,acc) (setf ,acc ,casted))))
+                    `(if (< ,val ,acc)
+                         (setf ,acc ,casted)
+                         (when (and (not (%nan-p ,val)) (%nan-p ,acc))
+                           (setf ,acc ,casted))))
                    ((and prop float)
-                    `(cond ((%nan-p ,acc) nil)
-                           ((%nan-p ,val) (setf ,acc ,casted))
-                           ((< ,val ,acc) (setf ,acc ,casted))))
+                    `(if (< ,val ,acc)
+                         (setf ,acc ,casted)
+                         (when (and (%nan-p ,val) (not (%nan-p ,acc)))
+                           (setf ,acc ,casted))))
                    (t `(when (< ,val ,acc) (setf ,acc ,casted))))))))
 
 (defmacro %op-arg-step (op acc best-i r val lt acc-lt)
@@ -311,8 +322,9 @@
          (init   (%op-init   op lt res-lt))
          (arg-p  (%op-arg-p  op))
          (nan-skip-arg (and arg-p (%op-nan-skip-p op) (subtypep lt 'float))))
-    `(let ((d (the (simple-array ,lt (*)) in-data)))
-       (let ((acc (the ,acc-lt ,init))
+    `(locally (declare (optimize (speed 3) (safety 0)))
+       (let ((d (the (simple-array ,lt (*)) in-data)))
+         (let ((acc (the ,acc-lt ,init))
              ,@(when arg-p `((best-i 0)))
              (p   (the fixnum in-off))
              (end (the fixnum (+ in-off in-size))))
@@ -327,36 +339,70 @@
          ,@(when nan-skip-arg
              `((when (%nan-p acc)
                  (error "~a: All-NaN slice encountered" ',op))))
-         (setf (aref (the (simple-array ,res-lt (*)) res-data) res-off)
-               ,(%cast-form res-lt (if arg-p 'best-i 'acc)))))))
+           (setf (aref (the (simple-array ,res-lt (*)) res-data) res-off)
+                 ,(%cast-form res-lt (if arg-p 'best-i 'acc))))))))
 
 (defmacro %kernel-single-axis (op lt res-lt)
-  "路径 2 的列扫内核：连续 + 归约区可塌成一层（单轴或多轴连续区间）。"
+  "路径 2 的列扫内核：连续 + 归约区可塌成一层（单轴或多轴连续区间）。
+
+   单路 + 指针递增：每轮一次 `(incf p inner)` 取代
+   `(+ in-base (* r inner) i)` 的那次乘法与两次加法。
+   性能的关键不在这里的写法，而在调用点外面那层
+   `(locally (declare (optimize (speed 3) (safety 0))))` —— 见
+   %CONTIG-AXIS-BODY 的说明；没有它每条 `aref` 都带边界比较。
+
+   arg 族（argmax/argmin）与其余算子共用同一模板，只是内层调用
+   %OP-ARG-STEP（额外维护 best-i 与线性下标）。"
   (let* ((acc-lt (%op-acc-lt op lt res-lt))
          (init   (%op-init   op lt res-lt))
          (arg-p  (%op-arg-p  op))
          (nan-skip-arg (and arg-p (%op-nan-skip-p op) (subtypep lt 'float))))
-    `(let ((d  (the (simple-array ,lt (*)) in-data))
-           (od (the (simple-array ,res-lt (*)) res-data))
-           (init-v (the ,acc-lt ,init)))
-       (declare (type fixnum outer red inner))
-       (dotimes (o outer)
-         (let ((in-base (the fixnum (+ in-off (* o red inner)))))
-           (declare (type fixnum in-base))
-           (dotimes (i inner)
-             (let ((acc init-v)
-                   ,@(when arg-p `((best-i 0))))
-               (declare ,@(when arg-p '((type fixnum best-i))))
-               (dotimes (r red)
-                 (let ((v (the ,lt (aref d (the fixnum (+ in-base (* r inner) i))))))
-                   ,(if arg-p
-                        `(%op-arg-step ,op acc best-i r v ,lt ,acc-lt)
-                        `(%op-step ,op acc v ,lt ,acc-lt))))
-               ,@(when nan-skip-arg
-                   `((when (%nan-p acc)
-                       (error "~a: All-NaN slice encountered" ',op))))
-               (setf (aref od (the fixnum (+ res-off (* o inner) i)))
-                     ,(%cast-form res-lt (if arg-p 'best-i 'acc))))))))))
+    (if arg-p
+        ;; ---- arg 族：单路（保持原样）----
+        `(let ((d  (the (simple-array ,lt (*)) in-data))
+               (od (the (simple-array ,res-lt (*)) res-data))
+               (init-v (the ,acc-lt ,init)))
+           (declare (type fixnum outer red inner))
+           (dotimes (o outer)
+             (let ((in-base (the fixnum (+ in-off (* o red inner)))))
+               (declare (type fixnum in-base))
+               (dotimes (i inner)
+                 (let ((acc init-v) (best-i 0))
+                   (declare (type ,acc-lt acc) (type fixnum best-i))
+                   (dotimes (r red)
+                     (let ((v (the ,lt (aref d (the fixnum (+ in-base (* r inner) i))))))
+                       (%op-arg-step ,op acc best-i r v ,lt ,acc-lt)))
+                   ,@(when nan-skip-arg
+                       `((when (%nan-p acc)
+                           (error "~a: All-NaN slice encountered" ',op))))
+                   (setf (aref od (the fixnum (+ res-off (* o inner) i)))
+                         ,(%cast-form res-lt 'best-i)))))))
+        ;; ---- 非 arg：单路 + 指针递增 ----
+        ;;
+        ;; 这里试过「四个输出行并行」，不划算：`%%REDUCE-<NAME>` 是把全部
+        ;; dtype × 全部选路编在一起的巨型函数（`sum` 的反汇编近 5 万行），
+        ;; 再塞进四套累加器与四个索引变量之后寄存器被挤爆 —— 反汇编里每个
+        ;; `(incf c0 inner)` 都退化成「存栈再读回」，实测 safety 1 下
+        ;; 2.05 ms、safety 0 下反而 3.9 ms，比单路还慢。
+        ;; 单路 + 指针递增（每轮一次 `(incf p inner)`，替代
+        ;; `(+ in-base (* r inner) i)` 的一次乘法 + 两次加法）才是净收益。
+        `(let ((d  (the (simple-array ,lt (*)) in-data))
+               (od (the (simple-array ,res-lt (*)) res-data))
+               (init-v (the ,acc-lt ,init)))
+           (declare (type fixnum outer red inner))
+           (dotimes (o outer)
+             (let ((in-base  (the fixnum (+ in-off (* o red inner))))
+                   (out-base (the fixnum (+ res-off (* o inner)))))
+               (declare (type fixnum in-base out-base))
+               (dotimes (i inner)
+                 (let ((acc init-v) (p (the fixnum (+ in-base i))))
+                   (declare (type ,acc-lt acc) (type fixnum p))
+                   (dotimes (r red)
+                     (let ((v (the ,lt (aref d p))))
+                       (%op-step ,op acc v ,lt ,acc-lt))
+                     (incf p inner))
+                   (setf (aref od (the fixnum (+ out-base i)))
+                         ,(%cast-form res-lt 'acc))))))))))
 
 (defconstant +row-acc-min-inner+ 16
   "行累加内核（%KERNEL-ROW-ACC）的启用门槛：内层维 ≥ 16 个元素。
@@ -437,7 +483,14 @@
                               do (setf r (* r (the fixnum (nth i in-shape)))))
                         r)))
           (declare (fixnum a b outer red inner))
-          ,inner-form))))
+          ;; 内核执行区单独放开优化：`%%REDUCE-<NAME>` 整体保留默认 safety
+          ;; （轴解析、dtype 校验、错误报告都在这一层，属 §7 的 API 层），
+          ;; 但下面这段纯下标运算若按 safety 1 编译，每条 `(aref d i)` 都会
+          ;; 生成一次边界比较 + 越界跳转、每次整数加法都跟一条 `JO`，
+          ;; 反汇编里 4 路并行的四个累加器之间还夹着大量栈溢出/回填 ——
+          ;; 实测 1M f64 沿最内轴 2.35 ms，手写同结构 0.45 ms，差额全在这里。
+          (locally (declare (optimize (speed 3) (safety 0)))
+            ,inner-form)))))
 
   (defun %contig-axis-clause (op arg-p dispatch)
     "生成「归约轴连成一段」的那条 COND clause（恒为 1 条，包成列表便于 ,@）。

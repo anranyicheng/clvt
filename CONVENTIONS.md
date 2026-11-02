@@ -714,6 +714,57 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 > 编译期推成区间」（log/exp/sqrt 的各种组合）的内核，都要照此办理 —— 这类
 > 失败与输入有关，普通用例全绿也查不出来，只有 NaN/±Inf 探针会红。
 
+#### 7.4.2 标量幂的专用循环（`vt-pow`）
+
+`vt-pow` 的标量指数分支原先写 `(vt-map (lambda (x) …) vf …)`，1M f64 的
+`(vt-pow a 2.0d0)` 要 **47.7 ms**，而同样表达式的裸循环只要 12.9 ms ——
+差额全在包装层：闭包 `funcall`、循环里反复建立 `handler-case` 的 handler
+栈、以及 `%CAST-TO` 对浮点目标生成的 `(coerce <form> 'double-float)`。
+
+`vt-fast-map` 接不住这条路：它把算子编进**全部**候选分支（窄整型掩码、
+`:bool` 真值化……），内核因此既不能 `declaim inline`（各分支实参元素类型
+互不相同，内联后 `(coerce p 'integer)` 之类会撞类型断言，编译期一串
+WARNING），又必须穿过上面那次 coerce。实测 `vt-fast-map` 版本 31.6 ms。
+
+| 项 | 内容 |
+|---|---|
+| 接管点 | `%pow-scalar-run`（`src/elementwise1.lisp`），在 `vt-pow` 的标量指数分支最先尝试，返回 T/NIL |
+| 分派 | 循环**外**按「元素 dtype × 指数类型」选 4 个具名内核之一：`%pow-run-{df,sf}-{df,sf,int}` |
+| 语义 | 与 `(expt x power)` 逐位相同：不做任何 coerce，指数原样传入（整数指数仍走 CL 的整数幂规则） |
+| 不接管 | 指数浮点类型与元素类型不匹配（f32 张量 × double 指数 —— `(expt single double)` 按 double 算完再舍入，是数值变更）、非连续、in/out dtype 不一致 |
+
+**不做「整数指数 → 乘法链」特化**。实测 `pow(x,2)` 与 `(* x x)` 在 0.05%
+的输入上位不同、`pow(x,3)` 差 8.7%（libm 的 pow 并不对非精确平方退化到
+乘法）。numpy 的 `np.power(arr, 2.0)` 之所以只要 0.45 ms，正是因为它走
+`fast_scalar_power` 的 `a*a` 分支，代价是与 C 库 pow 有 ulp 级差异。
+本库选择与 pow 一致，因此这一项与 numpy 的差距是**语义取舍**，不是待优化项。
+
+#### 7.4.3 归约内核：API 层与数值循环层的优化边界
+
+`%%REDUCE-<NAME>` 是把全部 dtype × 全部选路编在一起的单函数（`sum` 的反汇编
+近 5 万行）。它同时承担轴解析、dtype 校验与 `%reduce-dtype-error` 报错 ——
+这些属于 §7 的 API 层，**整体保留默认 safety**；只把纯下标运算的数值循环
+用 `(locally (declare (optimize (speed 3) (safety 0))))` 放出来。
+
+不加这层时反汇编里每条 `(aref d i)` 都跟一次 `CMP/JAE`（边界比较 + 越界
+跳转），每次整数加法后面都跟一条 `JO`：1M f64 沿最内轴 `sum` 2.0 ms，
+手写同结构循环 1.0 ms，差额全在这里。加上之后：`sum@axis1` 2.0→1.0、
+`amax@axis1` 2.7→0.8、`amax@axis0` 2.05→0.75、`amax` 全归约 1.3→0.65。
+
+配套的两处改动：
+
+- **指针递增**：内层 `(incf p inner)` 取代 `(+ in-base (* r inner) i)` 的
+  一次乘法 + 两次加法。
+- **`%OP-STEP` 的 max/min 判定重排**：先说「比上一个大吗」（一条比较），
+  NaN 只在「没变大」时进慢分支分辨。**注意 nanmax 的累加器初值本身就是
+  NaN**（全 NaN 时结果即 NaN），所以「acc 是 NaN 就替换」这一步不能省 ——
+  `core-test` 的 `vt-nanmax(200)` 一条就抓到过这个错。
+
+| 明确否决 | 原因 |
+|---|---|
+| 四个输出行并行（4 路累加器） | 巨型函数里寄存器被挤爆，`(incf c0 inner)` 退化成存栈再读回：safety 1 下 2.05 ms、safety 0 下反而 3.9 ms，比单路还慢 |
+| `sum` 全归约用多累加器 | 改变累加顺序（§7.3）。1.0 ms 是单条加法依赖链在 1M f64 上的硬件极限，numpy 的 0.27 ms 来自 pairwise summation，两者结果本来就不同 |
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有

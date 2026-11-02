@@ -4,6 +4,76 @@
 
 ---
 
+## 2026-11-03（五十三）— perf: 归约内核关掉边界检查、标量幂绕开闭包 —— 两处「不是算法问题」的浪费
+
+上一轮补完逐元素层之后，与 numpy 差距最大的几项集中在归约与幂：
+`max` 全归约 1.3 ms（numpy 0.12）、`sum@axis1` 2.0 ms、`amax@axis1` 2.6 ms、
+`(vt-pow a 2.0d0)` **47.7 ms**（numpy 0.45）。逐项拆开看，没有一项是
+算法选错，全部是「同样的算法被包装层拖住」：
+
+1. **归约内核每条 `aref` 都带边界检查**。`%%REDUCE-<NAME>` 是把全部
+   dtype × 全部选路编在一起的单函数（`sum` 的反汇编近 5 万行），为保住
+   轴解析/dtype 校验/错误报告这些 API 层职责，整体按默认 safety 编译 ——
+   于是内层数值循环里每次读数组都跟一条 `CMP/JAE`、每次整数加法都跟一条
+   `JO`。手写同结构的裸循环只要一半时间。
+2. **`vt-pow` 的标量指数分支用 `lambda` 调 `vt-map`**。`vt-fast-map` 只在
+   `(function <symbol>)` 字面形式下内联，`lambda` 会退化成闭包 `funcall`，
+   而且循环里每元素还反复建立 `handler-case` 的 handler 栈、再穿过
+   `%CAST-TO` 的 `(coerce <form> 'double-float)`。裸 `expt` 循环 12.9 ms，
+   这条路径 47.7 ms。
+
+**做法**
+
+| 改动 | 位置 |
+|---|---|
+| 归约的数值循环包 `(locally (declare (optimize (speed 3) (safety 0))))`，轴解析与校验仍在默认 safety | `src/reduce-stats.lisp` |
+| 列扫内核内层改指针递增：`(incf p inner)` 取代 `(+ in-base (* r inner) i)` 的乘法 + 两次加法 | `src/reduce-stats.lisp` |
+| `%OP-STEP` 的 max/min 判定重排：先比大小（一条比较），NaN 只在「没变大」时进慢分支分辨 | `src/reduce-stats.lisp` |
+| 新增 `%pow-scalar-run`（连续同形标量幂专用循环），按「元素 dtype × 指数类型」在循环**外**分派 4 个具名内核 | `src/elementwise1.lisp` |
+| `vt-pow` 的标量指数分支先试专用循环，其余形态回落原路径 | `src/elementwise1.lisp` |
+| `%pow-op-{df,sf}`：张量指数分支的 `lambda` 换成具名内核 | `src/elementwise1.lisp` |
+
+**实测（1M f64，AMD EPYC 9754，`bench/bench.lisp`）**
+
+| 算子 | 改前 | 改后 |
+|---|---:|---:|
+| `pow2`（`(vt-pow a 2.0d0)`） | 47.84 | **18.25** |
+| `sum@axis1` / `mean@axis1` | 1.99 / 2.00 | **0.96 / 0.99** |
+| `sum@axis0` | 0.78 | **0.67** |
+| `max@axis1` | 2.63 | **0.75** |
+| `max@axis0` | — | **0.85**（改前 2.05） |
+| `max` 全归约 | 1.31 | **0.65** |
+| `argmax` 全归约 | 1.48 | **1.31** |
+| `sum` 全归约 | 0.99 | 0.98（不动，见下） |
+
+**三处明确不做**（都写进 §7.4.2 / §7.4.3 存档，避免下一轮重复试）：
+
+| 否决项 | 原因 |
+|---|---|
+| `pow` 的「整数指数 → 乘法链」 | 实测 `pow(x,2)` 与 `(* x x)` 在 0.05% 的输入上位不同、`pow(x,3)` 差 8.7%。numpy 的 0.45 ms 来自 `fast_scalar_power` 的 `a*a`，代价是与 C 库 pow 有 ulp 差异；本库选择与 pow 逐位一致，这项差距是语义取舍 |
+| 归约「四个输出行并行」 | 巨型函数里寄存器被挤爆，`(incf c0 inner)` 退化成存栈再读回：safety 1 下 2.05 ms、safety 0 下反而 **3.9 ms**，比单路还慢 |
+| `sum` 全归约用多累加器 | 改变累加顺序（§7.3）。1.0 ms 是单条加法依赖链的硬件极限；numpy 的 0.27 ms 来自 pairwise summation，两者结果本来就不同 |
+
+**踩到的坑**：`%OP-STEP` 重排时把 `(%nan-p acc)` 当成冗余删掉，`core-test`
+的 `vt-nanmax(200)` 立刻红 —— **nanmax 的累加器初值本身就是 NaN**（全 NaN
+时结果即 NaN），所以「acc 是 NaN 就替换成 val」这一步不能省。修法是让
+skip 与 prop 共用「先比较、NaN 判据放慢分支」的对称结构。
+
+**测试**：新增 `test/perf-reduce-pow-test.lisp`（54 断言，登记进
+`test/run-tests.sh` 的 `perf-reduce-pow-test`）—— 五段：`vt-pow` 与逐元素
+`expt` **逐位**对拍（7 种指数 × 17 个特殊值 + 5000 元素长数组 + f32）、
+专用循环的接管判据 9 条（含「f32 × double 指数必须回退」）、归约与**朴素
+顺序参考实现**逐位对拍（sum/prod/max/min/mean × axis 0/1/-1/全局/多轴/
+转置视图）、NaN 跳过与传播（含 nanmax 全 NaN）、窄整型与布尔归约、
+倍率与绝对时间护栏。
+
+`bash test/run-tests.sh`：72 套件全通过，编译体检 0 WARNING。
+
+**破坏性变更**：无。所有改动只换执行路径，不换任何单个元素的运算式与
+累加顺序（`perf-reduce-pow-test` 的 C 段逐位对拍是这条的可执行版本）。
+
+---
+
 ## 2026-11-03（五十二）— perf: 逐元素层补上向量化 —— 1 元素/迭代的标量循环、列广播掉进通用路径、原地更新整块拷贝
 
 §7.4 的快路径清单里，GEMM 与归约有专门内核，**逐元素算术没有**：`vt-+`

@@ -50,6 +50,122 @@
       ;; 9) 常规幂（整数指数 → 精确；负整数指数的整数对由调用方处理）
       (t (expt x y)))))
 
+;;; ---------------------------------------------------------------------------
+;;; 具名幂内核（`vt-pow` 的两条 lambda 换成它们）
+;;;
+;;; 为什么必须具名：`vt-fast-map` 只在 `(function <symbol>)` 字面形式下做
+;;; **编译期内联**，传 `lambda` 会退化成 `vt-map` 的 `funcall` 闭包路径 ——
+;;; 每个元素多一次闭包调用，还在循环里反复建立 `handler-case` 的 handler 栈。
+;;; 1M f64 实测：闭包版 `(vt-pow a 2.0d0)` 47.7 ms，裸 `expt` 循环 12.9 ms，
+;;; 差额 35 ms 全部来自这层包装，与 pow 本身无关。
+;;;
+;;; 语义：与 `(expt x power)` **逐位相同**。这里刻意**不做**「整数指数 →
+;;; 乘法链」的特化 —— 实测 `pow(x,2)` 与 `(x*x)` 有 0.05% 的输入位差、
+;;; `pow(x,3)` 有 8.7%（libm 的 pow 并不对非精确平方退化到乘法）。
+;;; 那是改数值不是提速。numpy 的 `np.power(arr, 2.0)` 之所以只要 0.45 ms，
+;;; 正是因为它走 `fast_scalar_power` 的 `a*a` 分支，代价是与 C 库 pow
+;;; 有 ulp 级差异；本库选择与 pow 一致。
+;;;
+;;; 每个内核都保留原 lambda 的 `realp` 判据：`(expt 负底数 非整数指数)`
+;;; 在实数域无解，CL 允许返回复数，而本函数契约是「实数张量 + NaN」。
+;;; 返回类型不收窄（`(or ...)` 而非 `the`），避免 SBCL 按派生类型在调用点
+;;; 插返回值检查 —— 上一轮 `%softplus-df` 就是被这个坑掉的（NaN 不落在
+;;; 收窄后的区间里，合法输入抛 TYPE-ERROR）。
+(defmacro %def-pow-kernel (name lt ptype)
+  "定义 (X P) → LT 的幂内核；PTYPE 为指数的声明类型（integer 或浮点）。
+
+   实数分支用 `(the ,lt r)` 而不是 `(coerce r ',lt)`：`vt-fast-map` 的
+   内联循环会用 `%CAST-TO` 包一层写回，而它对浮点目标的展开是
+   `(coerce <form> 'single-float)`。若 `<form>` 的类型不可证，这就是
+   每元素一次泛型 COERCE 调用 —— 1M 元素实测 35 ms，而裸 `expt` 循环
+   只要 15 ms。`(expt double double)` 在实数分支只会是 double（浮点
+   expt 不会给出有理数），断言成立且让上层那次 coerce 折叠成恒等。"
+  `(defun ,name (x p)
+     (declare (optimize (speed 3) (safety 0)))
+     (let ((x (coerce x ',lt))
+           (p (coerce p ',ptype)))
+       (let ((r (expt x p)))
+         (if (realp r)
+             (coerce r ',lt)
+             ,(if (eq lt 'double-float) '+vt-dfloat-nan+ '+vt-sfloat-nan+))))))
+
+(%def-pow-kernel %pow-expt-f-df double-float double-float)
+(%def-pow-kernel %pow-expt-f-sf single-float single-float)
+(%def-pow-kernel %pow-expt-i-df double-float integer)
+(%def-pow-kernel %pow-expt-i-sf single-float integer)
+
+(defun %pow-op-df (x y)
+  "`%pow-op` 的 double-float 具名实例（NaN 常量固化成字面量，便于内联）。"
+  (%pow-op x y +vt-dfloat-nan+))
+
+(defun %pow-op-sf (x y)
+  "`%pow-op` 的 single-float 具名实例。"
+  (%pow-op x y +vt-sfloat-nan+))
+
+(defmacro %def-pow-run (name lt ptype nan)
+  "生成「连续同形」标量幂循环：(IN OUT POWER) → 写入 OUT，返回 T。
+
+   POWER 的声明类型必须固化成 PTYPE：`(expt x p)` 在 p 的类型未知时会走
+   expt 的运行时分派，1M 元素实测多 8 ms；声明成 double-float 后 SBCL 直接
+   展开到 libm pow 调用。调用方（`%POW-SCALAR-RUN`）负责先 `typep` 验过，
+   所以这里的 `the` 断言成立。"
+  `(defun ,name (in out power)
+     (declare (optimize (speed 3) (safety 0)))
+     (let ((d  (the (simple-array ,lt (*)) (vt-data in)))
+           (od (the (simple-array ,lt (*)) (vt-data out)))
+           (i0 (the fixnum (vt-offset in)))
+           (o0 (the fixnum (vt-offset out)))
+           (n  (the fixnum (vt-size in)))
+           (pv (the ,ptype power)))
+       (declare (type (simple-array ,lt (*)) d od)
+                (type fixnum i0 o0 n))
+       (loop for i fixnum from 0 below n do
+         (setf (aref od (the fixnum (+ o0 i)))
+               (let ((r (expt (aref d (the fixnum (+ i0 i))) pv)))
+                 (if (typep r ',lt) r ,nan))))
+       t)))
+
+(%def-pow-run %pow-run-df-df  double-float double-float +vt-dfloat-nan+)
+(%def-pow-run %pow-run-df-int double-float integer      +vt-dfloat-nan+)
+(%def-pow-run %pow-run-sf-sf  single-float single-float +vt-sfloat-nan+)
+(%def-pow-run %pow-run-sf-int single-float integer      +vt-sfloat-nan+)
+
+(defun %pow-scalar-run (in out power)
+  "连续、同形、同 dtype 的**标量指数**幂，逐元素写入 OUT。
+   接管返回 T，不适配返回 NIL（§8.3 钩子约定）。
+
+   为什么单开一条循环而不用 `vt-fast-map`：那条路会把算子编进**全部**
+   dtype 分支（窄整型掩码、`:bool` 真值化……），于是内核既不能
+   `declaim inline` —— 各分支里实参的元素类型互不相同，内联后
+   `(coerce p 'integer)` 之类的形式会在别的分支上撞类型断言，编译期直接
+   报一串 WARNING（零 WARNING 是门禁）；又必须穿过 `%CAST-TO` 的
+   `(coerce <form> 'double-float)`。1M f64 实测：`vt-fast-map` 31.6 ms，
+   裸 `expt` 循环 15.4 ms（libm pow 的硬下限，每次约 40 周期）。
+   本循环把类型分派提到**循环外**，体内只剩 `aref` + `expt`。
+
+   语义与 `(expt x power)` 逐位相同：**不做任何 coerce**，POWER 原样
+   传给 expt —— 整数指数仍走 CL 的整数幂规则，不会被悄悄转成浮点指数
+   （`(expt 2.5d0 2)` 与 `(expt 2.5d0 2.0d0)` 并不保证相同）。
+
+   指数类型与元素类型不匹配的组合（f32 张量 × double 指数）一律返回 NIL：
+   `(expt single double)` 按 double 算完再舍入，与 `(expt single single)`
+   的中间精度不同，那属于数值变更而不是提速。"
+  (unless (and (eq (vt-dtype in) (vt-dtype out))
+               (equal (vt-shape in) (vt-shape out))
+               (vt-contiguous-p in)
+               (vt-contiguous-p out))
+    (return-from %pow-scalar-run nil))
+  (let ((dt (vt-dtype in)))
+    (cond ((and (eq dt :float64) (typep power 'double-float))
+           (%pow-run-df-df in out power))
+          ((and (eq dt :float64) (integerp power))
+           (%pow-run-df-int in out power))
+          ((and (eq dt :float32) (typep power 'single-float))
+           (%pow-run-sf-sf in out power))
+          ((and (eq dt :float32) (integerp power))
+           (%pow-run-sf-int in out power))
+          (t nil))))
+
 (defun vt-pow (vt power &key out dtype)
   "逐元素幂 VT**POWER。POWER 为标量指数或张量（张量时逐元素广播幂，
       对标 numpy.power，v0.4.x 起支持）。
@@ -74,14 +190,19 @@
         ;; `%op-final-dtype` 与 `vt-promote-type` 等价，故不改变既有行为。
         (let* ((promoted (or dtype (%weak-final-dtype raw-vt vt power power)))
                (int-result (member promoted
-                                   '(:int8 :int16 :int32 :int64 :uint8 :uint16)))
-               (nan (vt-get-nan :float64)))
+                                   '(:int8 :int16 :int32 :int64 :uint8 :uint16))))
           (if int-result
               ;; numpy 整型幂：负整数指数 → 0（C99 pow 后截断为整型）
               (vt-map (lambda (x y) (if (minusp y) 0 (expt x y)))
                       vt power :out out :dtype promoted)
-              (vt-map (lambda (x y) (%pow-op x y nan))
-                      vt power :out out :dtype promoted)))
+              ;; 实数幂：具名内核 + vt-fast-map 走编译期内联（见 %DEF-POW-KERNEL）。
+              ;; 这一支原本是 lambda，1M f64 实测 47.7 ms，其中 35 ms 是闭包
+              ;; 与 handler-case 的逐元素开销。
+              (if (eq promoted :float32)
+                  (vt-fast-map (function %pow-op-sf) vt power
+                               :out out :dtype promoted)
+                  (vt-fast-map (function %pow-op-df) vt power
+                               :out out :dtype promoted))))
         ;; ---- 标量指数：原路径 ----
         (let* ((in-dt (vt-dtype vt))
                (int-pow-p (and (integerp power) (plusp power)))
@@ -101,12 +222,40 @@
             (int-pow-p
              (vt-map (lambda (x) (expt x power)) vt :out out :dtype dt))
             (t
-             (let ((vf (if (member dt '(:float64 :float32)) vt (vt-astype vt dt))))
-               (vt-map (lambda (x)
-                         (let ((result (handler-case (expt x power)
-                                         (error () nan))))
-                           (if (realp result) result nan)))
-                       vf :out out :dtype dt))))))))
+             (let* ((vf (if (member dt '(:float64 :float32)) vt (vt-astype vt dt)))
+                    (res (or out (%alloc-vt (vt-shape vf) dt))))
+               ;; 连续同形 + 连续 out：专用循环（理由见 %POW-SCALAR-RUN）。
+               ;; 这一条覆盖绝大多数调用（`:out` 或临时结果 + 连续输入），
+               ;; 其余形态（行/列广播、非连续 out）落到下面的内联/闭包路径。
+               (when (%pow-scalar-run vf res power)
+                 (return-from vt-pow res))
+               ;; 快路径的前提：输入已是结果 dtype，且指数的浮点类型与它一致。
+               ;; 不一致时（如 f32 张量 × double 指数）保留原 lambda ——
+               ;; vt-fast-map 会把单元素实参转成结果 dtype，而 `(expt single
+               ;; single)` 与 `(expt single double)` 的中间精度不同（后者按
+               ;; double 算完再舍入），那属于数值变更，不在「只提速」范围内。
+               (if (and (eq (vt-dtype vf) dt)
+                        (if (eq dt :float64)
+                            (or (integerp power) (typep power 'double-float))
+                            (or (integerp power) (typep power 'single-float))))
+                   (cond ((integerp power)
+                          ;; 非正整数指数（0 / 负数）；正整数在 INT-POW-P 分支。
+                          (if (eq dt :float32)
+                              (vt-fast-map (function %pow-expt-i-sf) vf power
+                                           :out out :dtype dt)
+                              (vt-fast-map (function %pow-expt-i-df) vf power
+                                           :out out :dtype dt)))
+                         ((eq dt :float32)
+                          (vt-fast-map (function %pow-expt-f-sf) vf power
+                                       :out out :dtype dt))
+                         (t
+                          (vt-fast-map (function %pow-expt-f-df) vf power
+                                       :out out :dtype dt)))
+                   (vt-map (lambda (x)
+                             (let ((result (handler-case (expt x power)
+                                             (error () nan))))
+                               (if (realp result) result nan)))
+                           vf :out out :dtype dt)))))))))
 
 (defun vt-expt (vt power &key out dtype)
   "vt-pow 的别名（CL 习惯命名）。语义与参数契约见 vt-pow。"

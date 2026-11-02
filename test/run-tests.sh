@@ -73,6 +73,7 @@ SUITES[uncovered-coverage-test]="136 覆盖缺口测试 (此前无任何测试/e
 SUITES[extensions3-test]="261 补充 NumPy 缺失函数测试 + 审查修复回归 (extensions3 + 审查报告 P0/P1/P2 + R-3 整数提升回归)"
 SUITES[fastmap-invariant-test]="24 数学函数快路径不变量测试 (宏展开结构 + 计时上界, 防 vt-fast-map→vt-map 性能回归)"
 SUITES[perf-simd-ew-test]="234 逐元素 SIMD 快路径测试 (二元/一元内核与标量内联逐位对拍·:bool 真值化·融合算子≡分步·行/列广播选路结构 + 倍率护栏)"
+SUITES[perf-reduce-pow-test]="54 标量幂专用循环与归约内核测试 (pow≡逐元素 expt 逐位·接管判据 9 条·归约与朴素顺序参考逐位·NaN 跳过/传播·窄整型/布尔·倍率与绝对时间护栏)"
 SUITES[complex-linalg-test]="216 复数线性代数测试 (46 项 numpy 2.4.6 差分对照: det/inv/solve/cholesky/QR/SVD/厄米特特征值/pinv/lstsq/rank/cond/matrix-power/einsum + 重构&正交&酉恒等式 + MP 四条条件 + 随机/退化/SPD/lstsq 数值压测(108 条, σ²=eig(A^H A) 交叉验证) + :out 与奇异/非正定报错契约 + 实数回归网; 期望由 test/gen_complex_linalg_expected.py 生成)"
 SUITES[setops-axis-trace-test]="56 按轴去重/迹 测试 (37 项 numpy 2.4.6 差分对照: vt-unique :axis 含 return-index/inverse/counts、NaN 行不折叠、非连续视图、退化形状 + vt-trace :offset/:axis1/:axis2 含高维收缩 + 契约断言 + 实数回归网; 期望由 test/gen_setops_axis_expected.py 生成)"
 SUITES[einsum-gemm-layout-test]="36 einsum GEMM 布局归一化 (§16.26: NN/NT/C-转置/兜底 四条路径各档尺寸 + 批量含广播与批量NT + f32/i32/i64/c128/c64 + 转置输入/切片/非连续 :out/小矩阵 + SIMD关与单线程不变; 主断言 = 与 vt-matmul 逐位相等)"
@@ -143,6 +144,7 @@ DEFAULT_ORDER=(
     simd-test
     perf-fastpath-test
     perf-simd-ew-test
+    perf-reduce-pow-test
     test-overlap
     test-copy-into
     test-simd-batch-matmul
