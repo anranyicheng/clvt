@@ -24,6 +24,7 @@
 ;;;; 用法：sbcl --dynamic-space-size 4096 --non-interactive \
 ;;;;             --load test/perf-reduce-pow-test.lisp
 
+(setf *read-default-float-format* 'single-float)
 (require :asdf)
 (defparameter cl-user::*clvt-test-dir*
   (make-pathname :name nil :type nil :defaults *load-truename*))
