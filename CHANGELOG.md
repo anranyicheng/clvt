@@ -4,6 +4,48 @@
 
 ---
 
+## 2026-11-03（五十五）— perf: 单元素访问 / 视图构造 / 连续判定全面提速 1.2~3.2 倍
+
+这一轮不看「跑一个元素多少钱」，只看**每次调用的固定开销**。用 sb-sprof
+剖析 1M 次 `vt-reshape` / `vt-slice` / `vt-ref` 之后，三处根因全部是同一个
+长相：**用泛型序列函数写指针运算**。
+
+| 根因 | 原来 | 现在 | 剖析占比 |
+|---|---|---|---|
+| 形状乘积 | `(reduce #'* shape :initial-value 1)` | 单遍 fixnum 循环 `%shape-product` | `vt-reshape` 42%、`vt-slice` 26% |
+| 索引类型校验 | `(find-if-not #'integerp indices)` 预扫一遍 | 并进指针遍历 | `vt-ref` 32% |
+| 连续判定 | 每轴两次 `NTH`（O(rank²)）+ `(some #'zerop shape)` | 秩 1/2 展开 + 递归返回后缀积（O(rank)） | `vt-contiguous-p` 自身 40% |
+
+顺带把单元素读写的元素分派从「4 次 `(equal (array-element-type data) …)`」
+改成 `(case (vt-dtype vt) …)`，写路径的 `COERCE` 目标类型由分派分支直接给出
+（不再经 `vt-element-type` 的两次 `(member dtype *vt-dtypes*)` 扫描）。
+
+**实测（每项 1M 次调用，min-of-3 进程 × min-of-5 批）**
+
+| 用例 | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| `vt-ref` 1D 连续 | 23.1 ms | 11.7 | **1.95×** |
+| `vt-ref` 2D 连续 / 转置视图 | 35.2 / 35.8 | 17.2 / 17.5 | **2.05×** |
+| `(setf vt-ref)` 2D | 46.1 | 20.4 | **2.26×** |
+| `vt-item` | 1.36 | 0.90 | **1.52×** |
+| `vt-slice` 行 / 块 / 全选 | 66.0 / 77.9 / 65.0 | 53.8 / 63.8 / 53.3 | **1.22×** |
+| `vt-transpose` 2D | 47.5 | 23.4 | **2.03×** |
+| `vt-reshape` 2D→1D | 83.2 | 34.6 | **2.40×** |
+| `vt-flip` axis0 | 54.0 | 33.2 | **1.63×** |
+| `vt-contiguous-p` 连续 / 转置 | 14.0 / 14.4 | 4.67 / 4.57 | **3.1×** |
+
+`vt-ref` 现在与 `%vt-ref-raw` 只差 0.7 ns（逻辑层已贴着内核）。
+拷贝/连续化/astype/逐元素/归约/大块拼接**未改动**，实测都在噪声内。
+
+**明确否决**：`(declaim (inline %make-vt))`（以及 `%shape-product` /
+`%shape-empty-p` 的同款内联）—— 内联后冷编译在 `--dynamic-space-size 4096`
+下 `gc_heap_exhausted`，把 `run-tests.sh` 的编译预算顶爆。
+
+**新增**：`test/access-view-perf-test.lisp`（99 条）—— A 段把形状乘积、
+连续判定、取数、写数（11 种 dtype）、只读判定、视图落地内容、拼接双路径
+与朴素参考实现对拍；B 段用机器无关倍率守住「`vt-ref ÷ %vt-ref-raw`」等
+5 条路线。契约见 `CONVENTIONS.md` §7.4.5，排查过程见 `HISTORY.md` §H.3.48。
+
 ## 2026-11-03（五十四）— perf: 非连续逐元素先换遍历形态再谈向量；向量循环一直带着边界检查跑
 
 上一轮把连续路径与归约都收拾完之后，`HISTORY` §H.3.46 留下的清单还剩三项：

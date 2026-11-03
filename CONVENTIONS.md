@@ -827,6 +827,35 @@ WARNING），又必须穿过上面那次 coerce。实测 `vt-fast-map` 版本 31
 选路结构与逐位一致由 `test/strided-ew-simd-test.lisp`（A–F 六段、143 条）
 守护；套件名 `strided-ew-simd-test`。
 
+#### 7.4.5 指针运算层：尺寸 / 连续判定 / 单元素访问 / 视图构造
+
+这一层（`%SHAPE-PRODUCT`、`VT-CONTIGUOUS-P`、`VT-REF`、`%VT-REF-RAW`、
+`(SETF VT-REF)`、`VT-SLICE`、`VT-TRANSPOSE`、`VT-FLIP`、`VT-RESHAPE`、
+`VT-OUT-WRITABLE-P`）不做数值运算，只在 shape/strides 上做整数运算、
+或读写一个元素。它**不是**「快路径 + 回退」结构（§7.4 的表），而是唯一
+路径 —— 所以它的成本直接等于每个算子的固定开销，约束也不同：
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 尺寸单遍 | 形状乘积走 `%SHAPE-PRODUCT`（单遍 fixnum 循环） | `(reduce #'* shape)` 是泛型归约：每次调用一次 `%COERCE-CALLABLE-TO-FUN`，每个元素一次通用 `*` 分派 |
+| 空判定不打第二趟 | `%SHAPE-EMPTY-P` 单遍；连续判定用「后缀元素数 = 0」向上传播 | `(some #'zerop shape)` 同样是泛型序列函数 + 逐元素 funcall |
+| 连续判定 O(rank) | 秩 1/2 展开；秩 ≥ 3 走 `%C-CONTIGUOUS-BACK`（每轴一次 CDR，递归返回后缀积） | 对每轴调两次 `NTH` 是 O(rank²) 次链表遍历（秩 3 = 6 次） |
+| 单元素访问单遍校验 | `VT-REF` / `(SETF VT-REF)` / `%VT-REF-RAW` 在**指针推进的同一次遍历**里做整数校验、数量校验、越界校验 | 先用 `(find-if-not #'integerp indices)` 预扫一遍，其开销与真正的取数相当 |
+| 元素读写按 dtype 分派 | `(case (vt-dtype vt) …)` | `(equal (array-element-type data) '…)` 每次调用先取一次 `ARRAY-ELEMENT-TYPE`，再比较 4 次类型说明符 |
+| 视图构造秩 1/2 展开 | `VT-TRANSPOSE`（perm=nil）/ `VT-FLIP`（单轴）/ `VT-RESHAPE` / `VT-SLICE` 的常见形态 | 秩 2 缺省转置不必构造 perm、不必分配 seen 位向量；单轴翻转不必 `COPY-LIST` + 两次 `NTH` |
+| 「恰好秩 2」必须写全 | `(and (cdr shape) (null (cddr shape)))` | `(null (cddr shape))` 对秩 1 也为真 —— 会把 `(second shape)` = NIL 当维度用 |
+
+**明确否决（不要再试）**
+
+| 否决项 | 理由 |
+|---|---|
+| `(declaim (inline %make-vt))` | 它有数百个调用点，内联等于把「分配 + 逐槽类型检查」复制到每处；冷编译内存峰值顶爆 `run-tests.sh` 的 `--dynamic-space-size 4096`（`fatal error: gc_heap_exhausted`）。`%SHAPE-PRODUCT` / `%SHAPE-EMPTY-P` 内联同理 |
+| 用 `reduce` / `some` / `find-if*` 写这一层 | 见上表：泛型序列函数的调用开销就是这段代码的主要成本 |
+| 改 `(SETF VT-REF)` 的 `COERCE` 语义 | 写浮点进整型目标报错是既有契约（CL 的 `COERCE` 要求数学值不变）；优化只允许把 `COERCE` 的目标类型从「运行期算出的 `VT-ELEMENT-TYPE`」换成「分派分支里已经确定的字面类型」 |
+
+逐位一致与选路不变量由 `test/access-view-perf-test.lisp`（A 段 62 条
+逐位对拍 + B 段 5 条机器无关倍率）守护；套件名 `access-view-perf-test`。
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有

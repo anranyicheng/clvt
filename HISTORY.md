@@ -5370,3 +5370,157 @@ JA     L5
 > **再慢在没有向量**（内层明明连续，却还在逐元素）。而这两层修完之后回头看，
 > 真正影响面最大的是第三层 —— **向量循环自己也一直带着边界检查**。
 > 一层比一层便宜：拆遍历一百多行，接钩子八十行，删边界检查三行。
+
+---
+
+## H.3.48 第二十八轮：访问、视图、连续性 —— 每个算子都要付的那笔固定开销
+
+前几轮把「跑一个元素多少钱」压到了内存带宽，但**每次调用**的那笔固定开销
+从没单独量过：`vt-ref` 取一个元素、`vt-slice` 切一个视图、`vt-reshape`
+换一个形状，都是几千万次量级的操作。用 sb-sprof 一照，三处根因浮出来，
+全部是「用泛型序列函数写指针运算」。
+
+### 一、`(reduce #'* shape :initial-value 1)`
+
+`vt-size` / `vt-shape-to-size` 原来都是这一行。它是**泛型归约**：每次调用
+先 `%COERCE-CALLABLE-TO-FUN` 造一个 `#'*` 的函数对象，再对每个元素走一次
+通用 `*` 分派。1M 次 `vt-reshape` 的剖析里它占：
+
+| 项 | 占比 |
+|---|---:|
+| `REDUCE` | 23.8% |
+| `*`（通用算术） | 13.6% |
+| `%COERCE-CALLABLE-TO-FUN` | 2.8% |
+| `GENERIC-*` | 1.8% |
+| 合计 | **42%** |
+
+而它算的只是两个 shape 的元素乘积。`vt-slice` 里同一条（`(zerop (vt-size vt))`
+判空）占 26%。
+
+### 二、`(find-if-not #'integerp indices)`
+
+`vt-ref` 在取数**之前**先整表扫一遍校验索引类型：
+
+| `vt-ref`(1M) 的剖析 | 占比 |
+|---|---:|
+| `%FIND-POSITION-IF-NOT` | 22.1% |
+| `INTEGERP` | 6.0% |
+| `IDENTITY` | 3.8% |
+| 合计 | **32%** |
+
+一次元素访问的 32% 花在「确认索引是整数」上，而这件事故障时也要做 ——
+挪进指针遍历里做，代价是零。
+
+### 三、`(nth i shape)` 的 O(rank²) 连续判定
+
+`vt-contiguous-p` 从末轴往前循环，每个轴调两次 `NTH`：秩 3 是 6 次链表
+遍历，秩 6 是 21 次。改成「递归返回后缀积、每轴只走一次 CDR」后，
+rank 6 的绝对代价 55 ns → 15 ns，rank 2 是 19 ns → 3 ns。
+
+顺带把秩 1/2 展开成纯整数比较（视图与拷贝路径的绝对多数都是这两档），
+并把 `(some #'zerop shape)` 预扫并进同一次遍历（0 长度轴用「后缀积 = 0」
+向上传播）。
+
+### 四、改法
+
+| 位置 | 改动 |
+|---|---|
+| `src/core.lisp` | 新增 `%SHAPE-PRODUCT`（单遍 fixnum）、`%SHAPE-EMPTY-P`；`vt-size` / `vt-shape-to-size` 改调前者 |
+| `src/core.lisp` | `vt-contiguous-p` 秩 1/2 展开 + 新增 `%C-CONTIGUOUS-BACK`（递归返回后缀积，0 长度传播） |
+| `src/core.lisp` | `vt-compute-strides` 秩 0/1/2 展开，免掉 `(reverse shape)` 的两次分配 |
+| `src/indexing.lisp` | `%vt-ref-raw` / `vt-ref` / `(setf vt-ref)`：单遍「整数校验 + 数量校验 + 越界校验 + 指针推进」；元素读写按 `(vt-dtype)` 的符号 `CASE` 分派，取代 4 次 `(equal (array-element-type data) …)`；写路径的 `COERCE` 目标类型由分派分支给定，不再走 `vt-element-type`（它内部有两次 `(member dtype *vt-dtypes*)` 线性扫描，剖析里占 20% + 15%） |
+| `src/indexing.lisp` | `vt-slice` 的空判定改 `%SHAPE-EMPTY-P` |
+| `src/manip.lisp` | `vt-reshape` 尺寸只算两次（原三处各算一遍）；`vt-transpose` 秩 2 缺省路径免 perm/seen；`vt-flip` 秩 2 单轴路径免 `COPY-LIST` + 两次 `NTH` |
+| `src/parcontract.lisp` | `vt-out-writable-p` 改单遍双链表 `DO`（原 `loop … never` + `(zerop (vt-size out))`） |
+| `test/access-view-perf-test.lisp` | **新增** 99 条（A 段 62 条逐位对拍 + B 段 5 条倍率护栏 + 报错契约） |
+| `test/run-tests.sh` | 注册 `access-view-perf-test` |
+
+### 五、实测（min-of-3 进程 × min-of-5 批，`--dynamic-space-size 4096`）
+
+| 用例（每项 1M 次调用） | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| `vt-ref` 1D 连续 | 23.1 ms | 11.7 | **1.95×** |
+| `vt-ref` 2D 连续 | 35.2 | 17.2 | **2.04×** |
+| `vt-ref` 2D 转置视图 | 35.8 | 17.5 | **2.05×** |
+| `(setf vt-ref)` 2D | 46.1 | 20.4 | **2.26×** |
+| `vt-item`（×100k） | 1.36 | 0.90 | **1.52×** |
+| `vt-slice` 行 `a[i,:]` | 66.0 | 53.8 | **1.23×** |
+| `vt-slice` 块 `a[i:i+10,5:200:3]` | 77.9 | 63.8 | **1.22×** |
+| `vt-slice` 全选 | 65.0 | 53.3 | **1.22×** |
+| `vt-transpose` 2D | 47.5 | 23.4 | **2.03×** |
+| `vt-reshape` 2D→1D | 83.2 | 34.6 | **2.40×** |
+| `vt-flip` axis0 | 54.0 | 33.2 | **1.63×** |
+| `vt-contiguous-p` 连续 | 14.0 | 4.67 | **3.00×** |
+| `vt-contiguous-p` 转置 | 14.4 | 4.57 | **3.15×** |
+| `vt-contiguous-p` 3D 置换 | 22.1 | 10.4 | **2.13×** |
+
+**没动的那些**（`%vt-ref-raw`、`vt-copy`、`vt-contiguous`、`vt-astype`、
+逐元素、归约、大块拼接）实测都在噪声内：这些是分配/带宽受限的路径，
+本机同一构建连跑三次的离散度就有 1.3~3×（例如 `vt-contiguous(转置 f64)`
+在 0.50 / 1.55 / 1.60 ms 之间跳）。
+
+`%vt-ref-raw` 保持 11.0 ms vs `vt-ref` 11.7 ms —— **逻辑层与物理内核只差
+0.7 ns**，说明这一层已经贴着内核，再往下要么动调用约定，要么动结构体布局。
+
+**与 numpy 2.4.6 同机对照**（numpy 侧用 Python 循环计时，含字节码与 C 分派）
+
+| 操作 | clvt 改前 | clvt 改后 | numpy 2.4.6 |
+|---|---:|---:|---:|
+| 转置视图 `a.T` | 47.5 ns | 23.4 ns | 60 ns |
+| 重塑 `reshape` | 83.2 ns | 34.6 ns | 109 ns |
+| 切片 `a[0:1,:]` | 66.0 ns | 53.8 ns | 90 ns |
+| 取一个元素 `a[0,0]` | 23.1 ns | 11.7 ns | 20 ns |
+| 转置连续化 1M f64 | 1.48 ms | 1.48 ms | **0.745 ms** |
+| 拼接 64 行（64×1000） | 29 µs | 25 µs | **11 µs** |
+
+视图创建这一列 clvt 更快的**结构原因**是调用路径：numpy 每次都要构造一个
+Python 对象再走 C 分派，clvt 只是一次 Lisp 函数调用 + 一次结构体分配。
+这不是「实现更优」，跨语言比这一列要打折看。
+
+反过来，「转置连续化」与「小规模拼接」numpy 快 1.6~2.3 倍 —— 这两条都落在
+`%GATHER-CONTIGUOUS` 与 `VT-CONCATENATE` 的非连续分支上（分块/预取策略），
+本轮没有动，属于**已知未关的差距**。
+
+### 六、一次否决：`(declaim (inline %make-vt))`
+
+剖析里 `%MAKE-VT` 占 `vt-slice` 的 25%、`vt-flip` 的 34%（6 槽结构体 +
+逐槽类型检查 + 调用的实参装配），看起来内联是稳赚。加上之后：
+
+```
+fatal error encountered in SBCL pid ... "sbcl"
+   3: Foreign function gc_heap_exhausted_error_or_lose
+```
+
+冷编译在 `--dynamic-space-size 4096`（`run-tests.sh` 的预算）下直接崩。
+逐个排查发现同样的还有 `%SHAPE-PRODUCT` / `%SHAPE-EMPTY-P` —— 它们有
+数百个调用点，内联等于把「单遍循环 + 逐元素类型检查」抄到每一处。
+三个 `DECLAIM INLINE` 全撤，只在文档里写清「不要再试」。
+
+> 排查顺序上还踩过一次误判：先怀疑 `(setf vt-ref)` 里那个 11 分支的
+> `macrolet`，把它改回单值 `cval` 之后 4096MB 仍然崩 —— 真正的原因在
+> core.lisp 的三个内联声明。
+
+### 七、一次差点写错：`(null (cddr shape))` 不是「秩 2」
+
+新加的秩 2 快速路径判据最初写成 `(null (cddr shape))`。它对**秩 1** 也
+为真（单元素列表的 `cddr` 是 NIL），于是 `(vt-flip v1d :axis 0)` 走进秩 2
+分支，`(cadr shape)` 读出 NIL：
+
+```
+The value NIL is not of type FIXNUM when binding CLVT::D1
+```
+
+`vt-transpose` 的同类判据会把秩 1 张量转成形状 `(NIL NIL)`。
+正确写法是 `(and (cdr shape) (null (cddr shape)))`。
+
+这个错是**新写的 A2 段（21 种视图形态 × 参考实现对拍）在第一次运行时就
+抓到的**，不是靠事后 review —— 这类「秩退化」的判据错误在功能测试里通常
+表现为「某个秩下直接报类型错误」，而现有套件几乎不覆盖秩 1 的
+`vt-flip` / `vt-transpose` 组合。
+
+### 八、一句话
+
+> 指针运算层的性能问题有个共同长相：**用泛型序列函数写整数运算**
+> （`reduce` / `some` / `find-if` / `nth`）。它们在语义上完全正确、在
+> 代码里也最自然，但每一个都带着「造函数对象 + 逐元素分派」的固定成本，
+> 而这一层恰恰是**每个算子都要付一次**的地方。

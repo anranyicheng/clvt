@@ -23,10 +23,16 @@
   (offset 0 :type fixnum)
   (dtype :float64 :type symbol))
 
-(declaim (inline vt-shape vt-strides vt-offset vt-data vt-dtype
-                 vt-order vt-size))
+(declaim (inline vt-shape vt-strides vt-offset vt-data vt-dtype vt-order vt-size))
 ;; VT-P 不列入：结构体访问器由 SBCL 在 layout 已知时自动内联，显式
 ;; DECLAIM 只会得到「Proclaiming VT-P to be INLINE, but 1 call …」告警。
+;;
+;; %MAKE-VT / %SHAPE-PRODUCT / %SHAPE-EMPTY-P **不**内联（实测否决）：
+;; 它们被 30 个源文件的数百个调用点引用，内联等于把「分配 + 逐槽类型检查」
+;; 或「单遍循环 + 逐元素类型检查」整份复制到每个调用点 —— 编译内存峰值
+;; 直接把 run-tests.sh 的 --dynamic-space-size 4096 顶爆（fatal error:
+;; gc_heap_exhausted）。省下的那次函数调用换不回整个库的编译预算。
+;; VT-SIZE 保留内联：它的体只有一个已知函数的调用，代价可忽略。
 
 ;;; ------------------------------------------------------------------
 ;;; 访问器与尺寸
@@ -40,14 +46,38 @@
   "张量的维度数（秩）。"
   (length (vt-shape vt)))
 
+(defun %shape-product (shape)
+  "形状的元素乘积，单遍 fixnum 循环。
+
+   为什么不用 `(reduce #'* shape :initial-value 1)`：那是一个**泛型**归约
+   —— 每次调用都要 `%COERCE-CALLABLE-TO-FUN` 建立函数对象、再对每个元素
+   走一次通用 `*` 分派。sb-sprof 实测（1M 次 `vt-reshape`）它占 `vt-reshape`
+   全部耗时的 **45%**（其中 REDUCE 23.8% + `*` 13.6% + GENERIC-* 1.8% +
+   %COERCE-CALLABLE-TO-FUN 2.8%），而这只是两个 shape 的元素乘积。
+   形状维度天然是 fixnum（`vt-shape` 的类型声明 + 所有构造路径都保证），
+   所以这里可以安全地做定点乘法。"
+  (declare (type list shape) (optimize (speed 3)))
+  (let ((n 1))
+    (declare (type fixnum n))
+    (dolist (d shape n)
+      (declare (type fixnum d))
+      (setf n (the fixnum (* n d))))))
+
+(defun %shape-empty-p (shape)
+  "形状是否含 0 长度轴（即空张量）。单遍循环，理由同 `%SHAPE-PRODUCT`。"
+  (declare (type list shape) (optimize (speed 3)))
+  (dolist (d shape nil)
+    (declare (type fixnum d))
+    (when (zerop d) (return t))))
+
 (defun vt-size (vt)
   "张量的逻辑元素总数。"
-  (the fixnum (reduce #'* (vt-shape vt) :initial-value 1)))
+  (%shape-product (vt-shape vt)))
 
 (defun vt-shape-to-size (shape)
   "计算形状对应的总元素个数。"
-  (declare (list shape))
-  (reduce #'* shape :initial-value 1))
+  (declare (type list shape))
+  (%shape-product shape))
 
 (defun vt-itemsize (vt)
   "每个元素的字节大小。"
@@ -64,15 +94,20 @@
 (defun vt-compute-strides (shape)
   "根据形状计算 C 连续（行主序）步长；标量 (nil) 返回 nil。"
   (declare (list shape) (optimize (speed 3) (safety 0)))
-  (if (null shape)
-      nil
-      (let ((result nil)
-            (stride 1))
-        (declare (type fixnum stride))
-        (do ((tail (reverse shape) (cdr tail)))
-            ((null tail) result)
-          (push stride result)
-          (setf stride (the fixnum (* stride (the fixnum (car tail)))))))))
+  (cond
+    ;; 秩 0/1/2 是全部视图与拷贝路径的绝对多数，避开 (reverse shape) 的两次
+    ;; 列表分配；秩 ≥ 3 仍走原来的「反转后逐轴累乘」。
+    ((null shape) nil)
+    ((null (cdr shape)) (list 1))
+    ((null (cddr shape)) (list (the fixnum (second shape)) 1))
+    (t
+     (let ((result nil)
+           (stride 1))
+       (declare (type fixnum stride))
+       (do ((tail (reverse shape) (cdr tail)))
+           ((null tail) result)
+         (push stride result)
+         (setf stride (the fixnum (* stride (the fixnum (car tail))))))))))
 
 (defun vt-compute-logical-strides (shape)
   "计算给定形状的逻辑（连续内存）步长。"
@@ -351,23 +386,49 @@
 ;;; 连续判定与落地
 ;;; ------------------------------------------------------------------
 
+(defun %c-contiguous-back (shape strides)
+  "从末轴往头判定 C 连续，返回 (values 连续? 已算出的后缀元素数)。
+
+   递归而非 `(nth i …)` 循环：原实现对每个轴调两次 NTH，秩 r 的代价是
+   O(r²) 次链表遍历（秩 3 就是 6 次），而 sb-sprof 里 NTH 占 `vt-reshape`
+   的 4.5%、`vt-contiguous-p` 自身的 40% 以上。递归版每轴只走一次 CDR。
+
+   0 长度轴用「后缀元素数 = 0」向上传播，外层轴一看到它就不再判定 ——
+   这样 `VT-CONTIGUOUS-P` 不必再做一趟 `%SHAPE-EMPTY-P` 预扫。"
+  (declare (type list shape strides) (optimize (speed 3)))
+  (if (null shape)
+      (values t 1)
+      (multiple-value-bind (ok expected) (%c-contiguous-back (cdr shape) (cdr strides))
+        (declare (type fixnum expected))
+        (let ((d (car shape)) (s (car strides)))
+          (declare (type fixnum d s))
+          (cond ((or (= d 0) (= expected 0)) (values t 0))  ; 空张量恒连续
+                ((= d 1) (values ok expected))              ; 单例轴不参与判定
+                ((and ok (= s expected))
+                 (values t (the fixnum (* expected d))))
+                (t (values nil expected)))))))
+
 (defun vt-contiguous-p (vt)
   "判断张量是否为 C 连续（可安全重塑）。对标 numpy 的 c_contiguous 判定。"
+  (declare (optimize (speed 3)))
   (let ((shape (vt-shape vt))
         (strides (vt-strides vt)))
-    (if (or (null shape)
-            (some #'zerop shape))
-        t
-        (let ((expected 1) (contiguous t))
-          (declare (type fixnum expected))
-          (loop for i fixnum from (1- (length shape)) downto 0
-                for dim fixnum = (the fixnum (nth i shape))
-                for stride fixnum = (the fixnum (nth i strides))
-                do (cond ((= dim 1) nil)
-                         ((= stride expected)
-                          (setf expected (the fixnum (* expected dim))))
-                         (t (setf contiguous nil))))
-          contiguous))))
+    (cond
+      ((null shape) t)                                  ; 0 维恒连续
+      ;; 秩 1/2 展开：这是逐元素、拷贝、视图路径最常见的两种形态，
+      ;; 展开后只剩整数比较，没有函数调用，也没有 0 长度预扫。
+      ((null (cdr shape))
+       (let ((d (car shape)) (s (car strides)))
+         (declare (type fixnum d s))
+         (or (= d 0) (= d 1) (= s 1))))
+      ((null (cddr shape))
+       (let ((d0 (car shape)) (d1 (cadr shape))
+             (s0 (car strides)) (s1 (cadr strides)))
+         (declare (type fixnum d0 d1 s0 s1))
+         (or (= d0 0) (= d1 0)
+             (and (or (= d1 1) (= s1 1))
+                  (or (= d0 1) (= s0 (if (= d1 1) 1 d1)))))))
+      (t (nth-value 0 (%c-contiguous-back shape strides))))))
 
 
 

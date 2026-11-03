@@ -111,8 +111,10 @@ SUITES[core-test]="282 基础契约回归 (1 结构/199 函数语义/返回值�
 SUITES[differential-probes-test]="496 差分探针 vs numpy (期望内嵌逐项判定, 覆盖算术/超越/归约/索引/操纵/随机/错误路径)"
 SUITES[differential-probes-test2]="405 第2阶段差分探针 vs numpy (导出符号 #200-#377: NaN统计/linalg分解/NN/随机/契约, 期望内嵌逐项判定)"
 SUITES[manip-interop-test]="195 形状/视图/拼接/切片 跨语言互操作测试 (Lisp vt-save 落盘 + NumPy 逐位校验, 1000x1000 基准)"
+SUITES[access-view-perf-test]="99 访问/切片/视图/连续性护栏 (A段 逐位一致: 形状乘积·连续判定·取数·写数全 dtype·只读判定·视图落地内容·拼接双路径 与参考实现对拍；B段 机器无关倍率: vt-ref÷%vt-ref-raw、setf÷raw、reshape/flip/slice÷transpose、contiguous-p÷transpose(含 rank 6)、拼接每元素代价；见 CONVENTIONS §7.4.5)"
 SUITES[performance-bench]="性能基准测试 (1M 元素 / 1k×1k / 100×100 三档)"
 SUITES[complex-bench]="复数层性能基准 (1M 元素: 算术/超越/归约/排序/比较/线代, 对照 float64 同规模; 见 CONVENTIONS §16.14)"
+SUITES[bench-access-view]="访问/切片/视图/连续化/拼接 基准 (1M 次视图构造与单元素访问、1M 元素连续化、拼接各形态; 只打印耗时、不判定成败, 用于同机改前/改后对比, 口径见 CONVENTIONS §7.4.5)"
 
 # 需要「Lisp 生成数据 + Python/NumPy 校验」两阶段流水线的套件
 # 格式: PIPELINE_SUITES[name]="<阶段1 .lisp 文件> <阶段2 .py 文件>"
@@ -180,6 +182,7 @@ DEFAULT_ORDER=(
     empty-axis-binning-test
     nn-core-sweep-test
     view-consistency-test
+    access-view-perf-test
     complex-gap-test
     complex-matmul-perf-test
     complex-test
@@ -208,6 +211,7 @@ BENCH_SUITES=(
     benchmark-copy
     performance-bench
     complex-bench
+    bench-access-view
 )
 
 # ============================================================

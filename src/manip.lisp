@@ -134,42 +134,55 @@
       (t (%cx-reinterpret v (if (eq shape :none) nil shape) dtype)))))
 
 (defun vt-reshape (vt new-shape)
-  "重塑形状：连续则零拷贝视图，否则落地后重塑。"
-  (let* ((new-shape (%resolve-minus-one
-                     new-shape
-                     (vt-shape-to-size (vt-shape vt))))
-         (old-size (vt-shape-to-size (vt-shape vt)))
-         (new-size (vt-shape-to-size new-shape)))
+  "重塑形状：连续则零拷贝视图，否则落地后重塑。
+
+   尺寸只算两次（旧形状一次、解析后的新形状一次）：原实现在
+   `%resolve-minus-one` 的实参里、`old-size`、`new-size` 三处各算一遍，
+   而每次都要走 `vt-shape-to-size`，实测占 `vt-reshape` 耗时的 45%。"
+  (let* ((old-size (vt-size vt))
+         (shape (%resolve-minus-one new-shape old-size))
+         (new-size (vt-shape-to-size shape)))
     (unless (= old-size new-size)
       (error "重塑失败: 元素总数不一致 (旧 ~a, 新 ~a)" old-size new-size))
     (if (vt-contiguous-p vt)
-        (%make-vt :data (vt-data vt) :shape new-shape
-                  :strides (vt-compute-strides new-shape)
+        (%make-vt :data (vt-data vt) :shape shape
+                  :strides (vt-compute-strides shape)
                   :offset (vt-offset vt) :dtype (vt-dtype vt))
         (let ((cont (vt-contiguous vt)))
-          (%make-vt :data (vt-data cont) :shape new-shape
-                    :strides (vt-compute-strides new-shape)
+          (%make-vt :data (vt-data cont) :shape shape
+                    :strides (vt-compute-strides shape)
                     :offset 0 :dtype (vt-dtype cont))))))
 
 (defun vt-transpose (vt &optional (perm nil))
   "零拷贝转置。perm 为轴排列列表；缺省时反转所有轴。"
-  (let* ((shape (vt-shape vt))
-         (strides (vt-strides vt))
-         (rank (length shape)))
-    (unless perm
-      (setf perm (loop for i from (1- rank) downto 0 collect i)))
-    (unless (= (length perm) rank)
-      (error "perm 长度 ~a 必须等于秩 ~a" (length perm) rank))
-    (let ((seen (make-array rank :element-type 'bit :initial-element 0)))
-      (dolist (p perm)
-        (unless (and (integerp p) (<= 0 p (1- rank)))
-          (error "perm 值 ~a 超出范围 [0, ~a]" p (1- rank)))
-        (when (= (aref seen p) 1) (error "perm 中存在重复轴索引: ~a" p))
-        (setf (aref seen p) 1)))
-    (%make-vt :data (vt-data vt)
-              :shape (mapcar (lambda (p) (nth p shape)) perm)
-              :strides (mapcar (lambda (p) (nth p strides)) perm)
-              :offset (vt-offset vt) :dtype (vt-dtype vt))))
+  (let ((shape (vt-shape vt))
+        (strides (vt-strides vt)))
+    (cond
+      ;; 秩 2 的缺省转置：不做 perm 构造、不分配 seen 位向量、不校验
+      ;; （perm=nil 时反转是唯一的合法排列）。这是矩阵代码里最热的一条。
+      ;; 判据必须写成「有第二轴且没有第三轴」—— 只用 `(null (cddr shape))`
+      ;; 会把秩 1（cddr 也是 NIL）一起吞进来，然后读出一个 NIL 维度。
+      ((and (null perm) (cdr shape) (null (cddr shape)))
+       (%make-vt :data (vt-data vt)
+                 :shape (list (second shape) (first shape))
+                 :strides (list (second strides) (first strides))
+                 :offset (vt-offset vt) :dtype (vt-dtype vt)))
+      (t
+       (let ((rank (length shape)))
+         (unless perm
+           (setf perm (loop for i from (1- rank) downto 0 collect i)))
+         (unless (= (length perm) rank)
+           (error "perm 长度 ~a 必须等于秩 ~a" (length perm) rank))
+         (let ((seen (make-array rank :element-type 'bit :initial-element 0)))
+           (dolist (p perm)
+             (unless (and (integerp p) (<= 0 p (1- rank)))
+               (error "perm 值 ~a 超出范围 [0, ~a]" p (1- rank)))
+             (when (= (aref seen p) 1) (error "perm 中存在重复轴索引: ~a" p))
+             (setf (aref seen p) 1)))
+         (%make-vt :data (vt-data vt)
+                   :shape (mapcar (lambda (p) (nth p shape)) perm)
+                   :strides (mapcar (lambda (p) (nth p strides)) perm)
+                   :offset (vt-offset vt) :dtype (vt-dtype vt)))))))
 
 (defun vt-squeeze (vt &key axis)
   "移除长度为 1 的维度（axis 指定单轴，缺省移除全部）。"
@@ -328,27 +341,43 @@
   offset 推到缓冲区之外（缓冲长度也是 0），随后 `subseq` / `%make-vt`
   的类型检查就会炸。numpy 对空数组同样不移动 data 指针。"
   (let ((shape (vt-shape vt)) (strides (vt-strides vt))
-        (empty (zerop (vt-size vt))))
-    (if (null axis)
-        (%make-vt :data (vt-data vt) :shape shape
-                  :strides (mapcar #'- strides)
-                  :offset (+ (vt-offset vt)
-                             (if empty
-                                 0
-                                 (loop for d in shape
-                                       for s in strides
-                                       sum (%flip-shift d s))))
-                  :dtype (vt-dtype vt))
-        (let* ((rank (length shape))
-               (ax (vt-normalize-axis axis rank))
-               (strides (copy-list strides))
-               (dim (nth ax shape))
-               (old-stride (nth ax strides)))
-          (setf (nth ax strides) (- old-stride))
-          (%make-vt :data (vt-data vt) :shape shape :strides strides
-                    :offset (+ (vt-offset vt)
-                               (if empty 0 (%flip-shift dim old-stride)))
-                    :dtype (vt-dtype vt))))))
+        (empty (%shape-empty-p (vt-shape vt))))
+    (flet ((mk (st off)
+             (%make-vt :data (vt-data vt) :shape shape :strides st
+                       :offset off :dtype (vt-dtype vt))))
+      (cond
+        ((null axis)
+         (mk (mapcar #'- strides)
+             (+ (vt-offset vt)
+                (if empty
+                    0
+                    (loop for d in shape
+                          for s in strides
+                          sum (%flip-shift d s))))))
+        ;; 秩 2 且指定单轴：最常见的「翻转行/翻转列」。原实现要
+        ;; COPY-LIST + 两次 NTH + SETF NTH（sb-sprof：copy-list 5.8%、
+        ;; NTH 5.7%、NTHCDR 3.3%），这里直接构造两个元素的列表。
+        ;; 判据同 VT-TRANSPOSE：必须显式排除秩 1（cddr 同样为 NIL）。
+        ((and (cdr shape) (null (cddr shape)))
+         (let* ((ax (vt-normalize-axis axis 2))
+                (d0 (car shape)) (d1 (cadr shape))
+                (s0 (car strides)) (s1 (cadr strides)))
+           (declare (type fixnum d0 d1 s0 s1))
+           (if (= ax 0)
+               (mk (list (- s0) s1)
+                   (+ (vt-offset vt) (if empty 0 (%flip-shift d0 s0))))
+               (mk (list s0 (- s1))
+                   (+ (vt-offset vt) (if empty 0 (%flip-shift d1 s1)))))))
+        (t
+         (let* ((rank (length shape))
+                (ax (vt-normalize-axis axis rank))
+                (strides (copy-list strides))
+                (dim (nth ax shape))
+                (old-stride (nth ax strides)))
+           (setf (nth ax strides) (- old-stride))
+           (mk strides
+               (+ (vt-offset vt)
+                  (if empty 0 (%flip-shift dim old-stride))))))))))
 
 (defun vt-roll (vt shift &key axis)
   "滚动元素。语义对标 NumPy：
