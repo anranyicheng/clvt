@@ -161,6 +161,30 @@
     (bench "vstack 64 行视图" (lambda () (apply #'vt-vstack rows)) :elems 64000)
     (bench "hstack 64 行视图" (lambda () (apply #'vt-hstack rows)) :elems 64000)
 
+    (header "[7] 非连续视图上的归约（1M 元素）")
+    (bench "sum 连续（对照）" (lambda () (vt-sum a)) :elems 1000000)
+    (bench "sum 转置 axis=nil" (lambda () (vt-sum at)) :elems 1000000)
+    (bench "sum 转置 axis=0" (lambda () (vt-sum at :axis 0)) :elems 1000000)
+    (bench "sum 转置 axis=1" (lambda () (vt-sum at :axis 1)) :elems 1000000)
+    (bench "amax 转置 axis=0" (lambda () (vt-amax at :axis 0)) :elems 1000000)
+    (bench "argmax 转置 axis=0" (lambda () (vt-argmax at :axis 0)) :elems 1000000)
+    (bench "sum 步进2 axis=0 (500k)"
+           (lambda () (vt-sum av :axis 0)) :elems 500000)
+    (let ((i16t (vt-transpose (vt-astype a :int16))))
+      (bench "sum int16 转置 axis=0" (lambda () (vt-sum i16t :axis 0)) :elems 1000000))
+
+    (header "[8] 跨 dtype 写入（1M 元素）")
+    (let ((d32 (vt-zeros '(1000 1000) :dtype :float32)))
+      (bench "astype 连续 f64→f32（对照）" (lambda () (vt-astype a :float32)) :elems 1000000)
+      (bench "astype 转置 f64→f32（对照）" (lambda () (vt-astype at :float32)) :elems 1000000)
+      (bench "copy-into 连续 f64→f32" (lambda () (vt-copy-into d32 a)) :elems 1000000)
+      (bench "copy-into 转置 src f64→f32" (lambda () (vt-copy-into d32 at)) :elems 1000000)
+      (bench "copy-into 转置 dst f64→f32"
+             (lambda () (vt-copy-into (vt-transpose (vt-zeros '(1000 1000) :dtype :float32)) a))
+             :elems 1000000)
+      (bench "setf vt-slice 跨 dtype" (lambda () (setf (vt-slice d32 '(:all) '(:all)) a))
+             :elems 1000000))
+
     (format t "~%完成。绝对值仅供同机前后对比；跨机请看~%")
     (format t "test/access-view-perf-test.lisp 的 B 段倍率护栏。~%")
     (finish-output)))

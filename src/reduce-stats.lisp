@@ -553,67 +553,102 @@
                      ,(%cast-form res-lt '(aref acc i))))))))))
 
 (defmacro %kernel-general (op lt res-lt)
-  "路径 3：通用回退（支持非连续 :out）。"
+  "路径 3：通用回退（支持非连续 :out）。
+
+   单轴归约（n-red = 1）另有一条**指针递增**通路：把「每元素一次三重里程计
+   （算 offset、算 linear、推 red-idx）」换成「读一次、指针 += 步长」。
+   顺序完全不变（r 仍是 0,1,2,…，arg 族的 linear 仍是 r），故逐位相同。
+
+   两条通路是**各自独立的整段循环**，不是循环体内的 `(if (= n-red 1) …)`：
+   后者会让多轴那条（全归约走它）的寄存器分配变差 —— 实测 f64 全归约
+   sum/prod 反而慢 11~23%，而单轴那条并没有因此更快。判定放在循环外，
+   每条循环都保持原来的形态。
+
+   实测 1000×1000 转置视图：`sum :axis 0` 4.44 → 0.58 ms、
+   `sum :axis 1` 5.03 → 0.70、`amax :axis 0` 5.05 → 0.81、
+   `argmax :axis 0` 5.13 → 1.08、`sum :axis 0`（步进 2）2.25 → 0.37。"
   (let* ((acc-lt (%op-acc-lt op lt res-lt))
          (init   (%op-init   op lt res-lt))
          (arg-p  (%op-arg-p  op))
          (nan-skip-arg (and arg-p (%op-nan-skip-p op) (subtypep lt 'float))))
-    `(let ((d  (the (simple-array ,lt (*)) in-data))
-           (od (the (simple-array ,res-lt (*)) res-data)))
-       (declare (type fixnum n-red n-non red-size non-size))
-       (let ((non-idx (make-array (max n-non 1) :element-type 'fixnum :initial-element 0))
-             (red-idx (make-array (max n-red 1) :element-type 'fixnum :initial-element 0))
-             (init-v  (the ,acc-lt ,init))
-             (out-ptr res-off))
-         (declare (type (simple-array fixnum (*)) non-idx red-idx)
-                  (type fixnum out-ptr))
-         (dotimes (_ non-size)
-           (let ((base in-off))
-             (declare (type fixnum base))
-             (dotimes (dd n-non)
-               (incf base (* (aref non-idx dd) (svref non-strides dd))))
-             (fill red-idx 0)
-             (let ((acc init-v)
-                   ,@(when arg-p `((best-i 0))))
-               (declare (type ,acc-lt acc)
-                        ,@(when arg-p '((type fixnum best-i))))
-               (dotimes (r red-size)
-                 (let ((offset 0) (linear 0) (mult 1))
-                   (declare (type fixnum offset linear mult))
-                   (loop for dd fixnum from (1- n-red) downto 0 do
-                     (incf offset (* (aref red-idx dd) (svref red-strides-v dd)))
-                     (incf linear (* (aref red-idx dd) mult))
-                     (setf mult (* mult (svref red-sizes dd))))
-                   (let ((v (the ,lt (aref d (the fixnum (+ base offset))))))
-                     ,(if arg-p
-                          `(%op-arg-step ,op acc best-i linear v ,lt ,acc-lt)
-                          `(%op-step ,op acc v ,lt ,acc-lt))))
-                 (when (plusp n-red)
-                   (let ((dd (1- n-red)))
-                     (declare (type fixnum dd))
-                     (loop
-                       (incf (aref red-idx dd))
-                       (when (< (aref red-idx dd) (svref red-sizes dd)) (return))
-                       (setf (aref red-idx dd) 0)
-                       (decf dd)
-                       (when (< dd 0) (return))))))
-               ,@(when nan-skip-arg
-                   `((when (%nan-p acc)
-                       (error "~a: All-NaN slice encountered" ',op))))
-               (setf (aref od out-ptr)
-                     ,(%cast-form res-lt (if arg-p 'best-i 'acc))))
-             (when (plusp n-non)
-               (let ((dd (1- n-non)))
-                 (declare (type fixnum dd))
-                 (loop
-                   (incf (aref non-idx dd))
-                   (incf out-ptr (svref out-non-strides dd))
-                   (when (< (aref non-idx dd) (svref non-sizes dd)) (return))
-                   (setf (aref non-idx dd) 0)
-                   (decf out-ptr (* (svref non-sizes dd)
-                                    (svref out-non-strides dd)))
-                   (decf dd)
-                   (when (< dd 0) (return)))))))))))
+    ;; 下面两个都是**生成期**函数（不是展开结果里的宏）：两条循环共用
+    ;; 「取一个元素喂给算子」与「一个输出元素的完整处理」两段代码。
+    ;; 写成 FLET 而不是 MACROLET，因为后者的内层反引号里的 `,lt` 会在
+    ;; 展开期（而不是生成期）求值，`lt` 那时不存在。
+    (flet ((step-form (off lin)
+             `(let ((v (the ,lt (aref d (the fixnum ,off)))))
+                ,(if arg-p
+                     `(%op-arg-step ,op acc best-i ,lin v ,lt ,acc-lt)
+                     `(%op-step ,op acc v ,lt ,acc-lt))))
+           (body-form (traversal)
+             ;; 一个输出元素的完整处理：算基址 → 遍历 TRAVERSAL → 写回 → 推进
+             `(let ((base in-off))
+                (declare (type fixnum base))
+                (dotimes (dd n-non)
+                  (incf base (* (aref non-idx dd) (svref non-strides dd))))
+                (fill red-idx 0)
+                (let ((acc init-v)
+                      ,@(when arg-p `((best-i 0))))
+                  (declare (type ,acc-lt acc)
+                           ,@(when arg-p '((type fixnum best-i))))
+                  ,traversal
+                  ,@(when nan-skip-arg
+                      `((when (%nan-p acc)
+                          (error "~a: All-NaN slice encountered" ',op))))
+                  (setf (aref od out-ptr)
+                        ,(%cast-form res-lt (if arg-p 'best-i 'acc))))
+                (when (plusp n-non)
+                  (let ((dd (1- n-non)))
+                    (declare (type fixnum dd))
+                    (loop
+                      (incf (aref non-idx dd))
+                      (incf out-ptr (svref out-non-strides dd))
+                      (when (< (aref non-idx dd) (svref non-sizes dd)) (return))
+                      (setf (aref non-idx dd) 0)
+                      (decf out-ptr (* (svref non-sizes dd)
+                                       (svref out-non-strides dd)))
+                      (decf dd)
+                      (when (< dd 0) (return))))))))
+      `(let ((d  (the (simple-array ,lt (*)) in-data))
+             (od (the (simple-array ,res-lt (*)) res-data)))
+         (declare (type fixnum n-red n-non red-size non-size))
+         (let ((non-idx (make-array (max n-non 1) :element-type 'fixnum :initial-element 0))
+               (red-idx (make-array (max n-red 1) :element-type 'fixnum :initial-element 0))
+               (init-v  (the ,acc-lt ,init))
+               (out-ptr res-off))
+           (declare (type (simple-array fixnum (*)) non-idx red-idx)
+                    (type fixnum out-ptr))
+           (if (= n-red 1)
+               ;; ---------- 单轴：指针 += 归约轴步长 ----------
+               (let ((st (the fixnum (svref red-strides-v 0))))
+                 (declare (type fixnum st))
+                 (dotimes (_ non-size)
+                   ,(body-form
+                     `(let ((p base))
+                        (declare (type fixnum p))
+                        (dotimes (r red-size)
+                          ,(step-form 'p 'r)
+                          (incf p st))))))
+               ;; ---------- 多轴：三重里程计（原样保留）----------
+               (dotimes (_ non-size)
+                 ,(body-form
+                   `(dotimes (r red-size)
+                      (let ((offset 0) (linear 0) (mult 1))
+                        (declare (type fixnum offset linear mult))
+                        (loop for dd fixnum from (1- n-red) downto 0 do
+                          (incf offset (* (aref red-idx dd) (svref red-strides-v dd)))
+                          (incf linear (* (aref red-idx dd) mult))
+                          (setf mult (* mult (svref red-sizes dd))))
+                        ,(step-form `(+ base offset) 'linear))
+                      (when (plusp n-red)
+                        (let ((dd (1- n-red)))
+                          (declare (type fixnum dd))
+                          (loop
+                            (incf (aref red-idx dd))
+                            (when (< (aref red-idx dd) (svref red-sizes dd)) (return))
+                            (setf (aref red-idx dd) 0)
+                            (decf dd)
+                            (when (< dd 0) (return))))))))))))))
 
 (defmacro %kernel-small-general (op)
   "路径 3 内的小整型通用内核（不按 in-lt × res-lt 特化，每算子仅展开一份）。
@@ -622,7 +657,9 @@
    属逻辑级 dtype，读取经通用 aref（无 the 特化）、累加器按算子语义
    （sum/prod 提升至 int64，max/min 用输入 dtype 极值初始化），
    写出经 vt-cast 按结果 dtype 转换。正确性由本内核兜底，
-   与特化内核遵循同一算子语义；连续性/特化只影响性能。"
+   与特化内核遵循同一算子语义；连续性/特化只影响性能。
+
+   单轴（n-red = 1）同样走指针递增子路径，理由与收益见 `%KERNEL-GENERAL`。"
   (let* ((arg-p (%op-arg-p op))
          (base  (%op-base op))
          (init-v
@@ -633,8 +670,22 @@
              (:any  0)
              (:max  `(%small-int-extreme (vt-dtype tensor) :min))
              (:min  `(%small-int-extreme (vt-dtype tensor) :max)))))
-    `(let ((d  in-data)
-           (od res-data))
+    ;; STEP-FORM 是生成期函数，理由见 %KERNEL-GENERAL 的同名注释。
+    (flet ((step-form (off lin)
+             `(let ((v (aref d (the fixnum ,off))))
+                ,(ecase base
+                   (:sum  `(incf acc v))
+                   (:prod `(setf acc (* acc v)))
+                   (:all  `(when (zerop v) (setf acc 0)))
+                   (:any  `(when (/= v 0) (setf acc 1)))
+                   (:max  (if arg-p
+                              `(when (> v acc) (setf acc v best-i ,lin))
+                              `(when (> v acc) (setf acc v))))
+                   (:min  (if arg-p
+                              `(when (< v acc) (setf acc v best-i ,lin))
+                              `(when (< v acc) (setf acc v))))))))
+      `(let ((d  in-data)
+             (od res-data))
        (declare (type fixnum n-red n-non red-size non-size))
        (let ((non-idx (make-array (max n-non 1) :element-type 'fixnum :initial-element 0))
              (red-idx (make-array (max n-red 1) :element-type 'fixnum :initial-element 0))
@@ -643,61 +694,56 @@
          (declare (type (simple-array fixnum (*)) non-idx red-idx)
                   (type fixnum out-ptr))
          (dotimes (_ non-size)
-           (let ((base-idx in-off))
-             (declare (type fixnum base-idx))
-             (dotimes (dd n-non)
-               (incf base-idx (* (aref non-idx dd) (svref non-strides dd))))
-             (fill red-idx 0)
-             (let ((acc init-v)
-                   ,@(when arg-p `((best-i 0))))
-               (declare ,@(when arg-p '((type fixnum best-i))))
-               (dotimes (r red-size)
-                 (let ((offset 0) (linear 0) (mult 1))
-                   (declare (type fixnum offset linear mult))
-                   (loop for dd fixnum from (1- n-red) downto 0 do
-                     (incf offset (* (aref red-idx dd) (svref red-strides-v dd)))
-                     (incf linear (* (aref red-idx dd) mult))
-                     (setf mult (* mult (svref red-sizes dd))))
-                   (let ((v (aref d (the fixnum (+ base-idx offset)))))
-                     ,(ecase base
-                        (:sum  `(incf acc v))
-                        (:prod `(setf acc (* acc v)))
-                        (:all  `(when (zerop v) (setf acc 0)))
-                        (:any  `(when (/= v 0) (setf acc 1)))
-                        (:max  (if arg-p
-                                   `(when (> v acc) (setf acc v best-i linear))
-                                   `(when (> v acc) (setf acc v))))
-                        (:min  (if arg-p
-                                   `(when (< v acc) (setf acc v best-i linear))
-                                   `(when (< v acc) (setf acc v)))))))
-                 ;; red-idx 进位（dotimes(r) 每轮执行）
-                 (when (plusp n-red)
-                   (let ((dd (1- n-red)))
-                     (declare (type fixnum dd))
-                     (loop
-                       (incf (aref red-idx dd))
-                       (when (< (aref red-idx dd) (svref red-sizes dd)) (return))
-                       (setf (aref red-idx dd) 0)
-                       (decf dd)
-                       (when (< dd 0) (return))))))
-               ;; 本输出元素写回（在 acc 作用域内）
-               (setf (aref od out-ptr)
-                     ,(if arg-p
-                          `(vt-cast best-i final-out-dtype)
-                          `(vt-cast acc final-out-dtype))))
-             ;; non-idx 进位
-             (when (plusp n-non)
-               (let ((dd (1- n-non)))
-                 (declare (type fixnum dd))
-                 (loop
-                   (incf (aref non-idx dd))
-                   (incf out-ptr (svref out-non-strides dd))
-                   (when (< (aref non-idx dd) (svref non-sizes dd)) (return))
-                   (setf (aref non-idx dd) 0)
-                   (decf out-ptr (* (svref non-sizes dd)
-                                    (svref out-non-strides dd)))
-                   (decf dd)
-                   (when (< dd 0) (return)))))))))))
+             (let ((base-idx in-off))
+               (declare (type fixnum base-idx))
+               (dotimes (dd n-non)
+                 (incf base-idx (* (aref non-idx dd) (svref non-strides dd))))
+               (fill red-idx 0)
+               (let ((acc init-v)
+                     ,@(when arg-p `((best-i 0))))
+                 (declare ,@(when arg-p '((type fixnum best-i))))
+                 (if (= n-red 1)
+                     (let ((p (the fixnum base-idx))
+                           (st (the fixnum (svref red-strides-v 0))))
+                       (declare (type fixnum p st))
+                       (dotimes (r red-size)
+                         ,(step-form 'p 'r)
+                         (incf p st)))
+                     (dotimes (r red-size)
+                       (let ((offset 0) (linear 0) (mult 1))
+                         (declare (type fixnum offset linear mult))
+                         (loop for dd fixnum from (1- n-red) downto 0 do
+                           (incf offset (* (aref red-idx dd) (svref red-strides-v dd)))
+                           (incf linear (* (aref red-idx dd) mult))
+                           (setf mult (* mult (svref red-sizes dd))))
+                         ,(step-form `(+ base-idx offset) 'linear))
+                       (when (plusp n-red)
+                         (let ((dd (1- n-red)))
+                           (declare (type fixnum dd))
+                           (loop
+                             (incf (aref red-idx dd))
+                             (when (< (aref red-idx dd) (svref red-sizes dd)) (return))
+                             (setf (aref red-idx dd) 0)
+                             (decf dd)
+                             (when (< dd 0) (return)))))))
+                 ;; 本输出元素写回（在 acc 作用域内）
+                 (setf (aref od out-ptr)
+                       ,(if arg-p
+                            `(vt-cast best-i final-out-dtype)
+                            `(vt-cast acc final-out-dtype))))
+               ;; non-idx 进位
+               (when (plusp n-non)
+                 (let ((dd (1- n-non)))
+                   (declare (type fixnum dd))
+                   (loop
+                     (incf (aref non-idx dd))
+                     (incf out-ptr (svref out-non-strides dd))
+                     (when (< (aref non-idx dd) (svref non-sizes dd)) (return))
+                     (setf (aref non-idx dd) 0)
+                     (decf out-ptr (* (svref non-sizes dd)
+                                      (svref out-non-strides dd)))
+                     (decf dd)
+                     (when (< dd 0) (return))))))))))))
 ;;; ============================================================
 ;;; 统一生成宏
 ;;; ============================================================

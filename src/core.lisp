@@ -1364,13 +1364,34 @@
                    (%memcpy dest-data q src-data p run-len)
                    (incf q run-len))))))
 
-          ;; 快路径 2：连续 + 同形 + 需要类型转换
+          ;; 快路径 2：**跨 dtype 且元素数够多**（任意布局）—— 先用 VT-ASTYPE
+          ;; 整张转换，再以同 dtype 写回 dest。
+          ;; 原来逐元素 `(FUNCALL CASTER (AREF src …))`：每元素一次闭包调用
+          ;; + 两次泛型 AREF（dest/src 都是 `(simple-array t)`，每次读都要
+          ;; 重新判元素类型）。1M f64→f32 实测 10.0 ms，而 ASTYPE 的整数组
+          ;; 特化只要 0.76 ms —— 同一个转换，只是入口不同。
+          ;; 语义不变：`VT-CAST-FUN` 与 `VT-ASTYPE` 的 10×10 特化表逐格一致
+          ;; （bool 真值化、复数取实部、NaN→整数 0 都在两张表里同规则），
+          ;; 11 dtype × 11 dtype × 15 个边界值实测逐位相同。
+          ;; 门槛 16：更小的块（4 元素实测 317→372 ns）里「分配一张中转
+          ;; 数组」比直接转换还贵，此时留在下面的逐元素路径更划算。
+          ((and (not same-dtype) (>= size 16))
+           (let ((converted (vt-astype src dest-dtype)))
+             (if (and dest-contig (equal (vt-shape converted) dest-shape))
+                 (%memcpy dest-data dest-off (vt-data converted)
+                          (vt-offset converted) size)
+                 ;; dest 非连续或形状是 src 广播后的超级形状：转成同 dtype 后
+                 ;; 走下面那几条（此时不会再回到本分支）。
+                 (vt-copy-into dest converted))))
+
+          ;; 快路径 2b：小块的跨 dtype 转换（逐元素，无中转分配）
           ((and dest-contig src-contig same-shape)
            (let ((caster (vt-cast-fun dest-dtype)))
              (declare (type function caster))
              (dotimes (i size)
                (setf (aref dest-data (+ dest-off i))
                      (funcall caster (aref src-data (+ src-off i)))))))
+
           ;; 快路径 3：src 是标量或 size=1 → 广播填充
           ((= (vt-size src) 1)
            (vt-fill dest (aref src-data src-off)))

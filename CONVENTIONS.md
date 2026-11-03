@@ -856,6 +856,31 @@ WARNING），又必须穿过上面那次 coerce。实测 `vt-fast-map` 版本 31
 逐位一致与选路不变量由 `test/access-view-perf-test.lisp`（A 段 62 条
 逐位对拍 + B 段 5 条机器无关倍率）守护；套件名 `access-view-perf-test`。
 
+#### 7.4.6 非连续视图的归约 / 跨 dtype 写入
+
+这两处都属于「执行层选路」，因此硬约束与 §7.4 相同：**结果逐位不变**。
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 单轴归约单列一条循环 | `%KERNEL-GENERAL` 在 `(= n-red 1)` 时走「读一次 + 指针 += 归约轴步长」，多轴仍走三重里程计；两条是**各自独立的整段循环**，不是循环体内的 `IF` | 合成一条（循环体内 if）会让多轴那条（全归约走它）的寄存器分配变差：f64 `sum`/`prod` 全归约实测慢 11~23%，而单轴并没有因此更快 |
+| 累加顺序逐字不变 | 单轴通路里 `r` 仍从 0 递增；arg 族的 `linear` 仍是 `r` | §7.3：归约累加顺序是契约，不允许因选路而变 |
+| 单轴通路也覆盖窄整型 | `%KERNEL-SMALL-GENERAL` 同款结构 | 窄整型的 axis 归约走的是同一类里程计，收益同源 |
+| 跨 dtype 写入先过 `VT-ASTYPE` | `VT-COPY-INTO` 在 `(not same-dtype)` 且 `size ≥ 16` 时：`VT-ASTYPE` 整张转换 → `%MEMCPY`（dest 连续且同形）或同 dtype 递归（dest 非连续/需广播） | 原来的逐元素 `(FUNCALL (VT-CAST-FUN …) (AREF …))` 每元素一次闭包调用 + 两次泛型 `AREF`（`dest/src` 都是 `(simple-array t)`）：1M f64→f32 是 10.0 ms，而 ASTYPE 的整数组特化只要 0.76 ms |
+| 门槛 16 个元素 | 更小的块留在逐元素路径（快路径 2b） | 分配一张中转数组在 4 元素时比直接转换还贵（实测 317 → 372 ns） |
+| 两张 cast 表必须逐格一致 | `VT-CAST-FUN` 与 `VT-ASTYPE` 的 10×10 特化表（含 `:bool` 真值化、复数取实部、NaN→整数 0） | 「借道 ASTYPE」的**唯一前提**；由 `test/reduce-copy-perf-test.lisp` 的 A4 段 11×11 × 3 布局守着 |
+
+**明确否决**
+
+| 否决项 | 理由 |
+|---|---|
+| 把两条归约通路合成一条、用运行时布尔选路 | 见上表第一行：多轴那条会慢 11~23% |
+| 改动单轴通路的累加顺序（例如按 stride 排轴、或多累加器） | 会改变浮点结果（§7.3）。numpy 的 0.18 ms 来自 pairwise summation，**结果与顺序累加不同**，不是同一口径 |
+| 跨 dtype 写入保留逐元素 `FUNCALL CASTER` | 与 ASTYPE 是同一张表，没有理由走慢 13 倍的那条 |
+
+非连续归约的物理形态无关性（6 种视图 × 6 种 dtype × 单轴/多轴/arg/keepdims
+逐位相同）与跨 dtype 写入的等价性由 `test/reduce-copy-perf-test.lisp`
+（A 段 51 条逐位对拍 + B 段 7 条倍率）守护；套件名 `reduce-copy-perf-test`。
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有
