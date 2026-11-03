@@ -9,12 +9,14 @@
    布尔逻辑视图（T/NIL 不能进 `+`/`=`），也省掉每元素一次 dtype 判断。
    外部用户应使用 `VT-REF`（§17.8 逻辑视图）。
 
-   性能（单元素路径，1M 次调用实测 11.2 → 6.6 ms）：
+   性能（单元素路径，1M 次调用）：
      · 索引遍历里一次 `(dolist (idx indices))` 同时做「整数校验 + 越界校验 +
        指针推进」，取代原先三层并行 FOR 子句（每层各推一次游标）；
      · 元素读取按 `(VT-DTYPE)` 走符号 `CASE`（编译成跳转表），取代原先四次
        `(EQUAL (ARRAY-ELEMENT-TYPE data) '…)` —— 后者每次调用都要取/比较类型
-       说明符，sb-sprof 里占 4.6%，且 `ARRAY-ELEMENT-TYPE` 本身是一次调用。"
+       说明符，sb-sprof 里占 4.6%，且 `ARRAY-ELEMENT-TYPE` 本身是一次调用。
+   本函数自身耗时基本不变（~11 ms，它的校验本来就在循环里）；去掉的是
+   `VT-REF` 里那趟独立的类型预扫，见那边的注释。"
   (declare (optimize (speed 3)) (dynamic-extent indices))
   (let ((shape (vt-shape vt))
         (strides (vt-strides vt))

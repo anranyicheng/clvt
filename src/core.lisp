@@ -51,9 +51,10 @@
 
    为什么不用 `(reduce #'* shape :initial-value 1)`：那是一个**泛型**归约
    —— 每次调用都要 `%COERCE-CALLABLE-TO-FUN` 建立函数对象、再对每个元素
-   走一次通用 `*` 分派。sb-sprof 实测（1M 次 `vt-reshape`）它占 `vt-reshape`
-   全部耗时的 **45%**（其中 REDUCE 23.8% + `*` 13.6% + GENERIC-* 1.8% +
-   %COERCE-CALLABLE-TO-FUN 2.8%），而这只是两个 shape 的元素乘积。
+   走一次通用 `*` 分派。sb-sprof 实测（1M 次 `vt-reshape`）这一组占
+   `vt-reshape` 全部耗时的 **42%**（REDUCE 23.8% + `*` 13.6% +
+   GENERIC-* 1.8% + %COERCE-CALLABLE-TO-FUN 2.8%），而这只是两个 shape
+   的元素乘积。
    形状维度天然是 fixnum（`vt-shape` 的类型声明 + 所有构造路径都保证），
    所以这里可以安全地做定点乘法。"
   (declare (type list shape) (optimize (speed 3)))
@@ -390,8 +391,8 @@
   "从末轴往头判定 C 连续，返回 (values 连续? 已算出的后缀元素数)。
 
    递归而非 `(nth i …)` 循环：原实现对每个轴调两次 NTH，秩 r 的代价是
-   O(r²) 次链表遍历（秩 3 就是 6 次），而 sb-sprof 里 NTH 占 `vt-reshape`
-   的 4.5%、`vt-contiguous-p` 自身的 40% 以上。递归版每轴只走一次 CDR。
+   O(r²) 次链表遍历（秩 3 就是 6 次）。sb-sprof 里 NTH + NTHCDR 占
+   `vt-reshape` 的 7.8%，占 `vt-contiguous-p` 自身耗时的绝大部分。
 
    0 长度轴用「后缀元素数 = 0」向上传播，外层轴一看到它就不再判定 ——
    这样 `VT-CONTIGUOUS-P` 不必再做一趟 `%SHAPE-EMPTY-P` 预扫。"
