@@ -117,35 +117,48 @@
       (:div `(/ ,x ,y))
       (:sqdiff (let ((d `(- ,x ,y))) `(* ,d ,d))))))
 
-(defmacro %sew2-flat (lt prefix kind a b res)
-  "两侧都是 :full 的扁平循环（结果连续、输入同形连续 ⇒ 线性下标即可）。"
-  (let* ((n (gensym "N")) (i (gensym "I")) (lim (gensym "LIM"))
-         (ad (gensym "AD")) (bd (gensym "BD")) (od (gensym "OD"))
-         (ao (gensym "AO")) (bo (gensym "BO")) (oo (gensym "OO"))
+(defmacro %sew2-run-body (prefix kind n ad bd od ao bo oo)
+  "「从各自起点起算 N 个元素」的向量循环体（整块 + 标量尾块）。
+
+   与 `%SEW2-FLAT` 共用同一份展开，差别只在于起点是**表达式**而不是
+   `(vt-offset …)`：非连续视图的内层 run 由外层 odometer 每行重算一次
+   起点，若为此重新走一遍 `vt-*` 取值就等于每行一次函数调用。
+   铁律 1：只换地址算术，单个元素的表达式一字未改。"
+  (let* ((i (gensym "I")) (lim (gensym "LIM"))
          (lanes (%sew-lanes prefix))
          (vecaref (%sew-sym prefix "-ROW-MAJOR-AREF"))
          (vx `(,vecaref ,ad (+ ,ao ,i)))
          (vy `(,vecaref ,bd (+ ,bo ,i)))
          (sx `(aref ,ad (+ ,ao ,i)))
          (sy `(aref ,bd (+ ,bo ,i))))
+    `(let* ((,lim (- ,n (mod ,n ,lanes)))
+            (,i 0))
+       (declare (type fixnum ,lim ,i))
+       ;; 内层是纯数值循环：下标由 `(vt-size …)` 决定，`safety 0` 只删掉
+       ;; 每条 aref 的边界比较（§7.4.3 同一条规矩）。外面那层地址算术
+       ;; 仍保持默认 safety。
+       (locally (declare (optimize (speed 3) (safety 0)))
+         (loop while (< ,i ,lim)
+               do (setf (,vecaref ,od (+ ,oo ,i)) ,(%sew-vec-form prefix kind vx vy))
+                  (incf ,i ,lanes))
+         (loop while (< ,i ,n)
+               do (setf (aref ,od (+ ,oo ,i)) ,(%sew-scal-form kind sx sy))
+                  (incf ,i)))
+       t)))
+
+(defmacro %sew2-flat (lt prefix kind a b res)
+  "两侧都是 :full 的扁平循环（结果连续、输入同形连续 ⇒ 线性下标即可）。"
+  (let* ((n (gensym "N"))
+         (ad (gensym "AD")) (bd (gensym "BD")) (od (gensym "OD"))
+         (ao (gensym "AO")) (bo (gensym "BO")) (oo (gensym "OO")))
     `(let* ((,n (vt-size ,res))
             (,ad (the (simple-array ,lt (*)) (vt-data ,a)))
             (,bd (the (simple-array ,lt (*)) (vt-data ,b)))
             (,od (the (simple-array ,lt (*)) (vt-data ,res)))
-            (,ao (vt-offset ,a)) (,bo (vt-offset ,b)) (,oo (vt-offset ,res))
-            (,lim (- ,n (mod ,n ,lanes)))
-            (,i 0))
-       (declare (type fixnum ,n ,ao ,bo ,oo ,lim ,i)
+            (,ao (vt-offset ,a)) (,bo (vt-offset ,b)) (,oo (vt-offset ,res)))
+       (declare (type fixnum ,n ,ao ,bo ,oo)
                 (type (simple-array ,lt (*)) ,ad ,bd ,od))
-       (loop while (< ,i ,lim)
-             do (setf (,vecaref ,od (+ ,oo ,i))
-                      ,(%sew-vec-form prefix kind vx vy))
-                (incf ,i ,lanes))
-       (loop while (< ,i ,n)
-             do (setf (aref ,od (+ ,oo ,i))
-                      ,(%sew-scal-form kind sx sy))
-                (incf ,i))
-       t)))
+       (%sew2-run-body ,prefix ,kind ,n ,ad ,bd ,od ,ao ,bo ,oo))))
 
 (defmacro %sew2-rows (lt prefix kind a b res a-mode b-mode)
   "行循环。A-MODE / B-MODE 是字面量形态：
@@ -158,7 +171,7 @@
    :scalar / :col 的操作数在每行行首取一个标量、向量广播一次，行内不再
    访存；:full / :row 直接读。尾块一律回到与标量内联循环**同一个**单个
    元素表达式，因此整块与尾块都是单次舍入、与通用路径逐位相同。"
-  (let* ((i (gensym "I")) (r (gensym "R"))
+  (let* ((i (gensym "I")) (r (gensym "R")) (lim (gensym "LIM"))
          (ad (gensym "AD")) (bd (gensym "BD")) (od (gensym "OD"))
          (ao (gensym "AO")) (bo (gensym "BO")) (oo (gensym "OO"))
          (nrows (gensym "NROWS")) (nlast (gensym "NLAST"))
@@ -183,24 +196,29 @@
                         `((type fixnum ,i)))))
     `(let* ((,nrows (%sew-nrows ,res))
             (,nlast (%sew-nlast ,res))
+            ;; 向量段的终点提到循环外：原先写 `(<= (+ i lanes) nlast)`，
+            ;; 每个向量迭代都要重算一次加法与比较（250 次/行 × 1000 行），
+            ;; 行广播加法上实测 0.79 ms → 0.60 ms。
+            (,lim (- ,nlast (mod ,nlast ,lanes)))
             (,ad (the (simple-array ,lt (*)) (vt-data ,a)))
             (,bd (the (simple-array ,lt (*)) (vt-data ,b)))
             (,od (the (simple-array ,lt (*)) (vt-data ,res)))
             (,ao (vt-offset ,a)) (,bo (vt-offset ,b)) (,oo (vt-offset ,res)))
-       (declare (type fixnum ,nrows ,nlast ,ao ,bo ,oo)
+       (declare (type fixnum ,nrows ,nlast ,lim ,ao ,bo ,oo)
                 (type (simple-array ,lt (*)) ,ad ,bd ,od))
        (dotimes (,r ,nrows)
          (declare (type fixnum ,r))
          (let ,binds
            (declare ,@types)
-           (loop while (<= (+ ,i ,lanes) ,nlast)
-                 do (setf (,vecaref ,od (+ ,oo ,i))
-                          ,(%sew-vec-form prefix kind vx vy))
-                    (incf ,i ,lanes))
-           (loop while (< ,i ,nlast)
-                 do (setf (aref ,od (+ ,oo ,i))
-                          ,(%sew-scal-form kind sx sy))
-                    (incf ,i))
+           (locally (declare (optimize (speed 3) (safety 0)))
+             (loop while (< ,i ,lim)
+                   do (setf (,vecaref ,od (+ ,oo ,i))
+                            ,(%sew-vec-form prefix kind vx vy))
+                      (incf ,i ,lanes))
+             (loop while (< ,i ,nlast)
+                   do (setf (aref ,od (+ ,oo ,i))
+                            ,(%sew-scal-form kind sx sy))
+                      (incf ,i)))
            (incf ,oo ,nlast)
            ,@(let ((s (funcall step a-mode)))
                (if (eq s 0) nil `((incf ,ao ,s))))
@@ -316,12 +334,13 @@
                   (,nvec (,vecbcast ,nan)))))
        (declare (type fixnum ,n ,ao ,oo ,lim ,i)
                 (type (simple-array ,lt (*)) ,ad ,od))
-       (loop while (< ,i ,lim)
-             do (setf (,vecaref ,od (+ ,oo ,i)) ,body)
-                (incf ,i ,lanes))
-       (loop while (< ,i ,n)
-             do (setf (aref ,od (+ ,oo ,i)) ,tail)
-                (incf ,i))
+       (locally (declare (optimize (speed 3) (safety 0)))
+         (loop while (< ,i ,lim)
+               do (setf (,vecaref ,od (+ ,oo ,i)) ,body)
+                  (incf ,i ,lanes))
+         (loop while (< ,i ,n)
+               do (setf (aref ,od (+ ,oo ,i)) ,tail)
+                  (incf ,i)))
        t)))
 
 (defun %sew1 (op a res)
@@ -340,6 +359,58 @@
              (abs (%sew1-flat single-float abs a res))
              (%op-sqrt-sf (%sew1-flat single-float sqrt a res))))
           (t nil))))
+
+;;; ------------------------------------------------------------------
+;;; 非连续视图的内层 run（run 级向量循环）
+;;;
+;;; 非连续内联路径（`map-reduce.lisp` 的 %INLINE2-STRIDED）把遍历拆成
+;;; 「外层 odometer × 内层 run」。内层那一段只要三方的内层 stride 都是 1，
+;;; 就与连续情形逐元素同构 —— 于是可以整段交给向量循环，每行一次调用。
+;;; 这里只提供「给定起点 + 长度」的入口：起点由调用方的 odometer 算好
+;;; （那是它已经有的信息），本层不做任何坐标推导，也不认识 shape/strides。
+;;;
+;;; 每行一次函数调用 + 一次 (CASE KIND) 分派是刻意接受的：run 长度 ≥ 32
+;;; 才启用（调用方判），单次开销 ~20ns，摊到 32 个元素上已经小于 1 个元素的
+;;; 标量代价。
+;;; ------------------------------------------------------------------
+
+(defmacro %def-sew2-run (name lt prefix)
+  "为元素类型 LT 生成 (KIND N D0 D1 OD A0 B0 O0) 的 run 内核。"
+  `(defun ,name (kind n d0 d1 od a0 b0 o0)
+     (declare (type fixnum n a0 b0 o0) (optimize (speed 3) (safety 0)))
+     (let ((d0 (the (simple-array ,lt (*)) d0))
+           (d1 (the (simple-array ,lt (*)) d1))
+           (od (the (simple-array ,lt (*)) od)))
+       (declare (type (simple-array ,lt (*)) d0 d1 od))
+       (case kind
+         (:add    (%sew2-run-body ,prefix :add    n d0 d1 od a0 b0 o0))
+         (:sub    (%sew2-run-body ,prefix :sub    n d0 d1 od a0 b0 o0))
+         (:mul    (%sew2-run-body ,prefix :mul    n d0 d1 od a0 b0 o0))
+         (:div    (%sew2-run-body ,prefix :div    n d0 d1 od a0 b0 o0))
+         (:sqdiff (%sew2-run-body ,prefix :sqdiff n d0 d1 od a0 b0 o0))
+         (t nil)))))
+
+(%def-sew2-run %sew2-run-f64 double-float "F64.4")
+(%def-sew2-run %sew2-run-f32 single-float "F32.8")
+
+(defun %sew2-run-try (op lt n d0 d1 od a0 b0 o0)
+  "run 级 SIMD 钩子：(OP LT N D0 D1 OD A0 B0 O0) → T/NIL。
+
+   F64/F32 之外的类型、或算子不在白名单时返回 NIL（调用方回退到标量内层循环，
+   铁律 2）。N ≤ 0 也返回 NIL —— 空 run 不该由快路径「成功」处理掉。"
+  (declare (type fixnum n a0 b0 o0))
+  (when (plusp n)
+    (let ((kind (case op
+                  ((+) :add)
+                  ((-) :sub)
+                  ((*) :mul)
+                  ((/) :div)
+                  ((%sq-diff-df %sq-diff-sf) :sqdiff)
+                  (t nil))))
+      (cond ((null kind) nil)
+            ((eq lt 'double-float) (%sew2-run-f64 kind n d0 d1 od a0 b0 o0))
+            ((eq lt 'single-float) (%sew2-run-f32 kind n d0 d1 od a0 b0 o0))
+            (t nil)))))
 
 ;;; ------------------------------------------------------------------
 ;;; 选路外壳：形态不满足时返回 NIL（调用方回退，铁律 2）
@@ -363,4 +434,5 @@
 ;;; 注册到 map-reduce 的钩子（§8.3）。写在文件末尾：本文件加载完成后钩子
 ;;; 才指向真实函数，调用点在运行期解引用，因此加载顺序不构成前向依赖。
 (setf *simd-ew2-fn* #'%sew2-try
-      *simd-ew1-fn* #'%sew1-try)
+      *simd-ew1-fn* #'%sew1-try
+      *simd-ew2-run-fn* #'%sew2-run-try)

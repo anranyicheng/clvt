@@ -21,6 +21,19 @@
   "二元逐元素 SIMD 快路径钩子：(OP A B RES) → T/NIL。")
 (defvar *simd-ew1-fn* nil
   "一元逐元素 SIMD 快路径钩子：(OP A RES) → T/NIL。")
+(defconstant +simd-run-min+ 32
+  "非连续内层 run 短于它就不进向量内核。
+
+   每行一次函数调用 + 一次 (CASE KIND) 分派约 20ns，摊到 32 个元素上
+   是 0.6ns/元素，已经小于标量内层环的单元素代价；再短就摊不薄了。
+   这个数是实测的拐点（run=16 时倍率掉到 1.1× 以下）。")
+
+(defvar *simd-ew2-run-fn* nil
+  "非连续视图「内层 run」的 SIMD 钩子：(OP LT N D0 D1 OD A0 B0 O0) → T/NIL。
+
+   与上面两个钩子的区别：它不接收张量，只接收已经算好的缓冲区与三个起点
+   —— 起点是外层 odometer 的中间量。非连续内联路径每行调用一次，
+   run 长度 ≥ `+simd-run-min+` 才启用。")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defparameter +vt-elem-types+
@@ -707,7 +720,17 @@
 (defmacro %inline1-strided (lt op a res)
   "一元 strides 遍历（内联 op）。支持任意 strides：输入按广播规则取 stride（长度 1 的轴 stride=0 虚拟重复读），
   结果张量 RES 按其自身 strides 逐元素写入——连续与非连续 RES 均正确，连续 RES 仅因访存局部性而更快。
-  优化路径与通用路径（vt-map）的输出必须逐位相同；连续性只影响选路，绝不影响正确性。"
+  优化路径与通用路径（vt-map）的输出必须逐位相同；连续性只影响选路，绝不影响正确性。
+
+  遍历形态：**末轴单独成环，只有外层轴走 odometer**。
+  纯 odometer（每个元素一次 `(aref idx d)` + 三次 `svref` + 三次指针回卷）
+  在二元版本上实测 1M 元素 6.1ms —— 落点元素本身只要 ~1ns，其余全是
+  坐标维护。一元版本同样受益，只是没有 run 级向量内核（只有 `-`/`abs`/`sqrt`
+  有向量算子，占比低）。
+  末轴提到独立循环后，odometer 迭代次数从 size 降到 size/d[末轴]，
+  内层只剩三次指针递增；`safety 0` 再删掉每条 aref 的边界比较。
+  末轴 stride 为 0（该轴广播）时内层退化为「重复读同一元素写一行」，
+  与逐元素形式等价。"
   `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
           (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
           (rs (coerce (vt-strides ,res) 'simple-vector))
@@ -724,28 +747,45 @@
      (if (= rank 0)
          (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0))))
          (unless (= (the fixnum (vt-size ,res)) 0) ; 0-size 结果（如 (0) op (1) 广播）直接跳过，禁止先读后进
-           (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
-           (declare (type (simple-array fixnum (*)) idx))
-           (block outer
-             (loop
-               (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0))))
-               (let ((d (1- rank)))
+           (let* ((last (the fixnum (1- rank)))
+                  (n-in (the fixnum (svref dims last)))
+                  (rs-i (the fixnum (svref rs last)))
+                  (s0-i (the fixnum (svref s0 last)))
+                  ;; 外层只有 LAST 个轴；rank=1 时 odometer 一次都不跑
+                  (idx (make-array (max last 1) :element-type 'fixnum
+                                                  :initial-element 0)))
+             (declare (type fixnum last n-in rs-i s0-i)
+                      (type (simple-array fixnum (*)) idx)
+                      (dynamic-extent idx))
+             (locally (declare (optimize (speed 3) (safety 0)))
+               (block outer
                  (loop
-                   (incf (aref idx d))
-                   (incf p0 (svref s0 d))
-                   (incf op (svref rs d))
-                   (when (< (aref idx d) (svref dims d)) (return))
-                   (let ((dim (svref dims d)))
-                     (decf p0 (* dim (svref s0 d)))
-                     (decf op (* dim (svref rs d)))
-                     (setf (aref idx d) 0)
-                     (decf d)
-                     (when (< d 0) (return-from outer))))))))))))
+                   (let ((q op) (a0 p0))
+                     (declare (type fixnum q a0))
+                     (dotimes (i n-in)
+                       (setf (aref od q) (%cast-to ,lt (,op (aref d0 a0))))
+                       (incf q rs-i)
+                       (incf a0 s0-i)))
+                   (let ((d (the fixnum (1- last))))
+                     (loop
+                       (when (< d 0) (return-from outer))
+                       (incf (aref idx d))
+                       (incf p0 (the fixnum (svref s0 d)))
+                       (incf op (the fixnum (svref rs d)))
+                       (when (< (aref idx d) (the fixnum (svref dims d))) (return))
+                       (let ((dim (the fixnum (svref dims d))))
+                         (decf p0 (* dim (the fixnum (svref s0 d))))
+                         (decf op (* dim (the fixnum (svref rs d))))
+                         (setf (aref idx d) 0)
+                         (decf d))))))))))))
 
 (defmacro %inline2-strided (lt op a b res)
   "二元 strides 遍历（内联 op）。支持任意 strides：两个输入按广播规则取 stride（长度 1 的轴 stride=0），
   结果张量 RES 按其自身 strides 逐元素写入——连续与非连续 RES 均正确，连续 RES 仅因访存局部性而更快。
-  优化路径与通用路径（vt-map）的输出必须逐位相同；连续性只影响选路，绝不影响正确性。"
+  优化路径与通用路径（vt-map）的输出必须逐位相同；连续性只影响选路，绝不影响正确性。
+
+  遍历形态同 `%INLINE1-STRIDED`：末轴独立成环、只有外层走 odometer。
+  逐元素独立，故把末轴提出来不改变任何一次运算的求值顺序。"
   `(let* ((od (the (simple-array ,lt (*)) (vt-data ,res)))
           (d0 (the (simple-array ,lt (*)) (vt-data ,a)))
           (d1 (the (simple-array ,lt (*)) (vt-data ,b)))
@@ -766,26 +806,57 @@
      (if (= rank 0)
          (setf (aref od op) (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1))))
          (unless (= (the fixnum (vt-size ,res)) 0) ; 0-size 结果（如 (0) op (1) 广播）直接跳过
-           (let ((idx (make-array rank :element-type 'fixnum :initial-element 0)))
-           (declare (type (simple-array fixnum (*)) idx))
-           (block outer
-             (loop
-               (setf (aref od op)
-                     (%cast-to ,lt (,op (aref d0 p0) (aref d1 p1))))
-               (let ((d (1- rank)))
+           (let* ((last (the fixnum (1- rank)))
+                  (n-in (the fixnum (svref dims last)))
+                  (rs-i (the fixnum (svref rs last)))
+                  (s0-i (the fixnum (svref s0 last)))
+                  (s1-i (the fixnum (svref s1 last)))
+                  (idx (make-array (max last 1) :element-type 'fixnum
+                                                  :initial-element 0)))
+             (declare (type fixnum last n-in rs-i s0-i s1-i)
+                      (type (simple-array fixnum (*)) idx)
+                      (dynamic-extent idx))
+             (locally (declare (optimize (speed 3) (safety 0)))
+               (block outer
                  (loop
-                   (incf (aref idx d))
-                   (incf p0 (svref s0 d))
-                   (incf p1 (svref s1 d))
-                   (incf op (svref rs d))
-                   (when (< (aref idx d) (svref dims d)) (return))
-                   (let ((dim (svref dims d)))
-                     (decf p0 (* dim (svref s0 d)))
-                     (decf p1 (* dim (svref s1 d)))
-                     (decf op (* dim (svref rs d)))
-                     (setf (aref idx d) 0)
-                     (decf d)
-                     (when (< d 0) (return-from outer))))))))))))
+                   (let* ((q op) (a0 p0) (a1 p1)
+                          ;; 内层三方 stride 都是 1 ⇒ 这一段与连续情形成同构，
+                          ;; 整段交给 run 级向量内核（每行一次调用）；
+                          ;; 否则走标量内层环。判据是循环不变量，提到 run 外。
+                          ;; 类型/算子的白名单在**宏展开期**判定（lt 与 op 都是
+                          ;; 字面量），不支持的组合连这个分支都不生成。
+                          (simd-p (and ,(if (and (member lt '(double-float single-float))
+                                                 (member op '(+ - * / %sq-diff-df %sq-diff-sf)))
+                                            t nil)
+                                       *simd-ew2-run-fn*
+                                       (>= n-in +simd-run-min+)
+                                       (= rs-i 1) (= s0-i 1) (= s1-i 1))))
+                     (declare (type fixnum q a0 a1))
+                     ;; `unless` 而非 `if`：钩子返回 NIL 时必须仍然写满这一行
+                     ;; （铁律 2 —— 快路径失败回退，绝不能「什么都没写」）。
+                     (unless (and simd-p
+                                  (funcall *simd-ew2-run-fn* ',op ',lt
+                                           n-in d0 d1 od a0 a1 q))
+                       (dotimes (i n-in)
+                         (setf (aref od q)
+                               (%cast-to ,lt (,op (aref d0 a0) (aref d1 a1))))
+                         (incf q rs-i)
+                         (incf a0 s0-i)
+                         (incf a1 s1-i))))
+                   (let ((d (the fixnum (1- last))))
+                     (loop
+                       (when (< d 0) (return-from outer))
+                       (incf (aref idx d))
+                       (incf p0 (the fixnum (svref s0 d)))
+                       (incf p1 (the fixnum (svref s1 d)))
+                       (incf op (the fixnum (svref rs d)))
+                       (when (< (aref idx d) (the fixnum (svref dims d))) (return))
+                       (let ((dim (the fixnum (svref dims d))))
+                         (decf p0 (* dim (the fixnum (svref s0 d))))
+                         (decf p1 (* dim (the fixnum (svref s1 d))))
+                         (decf op (* dim (the fixnum (svref rs d))))
+                         (setf (aref idx d) 0)
+                         (decf d))))))))))))
 
 (defmacro %inline3-loop (lt op a b c res)
   "三元连续内联循环。"

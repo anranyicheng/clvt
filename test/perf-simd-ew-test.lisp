@@ -457,10 +457,15 @@
                                            (vt-* *big-a* *big-b* :out out1)))))
                0.75 "simd/scalar"))
 
+;;; 基线必须**两个钩子都关**：`*simd-ew2-fn*` 关掉之后，行广播这个形态
+;;; 会掉进 `%inline2-strided`，而那条路的内层 run 现在也接到了
+;;; `*simd-ew2-run-fn*`（§7.4.4）—— 于是「关掉 SIMD」实际关的是扁平向量
+;;; 循环，比的成了两套向量实现的快慢，护栏就失去意义了（实测 1.48× 假红灯）。
 (let ((out2 (%alloc-vt '(1000 1000) :float64)))
   (check-ratio "D2 SIMD 行广播加法 ≤ 0.5× 标量 odometer"
                (/ (%median-us (lambda () (vt-+ *big-m* *big-r* :out out2)))
-                  (%median-us (lambda () (let ((clvt::*simd-ew2-fn* nil))
+                  (%median-us (lambda () (let ((clvt::*simd-ew2-fn* nil)
+                                               (clvt::*simd-ew2-run-fn* nil))
                                            (vt-+ *big-m* *big-r* :out out2)))))
                0.5 "simd/strided"))
 
