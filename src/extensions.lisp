@@ -54,78 +54,23 @@
   dst)
 
 (defun vt-flatnonzero (tensor &key (dtype :int64))
-  "返回展平后非零元素的索引。"
-  (let* ((flat (vt-ravel tensor))
-         (data (vt-data flat))
-         (size (vt-size flat))
-         (offset (vt-offset flat))
-         (stride (or (first (vt-strides flat)) 1)))
-    (declare (type fixnum size offset stride))
-    ;; 两遍扫描：先数、再落位。原实现用 PUSH/NREVERSE 收集，每命中一次就
-    ;; 分配一个 cons，且逐元素 `(aref data ptr)` 走通用分派（DATA 没有元素
-    ;; 类型声明，每次都要查 widetag）；这里把「按元素类型展开」的循环收在
-    ;; 一处，命中时只写一个下标。
-    ;;
-    ;; 落位缓冲直接开成 `(signed-byte 64)`（结果 dtype INT64 的物理元素类型），
-    ;; 写完用 `%MAKE-VT` 直接包成张量。**不能**交给 VT-FROM-ARRAY：
-    ;; 它对每个元素走一次「通用 AREF + VT-CAST」，而 VT-CAST 包着
-    ;; WITH-FLOAT-SAFE（两次 FP 控制字读写）—— 实测 13.3 万个下标要 33 ms，
-    ;; 比两遍扫描本身（0.53 ms）贵 60 倍，把整个函数拖成比原实现还慢 6 倍
-    ;; （n=200000 实测：旧 5.0ms / 走 VT-FROM-ARRAY 33ms / 直接包装 0.6ms）。
-    ;; 目标 dtype 不是 INT64 时才补一次 VT-ASTYPE（整组特化转换，不逐元素分派）。
-    (macrolet ((walk (lt)
-                 `(let ((d (the (simple-array ,lt (*)) data)))
-                    (declare (type (simple-array ,lt (*)) d)
-                             (type fixnum size offset stride))
-                    (let ((cnt 0))
-                      (declare (type fixnum cnt))
-                      (let ((ptr offset))
-                        (declare (type fixnum ptr))
-                        (dotimes (i size)
-                          (unless (= (aref d ptr) 0) (incf cnt))
-                          (incf ptr stride)))
-                      (let ((acc (make-array cnt :element-type '(signed-byte 64)))
-                            (k 0)
-                            (ptr offset))
-                        (declare (type (simple-array (signed-byte 64) (*)) acc)
-                                 (type fixnum k ptr))
-                        (dotimes (i size)
-                          (unless (= (aref d ptr) 0)
-                            (setf (aref acc k) i)
-                            (incf k))
-                          (incf ptr stride))
-                        acc))))
-               (walk-generic ()
-                 "未知元素类型：不声明，保持通用 AREF（语义一致，只是慢）。"
-                 `(let ((cnt 0))
-                    (declare (type fixnum cnt))
-                    (dotimes (i size)
-                      (unless (= (aref data (the fixnum (+ offset (* i stride)))) 0)
-                        (incf cnt)))
-                    (let ((acc (make-array cnt :element-type '(signed-byte 64)))
-                          (k 0))
-                      (declare (type (simple-array (signed-byte 64) (*)) acc)
-                               (type fixnum k))
-                      (dotimes (i size)
-                        (unless (= (aref data (the fixnum (+ offset (* i stride)))) 0)
-                          (setf (aref acc k) i)
-                          (incf k)))
-                      acc))))
-      (let ((raw (let ((et (array-element-type data)))
-                   (cond ((equal et 'double-float)            (walk double-float))
-                         ((equal et 'single-float)            (walk single-float))
-                         ((equal et '(signed-byte 64))        (walk (signed-byte 64)))
-                         ((equal et '(signed-byte 32))        (walk (signed-byte 32)))
-                         ((equal et '(signed-byte 16))        (walk (signed-byte 16)))
-                         ((equal et '(signed-byte 8))         (walk (signed-byte 8)))
-                         ((equal et '(unsigned-byte 16))      (walk (unsigned-byte 16)))
-                         ((equal et '(unsigned-byte 8))       (walk (unsigned-byte 8)))
-                         ((equal et '(complex double-float))  (walk (complex double-float)))
-                         ((equal et '(complex single-float))  (walk (complex single-float)))
-                         (t (walk-generic))))))
-        (let ((res (%make-vt :data raw :shape (list (length raw)) :strides (list 1)
-                             :offset 0 :dtype :int64)))
-          (if (eq dtype :int64) res (vt-astype res dtype)))))))
+  "返回展平后非零元素的索引。
+
+  实现落在 `%FLAT-NONZERO-INDICES`（`src/indexing.lisp`）—— 那是
+   `vt-nonzero` / `vt-argwhere` / `vt-extract` 与本函数共用的**唯一**
+  「找出非零位置」内核，两遍扫描（先数、再落位）+ 按元素类型展开。
+  这里只负责把下标数组包成张量，并按需转成 DTYPE。
+
+   历史（v0.4.20→21）：原实现 `(push i acc)` + `(nreverse acc)`，
+   每命中一次分配一个 cons；改成两遍扫描后又要小心收尾 ——
+   交给 `VT-FROM-ARRAY` 会对每个元素走一次「通用 AREF + VT-CAST」，
+   13.3 万个下标要 33ms，比扫描本身（0.53ms）贵 60 倍，反而比原实现慢
+   6 倍。因此内核直接产出 `(signed-byte 64)` 数组、由 `%MAKE-VT` 包装，
+   非 :int64 目标才补一次 `VT-ASTYPE`（整组特化转换，不逐元素分派）。"
+  (let* ((raw (%flat-nonzero-indices tensor))
+         (res (%make-vt :data raw :shape (list (length raw)) :strides '(1)
+                        :offset 0 :dtype :int64)))
+    (if (eq dtype :int64) res (vt-astype res dtype))))
 
 (defparameter *vt-einsum-label-pool*
   (let ((chars '()))

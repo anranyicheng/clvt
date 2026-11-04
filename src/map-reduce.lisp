@@ -59,8 +59,16 @@
      走 vt-map 兜底（语义不变，仅性能差异），以控制展开体积。")
 
   (defparameter +vt-mask-in-types+
-    '(double-float single-float (signed-byte 64) (signed-byte 32))
-    "窄整型输出时可配的输入类型（数据源；窄整型输入仍走同类型路径）。")
+    '(double-float single-float (signed-byte 64) (signed-byte 32) (unsigned-byte 8))
+    "窄整型输出时可配的输入类型（数据源；更窄的整型输入仍走同类型路径）。
+
+     `(UNSIGNED-BYTE 8)` 这一格服务的是 **`:bool` / `:uint8` 输入**：谓词族
+     （`vt-nonzero-p` / `vt-positive-p` / `vt-zero-p` …）在布尔掩码上再取掩码
+     是最常见的链路（`vt-count-nonzero`、`vt-where` 单参形式、逻辑运算），
+     而 `:bool` 与 `:uint8` 的物理类型同为 ub8 —— 缺了这一格，整条链会静默
+     退回 `vt-map` 的闭包路径，1M 元素实测 11~12ms（同类 float64 输入 1.8ms）。
+     只加一格而不是补全 4 个窄整型，是为了控制 `vt-fast-map` 200+ 展开点的
+     代码体积（矩阵每加一行，三个掩码宏各多一份完整循环体）。")
 
   ;; ------------------------------------------------------------------
   ;; 复数元素类型（CONVENTIONS §16.14 执行层）

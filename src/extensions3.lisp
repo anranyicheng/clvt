@@ -144,25 +144,41 @@
   "去除 1 维张量首尾的零（对标 numpy.trim_zeros）。
    TRIM 取值 :fb（默认，去首尾）/ :f（仅去首）/ :b（仅去尾）。
    判定用 = 比较（与 numpy 一致，0.0 亦视为零）。
-   示例：(vt-trim-zeros '(0 0 1 2 0 3 0 0)) => [1 2 0 3]"
+   示例：(vt-trim-zeros '(0 0 1 2 0 3 0 0)) => [1 2 0 3]
+
+   性能（v0.4.21）：原实现把整条数据 `(COERCE … 'LIST)` 成 1M 个 cons，
+   再用 `(NTH K VALS)` 逐个试探两端、`(SUBSEQ VALS START END)` 复制一段
+   list，最后 `VT-FROM-SEQUENCE` 逐元素 `VT-CAST` 建结果。1M 元素实测
+   28ms —— 而真正需要的只是「两端各走几步」。现在直接在类型化的
+   double-float 缓冲上走指针，找到 [start, end) 后 `VT-SLICE` + `VT-CONTIGUOUS`。
+   判定仍走 **float64**（与原实现一致）：复数输入按实部判零，
+   而不是按 `(ZEROP #C(0 1))`（那会给「非零」），语义不变。
+   结果元素直接取自原张量 —— 原实现把值经 float64 往返一遍，
+   `|x| > 2^53` 的整数会被静默舍入，这里顺带修掉了。"
   (let* ((input (ensure-vt tensor))
          (one-d (if (null (vt-shape input))
-                    (vt-reshape input '(1))
-                    (vt-ravel input)))
+                    (%flat-offset0 (vt-reshape input '(1)))
+                    (%flat-offset0 input)))
          (n (vt-size one-d)))
     (unless (member trim '(:fb :f :b))
       (error "vt-trim-zeros: trim 必须是 :fb / :f / :b 之一，收到 ~a" trim))
     (if (zerop n)
         one-d
-        (let ((vals (coerce (vt-data (vt-astype one-d :float64)) 'list)))
+        (let* ((fv (if (eq (vt-dtype one-d) :float64)
+                       one-d
+                       (vt-astype one-d :float64)))
+               (d (vt-data fv)))
+          (declare (type (simple-array double-float (*)) d)
+                   (type fixnum n))
           (let ((start 0) (end n))
+            (declare (type fixnum start end))
             (when (member trim '(:fb :f))
-              (loop while (and (< start end) (zerop (nth start vals)))
+              (loop while (and (< start end) (zerop (aref d start)))
                     do (incf start)))
             (when (member trim '(:fb :b))
-              (loop while (and (< start end) (zerop (nth (1- end) vals)))
+              (loop while (and (< start end) (zerop (aref d (the fixnum (1- end)))))
                     do (decf end)))
-            (vt-from-sequence (subseq vals start end) :dtype (vt-dtype one-d)))))))
+            (vt-contiguous (vt-slice one-d (list start end))))))))
 
 ;;; ==================================================================
 ;;; 2. 形状操作类（Shape manipulation）
@@ -940,11 +956,25 @@
             xe ye
             :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
 
+(declaim (inline %e3-sign-bit-p))
 (defun %e3-sign-bit-p (x)
   "IEEE 754 符号位判定（含 -0.0 与 NaN 的符号位）。
    minusp/float-sign 均无法区分 ±0.0，这里直接读 double-float 位模式。"
   (declare (double-float x))
   (logbitp 63 (logand #xFFFFFFFFFFFFFFFF (sb-kernel:double-float-bits x))))
+
+;;; 谓词族的具名算子（v0.4.21）——理由同 elementwise1.lisp 同名小节：
+;;; `vt-fast-map` 只对 `(function <符号>)` 内联，匿名 lambda 一律退回闭包路径。
+;;; 这三个算子都靠 `with-float-safe`（`vt-fast-map` 外层已屏蔽），
+;;; 因此对 NaN 做 `(> x most-positive-double-float)` 不会抛 INVALID-OPERATION。
+(declaim (inline %pred-signbit %pred-posinf %pred-neginf))
+
+(defun %pred-signbit (v)
+  "符号位 → 0/1。入参已由调用方 `ensure-vt :dtype :float64` 收敛到 double。"
+  (if (%e3-sign-bit-p (coerce v 'double-float)) 1 0))
+
+(defun %pred-posinf (v) (if (and (floatp v) (%pos-inf-p v)) 1 0))
+(defun %pred-neginf (v) (if (and (floatp v) (%neg-inf-p v)) 1 0))
 
 (defun vt-copysign (x y &key out dtype)
   "逐元素赋予 X 的绝对值与 Y 的符号（对标 numpy.copysign）。
@@ -966,14 +996,16 @@
 
 (defun vt-signbit (tensor &key out)
   "逐元素符号位判定，返回 **:bool** 布尔张量（对标 numpy.signbit，§17）。
-   x < 0 或为负零（-0.0）→ True，否则 False。:out 契约同 vt-=（dtype :bool）。"
-    (when (%cx-reject tensor)
+   x < 0 或为负零（-0.0）→ True，否则 False。:out 契约同 vt-=（dtype :bool）。
+
+   性能（v0.4.21）：原实现以匿名 lambda 传 `vt-map`，命中不了
+   `vt-fast-map` 的内联分支，1M float64 实测 31ms（numpy 0.9ms）。
+   改为具名内联算子后走 `%mask1-loop`，语义逐位不变 ——
+   `vt-map` 的写回本就是 `vt-cast-fun` 的真值化，而算子恒返 0/1。"
+  (when (%cx-reject tensor)
     (error "vt-signbit: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-map (lambda (x)
-            ;; v0.4.1 修复（差分测试 R5）：按 IEEE 符号位判定；正 NaN 符号位
-            ;; 为 0（numpy.signbit(+nan)=0），负 NaN/-0.0/负数为 1。
-            (if (%e3-sign-bit-p (coerce x 'double-float)) 1 0))
-          (ensure-vt tensor :dtype :float64) :out out :dtype :bool))
+  (vt-fast-map #'%pred-signbit (ensure-vt tensor :dtype :float64)
+               :out out :dtype :bool))
 
 (declaim (inline %e3-nextafter))
 (defun %e3-nextafter (a b)
@@ -1680,13 +1712,42 @@
           (let ((v (vt-item c)))
             (vt-full nil (/ v (sqrt (* v v))) :dtype :float64))
           (let ((r (vt-zeros (list n n) :dtype :float64)))
-            (dotimes (i n r)
-              (dotimes (j n)
-                (let ((cii (%vt-ref-raw c i i)) (cjj (%vt-ref-raw c j j)))
-                  (setf (vt-ref r i j)
-                        (if (or (zerop cii) (zerop cjj))
-                            (if (= i j) 1.0d0 0.0d0)
-                            (/ (%vt-ref-raw c i j) (sqrt (* cii cjj)))))))))))))
+            ;; 性能（v0.4.21）：原循环对每个 (i,j) 调两次 `%VT-REF-RAW` 读对角线、
+            ;; 一次 `(SETF (VT-REF R I J))` 写结果 —— 后者要走完整的坐标折算
+            ;; （形状/步长遍历 + 越界检查）。n=1000 即 100 万次折算，实测
+            ;; 148ms 而 `VT-COV` 本身只要 16ms（numpy.corrcoef 8.1ms）。
+            ;;
+            ;; 现在：C 与 R 都先归为连续视图（R 由 `VT-ZEROS` 建成，恒连续；
+            ;; C 由 `VT-COV` 新建，`VT-CONTIGUOUS` 在已连续时是零开销原语），
+            ;; 对角线抄进一个长度 n 的缓冲，内层只剩三次 AREF 与一次 SQRT。
+            ;;
+            ;; **逐位不变**：`(SQRT (* CII CJJ))` 的算式与求值次序一字未动
+            ;; （没有改成 `(* (SQRT CII) (SQRT CJJ))` —— 那在末位不同）。
+            (let* ((cc   (vt-contiguous c))
+                   (cd   (vt-data cc))
+                   (co   (vt-offset cc))
+                   (cols (second (vt-shape c)))
+                   (rd   (vt-data r))
+                   (diag (make-array (max n 1) :element-type 'double-float)))
+              (declare (type (simple-array double-float (*)) cd rd diag)
+                       (type fixnum n cols co))
+              (dotimes (i n)
+                (declare (type fixnum i))
+                (setf (aref diag i) (aref cd (the fixnum (+ co (* i cols) i)))))
+              (dotimes (i n r)
+                (declare (type fixnum i))
+                (let ((cii (aref diag i))
+                      (row (* i n)))
+                  (declare (type double-float cii) (type fixnum row))
+                  (dotimes (j n)
+                    (declare (type fixnum j))
+                    (let ((cjj (aref diag j)))
+                      (declare (type double-float cjj))
+                      (setf (aref rd (the fixnum (+ row j)))
+                            (if (or (zerop cii) (zerop cjj))
+                                (if (= i j) 1.0d0 0.0d0)
+                                (/ (aref cd (the fixnum (+ co (* i cols) j)))
+                                   (sqrt (* cii cjj)))))))))))))))
 
 (defun vt-cross (a b &key (axis nil) (axisa -1) (axisb -1) (axisc -1) dtype)
   "向量叉积（对标 numpy.cross）。
@@ -1921,15 +1982,19 @@
 
 (defun vt-isposinf (tensor &key out)
   "逐元素 +Inf 判定，返回 **:bool** 布尔张量（对标 numpy.isposinf，§17）。
-   :out 契约同 vt-=（dtype :bool）。"
-  (vt-map (lambda (x) (if (and (floatp x) (%pos-inf-p x)) 1 0))
-          (ensure-vt tensor :dtype :float64) :out out :dtype :bool))
+   :out 契约同 vt-=（dtype :bool）。
+
+   性能（v0.4.21）：匿名 lambda → 具名内联算子 `%pred-posinf`，
+   1M float64 实测 26.5ms → 2.6ms（`vt-isnan` 同一形状只要 1.7ms，
+   差额是 `ensure-vt :dtype :float64` 的 dtype 检查本身）。"
+  (vt-fast-map #'%pred-posinf (ensure-vt tensor :dtype :float64)
+               :out out :dtype :bool))
 
 (defun vt-isneginf (tensor &key out)
   "逐元素 -Inf 判定，返回 **:bool** 布尔张量（对标 numpy.isneginf，§17）。
-   :out 契约同 vt-=（dtype :bool）。"
-  (vt-map (lambda (x) (if (and (floatp x) (%neg-inf-p x)) 1 0))
-          (ensure-vt tensor :dtype :float64) :out out :dtype :bool))
+   :out 契约同 vt-=（dtype :bool）。性能同 `vt-isposinf`。"
+  (vt-fast-map #'%pred-neginf (ensure-vt tensor :dtype :float64)
+               :out out :dtype :bool))
 
 ;;; ==================================================================
 ;;; 8. 集合类（Set operations）

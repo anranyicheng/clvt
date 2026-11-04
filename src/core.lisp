@@ -644,18 +644,69 @@
    这是 `vt-astype ... :bool` 的落点，也是「数值 → 布尔」的唯一转换规则
    （CONVENTIONS §17.1）：非零→1、零→0、NaN→1，复数按「任一分量非零」。
    不能走整数截断表 —— `(truncate 0.5)` 是 0，而 `np.array(0.5).astype(bool)`
-   是 True，两者语义不同。"
+   是 True，两者语义不同。
+
+   性能（v0.4.21）：原实现对每个元素走 `VT-DO-EACH` —— 那是给任意 strides
+   用的递归里程计，叶子处 `(aref data ptr)` 的 DATA 没有元素类型声明，
+   于是每次取元素都要查 widetag 走通用 AREF，且内层是对 LOCAL FUNCTION 的
+   真调用。1M 元素实测：f64→bool 19.5ms、i64→bool 11ms、bool→bool 11ms
+   （numpy 同规模 0.9ms）。这里加一条**连续视图**的落点：按元素类型展开成
+   线性下标循环，内层只剩一次 AREF + `%BOOL-FLAG`。非连续视图仍走
+   `VT-DO-EACH`（语义逐位相同，只是慢）—— 两条路的写入表达式是同一个
+   `(%bool-flag …)`，不存在两份真值规则。
+
+   注意 `(unsigned-byte 8)` 这一格**不能**省成 `%MEMCPY`：`:uint8` 数组里
+   可以合法存放 2、3，真值化必须给 1。`:bool` 源元素固然只含 0/1，但
+   按元素类型分派时两者物理类型相同、无法区分，所以统一走 `%BOOL-FLAG`。"
   (with-float-safe
     (let* ((in (ensure-vt tensor))
-           (res (%alloc-vt (vt-shape in) :bool))
-           (od (vt-data res))
-           (i 0))
+           (shape (vt-shape in))
+           (n (vt-shape-to-size shape))
+           (res (%alloc-vt shape :bool))
+           (od (vt-data res)))
       (declare (type (simple-array (unsigned-byte 8) (*)) od)
-               (type fixnum i))
-      (vt-do-each (ptr val in)
-        (declare (ignore ptr))
-        (setf (aref od i) (the (unsigned-byte 8) (%bool-flag val)))
-        (incf i))
+               (type fixnum n))
+      (if (and (vt-contiguous-p in) (vt-contiguous-p res))
+          (let ((data (vt-data in))
+                (off (vt-offset in)))
+            (declare (type fixnum off))
+            (macrolet ((walk (lt)
+                         `(let ((d (the (simple-array ,lt (*)) data)))
+                            (declare (type (simple-array ,lt (*)) d)
+                                     (type fixnum off n))
+                            (let ((p off))
+                              (declare (type fixnum p))
+                              (dotimes (i n)
+                                (declare (type fixnum i))
+                                (setf (aref od i)
+                                      (the (unsigned-byte 8)
+                                           (%bool-flag (aref d p))))
+                                (incf p)))))
+                       (walk-generic ()
+                         "未知元素类型：不声明，保持通用 AREF（语义一致，只是慢）。"
+                         `(dotimes (i n)
+                            (declare (type fixnum i))
+                            (setf (aref od i)
+                                  (the (unsigned-byte 8)
+                                       (%bool-flag (aref data (+ off i))))))))
+              (let ((et (array-element-type data)))
+                (cond ((equal et 'double-float)            (walk double-float))
+                      ((equal et 'single-float)            (walk single-float))
+                      ((equal et '(signed-byte 64))        (walk (signed-byte 64)))
+                      ((equal et '(signed-byte 32))        (walk (signed-byte 32)))
+                      ((equal et '(signed-byte 16))        (walk (signed-byte 16)))
+                      ((equal et '(signed-byte 8))         (walk (signed-byte 8)))
+                      ((equal et '(unsigned-byte 16))      (walk (unsigned-byte 16)))
+                      ((equal et '(unsigned-byte 8))       (walk (unsigned-byte 8)))
+                      ((equal et '(complex double-float))  (walk (complex double-float)))
+                      ((equal et '(complex single-float))  (walk (complex single-float)))
+                      (t (walk-generic))))))
+          (let ((i 0))
+            (declare (type fixnum i))
+            (vt-do-each (ptr val in)
+              (declare (ignore ptr))
+              (setf (aref od i) (the (unsigned-byte 8) (%bool-flag val)))
+              (incf i))))
       res)))
 
 (defun %all-bool-tensors-p (xs)

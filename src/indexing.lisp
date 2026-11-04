@@ -486,45 +486,180 @@
                    condition x y :out result :dtype final-dtype))
          result))))))
 
+(defun %flat-nonzero-indices (tensor)
+  "TENSOR（任意 strides）展平后非零元素的**逻辑扁平下标**，返回
+  `(simple-array (signed-byte 64) (*))`，长度 = 非零个数。
+
+  这是 `vt-flatnonzero` / `vt-nonzero` / `vt-argwhere` / `vt-extract` 四条
+  路径共用的**唯一**「找出非零位置」实现 —— 它们的差别只是拿到下标之后
+  怎么组织输出（1-D 下标 / 按轴分解的坐标列表 / (n,rank) 坐标矩阵 /
+  按下标采集值），所以收集这一层必须只有一份，否则四条路会各自退化。
+
+  两遍扫描：先数、再落位。原实现一律 `(push i acc)` + `(nreverse acc)` ——
+  每命中一次分配一个 cons（1M 元素全是非零时就是 1M 个 cons、约 16MB 垃圾），
+  且逐元素 `(aref data ptr)` 的 DATA 没有元素类型声明，每次都要查 widetag
+  走通用 AREF。这里把「按元素类型展开」的循环收在一处，命中时只写一个
+  `(signed-byte 64)`，结果可直接 `%MAKE-VT` 包成张量，不必再过
+  `vt-from-sequence`（那会对每个元素走一次 `vt-cast`，13.3 万个下标要 33ms，
+  比扫描本身贵 60 倍）。
+
+  落位缓冲用 `(signed-byte 64)` 而不是 fixnum：`vt-flatnonzero` 的结果
+  dtype 就是 :int64（其物理类型），由 `%MAKE-VT` 直接包装，省掉一次转换。
+  下标值本身恒非负且 < size，故对 fixnum 与 s64 都是安全范围。"
+  (let* ((flat (vt-ravel tensor))
+         (data (vt-data flat))
+         (size (vt-size flat))
+         (offset (vt-offset flat))
+         (stride (or (first (vt-strides flat)) 1)))
+    (declare (type fixnum size offset stride))
+    (macrolet ((walk (lt)
+                 `(let ((d (the (simple-array ,lt (*)) data)))
+                    (declare (type (simple-array ,lt (*)) d)
+                             (type fixnum size offset stride))
+                    (let ((cnt 0))
+                      (declare (type fixnum cnt))
+                      (let ((ptr offset))
+                        (declare (type fixnum ptr))
+                        (dotimes (i size)
+                          (unless (= (aref d ptr) 0) (incf cnt))
+                          (incf ptr stride)))
+                      (let ((acc (make-array cnt :element-type '(signed-byte 64)))
+                            (k 0)
+                            (ptr offset))
+                        (declare (type (simple-array (signed-byte 64) (*)) acc)
+                                 (type fixnum k ptr))
+                        (dotimes (i size)
+                          (unless (= (aref d ptr) 0)
+                            (setf (aref acc k) i)
+                            (incf k))
+                          (incf ptr stride))
+                        acc))))
+               (walk-generic ()
+                 "未知元素类型：不声明，保持通用 AREF（语义一致，只是慢）。"
+                 `(let ((cnt 0))
+                    (declare (type fixnum cnt))
+                    (dotimes (i size)
+                      (unless (= (aref data (the fixnum (+ offset (* i stride)))) 0)
+                        (incf cnt)))
+                    (let ((acc (make-array cnt :element-type '(signed-byte 64)))
+                          (k 0))
+                      (declare (type (simple-array (signed-byte 64) (*)) acc)
+                               (type fixnum k))
+                      (dotimes (i size)
+                        (unless (= (aref data (the fixnum (+ offset (* i stride)))) 0)
+                          (setf (aref acc k) i)
+                          (incf k)))
+                      acc))))
+      (let ((et (array-element-type data)))
+        (cond ((equal et 'double-float)            (walk double-float))
+              ((equal et 'single-float)            (walk single-float))
+              ((equal et '(signed-byte 64))        (walk (signed-byte 64)))
+              ((equal et '(signed-byte 32))        (walk (signed-byte 32)))
+              ((equal et '(signed-byte 16))        (walk (signed-byte 16)))
+              ((equal et '(signed-byte 8))         (walk (signed-byte 8)))
+              ((equal et '(unsigned-byte 16))      (walk (unsigned-byte 16)))
+              ((equal et '(unsigned-byte 8))       (walk (unsigned-byte 8)))
+              ((equal et '(complex double-float))  (walk (complex double-float)))
+              ((equal et '(complex single-float))  (walk (complex single-float)))
+              (t (walk-generic)))))))
+
+(defun %coords-from-flat (flat shape)
+  "把逻辑扁平下标向量 FLAT（**必须升序**，`%FLAT-NONZERO-INDICES` 的产物
+  天然满足）按 SHAPE 分解成每轴一个 `(signed-byte 64)` 数组的列表。
+
+  坐标用**里程计**推进，不做除法：原实现逐元素算
+  `(MOD (FLOOR K STRIDE_D) DIM_D)`，秩 r 就是每元素 2r 次整数除法
+  （1M 元素 × 秩 2 ≈ 300 万次除法，实测占 `vt-nonzero` 总耗时的七成）。
+  这里改成「从上一个下标走到当前下标」：每一步只给末轴 +1，溢出才向前进位，
+  所有元素合起来正好走 N 步，摊还 O(1)。
+
+  秩 1 直接返回 FLAT 本身（坐标就是扁平下标，不必复制）。"
+  (let* ((rank (length shape))
+         (num (length flat)))
+    (declare (type fixnum rank num))
+    (cond
+      ((zerop rank) '())
+      ((= rank 1) (list flat))
+      (t
+       (let* ((dims (coerce shape 'simple-vector))
+              (arrs (coerce (loop repeat rank
+                                  collect (make-array num
+                                                      :element-type '(signed-byte 64)))
+                            'simple-vector))
+              (col (make-array rank :element-type 'fixnum :initial-element 0))
+              (cur 0)
+              (last (1- rank)))
+         (declare (type simple-vector dims arrs)
+                  (type (simple-array fixnum (*)) col)
+                  (type fixnum cur last))
+         (dotimes (i num)
+           (declare (type fixnum i))
+           (let ((k (aref flat i)))
+             (declare (type fixnum k))
+             ;; 里程计从 CUR 推进到 K（K ≥ CUR，故总步数恰为 N）
+             (loop while (< cur k)
+                   do (incf cur)
+                      (let ((d last))
+                        (declare (type fixnum d))
+                        (loop
+                          (let ((nv (1+ (the fixnum (aref col d)))))
+                            (declare (type fixnum nv))
+                            (if (< nv (the fixnum (svref dims d)))
+                                (progn (setf (aref col d) nv) (return))
+                                (progn (setf (aref col d) 0)
+                                       (decf d)
+                                       (when (< d 0) (return))))))))
+             ;; 按轴落位（每轴一次，带类型断言避免通用 AREF）
+             (dotimes (d rank)
+               (declare (type fixnum d))
+               (setf (aref (the (simple-array (signed-byte 64) (*)) (svref arrs d)) i)
+                     (the (signed-byte 64) (aref col d))))))
+         (coerce arrs 'list))))))
+
 (defun vt-argwhere (condition &key (dtype :int64))
   "返回非零元素坐标，形状 (n, rank)。"
   (let* ((final (if (member dtype '(:int32 :int64)) dtype :int64))
          (lisp-type (if (eq final :int32) '(signed-byte 32) '(signed-byte 64)))
+         (condition (ensure-vt condition))
          (shape (vt-shape condition))
          (rank (length shape))
-         (data (vt-data condition))
-         (offset (vt-offset condition))
-         (shape-vec (coerce shape 'simple-vector))
-         (strides-vec (coerce (vt-strides condition) 'simple-vector))
-         (result (make-array 64 :element-type '(signed-byte 64)
-                                :fill-pointer 0 :adjustable t))
-         (coord (make-array rank :element-type '(signed-byte 64))))
-    (labels ((recurse (depth ptr)
-               (if (= depth rank)
-                   (when (/= (aref data ptr) 0)
-                     (if (zerop rank)
-                         (vector-push-extend 0 result)
-                         (loop for c across coord
-                               do (vector-push-extend c result))))
-                   (let ((dim (svref shape-vec depth))
-                         (stride (svref strides-vec depth)))
-                     (loop for i from 0 below dim do
-                       (setf (aref coord depth) i)
-                       (recurse (1+ depth) (+ ptr (* i stride))))))))
-      (recurse 0 offset))
-    (let* ((total (length result))
-           (count (if (zerop rank) total (floor total rank))))
-      (cond ((zerop count)
-             (vt-zeros (list 0 rank) :dtype final))
-            ((> rank 0)
-             (let ((final-data (make-array total :element-type lisp-type)))
-               (loop for i from 0 below total
-                     for idx across result
-                     do (setf (aref final-data i) idx))
-               (%make-vt :data final-data :shape (list count rank) :strides (list rank 1)
-                         :offset 0 :dtype final)))
-            (t (%make-vt :data (make-array 0 :element-type lisp-type)
-                         :shape (list count 0) :strides '(0 1) :offset 0 :dtype final))))))
+         (flat (%flat-nonzero-indices condition))
+         (count (length flat)))
+    ;; 性能（v0.4.21）：原实现用递归里程计逐元素遍历，命中一个就
+    ;; `(VECTOR-PUSH-EXTEND …)` 逐分量追加进可调向量（可调向量扩容要反复
+    ;; realloc + 整段拷贝），最后再整段拷进定长数组。1M 掩码实测 17.5ms
+    ;; （numpy 0.76ms，差 23 倍）。
+    ;; 现在复用 `%FLAT-NONZERO-INDICES`（两遍扫描 + 类型化循环）拿扁平下标，
+    ;; 再逐轴分解；输出形状与元素值与原实现完全相同。
+    (cond
+      ((zerop count)
+       (vt-zeros (list 0 rank) :dtype final))
+      ((zerop rank)
+       ;; 0 维：numpy 的 argwhere 对非零 0 维输入给 shape (1, 0)。
+       (%make-vt :data (make-array 0 :element-type lisp-type)
+                 :shape (list count 0) :strides '(0 1) :offset 0 :dtype final))
+      (t
+       (let ((arrays (%coords-from-flat flat shape))
+             (total (* count rank)))
+         (declare (type fixnum total))
+         (macrolet ((fill-out (ot)
+                      `(let ((out (make-array total :element-type ',ot)))
+                         (declare (type (simple-array ,ot (*)) out)
+                                  (type fixnum count rank total))
+                         (dotimes (d rank)
+                           (declare (type fixnum d))
+                           (let ((arr (the (simple-array (signed-byte 64) (*))
+                                           (nth d arrays))))
+                             (declare (type (simple-array (signed-byte 64) (*)) arr))
+                             (dotimes (i count)
+                               (declare (type fixnum i))
+                               (setf (aref out (the fixnum (+ (* i rank) d)))
+                                     (aref arr i)))))
+                         (%make-vt :data out
+                                   :shape (list count rank) :strides (list rank 1)
+                                   :offset 0 :dtype final))))
+           (if (eq final :int32) (fill-out (signed-byte 32))
+               (fill-out (signed-byte 64)))))))))
 
 (defun vt-nonzero (condition)
   "返回非零元素在各维度的索引列表（对标 torch.nonzero(as_tuple=true)）。
@@ -532,52 +667,37 @@
    - 长度 1 的列表，表示「存在非零元素」；
    - 内含形状 (0) 的空索引张量，表示「0 维张量没有可索引的维度」。
    这样既能区分「非零标量」与「零标量」（后者走 (zerop num) 分支返回 nil），
-   又与 NumPy 对 0 维输入的 (array([0]),) 语义在「有个元素被选中」这一点上对齐。"
+   又与 NumPy 对 0 维输入的 (array([0]),) 语义在「有个元素被选中」这一点上对齐。
+
+   性能（v0.4.21）：原实现用 `(PUSH LOGIC-IDX NZ)` 收集扁平下标（每个非零
+   元素一个 cons，1M 非零 ≈ 16MB 垃圾），再 `(NREVERSE …)`，最后逐轴
+   `(AREF (NTH D ARRAYS) I)` —— `NTH` 在最内层，每次写一个分量都要遍历一次
+   LIST 且 AREF 走通用分派。1M float64 实测 39ms（numpy 2.7ms）。
+   现在复用 `%FLAT-NONZERO-INDICES` + `%COORDS-FROM-FLAT`（都是类型化两遍
+   扫描），并按轴外层循环写回 —— 输出与原实现逐元素相同。"
   (let* ((condition (if (numberp condition)
                         (ensure-vt condition)
                         condition))
          (shape (vt-shape condition))
-         (rank (length shape))
-         (data (vt-data condition))
-         (offset (vt-offset condition))
-         (in-strides (vt-strides condition))
-         (logic-strides (vt-compute-strides shape))
-         (nz '()))
-    (labels ((recurse (depth logic-idx ptr)
-               (if (= depth rank)
-                   (unless (zerop (aref data ptr)) (push logic-idx nz))
-                   (let ((dim (nth depth shape))
-                         (in-stride (nth depth in-strides))
-                         (logic-stride (nth depth logic-strides)))
-                     (loop for i from 0 below dim do
-                       (recurse (1+ depth)
-                                (+ logic-idx (* i logic-stride))
-                                (+ ptr (* i in-stride))))))))
-      (recurse 0 0 offset))
-    (setf nz (nreverse nz))
-    (let ((num (length nz)))
-      (cond
-        ((zerop rank)
-         (list (vt-zeros '(0) :dtype :int64)))
-        ((zerop num)
-         (loop repeat rank collect (vt-zeros '(0) :dtype :int64)))
-        (t
-         (let ((arrays (loop repeat rank
-                             collect (make-array num
-                                                 :element-type '(signed-byte 64)))))
-           (loop for flat in nz for i from 0 do
-             (let ((rem flat))
-               (loop for d from 0 below rank
-                     for stride in logic-strides do
-                 (let ((coord (floor rem stride)))
-                   (setf (aref (nth d arrays) i) coord)
-                   (decf rem (* coord stride))))))
-           (loop for arr in arrays
-                 collect (%make-vt :data arr
-                                   :shape (list num)
-                                   :strides '(1)
-                                   :offset 0
-                                   :dtype :int64))))))))
+         (rank (length shape)))
+    (cond
+      ;; 0 维：既有行为（非零/零都给 (list 空 (0)) ）
+      ((zerop rank)
+       (list (vt-zeros '(0) :dtype :int64)))
+      (t
+       (let* ((flat (%flat-nonzero-indices condition))
+              (num (length flat)))
+         (cond
+           ((zerop num)
+            (loop repeat rank collect (vt-zeros '(0) :dtype :int64)))
+           (t
+            (let ((arrays (%coords-from-flat flat shape)))
+              (loop for arr in arrays
+                    collect (%make-vt :data arr
+                                      :shape (list num)
+                                      :strides '(1)
+                                      :offset 0
+                                      :dtype :int64))))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 索引 dtype 契约
@@ -1005,19 +1125,94 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
       ;; interpreted as an integer；此前用 truncate 静默截断（0.5 → 0），
       ;; 会静默产生错误结果。空索引合法（no-op），见 `%check-integer-index`。
       (%check-integer-index "vt-choose" idx-vt)
-      (loop for i from 0 below final-size
-            for raw = (truncate (aref idx-data (+ idx-off i)))
-            for idx = (ecase mode
-                        (:raise raw)
-                        (:wrap  (mod raw n))
-                        (:clip  (max 0 (min (1- n) raw))))
-            do (when (or (< idx 0) (>= idx n))
-                 (error "vt-choose: 索引 ~a 越界 (choices 数量 ~a)" raw n))
-               (let* ((cv (nth idx flat-choices))
-                      (cd (vt-data cv))
-                      (co (vt-offset cv)))
-                 (setf (aref result-data i)
-                       (vt-cast (aref cd (+ co i)) result-type))))
+      ;; ------------------------------------------------------------------
+      ;; 性能（v0.4.21）：原循环每元素取一次 `(nth idx flat-choices)`（列表
+      ;; 遍历）、两次 `(vt-data …)`/`(vt-offset …)` 访问器，以及一次
+      ;; `VT-CAST` —— 而 `VT-CAST` 内部包着 `WITH-FLOAT-SAFE`（两次 FP 控制字
+      ;; 读写）+ 按 dtype 的 ECASE 分派。1M 元素实测 264ms（numpy 9.5ms，
+      ;; 差 28 倍），三个选择张量都是 float64，转换本身是恒等映射。
+      ;;
+      ;; 现在分三步，每步只对它自己的类型维度展开，**不做 in×out 全组合**
+      ;; （那是 10×10 份循环体）：
+      ;;   1. 索引归一：按索引元素类型展开，把 [0,n) 的结果写进 FIXNUM 数组；
+      ;;   2. 取值：按**结果**元素类型展开，候选与其同型时是纯 AREF 直传；
+      ;;   3. 候选与结果类型不同（混合 dtype 提升）时，退回原逐元素 VT-CAST。
+      ;; 索引数据只读一遍、候选数据只读一遍，没有额外的 dtype 分派。
+      ;; ------------------------------------------------------------------
+      (let ((datas (coerce (mapcar #'vt-data flat-choices) 'simple-vector))
+            (offs  (coerce (mapcar #'vt-offset flat-choices) 'simple-vector))
+            (rlt   (vt-dtype->lisp-type result-type)))
+        (declare (type simple-vector datas offs))
+        (flet ((norm (raw)
+                 "索引归一（:wrap/:clip）并做越界判定；返回恒在 [0, n)。"
+                 (let ((idx (ecase mode
+                              (:raise raw)
+                              (:wrap  (mod raw n))
+                              (:clip  (max 0 (min (1- n) raw))))))
+                   (when (or (< idx 0) (>= idx n))
+                     (error "vt-choose: 索引 ~a 越界 (choices 数量 ~a)" raw n))
+                   idx)))
+          (declare (inline norm))
+          (if (and (> final-size 0)
+                   (every (lambda (tv)
+                            (equal (array-element-type (vt-data tv)) rlt))
+                          flat-choices))
+              (let ((nidx (make-array final-size :element-type 'fixnum)))
+                (declare (type (simple-array fixnum (*)) nidx))
+                ;; --- 第 1 步：索引归一（按索引元素类型展开） ---
+                (macrolet ((idx-walk (ilt)
+                             `(let ((idat (the (simple-array ,ilt (*)) idx-data)))
+                                (declare (type (simple-array ,ilt (*)) idat)
+                                         (type fixnum final-size idx-off))
+                                (dotimes (i final-size)
+                                  (declare (type fixnum i))
+                                  (setf (aref nidx i)
+                                        (norm (aref idat (the fixnum (+ idx-off i))))))))
+                           (idx-generic ()
+                             `(dotimes (i final-size)
+                                (declare (type fixnum i))
+                                (setf (aref nidx i)
+                                      (norm (aref idx-data (+ idx-off i)))))))
+                  (let ((iet (array-element-type idx-data)))
+                    (cond ((equal iet '(signed-byte 64))   (idx-walk (signed-byte 64)))
+                          ((equal iet '(signed-byte 32))   (idx-walk (signed-byte 32)))
+                          ((equal iet '(signed-byte 16))   (idx-walk (signed-byte 16)))
+                          ((equal iet '(signed-byte 8))    (idx-walk (signed-byte 8)))
+                          ((equal iet '(unsigned-byte 16)) (idx-walk (unsigned-byte 16)))
+                          ((equal iet '(unsigned-byte 8))  (idx-walk (unsigned-byte 8)))
+                          (t (idx-generic)))))
+                ;; --- 第 2 步：取值（按结果元素类型展开，无 VT-CAST） ---
+                (macrolet ((walk (lt)
+                             `(let ((od (the (simple-array ,lt (*)) result-data)))
+                                (declare (type (simple-array ,lt (*)) od)
+                                         (type fixnum final-size))
+                                (dotimes (i final-size)
+                                  (declare (type fixnum i))
+                                  (let* ((idx (aref nidx i))
+                                         (src (the (simple-array ,lt (*))
+                                                   (svref datas idx)))
+                                         (so  (the fixnum (svref offs idx))))
+                                    (declare (type fixnum idx so))
+                                    (setf (aref od i)
+                                          (aref src (the fixnum (+ so i)))))))))
+                  (cond ((equal rlt 'double-float)            (walk double-float))
+                        ((equal rlt 'single-float)            (walk single-float))
+                        ((equal rlt '(signed-byte 64))        (walk (signed-byte 64)))
+                        ((equal rlt '(signed-byte 32))        (walk (signed-byte 32)))
+                        ((equal rlt '(signed-byte 16))        (walk (signed-byte 16)))
+                        ((equal rlt '(signed-byte 8))         (walk (signed-byte 8)))
+                        ((equal rlt '(unsigned-byte 16))      (walk (unsigned-byte 16)))
+                        ((equal rlt '(unsigned-byte 8))       (walk (unsigned-byte 8)))
+                        ((equal rlt '(complex double-float))  (walk (complex double-float)))
+                        ((equal rlt '(complex single-float))  (walk (complex single-float)))
+                        (t (error "vt-choose: 不认识的元素类型 ~a" rlt)))))
+              ;; 混合 dtype：逐元素 VT-CAST（正确性兜底）
+              (loop for i from 0 below final-size
+                    for idx = (norm (aref idx-data (+ idx-off i)))
+                    do (setf (aref result-data i)
+                             (vt-cast (aref (svref datas idx)
+                                            (the fixnum (+ (svref offs idx) i)))
+                                      result-type))))))
       (%make-vt :data result-data
                 :shape final-shape
                 :strides (vt-compute-strides final-shape)
@@ -1060,6 +1255,51 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
             do (setf result (vt-where cond choice result)))
       result)))
 
+(defun %gather-at-flat (flat idx limit)
+  "按逻辑扁平下标 IDX 从 FLAT 采集元素，返回新 1-D 张量（dtype 同 FLAT）。
+  FLAT 必须已过 `%FLAT-OFFSET0`（offset 0、stride 1）；超过 LIMIT 的下标按
+  LIMIT 裁剪（numpy `take(..., mode='clip')`）。IDX 为 `(signed-byte 64)` 数组。
+
+  为什么单独提出来：`vt-extract` 的两条分支（同形 / 需裁剪）差别只在
+  下标来源，采集这一层必须只有一份，否则两条路会各自退化。
+  布尔源按 `%BOOL-FLAG` 真值化写回（`:bool` 的物理类型也是 ub8，但语义是
+  0/1，不能原样搬运 `:uint8` 的数据，见 §17.1）。"
+  (let* ((dt (vt-dtype flat))
+         (boolp (eq dt :bool))
+         (n (length idx))
+         (data (vt-data flat))
+         (res-data (make-array n :element-type (vt-dtype->lisp-type dt))))
+    (declare (type (simple-array (signed-byte 64) (*)) idx)
+             (type fixnum n limit))
+    (macrolet ((walk (lt &optional bool-write)
+                 `(let ((d  (the (simple-array ,lt (*)) data))
+                        (od (the (simple-array ,lt (*)) res-data)))
+                    (declare (type (simple-array ,lt (*)) d od)
+                             (type fixnum n limit))
+                    (dotimes (i n)
+                      (declare (type fixnum i))
+                      (let ((k (aref idx i)))
+                        (declare (type fixnum k))
+                        (when (> k limit) (setf k limit))
+                        (setf (aref od i)
+                              ,(if bool-write
+                                   `(the ,lt (%bool-flag (aref d k)))
+                                   `(aref d k))))))))
+      (let ((et (array-element-type data)))
+        (cond ((equal et 'double-float)            (walk double-float))
+              ((equal et 'single-float)            (walk single-float))
+              ((equal et '(signed-byte 64))        (walk (signed-byte 64)))
+              ((equal et '(signed-byte 32))        (walk (signed-byte 32)))
+              ((equal et '(signed-byte 16))        (walk (signed-byte 16)))
+              ((equal et '(signed-byte 8))         (walk (signed-byte 8)))
+              ((equal et '(unsigned-byte 16))      (walk (unsigned-byte 16)))
+              ((equal et '(unsigned-byte 8))
+               (if boolp (walk (unsigned-byte 8) t) (walk (unsigned-byte 8))))
+              ((equal et '(complex double-float))  (walk (complex double-float)))
+              ((equal et '(complex single-float))  (walk (complex single-float)))
+              (t (error "vt-extract: 不认识的元素类型 ~a" et)))))
+    (%make-vt :data res-data :shape (list n) :strides '(1) :offset 0 :dtype dt)))
+
 (defun vt-extract (condition tensor)
   "根据条件提取元素（对标 numpy.extract）。
    CONDITION 可为：
@@ -1082,35 +1322,22 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
            (vt-flatten tensor)
            (vt-zeros (list 0) :dtype (vt-dtype tensor))))
       ((equal cshape tshape)
-       (let* ((flat-cond   (vt-flatten condition))
-              (flat-data   (vt-flatten tensor))
-              (cond-data   (vt-data flat-cond))
-              (tensor-data (vt-data flat-data))
-              (size        (vt-size flat-data))
-              (result      '()))
-         (loop for i from 0 below size
-               when (/= (aref cond-data i) 0)
-                 do (push (aref tensor-data i) result))
-         (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor))))
+       (let* ((flat-cond (%flat-offset0 condition))
+              (flat-data (%flat-offset0 tensor))
+              (idx       (%flat-nonzero-indices flat-cond)))
+         (%gather-at-flat flat-data idx (1- (vt-size flat-data)))))
       (t
        ;; numpy 语义：arr.take(condition.nonzero()[0], mode='clip')（展平）。
        ;; v0.4.x 修复：原实现把 condition 广播到 TENSOR 形状，与 numpy 的
        ;; 「条件展平非零索引 + clip 采集」不一致（如 (2,1) 条件配 (3,) 数据，
        ;; numpy 取 arr[0]，原实现广播失败报错）。
-       (let* ((flat-cond (vt-flatten condition))
-              (flat-data (vt-flatten tensor))
-              (cd (vt-data flat-cond))
-              (td (vt-data flat-data))
-              (csize (vt-size flat-cond))
-              (tsize (vt-size flat-data))
-              (result '()))
-         (loop for i from 0 below csize
-               when (/= (aref cd i) 0)
-                 do (if (zerop tsize)
-                        (error "vt-extract: 条件含真值但 TENSOR 为空（numpy IndexError）")
-                        (let ((idx (max 0 (min i (1- tsize)))))
-                          (push (aref td idx) result))))
-         (vt-from-sequence (nreverse result) :dtype (vt-dtype tensor)))))))
+       (let* ((flat-cond (%flat-offset0 condition))
+              (flat-data (%flat-offset0 tensor))
+              (tsize     (vt-size flat-data))
+              (idx       (%flat-nonzero-indices flat-cond)))
+         (when (and (> (length idx) 0) (zerop tsize))
+           (error "vt-extract: 条件含真值但 TENSOR 为空（numpy IndexError）"))
+         (%gather-at-flat flat-data idx (max 0 (1- tsize))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; searchsorted 的类型特化二分内核（v0.4.4 性能修复）
