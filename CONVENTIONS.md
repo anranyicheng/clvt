@@ -947,6 +947,84 @@ int16 / uint16）的全部元素都要走 `%kernel-small-general` 的三重里�
 转置/翻转视图、广播、0 维、空）与 13 条倍率护栏由
 `test/elementwise-named-perf-test.lisp` 守护；套件名 `elementwise-named-perf-test`。
 
+#### 7.4.8 取整族按「原语」逐格选，不按名字成批改
+
+CL 的 `floor`/`ceiling`/`round`/`truncate` 对浮点返回**整数**，所以取整族要
+`(float (nth-value 0 (op x)) x)` 转回浮点；而 `f` 前缀的四个原语直接返回浮点。
+「统一换成 f 前缀」看起来是显然的优化，实测是错的 —— 两条路的代价不是逐格同向
+（1M double-float，纯循环微基准，ns/元素）：
+
+| 原语 | 整数中转 + 转回浮点 | 浮点原生 | 结论 |
+|---|---:|---:|---|
+| `floor` | 2.26 | **1.79**（`ffloor`） | 换 |
+| `ceiling` | 2.21 | 2.23（`fceiling`） | 换（原生路本身不更快，但省掉 `(float res x)` 的保守转换，见下） |
+| `round` | **1.04** | 6.42（`fround`） | **不换**（浮点原生慢 6 倍） |
+| `truncate` | **1.07** | 2.28（`ftruncate`） | **不换**（慢 2 倍） |
+
+原因是 SBCL 对 `round`/`truncate` 的 double 有 `cvtsd2si` + `cvtsi2sd` 直通，
+两条指令就够；而 `floor`/`ceiling` 的整数路要走
+`%UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM` 的分派（编译器无法证明结果落在
+fixnum 内，于是生成「可能分配 bignum」的那条路），反而比 SSE 的 `roundsd` 贵。
+
+`ceiling` 那一行的 2.23 对 2.21 看着像没赚，但**库里的实测是 4.0 → 2.7**。
+差在微基准与库内 body 的写法不同：库里是 `(float res x)`，第二实参是**变量**
+`x`，`FLOAT` 要按它的类型在运行期选转换路径（还可能带一次类型检查）；
+微基准里写的是 `(float res 1.0d0)`，常量足够让编译器把这条路折掉。
+换成 f 前缀后 `res` 本身就是浮点，`(float res x)` 整段消失 —— 省的是这一段，
+不是原语本身。
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 换不换**按原语实测**决定，不按名字批量改 | `%floor1`/`%ceiling1` 走 `ffloor`/`fceiling`；`%round1`/`%truncate1` 保持整数中转 | 四个原语在 SBCL 里的实现档次不同，成批改会让一半变慢 |
+| 反向护栏钉住「不许成批改」 | `test/search-act-perf-test.lisp` 里有 `floor ≤ 2.0× round`、`ceiling ≤ 2.0× round` | 若有人把四个一起换成 f 前缀，这两条会红 |
+| 负零以 numpy 为准 | `vt-floor(-0.0)` / `vt-ceiling(-0.0)` 返回 `-0.0` | `np.floor(-0.0)` 就是 `-0.0`。原写法 `(float 0 x)` 恒给 `+0.0`，且那句「负零修正」用 `(minusp (float-sign x))` 判 `-0.0` 时是 NIL —— 修不了自己 |
+
+`DIVISOR ≠ 1` 是库扩展（numpy 无对应物），仍走原 `vt-map` 闭包路径，
+语义逐位不变。
+
+#### 7.4.9 多趟流水线能不能融合，看「中间结果在目标域里是否精确」
+
+`vt-sinc` 不融合（§7.4.7 最后一条），`vt-hard-sigmoid` 融合 —— 判据不是
+「差几趟」，而是**中间值在目标域里是不是精确的**：
+
+| 用例 | 改前 | 改后 | 融合安全吗 |
+|---|---:|---:|---|
+| `hard-sigmoid` f64 | 8.7 ms | **8.0** | 安全：`(* x 0.2d0)` 与 `(+ y 0.5d0)` 都在 double 域，double 的中间结果存回内存与留在寄存器是同一个值 |
+| `hard-sigmoid` f32 | 9.1 | 9.1（不融合） | 不安全：`0.2d0`/`0.5d0` 是 double 字面量，三趟在 double 域算完再收窄回 single；融合进 single 域会少一次舍入 |
+
+同一条判据也管「参数怎么进循环」：`vt-leaky-relu` 原来把 `ALPHA` 绑在特殊变量
+`*nn-act-param*` 上，循环里每元素一次 `SYMBOL-VALUE`（编译器必须假定任何调用都
+可能改它）—— 1M f64 要 16.2 ms，而同结构的 `vt-relu` 只要 1.5 ms。改成二元算子、
+`ALPHA` 走实参后 6.4 ms。
+
+| 约定 | 内容 |
+|---|---|
+| 融合的前提是「每步都在结果 dtype 里精确」 | f64 可以，f32 遇到 double 字面量就不行 |
+| 每元素路径上不许读特殊变量 | 带参算子用实参（弱标量，§16.31）而不是 `defvar` + `let` 绑定 |
+| 流水线的每一趟都必须走 `vt-fast-map` | `(vt-map #'* a b)` 是**函数**调用，算子无法内联；`vt-swish` 因此白花了 11 ms（22.6 → 11.2） |
+| 算子的参数**不要**写死 `double-float` 类型声明 | `vt-fast-map` 会展开 `:bool` 掩码分支（那里输入静态类型是 `(unsigned-byte 8)`），硬声明会让死分支各报一条 WARNING（实测 74 条 / 21 条），把「零 WARNING」门禁打红。用 `TYPEP` 守卫代替 |
+
+#### 7.4.10 搜索/分箱类：比较域一次选定，内核按域特化
+
+`vt-digitize` 原来是「每元素一次泛型二分」：`BIN-DATA` 是 `(simple-array t)`，
+每次比较都要查 widetag、走通用 `AREF`、拆箱、泛型算术。1M 元素 / 1000 bins
+实测 **138 ms**（138 ns/元素，全库最慢的一格），而同样的二分在 C 里是 3 ms 量级。
+
+| 用例（1M） | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| `vt-digitize` f64 / 1000 bins | 138 ms | **16.0** | 8.6× |
+| `vt-digitize` i64 / 1000 bins | 108 | **31.4** | 3.4× |
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 比较域一次选定：**有浮点 → double，全整型 → `(signed-byte 64)`** | `X` 与 `BINS` 各转一次到该域，随后是「步长遍历 + 定长数组二分」 | 这个域与 numpy 的 `result_type(x, bins)` 提升一致，所以转换不改变判定 |
+| 内核按域各写一份，分支结构逐字相同 | `%bisect-double` / `%bisect-s64` 的 `>` / `>=` 方向、`reverse` 与 `side` 语义与改前的泛型二分一字不差 | 二分写错一位就是静默错一格，不能靠「看起来一样」 |
+| 写结果按**逻辑**序号，不按物理偏移 | 原实现 `(setf (aref result ptr) …)` 的 `PTR` 是物理偏移，遇到步进视图会在 `size` 之外写 | `VT-FLATTEN` 一旦不返回连续拷贝就是越界写 |
+
+等价性由 `test/search-act-perf-test.lisp` 守护：与逐字复刻的泛型二分实现逐位
+对拍（8 种 x dtype × bins 递增/递减 × side 左右 × 6 种物理形态），另加
+「距 `vt-abs` 的比值」护栏防止回退到泛型路径。
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有

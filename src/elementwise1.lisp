@@ -650,9 +650,43 @@
                  (float res ,x))
              res))))
 
+;;; ------------------------------------------------------------------
+;;; FLOOR / CEILING 走浮点取整原语（v0.4.20 性能补漏）
+;;;
+;;; `%floor-family-body1' 对四个函数一视同仁，但 SBCL 的四个原语**不是**
+;;; 一样贵的（1M double-float，纯循环微基准，单位 ns/元素）：
+;;;
+;;;     (float (nth-value 0 (floor x)))    2.26      (ffloor x)     1.79
+;;;     (float (nth-value 0 (ceiling x)))  2.21      (fceiling x)   2.23
+;;;     (float (nth-value 0 (round x)))    1.04      (fround x)     6.42
+;;;     (float (nth-value 0 (truncate x))) 1.07      (ftruncate x)  2.28
+;;;
+;;; 所以「统一换成 f 前缀」是错的 —— 表里两列不是逐格都更便宜：
+;;; ROUND / TRUNCATE 的整数版有 cvtsd2si 直通（1 ns），浮点版反而慢 6 倍。
+;;; 只有 FLOOR / CEILING 这一列该换，因为它们的整数版要走
+;;; `%UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM' 的分派（编译器无法证明结果
+;;; 落在 fixnum 内，于是生成「可能分配 bignum」的那条路），换完之后连
+;;; `(float res x)' 那次 integer→float 转换也一并省了。
+;;;
+;;; 换 FLOOR / CEILING 还顺带修正了负数零：`(ffloor -0.0d0)' 是 `-0.0d0'，
+;;; `(fceiling -0.5d0)' 也是 `-0.0d0'，而原写法 `(float 0 x)' 恒给 `+0.0'
+;;; —— `(minusp (float-sign -0.0d0))' 是 NIL（`-0.0 = 0'），所以原来那句
+;;; 「负零修正」对 `-0.0' 输入根本不触发。numpy 的 `np.floor(-0.0)' /
+;;; `np.ceil(-0.0)' 都是 `-0.0'，改后与 numpy 对齐（见 CONVENTIONS §7.4.8）。
+;;; ------------------------------------------------------------------
+(defmacro %floor-family-body1f (x op)
+  "FLOOR/CEILING 的 DIVISOR=1 展开：直接用浮点取整原语。
+
+   OP 是 `ffloor' / `fceiling'。与 `%floor-family-body1' 的结果在**所有
+   有限值**上逐位相同（浮点取整不经过整数中转，不存在 bignum 往返），
+   NaN/±Inf 仍按原样传播、整数输入仍返回整数。"
+  `(if (and (floatp ,x) (%nan-or-inf-p ,x))
+       ,x
+       (,op ,x)))
+
 (declaim (inline %floor1 %ceiling1 %round1 %truncate1))
-(defun %floor1 (x)    (%floor-family-body1 x floor))
-(defun %ceiling1 (x)  (%floor-family-body1 x ceiling))
+(defun %floor1 (x)    (%floor-family-body1f x ffloor))
+(defun %ceiling1 (x)  (%floor-family-body1f x fceiling))
 (defun %round1 (x)    (%floor-family-body1 x round))
 (defun %truncate1 (x) (%floor-family-body1 x truncate))
 

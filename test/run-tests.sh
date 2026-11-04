@@ -106,6 +106,7 @@ MLP 层 = matmul→bias→activation、残差 = add∘f）。同一张用例表�
 （f64+f32 → f32）、vt-convolve 静默展平多维输入、:uint32/:uint64 的 ECASE 泄漏三组缺陷，CONVENTIONS §17.10.24）"
 SUITES[complex-matmul-perf-test]="53 复数 matmul 内核回归 (正确性: 朴素三重循环逐位对照/尾路径 n%4/退化与零尺寸/切片视图 offset/批量与 batch 广播/einsum NN·NT·转置输出逐位一致/c64·c128/:out; 性能护栏: 新内核 ≥1.3× 旧形状、≤3.5× 实数标量行内核、并行不改结果; 见 CONVENTIONS §16.27)"
 SUITES[reduce-global-narrow-perf-test]="697 窄整型全归约「塌轴」路径回归 (值 ≡ 朴素参照: 5 窄 dtype(bool/int8/uint8/int16/uint16) × 3 形状 × 7 算子(sum/prod/max/min/all/any/count-nonzero) 含 int64 补码回绕的 prod 溢出; 物理形态无关性: 6 种视图(转置/翻转/双负步长/reshape+转置/3D 置换) 逐位相同; dtype 契约: sum/prod→int64、max/min→输入、all/any→:bool; 退化(空/单元素/0 维)单位元与报错; 4 条机器无关倍率护栏: 秩不变性 2D/1D 与 3D/1D、窄整型÷int32、全局÷沿轴、amax÷sum; 1M 实测 all(bool) 2D 9.12→0.54ms(17×)、sum(int8) 2D 9.23→0.42ms(22×), 见 CONVENTIONS §7.4.6)"
+SUITES[search-act-perf-test]="搜箱/取整/激活 三组执行层改写回归 (digitize: 比较域特化 double/s64 两内核, 新实现 ≡ 逐字复刻的泛型二分实现 逐位对拍, 覆盖 8 种 x dtype × bins 递增·递减 × side 左右 × 6 种物理形态 + 空/单bin/0维/非单调报错/lists bins; floor·ceiling: 走 ffloor·fceiling, 与改前 %floor-family-body1 展开逐位对拍, 覆盖 ±0.0/denormal/2^53±1/1e300/NaN/±Inf 且钉住 floor(-0.0)=-0.0 与 numpy 对齐, 反向断言 round·truncate 未被波及; swish·leaky-relu·hard-sigmoid: 与逐字复刻的改动前实现逐位对拍(f64/f32/整数/边界值/转置·翻转/:out/0维/空/多 alpha); 8 条机器无关倍率护栏; 1M 实测 digitize 161.3→16.7ms(9.7×)、swish 24.2→12.1、leaky-relu 16.1→6.4、hard-sigmoid 10.9→8.2、floor 4.12→3.11、ceiling 4.13→2.98, 见 CONVENTIONS §7.4.8)"
 SUITES[elementwise-named-perf-test]="113 逐元素算子「具名内联」回归 (8 个函数 rint/sinc/reciprocal/deg2rad/rad2deg/copysign/logaddexp/lerp: 新实现 ≡ 逐字复刻的改动前实现(仍走 vt-map 闭包路径) 逐位对拍, 覆盖 ±0.0 符号位/NaN/±Inf/整数输入/f32/:out/转置·翻转视图/广播/0 维/空; 13 条机器无关倍率护栏 old÷new; 1M 实测 rint 28.96→2.74ms、lerp 21.94→2.30、rad2deg 9.72→1.26、copysign 12.00→1.91、sinc 29.19→12.75, 全部 ≥10%)"
 SUITES[view-consistency-test]="3548 物理形态无关性与分解纯函数性（换轴：随机输入 → 同一逻辑张量的不同物理形态 + 调用次数。A 视图一致性 1743 项：10 类视图(转置/翻转/子块/负步长/广播/转置后切片/单列/行反向/子块转置) × 45 函数 × 3 dtype 逐位相等 + 3D 全排列归约 + 算子不得改写视图；B :out 指向转置/负步长的写穿透与底层 buffer 镜像布局、out 与输入同一 buffer 的读写别名；C SVD 纯函数性（同输入两次逐位相等 + 不消费全局随机流，覆盖实数/:full-matrices/复数）；D 复数 SVD 的 U 必须酉（零奇异值列正交补全，含零矩阵/秩1/满秩/tall-full）；E VT-LSTSQ 契约（x 形状跟 b、residual 是平方和、无残差给 (0,) 空数组，实/复两版）；F eig/cholesky 只读下三角是 LAPACK 语义；G MATMUL 收缩轴校验（复数路径原先不校验，按 k 越界读 B 返回 1e77 量级的垃圾矩阵且无任何信号；实/复两路现在报同一条消息）；CONVENTIONS §17.10.22）"
 SUITES[complex-test]="136 复数语义测试 (83 项 numpy 2.4.6 差分对照 + dtype 提升 100 格 + 分支切割/NaN/字典序/视图/out 契约/未支持报错 + 实数回归, 期望由 test/gen_complex_expected.py 生成)"
@@ -192,6 +193,7 @@ DEFAULT_ORDER=(
     reduce-copy-perf-test
     reduce-global-narrow-perf-test
     elementwise-named-perf-test
+    search-act-perf-test
     complex-gap-test
     complex-matmul-perf-test
     complex-test

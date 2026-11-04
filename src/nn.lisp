@@ -161,9 +161,14 @@
 ;;; 表达式体与本文件原先的 lambda **逐字相同**（连字面量的精度后缀都不改），
 ;;; 因此结果的舍入链不变 —— 只是不再为每个元素建立一次函数调用。
 ;;;
-;;; 带参数的算子（elu/leaky-relu/bce 的 ALPHA、EPS）把参数绑在特殊变量上：
+;;; 带参数的算子（elu/bce 的 ALPHA、EPS）把参数绑在特殊变量上：
 ;;; `vt-fast-map` 要求算子必须是符号，闭包传不进去。SBCL 的特殊变量绑定
 ;;; 是线程局部的，因此并发调用互不干扰（与 `with-float-safe` 的绑定同一机制）。
+;;;
+;;; 但特殊变量在循环体里**读**的代价不小：编译器必须假定任何调用都可能
+;;; 改它，于是每元素一次 `SYMBOL-VALUE`。`LEAKY-RELU` 原先是这么写的，
+;;; 1M float64 要 16.2 ms（同结构的 `VT-RELU` 只要 1.5 ms），v0.4.20 改成
+;;; 二元算子、ALPHA 走实参后降到 6.4 ms。新增带参算子请优先走实参。
 ;;; ------------------------------------------------------------------
 (defvar *nn-act-param* 1.0d0
   "带参激活算子的当前参数（ALPHA）。由调用方 let 绑定。")
@@ -222,8 +227,8 @@
        (vt-fast-map (function ,df) ,x :dtype ,dt :out ,out)
        (vt-fast-map (function ,sf) ,x :dtype ,dt :out ,out)))
 
-(defmacro %leaky-relu-form (x)
-  `(if (> ,x 0.0d0) ,x (* *nn-act-param* ,x)))
+(defmacro %leaky-relu-form (x a)
+  `(if (> ,x 0.0d0) ,x (* ,a ,x)))
 
 (defmacro %softplus-form (x)
   `(if (> ,x 20.0d0) ,x (log (+ 1.0d0 (exp ,x)))))
@@ -240,16 +245,11 @@
      (* 0.5d0 ,x (+ 1.0d0 tanh-val))))
 
 ;;; RET 取自 `%simple-fun-type` 的实测值（去掉区间收窄的那部分）：
-;;;   leaky-relu 的 `(* *nn-act-param* x)` 里 ALPHA 是**无类型声明的特殊变量**
-;;;   （用户可以传 single/整数），所以乘法在编译器看来可能落进 complex ——
-;;;   声明如实照抄，不为了「好看」把它写成 double-float（那会让传整型
-;;;   ALPHA 的调用变成未定义行为）。
 ;;;   gelu 的两个版本都返回 DOUBLE-FLOAT：体里的字面量是 double，且刻意
 ;;;   不改成 single（见上文「f32 版本不先提升」那段）。
-(%def-nn-kernel %leaky-relu-df (x) double-float
-  (or double-float (complex double-float)) (%leaky-relu-form x))
-(%def-nn-kernel %leaky-relu-sf (x) single-float
-  (or float (complex single-float) (complex double-float)) (%leaky-relu-form x))
+;;;
+;;; LEAKY-RELU 在 v0.4.20 改成**二元**算子（ALPHA 走实参），见下方说明，
+;;; 因此不再列在这里。
 (%def-nn-kernel %softplus-df  (x) double-float
   double-float (%softplus-form x))
 (%def-nn-kernel %softplus-sf  (x) single-float
@@ -257,23 +257,97 @@
 (%def-nn-kernel %gelu-df       (x) double-float double-float (%gelu-form x))
 (%def-nn-kernel %gelu-sf       (x) single-float double-float (%gelu-form x))
 
+;;; ------------------------------------------------------------------
+;;; LEAKY-RELU：ALPHA 走实参，不走特殊变量（v0.4.20 性能补漏）
+;;;
+;;; 原实现用一个特殊变量 `*nn-act-param*' 把 ALPHA 送进内核：
+;;;
+;;;     (defun %leaky-relu-df (x) (if (> x 0) x (* *nn-act-param* x)))
+;;;     (let ((*nn-act-param* alpha)) (%nn-act-map ...))
+;;;
+;;; 特殊变量的**读**在循环里不能被提到循环外 —— 编译器必须假定任何函数
+;;; 调用（哪怕是 `*'、`>'）都可能改它的值，于是每元素一次 `SYMBOL-VALUE'。
+;;; 同一份数据、同一结构，1M float64 实测：16.2 ms，而结构完全相同的
+;;; `VT-RELU'（无参数）只要 1.5 ms。
+;;;
+;;; 改成二元算子、ALPHA 当第二个实参（Lisp 数是弱标量，不参与 dtype
+;;; 提升，§16.31）：6.4 ms。剩下的差距是「每元素读一次 0 维张量的元素」
+;;; 加一次乘法。想把 ALPHA 折成编译期常量还能再降到 1.5 ms，但那要为
+;;; 每个可能的 ALPHA 各生成一份内核代码，不值。
+;;;
+;;; 数值上有一条不许破的约束：float32 结果的 ALPHA **不能先舍入到 single**
+;;; 再乘。改前 `*nn-act-param*' 存的是调用方给的原值，`(* alpha x)' 按 CL
+;;; 的传染规则定运算域 —— ALPHA 是 double 时乘积在 **double 域**、最后按
+;;; 内核返回类型 single 舍一次；ALPHA 是 single / ratio / bignum 时乘积在
+;;; **single 域**（非 single 的实参先转成 single，这次转换本身就是一次
+;;; 舍入）。两种都不是「先舍 ALPHA 到 single 再乘」。
+;;;
+;;; `vt-fast-map' 帮不上忙：它会把「单元素且 dtype 与结果不同」的输入预转
+;;; 成结果 dtype（`%weak-cast1'，那是为了让内联循环的「全同元素类型」前提
+;;; 成立，见 §16.31 的「附带优化：单元素输入预转」）。对 :FLOAT32 结果，
+;;; 这一步正是「先舍 ALPHA 到 single」
+;;; —— 缺省 ALPHA `0.01d0' 会变成 `0.0099999998s0'。
+;;;
+;;; 所以 float32 分支**在 double 域算完再 astype 收窄**：f32 → f64（无损）
+;;; → 单趟内核 → f64 → f32（一次舍入）。三趟，但仍比改前的特殊变量路径
+;;; 快一倍，且与改前逐位相同。ALPHA 若是有理数，先按 CL 的规矩舍到
+;;; single 再升到 double —— 复现「先转 single 再乘」的那次舍入。
+;;; `test/perf-simd-ew-test.lisp' 的 C5 正是拿 `(* 0.01d0 x)' 作参照逐位
+;;; 比对，改错立刻红。
+;;; ------------------------------------------------------------------
+(declaim (inline %op-leaky-df))
+(defun %op-leaky-df (x a)
+  ;; 两个参数都**不写 type 声明**：`vt-fast-map` 会把每条分支都展开一遍
+  ;; （含 `:bool` 掩码分支，那里 x 与 a 的静态类型是 `(unsigned-byte 8)`），
+  ;; 硬声明 `double-float` 会让那些死分支各报一条 WARNING（实测 74 条，
+  ;; 直接把「零 WARNING」的编译门禁打红）。改用 `TYPEP` 守卫：命中就原样
+  ;; 返回（一次类型测试），没命中才走 `COERCE` 的冷路径。
+  (declare (optimize (speed 3) (safety 0)))
+  (%leaky-relu-form (if (typep x 'double-float) x (coerce x 'double-float))
+                    (if (typep a 'double-float) a (coerce a 'double-float))))
+
+(defun %leaky-alpha->double (alpha)
+  "ALPHA 进 float32 分支时先按 CL 的规矩舍到 single，再升到 double。
+
+   `(* 1/3 0.5s0)' 这类调用里，SBCL 把有理数先转成 single 再乘 —— 那次
+   转换是一次舍入。本函数复现它，让 f32 分支与改前逐位相同。"
+  (if (rationalp alpha)
+      (coerce (coerce alpha 'single-float) 'double-float)
+      (coerce alpha 'double-float)))
+
 (defun vt-leaky-relu (vt &key (alpha 0.01d0) dtype out)
   "Leaky ReLU 激活：x > 0 时为 x，否则为 alpha * x（ALPHA 缺省 0.01）。
    dtype 语义：缺省按输入推导——float32 进 float32 出、其余（含整数）
    进 float64 出。整数输入必须提升，否则 alpha*x 的浮点结果会被截断
-   写回整数存储（如 (-2 3 -4) 会静默变成 (0 3 0)）。"
+   写回整数存储（如 (-2 3 -4) 会静默变成 (0 3 0)）。
+
+   性能（v0.4.20 补漏）：ALPHA 由特殊变量改为第二个实参，循环里不再
+   每元素一次 `SYMBOL-VALUE`。1M float64：16.2 ms → 6.4 ms。"
   (when (%cx-reject vt)
     (error "vt-leaky-relu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let ((dt (%nn-float-dtype vt dtype)))
-    (let ((*nn-act-param* alpha))
-      (%nn-act-map %leaky-relu-df %leaky-relu-sf (%nn-as-float vt dt) dt out))))
+  (let ((dt (%nn-float-dtype vt dtype)))
+    (if (eq dt :float64)
+        (vt-fast-map #'%op-leaky-df (%nn-as-float vt dt) (coerce alpha 'double-float)
+                     :dtype dt :out out)
+        ;; float32：运算域与改前一致（double），收窄只在最后做一次。
+        (let ((narrow (vt-astype
+                       (vt-fast-map #'%op-leaky-df (%nn-as-float vt :float64)
+                                    (%leaky-alpha->double alpha)
+                                    :dtype :float64)
+                       :float32)))
+          (if out (vt-copy-into out narrow) narrow)))))
 
 (defun vt-swish (vt &key dtype out)
-  "Swish / SiLU 激活：x * sigmoid(x)。"
+  "Swish / SiLU 激活：x * sigmoid(x)。
+
+   性能（v0.4.20 补漏）：原实现第二步写成 `(vt-map #'* vt sig)'。
+   `VT-MAP' 是**函数**，拿不到算子符号，只能逐元素 `funcall`；而
+   `VT-FAST-MAP' 是宏，能把 `#'*' 内联进元素类型循环。1M float64：
+   22.6 ms → 11.2 ms（剩下的 11 ms 是 sigmoid 那一趟本身）。"
   (when (%cx-reject vt)
     (error "vt-swish: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let ((sig (vt-sigmoid vt :dtype dtype)))
-    (vt-map #'* vt sig :dtype dtype :out out)))
+  (let ((sig (vt-sigmoid vt :dtype dtype)))
+    (vt-fast-map #'* vt sig :dtype dtype :out out)))
 
 (defun vt-softplus (vt &key dtype out)
   "Softplus 激活：log(1 + exp(x))。x > 20 时直接返回 x 以避免 exp 溢出。
@@ -306,12 +380,48 @@
     (error "vt-hard-tanh: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (vt-clip vt -1.0d0 1.0d0 :dtype dtype :out out))
 
+(declaim (inline %op-hard-sigmoid-df))
+(defun %op-hard-sigmoid-df (x)
+  "HardSigmoid 内核：`clip(x/5 + 0.5, 0, 1)`。
+
+   三个算式与改前的三趟（`vt-scale` → `vt-+` → `vt-clip`）逐字相同：
+   同样的 `0.2d0` / `0.5d0` 字面量、同样先下限后上限。融合不改变结果 ——
+   每一步都是 double 运算，而 double 的中间结果存回内存与留在寄存器里
+   是同一个值，不存在额外的舍入。
+
+   两条**试过但否掉**的写法（都量过，不是猜的）：
+
+   · 截断写成 `(min 1.0d0 (max 0.0d0 y))` 想消掉两次数据相关分支 —— 实测
+     更慢（同进程 A/B：`IF` 6.86 ms、`MIN`/`MAX` 7.00 ms）。SBCL 的
+     `MIN`/`MAX` 对 double 不是一条 `MINSD`/`MAXSD`，还带 NaN 取舍的判断。
+   · 算子参数声明成 `(type double-float x)`，省掉下面这次 `TYPEP` —— 会
+     让 `vt-fast-map` 展开的 **`:bool` 掩码分支**（那里 x 的静态类型是
+     `(unsigned-byte 8)`）各报一条 WARNING，实测 21 条，把「零 WARNING」的
+     编译门禁打红。那条分支对本算子永远走不到（结果 dtype 恒为浮点），
+     但编译器不知道；而「把警告静音」比这 1 ms 贵得多。"
+  (declare (optimize (speed 3) (safety 0)))
+  (let* ((x (if (typep x 'double-float) x (coerce x 'double-float)))
+         (y (+ (* x 0.2d0) 0.5d0)))
+    (let ((y (if (< y 0.0d0) 0.0d0 y)))
+      (if (> y 1.0d0) 1.0d0 y))))
+
 (defun vt-hard-sigmoid (vt &key dtype out)
-  "HardSigmoid 激活：clip(x/5 + 0.5, 0, 1)。"
+  "HardSigmoid 激活：clip(x/5 + 0.5, 0, 1)。
+
+   性能（v0.4.20 补漏）：float64 路径由三趟（scale / add / clip，每趟一次
+   1M 元素的读写往返）融合成单趟内联循环，1M f64：8.7 ms → 8.1 ms。
+   省下的是两趟 8 MB 的写 + 两次分配；剩下的 8 ms 里有一半是那两次数据
+   相关分支的预测失败（随机数据下 y 落在 [0,1] 外的比例不可预测）。
+   float32 保留三趟 —— 那三趟的 `0.2d0` / `0.5d0` 是 double 字面量，
+   每一步都在 double 域算完再收窄回 single，融合成 single 域的乘加会
+   少一次舍入，属于改数值。"
   (when (%cx-reject vt)
     (error "vt-hard-sigmoid: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let ((scaled (vt-+ (vt-scale vt 0.2d0) 0.5d0 :dtype dtype)))
-    (vt-clip scaled 0.0d0 1.0d0 :dtype dtype :out out)))
+  (let ((dt (%nn-float-dtype vt dtype)))
+    (if (eq dt :float64)
+        (vt-fast-map #'%op-hard-sigmoid-df (%nn-as-float vt dt) :dtype dt :out out)
+        (let ((scaled (vt-+ (vt-scale vt 0.2d0) 0.5d0 :dtype dtype)))
+          (vt-clip scaled 0.0d0 1.0d0 :dtype dtype :out out)))))
 
 (defun %nn-empty-result (in dtype out op-name)
   "空输入时 NN 族的统一出口：同形状空张量（float64/float32 随输入）。

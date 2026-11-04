@@ -5888,3 +5888,280 @@ OUTER = 1 / RED = size / INNER = 1，`%kernel-single-axis` 就是一条扁平指
 > 「全归约总有人接」，而那个「有人」只服务 4 种 dtype；`(function <符号>)`
 > 假设「大家都会写具名算子」，而漏了八个入口。判据写进契约（§7.4.6.1 /
 > §7.4.7）比修好这十处更值钱 —— 它让下一轮不用再靠记忆去找漏。
+
+## H.3.51 第三十一轮：一条泛型 AREF 值 138 ns，一次特殊变量读值 10 ms
+
+上一轮排了张 70 多例的 ns/元素 表，排完只看最刺眼的两组。这一轮把那张表里
+**所有 ≥ 8 ns/元素**的格子逐格翻案。翻出来三组，病根一个比一个朴素：一处是
+「把 `(simple-array t)` 当数组用」，一处是「四个原语当成了一个」，一处是
+「特殊变量在循环里读」。
+
+### 一、第一组：`vt-digitize` 138 ns/元素，其中一百二十多纳秒花在「取值」
+
+`vt-digitize` 是全库最慢的一格。1M 元素、1000 bins：
+
+| 用例 | 改前 | 改后 |
+|---|---:|---:|
+| f64 | 138 ms | **16.0 ms** |
+| i64 | 108 ms | **31.4 ms** |
+
+1000 bins 的二分是**十次比较**。十次比较要 138 ns，就是每次 13.8 ns ——
+一次 `>` 不可能这么贵。线索在 `BIN-DATA` 的类型上：
+
+```lisp
+(let* ((bin-data (vt-data flat-bins))   ; (simple-array t)
+       (nbins (vt-size flat-bins)))
+  (vt-do-each (ptr val flat-x)
+    (setf (aref result ptr)
+          (%digitize-searchsorted bin-data nbins reverse-p side-right-p val))))
+```
+
+`(simple-array t)` 的 `AREF` 不是一个 load：要查 widetag 判断这个单元装的是
+double 还是 integer 还是 bignum，再按类型分派到不同的拆箱路径，拆出来还要走
+**泛型数值比较**（`>` 在两数类型不同时又是一次分派）。十次比较 × 1M 元素 =
+一千万次这样的往返；`val` 那一侧也从 `vt-do-each` 拿了泛型值，同样的拆箱再
+发生一次 —— 因为 x 在浮点数组里是 double、在整数数组里是 fixnum，编译器
+一个都定不下来。
+
+这就是它比第二名慢十倍的原因：**别人的常数是 1，它是 15**。
+
+改法：**比较域一次选定，内核按域特化**。判据是「x 与 bins 里有没有浮点」：
+
+- 有浮点 → `double`。float32 转 double 无损（single 是 double 的子集），
+  整型转 double 与 numpy 的 `result_type(x, bins)` 提升一致 —— 所以这个转换
+  **不改变任何一次比较的结果**。
+- 全整型 → `(signed-byte 64)`。这里刻意**不**统一转 double：`2^53 + 1` 这类
+  值转 double 会丢最后一位，而分箱边界正好是「等于」与「大于」的分界，差一位
+  就是静默错一格。整数域上比较是精确的，代价也一样。
+
+```lisp
+(defun %bisect-double (bins nbins v reverse-p side-right-p)
+  (declare (type (simple-array double-float (*)) bins) (type double-float v))
+  (let ((lo 0) (hi nbins))
+    (loop while (< lo hi) do
+      (let* ((mid (ash (+ lo hi) -1))
+             (mv (aref bins (if reverse-p (- nbins 1 mid) mid))))
+        (if (if side-right-p (> mv v) (>= mv v))
+            (setf hi mid)
+            (setf lo (1+ mid)))))
+    lo))
+```
+
+两条内核的**分支结构与原来的泛型二分逐字相同** —— 同 `side`、同 `reverse`、
+同 `>` / `>=` 的方向，连 `(if reverse-p (- nbins 1 mid) mid)` 这个下标的写法
+都没动。只把「泛型取值」换成定长数组的 `AREF`。二分这种代码，写错一位不会崩，
+只会静默错一格，所以这里不敢「顺手重写得更漂亮」。
+
+`X` 保持步长遍历（`(aref x-data ptr)` + `(incf ptr xstride)`），所以非连续
+输入不需要先做连续化拷贝 —— 转置 / 步进 / 翻转视图直接读。
+
+**顺带修正的两处。**
+
+第一处是**越界写**。原实现写结果用的是：
+
+```lisp
+(setf (aref result ptr) ...)   ; PTR 来自 vt-do-each —— 那是**物理**偏移
+```
+
+`vt-do-each` 给的 `PTR` 是物理下标。`(vt-slice a :step 2)` 这种视图的物理
+偏移是 0, 2, 4, …, 2n-2，而 `result` 只有 n 个格子：写到一半就越界，前半段
+还留空。连续输入时 `PTR` 恰好等于逻辑序号，所以这个错**只在非连续输入上
+出现**，而原来的测试全是连续输入。现在一律按逻辑序号 `i` 写。
+
+第二处是 **NaN 输入会崩**。`(> mv nan)` 在 SBCL 上会触发
+`FLOATING-POINT-INVALID-OPERATION`（默认陷阱打开），而 `np.digitize([nan], bins)`
+静默返回最后一个桶。核心循环包一层 `with-float-safe` 就对齐了。
+
+### 二、第二组：四个取整原语，编译器给的待遇完全不同
+
+`vt-floor` / `vt-ceiling` 各 4 ms（1M f64），比 `vt-abs` 贵 5 倍。一条 SSE 的
+`roundsd` 不可能要 4 ns/元素。四个取整函数共用一个展开宏：
+
+```lisp
+(defmacro %floor-family-body1 (x op) `(float (nth-value 0 (,op ,x)) ,x))
+```
+
+问题就在这个「共用」上。CL 的四个取整原语对浮点返回**整数**，所以都要转回
+浮点；但 SBCL 对它们的实现档次不一样（1M double-float 纯循环，ns/元素）：
+
+| 原语 | `(float (nth-value 0 (op x)) x)` | 浮点原生 |
+|---|---:|---:|
+| `floor` | 2.26 | **1.79**（`ffloor`） |
+| `ceiling` | 2.21 | 2.23（`fceiling`） |
+| `round` | **1.04** | 6.42（`fround`） |
+| `truncate` | **1.07** | 2.28（`ftruncate`） |
+
+`round` / `truncate` 的 double 有 `cvtsd2si` + `cvtsi2sd` 直通，两条指令就够，
+退化到整数再转回来几乎免费；`floor` / `ceiling` 的整数路却要走
+`%UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM` 的分派 —— 编译器无法证明结果落在
+fixnum 内，于是生成「可能分配 bignum」的那条路（实际不分配，但分派和分支在）。
+
+所以「统一换成 f 前缀」是错的：表里两列**不是逐格都更便宜**，`fround` 慢 6 倍、
+`ftruncate` 慢 2 倍。只换 floor / ceiling 这两个，`%round1` / `%truncate1`
+一个字节不动。这条也写成了反向护栏（`floor ≤ 2.0× round`），谁要是「顺手
+统一」，测试会红。
+
+库里实测比表里赚得多：3.9 → 2.8（floor）、4.0 → 2.7（ceiling），而微基准里
+2.26 vs 1.79 只差 0.47。差在库内写的是 `(float res x)`、第二实参是**变量**
+`x`，`FLOAT` 要按它的运行期类型选转换路径（还带一次类型检查）；微基准里写的
+是 `(float res 1.0d0)`，常量足够让编译器把这条路折掉。换成 `ffloor` 后
+`res` 本身就是浮点，`(float res x)` 整段消失 —— 省的是这一段，不是原语本身。
+**这就是为什么「按微基准改」和「按库内实测改」会得出不同结论，而后者的口径
+才算数。**
+
+换 `ffloor` / `fceiling` 还顺带修正了负零：
+
+```lisp
+(vt-floor (vt-from-sequence '(-0.0d0)))   ; 改前 +0.0，改后 -0.0
+```
+
+原写法 `(float 0 x)` 恒给 `+0.0`；代码里那句「负零修正」用的是
+`(minusp (float-sign x))`，而 `(float-sign -0.0d0)` 是 `-0.0d0`，
+`(minusp -0.0d0)` 是 **NIL**（`-0.0 = 0`，不是负数）—— 这条修正对 `-0.0`
+输入根本不触发。`(ffloor -0.0d0)` 直接给 `-0.0d0`，`(fceiling -0.5d0)` 也是
+`-0.0d0`，与 `np.floor(-0.0)` / `np.ceil(-0.0)` 一致。
+
+### 三、第三组：三个激活函数，三种不同的执行层开销
+
+同一个文件里三个相邻的函数，慢的原因各不相同：
+
+| 用例（1M f64） | 改前 | 改后 | 病根 |
+|---|---:|---:|---|
+| `vt-swish` | 22.6 ms | **11.2** | `(vt-map #'* …)` |
+| `vt-leaky-relu` | 16.2 | **6.4** | ALPHA 绑在特殊变量上 |
+| `vt-hard-sigmoid` | 8.7 | **8.0** | 三趟流水线 |
+
+**swish：一个字符。** `(vt-map #'* vt sig)` 里 `VT-MAP` 是**函数**，算子符号
+到了里面只剩一个函数对象，只能逐元素 `funcall`。`VT-FAST-MAP` 是**宏**，
+`(function *)` 这种形式能在展开期认出符号、把乘法内联进元素类型循环。
+改一个字符，22.6 → 11.2。剩下的 11 ms 是 sigmoid 那一趟本身（`exp` 就是那么贵）。
+
+**leaky-relu：特殊变量的读不能提出循环。**
+
+```lisp
+(defun %leaky-relu-df (x) (if (> x 0) x (* *nn-act-param* x)))
+(let ((*nn-act-param* alpha)) (%nn-act-map ...))
+```
+
+`*nn-act-param*` 是 `defvar` 出来的特殊变量，`let` 绑定是**动态**的。编译器
+在循环体里读它，必须假定任何函数调用（哪怕是 `*`、`>`）都可能改它的值 ——
+不能提到循环外，于是每元素一次 `SYMBOL-VALUE`（一次符号表 + 一次线程局部
+符号值查表）。同一份数据、结构完全相同的 `VT-RELU` 只要 1.5 ms，而它要 16.2。
+
+改成**二元算子**，ALPHA 走实参：16.2 → 6.4。
+
+这里踩到一个**必须记下来的坑**。第一版把 ALPHA 收成 single 传进 float32 分支，
+`test/perf-simd-ew-test.lisp` 的 C5 立刻红：
+
+```
+[FAIL] C5 vt-leaky-relu FLOAT32 ≡ 参考 lambda
+```
+
+原因是 `vt-fast-map` 会把「单元素且 dtype 与结果不同」的输入预转成结果 dtype
+（`%weak-cast1`，那是为了让内联循环的「全同元素类型」前提成立）。对 float32
+结果，这一步正好是「先把 ALPHA 舍到 single」：缺省 `0.01d0` 变成
+`0.0099999998s0` 再乘，比改前多一次舍入。改前的语义是 `(* 0.01d0 single-x)`
+在 **double 域**算出乘积、再按内核的返回类型收窄一次。
+
+所以 float32 分支最终写成：**f32 → f64（无损）→ 单趟内核 → 收窄回 f32**。
+三趟，但仍比原来的特殊变量路径快一倍多，且与改前逐位相同。ALPHA 若是有理数，
+先按 CL 的规矩舍到 single 再升 double —— 复现「先转 single 再乘」的那次舍入。
+
+**hard-sigmoid：融合的判据不是「差几趟」。** 原实现三趟
+（`vt-scale` → `vt-+` → `vt-clip`），每趟一次 1M 元素的读写往返，三趟就是
+三次「写 8 MB、再读 8 MB」。融合成单趟显然该快，但「不许改舍入次数」那条
+先拦一道。判据是：**中间结果在目标域里是否精确**。
+
+- f64：`(* x 0.2d0)` 与 `(+ y 0.5d0)` 都在 double 域，double 的中间结果存回
+  内存与留在寄存器里是**同一个值**（double 就是内存格式）。融合安全。
+- f32：`0.2d0` / `0.5d0` 是 **double 字面量**，三趟实际是在 double 域里算完
+  每一步再收窄回 single。融合进 single 域（`0.2s0`）会**少一次舍入**，结果
+  在最后一位上不同。所以 float32 保留三趟，一字不改。
+
+于是同一个函数里 f64 走单趟内联、f32 走老的三趟 —— 看着不对称，但这是
+「不改数值」的唯一做法。8.7 → 8.0。
+
+### 四、怎么证明「结果没变」
+
+三组改动里有两组是**静默错**的类型：digitize 错一格、floor 差一位负零，都
+不会崩、不会报警、也不会被「跑个例子看看」发现。所以依旧不写手抄期望值。
+
+`test/search-act-perf-test.lisp`（79 条）：
+
+- **digitize**：与一份**逐字复刻的改动前泛型二分实现**逐位对拍。8 种 x dtype
+  （f64 / f32 / i64 / i32 / uint8 / int16 / Lisp list）× bins 递增/递减 ×
+  `side` 左右 × 6 种物理形态（连续 / 转置 / 步进 / 翻转 / 子块 / 3D 置换），
+  另加盖空 x、单 bin、0 维输入、非单调报错、bins 传 list。
+- **floor / ceiling**：与改动前的展开式逐位对拍，覆盖 ±0.0、denormal、
+  `2^53±1`、`1e300`、NaN、±Inf，并**反向钉住** `round(2.5) = 2`、
+  `truncate(-2.7) = -2.0` 没被波及 —— 这条防的是「顺手统一成 f 前缀」。
+- **三个激活函数**：与逐字复刻的改动前实现逐位对拍（f64 / f32 / 整数 /
+  边界值 / 转置 / 翻转 / `:out` / 0 维 / 空 / 多个 alpha）。
+- **10 条倍率护栏**：机器无关比值，两边同机同进程跑。`digitize ≤ 45× abs`、
+  `digitize-i64 ≤ 70× abs`、`floor ≤ 2.0× round`、`ceiling ≤ 2.0× round`、
+  `swish ≤ 25× abs`、`leaky-relu ≤ 18× abs`、`hard-sigmoid ≤ 20× abs`、
+  `swish-f32 ≤ 20× abs`。
+
+**关于基准本身，这一轮学到两件事，都比改代码重要。**
+
+第一件：**时钟不跳的情况下，`best-ms` 的绝对值不可跨进程比较。** 首次跑出来
+全是 `0.000 ms` 并除零，三个原因叠在一起 —— 被测表达式直接内联在 `dotimes`
+里，SBCL 把两次 `GET-INTERNAL-REAL-TIME` 当同一表达式做了公共子表达式消除；
+本机时钟只按 **1 ms** 跳；表达式结果没人用，被当死代码删了。解法三步：包成
+thunk（挡住 CSE）、结果落到一个 `defvar` 的 `*sink*` 上（挡住 DCE）、自适应
+放大到单轮 ≥ 100 ms。即使这样，同一份代码在两次进程里能差 20%（8.0 vs 6.9
+那只 hard-sigmoid 就是），所以**只信同进程内的 A/B**。
+
+第二件：**数据分布会改变结论。** 用 `linspace` 造 x（递增）时 digitize 只要
+10.3 ms，换成随机数据 16.0 ms —— 递增数据让二分的分支几乎全预测对，把分支
+惩罚整个藏起来。所以基准语料统一用 `vt-random-uniform`，与
+`test/search-act-perf-test.lisp` 的护栏段同源。这一条也解释了为什么
+`vt-leaky-relu` 6.4 ms 里有 5 ms 是「一个不可预测的 `x > 0`」：随机数据下
+它一半走错边，每次错 17 个周期。
+
+### 五、与 numpy 2.4.6 的距离
+
+| 用例（1M，随机数据） | clvt 改后 | numpy 2.4.6 | 比 |
+|---|---:|---:|---:|
+| `digitize` f64 / 1000 bins | 16.0 ms | 13.05 ms | 1.2× |
+| `digitize` i64 / 1000 bins | 31.4 | 30.6 | 1.03× |
+| `floor` f64 | 2.8 | 0.15 | 19× |
+| `ceiling` f64 | 2.7 | 0.15 | 18× |
+| swish | 11.2 | 2.20 | 5.1× |
+| leaky-relu | 6.4 | 5.72 | 1.1× |
+| hard-sigmoid | 8.0 | 1.21 | 6.6× |
+
+三件事：
+
+- **digitize 从 46 倍追到 1.0~1.2 倍**，基本贴平。numpy 的 `searchsorted` 也是
+  标量二分，两边同样的 `O(n log k)`；剩下的 20% 差在 numpy 用「上一个元素的
+  结果当本次搜索的初值」这类小技巧，以及它把 bins 常驻寄存器。这条差距已经
+  不值得再追。
+- **`leaky-relu` 1.1 倍**：numpy 的 `np.where(x > 0, x, 0.01*x)` 也是分支，
+  5.72 ms 里同样有一半是预测失败 —— 两边在同一条坑里。
+- **`floor` / `ceiling` 的 18~19 倍是 SIMD**：numpy 的 `np.floor` 是
+  `roundsd` 的批量版本，1M 只要 0.15 ms（几乎就是内存带宽）。本库是标量循环。
+  **注意 `round` 那一行是本轮的反例**：它一点没改，3.8 ms 就是原来那个
+  「整数中转」的数字 —— 说明取整族的天花板不在原语选择，而在「标量 vs SIMD」。
+
+### 六、试过但否掉的四处
+
+- **`fround` / `ftruncate`**：慢 6 倍 / 2 倍，理由见 §二 的表。已写成反向护栏。
+- **hard-sigmoid 的 float32 融合**：会少一次舍入，属于改数值。
+- **hard-sigmoid 的截断改成 `(min 1.0d0 (max 0.0d0 y))`**：本想消掉两次数据相关
+  分支，实测**更慢**（同进程 A/B：`IF` 6.86 ms、`MIN`/`MAX` 7.00 ms）——
+  SBCL 的 `MIN`/`MAX` 对 double 不是一条 `MINSD`/`MAXSD`，还带 NaN 取舍的判断。
+- **给算子参数加 `(type double-float x)` 声明**（能再省 1 ms 的类型测试）：
+  `vt-fast-map` 会把 `:bool` 掩码分支一起展开，那里输入的静态类型是
+  `(unsigned-byte 8)`，硬声明让那些**永远走不到**的分支各报一条 WARNING
+  （实测 74 条 / 21 条），把「零 WARNING」的编译门禁直接打红。改用 `TYPEP`
+  守卫：命中原样返回，没命中才走 `COERCE` 冷路径。门禁比 1 ms 值钱。
+
+### 七、一句话
+
+> 三组的病根其实是同一件事的三个变体：**某个「通用」的东西被放在了每元素的
+> 路径上**。`(simple-array t)` 是通用取值，特殊变量是通用传参，三趟流水线是
+> 通用写法。修复的方式全都是「把通用换成特化」—— 按比较域、按实参、按 dtype。
+> 而这一轮真正新学到的东西在基准一侧：**同一个函数在两种数据分布上能差 55%，
+> 在两个进程里能差 20%** —— 所以「优化了 10%」这句话，只有在「同进程、同语料、
+> 同 rep 数」的前提下才有意义。

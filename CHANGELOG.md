@@ -4,6 +4,118 @@
 
 ---
 
+## 2026-11-04（五十九）— perf: digitize 按比较域特化、floor/ceiling 走浮点原语、三个激活函数补掉执行层开销，1.1~8.6 倍
+
+上一轮把 70 多个导出函数排成一张 ns/元素 表，排完只看了「最刺眼的两组」。
+这一轮的做法是**把那张表里所有 ≥ 8 ns/元素 的格子逐格翻案** —— 一个函数跑得
+比同规模的另一个慢十倍，一定有原因，而且原因通常不是算法。翻出来三组。
+
+**第一组：`vt-digitize` 是全库最慢的一格 —— 138 ns/元素。**
+
+| 用例（1M，1000 bins） | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| `vt-digitize` f64 `x` | 138 ms | **16.0** | 8.6× |
+| `vt-digitize` i64 `x` | 108 | **31.4** | 3.4× |
+
+`BIN-DATA` 是 `(simple-array t)`，所以每次二分比较都要：查 widetag → 走通用
+`AREF` → 拆箱 → 泛型 `>`。1000 bins 是十次比较，1M 元素就是一千万次这样的
+往返 —— 二分本身只有十步，代价全在「取值」上。
+
+改法是把**比较域一次选定**，然后按域各写一条内核：
+
+- 有浮点 → `double`（float32 转 double 无损；整型转 double 与 numpy 的
+  `result_type(x, bins)` 提升一致）；
+- 全整型 → `(signed-byte 64)`，比较在整数域精确进行，不走 double
+  （`2^53+1` 这类值转 double 会丢一位，分箱边界上就是静默错一格）。
+
+`X` 与 `BINS` 各转一次到该域，随后是「步长遍历 + 定长数组二分」。两条内核的
+分支结构与原来的 `%digitize-searchsorted` **逐字相同** —— 同 `side`、同
+`reverse`、同 `>` / `>=` 方向，连 `(if reverse-p (- nbins 1 mid) mid)` 这个
+下标的写法都没动，只把「泛型取值」换成定长数组的 `AREF`。二分写错一位是
+静默错一格，不敢「顺手重写得更漂亮」。
+
+顺带修正两处：原实现 `(setf (aref result ptr) …)` 的 `PTR` 是**物理偏移**，
+遇到 `(vt-slice a :step 2)` 这类步进视图会在 `size` 之外写、并漏写前半段
+（连续输入时 `PTR` 恰好等于逻辑序号，所以这个错只在非连续输入上出现）；
+另外原实现遇 NaN 输入会抛 `FLOATING-POINT-INVALID-OPERATION`，核心循环包上
+`with-float-safe` 后与 numpy 一致。
+
+**第二组：`floor` / `ceiling` 走了一条会分配 bignum 的路。**
+
+| 用例（1M f64） | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| `vt-floor` | 3.9 ms | **2.8** | 1.4× |
+| `vt-ceiling` | 4.0 | **2.7** | 1.5× |
+
+`%floor-family-body1` 对四个取整函数一视同仁：`(float (nth-value 0 (op x)) x)`。
+但 SBCL 的四个取整原语**不是一样贵的**（1M double-float，纯循环，ns/元素）：
+
+| 原语 | 整数中转 + 转回浮点 | 浮点原生 |
+|---|---:|---:|
+| `floor` | 2.26 | **1.79**（`ffloor`） |
+| `ceiling` | 2.21 | **2.23**（`fceiling`） |
+| `round` | **1.04** | 6.42（`fround`） |
+| `truncate` | **1.07** | 2.28（`ftruncate`） |
+
+`round`/`truncate` 的 double 有 `cvtsd2si` + `cvtsi2sd` 直通，两条指令就够；
+`floor`/`ceiling` 的整数路却要走 `%UNARY-TRUNCATE-DOUBLE-FLOAT-TO-BIGNUM` 的
+分派（编译器无法证明结果落在 fixnum 内，于是生成「可能分配 bignum」的那条路）。
+所以**只换 floor / ceiling，round / truncate 一个字节不动** —— 「统一换成 f
+前缀」是错的，会让一半变慢。库里实测比微基准赚得多（3.9 → 2.8），差在库内
+写的是 `(float res x)`、第二实参是**变量** `x`，`FLOAT` 要按它的运行期类型
+选转换路径；换成 `ffloor` 后这段整段消失。
+
+换 `ffloor`/`fceiling` 还顺带修正了负零：`(ffloor -0.0d0)` 是 `-0.0d0`，
+`(fceiling -0.5d0)` 也是 `-0.0d0`；而原写法的 `(float 0 x)` 恒给 `+0.0`，
+且那句「负零修正」用 `(minusp (float-sign x))` 判 `-0.0` 是 NIL（`-0.0 = 0`），
+根本不会触发 —— 修不了自己。`np.floor(-0.0)` / `np.ceil(-0.0)` 都是 `-0.0`，
+改后与 numpy 对齐。
+
+**第三组：三个激活函数，三种不同的执行层开销。**
+
+| 用例（1M f64） | 改前 | 改后 | 倍率 | 病根 |
+|---|---:|---:|---:|---|
+| `vt-swish` | 22.6 ms | **11.2** | 2.0× | 第二步写成 `(vt-map #'* …)` |
+| `vt-leaky-relu` | 16.2 | **6.4** | 2.5× | ALPHA 绑在特殊变量上 |
+| `vt-hard-sigmoid` | 8.7 | **8.0** | 1.1× | 三趟流水线，每趟一次 1M 读写 |
+
+- `vt-swish` 的 `(vt-map #'* vt sig)` 里 `VT-MAP` 是**函数**，拿不到算子符号，
+  只能逐元素 `funcall`（`vt-fast-map` 是宏，才能把 `#'*` 内联进元素类型循环）。
+  改一个字符：`vt-map` → `vt-fast-map`。剩下 11 ms 是 sigmoid 那一趟本身。
+- `vt-leaky-relu` 把 ALPHA 绑在 `*nn-act-param*` 上。特殊变量的**读**在循环里
+  提不到循环外 —— 编译器必须假定任何函数调用（哪怕是 `*`、`>`）都可能改它，
+  于是每元素一次 `SYMBOL-VALUE`。同一份数据、结构完全相同的 `VT-RELU` 只要
+  1.5 ms。改成**二元算子**、ALPHA 走实参后 6.4 ms。
+  这里有一个**不能踩的坑**：`vt-fast-map` 会把「单元素且 dtype 与结果不同」
+  的输入预转成结果 dtype（`%weak-cast1`），对 float32 结果，这一步正好是
+  「先把 ALPHA 舍到 single」—— 缺省 `0.01d0` 会变成 `0.0099999998s0`，
+  与改前「double 域算完再收窄一次」差最后一位。所以 float32 分支改成
+  「f32 → f64（无损）→ 单趟内核 → 收窄回 f32」，三趟，但仍比原来的特殊变量
+  路径快一倍多，且与改前逐位相同。
+- `vt-hard-sigmoid` 是 `scale → add → clip` 三趟，每趟一次 1M 元素的读写往返。
+  float64 路径融合成单趟内联循环：`(* x 0.2d0)` 与 `(+ y 0.5d0)` 都在 double
+  域，double 的中间结果存回内存与留在寄存器里是**同一个值**，融合不引入舍入。
+  **float32 保留三趟** —— 那三趟的 `0.2d0` / `0.5d0` 是 double 字面量，每一步
+  都在 double 域算完再收窄回 single；融合进 single 域会少一次舍入，那是改数值。
+
+**逐位证明**：仍然不写手抄期望值。
+
+- `digitize`：与**逐字复刻的泛型二分实现**逐位对拍。8 种 x dtype（f64 / f32 /
+  i64 / i32 / uint8 / int16 / Lisp list）× bins 递增/递减 × `side` 左右 ×
+  6 种物理形态（连续 / 转置 / 步进 / 翻转 / 子块 / 3D 置换），另加盖空 x、
+  单 bin、0 维输入、非单调报错、bins 传 list。
+- `floor`/`ceiling`：与改动前的展开式逐位对拍，覆盖 ±0.0、denormal、`2^53±1`、
+  `1e300`、NaN、±Inf，并**反向钉住** `round(2.5) = 2`、`truncate(-2.7) = -2.0`
+  没被波及 —— 这条防的是「顺手统一成 f 前缀」。
+- 三个激活函数：与逐字复刻的改动前实现逐位对拍（f64 / f32 / 整数 / 边界值 /
+  转置 / 翻转 / `:out` / 0 维 / 空 / 多个 alpha）。float32 的 leaky-relu 与
+  `test/perf-simd-ew-test.lisp` 的 C5（拿 `(* 0.01d0 x)` 作参照）也逐位对上。
+
+**新增**：`test/search-act-perf-test.lisp`（79 条，含 10 条机器无关倍率护栏 ——
+`digitize ≤ 45× abs`、`floor ≤ 2.0× round` 这类；若有人退回泛型路径，或把四个
+取整原语一起换成 f 前缀，护栏会红）。契约见 `CONVENTIONS.md` §7.4.8 ~ §7.4.10，
+过程见 `HISTORY.md` §H.3.51。
+
 ## 2026-11-04（五十八）— perf: 窄整型全归约塌成一层 + 八个逐元素算子补上具名内联，2~22 倍
 
 这一轮换了个找法：不做「给某个函数挑毛病」式的巡检，而是**把全部导出函数在
