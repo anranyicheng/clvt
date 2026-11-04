@@ -71,6 +71,7 @@ SUITES[out-contract-v2-test]="56 :out 契约 v2 严格相等测试 (形状/dtype
 SUITES[nan-broadcast-test]="31 NaN/Inf 广播对齐 numpy 测试 (算术/极值/比较/归约/dtype 提升)"
 SUITES[uncovered-coverage-test]="136 覆盖缺口测试 (此前无任何测试/example 调用的公开函数 + identity/vander/atanh 回归)"
 SUITES[extensions3-test]="261 补充 NumPy 缺失函数测试 + 审查修复回归 (extensions3 + 审查报告 P0/P1/P2 + R-3 整数提升回归)"
+SUITES[extensions-opt-test]="283 六个扩展函数的优化回归 (flatnonzero/ravel-multi-index/tril·triu-indices/vander/resize/indices: 与**独立重写**的朴素参照逐位对拍 shape·dtype·每元素(窄整型补码回绕/NaN 计入非零/偏移与步长视图/空与 0 维/:bool 与复数) + 机器无关倍率护栏(优化版 ÷ 逐元素旧算法: ravel-multi-index 527×·triu 317×·tril 307×·vander 183×·indices 68×·resize 55×·flatnonzero 6.5×); 首轮即抓出 vt-indices 复数兜底分支的越界写法与 :bool 的 TYPE-ERROR)"
 SUITES[fastmap-invariant-test]="24 数学函数快路径不变量测试 (宏展开结构 + 计时上界, 防 vt-fast-map→vt-map 性能回归)"
 SUITES[perf-simd-ew-test]="234 逐元素 SIMD 快路径测试 (二元/一元内核与标量内联逐位对拍·:bool 真值化·融合算子≡分步·行/列广播选路结构 + 倍率护栏)"
 SUITES[perf-reduce-pow-test]="54 标量幂专用循环与归约内核测试 (pow≡逐元素 expt 逐位·接管判据 9 条·归约与朴素顺序参考逐位·NaN 跳过/传播·窄整型/布尔·倍率与绝对时间护栏)"
@@ -170,6 +171,7 @@ DEFAULT_ORDER=(
     nan-broadcast-test
     uncovered-coverage-test
     extensions3-test
+    extensions-opt-test
     fastmap-invariant-test
     complex-dispatch-test
     complex-reload-test

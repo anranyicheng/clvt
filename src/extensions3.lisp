@@ -253,20 +253,35 @@
    先展平源数据，再按行主序循环取用，直至填满目标元素个数。
    若源为空 → 结果全零（对标 numpy）。NEW-SHAPE 中的 -1 不受支持（numpy.resize 不支持）。
    示例：(vt-resize (vt-fromiter '(1 2 3)) '(2 3)) => [[1 2 3][1 2 3]]
-        (vt-resize (vt-fromiter '(1 2 3)) '(5))   => [1 2 3 1 2]"
-  (let* ((flat (vt-ravel tensor))
-         (src (vt-astype flat (vt-dtype tensor)))
-         (n (vt-size src))
+        (vt-resize (vt-fromiter '(1 2 3)) '(5))   => [1 2 3 1 2]
+
+   填充就是「把同一段模式按周期重复」，所以按**块倍增**用 %MEMCPY 拷：
+   先把源整段写入，再每次把已填好的前缀翻倍（块长不超过剩余量），
+   落点恒为连续张量的线性下标 —— 没有 `(mod i n)`，也没有逐元素
+   `(setf (vt-ref …))`（那要走通用 aref + 坐标折算）。"
+  (let* ((flat (vt-contiguous (vt-ravel tensor)))
+         (n (vt-size flat))
          (total (vt-shape-to-size new-shape))
          (res (vt-zeros new-shape :dtype (vt-dtype tensor))))
-    (when (zerop total)
+    (when (or (zerop total) (zerop n))
       (return-from vt-resize res))
-    (if (zerop n)
-        res
-        (let ((out (vt-ravel res))
-              (vals (vt-data src)))
-          (dotimes (i total res)
-            (setf (vt-ref out i) (aref vals (mod i n))))))))
+    (let ((dst (vt-data res))
+          (src (vt-data flat))
+          (soff (vt-offset flat)))
+      (declare (type fixnum soff))
+      ;; 源比目标长时只取前 TOTAL 个（numpy.resize 的截断语义）
+      (let ((filled (min total n)))
+        (declare (type fixnum filled))
+        (%memcpy dst 0 src soff filled)
+        (loop while (< filled total)
+              do (let ((chunk (min filled (- total filled))))
+                   (declare (type fixnum chunk))
+                   ;; DST 与 SRC 是同一数组且目标区间在源之后：CLHS REPLACE 对
+                   ;; 「同一对象重叠」规定为「先整体取出再写回」，结果与逐元素
+                   ;; 取模相同。
+                   (%memcpy dst filled dst 0 chunk)
+                   (incf filled chunk))))
+      res)))
 
 ;;; ==================================================================
 ;;; 3. 索引类（Indexing）
@@ -609,6 +624,77 @@
               (error "vt-compress: condition 长度 ~a 超过轴长 ~a" clen ax-dim))
             (vt-take tensor (selected-indices ax-dim) :axis ax))))))
 
+(defun %e3-index-layer-fill (layer outer axis-len stride dtype)
+  "把 VT-INDICES 的一层就地填好：值 = 该元素沿本层轴上的坐标 I。
+   布局是「外层块（OUTER 个）× 轴长 × 连续重复（STRIDE 个）」，
+   落点因此是纯线性下标 `off + o·stride·axis-len + i·stride + s`。"
+  (declare (type fixnum outer axis-len stride))
+  (let ((d (vt-data layer))
+        (off (vt-offset layer))
+        ;; `:bool` 的物理元素是 0/1 字节，而 `VT-CAST` 的**逻辑层**契约是
+        ;; 返回 T/NIL（§17.10.8）。直接把 T/NIL 塞进 (unsigned-byte 8) 数组
+        ;; 会抛 TYPE-ERROR；索引值只有「零 / 非零」两种，这里显式落到 0/1。
+        (boolp (eq dtype :bool)))
+    (declare (type fixnum off))
+    ;; 逐元素写 (setf (vt-ref …)) 要为每个元素算一次坐标再走通用 aref；
+    ;; 按元素类型特化后内层只剩三次加法。VT-CAST 提到 I 层（每行一次），
+    ;; 与逐元素调用语义相同（下标非负，故 i 与 dtype 的转换是幂等的）。
+    (flet ((val (i)
+             "坐标 I 按目标 dtype 落地的**物理值**。"
+             (if boolp (if (zerop i) 0 1) (vt-cast i dtype))))
+      (macrolet ((walk (lt)
+                 `(let ((dd (the (simple-array ,lt (*)) d)))
+                    (declare (type (simple-array ,lt (*)) dd)
+                             (type fixnum off outer axis-len stride))
+                    ;; 待写入的值只取决于 I（≤ 轴长个），按轴长预转一次；
+                    ;; 放进 O 循环里就是 OUTER × 轴长 次 VT-CAST —— 而
+                    ;; VT-CAST 自己包着 WITH-FLOAT-SAFE（两次 FP 控制字
+                    ;; 读写），沿**末轴**的那一层恰好 OUTER = ∏前置维，
+                    ;; 会把整个函数的耗时拖到一个量级以上。
+                    (let ((vls (make-array axis-len :element-type ',lt)))
+                      (declare (type (simple-array ,lt (*)) vls))
+                      (dotimes (i axis-len)
+                        (declare (type fixnum i))
+                        (setf (aref vls i) (the ,lt (val i))))
+                      (dotimes (o outer)
+                        (declare (type fixnum o))
+                        (let ((base (the fixnum (+ off (* o stride axis-len)))))
+                          (declare (type fixnum base))
+                          (dotimes (i axis-len)
+                            (declare (type fixnum i))
+                            (let ((cv (aref vls i)))
+                              (dotimes (s stride)
+                                (declare (type fixnum s))
+                                (setf (aref dd (the fixnum (+ base (* i stride) s)))
+                                      cv)))))))))
+               (walk-generic ()
+                 "未知元素类型（复数等）：按线性下标写通用 AREF。
+                  ★ 必须写 `(AREF D …)` 而不是 `(SETF (VT-REF LAYER …))` ——
+                  LAYER 是 (R D0 D1 …) 的多维张量，VT-REF 要求索引个数等于
+                  秩，给一个展平下标会直接报「索引数量 1 与维度数 3 不匹配」。
+                  层由 VT-ZEROS 建成 C 连续、offset 0，故线性下标即逻辑位置。"
+                 `(dotimes (o outer)
+                    (declare (type fixnum o))
+                    (dotimes (i axis-len)
+                      (declare (type fixnum i))
+                      (let ((cv (val i)))
+                        (dotimes (s stride)
+                          (declare (type fixnum s))
+                          (setf (aref d (the fixnum (+ off (* o stride axis-len)
+                                                       (* i stride) s)))
+                                cv)))))))
+        (let ((et (array-element-type d)))
+          (cond ((equal et 'double-float)            (walk double-float))
+                ((equal et 'single-float)            (walk single-float))
+                ((equal et '(signed-byte 64))        (walk (signed-byte 64)))
+                ((equal et '(signed-byte 32))        (walk (signed-byte 32)))
+                ((equal et '(signed-byte 16))        (walk (signed-byte 16)))
+                ((equal et '(signed-byte 8))         (walk (signed-byte 8)))
+                ((equal et '(unsigned-byte 16))      (walk (unsigned-byte 16)))
+                ((equal et '(unsigned-byte 8))       (walk (unsigned-byte 8)))
+                (t (walk-generic)))))))
+  layer)
+
 (defun vt-indices (dimensions &key (dtype :int64) (sparse nil))
   "网格索引张量（对标 numpy.indices）。
    SPARSE=nil：返回 shape (R, D0, D1, ...) 的单一张量（R = 维度数），
@@ -627,23 +713,25 @@
                        (loop for d from 0 below r collect (if (= d ax) (nth d dims) 1))
                        dims))
                (layer (vt-zeros sh :dtype dtype))
-               (flat (vt-ravel layer))
-               ;; 该层沿 ax 轴的步长（行主序），以及每个「i 值」重复块的大小
-               (stride (apply #'* (nthcdr (1+ ax) sh)))
-               ;; STRIDE 为 0 说明该层后面有 0 长维（如 (2 0 3) 的第 0 层），
-               ;; 整层没有任何元素可写。原先把它兜成 1 再照常写，就落到
-               ;; 空 buffer 上 —— 实测 (vt-indices '(2 0 3)) 报
-               ;; "cannot index into an empty tensor"，而 numpy 返回
-               ;; (3 2 0 3) 全空。层大小同样为 0 时直接跳过填充。
-               (stride (if (zerop stride) 1 stride))
-               (outer (apply #'* (subseq sh 0 ax)))
-               (axis-len (nth ax sh)))
-          (when (plusp (apply #'* sh))
-            (dotimes (o outer)
-              (dotimes (i axis-len)
-                (dotimes (s stride)
-                  (setf (vt-ref flat (+ (* o stride axis-len) (* i stride) s))
-                        (vt-cast i dtype))))))
+               ;; 该层沿 AX 的步长（行主序）= AX 之后各维之积，每个「i 值」
+               ;; 连续重复 STRIDE 次；OUTER 是 AX 之前各维之积。三者都单遍
+               ;; 求出（`(apply #'* (subseq …))` 要为每层切一次子表）。
+               (stride 1)
+               (outer 1)
+               (axis-len 1)
+               (di 0))
+          (declare (type fixnum stride outer axis-len di))
+          (dolist (d sh)
+            (cond ((< di ax) (setf outer (the fixnum (* outer d))))
+                  ((> di ax) (setf stride (the fixnum (* stride d))))
+                  (t (setf axis-len d)))
+            (incf di))
+          ;; STRIDE 为 0 说明该层后面有 0 长维（如 (2 0 3) 的第 0 层），
+          ;; 整层没有任何元素可写。把它兜成 1 再照常写就会落到空 buffer 上；
+          ;; 层大小为 0 时直接跳过填充（numpy 对 (2 0 3) 给出全空张量）。
+          (when (plusp (%shape-product sh))
+            (%e3-index-layer-fill layer outer axis-len
+                                  (if (zerop stride) 1 stride) dtype))
           (push layer layers)))
       (let ((ordered (nreverse layers)))
         (if sparse

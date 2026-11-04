@@ -124,71 +124,121 @@
 ;;; 4. ravel-multi-index
 ;;; ------------------------------------------------------------------
 (defun vt-ravel-multi-index (multi-index shape)
-  "多维索引→扁平索引，对标 np.ravel_multi_index。支持标量和批量模式。"
-  (let ((strides (let ((s 1) (lst nil))
-                   (loop for d in (reverse shape)
-                         do (push s lst) (setf s (* s d)))
-                   lst)))
-    (if (every #'numberp multi-index)
-        (reduce #'+ (mapcar #'* multi-index strides))
-        (let* ((n (length (first multi-index)))
-               (result (vt-zeros (list n) :dtype :int64))
-               (rdata (vt-data result)))
-          (loop for i fixnum below n do
-            (let ((idx 0))
-              (declare (type (signed-byte 64) idx))
-              (loop for mi in multi-index
-                    for str in strides
-                    do (incf idx (* (truncate (nth i mi)) (the fixnum str))))
-              (setf (aref rdata i) idx)))
-          result))))
+  "多维索引→扁平索引，对标 np.ravel_multi_index。支持标量和批量模式。
+
+   批量模式的入参形态是「每个维度一个序列」，原实现按
+   `(nth i mi)` 逐维度取值 —— 对 LIST 而言 NTH 是 O(i)，于是整个批量
+   成了 O(n²·k)：n = 1e5 时光还原坐标就要十几秒。这里先把每个序列
+   COERCE 成 SIMPLE-VECTOR（一次 O(n)），循环内只做 `SVREF`。
+
+   索引的取值语义不变：整数原样使用，浮点按 TRUNCATE 截断（与
+   numpy 的整数下标要求不同，本库沿用既有行为）。非序列元素
+   （既不是 LIST 也不是 VECTOR）仍走原来的 NTH 兜底路径。"
+  (labels ((strides-of (dims)
+             (let ((s 1) (acc '()))
+               (dolist (d (reverse dims) acc)
+                 (push s acc)
+                 (setf s (* s d))))))
+    (let* ((strides (strides-of shape)))
+      (if (every #'numberp multi-index)
+          (reduce #'+ (mapcar #'* multi-index strides))
+          (let* ((axes (mapcar (lambda (mi)
+                                 (if (typep mi '(or list vector))
+                                     (coerce mi 'simple-vector)
+                                     mi))
+                               multi-index))
+                 (n (length (first axes)))
+                 (result (vt-zeros (list n) :dtype :int64))
+                 (rdata (vt-data result)))
+            (declare (type fixnum n)
+                     (type (simple-array (signed-byte 64) (*)) rdata))
+            (if (every (lambda (a) (typep a 'simple-vector)) axes)
+                (dotimes (i n result)
+                  (declare (type fixnum i))
+                  (let ((idx 0))
+                    (declare (type (signed-byte 64) idx))
+                    (loop for ax in axes
+                          for st fixnum in strides
+                          do (let ((v (svref ax i)))
+                               (incf idx (* (if (integerp v) v (truncate v))
+                                            (the fixnum st)))))
+                    (setf (aref rdata i) idx)))
+                ;; 兜底：元素不是序列（与旧实现逐字同路径）
+                (progn
+                  (loop for i fixnum below n do
+                    (let ((idx 0))
+                      (declare (type (signed-byte 64) idx))
+                      (loop for mi in multi-index
+                            for str in strides
+                            do (incf idx (* (truncate (nth i mi)) (the fixnum str))))
+                      (setf (aref rdata i) idx)))
+                  result)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; 5. triu_indices / tril_indices
+;;;
+;;; 两个函数只差「取哪一侧」，共用 %TRIANGLE-INDICES。原实现用 PUSH 收集
+;;; 两条 LIST 再 NREVERSE、最后 `:initial-contents` 整表复制一遍 —— 对
+;;; 三角矩阵这种「元素数 = O(n²)」的输出，列表节点与数组两份内存都白付。
+;;; 现在先按行闭区间数出元素个数（O(n)），再按同一区间直接写进
+;;; (signed-byte 64) 数组：零 cons、零二次拷贝。
 ;;; ------------------------------------------------------------------
+(defun %triangle-indices (n cols k lower)
+  "返回 (values ROWS COLS)：N × COLS 矩阵里满足三角条件的位置，行主序。
+   LOWER 为真取 j ≤ i + k（下三角），否则取 j ≥ i + k（上三角）。"
+  (declare (type fixnum n cols k))
+  (flet ((row-range (i)
+           "该行被接受的列区间 [LO, HI)。"
+           (if lower
+               (values 0 (min cols (max 0 (+ i k 1))))
+               (values (max 0 (min cols (+ i k))) cols))))
+    (let ((cnt 0))
+      (declare (type fixnum cnt))
+      (dotimes (i n)
+        (multiple-value-bind (lo hi) (row-range i)
+          (declare (type fixnum lo hi))
+          (incf cnt (- hi lo))))
+      (let ((rows (make-array cnt :element-type '(signed-byte 64)))
+            (cl (make-array cnt :element-type '(signed-byte 64)))
+            (p 0))
+        (declare (type (simple-array (signed-byte 64) (*)) rows cl)
+                 (type fixnum p))
+        (dotimes (i n)
+          (multiple-value-bind (lo hi) (row-range i)
+            (declare (type fixnum lo hi))
+            (loop for j fixnum from lo below hi
+                  do (setf (aref rows p) i)
+                     (setf (aref cl p) j)
+                     (incf p))))
+        ;; 直接把已经写好的 (signed-byte 64) 数组包成 1 维 :int64 张量。
+        ;; 走 VT-FROM-ARRAY 会再逐元素 `(vt-cast (row-major-aref …) :int64)`
+        ;; 复制一遍 —— 对 O(n²) 个下标来说，这一趟复制比填表本身还贵一个量级。
+        (flet ((as-vt (arr)
+                 (%make-vt :data arr :shape (list cnt) :strides (list 1)
+                           :offset 0 :dtype :int64)))
+          (values (as-vt rows) (as-vt cl)))))))
+
 (defun vt-tril-indices (n &key (k 0) m)
   "返回下三角索引 (rows, cols)，对标 np.tril_indices。"
   (declare (fixnum n k))
   (when (minusp n)
     (error "vt-tril-indices: n (~a) 不能为负" n))
-  (let ((cols (or m n)) (rows '()) (cl '()))
+  (let ((cols (or m n)))
     (declare (fixnum cols))
     (when (minusp cols)
       (error "vt-tril-indices: m (~a) 不能为负" m))
-    (loop for i fixnum below n do
-      (loop for j fixnum below cols do
-        (when (<= (- j i) k)
-          (push i rows) (push j cl))))
-    (values (vt-from-array
-             (make-array (length rows) :element-type '(signed-byte 64)
-                                       :initial-contents (nreverse rows))
-             :dtype :int64)
-            (vt-from-array
-             (make-array (length cl) :element-type '(signed-byte 64)
-                                     :initial-contents (nreverse cl))
-             :dtype :int64))))
+    (%triangle-indices n cols k t)))
 
 (defun vt-triu-indices (n &key (k 0) m)
   "返回上三角索引 (rows, cols)，对标 np.triu_indices。"
   (declare (fixnum n k))
   (when (minusp n)
     (error "vt-triu-indices: n (~a) 不能为负" n))
-  (let ((cols (or m n)) (rows '()) (cl '()))
+  (let ((cols (or m n)))
     (declare (fixnum cols))
     (when (minusp cols)
       (error "vt-triu-indices: m (~a) 不能为负" m))
-    (loop for i fixnum below n do
-      (loop for j fixnum below cols do
-        (when (>= (- j i) k)
-          (push i rows) (push j cl))))
-    (values (vt-from-array
-	     (make-array (length rows) :element-type '(signed-byte 64)
-                                       :initial-contents (nreverse rows))
-             :dtype :int64)
-            (vt-from-array
-	     (make-array (length cl) :element-type '(signed-byte 64)
-                                     :initial-contents (nreverse cl))
-             :dtype :int64))))
+    (%triangle-indices n cols k nil)))
 
 ;;; ------------------------------------------------------------------
 ;;; 6. vander
@@ -203,35 +253,93 @@
    ★ 布尔输入的结果 dtype 取 **:int64**（numpy：`np.vander(bool)` → int64）。
      保持 `:bool` 会让「第 3 列 = x²」与 `(vt-pow b 2)`（§17.10.11 已定为
      int64）在同一个表达式上给出两种 dtype；值虽然都是 0/1，但下游一旦
-     就地写入（`(setf (vt-slice …) 3)`）就会撞上 bool 的 0/1 值域。"
-  (let* ((xv (vt-contiguous (vt-flatten x)))
+     就地写入（`(setf (vt-slice …) 3)`）就会撞上 bool 的 0/1 值域。
+
+   递推的每一步都必须「按结果 dtype 回绕」。原实现把这一步写成
+   `(vt-cast (* base xi) dtype)` —— 每元素一次 ECASE 分派 + 通用算术 + COERCE，
+   而它要的只是算术里的一次截断。现在按元素类型各展开一份循环：窄整型用
+   `(ldb (byte w 0) …)` 取低位后按有/无符号还原，int64 用
+   `(the (signed-byte 64) …)`（SBCL 在该声明下发模乘，溢出即回绕，不产生
+   bignum），浮点用同精度的原生乘法 —— 与 `(vt-cast … dtype)` 逐位相同。
+
+   `X-OFF` 参与寻址：`vt-contiguous` 对「已连续但 offset 非零」的视图原样
+   返回，漏掉它就会从底层数组的第 0 个元素开始取 x。"
+  (let* ((flat (vt-flatten x))
+         ;; :bool 的结果 dtype 是 :int64（见 docstring），先把输入按结果 dtype
+         ;; 落地：否则下面按结果元素类型声明的 XS/RS 会撞上「输入是 0/1 字节
+         ;; 数组」而抛 TYPE-ERROR。
+         (dtype (let ((d (vt-dtype flat))) (if (eq d :bool) :int64 d)))
+         (xv (vt-contiguous (if (eq (vt-dtype flat) dtype) flat (vt-astype flat dtype))))
          (len (vt-size xv))
          (ncols (or n len))
-         (dtype (let ((d (vt-dtype xv))) (if (eq d :bool) :int64 d)))
-         (int-p (not (vt-float-dtype-p dtype)))
          (result (vt-zeros (list len ncols) :dtype dtype))
          (xdata (vt-data xv))
-         (rdata (vt-data result))
-         (one (vt-cast 1 dtype)))
-    (declare (fixnum len ncols))
-    (dotimes (i len)
-      (let* ((xi (aref xdata i))
-             (base one)
-             (row-start (* i ncols)))
-        (declare (type fixnum row-start))
-        (if increasing
-            (dotimes (j ncols)
-              (setf (aref rdata (+ row-start j)) base)
-              (setf base (if int-p
-                             (vt-cast (* base xi) dtype)
-                             (* base xi))))
-            ;; 递减：j=0 写入最高次幂 xi^(ncols-1)，j=ncols-1 写入 xi^0
-            (dotimes (j ncols)
-              (setf (aref rdata (+ row-start (- ncols 1 j))) base)
-              (setf base (if int-p
-                             (vt-cast (* base xi) dtype)
-                             (* base xi)))))))
-    result))
+         (x-off (vt-offset xv))
+         (rdata (vt-data result)))
+    (declare (type fixnum len ncols x-off))
+    (macrolet ((rows (lt one next)
+                 `(let ((xs (the (simple-array ,lt (*)) xdata))
+                        (rs (the (simple-array ,lt (*)) rdata)))
+                    (declare (type (simple-array ,lt (*)) xs rs)
+                             (type fixnum len ncols x-off))
+                    (dotimes (i len)
+                      (declare (type fixnum i))
+                      (let ((xi (aref xs (the fixnum (+ x-off i))))
+                            (row-start (the fixnum (* i ncols))))
+                        (declare (type ,lt xi) (type fixnum row-start))
+                        (let ((base (the ,lt ,one)))
+                          (declare (type ,lt base))
+                          (if increasing
+                              (dotimes (j ncols)
+                                (declare (type fixnum j))
+                                (setf (aref rs (the fixnum (+ row-start j))) base)
+                                (setf base ,next))
+                              ;; 递减：j=0 写入最高次幂 xi^(ncols-1)，j=ncols-1 写入 xi^0
+                              (dotimes (j ncols)
+                                (declare (type fixnum j))
+                                (setf (aref rs (the fixnum (+ row-start (- ncols 1 j))))
+                                      base)
+                                (setf base ,next))))))))
+               (wrap-signed (bits)
+                 "有符号窄整型的回绕：取低 BITS 位后按二进制补码还原。"
+                 `(let ((u (ldb (byte ,bits 0) (* base xi))))
+                    (if (> u ,(1- (ash 1 (1- bits))))
+                        (- u ,(ash 1 bits))
+                        u)))
+               (wrap-unsigned (bits)
+                 "无符号窄整型的回绕：取低 BITS 位。"
+                 `(ldb (byte ,bits 0) (* base xi))))
+      (let ((et (array-element-type rdata)))
+        (cond ((equal et 'double-float)            (rows double-float 1.0d0 (* base xi)))
+              ((equal et 'single-float)            (rows single-float 1.0s0 (* base xi)))
+              ;; int64 的回绕只能靠「声明驱动的模乘」实现（SBCL 在该声明下
+              ;; 发 IMUL + 溢出转 bignum 再截断，结果恰是补码回绕）。默认
+              ;; safety 1 会为返回值插类型检查、超界即抛 TYPE-ERROR，所以
+              ;; 这段纯下标/纯标量算术按 §7.4.3 的口径放进 safety 0：
+              ;; 循环边界与数组类型都由外层构造保证，不需要运行期检查。
+              ((equal et '(signed-byte 64))
+               (locally (declare (optimize (speed 3) (safety 0)))
+                 (rows (signed-byte 64) 1 (the (signed-byte 64) (* base xi)))))
+              ((equal et '(signed-byte 32))        (rows (signed-byte 32) 1 (wrap-signed 32)))
+              ((equal et '(signed-byte 16))        (rows (signed-byte 16) 1 (wrap-signed 16)))
+              ((equal et '(signed-byte 8))         (rows (signed-byte 8) 1 (wrap-signed 8)))
+              ((equal et '(unsigned-byte 16))      (rows (unsigned-byte 16) 1 (wrap-unsigned 16)))
+              ((equal et '(unsigned-byte 8))       (rows (unsigned-byte 8) 1 (wrap-unsigned 8)))
+              ;; 未知元素类型：逐元素沿用 VT-CAST（语义一致，只是慢）
+              (t (dotimes (i len result)
+                   (declare (type fixnum i))
+                   (let ((xi (aref xdata (the fixnum (+ x-off i))))
+                         (row-start (the fixnum (* i ncols)))
+                         (base (vt-cast 1 dtype)))
+                     (declare (type fixnum row-start))
+                     (if increasing
+                         (dotimes (j ncols)
+                           (setf (aref rdata (the fixnum (+ row-start j))) base)
+                           (setf base (vt-cast (* base xi) dtype)))
+                         (dotimes (j ncols)
+                           (setf (aref rdata (the fixnum (+ row-start (- ncols 1 j)))) base)
+                           (setf base (vt-cast (* base xi) dtype)))))))))
+      result)))
 
 ;;; ------------------------------------------------------------------
 ;;; 7. one-hot
