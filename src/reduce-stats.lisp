@@ -445,13 +445,26 @@
     "路径 2 的几何条件：输入/输出都连续，且归约轴在 shape 里连成一段。
 
      连成一段是「多层轴塌成一层」的充要条件：单轴天然满足；
-     (0 1)、(1 2) 满足；(0 2) 不满足（中间夹着一层不归约的轴）。"
-    '((consp axes)                          ; 非全归约（全归约走路径 1）
-      (vt-contiguous-p tensor)
+     (0 1)、(1 2) 满足；(0 2) 不满足（中间夹着一层不归约的轴）。
+
+     **全归约（AXES = NIL）也连成一段** —— 它归约的是 [0, rank) 这一段，
+     OUTER = 1 / RED = size / INNER = 1。此前这里写 `(consp axes)` 把全归约
+     排除在外，理由是「全归约走路径 1」；但路径 1 只服务 4 种存储级 dtype，
+     于是 bool / int8 / uint8 / int16 / uint16 的**全归约**掉进路径 3 的
+     里程计（`%kernel-small-general`），1M 元素实测 9.2 ms，而同一条数据
+     沿轴归约只要 0.36 ms（差 25 倍）。放开之后窄整型全归约走
+     `%kernel-single-axis`（RED = size、INNER = 1 时它就是一条扁平指针
+     递增循环），与路径 3 的累加次序完全相同（r = 0,1,2,…），故**逐位不变**。
+
+     存储级 dtype 不受影响：路径 1 的测试在前，条件严格更宽
+     （`global` + 连续，不看 res 连续性与轴形态），连续全归约仍由它接走；
+     非连续的存储级全归约在路径 2 这里仍然不满足 `(vt-contiguous-p tensor)`。"
+    '((vt-contiguous-p tensor)
       (vt-contiguous-p res)
-      (loop for x in axes
-            for y in (cdr axes)
-            always (= y (1+ x)))))
+      (or (null axes)                     ; 全归约：归约 [0, rank) 这一段
+          (loop for x in axes
+                for y in (cdr axes)
+                always (= y (1+ x))))))
 
   (defun %contig-axis-body (op arg-p kernel)
     "路径 2 的 clause body（**forms 列表**，供 CONS 拼到测试条件后面）。
@@ -469,8 +482,10 @@
                           (if (>= inner +row-acc-min-inner+)
                               ,(funcall kernel '%kernel-row-acc)
                               ,(funcall kernel '%kernel-single-axis)))))))
-      `((let* ((a (the fixnum (first axes)))
-               (b (the fixnum (1+ (the fixnum (car (last axes))))))
+      `((let* ((a (the fixnum (if axes (first axes) 0)))
+               (b (the fixnum (if axes
+                                  (1+ (the fixnum (car (last axes))))
+                                  (length in-shape))))
                (outer (let ((r 1))
                         (dotimes (i a r)
                           (setf r (* r (the fixnum (nth i in-shape)))))))

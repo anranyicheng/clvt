@@ -902,28 +902,31 @@
   (let ((v (ensure-vt tensor)))
     (%float-map #'%e3-log1p v out (%e3-float-prefer-dtype dtype (vt-dtype v)))))
 
+(declaim (inline %e3-logaddexp2))
+(defun %e3-logaddexp2 (a b)
+  "logaddexp 内核（判据与改前 lambda 逐条相同：NaN → +Inf → -Inf → 稳定式）。"
+  (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
+    (cond ((%nan-p af) af)
+          ((%nan-p bf) bf)
+          ((%pos-inf-p af) af)
+          ((%pos-inf-p bf) bf)
+          ((%neg-inf-p af) bf)
+          ((%neg-inf-p bf) af)
+          (t (let ((m (max af bf)))
+               (+ m (log (+ 1.0d0 (exp (- (min af bf) m))))))))))
+
 (defun vt-logaddexp (x y &key out dtype)
   "逐元素 log(exp(x) + exp(y))，数值稳定（对标 numpy.logaddexp）。
    整数输入输出 float64，float32 张量进 float32 出（弱标量不升宽，§16.31）。
    :out 契约同 vt-abs（支持广播）。"
-    (when (%cx-reject x y)
+  (when (%cx-reject x y)
     (error "vt-logaddexp: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let* ((xo (ensure-vt x))
-       (yo (ensure-vt y))
-       (xe (%coerce-float-input xo :float64))
-       (ye (%coerce-float-input yo :float64))
-       (fn (lambda (a b)
-              (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
-                (cond ((%nan-p af) af)
-                      ((%nan-p bf) bf)
-                      ((%pos-inf-p af) af)
-                      ((%pos-inf-p bf) bf)
-                      ((%neg-inf-p af) bf)
-                      ((%neg-inf-p bf) af)
-                      (t (let ((m (max af bf)))
-                           (+ m (log (+ 1.0d0 (exp (- (min af bf) m))))))))))))
-    (vt-map fn xe ye
-            :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
+  (let* ((xo (ensure-vt x))
+         (yo (ensure-vt y))
+         (xe (%coerce-float-input xo :float64))
+         (ye (%coerce-float-input yo :float64)))
+    (vt-fast-map #'%e3-logaddexp2 xe ye
+                 :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
 
 (defun vt-float-power (x y &key out dtype)
   "逐元素幂运算，结果恒为浮点（对标 numpy.float_power）。
@@ -976,23 +979,26 @@
 (defun %pred-posinf (v) (if (and (floatp v) (%pos-inf-p v)) 1 0))
 (defun %pred-neginf (v) (if (and (floatp v) (%neg-inf-p v)) 1 0))
 
+(declaim (inline %e3-copysign2))
+(defun %e3-copysign2 (a b)
+  "copysign 内核：符号取自 b 的 IEEE 符号位（minusp 认不出 −0.0）。"
+  ;; v0.4.1 修复（差分测试 R4）：符号取自 y 的 IEEE 符号位，
+  ;; minusp 无法识别 -0.0（copysign(1,-0.0) 应为 -1.0）。
+  (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
+    (if (%e3-sign-bit-p bf) (- (abs af)) (abs af))))
+
 (defun vt-copysign (x y &key out dtype)
   "逐元素赋予 X 的绝对值与 Y 的符号（对标 numpy.copysign）。
    结果恒为浮点；NaN 符号位处理与 numpy 一致（copysign(1, nan) → 1）。
    :out 契约同 vt-abs（支持广播）。"
-    (when (%cx-reject x y)
+  (when (%cx-reject x y)
     (error "vt-copysign: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let* ((xo (ensure-vt x))
-       (yo (ensure-vt y))
-       (xe (%coerce-float-input xo :float64))
-       (ye (%coerce-float-input yo :float64)))
-    (vt-map (lambda (a b)
-              ;; v0.4.1 修复（差分测试 R4）：符号取自 y 的 IEEE 符号位，
-              ;; minusp 无法识别 -0.0（copysign(1,-0.0) 应为 -1.0）。
-              (let ((af (coerce a 'double-float)) (bf (coerce b 'double-float)))
-                (if (%e3-sign-bit-p bf) (- (abs af)) (abs af))))
-            xe ye
-            :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
+  (let* ((xo (ensure-vt x))
+         (yo (ensure-vt y))
+         (xe (%coerce-float-input xo :float64))
+         (ye (%coerce-float-input yo :float64)))
+    (vt-fast-map #'%e3-copysign2 xe ye
+                 :out out :dtype (%e3-double-result-dtype dtype x xo y yo))))
 
 (defun vt-signbit (tensor &key out)
   "逐元素符号位判定，返回 **:bool** 布尔张量（对标 numpy.signbit，§17）。

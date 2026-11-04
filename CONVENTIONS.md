@@ -674,7 +674,8 @@ SBCL 对**非有限值**调用 `floor/round/ceiling/truncate` 会触发 `FLOATIN
 |---|---|---|---|
 | GEMM | `%simd-matmul-{f32,i32,i64}`（`simd-matmul.lisp`） | 2 维、dtype 属存储级、`m·k·n ≥ *simd-matmul-threshold*`、out 连续且 dtype 精确匹配 | `vt-einsum` 通用路径 |
 | GEMM（f64） | `%simd-matmul-f64-512`（`gemm-avx512.lisp`，运行时发射的 AVX-512 机器码；8 行 × 16 列微块，列尾走掩码内核） | 同上一行，**且** `avx512-gemm-kernels` 非 NIL —— 即 x86-64 + `/proc/cpuinfo` 有 `avx512f` + `*avx512-gemm-enabled*` 为真。`m mod 8` 的行尾仍交回 `%simd-matmul-f64` | `%simd-matmul-f64`（sb-simd AVX2） |
-| 归约（全归约） | `%kernel-global` | 输入连续、`axis=nil`、dtype 属 4 种存储级 | `%kernel-general`（stride 驱动 odometer） |
+| 归约（全归约，存储级 dtype） | `%kernel-global` | 输入连续、`axis=nil`、dtype 属 4 种存储级 | `%kernel-general`（stride 驱动 odometer） |
+| 归约（全归约，窄整型） | `%kernel-single-axis`（经「归约轴连成一段」那条 clause，`outer=1` / `red=size` / `inner=1`） | 输入连续、`axis=nil`、dtype 属 4 种窄整型（bool/int8/uint8/int16/uint16）。**全归约的归约轴 `[0, rank)` 天然连成一段**，塌轴后就是一条扁平指针递增循环 | `%kernel-small-general`（窄整型里程计） |
 | 归约（沿轴） | `%kernel-row-acc`（`inner ≥ +row-acc-min-inner+`）/ `%kernel-single-axis` | 输入与 out 都连续，且**归约轴在 shape 里连成一段** `[a,b)` —— 满足时多层轴等价于一层：`outer=∏[0,a)`、`red=∏[a,b)`、`inner=∏[b,rank)`；单轴天然满足，`(0,1)`/`(1,2)` 满足，`(0,2)` 不满足。窄整型同条件（内层用 `%small-int-axis-form` 分派）。行累加额外要求 out 不与输入同数组 | `%kernel-general` / `%kernel-small-general`（窄整型） |
 | 归约（arg 族） | `%kernel-single-axis` | 单轴 + 存储级 dtype（numpy 的 `argmax`/`argmin` 不接受轴元组；窄整型留在通用路径） | `%kernel-general` |
 | 类型转换 | `vt-astype` 的 `spec` 特化（10×10 + 4×8 窄整型），提成局部函数 `%cast-run` 后**两条落点共用同一张表** | 连续视图 → 整数组一次；非连续且内层 run ≥ `+astype-fuse-min-run+` → 逐 run 一趟直接写目标 | `%gather-contiguous` → 递归 astype（run 太短或未知元素类型） |
@@ -880,6 +881,71 @@ WARNING），又必须穿过上面那次 coerce。实测 `vt-fast-map` 版本 31
 非连续归约的物理形态无关性（6 种视图 × 6 种 dtype × 单轴/多轴/arg/keepdims
 逐位相同）与跨 dtype 写入的等价性由 `test/reduce-copy-perf-test.lisp`
 （A 段 51 条逐位对拍 + B 段 7 条倍率）守护；套件名 `reduce-copy-perf-test`。
+
+#### 7.4.6.1 全归约也是「归约轴连成一段」
+
+全归约（`axis = nil`）的归约轴是 `[0, rank)` —— 它**天然连成一段**，几何上就是
+`outer = 1 / red = size / inner = 1`。所以它不该有独立的判据：一旦把「全归约」
+从 §7.4 那条「连成一段」的 clause 里排除出去，唯一的后果是**只有路径 1 服务的那
+4 种存储级 dtype 有扁平循环**，其余 5 种逻辑 dtype（bool / int8 / uint8 /
+int16 / uint16）的全部元素都要走 `%kernel-small-general` 的三重里程计
+（每元素 `(aref idx d)` 取坐标 + 三次 `svref` 取步长 + 指针回卷）：
+
+| 用例（1M，1D 输入） | 里程计 | 塌轴后 |
+|---|---:|---:|
+| `vt-sum` int8 | 2.94 ms | **0.41** |
+| `vt-sum` int16 | 2.95 | **0.39** |
+| `vt-amax` int8 | 3.37 | **0.81** |
+
+2D 输入更明显（归约轴两层，连里程计内部那条单轴指针递增子路径都用不上）：
+`vt-all` bool 9.12 → **0.54**、`vt-sum` int8 9.23 → **0.42**、`vt-amax` int16
+9.48 → **0.82**。同一份数据沿轴归约一直是 0.36 ms，也就是说改前「全归约比沿轴
+归约慢 25 倍」纯粹是选路缺口。
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 判据写「是否连成一段」，不写「是否非全归约」 | `%contig-axis-test` 的第一条是 `(or (null axes) <连段判定>)`；`axes` 为 NIL 时 `a = 0`、`b = rank` | 「全归约」是「连成一段」的特例，不是它的反例。写成 `(consp axes)` 等于把 5 种逻辑 dtype 的整块性能押在路径 1 的 dtype 白名单上 |
+| 存储级 dtype 的顺序不变 | 路径 1 的条件（`global` + 连续 + 非窄整型）严格更宽且排在前面，连续全归约仍由 `%kernel-global` 接走 | 同一条扁平循环，换过去只有坏处 |
+| 累加次序逐字不变 | 塌轴后 `r` 仍从 0 递增到 `red-1` | §7.3：归约累加次序是契约 |
+
+窄整型全归约的多 dtype × 多形状 × 7 算子 × 6 种物理形态 × 退化输入由
+`test/reduce-global-narrow-perf-test.lisp`（697 条，含 4 条机器无关倍率护栏：
+秩不变性、窄整型÷存储级、全局÷沿轴、amax÷sum）守护；套件名
+`reduce-global-narrow-perf-test`。
+
+#### 7.4.7 逐元素算子必须具名（`(function <符号>)`）
+
+`vt-fast-map` 在**宏展开期**看第一个实参的形状：只有 `(function <符号>)` 才把
+算子编进元素类型特化循环；`(lambda (x) …)` 一律走
+`(apply #'vt-map fn …)` —— 每元素一次 `funcall` + 两次泛型 `aref` + 一次泛型
+`VT-CAST`。两者是数量级关系，不是百分比关系。
+
+| 用例（1M f64） | 闭包路径 | 具名内联 |
+|---|---:|---:|
+| `vt-rint` | 28.96 ms | **2.74** |
+| `vt-lerp` | 21.94 | **2.30** |
+| `vt-rad2deg` / `vt-deg2rad` | 9.72 / 9.27 | **1.26 / 1.37** |
+| `vt-copysign` | 12.00 | **1.91** |
+| `vt-reciprocal` | 8.77 | **1.70** |
+| `vt-sinc` | 29.19 | **12.75**（= `vt-sin` 的量级，已到底） |
+| `vt-logaddexp` | 20.76 | **9.96**（= 稳定式本身的代价） |
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 算子写成 `defun` + `(declaim (inline …))`，调用点用 `#'name` | 算子体逐字搬过去，不改任何运算式 | 保证结果逐位不变；改成 `inline` 只是让编译器能把它塞进循环 |
+| 闭包捕获的常量提成 `defconstant` | `+rad2deg-df+` / `+deg2rad-sf+` 等四个因子；表达式与原来的运行期表达式逐字相同 | 保持**一元**形态。（退化成二元「算子 × 因子」广播虽然也能内联，但走的是 n=2 分支，且要多一次 stride 判断） |
+| 语义不同的分支拆成不同算子 | `vt-reciprocal` 的整数分支（`1 // x` + 零除报错）与浮点分支拆成 `%op-recip-int` / `-df` / `-sf` | 一个算子只能编进一种 dtype 的循环 |
+| **不做**「把两趟流水线融合成一趟」 | `vt-sinc` 保留 `vt-scale` 那一趟，只把最后的 map 具名 | 融合后 float32 路径会少一次单精度舍入 —— 那是改数值，不是改执行层 |
+| **不做**「把定义换成捷径」 | `vt-reciprocal` 的整数分支仍写 `(truncate (/ 1 v))`（9 ms），不改写成 `(if (= v 1) 1 (if (= v -1) -1 0))` | 两者数学等价，但后者是把**定义**换成**捷径**，超出「只改执行层」的范围 |
+
+`vt-rint` 是这条规律最容易漏的一个：它的算子体与 `%ROUND1` **逐字相同**
+（`rint` 的定义就是「最近偶数」，CL `round` 的舍入策略正是这个），
+却因为写成了匿名 lambda 而一直走闭包路径 —— 同族的 `vt-round` 只要 2.5 ms，
+它要 29 ms。
+
+八个算子的逐位等价（对 ±0.0 符号位、NaN、±Inf、整数输入、float32、`:out`、
+转置/翻转视图、广播、0 维、空）与 13 条倍率护栏由
+`test/elementwise-named-perf-test.lisp` 守护；套件名 `elementwise-named-perf-test`。
 
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 

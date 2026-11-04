@@ -75,25 +75,55 @@
   (vt-fast-map #'%op-ge (ensure-vt t1) (ensure-vt t2)
                :dtype dtype :out out))
 
+;;; ------------------------------------------------------------------
+;;; 角 / 插值 / 倒数 / sinc：具名内联算子
+;;;
+;;; 与 elementwise1.lisp 的取整族、extensions3.lisp 的谓词族同一个病根：
+;;; 都写成 `(vt-map (lambda (x) …) …)`，而 `vt-fast-map` 只对
+;;; `(function <符号>)` 内联，匿名 lambda 一律 `(apply #'vt-map …)` 回退成
+;;; 「逐元素 funcall + 泛型 aref」。1M float64 实测（改前，中位数，运行间 ±5%）：
+;;;   vt-rint 29.0 / vt-sinc 29.2 / vt-lerp 21.9 / vt-rad2deg 9.7 /
+;;;   vt-deg2rad 9.3 / vt-reciprocal 8.8 ms，而同量级的 `(vt-* a a)` 是 0.88 ms。
+;;;
+;;; 改法只有一条：把算子提成**具名 + inline** 的函数，算子体逐字不动，
+;;; 交给 `vt-fast-map` 编进元素类型特化循环。缩放因子按 dtype 预置成
+;;; 常量（`+rad2deg-df+` 等），这样一元算子保持单参形态、走 `%inline1-loop`，
+;;; 不必为了传因子退化成二元广播路径。
+;;; ------------------------------------------------------------------
+(defconstant +rad2deg-df+ (/ 180.0d0 pi)
+  "float64 的弧度→角度因子（与改前的运行期 `(/ 180.0d0 pi)` 逐位相同）。")
+(defconstant +rad2deg-sf+ (/ 180.0s0 (coerce pi 'single-float))
+  "float32 的弧度→角度因子（与改前的运行期表达式逐位相同）。")
+(defconstant +deg2rad-df+ (/ pi 180.0d0)
+  "float64 的角度→弧度因子（与改前的运行期表达式逐位相同）。")
+(defconstant +deg2rad-sf+ (/ (coerce pi 'single-float) 180.0s0)
+  "float32 的角度→弧度因子（与改前的运行期表达式逐位相同）。")
+
+(declaim (inline %op-rad2deg-df %op-rad2deg-sf %op-deg2rad-df %op-deg2rad-sf))
+(defun %op-rad2deg-df (x) (* x +rad2deg-df+))
+(defun %op-rad2deg-sf (x) (* x +rad2deg-sf+))
+(defun %op-deg2rad-df (x) (* x +deg2rad-df+))
+(defun %op-deg2rad-sf (x) (* x +deg2rad-sf+))
+
 (defun vt-rad2deg (vt &key out dtype)
   "弧度转角度（×180/π）。整数输入输出 float64，
       float32 进 float32 出。:out 契约同 vt-+。"
-    (when (%cx-reject vt)
+  (when (%cx-reject vt)
     (error "vt-rad2deg: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let* ((dt (%infer-float-dtype vt dtype))
-         (factor (if (eq dt :float32) (/ 180.0s0 (coerce pi 'single-float))
-                     (/ 180.0d0 pi))))
-    (vt-map (lambda (x) (* x factor)) vt :out out :dtype dt)))
+  (let ((dt (%infer-float-dtype vt dtype)))
+    (if (eq dt :float32)
+        (vt-fast-map #'%op-rad2deg-sf vt :out out :dtype dt)
+        (vt-fast-map #'%op-rad2deg-df vt :out out :dtype dt))))
 
 (defun vt-deg2rad (vt &key out dtype)
   "角度转弧度（×π/180）。整数输入输出 float64，
       float32 进 float32 出。:out 契约同 vt-+。"
-    (when (%cx-reject vt)
+  (when (%cx-reject vt)
     (error "vt-deg2rad: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(let* ((dt (%infer-float-dtype vt dtype))
-         (factor (if (eq dt :float32) (/ (coerce pi 'single-float) 180.0s0)
-                     (/ pi 180.0d0))))
-    (vt-map (lambda (x) (* x factor)) vt :out out :dtype dt)))
+  (let ((dt (%infer-float-dtype vt dtype)))
+    (if (eq dt :float32)
+        (vt-fast-map #'%op-deg2rad-sf vt :out out :dtype dt)
+        (vt-fast-map #'%op-deg2rad-df vt :out out :dtype dt))))
 
 ;;; ------------------------------------------------------------------
 ;;; 极值 / 逻辑算子（具名 + 内联）
@@ -361,14 +391,17 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
     ;; 双侧：min(max, max(min, x))，与 %op-clip 同义
     (t (vt-fast-map #'%op-clip vt min-val max-val :dtype dtype :out out))))
 
+(declaim (inline %op-lerp3))
+(defun %op-lerp3 (s e w)
+  "线性插值内核：`s + (e − s)·w`（与改前 lambda 的运算符次序逐字相同）。"
+  (+ s (* (- e s) w)))
+
 (defun vt-lerp (start end weight &key out dtype)
   "逐元素线性插值 start + (end - start) * weight，
       对标 numpy 的 a + (b-a)*t 形式（三者均支持广播）。
       :dtype 决定结果 dtype（缺省按提升规则），:out 契约同 vt-+。"
-  (vt-map (lambda (s e w)
-            (+ s (* (- e s) w)))
-          (ensure-vt start) (ensure-vt end) (ensure-vt weight)
-          :dtype dtype :out out))
+  (vt-fast-map #'%op-lerp3 (ensure-vt start) (ensure-vt end) (ensure-vt weight)
+               :dtype dtype :out out))
 
 (defun vt-cbrt (vt &key out dtype)
   "逐元素立方根。定义为 signum(x)*|x|^(1/3)，因此负数返回实数值
@@ -439,6 +472,15 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
         (vt-fast-map #'%hypot-sf v1 v2 :out out :dtype dt)
         (vt-fast-map #'%hypot-df v1 v2 :out out :dtype dt))))
 
+(declaim (inline %op-recip-int %op-recip-df %op-recip-sf))
+(defun %op-recip-int (v)
+  "整数倒数内核：1 // v（截断），零除确定性报错 —— 与改前 lambda 逐字相同。"
+  (if (zerop v)
+      (error "vt-reciprocal: 整数零除")
+      (truncate (/ 1 v))))
+(defun %op-recip-df (v) (/ 1.0d0 v))
+(defun %op-recip-sf (v) (/ 1.0s0 v))
+
 (defun vt-reciprocal (vt &key out dtype)
   "逐元素倒数 (1/x)。
 
@@ -463,10 +505,10 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
          (dt (or dtype (if (eq in-dt :bool) :int8 in-dt))))
     (if (vt-int-dtype-p dt)
         ;; 整数倒数：保持整数语义（1//x），零除交给 CL 整数除零错误
-        (vt-map (lambda (v) (if (zerop v) (error "vt-reciprocal: 整数零除") (truncate (/ 1 v))))
-                vt :out out :dtype dt)
-        (let ((one (if (eq dt :float32) 1.0s0 1.0d0)))
-          (vt-map (lambda (v) (/ one v)) vt :out out :dtype dt)))))
+        (vt-fast-map #'%op-recip-int vt :out out :dtype dt)
+        (if (eq dt :float32)
+            (vt-fast-map #'%op-recip-sf vt :out out :dtype dt)
+            (vt-fast-map #'%op-recip-df vt :out out :dtype dt)))))
 
 (defun vt-negative (vt &key out dtype)
   "逐元素取负（-x）。这是一元 vt-- 的具名入口，
@@ -499,6 +541,12 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
         (vt-fast-map (function %cop-neg) in :out out :dtype dt))))
   (vt-fast-map #'- vt :dtype dtype :out out))
 
+(declaim (inline %op-sinc1))
+(defun %op-sinc1 (x)
+  "sinc 内核：`sin(x)/x`，x = 0 时取 1（与改前 lambda 逐字相同，
+   连 1.0d0 这个字面量都不动 —— 写回时由目标 dtype 收窄，与改前一致）。"
+  (if (zerop x) 1.0d0 (/ (sin x) x)))
+
 (defun vt-sinc (tensor &key out dtype)
   "逐元素归一化 sinc 函数 sin(πx)/(πx)，且 sinc(0)=1（对标 numpy.sinc）。
       整数输入输出 float64，float32 进 float32 出。:out 契约同 vt-+。"
@@ -509,9 +557,7 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
         (vt-fast-map (function %cop-sinc) in :out out :dtype dt))))
   (let* ((dt (%infer-float-dtype tensor dtype))
          (x-pi (vt-scale tensor pi :dtype dt)))
-    (vt-map (lambda (x)
-              (if (zerop x) 1.0d0 (/ (sin x) x)))
-            x-pi :out out :dtype dt)))
+    (vt-fast-map #'%op-sinc1 x-pi :out out :dtype dt)))
 
 ;; 在编译期间垃圾回收内存，防止爆炸
 #+sbcl (sb-ext::gc :full t)

@@ -702,18 +702,17 @@
 
 (defun vt-rint (vt &key out dtype)
   "逐元素取整到最近偶数（对标 numpy.rint）。
-      NaN/±Inf 原样传播；整数输入保持整数 dtype。:out 契约同 vt-+。"
-    (when (%cx-reject vt)
+      NaN/±Inf 原样传播；整数输入保持整数 dtype。:out 契约同 vt-+。
+
+   性能（v0.4.20 补漏）：本函数此前是取整族里**唯一**还留着匿名 lambda 的
+   一个 —— `vt-fast-map` 只对 `(function <符号>)` 内联，`(lambda (x) …)`
+   直接 `(apply #'vt-map …)` 回退成逐元素 funcall + 泛型 aref。
+   1M float64 实测 29.0 ms（运行间 29~31），而同族 vt-round 只要 2.5 ms。
+   算子体与 `%ROUND1` **逐字相同**（rint 的定义就是「最近偶数」，
+   与 CL `round` 的舍入策略一致，两者只差一个入口名），
+   因此直接复用同一个内联算子，语义逐位不变。"
+  (when (%cx-reject vt)
     (error "vt-rint: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
-(vt-map (lambda (x)
-            (if (and (floatp x) (%nan-or-inf-p x))
-                x
-                (let ((res (nth-value 0 (round x))))
-                  (if (floatp x)
-                      (if (and (zerop res) (minusp (float-sign x)))
-                          (- (float 0.0 x))
-                          (float res x))
-                      res))))
-          vt :out out :dtype dtype))
+  (vt-fast-map #'%round1 vt :out out :dtype dtype))
 
 #+sbcl (sb-ext::gc :full t) ;; 在编译期间垃圾回收内存，防止爆炸

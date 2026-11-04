@@ -5685,3 +5685,206 @@ The value NIL is not of type FIXNUM when binding CLVT::D1
 > 这两处的病根是同一个：**每元素重新算一次「我在哪」**。归约在算物理下标，
 > 跨 dtype 写入在重新判元素类型。凡是「每元素都要付」的开销，挪到循环外
 > 或者换成类型特化，收益都是数量级的。
+
+## H.3.50 第三十轮：窄整型全归约塌成一层、八个逐元素算子补上具名内联
+
+前二十九轮的找法都是「想起某个函数大概慢，去量它」。这一轮换了做法：把**全部
+导出函数**在 1M 元素上跑一遍，排一张 ns/元素 表，只看哪一格的代价和它承担的
+算术不相称。70 多例排下来，刺眼的是两组 —— 两组的病根都不是新问题，而是**早就
+写进文档、只是没贯彻到这几个入口**。
+
+### 一、第一组：一个 `(consp axes)` 把五种 dtype 挡在快路径外
+
+`vt-sum` / `vt-all` / `vt-amax` 在 **bool / int8 / uint8 / int16 / uint16** 上的
+全归约要 9 ms 出头，而同一份数据沿轴归约只要 0.36 ms：
+
+| 用例（1M） | 改前 | 同数据沿轴归约 |
+|---|---:|---:|
+| `vt-sum` bool 2D `:axis nil` | 9.09 ms | 0.36 ms |
+| `vt-all` bool 2D `:axis nil` | 9.12 | — |
+| `vt-amax` int16 2D `:axis nil` | 9.48 | — |
+| `vt-sum` int8 2D `:axis nil` | 9.23 | — |
+
+差 25 倍，而且**只在这五种 dtype 上**。线索在 `%contig-axis-test` 的第一条：
+
+```lisp
+'((consp axes)                     ; ← 非全归约（全归约走路径 1）
+  (vt-contiguous-p tensor)
+  (vt-contiguous-p res)
+  (loop for x in axes for y in (cdr axes) always (= y (1+ x))))
+```
+
+注释说得没错：全归约确实有专属通路 —— 路径 1 `%kernel-global`，一条扁平循环。
+但它只为 4 种**存储级** dtype 生成实例（`+kernel-lts+`：double-float /
+single-float / int64 / int32）。窄整型不在其中，于是它们的全归约绕开路径 1、
+又因为 `(consp axes)` 为假绕开路径 2，最终掉进路径 3 的 `%kernel-small-general`
+—— 那是一台**通用里程计**：每元素 `(aref idx d)` 取一次坐标、`svref` 取步长、
+指针回卷。2D 时归约轴有两层，连「指针 += 步长」那条子路径都用不上，每元素
+两次坐标读取加一次进位。
+
+而全归约的归约轴 `[0, rank)` **本来就「连成一段」**。塌成一层之后
+OUTER = 1 / RED = size / INNER = 1，`%kernel-single-axis` 就是一条扁平指针
+递增循环 —— 和路径 1 一模一样，只是按 dtype 泛化。所以改动其实是**一行判据**：
+
+```lisp
+'((vt-contiguous-p tensor)
+  (vt-contiguous-p res)
+  (or (null axes)                  ; 全归约：归约 [0, rank) 这一段
+      (loop for x in axes for y in (cdr axes) always (= y (1+ x)))))
+```
+
+配合几何量里两处：
+
+```lisp
+(let* ((a (the fixnum (if axes (first axes) 0)))
+       (b (the fixnum (if axes (1+ (car (last axes))) (length in-shape)))))
+```
+
+存储级 dtype 一格没动：路径 1 的测试排在前面，条件严格更宽（`global` + 仅要求
+输入连续，不看 res 连续性、也不看轴形态），连续全归约照旧由它接走；非连续的
+存储级全归约在路径 2 这里仍然被 `(vt-contiguous-p tensor)` 挡住。
+
+| 用例（1M） | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| `vt-sum` int8 2D `:axis nil` | 9.23 | **0.42** | 22.0× |
+| `vt-sum` bool 2D | 9.09 | **0.52** | 17.5× |
+| `vt-any` bool 2D | 9.68 | **0.57** | 17.0× |
+| `vt-all` bool 2D | 9.12 | **0.54** | 16.9× |
+| `vt-amax` int16 2D | 9.48 | **0.82** | 11.6× |
+| `vt-sum` int16 1D | 2.95 | **0.39** | 7.7× |
+| `vt-sum` int8 1D | 2.94 | **0.41** | 7.2× |
+| `vt-all` bool 1D | 2.81 | **0.55** | 5.1× |
+| `vt-amax` int8 1D | 3.37 | **0.81** | 4.2× |
+
+1D 的倍率小一半，因为 1D 全归约本来就只有一层轴，里程计退化得没那么厉害 —— 这
+正好是「慢在轴层数」的旁证。
+
+### 二、第二组：八个算子的算子还是匿名 lambda
+
+`vt-fast-map` 只对 `(function <符号>)` 形式内联；传 `(lambda (x) …)` 会直接
+`(apply #'vt-map …)`，退化成「逐元素 funcall + 两次泛型 `AREF` + 逐元素
+`VT-CAST`」。这条规律在取整族、谓词族、hypot、cbrt 里都写明并修过了
+（§7.4.7 是这一轮才补进契约的），但还漏着八个：
+
+| 用例（1M） | 改前 | 改后 | 倍率 |
+|---|---:|---:|---:|
+| `vt-rint` f64 | 28.96 | **2.74** | 10.6× |
+| `vt-rint` f32 | 20.69 | **2.11** | 9.8× |
+| `vt-lerp` f64 | 21.94 | **2.30** | 9.5× |
+| `vt-rad2deg` f64 | 9.72 | **1.26** | 7.7× |
+| `vt-rad2deg` f32 | 5.37 | **0.74** | 7.3× |
+| `vt-deg2rad` f64 | 9.27 | **1.37** | 6.8× |
+| `vt-deg2rad` f32 | 5.31 | **0.81** | 6.6× |
+| `vt-copysign` f64 | 12.00 | **1.91** | 6.3× |
+| `vt-reciprocal` f64 | 8.77 | **1.70** | 5.2× |
+| `vt-reciprocal` f32 | 4.62 | **1.02** | 4.5× |
+| `vt-rint` int64 | 7.48 | **1.60** | 4.7× |
+| `vt-sinc` f64 | 29.19 | **12.75** | 2.3× |
+| `vt-logaddexp` f64 | 20.76 | **9.96** | 2.1× |
+| `vt-reciprocal` int64 | 16.52 | **9.00** | 1.8× |
+
+改法只有一条：算子提成**具名 + `declaim inline`**，算子体逐字不动。三处细节：
+
+- **`vt-rint` 的算子体与 `%ROUND1` 逐字相同。** `rint` 的定义就是「最近偶数」，
+  与 CL `round` 的舍入策略一致，两者只差一个入口名。所以直接
+  `(vt-fast-map #'%round1 …)`，不新造第二份 —— 两份逐字相同的内核迟早会分叉。
+- **`vt-rad2deg` / `vt-deg2rad` 原来闭包捕获一个运行期算出的 `factor`。** 直接
+  把它当第二个参数传给算子会变成二元形态、走广播路径，比一元路径更慢。改法是把
+  两个因子提成 `defconstant`（`+rad2deg-df+` / `+rad2deg-sf+` / `+deg2rad-df+` /
+  `+deg2rad-sf+`），按 `dt` 选算子，保持单参形态走 `%inline1-loop`。
+  常量初值与原来的运行期表达式**逐字相同** —— 包括 float32 那两支的
+  `(coerce pi 'single-float)`：写成 `3.1415927s0` 字面量会在读入期做一次十进制
+  转换，与 `coerce` 的结果可能差最后一位。这一位之差会直接出现在结果里
+  （`deg2rad` 的输出就是 `x * 因子`，因子差一位，全部输出都差一位）。
+- **`vt-sinc` 只换最后一次 map 的算子**，前面那次 `vt-scale tensor pi` 原样
+  保留。融合成 `sin(πx)/(πx)` 会让 float32 路径少一次单精度舍入 —— 属于改数值，
+  不做（§1 铁律 1 管的是「连续性不影响结果」，这里更进一步：**优化不得改变
+  舍入次数**）。
+
+### 三、怎么证明「结果没变」
+
+归约的错误是静默的：形状对、dtype 对、差一点。所以两个新套件都不写手抄期望值。
+
+`test/reduce-global-narrow-perf-test.lisp`（697 条）：
+
+* **A1 值 ≡ 独立重写的朴素参照**。参照在**逻辑值列表**上 `reduce`，与库里的任何
+  路径都不共享代码。5 种窄 dtype × 3 种形状（1D / 2D / 3D）× 7 个算子
+  （`sum` / `prod` / `amax` / `amin` / `all` / `any` / `mean`）。
+  这里踩到一个坑：`prod` 的 int64 结果会**补码回绕**，参照不建模就对不上
+  （`vt-prod uint16 九元素` = −5670685387920506880），所以参照里显式写了
+  `wrap-i64`。
+* **A2 存储级对照组**：同形状的 f64 / int32 必须**一点不变**（它们走路径 1）。
+* **A3 六种物理形态逐位相同**：连续 / 转置 / 步进 / 翻转 / 子块 / 3D 置换，
+  同一逻辑数据的结果必须逐位相等。
+* **A4 退化输入**：0 元素、1 元素、全零、全 T、单元素轴。
+* **B 段 4 条倍率护栏**：`check-at-most`，比值口径（§16.16 第 7 条：不写绝对
+  毫秒）。
+
+`test/elementwise-named-perf-test.lisp`（113 条）：
+
+* `old-*` **逐字复刻改动前实现**（仍走 `vt-map` + 闭包），与新实现逐位对拍。
+  覆盖 ±0.0 的符号位、NaN、±Inf、整数输入、float32、`:out`、转置/翻转视图、
+  广播、0 维、空数组。八个函数 × 这些形态。
+* 13 条 `check-ratio` 护栏。
+
+另外做了一次**两构建对拍**：同一份确定性语料在改动前 / 改动后两个 build 上各跑
+一遍，结果按 shape + dtype + 逐元素位模式打印，478 行，`diff` = **0 行**。
+
+### 四、与 numpy 2.4.6 的距离
+
+| 用例（1M） | clvt 改后 | numpy 2.4.6 | 比 |
+|---|---:|---:|---:|
+| `sum` int8 | 0.42 ms | 0.320 ms | 1.3× |
+| `sum` bool 2D | 0.52 | 0.342 | 1.5× |
+| `sum` int16 | 0.39 | 0.294 | 1.3× |
+| `amax` int16 | 0.82 | 0.024 | 34× |
+| `all` bool 2D（全 T，无短路） | 0.54 | 0.015 | 36× |
+| `any` bool 2D（全 F，无短路） | 0.57 | 0.010 | 57× |
+| `rint` f64 | 2.74 | 0.158 | 17× |
+| `rad2deg` f64 | 1.26 | 1.629 | **0.77×** |
+| `deg2rad` f64 | 1.37 | 1.638 | **0.84×** |
+| `copysign` f64 | 1.91 | 0.570 | 3.4× |
+| `reciprocal` f64 | 1.70 | 0.552 | 3.1× |
+| `sinc` f64 | 12.75 | 11.99 | 1.06× |
+| `logaddexp` f64 | 9.96 | 10.09 | 0.99× |
+
+三件事值得说清楚：
+
+- **`rad2deg` / `deg2rad` 已经比 numpy 快**（0.77× / 0.84×）—— numpy 这两个是
+  通用 ufunc 逐元素乘，本库编成了类型特化循环。这条是**反问句**：不是所有
+  「比 numpy 慢」都要追。
+- **`all` / `any` 的 57 倍不是「循环慢」**。numpy 对 bool 归约走逻辑与/或的
+  SIMD 字节扫描（1 MB 数据 0.01 ms，L3 命中），本库是逐元素取 `(signed-byte 64)`
+  累加。要追上得给 `:bool` 单独做一条字节级归约通路，属于**未关差距**，本轮不做
+  （收益只在 bool，且要新增一条内核族）。
+- **`amax` int16 的 34 倍**同理：numpy 用 SIMD 极值扫描，本库是标量比较。
+  `sinc` / `logaddexp` 已经贴平（1.0× 上下），因为它们的瓶颈是 `sin` / `log` /
+  `exp` 本身，而那两条路径本来就是同一条 libm 调用序列。
+
+### 五、有意不做的两处
+
+- **`vt-reciprocal` 的整数分支**（仍要 9.00 ms）。`(truncate (/ 1 v))` 每个元素
+  造一个 ratio 对象再截断。它等价于「v = ±1 给 ±1，否则给 0」，但那是把
+  **定义**换成**捷径** —— 一旦有人依赖「零除报错」「大整数精确」，换掉就出事。
+  只保留了「算子具名」这一层（4.7× 来自这里），数学不动。
+- **`vt-sinc` 的融合**，理由已在 §二 末尾：会改 float32 的舍入次数。
+
+### 六、清单
+
+| 位置 | 改动 |
+|---|---|
+| `src/reduce-stats.lisp` | `%contig-axis-test` 放开全归约（`(consp axes)` → `(or (null axes) …)`）；`%contig-axis-body` 的 `a`/`b` 在 `axes` 为 NIL 时取 `0`/`rank` |
+| `src/elementwise1.lisp` | `vt-rint` 改用 `#'%round1` |
+| `src/elementwise2.lisp` | 新增 4 个 `defconstant` 因子与 `%op-rad2deg-df/sf`、`%op-deg2rad-df/sf`、`%op-lerp3`、`%op-recip-int/-df/-sf`、`%op-sinc1`；5 个函数改走 `vt-fast-map` |
+| `src/extensions3.lisp` | 新增 `%e3-logaddexp2`、`%e3-copysign2`；`vt-logaddexp` / `vt-copysign` 改走 `vt-fast-map` |
+| `test/reduce-global-narrow-perf-test.lisp` | **新增** 697 条（A1~A4 值/形态逐位 + B 段 4 条倍率） |
+| `test/elementwise-named-perf-test.lisp` | **新增** 113 条（`old-*` 逐位对拍 + 13 条倍率） |
+| `test/run-tests.sh` | 注册两个新套件 |
+| `CONVENTIONS.md` | §7.4 表格拆出「全归约（窄整型）」一行；新增 §7.4.6.1（全归约也是连成一段）、§7.4.7（逐元素算子必须具名） |
+
+### 七、一句话
+
+> 两组的病根仍然是同一个：**一条判据的作用域没覆盖全**。`(consp axes)` 假设
+> 「全归约总有人接」，而那个「有人」只服务 4 种 dtype；`(function <符号>)`
+> 假设「大家都会写具名算子」，而漏了八个入口。判据写进契约（§7.4.6.1 /
+> §7.4.7）比修好这十处更值钱 —— 它让下一轮不用再靠记忆去找漏。
