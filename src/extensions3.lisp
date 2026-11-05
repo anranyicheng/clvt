@@ -1304,10 +1304,20 @@
 (defun %e3-store-double-vector (result tmp)
   "把 double vector TMP（长度 = RESULT 元素数）按 C 顺序写进 RESULT（可非连续）。
    按目标元素类型 8 路特化：原实现用 (setf (vt-ref result i) ...) 写，
-   每元素一次泛型 aref + 坐标折算，1M 元素约 100ms。"
+   每元素一次泛型 aref + 坐标折算，1M 元素约 100ms。
+
+   v0.4.20 补漏：RESULT **连续**（调用点几乎都是 `vt-zeros` 造的新数组）
+   时改走线性下标直写。原先不论连续与否都走 `VT-DO-EACH`，那个宏每元素要
+   算一次多维坐标、过一遍 `%cast-to`，即便目标是 double→double 也是
+   11 ns/元素（1M 实测 11 ms），而裸循环只要 0.5 ms。"
   (let ((d (vt-data result))
-        (i 0))
-    (declare (type fixnum i))
+        (i 0)
+        (off (vt-offset result)))
+    ;; TMP 恒为 `(make-array N :element-type 'double-float)`（本文件两处调用
+    ;; 点都是），声明后 `(aref tmp j)` 才走定长数组取值；不声明就是通用
+    ;; AREF，每元素一次 widetag 分派，1M 实测多出 3.3 ms。
+    (declare (type fixnum i off)
+             (type (simple-array double-float (*)) tmp))
     (macrolet ((w (lt)
                  `(let ((dd (the (simple-array ,lt (*)) d)))
                     (declare (type (simple-array ,lt (*)) dd)
@@ -1329,22 +1339,60 @@
                     (vt-do-each (ptr val result)
                       (declare (ignore val))
                       (setf (aref dd ptr) (if (zerop (aref tmp i)) 0 1))
-                      (incf i)))))
-      (cond ((and (equal (array-element-type d) '(unsigned-byte 8))
-                  (eq (vt-dtype result) :bool))
-             (w-bool))
-            ((equal (array-element-type d) 'double-float) (w double-float))
-            ((equal (array-element-type d) 'single-float) (w single-float))
-            ((equal (array-element-type d) '(signed-byte 64)) (w (signed-byte 64)))
-            ((equal (array-element-type d) '(signed-byte 32)) (w (signed-byte 32)))
-            ((equal (array-element-type d) '(signed-byte 16)) (w (signed-byte 16)))
-            ((equal (array-element-type d) '(signed-byte 8)) (w (signed-byte 8)))
-            ((equal (array-element-type d) '(unsigned-byte 16)) (w (unsigned-byte 16)))
-            ((equal (array-element-type d) '(unsigned-byte 8)) (w (unsigned-byte 8)))
-            (t (vt-do-each (ptr val result)
-                 (declare (ignore val))
-                 (setf (aref d ptr) (vt-cast (aref tmp i) (vt-dtype result)))
-                 (incf i)))))
+                      (incf i))))
+               (wc (lt val)
+                 ;; 连续目标的线性直写：C 顺序的第 j 个元素就在基数组的
+                 ;; OFF+J 处，无需坐标折算。VAL 里可以引用循环变量 J。
+                 `(let ((dd (the (simple-array ,lt (*)) d)))
+                    (declare (type (simple-array ,lt (*)) dd)
+                             (type fixnum off))
+                    (dotimes (j (vt-size result))
+                      (declare (type fixnum j))
+                      (setf (aref dd (the fixnum (+ off j))) ,val))
+                    t))
+               (wc-bool ()
+                 `(let ((dd (the (simple-array (unsigned-byte 8) (*)) d)))
+                    (declare (type (simple-array (unsigned-byte 8) (*)) dd)
+                             (type fixnum off))
+                    (dotimes (j (vt-size result))
+                      (declare (type fixnum j))
+                      (setf (aref dd (the fixnum (+ off j)))
+                            (if (zerop (aref tmp j)) 0 1)))
+                    t)))
+      (let ((contig-p (vt-contiguous-p result))
+            (et (array-element-type d)))
+        (cond ((and (equal et '(unsigned-byte 8)) (eq (vt-dtype result) :bool))
+                 (if contig-p (wc-bool) (w-bool)))
+                ;; double → double 不需要任何转换，直接搬（`%cast-to`
+                ;; double-float 虽然语义上是恒等，但它带着一次类型判断，
+                ;; 1M 元素实测 4.3 ms vs 裸拷贝 0.5 ms）。
+                ((equal et 'double-float)
+                 (if contig-p (wc double-float (aref tmp j)) (w double-float)))
+                ((equal et 'single-float)
+                 (if contig-p (wc single-float (%cast-to single-float (aref tmp j)))
+                     (w single-float)))
+                ((equal et '(signed-byte 64))
+                 (if contig-p (wc (signed-byte 64) (%cast-to (signed-byte 64) (aref tmp j)))
+                     (w (signed-byte 64))))
+                ((equal et '(signed-byte 32))
+                 (if contig-p (wc (signed-byte 32) (%cast-to (signed-byte 32) (aref tmp j)))
+                     (w (signed-byte 32))))
+                ((equal et '(signed-byte 16))
+                 (if contig-p (wc (signed-byte 16) (%cast-to (signed-byte 16) (aref tmp j)))
+                     (w (signed-byte 16))))
+                ((equal et '(signed-byte 8))
+                 (if contig-p (wc (signed-byte 8) (%cast-to (signed-byte 8) (aref tmp j)))
+                     (w (signed-byte 8))))
+                ((equal et '(unsigned-byte 16))
+                 (if contig-p (wc (unsigned-byte 16) (%cast-to (unsigned-byte 16) (aref tmp j)))
+                     (w (unsigned-byte 16))))
+                ((equal et '(unsigned-byte 8))
+                 (if contig-p (wc (unsigned-byte 8) (%cast-to (unsigned-byte 8) (aref tmp j)))
+                     (w (unsigned-byte 8))))
+                (t (vt-do-each (ptr val result)
+                     (declare (ignore val))
+                     (setf (aref d ptr) (vt-cast (aref tmp i) (vt-dtype result)))
+                     (incf i))))))
     result))
 
 (defun %e3-cumulative-skip-nan (tensor op init-val &key axis dtype out op-name)
@@ -1490,7 +1538,12 @@
   "在**未排序**的 double 缓冲 BUF[0,M) 上取分位 Q，就地重排 BUF。
    取位规则与 %E3-QUANTILE-SORTED 完全一致（:nearest 用 ROUND，
    即 numpy 的 round-half-to-even），只是把「排序后按下标取」
-   换成「quickselect 取第 k 小」。"
+   换成「quickselect 取第 k 小」。
+
+   v0.4.20 补漏：`:linear` 原来把 `(%select-double buf m lo)` 算了**两遍**
+   （`(- hi lo)` 里一次、外面一次），一共三次 select；而选完 Lo 之后再从
+   lo=0/hi=n-1 起选 Hi 必然退化（见 `%select-two-double` 的注释）。改为
+   一次 `%select-two-double` 同时取两个序位：1M 实测 193 ms → 14.9 ms。"
   (declare (type (simple-array double-float (*)) buf)
            (type fixnum m) (type double-float q))
   (let* ((pos (* q (1- m)))
@@ -1502,9 +1555,10 @@
       (:lower (%select-double buf m lo))
       (:higher (%select-double buf m hi))
       (:nearest (%select-double buf m (round pos)))
-      (:midpoint (/ (+ (%select-double buf m lo) (%select-double buf m hi)) 2.0d0))
-      (t (+ (%select-double buf m lo)
-            (* frac (- (%select-double buf m hi) (%select-double buf m lo))))))))
+      (:midpoint (multiple-value-bind (lv hv) (%select-two-double buf m lo hi)
+                   (/ (+ lv hv) 2.0d0)))
+      (t (multiple-value-bind (lv hv) (%select-two-double buf m lo hi)
+           (+ lv (* frac (- hv lv))))))))
 
 (defun %e3-quantile-sorted (sv n q interpolation)
   "在**已升序排序**的 simple-vector / vector SV（长度 N）上取分位 Q ∈ [0,1]，

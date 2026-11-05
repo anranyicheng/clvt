@@ -1974,6 +1974,33 @@
                 ((> k gt) (setf lo (the fixnum (1+ gt))))
                 (t (return pivot))))))))
 
+(defun %select-two-double (buf m k1 k2)
+  "取序位 K1、K2 两个值（K1 ≤ K2），返回 (values V1 V2)。就地重排 BUF。
+
+   为什么不是「两次 `%select-double`」：选完 K1 之后数组已经分区完毕，
+   再对**同一个缓冲区**从 lo=0/hi=n-1 起选 K2，三数取中的中位数样本
+   （v[lo]、v[mid]、v[hi]）恰好退化成「已经就位的 K1 序位值」，于是每趟
+   只削掉一个元素 → 累计访问量必然冲破 4N 护栏 → 整段重排。1M 实测
+   145 ms（单次 select 只要 17 ms），而 numpy 只要 10 ms。
+
+   选完 K1 有一条现成的不变量：{buf[0..k1]} 就是最小的 K1+1 个元素
+   （三区分区保证下标 < K1 的都 ≤ buf[K1]，> K1 的都 ≥ buf[K1]）。所以
+   K2 = K1+1 时答案就是尾部 [K1+1, M) 的最小值 —— 一趟线性扫描，1M 约
+   1 ms。分位位置 `q*(m-1)` 的 lower/upper 恰好只差 1，正好落在这条路上。"
+  (declare (type (simple-array double-float (*)) buf) (type fixnum m k1 k2))
+  (let ((v1 (%select-double buf m k1)))
+    (values v1
+            (cond ((= k2 k1) v1)
+                  ((= k2 (the fixnum (1+ k1)))
+                   (let ((best (aref buf (the fixnum (1+ k1)))))
+                     (declare (type double-float best))
+                     (loop for i fixnum from (+ k1 2) below m
+                           do (let ((x (aref buf i)))
+                                (declare (type double-float x))
+                                (when (< x best) (setf best x))))
+                     best))
+                  (t (%select-double buf m k2))))))
+
 (defun %percent-double-buffer (buf m q interpolation)
   "在未排序缓冲 BUF[0,M) 上按 numpy 位置公式取 Q 分位点（就地重排 BUF）。"
   (declare (type (simple-array double-float (*)) buf) (type fixnum m)
@@ -1984,15 +2011,14 @@
          (frac (- idx lower)))
     (declare (type fixnum lower upper) (type double-float frac))
     (case interpolation
-      (:linear (if (= lower upper)
-                   (%select-double buf m lower)
-                   (+ (* (- 1.0d0 frac) (%select-double buf m lower))
-                      (* frac (%select-double buf m upper)))))
+      (:linear (multiple-value-bind (lv hv) (%select-two-double buf m lower upper)
+                 (if (= lower upper)
+                     lv
+                     (+ (* (- 1.0d0 frac) lv) (* frac hv)))))
       (:lower (%select-double buf m lower))
       (:higher (%select-double buf m upper))
-      (:midpoint (/ (+ (%select-double buf m lower)
-                       (%select-double buf m upper))
-                    2.0d0))
+      (:midpoint (multiple-value-bind (lv hv) (%select-two-double buf m lower upper)
+                   (/ (+ lv hv) 2.0d0)))
       (:nearest (%select-double buf m (if (<= frac 0.5d0) lower upper))))))
 
 (defun %sorted-values (tensor)

@@ -1025,6 +1025,37 @@ fixnum 内，于是生成「可能分配 bignum」的那条路），反而比 SS
 对拍（8 种 x dtype × bins 递增/递减 × side 左右 × 6 种物理形态），另加
 「距 `vt-abs` 的比值」护栏防止回退到泛型路径。
 
+#### 7.4.11 分散写 / 分位选择 / 缓冲写回：三处「通用件留在每元素路径上」
+
+找这类问题不要逐个函数挑毛病，而是把 180 多个调用点（多 dtype、多物理形态、
+沿轴与全局两个方向）在各自有代表性的尺寸上排一遍 ns/元素 表，再看哪一格的
+代价与它承担的算术不相称。下面三组，病根都是「这行代码该在循环外」。
+
+| 用例（1M） | 改前 | 改后 | 倍率 | numpy 2.4.6 |
+|---|---:|---:|---:|---:|
+| `vt-put` 下标张量写 f64 | 238 ms | **2.3** | 103× | 1.18 |
+| `vt-percentile` 25% | 145 | **16.5** | 8.8× | 11.0 |
+| `vt-nanpercentile` 25% | 193 | **14.9** | 13.0× | 11.0 |
+| `vt-nancumsum` | 13.9 | **3.6** | 3.9× | 5.17 |
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 下标张量写：连续目标上「逻辑线性下标 ≡ 物理偏移」 | `%put-flat-contiguous` 把多维分解、`vt-cast`、下标/值的 LIST 三样全提到循环外，循环体只剩越界判定 + 一次 `AREF` 写 | 原路径每元素 `(reverse shape)` / `(reverse strides)` 各分配一个 list，再加一次 ECASE；1M 下标 = 16 MB cons |
+| 单值快路径的判据是「值的个数 = 1」，不是「值看起来是标量」 | `%put-single-value` 只认标量 / `T` / `NIL` / **单元素**张量，别的交回通用路径 | 值的复用规则是 `(mod vi n-values)`，只有 `n-values = 1` 时才等价于「恒取同一个值」 |
+| 越界三套语义（`:clip` / `:wrap` / 负数折叠）照抄，连判定顺序都不换 | `(minusp raw)` 与 `(>= raw (- total))` 的先后是有语义的 | 顺序换一下，`-1` 在 `:clip` 下就会被 wrap 到 `n-1` 而不是裁剪到 0 |
+| 在一个已分区的缓冲区上再查相邻序位，不许重新 quickselect | `%select-two-double`：`K2 = K1+1` 时取尾部最小值 | 选完 `K1` 后 `{buf[0..k1]}` 就是最小的 `K1+1` 个元素，第二次 select 的 pivot 样本必然退化，累计访问冲破 `4N` 护栏 → 整段排序（145 ms vs 17 ms） |
+| 分位类函数传「分位序列」时，每个分位各算一遍是可以的 | 但单次查询内部不许重复选同一序位 | `:linear` / `:midpoint` 的 `lower`/`upper` 只差 1，`%e3-quantile-buffer` 原来还对 `lower` 选了**两遍**（三次 select → 193 ms） |
+| 连续目标的写回不许走 `vt-do-each` | 那个宏每元素算一次多维坐标再 `%cast-to`，8 MB 搬移要 11 ms，裸拷贝 0.5 ms | 结果几乎都是 `vt-zeros` 造的新数组，连续是常态 |
+| 传给内核的临时缓冲必须声明元素类型 | `(simple-array double-float (*))`；`double → double` 连 `%cast-to` 都不走 | 不声明就是通用 AREF（每元素 widetag 分派，1M 多 3.3 ms）；`%cast-to` 虽语义恒等但带一次类型判断（4.3 ms vs 0.5 ms） |
+
+等价性由 `test/scatter-quantile-cum-test.lisp` 守护：`put` 与逐字复刻的旧通用
+路径逐点对拍（9 种目标 dtype × 4 种下标 dtype × 3 种 mode × 连续/转置/翻转/
+带偏移切片 × 5 种值形态，非连续目标还要比底层基数组）；分位与「两次独立
+select」的旧内核逐位对拍（5 种 interpolation × 10 个 q × 5 种输入 dtype ×
+沿轴逐行逐列）；`%e3-quantile-buffer` 另用 20 组随机缓冲直接对拍；累积与按定义
+手写的参考实现逐位对拍。另加比值护栏（`put ≤ 3× take`、
+`percentile(25) ≤ 0.5× sort`、`nancumsum ≤ 6× cumsum`）防止回退。
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有
