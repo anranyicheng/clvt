@@ -1079,6 +1079,66 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
               ((equal et '(unsigned-byte 8)) (writer (unsigned-byte 8)))
               (t nil))))))
 
+(defun %put-flat-multi-1to1 (tensor idxs vals mode)
+  "`VT-PUT` 的「连续目标 + 索引与值一一对应」快路径。已写入返回 T。
+   识别不了目标元素类型时返回 NIL，交回通用路径。
+
+   IDXS 是 `%INDEX->INT64` 产出的 (SIGNED-BYTE 64) 数组（负值尚未折算），
+   VALS 是与 IDXS **等长**的 simple-vector。
+
+   与通用路径逐位一致：同一个 `VT-CAST`、同一套越界判定与 MODE 语义，
+   连判定顺序都照抄（`:clip` 必须先于负数折算，见通用路径的说明）。
+   省掉的是「多维分解」—— 行主序连续目标上逻辑线性下标就等于物理偏移，
+   不需要每个元素再 `(reverse shape)` 一遍做逐维除法。"
+
+  (let* ((total (vt-size tensor))
+         (data (vt-data tensor))
+         (offset (vt-offset tensor))
+         (dt (vt-dtype tensor))
+         (n (length idxs)))
+    (declare (type fixnum total offset n))
+    (when (zerop n) (return-from %put-flat-multi-1to1 t))
+    (macrolet ((writer (lt)
+                 (let ((d (gensym "D")) (ar (gensym "AR")) (va (gensym "VA"))
+                       (i (gensym "I")) (raw (gensym "RAW")) (idx (gensym "IDX")))
+                   `(let ((,d (the (simple-array ,lt (*)) data))
+                          (,ar (the (simple-array (signed-byte 64) (*)) idxs))
+                          (,va (the simple-vector vals)))
+                      (declare (type (simple-array ,lt (*)) ,d)
+                               (type (simple-array (signed-byte 64) (*)) ,ar)
+                               (type simple-vector ,va)
+                               (type fixnum total offset n))
+                      ;; 浮点陷阱屏蔽提到循环外：逐元素调 VT-CAST 时那层
+                      ;; WITH-FLOAT-TRAPS-MASKED 要读写 FPU 控制字，实测
+                      ;; 216 ns/次，会让整条写回退化成「控制字搬运」。
+                      (with-float-safe
+                        (dotimes (,i n)
+                          (declare (type fixnum ,i))
+                          (let* ((,raw (aref ,ar ,i))
+                                 (,idx (cond ((and (>= ,raw 0) (< ,raw total)) ,raw)
+                                             ((eq mode :clip)
+                                              (max 0 (min ,raw (1- total))))
+                                             ((eq mode :wrap) (mod ,raw total))
+                                             ((and (minusp ,raw)
+                                                   (>= ,raw (- total)))
+                                              (+ ,raw total))
+                                             (t (error "索引 ~d 超出范围 [0, ~d)"
+                                                       ,raw total)))))
+                            (declare (type fixnum ,idx))
+                            (setf (aref ,d (the fixnum (+ offset ,idx)))
+                                  (%vt-cast-raw (aref ,va ,i) dt))))
+                        t)))))
+      (let ((et (array-element-type data)))
+        (cond ((equal et 'double-float) (writer double-float))
+              ((equal et 'single-float) (writer single-float))
+              ((equal et '(signed-byte 64)) (writer (signed-byte 64)))
+              ((equal et '(signed-byte 32)) (writer (signed-byte 32)))
+              ((equal et '(signed-byte 16)) (writer (signed-byte 16)))
+              ((equal et '(signed-byte 8)) (writer (signed-byte 8)))
+              ((equal et '(unsigned-byte 16)) (writer (unsigned-byte 16)))
+              ((equal et '(unsigned-byte 8)) (writer (unsigned-byte 8)))
+              (t nil))))))
+
 (defun vt-put (tensor indices values &key (mode :raise))
   "按展平索引就地写入 values。
 
@@ -1098,25 +1158,34 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
     ((not (numberp indices))
      (%check-integer-index "vt-put" (ensure-vt indices))))
   (let* ((total (vt-size tensor))
-         (val-list (cond
+         (val-vec (cond
                      ;; T / NIL 是**单个**布尔值，必须先于 LISTP 判断：
                      ;; NIL 既是布尔假又是空表，落到下面两支会得到空
-                     ;; VAL-LIST（N-VALUES=0 → VT-PUT 直接返回，静默空操作）。
+                     ;; VAL-VEC（N-VALUES=0 → VT-PUT 直接返回，静默空操作）。
                      ((or (eq values t) (null values))
-                      (list (if values 1 0)))
-                     ((numberp values) (list values))
+                      (vector (if values 1 0)))
+                     ((numberp values) (vector values))
                      ((or (listp values) (arrayp values))
                       ;; 目标为 :bool 时按布尔叶子展平：默认规则把 NIL 当空
                       ;; 子序列，`(list t nil t)` 会被压成 `(T T)`，值列表
                       ;; 短一截后由 (mod vi n-values) 循环复用 → 静默错值。
-                      (vt-flatten-sequence values
-                                           :bool (eq (vt-dtype tensor) :bool)))
+                      (coerce (vt-flatten-sequence
+                               values :bool (eq (vt-dtype tensor) :bool))
+                              'simple-vector))
                      ((vt-p values)
-                      (let ((flat (vt-flatten (ensure-vt values))))
-                        (loop for i below (vt-size flat)
-                              collect (aref (vt-data flat) i))))))
-         (n-values (length val-list)) (shape (vt-shape tensor))
+                      ;; 收进 vector 而不是 list：通用路径按 (mod vi n-values)
+                      ;; 逐个取值，LIST 上是 O(n) 的 NTH —— 整条循环因此退化成
+                      ;; O(n²)（1M 索引约 9 分钟）。vector 上是 O(1)。
+                      (let* ((flat (vt-flatten (ensure-vt values)))
+                             (m (vt-size flat))
+                             (src (vt-data flat))
+                             (v (make-array m)))
+                        (declare (type fixnum m))
+                        (dotimes (i m v)
+                          (setf (aref v i) (aref src i)))))))
+         (n-values (length val-vec)) (shape (vt-shape tensor))
          (strides (vt-strides tensor)) (offset (vt-offset tensor)) (data (vt-data tensor)))
+    (declare (type simple-vector val-vec))
     ;; H4 写入契约（v0.4.x 修复）：dim>1 且 stride=0 的广播维度禁止就地写入，
     ;; 否则一个逻辑位置会经零步长污染整片共享底层数据。
     ;; 改用 vt-out-writable-p 而非「任一 stride=0」：vt-slice 的 (:newa)
@@ -1130,32 +1199,42 @@ numpy 对空 *list* 同样放行（np.take(a, []) → 空结果、a.put([], [])
       (multiple-value-bind (v single-p) (%put-single-value values)
         (when single-p
           ;; 值的循环复用规则是 (mod vi n-values)，n-values = 1 时恒取同一个
-          ;; 值 —— 与 VAL-LIST 首元素等价，但不必为此摊开整条序列。
+          ;; 值 —— 与 VAL-VEC 首元素等价，但不必为此摊开整条序列。
           (when (%put-flat-contiguous tensor indices v mode)
             (return-from vt-put tensor)))))
-    (let ((idx-list (if (numberp indices) (list (round indices))
-                        (let ((flat (vt-flatten (ensure-vt indices))))
-                          (loop for i below (vt-size flat)
-                                collect (truncate (aref (vt-data flat) i)))))))
-      (loop for raw in idx-list
-            for vi from 0
-            for val = (nth (mod vi n-values) val-list)
-            do (let ((idx raw))
-                 ;; v0.4.x 修复：负数折算（-1 → n-1）仅适用于 :raise 语义；
-                 ;; 原实现对所有模式先折算，导致 :clip 的 -1 被 wrap 到
-                 ;; n-1 而非裁剪到 0（numpy.put(clip): 负索引裁剪到 0）。
-                 ;; :wrap 的 (mod idx total) 对负数与折算结果一致。
-                 (cond ((and (>= idx 0) (< idx total)) nil)
-                       ((eq mode :clip) (setq idx (max 0 (min idx (1- total)))))
-                       ((eq mode :wrap) (setq idx (mod idx total)))
-                       ((and (minusp idx) (>= idx (- total))) (incf idx total))
-                       (t (error "索引 ~d 超出范围 [0, ~d)" raw total)))
-                 (let ((rem idx) (phys offset))
-                   (loop for dim in (reverse shape)
-                         for stride in (reverse strides)
-                         do (multiple-value-bind (q r) (floor rem dim)
-                              (incf phys (* r stride)) (setf rem q)))
-                   (setf (aref data phys) (vt-cast val (vt-dtype tensor))))))
+    (let* ((idxs (if (numberp indices)
+                     (let ((a (make-array 1 :element-type '(signed-byte 64))))
+                       (setf (aref a 0) (round indices))
+                       a)
+                     (%index->int64 (ensure-vt indices))))
+           (n-idx (length idxs)))
+      (declare (type (simple-array (signed-byte 64) (*)) idxs)
+               (type fixnum n-idx))
+      ;; ---- 快路径：连续目标 + 一一对应 ----
+      ;; 逻辑线性下标 ≡ 物理偏移，多维分解整段省掉。不满足一一对应时仍走
+      ;; 通用路径 —— 那里的 (mod vi n-values) 复用才是正确语义。
+      (when (and (= n-idx n-values) (vt-contiguous-p tensor))
+        (when (%put-flat-multi-1to1 tensor idxs val-vec mode)
+          (return-from vt-put tensor)))
+      (dotimes (vi n-idx)
+        (let* ((raw (aref idxs vi))
+               (val (svref val-vec (mod vi n-values)))
+               (idx raw))
+          ;; v0.4.x 修复：负数折算（-1 → n-1）仅适用于 :raise 语义；
+          ;; 原实现对所有模式先折算，导致 :clip 的 -1 被 wrap 到
+          ;; n-1 而非裁剪到 0（numpy.put(clip): 负索引裁剪到 0）。
+          ;; :wrap 的 (mod idx total) 对负数与折算结果一致。
+          (cond ((and (>= idx 0) (< idx total)) nil)
+                ((eq mode :clip) (setq idx (max 0 (min idx (1- total)))))
+                ((eq mode :wrap) (setq idx (mod idx total)))
+                ((and (minusp idx) (>= idx (- total))) (incf idx total))
+                (t (error "索引 ~d 超出范围 [0, ~d)" raw total)))
+          (let ((rem idx) (phys offset))
+            (loop for dim in (reverse shape)
+                  for stride in (reverse strides)
+                  do (multiple-value-bind (q r) (floor rem dim)
+                       (incf phys (* r stride)) (setf rem q)))
+            (setf (aref data phys) (vt-cast val (vt-dtype tensor))))))
       tensor)))
 
 (defun vt-choose (choices indices &key (mode :raise))

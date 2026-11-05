@@ -487,8 +487,20 @@
         ((numberp v) (with-float-safe (not (zerop v))))
         (t t)))
 
-(defun vt-cast (val dtype)
-  "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。
+(defun %vt-cast-raw (val dtype)
+  "`VT-CAST` 的裸内核：**不**建立浮点陷阱屏蔽。
+
+   拆出来只为批量循环：`WITH-FLOAT-SAFE` 展开成
+   `SB-INT:WITH-FLOAT-TRAPS-MASKED`，每次进出要读写一遍 FPU 控制字，
+   本机实测 216 ns/次 —— 单值转换（`SETF VT-REF`、标量运算）无所谓，
+   但「每元素一次」的批量写回会让整条循环的时间全耗在控制字上
+   （1M 索引的 `VT-PUT` 实测 226 ms，其中约 210 ms 是它）。
+   批量调用方应当自己在外层包一次 `WITH-FLOAT-SAFE`，循环里调本函数。
+
+   语义与 `VT-CAST` **逐字相同**（同一段 body），包括 :bool 的真值化、
+   Lisp 布尔 → 1/0、复数取实部、整数回绕。
+
+   安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。
    NaN/Inf 转整数返回 0（确定性哨兵）。
    复数语义（CONVENTIONS §16.5）：
      - 目标为复数：实部/虚部分别 coerce 到分量浮点类型（实数入参虚部补 0）；
@@ -504,11 +516,10 @@
    `(vt-cast #C(0 1) :bool)` = 0，而 `(vt-astype … #C(0 1) … :bool)` = 1，
    同一个值在两条入口上给出相反答案。"
 
-  (with-float-safe
     ;; 先判 :bool —— 见 docstring 末段。%bool-flag 自己处理复数（任一分量非零），
     ;; 若先剥虚部再判，虚部就永久丢失了。
     (when (eq dtype :bool)
-      (return-from vt-cast (%bool-flag val)))
+      (return-from %vt-cast-raw (%bool-flag val)))
     ;; Lisp 布尔 → 1/0。九个数值 dtype 都要认，不只是 :bool 目标。
     ;; 此前 `(vt-cast t :float64)` 直接
     ;; TYPE-ERROR: The value T is not of type REAL，而同一件事的数组入口
@@ -531,7 +542,29 @@
       (:int16   (%wrap-int16 val))
       (:int8    (%wrap-int8 val))
       (:uint8   (%wrap-uint8 val))
-      (:uint16  (%wrap-uint16 val)))))
+      (:uint16  (%wrap-uint16 val))))
+
+(defun vt-cast (val dtype)
+  "安全类型转换。浮点转整数时执行截断，超出目标整数范围时按 NumPy 语义回绕（mod）。
+   NaN/Inf 转整数返回 0（确定性哨兵）。
+   复数语义（CONVENTIONS §16.5）：
+     - 目标为复数：实部/虚部分别 coerce 到分量浮点类型（实数入参虚部补 0）；
+     - 目标为实数/整数且入参为复数：取**实部**后按原规则转换
+       （对标 numpy astype 的 ComplexWarning 语义：静默丢弃虚部，
+        本库不产生 warning，行为在文档中显式声明）。
+   布尔语义（§17.1）：目标为 :bool 时按**真值**收敛（非零→1、零→0、
+   NaN→1），而不是像整数那样截断 —— `(vt-astype #(0.5) :bool)` 必须是
+   True，`(truncate 0.5)` 会给 0。
+   **复数 → :bool 不走「取实部」那条**：真值优先按整体判定（任一分量非零），
+   与 `%BOOL-FLAG` 的契约、`VT-ASTYPE` 的数组路径、`(setf VT-REF)` 一致。
+   §17.10.12：把 `:bool` 分支放在剥虚部之前是刻意的 —— 放在之后就得到
+   `(vt-cast #C(0 1) :bool)` = 0，而 `(vt-astype … #C(0 1) … :bool)` = 1，
+   同一个值在两条入口上给出相反答案。
+
+   实现上只是给 `%VT-CAST-RAW` 套一层浮点陷阱屏蔽；**批量循环应当直接用
+   裸内核 + 外层一次性屏蔽**（见 `%VT-CAST-RAW` 的说明：那层屏蔽每次
+   216 ns，逐元素调会把整条写回循环拖慢两个数量级）。"
+  (with-float-safe (%vt-cast-raw val dtype)))
 
 (defun vt-cast-fun (dtype)
   "返回将数值转换为 dtype 的转换函数(与 vt-cast 语义一致：回绕 + NaN 安全)。"

@@ -1754,12 +1754,16 @@
 ;;; ------------------------------------------------------------------
 (macrolet ((def-sorters (sorter msort lt floatp)
              `(progn
-                (defun ,msort (v base aux n)
-                  "对 V 的 [BASE, BASE+N) 段做自底向上稳定归并排序，AUX 为等长 scratch。"
-                  (declare (type (simple-array ,lt (*)) v aux)
+                (defun ,msort (a b base n)
+                  "对 A 的 [BASE, BASE+N) 段做自底向上稳定归并，结果落回 A。
+                   B 是等长 scratch（只用到 [0,N)）。A/B 交替承担源与目标，
+                   故每轮只有「一读一写」，而旧实现是「写 AUX + 整段 REPLACE
+                   回 V」—— 同样一趟归并要碰两遍内存。"
+                  (declare (type (simple-array ,lt (*)) a b)
                            (type fixnum base n))
-                  (let ((w 1))
-                    (declare (type fixnum w))
+                  (let ((w 1) (src a) (dst b) (off-s base) (off-d 0) (flip nil))
+                    (declare (type fixnum w off-s off-d)
+                             (type (simple-array ,lt (*)) src dst))
                     (loop while (< w n) do
                       (let ((lo 0))
                         (declare (type fixnum lo))
@@ -1769,18 +1773,28 @@
                                  (i lo) (j mid) (k lo))
                             (declare (type fixnum mid hi i j k))
                             (loop while (and (< i mid) (< j hi)) do
-                              (if (< (aref v (+ base j)) (aref v (+ base i)))
-                                  (progn (setf (aref aux k) (aref v (+ base j))) (incf j))
-                                  (progn (setf (aref aux k) (aref v (+ base i))) (incf i)))
+                              (if (< (aref src (+ off-s j)) (aref src (+ off-s i)))
+                                  (progn (setf (aref dst (+ off-d k))
+                                               (aref src (+ off-s j)))
+                                         (incf j))
+                                  (progn (setf (aref dst (+ off-d k))
+                                               (aref src (+ off-s i)))
+                                         (incf i)))
                               (incf k))
                             (loop while (< i mid) do
-                              (setf (aref aux k) (aref v (+ base i))) (incf i) (incf k))
+                              (setf (aref dst (+ off-d k)) (aref src (+ off-s i)))
+                              (incf i) (incf k))
                             (loop while (< j hi) do
-                              (setf (aref aux k) (aref v (+ base j))) (incf j) (incf k))
-                            (replace v aux :start1 (+ base lo) :end1 (+ base hi)
-                                       :start2 lo :end2 hi))
+                              (setf (aref dst (+ off-d k)) (aref src (+ off-s j)))
+                              (incf j) (incf k)))
                           (incf lo (* 2 w))))
-                      (setf w (* 2 w)))))
+                      (rotatef src dst) (rotatef off-s off-d)
+                      (setf flip (not flip))
+                      (setf w (* 2 w)))
+                    ;; 轮数为奇数时最后一趟写在 scratch 上，要搬回 A。
+                    (when flip
+                      (replace a src :start1 base :end1 (+ base n)
+                                     :start2 0 :end2 n))))
                 (defun ,sorter (data n count)
                   "把 DATA 中 COUNT 段、每段长度 N 的连续 fiber 各自原地升序排序。"
                   (declare (type (simple-array ,lt (*)) data)
@@ -1821,10 +1835,7 @@
                                       (decf j))
                                     (setf (aref data (+ base (1+ j))) x)))
                                 ;; ---- 归并排序（大 fiber）----
-                                (progn (,msort data base aux k)
-                                       (replace data aux
-                                                :start1 base :end1 (+ base k)
-                                                :start2 0 :end2 k))))
+                                (,msort data aux base k)))
                           ,@(when floatp
                               `((dotimes (i m)
                                   (setf (aref data (+ base k i)) (aref nanv i)))))))))))))
