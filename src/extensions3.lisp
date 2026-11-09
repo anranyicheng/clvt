@@ -2132,7 +2132,5 @@
   ;; 1M×1k 实测 87 秒）。
   (when (%cx-any-p element test-elements)
     (return-from vt-isin (%cx-op-isin element test-elements :invert invert :assume-unique assume-unique)))
-  (let* ((elem (ensure-vt element))
-         (test (ensure-vt test-elements))
-         (fm (%membership-float-mode-p elem test)))
+  (multiple-value-bind (elem test fm) (%membership-prepare element test-elements)
     (%membership-map elem (%membership-table (vt-unique test) fm) fm invert)))
