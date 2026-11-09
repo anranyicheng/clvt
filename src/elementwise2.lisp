@@ -321,12 +321,27 @@
       (vt-map (lambda (x) (ash x (- shift))) vt :dtype dtype :out out)))
 
 (declaim (inline %op-clip))
+(declaim (inline %op-clip-lo %op-clip-hi))
 (defun %op-clip (x minv maxv)
   "三元 clip：先下限后上限，即 (min maxv (max minv x))。
    v0.4.0 修复：原实现先上限后下限，当 minv > maxv 时结果为 minv，
-   而 numpy.clip(min>max) 的结果是 maxv（clamp 顺序以 max 收尾）。"
+   而 numpy.clip(min>max) 的结果是 maxv（clamp 顺序以 max 收尾）。
+
+   INLINE 是必需的：`%VT-INLINE3-FAST` 把算子体抄进元素循环，没有 inline
+   声明时 SBCL 保留成一次函数调用（每元素 14 ns），1M 元素就是 14 ms ——
+   与 `vt-lerp`（同样三元、有 inline 声明）的 2.3 ms 差 6 倍。"
   (let ((x (if (< x minv) minv x)))
     (if (> x maxv) maxv x)))
+
+(defun %op-clip-lo (x hi)
+  "仅上限分支：min(x, hi)。与改前 `(lambda (x) (min x max-val))` 逐字相同
+   （含 NaN 与符号零：CL 的 MIN 对 NaN 的取法由实现决定，改写成语义相近的
+   IF 表达式会在 `-0.0/0.0` 上换一个符号）。"
+  (min x hi))
+
+(defun %op-clip-hi (x lo)
+  "仅下限分支：max(x, lo)。与改前 `(lambda (x) (max x min-val))` 逐字相同。"
+  (max x lo))
 
 (defun vt-clip (vt &optional (min-val nil min-p) (max-val nil max-p)
                    &key out dtype)
@@ -382,12 +397,12 @@ missing a_max；若只要下限请显式传 MAX-VAL 为 nil）"))
                   (vt-zeros (vt-shape vt) :dtype (or dtype (vt-dtype vt))))))
        (vt-copy-into r vt)
        r))
-    ;; 仅上限：min(x, max)
+    ;; 仅上限：min(x, max) —— 具名内联算子（§7.4.7），三支都走 vt-fast-map
     ((null min-val)
-     (vt-map (lambda (x) (min x max-val)) vt :dtype dtype :out out))
+     (vt-fast-map #'%op-clip-lo vt max-val :dtype dtype :out out))
     ;; 仅下限：max(x, min)
     ((null max-val)
-     (vt-map (lambda (x) (max x min-val)) vt :dtype dtype :out out))
+     (vt-fast-map #'%op-clip-hi vt min-val :dtype dtype :out out))
     ;; 双侧：min(max, max(min, x))，与 %op-clip 同义
     (t (vt-fast-map #'%op-clip vt min-val max-val :dtype dtype :out out))))
 

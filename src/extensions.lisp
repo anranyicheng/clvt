@@ -15,16 +15,25 @@
   (vt-sum (vt-= tensor value)
 	  :axis axis :keepdims keepdims :dtype dtype))
 
+(declaim (inline %op-clip3))
+(defun %op-clip3 (x lo hi)
+  "三元裁剪内核：`(if (> x hi) hi (if (< x lo) lo x))`，
+   与改前 lambda 的运算符次序逐字相同（NaN 原样穿过：两次比较都为假）。"
+  (if (> x hi)
+      hi
+      (if (< x lo) lo x)))
+
 (defun vt-clip-tensor (tensor vmin vmax &key out dtype)
-  "将元素限制在 [vmin, vmax] 内，vmin/vmax 可为标量或张量。"
-  (vt-map (lambda (x lo hi)
-	    (if (> x hi)
-		hi
-		(if (< x lo) lo x)))
-          (ensure-vt tensor)
-	  (ensure-vt vmin)
-	  (ensure-vt vmax)
-	  :dtype dtype :out out))
+  "将元素限制在 [vmin, vmax] 内，vmin/vmax 可为标量或张量。
+
+   执行层（§7.4.14）：原先写成匿名 lambda 交给 `vt-map`，逐元素一次 funcall
+   + 泛型 aref，1M 元素 41 ms（numpy.clip 0.7 ms）。改具名 inline 算子后走
+   `vt-fast-map` 的三元内联循环；标量边界由 `%WEAK-CAST1` 对齐到结果 dtype。"
+  (vt-fast-map #'%op-clip3
+               (ensure-vt tensor)
+               (ensure-vt vmin)
+               (ensure-vt vmax)
+               :dtype dtype :out out))
 
 ;;; ------------------------------------------------------------------
 ;;; pytorch 风格别名

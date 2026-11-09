@@ -326,6 +326,53 @@
       (mapcar (lambda (x) (%weak-cast1 x final-dtype inputs)) inputs)
       inputs))
 
+(declaim (inline %exact-elcast-p))
+(defun %exact-elcast-p (value from-lt to-lt)
+  "VALUE 从 FROM-LT 转到 TO-LT 是否**不改变值**。
+
+   只走「范围更宽」一个方向：整数族内部、bool 的 0/1 → 任何数值类型都由
+   `subtypep` 判；**single-float → double-float 必须显式列**（CL 的两种浮点
+   互不包含，见下）；整数 → 浮点按尾数位数单独判（|v| ≤ 2^53 / 2^24）。
+   反向（double → single）会把 0.1d0 舍成 0.1f0，把比较域从 double 挪到
+   single —— 那是语义变更，不是对齐，这里一律不做。"
+  (cond ((equal from-lt to-lt) t)
+        ;; CL 里 SINGLE-FLOAT 与 DOUBLE-FLOAT 是**互不包含**的类型，
+        ;; `subtypep` 对它们给 NIL —— 但 f32 → f64 恰恰永远精确，是这里
+        ;; 最要紧的一条（f32 字面量 + f64 数组是全库最常见的写法）。
+        ((and (equal from-lt 'single-float) (equal to-lt 'double-float)) t)
+        ((and (equal from-lt '(complex single-float))
+              (equal to-lt '(complex double-float))) t)
+        ((subtypep from-lt to-lt)
+         (if (integerp value) (typep value to-lt) t))
+        ((and (equal to-lt 'double-float) (integerp value)
+              (<= (abs value) (expt 2 53))) t)
+        ((and (equal to-lt 'single-float) (integerp value)
+              (<= (abs value) (expt 2 24))) t)
+        (t nil)))
+
+(defun %mask-align (a b)
+  "把比较/判定内核的两个输入对齐到同一个物理元素类型（能无损对齐时）。
+
+   为什么 `%WEAK-CAST1` 管不到这里：比较算子的结果 dtype 是 `:bool`，
+   而 `%WEAK-CAST1` 的判据是「种类秩 源 ≤ 目标」；`:bool` 的秩是 -1，
+   于是 f32 标量对 f64 数组永远对不齐。掩码内核按 `(in-lt, in-lt)` 成对派发，
+   类型不齐就直接掉进 `vt-map` 的 funcall 兜底。实测 1M：
+     `(vt-< f64数组 0.5)`   69 ms      ← 0.5 是单精度字面量
+     `(vt-< f64数组 0.5d0)`  4.8 ms
+   同一条式子只差一个字面量后缀，差 14 倍。
+
+   只转 SIZE=1 的一方（广播标量转一次不改变任何结果），大数组绝不预转；
+   两侧都是大数组而 dtype 不同时原样返回 —— 那需要整段提升，不在这一层。"
+  (let ((ea (array-element-type (vt-data a)))
+        (eb (array-element-type (vt-data b))))
+    (cond
+      ((equal ea eb) (values a b))
+      ((and (= (vt-size a) 1) (%exact-elcast-p (vt-item a) ea eb))
+       (values (vt-astype a (vt-dtype b)) b))
+      ((and (= (vt-size b) 1) (%exact-elcast-p (vt-item b) eb ea))
+       (values a (vt-astype b (vt-dtype a))))
+      (t (values a b)))))
+
 (defun %bool-wrap (fn n)
   "把用户函数包一层 `%bool-flag`，让 `:bool` 结果的每个元素在**写回之前**
    就收敛成 0/1（§17.10）。
@@ -1188,42 +1235,51 @@
          (t (vt-map (function ,op) ,a :out ,res :dtype (vt-dtype ,res)))))))
 
 (defmacro %vt-mask2-fast (op a b res &key bool)
-  "二元「窄整型输出」连续快路径（4 种实数输入 + 2 种复数输入）。"
-  (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
-    `(let* ((,rd (vt-data ,res))
-            (,ea (array-element-type (vt-data ,a)))
-            (,eb (array-element-type (vt-data ,b))))
-       (cond
-         ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in (append (unless (%cx-only-op-p op)
-                                                  +vt-mask-in-types+)
-                                                (when (%cx-inline-op-p op 2)
-                                                  +cx-elem-types+))
-                             collect
-                             `((and (equal (array-element-type ,rd) ',olt)
-                                    (equal ,ea ',ilt)
-                                    (equal ,eb ',ilt))
-                               (%mask2-loop ,olt ,ilt ,op ,a ,b ,res :bool ,bool))))
-         (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
+  "二元「窄整型输出」连续快路径（4 种实数输入 + 2 种复数输入）。
+
+   MA / MB 是 `%MASK-ALIGN` 之后的输入：比较算子的结果 dtype 是 `:bool`，
+   `%WEAK-CAST1` 按种类秩判定，浮点标量与浮点数组永远对不齐，
+   于是「两个输入同一元素类型」这条派发前提不成立 —— 必须在这里先对齐。"
+  (let ((ra (gensym "MA")) (rb (gensym "MB"))
+        (rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
+    `(multiple-value-bind (,ra ,rb) (%mask-align ,a ,b)
+       (let* ((,rd (vt-data ,res))
+              (,ea (array-element-type (vt-data ,ra)))
+              (,eb (array-element-type (vt-data ,rb))))
+         (cond
+           ,@(loop for olt in +vt-mask-out-types+
+                   nconc (loop for ilt in (append (unless (%cx-only-op-p op)
+                                                    +vt-mask-in-types+)
+                                                  (when (%cx-inline-op-p op 2)
+                                                    +cx-elem-types+))
+                               collect
+                               `((and (equal (array-element-type ,rd) ',olt)
+                                      (equal ,ea ',ilt)
+                                      (equal ,eb ',ilt))
+                                 (%mask2-loop ,olt ,ilt ,op ,ra ,rb ,res :bool ,bool))))
+           (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res))))))))
 
 (defmacro %vt-mask2-strided-fast (op a b res &key bool)
-  "二元「窄整型输出」+ 非连续/广播快路径（4 种实数输入 + 2 种复数输入）。"
-  (let ((rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
-    `(let* ((,rd (vt-data ,res))
-            (,ea (array-element-type (vt-data ,a)))
-            (,eb (array-element-type (vt-data ,b))))
-       (cond
-         ,@(loop for olt in +vt-mask-out-types+
-                 nconc (loop for ilt in (append (unless (%cx-only-op-p op)
-                                                  +vt-mask-in-types+)
-                                                (when (%cx-inline-op-p op 2)
-                                                  +cx-elem-types+))
-                             collect
-                             `((and (equal (array-element-type ,rd) ',olt)
-                                    (equal ,ea ',ilt)
-                                    (equal ,eb ',ilt))
-                               (%mask2-strided ,olt ,ilt ,op ,a ,b ,res :bool ,bool))))
-         (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res)))))))
+  "二元「窄整型输出」+ 非连续/广播快路径（4 种实数输入 + 2 种复数输入）。
+   输入对齐同 `%VT-MASK2-FAST`。"
+  (let ((ra (gensym "MA")) (rb (gensym "MB"))
+        (rd (gensym "RD")) (ea (gensym "EA")) (eb (gensym "EB")))
+    `(multiple-value-bind (,ra ,rb) (%mask-align ,a ,b)
+       (let* ((,rd (vt-data ,res))
+              (,ea (array-element-type (vt-data ,ra)))
+              (,eb (array-element-type (vt-data ,rb))))
+         (cond
+           ,@(loop for olt in +vt-mask-out-types+
+                   nconc (loop for ilt in (append (unless (%cx-only-op-p op)
+                                                    +vt-mask-in-types+)
+                                                  (when (%cx-inline-op-p op 2)
+                                                    +cx-elem-types+))
+                               collect
+                               `((and (equal (array-element-type ,rd) ',olt)
+                                      (equal ,ea ',ilt)
+                                      (equal ,eb ',ilt))
+                                 (%mask2-strided ,olt ,ilt ,op ,ra ,rb ,res :bool ,bool))))
+           (t (vt-map (function ,op) ,a ,b :out ,res :dtype (vt-dtype ,res))))))))
 
 (defmacro vt-fast-map (fn &rest args)
   "编译期内联已知算子的逐元素映射（一元/二元/三元）。
