@@ -1086,6 +1086,45 @@ select」的旧内核逐位对拍（5 种 interpolation × 10 个 q × 5 种输�
 `put(1M) ÷ put(200k) ≤ 12`（元素 5×，平方实现给 25×）、
 `sort(1M) ÷ sort(200k) ≤ 9`（N log N 给约 6×）。
 
+#### 7.4.13 数据入口 / 相等判定 / 沿轴应用 / 外积：同一个「通用件在每元素路径上」
+
+这四个函数彼此无关，病根是同一个：**转换、取数、写回都按元素各收一次钱**，
+而这些钱的单价由「通用件」决定，不由数据决定。
+
+| 用例（1M，除注明） | 改前 | 改后 | 倍率 | numpy 2.4.6 |
+|---|---:|---:|---:|---:|
+| `vt-from-array` f64（源元素类型相同） | 266 ms | **7.0** | 38× | —（同 dtype 是零拷贝视图，不可比） |
+| `vt-array-equal` f64 | 83 | **2.0** | 41× | 0.42 |
+| `vt-apply-along-axis` + `vt-sort`（1000×1000） | 700 | **113** | 6.2× | 19.7 |
+| `vt-apply-along-axis` + `vt-copy`（1000×1000） | 644 | **13** | 50× | — |
+| `vt-apply-along-axis` + `vt-sum`（1000×1000） | 296 | **8** | 37× | — |
+| `vt-outer`（1000×1000） | 14.3 | **1.6** | 9× | 1.28 |
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 入口搬运先按「转换是否恒等」分流 | 源元素类型 == 目标（且目标不是 `:bool`）时整段搬；否则逐元素 `%VT-CAST-RAW`，浮点陷阱屏蔽在循环外只做一次 | `VT-CAST` 每次进出读写 FPU 控制字（216 ns/次），1M 元素的入口因此要 250 ms；`:bool` 是例外，因为目标要做**真值化**（2 → 1），字节拷贝会破坏 §17.1 的 0/1 不变量 |
+| 整段搬用 `REPLACE`，但只对秩 1 | 秩 ≠ 1 时按行主序逐元素搬 | 0 维数组不是 SEQUENCE（`REPLACE` 抛 TYPE-ERROR），多维数组也不是 —— 这条踩过 |
+| 相等判定先定**比较域**，再比 | 同 dtype 直接在原 dtype 上比；不同 dtype 用 `VT-PROMOTE-TYPE` 提升后比 | 无条件 `VT-ASTYPE … :float64` 会丢虚部（`#C(1 2)` 与 `#C(1 3)` 判等），并把 int64 的 2^54+1 与 2^54+2 抹成同一个数 —— 两条都是静默错值 |
+| 判等用 `=`，不用 `EQL` | `0.0` 与 `-0.0` 数值相等（numpy 也判等） | SBCL 对浮点的 `EQL` 是**位比较**（`(eql 0d0 -0d0)` = NIL）；反过来 `EQL` 让 `nan` 与同载荷自身相等（`(eql nan nan)` = T），也只有 `=` 才给出 numpy 的 NaN ≠ NaN |
+| 沿轴应用：fiber 的取/写各一份类型特化内核 | `%AAX-GATHER` / `%AAX-SCATTER` 按存储元素类型展开；写回同 dtype 且连续时直写 | 旧路径每个 fiber 三笔按元素收钱的动作：泛型 `AREF` 取数、`VT-FROM-ARRAY` 内逐元素 `VT-CAST`、写回再逐元素 `VT-CAST`（1M = 250 + 250 ms） |
+| fiber 缓冲仍**每 fiber 一份** | 不跨 fiber 复用同一块 `arr` | `func` 若把入参原样返回（`identity`），复用会让所有行别名到同一块内存，结果随最后一行漂移 |
+| 无收缩的 EINSUM 用广播逐元素代替 | `vt-outer` 缺省路径 = `(n 1) × (1 m)` 的广播乘 | 外积每个输出元素只做一次乘法、**没有求和**，不涉及归约顺序；1M 元素 14.3 → 1.6 ms |
+| 显式 `:dtype` 不走广播路径 | `vt-outer` 在 `dtype` 非空时仍调 `VT-EINSUM` | einsum 的 `:dtype` 是**计算 dtype**（先 cast 输入再算），`VT-*` 的是 §6.1 的「先算再 cast」。两者在整数溢出（int32 max² 给 4.6e18 vs 1）与复数 → 实数（乘积实部 vs 实部之积）两处不同 |
+| 乘积的符号零按 IEEE 传播 | `0.0 × -0.0 = -0.0`（numpy 同样给 `-0.0`） | einsum 的内核是「累加器 + 乘积」，`0 + (-0.0)` 会把符号加掉。这条差异是**新路径更贴 numpy**，不是回归 |
+
+等价性由 `test/entry-equal-apply-test.lisp` 守护：`vt-from-array` 与逐字复刻的
+旧实现按**位模式**对拍（11 种源元素类型 × 11 种目标 dtype × `fast` 两档，值域含
+NaN / ±Inf / ±0.0 / 2^53+1 / 复数虚部）；`vt-array-equal` 与旧实现对拍（10 组
+dtype 组合 × 相同值 / 不同值 / 转置视图），旧实现错的两处另钉死 numpy 的答案；
+`vt-apply-along-axis` 与旧实现对拍（6 dtype × 5 形状/轴 × 标量返回/1D 返回，
+加转置/列视图/翻转/0 长度轴/返回非连续视图）；`vt-outer` 与 einsum 对拍
+（7 dtype × 1D/2D/0 维/0 长度）。四条倍率护栏：`array-equal ≤ 2× isclose`、
+`from-array ≤ 0.25× 旧实现`、`outer ≤ 0.5× einsum`、`apply ≤ 3× 手写地板`
+（地板 = 同样的列访问 + 同样的 1000 次 fiber 构造与拷贝）。
+护栏计时按「一批迭代的平均」而不是单次调用：`GET-INTERNAL-REAL-TIME` 在这台
+机器上的刻度是 1 ms，给 1.5 ms 的操作单次计时只能读出 1 或 2（±30%），再叠上
+分配与 GC 的抖动，倍率会从 0.11 跳到 0.43 —— 护栏就变成了随机数。
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有
@@ -1201,6 +1240,7 @@ VMOVUPS    ZMM26, ZMM0        ; ← 40 条 FMA 后面跟了 34 条这个
 | `vt-einsum` | out dtype 硬校验（当前已实现，**保留为样板**） | ✅ |
 | `vt-matmul` | 1d 提升语义；`out` 走 `vt-copy-into` | ✅ |
 | `vt-isclose` | `rtol=1e-5, atol=1e-8` | ✅ 实测默认宽松（1e-6 内判等），需在文档写明 |
+| `vt-array-equal` | 形状完全一致才可能为真；同 dtype 精确比、异 dtype 按 `VT-PROMOTE-TYPE` 提升后比；`NaN ≠ NaN`、`0.0 = -0.0`；返回 Lisp 布尔而非张量（§7.4.13） | ✅ 已对齐 |
 | `vt-arange` | 整型溢出与 `int16/int8/uint*` 一致采用**回绕**语义（`%wrap-*`），不报错（见 §9.1） | ✅ |
 | `vt-linspace` | float32 输出**以 double 精度计算后舍入存储**（对标 NumPy，避免累积漂移） | ✅ |
 | `vt-random-uniform` / `vt-random-normal` | `uniform` 要求 `low`/`high` 为有限实数，`low = high` 合法（返回常量数组）；`normal` 要求 `std` 为非负有限实数，`std = 0` 返回 `mean` 填充 | ✅ |

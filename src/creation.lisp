@@ -204,6 +204,46 @@ NUM = 0 返回形状 (0) 的空张量（对标 np.linspace 的 num=0：采样点
     (when (complexp (row-major-aref arr i))
       (return t))))
 
+(defun %from-array-fill (arr data size dtype lisp-type fast)
+  "把 ARR（任意秩 CL 数组）按行主序的 SIZE 个元素写进 DATA。
+
+   三条路，判据是「转换是否恒等」而不是「看起来像不像」：
+
+     1. FAST：`COERCE`（调用方显式要求「不做安全转换」，可能抛类型错误）；
+     2. 源数组元素类型 == 目标元素类型（且目标不是 `:bool`）：
+        整段搬移（秩 1 用 `REPLACE`，其他秩按行主序逐元素 —— `REPLACE`
+        只吃 SEQUENCE）。这是**恒等**转换，不再逐元素走转换函数；
+     3. 其余：逐元素 `%VT-CAST-RAW`，浮点陷阱屏蔽在**循环外**做一次。
+
+   第 2 条排除 `:bool` 是有语义的：`%VT-CAST-RAW` 对 `:bool` 做**真值化**
+   （2 → 1），而字节拷贝会把 2 原样留下来，破坏 §17.1 的「布尔物理字节
+   只能是 0/1」不变量。
+
+   第 3 条不用 `VT-CAST` 的原因见 §7.4.13：那层 `WITH-FLOAT-SAFE` 展开成
+   `SB-INT:WITH-FLOAT-TRAPS-MASKED`，每次进出读写一遍 FPU 控制字，本机实测
+   216 ns/次；1M 元素的入口因此要花 250 ms 在「控制字搬运」上。
+   两者是同一段 body（`:bool` 真值化 / 复数取实部 / 整数回绕），只是屏蔽
+   的次数不同。"
+  (declare (type fixnum size))
+  (cond
+    (fast
+     (dotimes (i size)
+       (setf (aref data i) (coerce (row-major-aref arr i) lisp-type))))
+    ((and (not (eq dtype :bool))
+          (equal (array-element-type arr) lisp-type))
+     ;; 恒等转换：秩 1 时 REPLACE 走整段搬移；其他秩 **不能用 REPLACE** ——
+     ;; CL 的 REPLACE 只接受 SEQUENCE，0 维数组会抛 TYPE-ERROR、多维数组
+     ;; 也不是序列。按行主序逐元素搬，仍是恒等。
+     (if (= (array-rank arr) 1)
+         (replace data arr)
+         (dotimes (i size)
+           (setf (aref data i) (row-major-aref arr i)))))
+    (t
+     (with-float-safe
+       (dotimes (i size)
+         (setf (aref data i) (%vt-cast-raw (row-major-aref arr i) dtype))))))
+  data)
+
 (defun vt-from-array (arr &key (dtype nil) (fast nil))
   "从标准 CL 多维数组创建张量（保持维度）。
    fast t 意味着直接使用 coerce 转换，可能报错
@@ -216,7 +256,13 @@ NUM = 0 返回形状 (0) 的空张量（对标 np.linspace 的 num=0：采样点
    类型为 T 的数组（`(vector …)` / `#(…)` 字面量的元素类型都是 T）没有信息
    可依，此时**只有复数**按值扫一遍：`(vt-from-array (vector #c(1d0 2d0)))`
    曾落到兜底的 :float64 而静默丢虚部（与 v0.5.x 修的同一个坑，只是入口
-   从「声明类型」换成了「无类型」）。非复数维持 :float64。"
+   从「声明类型」换成了「无类型」）。非复数维持 :float64。
+
+   执行层（CONVENTIONS §7.4.13）：元素搬运不再逐元素调 VT-CAST。
+   源数组元素类型与目标完全一致时整段搬移（恒等转换，零转换开销）；
+   其余情形逐元素走 `%VT-CAST-RAW`（与 VT-CAST 同一段 body，只是陷阱
+   屏蔽提到循环外一次）。1M float64 实测 266ms → 7ms（其中约 6ms 是分配
+   并首次触碰 8MB 目标数组，旧路径也要付这笔）。"
   (let* ((shape (array-dimensions arr))
          (size (vt-shape-to-size shape))
          (cl-etype (array-element-type arr))
@@ -251,11 +297,7 @@ NUM = 0 返回形状 (0) 的空张量（对标 np.linspace 的 num=0：采样点
          (final (or dtype infer))
 	 (lisp-type (vt-dtype->lisp-type final))
          (data (make-array size :element-type lisp-type)))
-    (if fast
-	(dotimes (i size)
-	  (setf (aref data i) (coerce (row-major-aref arr i) lisp-type)))
-	(dotimes (i size)
-	  (setf (aref data i) (vt-cast (row-major-aref arr i) final))))    
+    (%from-array-fill arr data size final lisp-type fast)
     (%make-vt :data data :shape shape :strides (vt-compute-strides shape)
               :offset 0 :dtype final)))
 

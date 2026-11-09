@@ -6465,3 +6465,124 @@ dtype 分派，本库现在是「一次特化扫描 + 一次连续直写」。
 > 追平」（`cumsum`、`matmul`、`digitize`）和「哪里有洞」（`put`），而后者是
 > 逐个函数读代码读不出来的 —— 因为它长得完全正常，只是把 O(n) 的取值放进了
 > 一个跑 N 次的循环。**先量，再问相称性**。
+
+## H.3.54 第三十四轮：数据入口、相等判定、沿轴应用、外积 —— 四笔「每元素一次的通用件」
+
+这一轮的起点是换了个排序口径：前面几轮排的是**算子**（逐元素、归约、排序、
+索引、分位），这次排「用户每次建张量、每次判等、每次沿轴应用都会经过」的
+入口函数。四格中招，病根相同：转换 / 取数 / 写回按元素各收一次钱，单价由
+通用件决定。
+
+| 用例（1M，除注明） | 改前 | 改后 | 倍率 | numpy 2.4.6 |
+|---|---:|---:|---:|---:|
+| `vt-from-array` f64（同元素类型） | 266 ms | **7.0** | 38× | — |
+| `vt-array-equal` f64 | 83 | **2.0** | 41× | 0.42 |
+| `vt-apply-along-axis` + `vt-sort`（1000×1000） | 700 | **113** | 6.2× | 19.7 |
+| `vt-apply-along-axis` + `vt-copy`（1000×1000） | 644 | **13** | 50× | — |
+| `vt-apply-along-axis` + `vt-sum`（1000×1000） | 296 | **8** | 37× | — |
+| `vt-outer`（1000×1000） | 14.3 | **1.6** | 9× | 1.28 |
+
+### 一、`vt-from-array`：216 ns 的 FPU 控制字，乘以元素个数
+
+入口只有一行搬运：
+
+```lisp
+(dotimes (i size)
+  (setf (aref data i) (vt-cast (row-major-aref arr i) final)))
+```
+
+单独量 `vt-cast`：**216 ns/次**，而同样语义的 `coerce` 只要 2 ns。差额是
+`WITH-FLOAT-SAFE` 展开出来的 `SB-INT:WITH-FLOAT-TRAPS-MASKED` —— 每次进出
+读写一遍 FPU 控制字。1M 元素就是 250 ms 的控制字搬运，而 8 MB 的实际搬移
+只要 1 ms。
+
+按「转换是否恒等」分三条路：同元素类型整段搬；其余逐元素 `%VT-CAST-RAW`，
+屏蔽提到循环外一次。这里踩到一个坑：整段搬本来写的是 `REPLACE`，而
+`REPLACE` 只吃 SEQUENCE —— **0 维数组**不是序列，直接抛
+`The value #0A2.5d0 is not of type SEQUENCE`；多维数组也不是序列（这一点
+更容易被忽略，因为 `(make-array '(2 3))` 看起来「像个数组」）。改成「秩 1
+才用 REPLACE，其余按行主序逐元素」。
+
+`:bool` 目标是唯一必须绕开整段搬的 dtype：`%VT-CAST-RAW` 对它做**真值化**
+（2 → 1），而字节拷贝会把 2 原样留下，破坏 §17.1 的 0/1 不变量。
+
+### 二、`vt-array-equal`：一次 `astype :float64` 换来两条静默错值
+
+旧实现把所有输入先 `VT-ASTYPE … :float64` 再逐元素 `%VT-REF-RAW`。性能之外，
+这一步本身是错的：
+
+- 复数 → float64 取**实部**（§16.5 的 astype 语义），于是 `#C(1 2)` 与
+  `#C(1 3)` 判等；
+- int64 → double 只有 53 位尾数，2^54+1 与 2^54+2 落在同一个 double 上，
+  于是两个不同的 int64 判等。
+
+numpy 的 `array_equal` 是「按提升后的公共 dtype 比」，同 dtype 时**不做任何
+转换**。改法照此：同 dtype 直接比；异 dtype 走 `VT-PROMOTE-TYPE`（就是全库
+唯一那张提升表）。逐元素用 `=` 而不是 `EQL` 也是刻意的 —— SBCL 对浮点的
+`EQL` 是位比较，`(eql 0d0 -0d0)` 是 NIL，而 numpy 的 `0.0 == -0.0` 是 True。
+
+### 三、沿轴应用：三笔按元素收的钱，其中一笔被第一组顺手治好
+
+改前每个 fiber 的开销链是：泛型 `AREF` 取一条 fiber（1M 共 12 ms）→
+`vt-from-array` 造 fiber 张量（**250 ms**，就是第一组那个病）→ `func` →
+写回 `(vt-cast (%vt-ref-raw ov k) out-dt)`（249 ms）。第一组修完，中间那笔
+自己消失了；取数与写回各换成按元素类型展开的内核。
+
+有一处**不做**的优化：fiber 缓冲不跨 fiber 复用。`func` 若把入参原样返回
+（`identity`），复用同一块 `buf` 会让所有输出行别名到同一块内存，结果随最后
+一行漂移 —— 省 1000 次小分配不值这个语义风险。
+
+### 四、外积：无收缩的 einsum 也在做里程计
+
+`vt-outer` 缺省路径是 `vt-einsum "i,j->ij"`。外积每个输出元素只做一次乘法、
+没有求和，却仍要按元素算一遍 strides。改成两个广播视图的逐元素乘（numpy 的
+`outer` 就是 `multiply(a[:,None], b[None,:])`）后 14.3 → 1.6 ms。
+
+两侧唯一的值差异是**符号零**：einsum 的内核是「累加器 + 乘积」，`0 + (-0.0)`
+把符号加掉了，于是 `outer([0.0], [-0.0])` 给 `+0.0`；广播乘法给 `-0.0`，
+与 numpy 一致。这不是回归。
+
+显式 `:dtype` 仍走 einsum，原因写进了 §7.4.13 的表：einsum 的 `:dtype` 是
+**计算 dtype**（先 cast 输入再算），`vt-*` 的是 §6.1 的「先算再 cast」，两者在
+整数溢出（int32 max²：4.6e18 vs 1）与复数 → 实数（乘积实部 vs 实部之积）
+两处不同。为这次提速去改 `:dtype` 的语义不划算，所以只优化缺省路径。
+
+### 五、怎么证明「结果没变」
+
+四组都与**逐字复刻的改动前实现**对拍，期望值只来自 numpy 的地方单独标注：
+
+- `from-array`：按**位模式**比（`EQL`：浮点是位比较，`0.0/-0.0` 不相等、
+  同载荷 NaN 相等）—— 11 种源元素类型 × 11 种目标 dtype × `fast` 两档，143 例；
+- `array-equal`：10 组 dtype 组合 × 相同值 / 全零 / 转置视图；旧实现错的两处
+  （复数虚部、2^54±1）另钉 numpy 的答案；再加 `±0.0`、NaN、空张量、0 维、
+  `int8 -1` vs `uint8 255`、5 种物理形态两两判等；
+- `apply-along-axis`：6 dtype × 5 形状/轴 × 标量返回 / 1D 返回，加转置 /
+  列视图 / 翻转 / 0 长度轴 / `func` 返回非连续视图（`flip`）；
+- `outer`：7 dtype × 1D/2D/0 维/0 长度（值域避开 ±0 与溢出），±0、
+  int32 溢出、int8 回绕另按 numpy 钉死。
+
+护栏只用比值：`array-equal ÷ isclose ≤ 2`、`from-array ÷ 旧实现 ≤ 0.25`、
+`outer ÷ einsum ≤ 0.5`、`apply ÷ 手写地板 ≤ 3`。地板是这段代码里唯一
+「不可避免」的部分：同样的列访问（跨 1000 行取一条 fiber，1M 次 cache miss）
++ 同样的 1000 次 fiber 构造与拷贝；实测 1.1~1.2 倍，说明剩下的开销不在
+机械层，而在被调函数本身（`vt-sort` 每次调用约 57 µs 是它自己的事）。
+
+### 六、清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/creation.lisp` | 新增 `%FROM-ARRAY-FILL`；`VT-FROM-ARRAY` 的搬运改三条路 |
+| `src/extensions3.lisp` | 新增 `%ARRAY-EQUAL-RUN`；`VT-ARRAY-EQUAL` 改「先定比较域再比」 |
+| `src/extensions2.lisp` | 新增 `%AAX-GATHER` / `%AAX-SCATTER`；`VT-APPLY-ALONG-AXIS` 两条分支改用它们 |
+| `src/linalg.lisp` | `VT-OUTER` 缺省路径改广播乘；`:dtype` 仍走 einsum |
+| `test/entry-equal-apply-test.lisp` | 新增（180 条：四组对拍 + 四条倍率护栏） |
+| `test/run-tests.sh` | 登记新套件 |
+| `CONVENTIONS.md` | 新增 §7.4.13；§9.2 补 `vt-array-equal` 一行 |
+| `CHANGELOG.md` | （六十二） |
+
+### 七、一句话
+
+> 这一轮的四格没有一格是算法问题：`vt-cast` 的 216 ns、`astype :float64` 的
+> 一次多余转换、`vt-from-array` 的一次多余调用、einsum 的一次多余里程计。
+> 它们都在「看起来完全正常」的一行里 —— 判据仍然是**相称性**：这行代码承担
+> 的算术，配不配得上它按元素收的这笔钱。

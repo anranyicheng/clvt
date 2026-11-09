@@ -536,12 +536,104 @@
             ((complexp sample) :complex128)
             (t :bool))))
 
+(defun %aax-gather (sd soff ax-dim inner ii arr)
+  "把 SD 中从 SOFF+II 起、步长 INNER 的 AX-DIM 个元素按序写进 ARR。
+
+   按**存储元素类型**展开成 10 份特化循环（§7.4.13）：旧写法在
+   `(aref data (+ data-off …))` 上每元素走一次通用 AREF（1M 元素 12 ms）。
+   ARR 的分配留在调用方（每个 fiber 一份），语义与「每次新建缓冲」一致 ——
+   若被调函数把入参原样返回，各 fiber 的结果仍是各自独立的数组。"
+  (declare (type fixnum soff ax-dim inner ii))
+  (macrolet
+      ((gather (lt)
+         `(let ((s (the (simple-array ,lt (*)) sd))
+                (d (the (simple-array ,lt (*)) arr)))
+            (declare (type (simple-array ,lt (*)) s d)
+                     (type fixnum soff ax-dim inner ii))
+            (let ((p (the fixnum (+ soff ii))))
+              (declare (type fixnum p))
+              (dotimes (k ax-dim)
+                (declare (type fixnum k))
+                (setf (aref d k) (aref s p))
+                (incf p inner))))))
+    (let ((et (array-element-type sd)))
+      (cond
+        ((equal et 'double-float)           (gather double-float))
+        ((equal et 'single-float)           (gather single-float))
+        ((equal et '(signed-byte 64))       (gather (signed-byte 64)))
+        ((equal et '(signed-byte 32))       (gather (signed-byte 32)))
+        ((equal et '(signed-byte 16))       (gather (signed-byte 16)))
+        ((equal et '(signed-byte 8))        (gather (signed-byte 8)))
+        ((equal et '(unsigned-byte 16))     (gather (unsigned-byte 16)))
+        ((equal et '(unsigned-byte 8))      (gather (unsigned-byte 8)))
+        ((equal et '(complex double-float)) (gather (complex double-float)))
+        ((equal et '(complex single-float)) (gather (complex single-float)))
+        (t
+         (let ((p (the fixnum (+ soff ii))))
+           (dotimes (k ax-dim)
+             (setf (aref arr k) (aref sd p))
+             (incf p inner))))))))
+
+(defun %aax-scatter (rd base ov new-dim inner ii out-dt)
+  "把 OV 的 NEW-DIM 个元素写进 RD，落点 = BASE + K×INNER + II。
+
+   两条路：OV 与原结果**同 dtype 且连续**时逐元素直写（恒等转换）；
+   否则 `%VT-CAST-RAW` + `%VT-REF-RAW`。旧写法无条件 `VT-CAST`，
+   那层浮点陷阱屏蔽每次进出的固定开销是 216 ns —— 1M 输出即 249 ms。"
+  (declare (type fixnum base new-dim inner ii))
+  (if (and (eq (vt-dtype ov) out-dt) (vt-contiguous-p ov))
+      (let ((od (vt-data ov))
+            (oo (the fixnum (vt-offset ov)))
+            (et (array-element-type rd)))
+        (macrolet
+            ((scatter (lt)
+               `(let ((d (the (simple-array ,lt (*)) rd))
+                      (s (the (simple-array ,lt (*)) od)))
+                  (declare (type (simple-array ,lt (*)) d s)
+                           (type fixnum oo base new-dim inner ii))
+                  (let ((p base))
+                    (declare (type fixnum p))
+                    (dotimes (k new-dim)
+                      (declare (type fixnum k))
+                      (setf (aref d (the fixnum (+ p ii)))
+                            (aref s (the fixnum (+ oo k))))
+                      (incf p inner))))))
+          (cond
+            ((equal et 'double-float)           (scatter double-float))
+            ((equal et 'single-float)           (scatter single-float))
+            ((equal et '(signed-byte 64))       (scatter (signed-byte 64)))
+            ((equal et '(signed-byte 32))       (scatter (signed-byte 32)))
+            ((equal et '(signed-byte 16))       (scatter (signed-byte 16)))
+            ((equal et '(signed-byte 8))        (scatter (signed-byte 8)))
+            ((equal et '(unsigned-byte 16))     (scatter (unsigned-byte 16)))
+            ((equal et '(unsigned-byte 8))      (scatter (unsigned-byte 8)))
+            ((equal et '(complex double-float)) (scatter (complex double-float)))
+            ((equal et '(complex single-float)) (scatter (complex single-float)))
+            (t
+             (let ((p base))
+               (dotimes (k new-dim)
+                 (setf (aref rd (the fixnum (+ p ii)))
+                       (%vt-cast-raw (aref od (the fixnum (+ oo k))) out-dt))
+                 (incf p inner)))))))
+      (let ((p base))
+        (declare (type fixnum p))
+        (dotimes (k new-dim)
+          (declare (type fixnum k))
+          (setf (aref rd (the fixnum (+ p ii)))
+                (%vt-cast-raw (%vt-ref-raw ov k) out-dt))
+          (incf p inner)))))
+
 (defun vt-apply-along-axis (func axis vt)
   "沿指定轴对 1D 切片应用函数，对标 np.apply_along_axis。
    支持 func 返回标量（1D→scalar）或 1D 张量（1D→1D）。
    注意：func 会被额外调用一次用于探测输出形状，因此不应有副作用。
    布尔输入的结果 dtype 取 FUNC 返回值的 dtype（见
-   `%APPLY-ALONG-AXIS-RESULT-DTYPE`，CONVENTIONS §17.10.13）。"
+   `%APPLY-ALONG-AXIS-RESULT-DTYPE`，CONVENTIONS §17.10.13）。
+
+   执行层（§7.4.13）：每个 fiber 的三笔固定开销都在改前路径上
+   —— 泛型 AREF 逐元素取数、`VT-FROM-ARRAY` 逐元素 `VT-CAST`、
+   写回再逐元素 `VT-CAST`。前两笔各按元素收一次钱（1M 元素 = 250ms + 250ms），
+   现在都换成按元素类型特化的循环，写回的转换只在 dtype 不同时才发生。"
   (with-float-safe
     (let* ((vt-c (vt-contiguous vt))
            (shape (vt-shape vt-c))
@@ -571,16 +663,13 @@
              (dotimes (bi outer)
                (dotimes (ii inner)
                  (let ((arr (make-array ax-dim :element-type ltype)))
-                   (dotimes (k ax-dim)
-                     (setf (aref arr k)
-                           (aref data (+ data-off
-                                         (* bi ax-dim inner)
-                                         (* k inner) ii))))
+                   (%aax-gather data (+ data-off (* bi ax-dim inner))
+                                ax-dim inner ii arr)
                    (let* ((sl (vt-from-array arr :dtype (vt-dtype vt-c)))
                           (rv (funcall func sl))
                           (raw (%item-number rv)))
                      (setf (aref rdata (+ (* bi inner) ii))
-                           (vt-cast raw out-dt))))))
+                           (%vt-cast-raw raw out-dt))))))
              result))
           ;; 1D -> 1D
           ((and (vt-p sample) (= (length (vt-shape sample)) 1))
@@ -592,18 +681,12 @@
              (dotimes (bi outer)
                (dotimes (ii inner)
                  (let ((arr (make-array ax-dim :element-type ltype)))
-                   (dotimes (k ax-dim)
-                     (setf (aref arr k)
-                           (aref data (+ data-off
-                                         (* bi ax-dim inner)
-                                         (* k inner) ii))))
+                   (%aax-gather data (+ data-off (* bi ax-dim inner))
+                                ax-dim inner ii arr)
                    (let* ((sl (vt-from-array arr :dtype (vt-dtype vt-c)))
                           (ov (funcall func sl)))
-                     ;; 用 vt-ref 逐元素读取，兼容非连续/视图返回值
-                     (dotimes (k new-dim)
-                       (setf (aref rdata (+ (* bi new-dim inner)
-                                            (* k inner) ii))
-                             (vt-cast (%vt-ref-raw ov k) out-dt)))))))
+                     ;; VT-REF 兼容非连续/视图返回值；连续且同 dtype 走特化直写
+                     (%aax-scatter rdata (* bi new-dim inner) ov new-dim inner ii out-dt)))))
              result))
           (t (error "vt-apply-along-axis: func must return scalar or 1D VT")))))))
 

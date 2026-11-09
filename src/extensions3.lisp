@@ -2010,21 +2010,84 @@
 ;;; 7. 逻辑类（Logic）
 ;;; ==================================================================
 
+(defun %array-equal-run (x y n)
+  "X / Y 是同 dtype、连续、已展平的 vt，元素数 N。返回 T / NIL。
+
+   **逐元素用 `=` 而不是 `EQL`**：numpy 的 `==` 按数值判等，
+   `0.0 == -0.0` 为真、`nan == nan` 为假 —— `EQL` 正好相反（±0.0 位模式
+   不同则不等），用它会与 numpy 在符号零上分叉。浮点陷阱在此屏蔽，
+   否则 `NaN` 参与 `=` 会抛 `FLOATING-POINT-INVALID-OPERATION`。
+
+   按**存储元素类型**展开成 10 份特化循环：`(aref (simple-array double-float (*)) i)`
+   是一次 `movsd`，而通用 `AREF` 每元素要查 widetag。1M f64 的
+   `VT-ARRAY-EQUAL` 整体实测 83 → 2 ms（§7.4.13）。"
+  (let ((xd (vt-data x))
+        (yd (vt-data y))
+        (xo (the fixnum (vt-offset x)))
+        (yo (the fixnum (vt-offset y)))
+        (et (array-element-type (vt-data x))))
+    (with-float-safe
+      (macrolet
+          ((same (lt)
+             `(let ((xs (the (simple-array ,lt (*)) xd))
+                    (ys (the (simple-array ,lt (*)) yd)))
+                (declare (type (simple-array ,lt (*)) xs ys)
+                         (type fixnum xo yo n))
+                (dotimes (i n t)
+                  (declare (type fixnum i))
+                  (unless (= (aref xs (the fixnum (+ xo i)))
+                             (aref ys (the fixnum (+ yo i))))
+                    (return nil))))))
+        (cond
+          ((equal et 'double-float)           (same double-float))
+          ((equal et 'single-float)           (same single-float))
+          ((equal et '(signed-byte 64))       (same (signed-byte 64)))
+          ((equal et '(signed-byte 32))       (same (signed-byte 32)))
+          ((equal et '(signed-byte 16))       (same (signed-byte 16)))
+          ((equal et '(signed-byte 8))        (same (signed-byte 8)))
+          ((equal et '(unsigned-byte 16))     (same (unsigned-byte 16)))
+          ((equal et '(unsigned-byte 8))      (same (unsigned-byte 8)))
+          ((equal et '(complex double-float)) (same (complex double-float)))
+          ((equal et '(complex single-float)) (same (complex single-float)))
+          (t
+           (dotimes (i n t)
+             (declare (type fixnum i))
+             (unless (= (aref xd (the fixnum (+ xo i)))
+                        (aref yd (the fixnum (+ yo i))))
+               (return nil)))))))))
+
 (defun vt-array-equal (a b)
   "判定两张量形状相同且逐元素相等（对标 numpy.array_equal）。
    NaN != NaN（含 NaN 恒不相等，同 numpy）；返回 Lisp 布尔值（非张量）。
    示例：(vt-array-equal '(1 2) '(1 2)) => T
         (vt-array-equal (vt-from-array (vector (vt-get-nan :float64)))
-                        (vt-from-array (vector (vt-get-nan :float64)))) => NIL"
-  (let ((av (ensure-vt a)) (bv (ensure-vt b)))
-    (and (equal (vt-shape av) (vt-shape bv))
-         (let ((af (vt-ravel (vt-astype av :float64)))
-               (bf (vt-ravel (vt-astype bv :float64)))
-               (n (vt-size av)))
-           (with-float-safe
-             (dotimes (i n t)
-               (unless (= (%vt-ref-raw af i) (%vt-ref-raw bf i))
-                 (return nil))))))))
+                        (vt-from-array (vector (vt-get-nan :float64)))) => NIL
+
+   比较域（§7.4.13）：dtype **相同**时直接在原 dtype 上比（整数不经过浮点，
+   故 2^54+1 与 2^54+2 不会被 double 抹成同一个数）；不同 dtype 时按
+   `VT-PROMOTE-TYPE` 提升到公共域再比 —— 与 numpy 的 `==` 提升规则同一张表。
+   此前一律先 `VT-ASTYPE … :float64`，于是
+     · `#C(1.0 2.0)` 与 `#C(1.0 3.0)` 判等（虚部被 astype 丢掉）；
+     · int64 上超过 2^53 的两个相邻值判等（double 只有 53 位尾数）。
+   两条都是静默错值，且都不报错。"
+  (let* ((av (ensure-vt a))
+         (bv (ensure-vt b))
+         (shape-a (vt-shape av)))
+    (and (equal shape-a (vt-shape bv))
+         (let ((n (vt-size av)))
+           (if (zerop n)
+               t
+               (let* ((adt (vt-dtype av))
+                      (bdt (vt-dtype bv))
+                      (dt (if (eq adt bdt) adt (vt-promote-type adt bdt))))
+                 (%array-equal-run
+                  (if (eq adt dt)
+                      (vt-contiguous (vt-ravel av))
+                      (vt-astype av dt))
+                  (if (eq bdt dt)
+                      (vt-contiguous (vt-ravel bv))
+                      (vt-astype bv dt))
+                  n)))))))
 
 (defun vt-array-equiv (a b)
   "判定两张量是否可通过广播相等（对标 numpy.array_equiv）。

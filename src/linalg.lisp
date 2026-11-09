@@ -1412,13 +1412,31 @@
            (shape-a (vt-shape a-vt))
            (shape-b (vt-shape b-vt)))
       (if flatten
-          (let ((1d-a (if (null shape-a) 
-                          (vt-reshape a-vt '(1)) 
-                          (vt-flatten a-vt)))
-                (1d-b (if (null shape-b) 
-                          (vt-reshape b-vt '(1)) 
-                          (vt-flatten b-vt))))
-            (vt-einsum "i,j->ij" 1d-a 1d-b :dtype dtype :out out))          
+          ;; 外积 = 两个一维广播视图的逐元素乘（numpy 的 outer 就是
+          ;; `multiply(a[:,None], b[None,:])`）。走 VT-EINSUM 时，这条
+          ;; 「无收缩」的路径仍要按元素做一次 strides 里程计 —— 1M 元素
+          ;; 实测 14.3ms，而广播逐元素 1.6ms（§7.4.13）。
+          ;; 等价性：外积每个输出元素只做一次乘法，**没有求和**，
+          ;; 故不涉及归约顺序；dtype 提升两侧走同一张 VT-PROMOTE-TYPE 表。
+          ;;
+          ;; 显式 :dtype 仍走 EINSUM（原路径）：EINSUM 的 :dtype 是**计算
+          ;; dtype**（先把输入 cast 过去再乘），VT-* 的 :dtype 是 `§6.1` 的
+          ;; 「先提升计算、再 cast」。两者在「整数溢出」与「复数 → 实数」
+          ;; 两处给出不同结果（int32 max² 前者 4.6e18、后者 1；复数前者取
+          ;; 乘积实部、后者取输入实部之积），不能互换 —— 宁可只优化缺省路径。
+          (let* ((1d-a (if (null shape-a)
+                           (vt-reshape a-vt '(1))
+                           (vt-ravel a-vt)))
+                 (1d-b (if (null shape-b)
+                           (vt-reshape b-vt '(1))
+                           (vt-ravel b-vt)))
+                 (na (vt-size 1d-a))
+                 (nb (vt-size 1d-b)))
+            (if dtype
+                (vt-einsum "i,j->ij" 1d-a 1d-b :dtype dtype :out out)
+                (vt-* (vt-reshape 1d-a (list na 1))
+                      (vt-reshape 1d-b (list 1 nb))
+                      :out out)))
           (if (or (null shape-a) (null shape-b))
               (vt-* a-vt b-vt :dtype dtype :out out)
               (let* ((rank-a (length shape-a))
