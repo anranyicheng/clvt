@@ -6881,3 +6881,183 @@ Lisp 的 `0.5` 读成 **single-float**，`0.5d0` 是 double-float。
 > 哈希表的关键不是「键能不能比」，是「键的**低位**散不散」。
 > 一个 O(n+m) 的实现在规整数据上悄悄退化成 O(n×m)，而随机数据的基准测试
 > 会告诉你一切正常 —— 这类退化只能靠**换数据形状**发现，不能靠读代码发现。
+
+## H.3.57 第三十七轮：抽样不贵，写回贵
+
+`random.lisp` 是全库唯一一个不带任何性能注释的文件。挑它是因为「随机数」在用户
+代码里是最不设防的一行 —— `(vt-random-uniform '(1000000))` 看着像个原语，而它
+当时要 208 ms。
+
+### 一、先量「抽样」和「写回」各占多少
+
+第一反应是 SBCL 的 `(random 1.0d0 state)` 太贵 —— 每次返回一个装箱的
+double-float，理论上要堆分配。于是把抽样本体单独拎出来量：
+
+| 1M 个 U[0,1) | 耗时 |
+|---|---:|
+| 纯 `(random 1.0d0 state)` × 1M（连数组都不写，只累加） | **5.5 ms** |
+| 内联循环写入 `(simple-array double-float)` | **5.6** |
+| `vt-map` + 具名算子（无 `vt-cast`） | 12.8 |
+| `vt-map` + 匿名 lambda + `vt-cast`（当时的实现） | **208** |
+
+5.5 ms / 1M = 5.5 ns 一次，SBCL 在「值不逃逸」时确实栈分配了。所以抽样一分钱
+不花，208 ms 全是写回路径的。
+
+两处固定成本，都在每元素上：
+
+1. `vt-map` 只内联 `(function <符号>)` 字面形式（§7.4.7），匿名 lambda 一律退回
+   `(apply #'vt-map …)`：每元素一次 funcall + 泛型 AREF + 装箱。这一层 208 → 12.8。
+2. 剩下的十几倍是 `vt-cast`：它每次套一层 `with-float-safe`，本机 216 ns/次。
+   1M × 216 ns ≈ 216 ms —— 和实测完全对上。
+
+第 2 条写在 `vt-cast` 自己的 docstring 里（「批量循环应当直接用裸内核 + 外层一次性
+屏蔽」），也写在 §7.1 里。也就是说这不是「没想到」，是**这条约定没有被贯彻到所有
+调用点**。`random.lisp` 的四个入口都没有照做。
+
+### 二、改法：按 dtype 展开强类型循环
+
+```lisp
+(defun %fill-uniform (out st low range)
+  (let ((n (vt-size out)) (dtype (vt-dtype out)))
+    (cond
+      ((and (eq dtype :float64) (typep low 'double-float) (typep range 'double-float))
+       (let ((d (the (simple-array double-float (*)) (vt-data out))))
+         (declare (type double-float low range))
+         (dotimes (i n) (setf (aref d i) (+ low (* range (random 1.0d0 st)))))))
+      ...)))
+```
+
+两个容易写错的细节：
+
+- **`:float32` 必须「先算后舍入」**。改前是 `(vt-cast (+ low (* range u)) :float32)`，
+  双精度算完再 `coerce`。若为了「省一次转换」改成在单精度里累加，值会不一样 ——
+  而这类差异不会报错，只会让下游的复现实验对不上。所以特化分支写的是
+  `(coerce (+ low (* range (random 1.0d0 st))) 'single-float)`。
+- **`low` / `range` 不是 double 时不能提前 `coerce`**。第一版为了统一类型，在入口
+  写了 `(coerce low 'double-float)`。这会在 `low` 是 ratio 或单精度时改变运算域
+  （`(* range u)` 的中间精度变了），得到一个「更快但不一样」的结果。改成
+  `(typep low 'double-float)` 成立才走特化，否则回退通用路径 —— 通用路径仍然用
+  `%vt-cast-raw`，只是外层要自己包一次 `with-float-safe`（否则 NaN → 整数会抛
+  `FLOATING-POINT-INVALID-OPERATION`）。
+
+### 三、另外两处不是「通用件」的问题，是算法
+
+**加权抽样的 CDF 是线性扫的。**
+
+```lisp
+(loop for i from 0 below n
+      when (<= r (aref cdf i)) return (aref src-data (+ src-offset i))
+      finally (return (aref src-data (+ src-offset (1- n)))))
+```
+
+每样本平均扫 k/2 项。k=1000、样本 1M 时是 5×10⁸ 次比较（2881 ms）。库里其实
+早就有一个 `binary-search-cdf`，只是只被 multinomial 用。改成二分：
+
+- 纯二分 1M 次：3471 → 151 ms；
+- 端到端（含写回）：2881 → 69 ms，**已经越过 numpy 的 66 ms**。
+
+等价性是严格的，不是「差不多」：线性版找「第一个 `cdf[i] >= r`」，二分版找的也是
+这个（`(< (aref cdf mid) r)` → `lo = mid+1`，否则 `hi = mid`），末尾兜底 `(1- k)`
+也一样。含大量零权重时两者都跳过零宽区间，测试里专门有一组
+（`(if (zerop (mod i 7)) 0.0 …)`）守着。
+
+顺带把 `cdf` 从 `(coerce … 'vector)` 改成就地构造 `(simple-array double-float (*))`：
+二分内核按强类型声明读它，通用 `AREF` 上慢三倍。
+
+**打乱是「每一步交换整行」。**
+
+```lisp
+(loop for i from (1- dim) downto 1 do
+  (let* ((si (apply #'vt-slice tensor …))   ; 分配
+         (sj (apply #'vt-slice tensor …)))  ; 分配
+    (let ((tmp (vt-copy si)))               ; 分配
+      (vt-copy-into si sj)
+      (vt-copy-into sj tmp))))
+```
+
+每次交换四次分配，1M 行就是 4M 次分配（974 ms）。改成「先算目标位置，再一次性
+gather」：
+
+1. `idx = 0..dim-1`，纯下标 Fisher–Yates；
+2. `(vt-take tensor idx :axis ax)` —— 一趟 gather；
+3. `(vt-copy-into tensor perm)` —— 写回原张量（原地语义不变）。
+
+随机访问从「每行 2 次读写」降到「每行 1 次读」，1M×8 从 974 到 118 ms。
+
+有意思的是 numpy 自己也要 635 ms —— 它也是逐步交换整行。所以这一格不是「追上
+numpy」，是**换了个访问模式**：numpy 的 `shuffle` 在原地做，本库现在多一份临时
+内存换 5 倍速度。这个交换值得写在文档里，因为它是唯一一处「本库比 numpy 快一个
+量级」的随机数操作。
+
+同一条路径也被 `vt-random-permutation` 的张量版复用（它此前同样是逐步 slice/copy）。
+
+### 四、为什么敢改，以及凭什么证明没改坏
+
+随机数和别的东西不一样：**它没有「正确值」，只有「同一个 seed 给同一串值」**。
+这条契约比任何"结果看起来对"都硬 —— 用户拿它复现实验、对齐论文、做 A/B。
+
+所以改动的第一原则是：**不许动抽样调用序列**。每个元素仍然恰好一次 `RANDOM`，
+`(random (1+ i))` 的递减顺序不变，`%normal-rand` 的两次 `random` 先后不变。
+变的只有「值怎么落到数组里」和「排列怎么作用到数据上」。
+
+证明方式也是照着这条原则设计的：与其钉死几个数（SBCL 一升级就失效），不如与
+**逐字复刻的改动前实现**同 seed 逐位对拍。`test/random-exec-test.lisp` 里
+`legacy-random` / `legacy-uniform` / `legacy-normal` / `legacy-random-int` /
+`legacy-choice-uniform` / `legacy-choice-weighted` / `legacy-shuffle` /
+`legacy-permutation` 都是原样抄下来的旧代码，只把 RNG 变成显式参数。108 条：
+
+- 四个采样入口 × shape NIL/3/1000/4×5/2×3×4/0 × dtype f64/f32/int32/int16/int8/
+  uint8/uint16/bool × `low`/`high` 含 ±0、`low=high`、整数、单精度、ratio；
+- `choice` 三分支（含张量 `p`、含零权重、单点权重、0 维、无放回无重复）；
+- `shuffle`/`permutation`（2D 双轴、3D 三轴、**转置视图写回**、多重集不变、
+  不改原张量、`dim=1` 原样返回）；
+- 语义点（同 seed 可复现、不同 seed 不同、dtype/shape、`vt-random` 拒绝整型、
+  1M 的均值/方差、加权经验频率 ±0.01）。
+
+六条机器无关护栏（倍率，§16.16 第 7 条）：
+
+| 护栏 | 改后实测 | 改前 | 抓什么 |
+|---|---:|---:|---|
+| `uniform ÷ random-int ≤ 3×` | 0.70 | **13.9** | 循环里塞回 `vt-cast` / funcall |
+| `choice 均匀 ÷ random-int ≤ 3×` | 1.14 | 30 | 同上 |
+| `normal ÷ uniform ≤ 10×` | 4.77 | 1.2 | 只抓 `normal` 单独退化 |
+| `uniform ÷ vt-zeros ≤ 30×` | 14.7 | 416 | 「采样必须有上限」的兜底 |
+| `choice 加权 ÷ 均匀(k=500) ≤ 20×` | 10.7 | **271** | 退回线性扫 CDF |
+| `shuffle ÷ permutation(1M) ≤ 12×` | 3.6 | **41** | 退回逐步交换整行 |
+
+第三条是个反例，值得留着：改前 `normal ÷ uniform` 是 1.2×（两个都慢，比值反而
+「正常」）。所以「比值护栏」不是万能的 —— 它会漏掉「两边一起退化」的情形。补的
+办法是每族都要有一条**以快路径为分母**的绝对锚点（这里是 `uniform ÷ vt-zeros`），
+以及一条「与同算法的另一实现比」的护栏（这里是 `shuffle ÷ permutation`，两者都是
+1M 次 Fisher–Yates，一个是纯数据交换、一个要搬运整行）。
+
+### 五、还差多少
+
+| 用例 | 本库 | numpy 2.4.6 | 差距 |
+|---|---:|---:|---|
+| `uniform` 1M | 7.5 ms | 2.5 | 3× |
+| `normal` 1M | 35 | 10.4 | 3.4× |
+| `integers` 1M | 9.0 | 1.8 | 5× |
+| `choice` 等概率 1M | 9.5 | 1.8 | 5× |
+| `choice` 加权 1M | 69 | 66 | 1.05× |
+| `shuffle` 1M×8 | 118 | 635 | **0.19×** |
+
+剩下的 3~5 倍全在「产生随机位」本身：SBCL 的 `(random 1.0d0)` 是 5.5 ns/个，
+numpy 的 PCG64 批量产 64 位字再切 53 位是 1.8 ns/个。这不在本库能改的范围内
+（改随机源就破坏了「同 seed 同序列」），所以这一格停在这里。
+
+### 六、清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/random.lisp` | 新增 `%FILL-UNIFORM` / `%FILL-NORMAL` / `%FILL-INT-RANGE` / `%FILL-CHOICE-UNIFORM` / `%FILL-CHOICE-WEIGHTED` / `%SHUFFLE-AXIS`；`BINARY-SEARCH-CDF` 前置 + 内联 + 强类型；`vt-random` / `vt-random-uniform` / `vt-random-normal` / `vt-random-int` / `vt-random-choice` / `vt-random-shuffle` / `vt-random-permutation` 改走内核；multinomial 的 counts 提循环外 |
+| `test/random-exec-test.lisp` | 新增（108 条：三组同 seed 对拍 + 一组语义点 + 六条倍率护栏） |
+| `test/run-tests.sh` | 登记新套件 |
+| `CONVENTIONS.md` | 新增 §7.4.16 |
+| `CHANGELOG.md` | （六十五） |
+
+### 七、一句话
+
+> 抽样不贵，写回贵。一个 `(random 1.0d0)` 只要 5.5 ns，而「把它写进数组」这件事
+> 在错误的写法下要 200 ns —— 40 倍。这类问题只在**把抽样本体和写回分开量**的
+> 时候才会现形：混在一起看，你只会得出「SBCL 的随机数生成很慢」这个错误结论。

@@ -197,6 +197,214 @@
        (cos (* 2.0d0 pi u2)))))
 
 
+;;; ------------------------------------------------------------------
+;;; 填充内核（见 CONVENTIONS §7.4.16）
+;;;
+;;; 四个入口原来都是「先建全零张量，再用 `VT-MAP` 的匿名 lambda 逐元素覆盖」：
+;;;
+;;;   (vt-map (lambda (x) (declare (ignore x)) (vt-cast (… (random 1.0d0 rng)) dtype))
+;;;           (vt-zeros shape :dtype dtype))
+;;;
+;;; 两处固定成本都落在**每元素**上：
+;;;   · `VT-MAP` 只内联 `(function <符号>)` 字面形式（§7.4.7），匿名 lambda 退回
+;;;     `(apply #'vt-map …)`：每元素一次 funcall + 泛型 AREF + 装箱；
+;;;   · `VT-CAST` 每次套一层 `WITH-FLOAT-SAFE`，实测 216 ns/次 —— 它的 docstring
+;;;     与 §7.1 都写着「批量循环要用裸内核 + 外层一次屏蔽」。
+;;;
+;;; 于是 1M 个 U[0,1) 采样要 208 ms，而同一个 random-state 上纯 `(random 1.0d0)`
+;;; 1M 次只要 5.5 ms：抽样本身一分钱不花，全是这两层。
+;;;
+;;; 现在按 dtype 展开强类型写入循环，陷阱屏蔽提到循环外一次。**抽样调用序列
+;;; 与改前逐字一致**（每个元素恰好一次 `RANDOM`），所以同一个 seed 的序列不变 ——
+;;; 这一点由 `test/random-exec-test.lisp` 与逐字复刻的旧实现对拍守护。
+;;; ------------------------------------------------------------------
+
+(declaim (inline binary-search-cdf))
+(defun binary-search-cdf (cdf r)
+  "返回第一个 `CDF[i] >= R` 的下标；`CDF` 全小于 `R` 时返回末位。
+
+   与「从 0 起线性扫到第一个 `(<= r (aref cdf i))`」逐位等价（含末尾兜底），
+   只是把每样本 O(k) 变成 O(log k)：k=1000、样本 1M 时 3471 ms → 151 ms。
+
+   `CDF` 必须是 `(simple-array double-float (*))`：调用方（`VT-RANDOM-CHOICE`
+   的加权分支、`VT-RANDOM-MULTINOMIAL`）都是就地构造的紧致 double 数组，
+   声明在这里让 `AREF` 走强类型访问。"
+  (declare (type (simple-array double-float (*)) cdf)
+           (type double-float r))
+  (let ((lo 0)
+        (hi (length cdf)))
+    (declare (type fixnum lo hi))
+    (loop while (< lo hi) do
+      (let ((mid (ash (+ lo hi) -1)))
+        (declare (type fixnum mid))
+        (if (< (aref cdf mid) r)
+            (setf lo (1+ mid))
+            (setf hi mid))))
+    (min lo (1- (length cdf)))))
+
+(defun %fill-uniform (out st low range)
+  "把 N 个 U[0,1) 采样经「乘 RANGE 加 LOW」后按 OUT 的 dtype 写进 OUT，返回 OUT。
+
+   `:float32` 是**先在双精度里算完再舍入一次**（`(coerce … 'single-float)`），
+   与改前 `(vt-cast (+ low (* range u)) dtype)` 逐位相同 —— 不是在单精度里累加。
+   `LOW` / `RANGE` 不是 double 时（ratio、单精度、bignum）走通用分支，避免
+   一次提前的 `coerce` 改变运算域。"
+  (let ((n (vt-size out))
+        (dtype (vt-dtype out)))
+    (declare (type fixnum n))
+    (cond
+      ((and (eq dtype :float64) (typep low 'double-float) (typep range 'double-float))
+       (let ((d (the (simple-array double-float (*)) (vt-data out))))
+         (declare (type double-float low range))
+         (dotimes (i n)
+           (setf (aref d i) (+ low (* range (random 1.0d0 st)))))))
+      ((and (eq dtype :float32) (typep low 'double-float) (typep range 'double-float))
+       (let ((d (the (simple-array single-float (*)) (vt-data out))))
+         (declare (type double-float low range))
+         (dotimes (i n)
+           (setf (aref d i) (coerce (+ low (* range (random 1.0d0 st))) 'single-float)))))
+      (t
+       (let ((d (vt-data out)))
+         ;; 通用分支要自己包一层屏蔽：`%VT-CAST-RAW` 是裸内核，NaN → 整数会触发
+         ;; FLOATING-POINT-INVALID-OPERATION（`VT-CAST` 平时替调用方包着）。
+         (with-float-safe
+           (dotimes (i n)
+             (setf (aref d i) (%vt-cast-raw (+ low (* range (random 1.0d0 st))) dtype)))))))
+    out))
+
+(defun %fill-normal (out st mean std)
+  "把 N 个正态采样经「乘 STD 加 MEAN」后按 OUT 的 dtype 写进 OUT，返回 OUT。"
+  (let ((n (vt-size out))
+        (dtype (vt-dtype out)))
+    (declare (type fixnum n))
+    (cond
+      ((and (eq dtype :float64) (typep mean 'double-float) (typep std 'double-float))
+       (let ((d (the (simple-array double-float (*)) (vt-data out))))
+         (declare (type double-float mean std))
+         (dotimes (i n)
+           (setf (aref d i) (+ mean (* std (%normal-rand st)))))))
+      ((and (eq dtype :float32) (typep mean 'double-float) (typep std 'double-float))
+       (let ((d (the (simple-array single-float (*)) (vt-data out))))
+         (declare (type double-float mean std))
+         (dotimes (i n)
+           (setf (aref d i)
+                 (coerce (+ mean (* std (%normal-rand st))) 'single-float)))))
+      (t
+       (let ((d (vt-data out)))
+         (with-float-safe
+           (dotimes (i n)
+             (setf (aref d i) (%vt-cast-raw (+ mean (* std (%normal-rand st))) dtype)))))))
+    out))
+
+(defun %fill-int-range (out st low range)
+  "把 [LOW, LOW+RANGE) 上的整数采样写进 OUT，返回 OUT。
+   每个元素恰好一次 `(random range st)` —— 与改前逐个 `VT-MAP` 元素的调用序列
+   相同，所以同一个 seed 给出同一串值。"
+  (let ((n (vt-size out))
+        (dtype (vt-dtype out)))
+    (declare (type fixnum n))
+    (cond
+      ((and (eq dtype :int64) (typep low 'fixnum) (typep range 'fixnum))
+       (let ((d (the (simple-array (signed-byte 64) (*)) (vt-data out))))
+         (declare (type fixnum low range))
+         (dotimes (i n)
+           (setf (aref d i) (+ low (random range st))))))
+      (t
+       (let ((d (vt-data out)))
+         (dotimes (i n)
+           (setf (aref d i) (%vt-cast-raw (+ low (random range st)) dtype))))))
+    out))
+
+(defun %fill-choice-uniform (out st src-data src-offset src-n)
+  "有放回等概率抽样：每个元素一次 `(random SRC-N st)`，从 SRC-DATA 取值后按
+   OUT 的 dtype 收敛，返回 OUT。三种最常见的「源与目标同类型」走强类型索引，
+   其余走泛型 AREF + 裸转换。"
+  (let ((n (vt-size out))
+        (dtype (vt-dtype out)))
+    (declare (type fixnum n src-offset src-n))
+    (flet ((idx () (+ src-offset (random src-n st))))
+      (declare (inline idx))
+      (cond
+        ((and (eq dtype :int64)
+              (typep src-data '(simple-array (signed-byte 64) (*))))
+         (let ((d (the (simple-array (signed-byte 64) (*)) (vt-data out)))
+               (s (the (simple-array (signed-byte 64) (*)) src-data)))
+           (dotimes (i n) (setf (aref d i) (aref s (idx))))))
+        ((and (eq dtype :float64)
+              (typep src-data '(simple-array double-float (*))))
+         (let ((d (the (simple-array double-float (*)) (vt-data out)))
+               (s (the (simple-array double-float (*)) src-data)))
+           (dotimes (i n) (setf (aref d i) (aref s (idx))))))
+        ((and (eq dtype :float32)
+              (typep src-data '(simple-array single-float (*))))
+         (let ((d (the (simple-array single-float (*)) (vt-data out)))
+               (s (the (simple-array single-float (*)) src-data)))
+           (dotimes (i n) (setf (aref d i) (aref s (idx))))))
+        (t
+         (let ((d (vt-data out)))
+           (with-float-safe
+             (dotimes (i n)
+               (setf (aref d i) (%vt-cast-raw (aref src-data (idx)) dtype))))))))
+    out))
+
+(defun %fill-choice-weighted (out st cdf src-data src-offset)
+  "有放回加权抽样：每个元素一次 `(random 1.0d0 st)` 定 R，再在 CDF 上二分取下标，
+   从 SRC-DATA 取值后按 OUT 的 dtype 收敛，返回 OUT。
+
+   改前是 `(loop for i from 0 below n when (<= r (aref cdf i)) return …)` ——
+   每样本平均扫 k/2 项。k=1000、样本 1M 时是 5×10⁸ 次比较（2881 ms）；
+   二分后 1M 次 `RANDOM` + 1M 次 10 步折半（165 ms）。"
+  (let ((n (vt-size out))
+        (dtype (vt-dtype out)))
+    (declare (type fixnum n src-offset))
+    (flet ((pick () (binary-search-cdf cdf (random 1.0d0 st))))
+      (declare (inline pick))
+      (cond
+        ((and (eq dtype :int64)
+              (typep src-data '(simple-array (signed-byte 64) (*))))
+         (let ((d (the (simple-array (signed-byte 64) (*)) (vt-data out)))
+               (s (the (simple-array (signed-byte 64) (*)) src-data)))
+           (dotimes (i n) (setf (aref d i) (aref s (+ src-offset (pick)))))))
+        ((and (eq dtype :float64)
+              (typep src-data '(simple-array double-float (*))))
+         (let ((d (the (simple-array double-float (*)) (vt-data out)))
+               (s (the (simple-array double-float (*)) src-data)))
+           (dotimes (i n) (setf (aref d i) (aref s (+ src-offset (pick)))))))
+        ((and (eq dtype :float32)
+              (typep src-data '(simple-array single-float (*))))
+         (let ((d (the (simple-array single-float (*)) (vt-data out)))
+               (s (the (simple-array single-float (*)) src-data)))
+           (dotimes (i n) (setf (aref d i) (aref s (+ src-offset (pick)))))))
+        (t
+         (let ((d (vt-data out)))
+           (with-float-safe
+             (dotimes (i n)
+               (setf (aref d i)
+                     (%vt-cast-raw (aref src-data (+ src-offset (pick))) dtype))))))))
+    out))
+
+(defun %shuffle-axis (tensor ax dim rng)
+  "沿 AX 做一次 Fisher–Yates 原地打乱，返回 TENSOR。
+
+   **抽样序列与改前完全相同**：交换对仍是
+   `(i, (random (1+ i) rng))`，`i` 从 `dim-1` 递减到 1（`%RANDOM` 的调用次数与
+   顺序都没变），所以同一个 seed 给出同一个排列。
+
+   变的只是「怎么把排列作用到数据上」。改前每一步
+   `vt-slice ×2 + vt-copy + vt-copy-into ×2` —— 四次分配，而 1M 行就是 4M 次
+   分配，1M×8 的 f64 实测 974 ms（numpy 634 ms）。现在先算出目标位置（一趟
+   纯下标交换），再用一次 `VT-TAKE` 沿轴 gather，然后 `VT-COPY-INTO` 写回：
+   随机访问从「每行 2 次读写」降到「每行 1 次读」，1M×8 到 121 ms。"
+  (let ((idx (make-array dim :element-type '(signed-byte 64))))
+    (dotimes (i dim) (setf (aref idx i) i))
+    (loop for i from (1- dim) downto 1
+          do (rotatef (aref idx i) (aref idx (random (1+ i) rng))))
+    (let ((iv (%make-vt :data idx :shape (list dim) :strides '(1)
+                        :offset 0 :dtype :int64)))
+      (vt-copy-into tensor (vt-take tensor iv :axis ax))))
+  tensor)
+
+
 (defun vt-random (shape &key (dtype :float64) (rng nil))
   "U[0,1) 均匀采样。仅支持浮点 dtype：
    整型 dtype 下 truncate(U[0,1)) 恒为 0（静默全 0 陷阱），
@@ -207,10 +415,7 @@
     (error "vt-random: dtype 必须为 :float64/:float32（整型输入会因截断静默全 0），得到 ~a；~
             整型随机数请使用 vt-random-int / vt-random-integers" dtype))
   (setf rng (%ensure-random-state rng))
-  (vt-map (lambda (x)
-            (declare (ignore x))
-            (vt-cast (%uniform-rand rng) dtype))
-          (vt-zeros shape :dtype dtype)))
+  (%fill-uniform (vt-zeros shape :dtype dtype) rng 0.0d0 1.0d0))
 
 (defun vt-random-uniform
     (shape &key (low 0.0d0) (high 1.0d0) (dtype :float64) (rng nil))
@@ -234,10 +439,7 @@
       (if (= low high)
           (vt-full shape low :dtype dtype)
           (let ((range (- high low)))
-            (vt-map (lambda (x)
-                      (declare (ignore x))
-                      (vt-cast (+ low (* range (%uniform-rand rng))) dtype))
-                    (vt-zeros shape :dtype dtype)))))))
+            (%fill-uniform (vt-zeros shape :dtype dtype) rng low range))))))
 
 (defun vt-random-normal
     (shape &key (mean 0.0d0) (std 1.0d0) (dtype :float64) (rng nil))
@@ -259,12 +461,7 @@
       (setf rng (%ensure-random-state rng))
       (if (zerop std)
           (vt-full shape mean :dtype dtype)
-          (let ((res (vt-zeros shape :dtype dtype)))
-            (vt-do-each (ptr val res)
-              (declare (ignore val))
-              (setf (aref (vt-data res) ptr)
-                    (vt-cast (+ mean (* std (%normal-rand rng))) dtype)))
-            res)))))
+          (%fill-normal (vt-zeros shape :dtype dtype) rng mean std)))))
 
 (defun vt-random-int
     (low high &key (size nil) (dtype :int64) (rng nil))
@@ -281,11 +478,7 @@
             (vt-full size low :dtype dtype)
             (make-vt nil low :dtype dtype))
         (if size
-            (vt-astype (vt-map (lambda (x)
-                                 (declare (ignore x))
-                                 (+ low (random range rng)))
-                               (vt-zeros size :dtype dtype))
-                       dtype)
+            (%fill-int-range (vt-zeros size :dtype dtype) rng low range)
             (make-vt nil (+ low (random range rng)) :dtype dtype)))))
 
 (defun vt-random-integers
@@ -348,12 +541,16 @@
         (error "vt-random-choice: p 的总和必须为正（否则无法归一化成概率），收到总和 ~a"
                (reduce #'+ pw))))
     (let ((cdf (when pw
-                 (let ((total (reduce #'+ pw)))
-                   (let ((cum 0.0d0))
-                     (coerce (mapcar (lambda (w)
-                                       (incf cum (/ w total)) cum)
-                                     pw)
-                             'vector))))))
+                 ;; 就地构造成 (simple-array double-float (*))：二分内核按强类型
+                 ;; 声明读它，`(coerce … 'vector)` 的通用 AREF 会慢三倍。
+                 ;; 数值上仍是「依次累加 w/total」，与改前同一个累积顺序。
+                 (let* ((total (reduce #'+ pw))
+                        (out (make-array n :element-type 'double-float))
+                        (cum 0.0d0))
+                   (loop for w in pw for i from 0
+                         do (incf cum (/ w total))
+                            (setf (aref out i) cum))
+                   out))))
       (when (and (not replace) size)
         (when (> size-total n)
           (error "vt-random-choice: replace=nil 时 size 总数 (~a) 不能大于 n (~a)"
@@ -363,11 +560,8 @@
              (aref src-data (+ src-offset (random n rng))))
 
            (sample-weighted-replace ()
-             (let ((r (random 1.0d0 rng)))
-               (loop for i from 0 below n
-                     when (<= r (aref cdf i))
-                       return (aref src-data (+ src-offset i))
-                     finally (return (aref src-data (+ src-offset (1- n)))))))
+             (aref src-data (+ src-offset
+                               (binary-search-cdf cdf (random 1.0d0 rng)))))
 
            (sample-uniform-no-replace-batch (k)
              (let ((idx (make-array n :element-type 'fixnum
@@ -426,13 +620,12 @@
              result))
 
           (t
+           ;; 有放回：唯一的每元素路径。改前是 `VT-DO-EACH` + 每元素一次 `VT-CAST`
+           ;; （216 ns/次的自带陷阱屏蔽），加权分支还要在 CDF 上线性扫。
            (let ((result (vt-zeros size-shape :dtype out-dtype)))
-             (vt-do-each (ptr val result)
-               (declare (ignore val))
-               (setf (aref (vt-data result) ptr)
-                     (vt-cast (if cdf (sample-weighted-replace)
-                                  (sample-uniform-replace))
-                              out-dtype)))
+             (if cdf
+                 (%fill-choice-weighted result rng cdf src-data src-offset)
+                 (%fill-choice-uniform result rng src-data src-offset n))
              result)))))))
 
 (defun vt-random-permutation (n &key (rng nil))
@@ -451,13 +644,7 @@
       (let* ((tensor (ensure-vt n))
              (result (vt-copy tensor))
              (first-dim (first (vt-shape result))))
-        (loop for i from (1- first-dim) downto 1 do
-          (let* ((j (random (1+ i) rng))
-                 (si (vt-slice result (list i)))
-                 (sj (vt-slice result (list j))))
-            (let ((tmp (vt-copy si)))
-              (vt-copy-into si sj)
-              (vt-copy-into sj tmp))))
+        (%shuffle-axis result 0 first-dim rng)
         result)))
 
 (defun vt-random-shuffle (tensor &key (axis 0) (rng nil))
@@ -466,17 +653,7 @@
   (let* ((ax (vt-normalize-axis axis (length (vt-shape tensor))))
          (dim (nth ax (vt-shape tensor))))
     (when (<= dim 1) (return-from vt-random-shuffle tensor))
-    (loop for i from (1- dim) downto 1 do
-      (let* ((j (random (1+ i) rng))
-             (si (apply #'vt-slice tensor
-                        (loop for d below (length (vt-shape tensor))
-                              collect (if (= d ax) (list i) '(:all)))))
-             (sj (apply #'vt-slice tensor
-                        (loop for d below (length (vt-shape tensor))
-                              collect (if (= d ax) (list j) '(:all))))))
-        (let ((tmp (vt-copy si)))
-          (vt-copy-into si sj)
-          (vt-copy-into sj tmp))))
+    (%shuffle-axis tensor ax dim rng)
     tensor))
 
 (defun vt-random-multinomial (n pvals &key (size nil) (rng nil))
@@ -524,24 +701,17 @@
                                  (reduce #'* (if (listp size)
                                                  size (list size)))
                                  1)))
-          (dotimes (trial total-trials)
-            (let ((counts (make-array k :element-type '(signed-byte 64)
-                                        :initial-element 0)))
+          ;; counts 提出循环外复用（每 trial 一次 `FILL` 而不是一次分配）：
+          ;; size 大时这是 total-trials 次 `MAKE-ARRAY` 的差别。
+          (let ((counts (make-array k :element-type '(signed-byte 64)
+                                      :initial-element 0)))
+            (dotimes (trial total-trials)
+              (fill counts 0)
               (dotimes (_ n)
-                (let ((r (random 1.0d0 rng)))
-                  (let ((idx (binary-search-cdf cdf r)))
-                    (incf (aref counts idx)))))
+                (incf (aref counts (binary-search-cdf cdf (random 1.0d0 rng)))))
               (loop for i from 0 below k
                     do (setf (aref res-data (+ (* trial k) i))
                              (aref counts i)))))
           result)))))
 
-(defun binary-search-cdf (cdf r)
-  (let ((lo 0) (hi (length cdf)))
-    (loop while (< lo hi) do
-      (let ((mid (floor (+ lo hi) 2)))
-        (if (< (aref cdf mid) r)
-            (setf lo (1+ mid))
-            (setf hi mid))))
-    (min lo (1- (length cdf)))))
 

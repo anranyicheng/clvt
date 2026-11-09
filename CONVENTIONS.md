@@ -1244,6 +1244,74 @@ double/int64，所以结果要 `vt-astype` 回落一次 —— 值都来自原�
 编码「O(1) 不能依赖值的形状」** —— 这一条是这轮踩坑之后补的，前四条都
 抓不到它）。
 
+#### 7.4.16 随机采样：抽样不贵，写回贵
+
+`vt-random` / `vt-random-uniform` / `vt-random-normal` / `vt-random-int` 从 v0.3
+起都是同一个写法：先 `vt-zeros` 建数组，再用 `vt-map` 的**匿名 lambda** 逐元素覆盖，
+lambda 里还要 `vt-cast` 一次。
+
+两处固定成本都落在每元素上，而抽样本身几乎免费：
+
+| 1M 个 U[0,1) | 耗时 |
+|---|---:|
+| 纯 `(random 1.0d0 state)` × 1M（不写数组） | **5.5 ms** |
+| 内联循环写入 `(simple-array double-float)` | **5.6** |
+| `vt-map` + 具名算子（无 `vt-cast`） | 12.8 |
+| `vt-map` + 匿名 lambda + `vt-cast`（改前） | **208** |
+
+也就是说 208 ms 里 200 ms 是 `VT-CAST` 的 `WITH-FLOAT-SAFE`（216 ns/次，§7.1 与
+`VT-CAST` 自己的 docstring 都写着「批量调用方应当在外层包一次」）—— 抽样一分钱
+没花，全花在每次进出读写 FPU 控制字上。
+
+| 用例 | 改前 | 改后 | numpy 2.4.6 |
+|---|---:|---:|---:|
+| `vt-random-uniform` 1M | 208 ms | **7.5** | 2.5 |
+| `vt-random-normal` 1M | 251 | **35** | 10.4 |
+| `vt-random-int` 1M | 15 | **9.0** | 1.8 |
+| `vt-random-choice` 等概率 1M | 273 | **9.5** | 1.8 |
+| `vt-random-choice` 加权 k=1000、1M | **2881** | **69** | 66 |
+| `vt-random-shuffle` 1M×8 f64 | 974 | **118** | 635 |
+| `vt-random-shuffle` 100k×4 f64 | 79 | **5.5** | 54 |
+
+另外两处不是「通用件」的问题，是算法：
+
+- **加权抽样的 CDF 是线性扫的。** `(loop for i from 0 below n when (<= r (aref cdf i))
+  return …)`，每样本平均扫 k/2 项。k=1000、样本 1M 时是 5×10⁸ 次比较。改成二分
+  （`BINARY-SEARCH-CDF`，并把 `cdf` 就地造成 `(simple-array double-float (*))`
+  而不是 `(coerce … 'vector)`）：3471 → 151 ms（纯二分），端到端 2881 → 69 ms。
+  等价性是严格的：线性版找「第一个 `cdf[i] >= r`」，二分版找的也是这个，末尾兜底
+  `(1- k)` 也一样。
+- **打乱是「每一步交换整行」。** 每次交换要 2×`VT-SLICE` + `VT-COPY` +
+  2×`VT-COPY-INTO` —— 四分配，1M 行就是 4M 次分配。改成「先算目标位置（一趟纯
+  下标交换），再用一次 `VT-TAKE` 沿轴 gather，最后 `VT-COPY-INTO` 写回」：
+  随机访问从每行 2 次读写降到 1 次读，1M×8 从 974 到 118 ms（numpy 635 ms）。
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| 批量采样不用 `VT-MAP` + lambda | 按 dtype 展开强类型写入循环（`%FILL-UNIFORM` 等） | `VT-MAP` 只内联 `(function <符号>)`（§7.4.7）；lambda 退回 `(apply #'vt-map …)`，每元素一次 funcall + 泛型 AREF + 装箱 |
+| 批量采样不在循环里调 `VT-CAST` | 目标的转换规则在**循环外**决定，循环里只有一次 `COERCE` 或一次 `%VT-CAST-RAW` | `VT-CAST` = `WITH-FLOAT-SAFE` + 裸内核，屏蔽层 216 ns/次。通用分支要自己在外层包一次，否则 NaN → 整数会触发 `FLOATING-POINT-INVALID-OPERATION` |
+| `:float32` 目标要「先算后舍入」 | `(coerce (+ low (* range u)) 'single-float)`，不要在单精度里累加 | 与改前 `(vt-cast …)` 的逐位一致，是整组改动等价性的基础 |
+| `LOW` / `RANGE` 不是 double 时不提前 `COERCE` | 只有 `(typep low 'double-float)` 成立才走特化分支，否则回退通用路径 | 一次提前的 `coerce` 会改变运算域（ratio 与单精度都会），结果是「看起来更快、值不一样」 |
+| 概率抽样在 CDF 上二分，不线性扫 | `BINARY-SEARCH-CDF`（内联，强类型声明） | 每样本 O(k) → O(log k)。k 小的时候看不出来，k=1000 时是 20 倍 |
+| 加权抽样的 CDF 直接用 `(simple-array double-float)` | 不用 `(coerce list 'vector)` | 二分内核按强类型声明读它；通用 `AREF` 上慢三倍 |
+| 打乱「先算排列，再 gather」 | `%SHUFFLE-AXIS`：纯下标 Fisher–Yates → `VT-TAKE` → `VT-COPY-INTO` | 逐步交换整行是每步 4 次分配；gather 让每行只被随机读一次 |
+| 换实现时**不许动抽样调用序列** | 每元素恰好一次 `RANDOM`，`(random (1+ i))` 的递减顺序不变 | 同一个 seed 必须给出同一串值 —— 这是唯一能逐位对拍的等价性契约，也是用户拿去复现实验的凭据 |
+
+`vt-random-permutation` 的整数版（纯数据交换，1M 22.5 ms）与 `vt-random-multinomial`
+的内核没有改算法，只把 counts 数组提出循环外复用。
+
+等价性由 `test/random-exec-test.lisp` 守护（108 条）：四个采样入口与**逐字复刻的
+改动前实现**同 seed 逐位对拍（shape 3/1000/4×5/2×3×4/0、7 种 dtype、`low`/`high`
+含 ±0、`low=high`、整数、单精度、ratio、0 维），`vt-random-choice` 三分支同 seed
+对拍（含张量 `p`、含零权重、单点权重、无放回无重复），`shuffle`/`permutation` 同
+seed 对拍（2D 双轴、3D 三轴、**转置视图写回**、多重集不变），另加语义点（可复现、
+不同 seed 不同、dtype/shape、拒绝整型、1M 的均值/方差、加权经验频率 ±0.01）。
+六条机器无关护栏：`uniform ÷ random-int ≤ 3×`（抓「循环里塞回 `VT-CAST`」，
+改前 13.9×）、`choice 均匀 ÷ random-int ≤ 3×`、`normal ÷ uniform ≤ 10×`、
+`uniform ÷ vt-zeros ≤ 30×`、`choice 加权 ÷ 均匀(k=500) ≤ 20×`（抓「退回线性扫
+CDF」，改前 271×）、`shuffle ÷ permutation(1M) ≤ 12×`（抓「退回逐步交换整行」，
+改前 41×）。
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有

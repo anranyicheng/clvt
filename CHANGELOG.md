@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-11-11（六十五）— perf: 随机采样的写回层重做，最多 42 倍
+
+这一轮查的是 `random.lisp` —— 全库唯一一个不带任何性能注释的文件。四个采样入口
+（`vt-random` / `vt-random-uniform` / `vt-random-normal` / `vt-random-int`）从
+v0.3 起都是同一个写法：`vt-zeros` 建数组，再用 `vt-map` 的**匿名 lambda** 逐元素
+覆盖，lambda 里还要 `vt-cast` 一次。
+
+抽样本身几乎免费 —— 同一个 random-state 上纯 `(random 1.0d0)` 一千万次只要 5.5 ms：
+
+| 1M 个 U[0,1) | 耗时 |
+|---|---:|
+| 纯 `(random 1.0d0 state)` × 1M（不写数组） | **5.5 ms** |
+| 内联循环写入 `(simple-array double-float)` | **5.6** |
+| `vt-map` + 具名算子（无 `vt-cast`） | 12.8 |
+| `vt-map` + 匿名 lambda + `vt-cast`（改前） | **208** |
+
+208 里的 200 是 `VT-CAST` 每次套的那层 `WITH-FLOAT-SAFE`（216 ns/次）。也就是说
+抽样一分钱没花，全花在每元素进出读写一次 FPU 控制字上 —— §7.1 与 `VT-CAST` 自己
+的 docstring 都写着「批量调用方应当在外层包一次」，只是这个文件没照做。
+
+| 用例 | 改前 | 改后 | 倍率 | numpy 2.4.6 |
+|---|---:|---:|---:|---:|
+| `vt-random-uniform` 1M | 208 ms | **7.5** | 28× | 2.5 |
+| `vt-random-normal` 1M | 251 | **35** | 7.2× | 10.4 |
+| `vt-random-int` 1M | 15 | **9.0** | 1.7× | 1.8 |
+| `vt-random-choice` 等概率 1M | 273 | **9.5** | 29× | 1.8 |
+| `vt-random-choice` 加权 k=1000、1M | **2881** | **69** | **42×** | 66 |
+| `vt-random-shuffle` 1M×8 f64 | 974 | **118** | 8.3× | 635 |
+| `vt-random-shuffle` 100k×4 f64 | 79 | **5.5** | 14× | 54 |
+
+**第二组：加权抽样的 CDF 是线性扫的。** 每样本平均扫 k/2 项，k=1000、样本 1M 时
+是 5×10⁸ 次比较。改成二分（并把 `cdf` 就地造成 `(simple-array double-float (*))`
+而不是 `(coerce … 'vector)`）：纯二分 3471 → 151 ms，端到端 2881 → 69 ms。
+等价性是严格的：线性版找「第一个 `cdf[i] >= r`」，二分版找的也是这个，末尾兜底
+`(1- k)` 也一样。改后 69 ms 已经越过 numpy 的 66 ms。
+
+**第三组：打乱是「每一步交换整行」。** 每次交换 2×`vt-slice` + `vt-copy` +
+2×`vt-copy-into` —— 四分配，1M 行就是 4M 次分配。改成「先算目标位置（一趟纯下标
+交换），再用一次 `vt-take` 沿轴 gather，最后 `vt-copy-into` 写回」：随机访问从
+每行 2 次读写降到 1 次读，1M×8 从 974 到 118 ms（numpy 635 ms，它也是逐步交换
+整行，所以这一格反而快 5 倍）。
+
+**等价性的契约是抽样调用序列。** 每个元素仍然恰好一次 `RANDOM`，`(random (1+ i))`
+的递减顺序不变 —— 同一个 seed 必须给出同一串值，这是用户拿去复现实验的凭据。
+所以测试不是「钉死几个数」，而是与**逐字复刻的改动前实现**同 seed 逐位对拍：
+shape 3/1000/4×5/2×3×4/0 × 7 种 dtype × `low`/`high` 含 ±0、`low=high`、整数、
+单精度、ratio，`normal` 三组 `mean`/`std`，`choice` 三分支（含张量 `p`、含零权重、
+单点权重、无放回无重复），`shuffle`/`permutation`（2D 双轴、3D 三轴、转置视图
+写回、多重集不变）。新增 `test/random-exec-test.lisp`（108 条），六条机器无关
+倍率护栏，其中 `choice 加权 ÷ 均匀(k=500) ≤ 20×`（改前 271×）与
+`shuffle ÷ permutation(1M) ≤ 12×`（改前 41×）分别守着这两个算法级退化。
+
 ## 2026-11-10（六十四）— perf: 集合运算改归并、会员判定换整数键，最多 341 倍
 
 这一轮查的是「多集合/查表」这一族：`vt-intersect1d` / `vt-setdiff1d` /
