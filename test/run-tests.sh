@@ -55,6 +55,7 @@ SUITES[linalg-fast-path-test]="LINALG 双路径测试 (lu/qr/solve/chol/eig: 差
 SUITES[test-copy-into]="41 vt-copy-into 正确性测试 + 复数×非连续 typed-walk (转置/翻转/3-D 置换/非连续 dest 与独立参照逐位相等 + c128T 拷贝 ≤8× 实数线护栏)"
 SUITES[bool-dtype-test]="327 布尔 dtype 测试 (52 例 numpy 逐例对照: 内容测试/比较/逻辑/any-all(轴·keepdims·空·NaN)/isclose·array_equal·allclose/isin·in1d/astype 真值化/sum 升 int64 + dtype 契约·0/1 不变量·打印·npy |b1 往返 + 布尔算术语义 + 逻辑视图/物理视图分层与四个内部解包点 + vt-ref 布尔化·setf·vt-view bool→uint8|int8·from-sequence 的 T/NIL 叶子与 0 维标量·flatten :bool·vt-put 布尔标量)"
 SUITES[io-interop-test]="77 vt-load/vt-save 持久化与 numpy .npy 互操作测试（含 NaN payload 逐位/视图字节等价/不变性/覆盖语义）"
+SUITES[io-exec-test]="可执行层序列化测试 (npy 整块拷贝与逐元素路径逐字节对拍 × 11 dtype × 5 形状 + lisp 流式写与旧 prin1 逐字符相同 + 往返语义 + 倍率护栏)"
 SUITES[test-simd-batch-matmul]="5 SIMD 批量矩阵乘测试"
 SUITES[gemm-avx512-test]="49 AVX-512 f64 GEMM 机器码内核测试 (EVEX 发射器/掩码尾块/写边界哨兵/非对齐 SAP; 与 sb-simd 内核逐位对照, n%4 的尾部标量列按 §7.3 放宽为 ≤1e-15 且必须只落在这些列)"
 SUITES[test-bug0]="37 已知 bug 回归测试"
@@ -226,6 +227,7 @@ DEFAULT_ORDER=(
     differential-probes-test2
     bool-dtype-test
     io-interop-test
+    io-exec-test
     manip-interop-test
     test-all
     example-smoke-test

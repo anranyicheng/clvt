@@ -683,6 +683,105 @@
                                 (- e 150)))))))
 
 ;;; ------------------------------------------------------------------
+;;; 数据区整块重解释（执行层）
+;;;
+;;; npy 数据区恒为「小端、紧凑、无 padding」，而 SBCL 在 x86-64 上的
+;;; specialized array 内存布局与它**逐字节相同**：f8 = 8 字节 IEEE-754，
+;;; i8 = 8 字节补码，c16 = 两个相邻的 f8，|b1 / |u1 = 1 字节。
+;;; 也就是说，只要张量 C 连续且本机小端，数据区本身就是「已编码好的
+;;; 字节」，不需要逐元素走 `%NPY-ENCODE-BITS`（位模式重建）+ `%SET-UINT-LE!`
+;;; （逐字节拆分），也不需要读回时逐元素走 `%UINT-LE-AT` + `%BITS->F64`。
+;;;
+;;; 逐元素路径对每个元素付「函数调用 + 泛型 AREF + 装箱」三笔固定成本，
+;;; 整块拷贝则是一趟线性搬字。1M 元素（8 MB）实测：
+;;;   · `vt-save :as :npy`   143 → 19 ms（其中 16 ms 是内核写盘）
+;;;   · `vt-load :as :npy`   200 → 7.7 ms
+;;;
+;;; 前提只有两条（都在运行时判，不满足就回退逐元素路径，结果逐位一致）：
+;;;   1. 本机小端（大端机上 specialized array 的字节序与 npy 相反）；
+;;;   2. 张量 C 连续且 offset 为 0（视图/切片仍走通用路径）。
+;;; ------------------------------------------------------------------
+
+(defparameter *native-little-endian-p*
+  (let ((b (make-array 2 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (sb-sys:with-pinned-objects (b)
+      (setf (sb-sys:sap-ref-16 (sb-sys:vector-sap b) 0) #x0102))
+    ;; 小端时低地址字节是 0x02
+    (= (aref b 0) #x02))
+  "本机内存是否为小端（npy 数据区恒为小端，整块拷贝只在两端一致时成立）。")
+
+(defparameter *npy-fast-copy* t
+  "是否允许 npy 数据区走整块字节拷贝。
+
+   置 NIL 可强制逐元素路径 —— 两条路径的输出必须逐字节相同
+   （`test/io-exec-test.lisp` 据此对拍，并以此量出整块拷贝的收益）。
+   与 `*enable-parallel-matmul*` 同类：只影响选路，不影响结果。")
+
+(defun %raw-byte-copy (src src-off dst dst-off nbytes)
+  "把 SRC 的 SRC-OFF 字节起 NBYTES 个字节原样拷进 DST 的 DST-OFF 起。
+
+   SRC / DST 的元素类型**可以不同**（例如 double-float 数组 → unsigned-byte 8
+   缓冲），两端都按字节视图处理：`%MEMCPY`（core.lisp）要求同 dtype，跨类型
+   就得退回 `replace` 的泛型序列路径，所以这里直接走 SAP。
+   不含指针元素（T 数组）不是本函数的目标，调用方只传 specialized array。
+
+   搬运顺序是 8 → 4 → 1 字节递减：x86-64 上 `sap-ref-64` 允许非对齐访问，
+   一次搬一个字；尾部不足 8 字节的部分用 4 / 1 字节收干净。"
+  (declare (type fixnum src-off dst-off nbytes))
+  (sb-sys:with-pinned-objects (src dst)
+    (let ((s (sb-sys:vector-sap src))
+          (d (sb-sys:vector-sap dst))
+          (i 0))
+      (declare (type fixnum i))
+      (loop while (<= (+ i 8) nbytes)
+            do (setf (sb-sys:sap-ref-64 d (+ dst-off i))
+                     (sb-sys:sap-ref-64 s (+ src-off i)))
+               (incf i 8))
+      (loop while (<= (+ i 4) nbytes)
+            do (setf (sb-sys:sap-ref-32 d (+ dst-off i))
+                     (sb-sys:sap-ref-32 s (+ src-off i)))
+               (incf i 4))
+      (loop while (< i nbytes)
+            do (setf (sb-sys:sap-ref-8 d (+ dst-off i))
+                     (sb-sys:sap-ref-8 s (+ src-off i)))
+               (incf i)))
+    nbytes))
+
+(defun %npy-copy-out (vt buf)
+  "把 C 连续张量的数据区整块拷进 BUF（npy 数据区字节缓冲），成功返回 T。
+   不满足整块条件时返回 NIL，调用方回退逐元素编码（两者字节完全相同）。"
+  (let* ((dtype (vt-dtype vt))
+         (nbytes (* (vt-size vt) (vt-dtype-itemsize dtype))))
+    (and *npy-fast-copy*
+         *native-little-endian-p*
+         (plusp (vt-size vt))
+         (zerop (vt-offset vt))
+         (vt-contiguous-p vt)
+         (= (length buf) nbytes)
+         (%raw-byte-copy (vt-data vt) 0 buf 0 nbytes)
+         t)))
+
+(defun %npy-decode-direct (oct dtype count)
+  "把 OCT（npy 数据区字节）整块重解释为 DTYPE 的 lisp 元素数组；不可行返回 NIL。
+
+   `:bool` 的一趟后处理不能省：numpy 的 |b1 只写 0/1，但别的工具可能写
+   任意字节，逐元素路径会把它真值化成 0/1（§17.1 的不变量），整块拷贝
+   不经过这道判定，所以补一趟单字节扫描（每元素一次比较，比解码便宜得多）。"
+  (let* ((itemsize (vt-dtype-itemsize dtype))
+         (nbytes (* count itemsize)))
+    (when (and *npy-fast-copy*
+               *native-little-endian-p*
+               (plusp count)
+               (= (length oct) nbytes))
+      (let ((buf (make-array count :element-type (vt-dtype->lisp-type dtype))))
+        (%raw-byte-copy oct 0 buf 0 nbytes)
+        (when (eq dtype :bool)
+          (dotimes (i count)
+            (when (/= (aref buf i) 0)
+              (setf (aref buf i) 1))))
+        buf))))
+
+;;; ------------------------------------------------------------------
 ;;; 小端字节装配
 ;;; ------------------------------------------------------------------
 
@@ -894,30 +993,34 @@
 ;;; ------------------------------------------------------------------
 
 (defun %npy-encode-data-buffer (vt)
-  "把张量按行主序逻辑顺序编码为 npy 数据区字节向量（小端、紧凑）。"
+  "把张量按行主序逻辑顺序编码为 npy 数据区字节向量（小端、紧凑）。
+
+   缓冲**不预清零**：两条路径都保证写满每一个字节（整块拷贝按 nbytes 全写，
+   逐元素路径每元素写满 itemsize）。8 MB 缓冲的 `:INITIAL-ELEMENT 0` 实测
+   要 5.6 ms —— 比真正的拷贝（1.7 ms）还贵，纯属白写一遍再被覆盖。"
   (let* ((dtype (vt-dtype vt))
          (itemsize (vt-dtype-itemsize dtype))
          (n (vt-size vt))
          (buf (make-array (* n itemsize)
-                          :element-type '(unsigned-byte 8)
-                          :initial-element 0)))
-    (with-float-safe
-      (let ((k 0))
-        (declare (fixnum k))
-        (vt-do-each (ptr val vt)
-          (declare (ignore ptr))
-          (if (vt-complex-dtype-p dtype)
-              ;; 复数：实部、虚部各按分量宽度写成一个小端字（interleaved，
-              ;; 与 numpy 的 <c16 / <c8 布局逐字节一致）
-              (let* ((half (floor itemsize 2))
-                     (base (* k itemsize))
-                     (bits-fn (if (= half 8) #'%f64-bits #'%f32-bits)))
-                (%set-uint-le! buf base
-                               (funcall bits-fn (realpart val)) half)
-                (%set-uint-le! buf (+ base half)
-                               (funcall bits-fn (imagpart val)) half))
-              (%set-uint-le! buf (* k itemsize) (%npy-encode-bits dtype val) itemsize))
-          (incf k))))
+                          :element-type '(unsigned-byte 8))))
+    (unless (%npy-copy-out vt buf)
+      (with-float-safe
+        (let ((k 0))
+          (declare (fixnum k))
+          (vt-do-each (ptr val vt)
+            (declare (ignore ptr))
+            (if (vt-complex-dtype-p dtype)
+                ;; 复数：实部、虚部各按分量宽度写成一个小端字（interleaved，
+                ;; 与 numpy 的 <c16 / <c8 布局逐字节一致）
+                (let* ((half (floor itemsize 2))
+                       (base (* k itemsize))
+                       (bits-fn (if (= half 8) #'%f64-bits #'%f32-bits)))
+                  (%set-uint-le! buf base
+                                 (funcall bits-fn (realpart val)) half)
+                  (%set-uint-le! buf (+ base half)
+                                 (funcall bits-fn (imagpart val)) half))
+                (%set-uint-le! buf (* k itemsize) (%npy-encode-bits dtype val) itemsize))
+            (incf k)))))
     buf))
 
 (defun %npy-f-strides (shape)
@@ -1048,17 +1151,64 @@
              (count (reduce #'* shape))
              (needed (* count (vt-dtype-itemsize dtype))))
         (%npy-check-data-length total data-start needed descr shape)
-        (let ((oct (%read-n-octets s needed "数据区")))
-          (%make-vt-from-raw (%npy-decode-data oct dtype count)
-                             shape dtype fortran-order))))))
+        (let* ((oct (%read-n-octets s needed "数据区"))
+               ;; C 序且本机小端：整块重解释，跳过逐元素 `%UINT-LE-AT` + `%BITS->F64`；
+               ;; fortran_order=True 仍需按列主序散布（走下面通用的 raw 路径）。
+               (direct (and (not fortran-order)
+                            (%npy-decode-direct oct dtype count))))
+          (if direct
+              (%make-vt :data direct
+                        :shape shape
+                        :strides (vt-compute-strides shape)
+                        :offset 0
+                        :dtype dtype)
+              (%make-vt-from-raw (%npy-decode-data oct dtype count)
+                                 shape dtype fortran-order)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; lisp 格式（s-expression）
 ;;; ------------------------------------------------------------------
 
+(defun %encode-lisp-element* (dtype x)
+  "同 `%ENCODE-LISP-ELEMENT`，但**不**自带 `WITH-FLOAT-SAFE`。
+
+   批量写路径（`%WRITE-LISP-ELEMENTS`）已经在外层屏蔽了一次浮点陷阱，
+   每个元素再包一层实测 216 ns/次 —— 1M 元素就是 216 ms，是
+   `vt-save :as :lisp` 里最大的一笔固定成本。调用方必须自己保证处于
+   屏蔽上下文（`%NAN-P` / `%POS-INF-P` / `%CISFINITE` 都要读浮点标志）。"
+  (cond
+    ((member dtype '(:float64 :float32))
+     (cond ((%nan-p x) :nan)
+           ((%pos-inf-p x) :inf)
+           ((%neg-inf-p x) :neg-inf)
+           (t x)))
+    ((vt-complex-dtype-p dtype)
+     (if (%cisfinite x)
+         x
+         (let ((rdt (vt-complex-real-dtype dtype)))
+           (list :cx (%encode-lisp-element* rdt (realpart x))
+                     (%encode-lisp-element* rdt (imagpart x))))))
+    (t x)))
+
+(defun %encode-lisp-element (dtype x)
+  "张量元素 → lisp 格式元素：非有限浮点编码为关键字，其余原样。
+
+   复数（§16.18）：两个分量都有限时直接写 `#C(re im)`（Lisp reader 原生可读）；
+   只要有一个分量非有限，就写成 `(:CX re im)` 列表，分量各自再编码为
+   :NAN/:INF/:NEG-INF —— `#C(:NAN 1d0)` 不是合法 Lisp 字面量，无法读回。
+
+   本函数自带陷阱屏蔽，供单元素调用；批量路径请直接用 `%ENCODE-LISP-ELEMENT*`。"
+  (if (or (member dtype '(:float64 :float32))
+          (vt-complex-dtype-p dtype))
+      (with-float-safe (%encode-lisp-element* dtype x))
+      x))
+
 (defun %lisp-data-vector (vt)
   "行主序逻辑数据向量；非有限浮点编码为 :NAN / :INF / :NEG-INF 关键字
-   （Lisp reader 严格往返；有限浮点以可读数字原样存储）。"
+   （Lisp reader 严格往返；有限浮点以可读数字原样存储）。
+
+   保留此函数供单点调试/核对用；`VT-SAVE :AS :LISP` 走的是
+   `%WRITE-LISP-ELEMENTS` 的流式路径（不建中间向量、不重复屏蔽陷阱）。"
   (let ((dtype (vt-dtype vt))
         (vec (make-array (vt-size vt) :initial-element 0)))
     (with-float-safe
@@ -1066,46 +1216,53 @@
         (declare (fixnum k))
         (vt-do-each (ptr val vt)
           (declare (ignore ptr))
-          (setf (aref vec k) (%encode-lisp-element dtype val))
+          (setf (aref vec k) (%encode-lisp-element* dtype val))
           (incf k))))
     vec))
 
-(defun %encode-lisp-element (dtype x)
-  "张量元素 → lisp 格式元素：非有限浮点编码为关键字，其余原样。
+(defun %write-lisp-elements (s vt)
+  "把 VT 的逻辑元素按行主序逐个 PRIN1 到流 S（元素间单空格分隔）。
 
-   复数（§16.18）：两个分量都有限时直接写 `#C(re im)`（Lisp reader 原生可读）；
-   只要有一个分量非有限，就写成 `(:CX re im)` 列表，分量各自再编码为
-   :NAN/:INF/:NEG-INF —— `#C(:NAN 1d0)` 不是合法 Lisp 字面量，无法读回。"
-  (cond
-    ((member dtype '(:float64 :float32))
-     (with-float-safe
-       (cond ((%nan-p x) :nan)
-             ((%pos-inf-p x) :inf)
-             ((%neg-inf-p x) :neg-inf)
-             (t x))))
-    ((vt-complex-dtype-p dtype)
-     (with-float-safe
-       (if (%cisfinite x)
-           x
-           (let ((rdt (vt-complex-real-dtype dtype)))
-             (list :cx (%encode-lisp-element rdt (realpart x))
-                       (%encode-lisp-element rdt (imagpart x)))))))
-    (t x)))
+   两处相对旧实现的改动：
+     1. 不再先建 1M 元素的中间向量 —— 旧路径要为每个元素写一次泛型向量，
+        `prin1` 整棵树时再逐元素读回来；
+     2. 浮点陷阱在**外层**屏蔽一次，元素编码走 `%ENCODE-LISP-ELEMENT*`。
+   输出仍是合法 s-expression（末元素之后的空格被 reader 忽略）。"
+  (let ((dtype (vt-dtype vt))
+        (k 0))
+    (declare (fixnum k))
+    (with-float-safe
+      (vt-do-each (ptr val vt)
+        (declare (ignore ptr))
+        (when (plusp k) (write-char #\Space s))
+        (prin1 (%encode-lisp-element* dtype val) s)
+        (incf k)))))
 
 (defun %save-lisp-format (vt path)
-  "把张量写为 clvt lisp 格式文本文件（单个可读 s-expression）。"
+  "把张量写为 clvt lisp 格式文本文件（单个可读 s-expression）。
+
+   前两版都是「先 `%LISP-DATA-VECTOR` 建一整条中间向量，再 `prin1` 整棵树」：
+   1M 元素要多写一遍泛型向量、printer 再遍历一遍。现在头尾手写、数据区
+   逐元素流式输出，头尾字段顺序与旧文件完全一致，旧 reader 无需改动。"
   (with-open-file (s path :direction :output :if-exists :supersede
                           :if-does-not-exist :create)
     (let ((*print-readably* t)
           (*print-pretty* nil)
           (*print-length* nil)
-          (*print-level* nil))
-      (prin1 (list :clvt-tensor
-                   :version 1
-                   :shape (vt-shape vt)
-                   :dtype (vt-dtype vt)
-                   :data (%lisp-data-vector vt))
-             s)
+          (*print-level* nil)
+          (*print-circle* nil)
+          (*print-base* 10)
+          (*print-radix* nil))
+      (format s "(:CLVT-TENSOR :VERSION 1 :SHAPE ~a :DTYPE ~s :DATA #("
+              ;; 0 维张量的 shape 是 NIL，`prin1` 写出来是 `NIL` 而不是 `()` ——
+              ;; 两者 reader 等价，但输出必须与旧文件**逐字符**一致（旧 reader
+              ;; 里 `(listp nil)` 为真，两种都能读）。
+              (if (vt-shape vt)
+                  (format nil "(~{~a~^ ~})" (vt-shape vt))
+                  "NIL")
+              (vt-dtype vt))
+      (%write-lisp-elements s vt)
+      (write-string "))" s)
       (terpri s))))
 
 (defun %decode-lisp-element (dtype v)
@@ -1171,25 +1328,48 @@
       (error "vt-load: ~a 不是有效的 clvt lisp 格式（空文件）" path))
     (multiple-value-bind (shape dtype data) (%validate-lisp-form form path)
       (let* ((count (reduce #'* shape))
-             (elems (coerce data 'list)))
+             ;; 旧实现在这里 `(coerce data 'list)`：1M 元素要 cons 出 1M 个
+             ;; 单元（约 16 MB 垃圾），随后 `%MAKE-VT-FROM-LIST` 再用 `LOOP FOR
+             ;; … IN` 走一遍链。改成 simple-vector 后两端都是 O(1) 索引。
+             (elems (if (vectorp data) data (coerce data 'simple-vector))))
         (unless (= (length elems) count)
           (error "vt-load: :data 长度 ~a 与 shape ~a 期望的 ~a 不符"
                  (length elems) (or shape :0-d) count))
-        (%make-vt-from-list elems shape dtype)))))
+        (%make-vt-from-seq elems shape dtype)))))
 
-(defun %make-vt-from-list (elems shape dtype)
-  "按行主序元素列表构造 C 连续 vt。"
-  (let ((buf (make-array (length elems)
-                         :element-type (vt-dtype->lisp-type dtype)
-                         :initial-element (vt-dtype-default-value dtype))))
-    (loop for v in elems
-          for k of-type fixnum from 0
-          do (setf (aref buf k) (%decode-lisp-element dtype v)))
+(defun %make-vt-from-seq (elems shape dtype)
+  "按行主序元素序列 ELEMS（向量或列表）构造 C 连续 vt。
+
+   四种最常见的 dtype 走「元素已是目标类型就直写」的分支：读回来的
+   `1.0d0` 本来就是 double-float，不必每元素先 `(funcall (vt-cast-fun dtype)
+   v)` 再判一次关键字。类型不符（例如文件里写 `1` 而 dtype 是 :FLOAT64）
+   与非法值仍落回 `%DECODE-LISP-ELEMENT`，报错文案一字不改。"
+  (let* ((n (length elems))
+         (lt (vt-dtype->lisp-type dtype))
+         (elems (if (vectorp elems) elems (coerce elems 'simple-vector)))
+         (buf (make-array n :element-type lt
+                            :initial-element (vt-dtype-default-value dtype))))
+    (declare (type fixnum n))
+    (macrolet ((fill-with (test)
+                 `(dotimes (k n)
+                    (let ((v (aref elems k)))
+                      (setf (aref buf k)
+                            (if ,test v (%decode-lisp-element dtype v)))))))
+      (cond ((eq lt 'double-float)     (fill-with (typep v 'double-float)))
+            ((eq lt 'single-float)     (fill-with (typep v 'single-float)))
+            ((eq lt '(signed-byte 64)) (fill-with (typep v '(signed-byte 64))))
+            ((eq lt '(signed-byte 32)) (fill-with (typep v '(signed-byte 32))))
+            (t (dotimes (k n)
+                 (setf (aref buf k) (%decode-lisp-element dtype (aref elems k)))))))
     (%make-vt :data buf
               :shape shape
               :strides (vt-compute-strides shape)
               :offset 0
               :dtype dtype)))
+
+(defun %make-vt-from-list (elems shape dtype)
+  "按行主序元素列表构造 C 连续 vt（`%MAKE-VT-FROM-SEQ` 的列表入口）。"
+  (%make-vt-from-seq elems shape dtype))
 
 ;;; ------------------------------------------------------------------
 ;;; 保存入口

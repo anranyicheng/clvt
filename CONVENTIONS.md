@@ -1312,6 +1312,76 @@ seed 对拍（2D 双轴、3D 三轴、**转置视图写回**、多重集不变�
 CDF」，改前 271×）、`shuffle ÷ permutation(1M) ≤ 12×`（抓「退回逐步交换整行」，
 改前 41×）。
 
+#### 7.4.17 序列化：npy 数据区本来就是「已经编好的字节」
+
+`vt-save :as :npy` / `vt-load :as :npy` 原先对每个元素做一遍「拆位模式 → 逐字节写」
+和「逐字节读 → 拼位模式」：写侧是 `%NPY-ENCODE-BITS`（用 `integer-decode-float`
+重建 IEEE-754 位模式）+ `%SET-UINT-LE!`（一个字节一个字节 `setf`）；读侧是
+`%UINT-LE-AT`（逐字节 `logior` 拼回）+ `%BITS->F64`（用 `scale-float` 重建浮点），
+产物还先落进一个 T 元素的普通向量，再由 `%MAKE-VT-FROM-RAW` 逐元素复制进
+specialized array。
+
+问题在于这套动作**结果等于输入**：npy 数据区恒为「小端、紧凑、无 padding」，
+而 SBCL 在 x86-64 上的 specialized array 布局与它逐字节相同 ——
+
+| dtype | npy descr | lisp 元素类型 | 单元素宽度 |
+|---|---|---|---:|
+| `:float64` | `<f8` | `double-float` | 8 |
+| `:float32` | `<f4` | `single-float` | 4 |
+| `:int64` / `:int32` / `:int16` / `:int8` | `<i8` / `<i4` / `<i2` / `\|i1` | 对应补码 | 8/4/2/1 |
+| `:uint16` / `:uint8` / `:bool` | `<u2` / `\|u1` / `\|b1` | `(unsigned-byte 16/8)` | 2/1/1 |
+| `:complex128` / `:complex64` | `<c16` / `<c8` | `(complex double/single-float)` 相邻两分量 | 16/8 |
+
+于是整个数据区**本来就已经是编码好的字节**，逐元素做一遍只是把同样的位模式拆开
+再拼回去，还顺带付了「函数调用 + 泛型 AREF + 装箱」三笔每元素固定成本。
+
+| 1M 元素 | 改前 | 改后 |
+|---|---:|---:|
+| `vt-save :as :npy`（f64，8 MB） | 143 ms | **19** |
+| `vt-load :as :npy`（f64，8 MB） | 200 | **7.7** |
+| `vt-save :as :npy`（c128，16 MB） | 250 | **40** |
+| `vt-load :as :npy`（c128，16 MB） | 390 | **16** |
+| `vt-save :as :lisp`（f64） | 669 | 467 |
+| `vt-load :as :lisp`（f64） | 436 | 346 |
+
+`vt-save` 剩下的 19 ms 里 **16 ms 是内核写盘**（同一块 8 MB 缓冲 `write-sequence`
+单趟就要 16 ms，约 500 MB/s）—— 已经到 I/O 下限，不是本库的问题。`vt-load` 的
+7.7 ms 则已经低于同规模纯拷贝的两倍。
+
+`%NPY-DECODE-DIRECT` 之前还要多付一笔：`(make-array n :element-type '(unsigned-byte 8)
+:initial-element 0)` 的**零填充本身**比拷贝还贵（8 MB 实测 5.6 ms vs 拷贝 1.7 ms），
+而缓冲随后会被整块覆盖。数据区缓冲一律不预清零。
+
+`:lisp` 文本格式另有两笔固定成本，与「整块重解释」无关：
+
+- 写：先 `%LISP-DATA-VECTOR` 建一整条 1M 元素的中间向量，`prin1` 整棵树时再
+  逐元素读一遍；且 `%ENCODE-LISP-ELEMENT` 在**每个元素**上套一次 `WITH-FLOAT-SAFE`
+  （216 ns/次，§7.4.16 同一个坑）。改成「头尾手写 + 数据区逐元素流式 `prin1`、
+  陷阱在外层屏蔽一次」后，1M 元素从 669 降到 467 ms —— 剩下的 383 ms 就是
+  SBCL 打印一个 double 的固有成本（`prin1` 逐元素 1M 次实测 383 ms），换不掉。
+- 读：`(coerce data 'list)` 为 1M 元素 cons 一遍，随后 `LOOP FOR … IN` 走链、
+  每元素再 `(funcall (vt-cast-fun dtype) v)`；改成 `simple-vector` + 「元素已是
+  目标类型就直写」的四个分支后 436 → 346 ms，剩下的主要是 reader 本身的成本。
+
+| 约定 | 内容 | 为什么 |
+|---|---|---|
+| npy 数据区先试「整块重解释」 | `%NPY-COPY-OUT` / `%NPY-DECODE-DIRECT`，条件不满足才逐元素 | 逐元素是 20~26 倍的成本，而两者输出**逐字节相同** |
+| 整块条件三条，全部运行时判 | 本机小端（`*NATIVE-LITTLE-ENDIAN-P*`）× C 连续 × `offset` 为 0 | 大端机、视图、切片都必须回退；`offset` 参与判断是因为 `vt-data` 起点不等于逻辑起点 |
+| 跨元素类型拷贝走 SAP，不走 `%MEMCPY` | `%RAW-BYTE-COPY`（8 → 4 → 1 字节递减） | `%MEMCPY` 要求两端同 dtype；跨类型只能退回 `replace` 的泛型序列路径 |
+| 数据区缓冲不预清零 | `(make-array n :element-type '(unsigned-byte 8))`，不带 `:initial-element` | 两条路径都写满每个字节；8 MB 的零填充要 5.6 ms，比拷贝本身还贵 |
+| `\|b1` 整块解码后补一趟真值化 | 单字节扫描，非 0 改 1 | numpy 只写 0/1，别的工具可能写任意字节；逐元素路径会真值化，整块路径不经过这道判定 |
+| 选路开关与结果解耦 | `*NPY-FAST-COPY*` 置 NIL 即强制逐元素 | 唯一能逐字节对拍的等价性契约，也是量出收益的唯一手段 |
+| lisp 文本格式**一个字符都不许变** | 头尾手写但字段与顺序照旧 | 旧文件必须仍可读，新文件必须能被旧 reader 读；`test/io-exec-test.lisp` 用「旧实现逐字符对拍」守住 |
+| 批量写元素不在每元素上屏蔽浮点陷阱 | `%ENCODE-LISP-ELEMENT*` 要求调用方已在屏蔽上下文 | `WITH-FLOAT-SAFE` 216 ns/次，1M 元素就是 216 ms |
+
+等价性由 `test/io-exec-test.lisp` 守护：11 种 dtype × 5 种形状（1 维 / 2 维 / 3 维 /
+0 维 / 空）× 编码与解码两侧，与**逐字复刻的改动前实现**逐字节 / 逐位对拍
+（NaN payload 与 `-0.0` 符号位单独钉死）；三个非连续视图（转置 / 翻转 / 转置+翻转）
+另测；lisp 文本用「旧实现的 `prin1` 整棵树」逐字符对拍（含 `:NAN` / `:INF` /
+`:NEG-INF` 与 `#C(…)` / `(:CX …)` 两种复数形式）；往返覆盖 11 dtype × 5 形状 ×
+2 格式。四条倍率护栏：`编码 逐元素 ÷ 整块 ≥ 8×`、`解码 逐元素 ÷ 整块 ≥ 4×`、
+`整块解码 ÷ 纯拷贝 ≤ 3×`、`lisp 写 旧 ÷ 新 ≥ 1.2×`。
+
 ### 7.5 f64 GEMM 不切 sb-simd 的 512 位通路（已实测否决）
 
 SBCL 2.6.9 起 `sb-simd` 带 AVX-512（`(require :sb-simd)` 后有
