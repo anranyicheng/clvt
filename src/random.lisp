@@ -631,9 +631,11 @@
 (defun vt-random-permutation (n &key (rng nil))
   "返回 0..n-1 的随机排列，或打乱给定张量（对标 numpy.random.permutation）。"
   (setf rng (%ensure-random-state rng))
+  ;; numpy.random.permutation(n)：n<=0 返回空数组，n=1 返回 [0]。
+  ;; 旧写法 (<= n 1) 把负数也当 n=1，permutation(-1) 错误返回 [0]。
   (when (and (integerp n) (<= n 1))
     (return-from vt-random-permutation
-      (vt-arange (if (zerop n) 0 1) :dtype :int64)))
+      (vt-arange (if (<= n 0) 0 1) :dtype :int64)))
   (if (integerp n)
       (let* ((arr (vt-arange n :dtype :int64))
              (data (vt-data arr)))

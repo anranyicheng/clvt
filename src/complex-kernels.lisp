@@ -121,17 +121,30 @@
 (defun %cop-abs (z)
   "复数模（实数输出）。abs(inf+nan·i)=inf，与 numpy 的 hypot 语义一致。
 
-   快路径：|x|、|y| 都在 [1e-150, 1e150] 内时直接 sqrt(x²+y²)
+   快路径：|x|、|y| 都在安全量级内时直接 sqrt(x²+y²)
    （1 sqrt + 2 mul，约 5ns）；只有可能上溢/下溢的极端量级才走
    带缩放的 %CX-HYPOT。numpy 恒用 hypot（每元素 2 次除法），
-   1M 元素比这里慢约 3 倍。"
+   1M 元素比这里慢约 3 倍。
+
+   安全阈值必须按分量精度分档：快路径计算 x²+y²，其溢出/下溢边界取决于
+   浮点格式的指数范围 —— double 的 x² 在 |x|≈1e154 上溢、≈1e-154 下溢，
+   single 的 x² 在 |x|≈1e19 上溢、≈1e-19 下溢。旧实现不分档，对 c64
+   一律用 double 口径的 [1e-150,1e150]，于是 c64 的 #C(1e30,1e30) 直接
+   sqrt((1e30)²+…) → +Inf（numpy 为 1.414e30）、#C(1e-25,1e-25) → 0.0
+   （numpy 为 1.414e-25）。该内核被 %COP-LOG / VT-NORM 复用，错误会级联。"
   (cond ((%cx-inf-p z) (%cx-inf-of z 1))
         ((%cx-nan-p z) (%cx-nan-of z))
         (t
-         (let ((x (%creal z)) (y (%cimag z)))
-           (if (and (< (abs x) 1d150) (< (abs y) 1d150)
-                    (or (zerop x) (> (abs x) 1d-150))
-                    (or (zerop y) (> (abs y) 1d-150)))
+         (let* ((x (%creal z))
+                (y (%cimag z))
+                ;; single 分量用 ≈1e±18 的保守阈值；double 分量维持 1e±150。
+                ;; 判据取 x/y 中较低精度者，保证 x²+y² 不越界。
+                (single-p (not (typep x 'double-float)))
+                (hi (if single-p 1.0e18 1d150))
+                (lo (if single-p 1.0e-18 1d-150)))
+           (if (and (< (abs x) hi) (< (abs y) hi)
+                    (or (zerop x) (> (abs x) lo))
+                    (or (zerop y) (> (abs y) lo)))
                (sqrt (+ (* x x) (* y y)))
                (%cx-hypot x y))))))
 

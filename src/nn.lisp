@@ -335,7 +335,15 @@
                                     (%leaky-alpha->double alpha)
                                     :dtype :float64)
                        :float32)))
-          (if out (vt-copy-into out narrow) narrow)))))
+          ;; float64 分支的 VT-FAST-MAP 内部会做 VT-CHECK-OUT；这一分支此前
+          ;; 直接用 VT-COPY-INTO 写 OUT，绕过 H1–H4 硬校验：OUT 的 shape /
+          ;; dtype 不匹配时静默按「能装就装」转换。补上同一套校验，与同族
+          ;; 激活函数（VT-SIGMOID/VT-RELU 等）一致（CONVENTIONS §4.6 机制 D）。
+          (if out
+              (vt-copy-into (vt-check-out out (vt-shape narrow) :float32
+                                          :op-name "vt-leaky-relu")
+                            narrow)
+              narrow)))))
 
 (defun vt-swish (vt &key dtype out)
   "Swish / SiLU 激活：x * sigmoid(x)。
@@ -473,24 +481,38 @@
       (vt-- shifted lse :dtype dtype :out out))))
 
 (defun vt-mean-squared-error (y-true y-pred &key dtype out)
-  "均方误差：mean((y_true - y_pred)²)。结果为标量（float64）。"
-  (vt-mean (vt-square (vt-- y-true y-pred :dtype dtype) :dtype dtype)
-	   :dtype dtype :out out))
+  "均方误差：mean((y_true - y_pred)²)。结果为标量（float64）。
+   整数输入按 §3.4 提升 float64 计算（旧实现走整数 VT-SQUARE，大残差会溢出）。"
+  (let* ((dt (%nn-float-dtype
+              (if (vt-p y-pred) y-pred y-true) dtype))
+         (y (%nn-as-float y-true dt))
+         (p (%nn-as-float y-pred dt)))
+    (vt-mean (vt-square (vt-- y p :dtype dt) :dtype dt)
+             :dtype dt :out out)))
 
 (defun vt-binary-cross-entropy (y-true y-pred &key (eps 1.0d-7) dtype out)
-  "二元交叉熵（对标 torch.nn.BCELoss）。p 含 NaN 时损失为 NaN；EPS 用于裁剪 log 的自变量避免 log(0)。"
-  ;; NaN 语义对标 torch.BCELoss：p 含 NaN 时损失必须为 NaN，
-  ;; 裁剪前显式判断（min/max 在 NaN 上比较恒 nil 会把 NaN 静默替换为 1-eps）。
-  (vt-mean (vt-map (lambda (y p)
-                     (let* ((pc (if (and (floatp p) (not (= p p)))
-                                    p
-                                    (max eps (min (- 1.0d0 eps) p))))
-                            (omp (if (and (floatp pc) (not (= pc pc)))
-                                     pc
-                                     (max eps (- 1.0d0 pc)))))
-                       (- (+ (* y (log pc)) (* (- 1.0d0 y) (log omp))))))
-                   y-true y-pred :dtype dtype)
-           :dtype dtype :out out))
+  "二元交叉熵（对标 torch.nn.BCELoss）。p 含 NaN 时损失为 NaN；EPS 用于裁剪 log 的自变量避免 log(0)。
+   整数输入按 §3.4 提升 float64 计算（旧实现让 EPS 裁剪在整数 dtype 上失效，
+   例 int y=[1,0,1] p=[0,1,0] 得 16.0，numpy 为 16.118）。"
+  ;; §3.4：nn 损失函数输出恒为浮点，不得依赖 VT-MAP 的 dtype=nil 缺省推导
+  ;; （那会让整数进→整数出，EPS 裁剪 [1e-7,1-1e-7] 被截断成 0/1）。
+  ;; 先用 %NN-FLOAT-DTYPE 推导、%NN-AS-FLOAT 规范两个输入，再全程传 DT。
+  (let* ((dt (%nn-float-dtype
+              (if (vt-p y-pred) y-pred y-true) dtype))
+         (y (%nn-as-float y-true dt))
+         (p (%nn-as-float y-pred dt)))
+    ;; NaN 语义对标 torch.BCELoss：p 含 NaN 时损失必须为 NaN，
+    ;; 裁剪前显式判断（min/max 在 NaN 上比较恒 nil 会把 NaN 静默替换为 1-eps）。
+    (vt-mean (vt-map (lambda (y p)
+                       (let* ((pc (if (and (floatp p) (not (= p p)))
+                                      p
+                                      (max eps (min (- 1.0d0 eps) p))))
+                              (omp (if (and (floatp pc) (not (= pc pc)))
+                                       pc
+                                       (max eps (- 1.0d0 pc)))))
+                         (- (+ (* y (log pc)) (* (- 1.0d0 y) (log omp))))))
+                     y p :dtype dt)
+             :dtype dt :out out)))
 
 (defun vt-cross-entropy (y-true y-pred &key (eps 1.0d-7) dtype out)
   "多类交叉熵（**概率/one-hot 输入**）。逐样本取 -Σ y·log(p) 后取均值；
@@ -505,12 +527,19 @@
    历史说明：本函数早期把「对标 torch.nn.CrossEntropyLoss」写进文档，
    但 torch 的该 API 实为 logits+索引语义，二者并不一致。现已把文档
    修正为本函数真实语义，对标需求由 vt-cross-entropy-logits 承担。"
-  (let* ((p-clipped (vt-clip y-pred eps (- 1.0d0 eps) :dtype dtype))
-         (log-prob (vt-log p-clipped :dtype dtype))
-         (loss-per-sample (vt-- (vt-sum (vt-* y-true log-prob :dtype dtype)
-					:axis -1 :dtype dtype)
-                                :dtype dtype)))
-    (vt-mean loss-per-sample :dtype dtype :out out)))
+  ;; §3.4：与 vt-binary-cross-entropy 同 —— 先推导浮点 DT、规范两输入，
+  ;; 再全程传 DT。旧实现的 EPS 裁剪在整数 y-pred 上失效（clip 后仍是 0/1），
+  ;; 虽多数用例侥幸得到正确整数部分，但浮点精度与 NaN 裁剪均不可靠。
+  (let* ((dt (%nn-float-dtype
+              (if (vt-p y-pred) y-pred y-true) dtype))
+         (y (%nn-as-float y-true dt))
+         (p (%nn-as-float y-pred dt))
+         (p-clipped (vt-clip p eps (- 1.0d0 eps) :dtype dt))
+         (log-prob (vt-log p-clipped :dtype dt))
+         (loss-per-sample (vt-- (vt-sum (vt-* y log-prob :dtype dt)
+					:axis -1 :dtype dt)
+                                :dtype dt)))
+    (vt-mean loss-per-sample :dtype dt :out out)))
 
 (defun %ce-flatten (x)
   "把嵌套 list / 张量摊平成标量列表（用于类别索引越界检查）。"

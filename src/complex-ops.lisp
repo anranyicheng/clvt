@@ -1136,8 +1136,17 @@
 
 (defun %cx-op-vdot (a b &key dtype out)
   "向量点积（对标 numpy.vdot）。复数：**第一个操作数取共轭**
-   （vdot(a,b) = Σ conj(a)·b，与 numpy 一致；vt-dot 不取共轭）。"
-(vt-dot (vt-conj (ensure-vt a)) (ensure-vt b) :dtype dtype :out out))
+   （vdot(a,b) = Σ conj(a)·b，与 numpy 一致；vt-dot 不取共轭）。
+
+   与实数层 vt-vdot 一样必须先把两输入展平：numpy.vdot 忽略原始形状，
+   恒按展平后的一维内积计算并返回标量。旧实现直接把 2-D 输入喂给
+   VT-DOT，得到 (2 2) 矩阵而非标量 —— 例：两个 2×2 复数矩阵，numpy.vdot
+   返回标量 204+0j，旧实现返回 2×2 矩阵。这里先 VT-RAVEL 两输入再相乘。"
+(let ((af (vt-ravel (ensure-vt a)))
+      (bf (vt-ravel (ensure-vt b))))
+  (when (/= (vt-size af) (vt-size bf))
+    (error "vt-vdot: 输入元素个数不一致（~a vs ~a）" (vt-size af) (vt-size bf)))
+  (vt-dot (vt-conj af) bf :dtype dtype :out out)))
 
 
 ;;; ------------------------------------------------------------------

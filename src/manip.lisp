@@ -486,14 +486,19 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
          (dim-size (nth ax shape)))
     (cond
       ((integerp indices-or-sections)
-       (let* ((n indices-or-sections)
-              (base (floor dim-size n))
-              (rem (rem dim-size n)))
+       (let* ((n indices-or-sections))
+         ;; 段数必须为正：numpy 对 0 抛 ZeroDivisionError、对负数抛
+         ;; "number sections must be larger than 0"。旧实现 n=0 时裸除零、
+         ;; n<0 时静默返回空列表，都不是可读的确定性报错（L2 底线）。
+         (unless (plusp n)
+           (error "vt-split: 段数必须为正，收到 ~a" n))
+         (let ((base (floor dim-size n))
+               (rem (rem dim-size n)))
          (loop with start = 0
                for i from 0 below n
                for chunk = (if (< i rem) (1+ base) base)
                collect (prog1 (vt-narrow tensor ax start (+ start chunk))
-                         (incf start chunk)))))
+                         (incf start chunk))))))
       ((listp indices-or-sections)
        (let ((points (append '(0) indices-or-sections (list dim-size))))
          (setf points (mapcar (lambda (p) (if (minusp p) (+ p dim-size) p)) points))

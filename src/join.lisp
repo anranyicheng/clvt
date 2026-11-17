@@ -672,9 +672,14 @@ NaN/Inf：纯数据搬运，逐位保留。
                                             (vt-size tensor-vt))
                                         "vt-delete"))
                  ((vt-p positions)
-                  (let ((flat (vt-flatten positions)))
-                    (loop for i below (vt-size flat)
-                          collect (truncate (aref (vt-data flat) i)))))
+                  ;; §9.2 索引 dtype 契约：非空浮点索引必须报错，不得静默
+                  ;; 截断（0.5 → 0）。与 take/put/choose/insert 一致走
+                  ;; %CHECK-INTEGER-INDEX；空索引放行（合法 no-op）。
+                  (progn
+                    (%check-integer-index "vt-delete 的 positions" positions)
+                    (let ((flat (vt-flatten positions)))
+                      (loop for i below (vt-size flat)
+                            collect (truncate (aref (vt-data flat) i))))))
                  ((listp positions) positions)
                  (t (list positions)))))
     (if (null axis)

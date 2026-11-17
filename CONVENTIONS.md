@@ -406,13 +406,14 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 
 #### 机制 D：把"out 正确性"下沉为库级原语
 
-重构新增：
+以 `src/parcontract.lisp` 的实际签名为准（早期草案里的名字 `vt-out-view` 从未落地，勿再引用）：
 
 ```lisp
-(vt-out-view shape dtype out &key op-name)
-;; 1. 逐条执行 H1–H5 硬校验（op-name 用于错误信息）
-;; 2. 返回 out 本身（保证 out.offset/strides 原样）
+(vt-check-out out shape dtype &key op-name)
+;; 1. 逐条执行 H1–H4 硬校验（类型 / shape / dtype 精确匹配 / 可写；op-name 用于错误信息）
+;; 2. 校验通过返回 out 本身（保证 out.offset/strides 原样）
 ;; 3. 不做任何连续化，不复制
+(vt-check-out-dtype-consistency op-name dtype out)   ; H5：:dtype 与 :out 一致
 ```
 
 以及
@@ -423,6 +424,8 @@ FLOAT64:FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64 FLOAT64
 ```
 
 **所有**带 `:out` 的函数必须经由这两个原语，杜绝各函数自行拼装检查逻辑（MECE：一个检查点，一处修改）。
+
+> **现状提示**：`vt-check-out` 的覆盖面尚未达到"所有" —— 带 `:out` 的公开函数里仍有一部分走各自文件内的检查路径（见 `grep -rn vt-check-out src/`）。新写代码一律走原语；存量函数的收敛是持续任务，勿以本条已全覆盖为由跳过校验。
 
 #### 机制 E：einsum 路由
 
@@ -1436,7 +1439,11 @@ VMOVUPS    ZMM26, ZMM0        ; ← 40 条 FMA 后面跟了 34 条这个
 
 ### 8.2 源文件加载顺序（`:serial t`）
 
-`package → util → iterator → nan → dtype → core → map-reduce → io → creation → manip → indexing → join → elementwise → reduce-stats → setops → random → linalg → simd-matmul → nn → rotate → extensions → extensions2 → extensions3`
+以 `clvt.asd` 的 `:components` 为准（本库含条件加载组件 `#+sbcl`）：
+
+`package → util → iterator → nan → dtype → core → dispatch → complex-kernels → parcontract → map-reduce → simd-ew(#+sbcl) → io → creation → manip → indexing → join → elementwise → elementwise1 → elementwise2 → reduce-stats → setops → random → linalg → gemm-avx512(#+sbcl) → simd-matmul(#+sbcl) → nn → rotate → extensions → extensions2 → extensions3 → complex → complex-ops → complex-linalg`
+
+要点：`dispatch` / `complex-kernels` 前移到所有归属文件之前（复数分派判据与标量内核必须最早可用）；三个 `complex*.lisp` 纯内核层最后加载。**旧版的 22 文件顺序清单已作废**，不要据它判断加载顺序。
 
 **约定**：新增源文件必须插入到正确位置，且**不得**引入前向依赖（除通过 `defvar` 声明的回调钩子，如 `*simd-matmul-2d-fn*`）。
 
