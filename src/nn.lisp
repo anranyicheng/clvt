@@ -335,10 +335,7 @@
                                     (%leaky-alpha->double alpha)
                                     :dtype :float64)
                        :float32)))
-          ;; float64 分支的 VT-FAST-MAP 内部会做 VT-CHECK-OUT；这一分支此前
-          ;; 直接用 VT-COPY-INTO 写 OUT，绕过 H1–H4 硬校验：OUT 的 shape /
-          ;; dtype 不匹配时静默按「能装就装」转换。补上同一套校验，与同族
-          ;; 激活函数（VT-SIGMOID/VT-RELU 等）一致（CONVENTIONS §4.6 机制 D）。
+          ;; :out 经 VT-CHECK-OUT 执行 H1–H4 硬校验，与同族激活函数一致。
           (if out
               (vt-copy-into (vt-check-out out (vt-shape narrow) :float32
                                           :op-name "vt-leaky-relu")
@@ -482,7 +479,7 @@
 
 (defun vt-mean-squared-error (y-true y-pred &key dtype out)
   "均方误差：mean((y_true - y_pred)²)。结果为标量（float64）。
-   整数输入按 §3.4 提升 float64 计算（旧实现走整数 VT-SQUARE，大残差会溢出）。"
+   整数输入按 §3.4 提升 float64 计算。"
   (let* ((dt (%nn-float-dtype
               (if (vt-p y-pred) y-pred y-true) dtype))
          (y (%nn-as-float y-true dt))
@@ -492,11 +489,8 @@
 
 (defun vt-binary-cross-entropy (y-true y-pred &key (eps 1.0d-7) dtype out)
   "二元交叉熵（对标 torch.nn.BCELoss）。p 含 NaN 时损失为 NaN；EPS 用于裁剪 log 的自变量避免 log(0)。
-   整数输入按 §3.4 提升 float64 计算（旧实现让 EPS 裁剪在整数 dtype 上失效，
-   例 int y=[1,0,1] p=[0,1,0] 得 16.0，numpy 为 16.118）。"
-  ;; §3.4：nn 损失函数输出恒为浮点，不得依赖 VT-MAP 的 dtype=nil 缺省推导
-  ;; （那会让整数进→整数出，EPS 裁剪 [1e-7,1-1e-7] 被截断成 0/1）。
-  ;; 先用 %NN-FLOAT-DTYPE 推导、%NN-AS-FLOAT 规范两个输入，再全程传 DT。
+   整数输入按 §3.4 提升 float64 计算。"
+  ;; §3.4：先用 %NN-FLOAT-DTYPE 推导浮点 DT、%NN-AS-FLOAT 规范两输入，全程传 DT。
   (let* ((dt (%nn-float-dtype
               (if (vt-p y-pred) y-pred y-true) dtype))
          (y (%nn-as-float y-true dt))
@@ -527,9 +521,7 @@
    历史说明：本函数早期把「对标 torch.nn.CrossEntropyLoss」写进文档，
    但 torch 的该 API 实为 logits+索引语义，二者并不一致。现已把文档
    修正为本函数真实语义，对标需求由 vt-cross-entropy-logits 承担。"
-  ;; §3.4：与 vt-binary-cross-entropy 同 —— 先推导浮点 DT、规范两输入，
-  ;; 再全程传 DT。旧实现的 EPS 裁剪在整数 y-pred 上失效（clip 后仍是 0/1），
-  ;; 虽多数用例侥幸得到正确整数部分，但浮点精度与 NaN 裁剪均不可靠。
+  ;; §3.4：先推导浮点 DT、规范两输入，全程传 DT。
   (let* ((dt (%nn-float-dtype
               (if (vt-p y-pred) y-pred y-true) dtype))
          (y (%nn-as-float y-true dt))

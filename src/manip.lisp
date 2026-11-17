@@ -487,9 +487,7 @@ v0.4.2 起支持，此前负索引/越界直接报错）。规约后 end < start
     (cond
       ((integerp indices-or-sections)
        (let* ((n indices-or-sections))
-         ;; 段数必须为正：numpy 对 0 抛 ZeroDivisionError、对负数抛
-         ;; "number sections must be larger than 0"。旧实现 n=0 时裸除零、
-         ;; n<0 时静默返回空列表，都不是可读的确定性报错（L2 底线）。
+         ;; 段数必须为正，否则报确定性错误。
          (unless (plusp n)
            (error "vt-split: 段数必须为正，收到 ~a" n))
          (let ((base (floor dim-size n))

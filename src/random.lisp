@@ -348,15 +348,11 @@
     out))
 
 (defun %fill-choice-identity (out st n)
-  "a 为整数时的有放回均匀抽样快路径。此时 source=arange(n)，故
-   source[i] ≡ i，抽样值恰为 (random n st) 本身 —— 无需构造并随机索引
-   一个 n 元素的 source 数组（原路径对 n=1e6 是 8 MB + 100 万次随机访存，
-   实测 choice 比 random-int 慢 ~5×，触发 E 段倍率护栏）。
+  "a 为整数时的有放回均匀抽样快路径。此时 source=arange(n)，source[i] ≡ i，
+   抽样值恰为 (random n st) 本身，无需构造并随机索引 n 元素的 source 数组。
 
-   与通用路径同 seed **逐位一致**：两者每个元素都恰好调用一次
-   (random n st)，且 arange(n)[i] = i；(random n st) 的返回值即该索引，
-   arange 在该索引处存的值也正是 i。按 OUT 的 dtype 收敛后值完全相同。
-   每个元素一次写入，无 VT-CAST、无二次数组访问。"
+   与通用路径同 seed 逐位一致：每元素恰好一次 (random n st)，按 OUT 的
+   dtype 收敛后值相同。每个元素一次写入。"
   (let ((m (vt-size out))
         (dtype (vt-dtype out)))
     (declare (type fixnum m n))
@@ -658,9 +654,8 @@
              (cond
                (cdf
                 (%fill-choice-weighted result rng cdf src-data src-offset))
-               ;; a 为整数 ⇒ source=arange(n)，值恰为 (random n)：走 identity
-               ;; 快路径，省掉 source 数组的构造与随机访存（同 seed 逐位一致）。
-               ;; a 为张量 ⇒ source 值不再是 i，必须走通用路径按索引取值。
+               ;; a 为整数 ⇒ source=arange(n)，值恰为 (random n)，走 identity 快路径；
+               ;; a 为张量 ⇒ source 值不是 i，走通用路径按索引取值。
                ((integerp a)
                 (%fill-choice-identity result rng n))
                (t
@@ -671,7 +666,6 @@
   "返回 0..n-1 的随机排列，或打乱给定张量（对标 numpy.random.permutation）。"
   (setf rng (%ensure-random-state rng))
   ;; numpy.random.permutation(n)：n<=0 返回空数组，n=1 返回 [0]。
-  ;; 旧写法 (<= n 1) 把负数也当 n=1，permutation(-1) 错误返回 [0]。
   (when (and (integerp n) (<= n 1))
     (return-from vt-random-permutation
       (vt-arange (if (<= n 0) 0 1) :dtype :int64)))

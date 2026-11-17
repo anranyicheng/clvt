@@ -713,11 +713,7 @@
    报错）；语义为 `round(分量/divisor)*divisor`，与实数路径一致。
    NaN / ±Inf 原样传播。  :out 契约同 vt-+。"
 (let* ((in (ensure-vt tensor))
-       ;; 必须用已 ENSURE-VT 的 IN 取 dtype：分派判据 %CX-ANY-P 会认 list
-       ;; 入参（如 (vt-round (list #C(1.2 3.4)))），而原始 TENSOR 此时还是
-       ;; list，直接 (vt-dtype tensor) 会抛 TYPE-ERROR。同库 %CX-OP-ABS 等
-       ;; 内核均用 (vt-dtype in)，这里对齐（CONVENTIONS §16.32.2）。
-       ;; 注意用 LET*（DT 依赖 IN），并行 LET 会让 DT 取到未绑定的 IN。
+       ;; 用已 ENSURE-VT 的 IN 取 dtype（接受 list 入参）；LET* 保证 DT 依赖的 IN 已绑定。
        (dt (or dtype (vt-dtype in))))
   (when (complexp divisor)
     (error "vt-round: 复数路径的 :divisor 必须是实数（CONVENTIONS §16.5）"))
@@ -1828,10 +1824,7 @@
          (d (vt-diagonal m :offset offset :axis1 axis1 :axis2 axis2))
          ;; 同实数层：对角线轴在末尾，沿 -1 收缩 → 保留其余轴
          (r (vt-sum d :axis -1 :dtype dt)))
-    ;; :out 必须走 VT-CHECK-OUT 执行 H1–H5 硬校验（形状/dtype 精确匹配、
-    ;; 可写）。旧实现用 VT-COPY-INTO 直接写入，是复数层唯一绕过校验的
-    ;; :out 路径：复矩阵 trace 写进 f64 out 会静默丢虚部且不报错。同文件
-    ;; 的 MATMUL/DOT/OUTER 均已改走 VT-CHECK-OUT，这里补齐一致性。
+    ;; :out 走 VT-CHECK-OUT 执行 H1–H5 硬校验（形状/dtype 精确匹配、可写）。
     (if out (progn (vt-copy-into (vt-check-out out (vt-shape r) dt
                                                :op-name "vt-trace")
                                  r)

@@ -814,10 +814,7 @@
    整型输入整型出（保持 dtype）；浮点输入同 dtype（NaN/±Inf 按 |x| 传播）。
    复数输入返回实模（c128→f64、c64→f32），与 vt-abs 完全一致。
    :out 契约同 vt-abs（形状/dtype 精确匹配、可写）。"
-  ;; 复数必须委托给 VT-ABS 的分派内核：VT-ABS 有 %CX-ANY-P 守卫，会把复数
-  ;; 路由到 %CX-OP-ABS（结果取实 dtype）。旧实现直接 VT-FAST-MAP #'ABS，
-  ;; 复数走实数 ABS 后 dtype 由输入提升决定（complex 保持 complex），
-  ;; 输出仍是复数（如 #C(3,4) → 5.0+0j），与 numpy.absolute 的实模语义不符。
+  ;; 复数委托 VT-ABS 分派内核：其 %CX-ANY-P 守卫把复数路由到 %CX-OP-ABS，取实模输出。
   (when (%cx-any-p tensor)
     (return-from vt-absolute (vt-abs tensor :out out :dtype dtype)))
   (vt-fast-map #'abs (ensure-vt tensor) :out out :dtype dtype))
