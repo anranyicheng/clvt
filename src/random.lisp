@@ -347,6 +347,38 @@
                (setf (aref d i) (%vt-cast-raw (aref src-data (idx)) dtype))))))))
     out))
 
+(defun %fill-choice-identity (out st n)
+  "a 为整数时的有放回均匀抽样快路径。此时 source=arange(n)，故
+   source[i] ≡ i，抽样值恰为 (random n st) 本身 —— 无需构造并随机索引
+   一个 n 元素的 source 数组（原路径对 n=1e6 是 8 MB + 100 万次随机访存，
+   实测 choice 比 random-int 慢 ~5×，触发 E 段倍率护栏）。
+
+   与通用路径同 seed **逐位一致**：两者每个元素都恰好调用一次
+   (random n st)，且 arange(n)[i] = i；(random n st) 的返回值即该索引，
+   arange 在该索引处存的值也正是 i。按 OUT 的 dtype 收敛后值完全相同。
+   每个元素一次写入，无 VT-CAST、无二次数组访问。"
+  (let ((m (vt-size out))
+        (dtype (vt-dtype out)))
+    (declare (type fixnum m n))
+    (cond
+      ((eq dtype :int64)
+       (let ((d (the (simple-array (signed-byte 64) (*)) (vt-data out))))
+         (declare (type (simple-array (signed-byte 64) (*)) d))
+         (dotimes (i m) (setf (aref d i) (random n st)))))
+      ((eq dtype :float64)
+       (let ((d (the (simple-array double-float (*)) (vt-data out))))
+         (declare (type (simple-array double-float (*)) d))
+         (dotimes (i m) (setf (aref d i) (float (random n st) 1d0)))))
+      ((eq dtype :float32)
+       (let ((d (the (simple-array single-float (*)) (vt-data out))))
+         (declare (type (simple-array single-float (*)) d))
+         (dotimes (i m) (setf (aref d i) (float (random n st) 1f0)))))
+      (t
+       (let ((d (vt-data out)))
+         (with-float-safe
+           (dotimes (i m) (setf (aref d i) (%vt-cast-raw (random n st) dtype)))))))
+    out))
+
 (defun %fill-choice-weighted (out st cdf src-data src-offset)
   "有放回加权抽样：每个元素一次 `(random 1.0d0 st)` 定 R，再在 CDF 上二分取下标，
    从 SRC-DATA 取值后按 OUT 的 dtype 收敛，返回 OUT。
@@ -623,9 +655,16 @@
            ;; 有放回：唯一的每元素路径。改前是 `VT-DO-EACH` + 每元素一次 `VT-CAST`
            ;; （216 ns/次的自带陷阱屏蔽），加权分支还要在 CDF 上线性扫。
            (let ((result (vt-zeros size-shape :dtype out-dtype)))
-             (if cdf
-                 (%fill-choice-weighted result rng cdf src-data src-offset)
-                 (%fill-choice-uniform result rng src-data src-offset n))
+             (cond
+               (cdf
+                (%fill-choice-weighted result rng cdf src-data src-offset))
+               ;; a 为整数 ⇒ source=arange(n)，值恰为 (random n)：走 identity
+               ;; 快路径，省掉 source 数组的构造与随机访存（同 seed 逐位一致）。
+               ;; a 为张量 ⇒ source 值不再是 i，必须走通用路径按索引取值。
+               ((integerp a)
+                (%fill-choice-identity result rng n))
+               (t
+                (%fill-choice-uniform result rng src-data src-offset n)))
              result)))))))
 
 (defun vt-random-permutation (n &key (rng nil))
