@@ -99,9 +99,10 @@
    纯语义构建时忽略 COUNT 的实际作用（本库一次性构建，无需预分配）。
    :out 契约：本函数为构建函数，无 :out。
    示例：(vt-fromiter '(1 2 3) :dtype :float64) => [1.0 2.0 3.0]"
-  (declare (ignore count))
   (when (not (or (null iterable) (typep iterable 'sequence)))
     (error "vt-fromiter: 需要序列输入，收到 ~a" (type-of iterable)))
+  (when (and count (/= count (length iterable)))
+    (error "vt-fromiter: count (~a) 必须等于序列长度 (~a)" count (length iterable)))
   (let* ((seq (or iterable '()))
          (has-complex (some (lambda (x) (or (complexp x) (%cx-deep-p x))) seq))
          (dt (cond ((and dtype-p dtype)
@@ -1289,10 +1290,13 @@
          (dt (or dtype (if (vt-complex-dtype-p in-dt)
                            (vt-real-dtype-of in-dt)
                            (if (eq in-dt :float32) :float32 :float64))))
+         ;; 度数换算系数用全精度 pi 推导，再按结果精度转换；
+         ;; 不能为 float32 硬编码截断的 pi（0.31415927s1 会让 deg 结果差 1 ULP）。
+         (deg-per-rad (if (eq dt :float32)
+                          (float (/ 180.0d0 pi) 1.0s0)
+                          (/ 180.0d0 pi)))
          (fn (if deg
-                 (lambda (z)
-                   (* (%carg z)
-                      (if (eq dt :float32) (/ 180.0s0 0.31415927s1) (/ 180.0d0 pi))))
+                 (lambda (z) (* (%carg z) deg-per-rad))
                  #'%carg)))
     ;; 度数换算需要额外一次乘法（内核未参数化），deg 走通用路径；
     ;; 默认弧度走 %CX-ANGLE-RUN 特化内核。

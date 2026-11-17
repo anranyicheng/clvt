@@ -61,7 +61,7 @@
    - 计算完成后按 DTYPE 转换：
        :float64 / :float32 → 浮点返回
        整型（:int64/:int32/:int16/:int8/:uint8/:uint16）
-                          → 走 vt-astype，NumPy 截断/回绕语义
+                          → 走 vt-astype，NumPy 截断/回绕语义（3.16 → 3）
        :bool              → 非零为真（vt-astype 真值化；numpy 的
                             np.geomspace(…, dtype=bool) 同样是 != 0）。
                             §17.10.14 之前这里**唯一**拒绝 bool 的
@@ -115,9 +115,17 @@
       (setf (aref rdata 0) s)
       (when endpoint
         (setf (aref rdata (1- num)) e))
-      (if (member dtype '(:int8 :int16 :int32 :int64 :uint8 :uint16))
-          (vt-astype (vt-round result) dtype)
-          (vt-astype result dtype)))))
+      ;; 全精度 log/exp 在 10 的整数次幂处有约 1 ULP 误差（如
+      ;; 99.9999999999999），整型直接截断会少 1。numpy 的 C log10/pow10
+      ;; 在这些点返回精确整数；这里把极接近整数的值吸附到该整数，再按
+      ;; dtype 转换（整型走截断：31.62 → 31，对齐 np.geomspace）。
+      (dotimes (i num)
+        (let* ((v (aref rdata i))
+               (n (round v)))
+          (when (and (/= n 0)
+                     (< (abs (- v n)) (* 1d-12 (abs n))))
+            (setf (aref rdata i) (float n 1d0)))))
+      (vt-astype result dtype))))
 
 
 ;;; ------------------------------------------------------------------

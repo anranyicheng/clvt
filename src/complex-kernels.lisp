@@ -84,7 +84,9 @@
           ;; 实轴：虚部保持原符号（含 -0.0），必须走特例，否则 ±0 会被抹平
           ((and (zerop y) (>= x 0)) (complex (sqrt x) y))
           ((and (zerop y) (minusp x))
-           (complex (* 0 x)
+           ;; 负实轴：虚部按 -0.0 符号分支，实部恒为 +0（C99/numpy csqrt，
+           ;; 不能用 (* 0 x) —— x<0 时会得到 -0.0）。
+           (complex (if (typep x 'double-float) 0.0d0 0.0s0)
                     (if (minusp (float-sign y))
 			(- (sqrt (- x)))
 			(sqrt (- x)))))

@@ -563,11 +563,14 @@
       (unless (= (length pw) n)
         (error "vt-random-choice: p 的长度 (~a) 必须等于 a 的元素数 (~a)"
                (length pw) n))
-      (unless (every (lambda (w) (and (realp w) (>= w 0))) pw)
-        (error "vt-random-choice: p 必须全部为非负实数，收到 ~s" pw))
-      (unless (plusp (reduce #'+ pw))
-        (error "vt-random-choice: p 的总和必须为正（否则无法归一化成概率），收到总和 ~a"
-               (reduce #'+ pw))))
+      ;; NaN 与 0 的比较会触发 FLOATING-POINT-INVALID；在此屏蔽陷阱，
+      ;; 让含 NaN 的权重走下面的干净参数错误（而非算术陷阱）。
+      (with-float-safe
+        (unless (every (lambda (w) (and (realp w) (>= w 0))) pw)
+          (error "vt-random-choice: p 必须全部为非负实数，收到 ~s" pw))
+        (unless (plusp (reduce #'+ pw))
+          (error "vt-random-choice: p 的总和必须为正（否则无法归一化成概率），收到总和 ~a"
+                 (reduce #'+ pw)))))
     (let ((cdf (when pw
                  ;; 就地构造成 (simple-array double-float (*))：二分内核按强类型
                  ;; 声明读它，`(coerce … 'vector)` 的通用 AREF 会慢三倍。

@@ -895,11 +895,19 @@
    返回数据区起点字节偏移。头总长放不下 2 字节长度域时自动升级 v2.0。"
   (let* ((dict (format nil "{'descr': '~a', 'fortran_order': False, 'shape': ~a, }"
                        descr (%npy-shape-text shape)))
-         (major (if (> (+ 10 (length dict)) 65535) 2 1))
+         ;; v1/v2 的判据是「dict + padding + 换行」这个写进长度域的值，
+         ;; 不是裸 dict 长度 + 固定 10。先按 v1 前缀（10）与换行（1）算 padding
+         ;; 与总头长，超过 2 字节长度域上限才升 v2。
+         (pad-v1 (mod (- 64 (mod (+ 11 (length dict)) 64)) 64))
+         (hlen-v1 (+ (length dict) pad-v1 1))
+         (major (if (> hlen-v1 65535) 2 1))
          (hlen-size (if (= major 1) 2 4))
-         (pad (mod (- 64 (mod (+ 9 hlen-size (length dict)) 64)) 64))
+         ;; v2 前缀多 2 字节，padding 口径随之不同，需重算。
+         (pad (if (= major 1)
+                  pad-v1
+                  (mod (- 64 (mod (+ 9 hlen-size (length dict)) 64)) 64)))
          (hlen (+ (length dict) pad 1)))
-    (when (> hlen 65535)
+    (when (and (= major 1) (> hlen 65535))
       (error "vt-save: npy header 过长（~a 字节），张量秩异常" hlen))
     (dotimes (i 6)
       (write-byte (aref #(147 78 85 77 80 89) i) stream))
