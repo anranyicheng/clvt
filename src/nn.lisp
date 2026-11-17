@@ -103,8 +103,8 @@
 
 (defun vt-relu (vt &key dtype out)
   "ReLU 激活。连续 float 张量走特化快路径（消除 funcall 开销）。
-  v0.4.1（差分测试 R8）：整数输入保持整数 dtype（对标 numpy.maximum
-  与 torch.relu）；浮点输入保持自身精度；显式 :dtype 仍生效。"
+  输出恒为浮点（§3.4）：整数输入提升 :float64，float32 保持 float32；
+  显式 :dtype 仍生效。"
   (when (%cx-reject vt)
     (error "vt-relu: 不支持复数输入（numpy 同样拒绝）。见 CONVENTIONS §16.11"))
 (with-float-safe
